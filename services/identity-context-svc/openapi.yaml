@@ -1,0 +1,292 @@
+openapi: "3.1.0"
+info:
+  title: Identity Context Service
+  version: "1.0"
+  description: |
+    Resolves authenticated principal, tenant, active legal entity, role profile,
+    delegated authority, and session trust posture for every ZoikoSuite request.
+
+    **Service Class:** Platform Foundation Service  
+    **Deployment Tier:** Tier 0  
+    **Architecture ref:** docs/architecture/03-microservices.md §09.1, docs/architecture/01-backend.md §12
+
+    ## Evidence Obligation
+    Every resolution (success and failure) produces a durable identity.context.resolved or
+    identity.context.resolution_failed event on the event backbone.
+
+    ## Failure Posture
+    All six resolution dimensions fail **closed**. Partial envelopes are prohibited.
+    A 503 is returned if any upstream dependency is unavailable.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://identity-context-svc.internal.zoiko.io
+    description: Internal cluster (mTLS required)
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    ResolveContextRequest:
+      type: object
+      required:
+        - legal_entity_id
+        - correlation_id
+      properties:
+        bearer_token:
+          type: string
+          description: OIDC JWT from the configured Identity Provider
+        saml_assertion:
+          type: string
+          description: Base64-encoded SAML 2.0 assertion
+        legal_entity_id:
+          type: string
+          description: The legal entity scope the principal is acting under
+          example: "01HXXXENTITYID"
+        correlation_id:
+          type: string
+          description: Per-request correlation identifier for tracing
+          example: "01HXXXCORRELID"
+
+    IdentityContextEnvelopeResponse:
+      type: object
+      required:
+        - envelope_jwt
+      properties:
+        envelope_jwt:
+          type: string
+          description: |
+            Signed JWT containing the IdentityContextEnvelope. Payload includes:
+              - principal (principal_id, tenant_id, principal_type, display_name)
+              - tenant_id
+              - legal_entity_id
+              - role_profile (role_assignments[], permission_bundle_ids[])
+              - delegated_authority[]
+              - session_trust_posture (posture, mfa_verified, adaptive_risk_score, session_context_id)
+              - correlation_id
+              - schema_version
+
+    InvalidateSessionRequest:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED]
+
+    UpdatePrincipalStatusRequest:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [ACTIVE, SUSPENDED, DISABLED]
+        reason:
+          type: string
+
+    ErrorResponse:
+      type: object
+      properties:
+        statusCode:
+          type: integer
+        message:
+          type: string
+        correlation_id:
+          type: string
+
+paths:
+  /v1/context/resolve:
+    post:
+      summary: Resolve identity context
+      operationId: resolveContext
+      description: |
+        Resolves all six dimensions of identity context and returns a signed
+        IdentityContextEnvelope JWT.
+        
+        **Hot path — P99 < 50ms.** Redis-cached session results are returned
+        directly. All six dimensions must resolve or the service fails closed (503).
+        
+        **Idempotency:** Same token + same correlation_id within TTL window returns
+        a cached envelope without creating a duplicate SessionContext record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveContextRequest"
+      responses:
+        "200":
+          description: Signed IdentityContextEnvelope JWT
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityContextEnvelopeResponse"
+        "401":
+          description: Token invalid, principal inactive, or trust posture BLOCKED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Upstream dependency unavailable — failing closed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/context/session/{sessionContextId}:
+    get:
+      summary: Retrieve cached session context
+      operationId: getSessionContext
+      description: |
+        Returns the cached envelope JWT for an active session. Used by downstream
+        services for fast re-validation (P99 < 5ms) without a full re-resolve.
+      parameters:
+        - name: sessionContextId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityContextEnvelopeResponse"
+          description: Cached envelope
+        "404":
+          description: Session not found or expired
+
+  /v1/context/session/{sessionContextId}/invalidate:
+    post:
+      summary: Invalidate a session
+      operationId: invalidateSession
+      description: |
+        Appends invalidated_at to the SessionContext record and evicts from cache.
+        **Idempotent** — re-submitting against an already-invalidated session is a no-op.
+        SessionContext records are never deleted per data-model §06.3 modeling rules.
+      parameters:
+        - name: sessionContextId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Actor-Principal-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InvalidateSessionRequest"
+      responses:
+        "204":
+          description: Session invalidated (or was already invalidated — idempotent)
+
+  /v1/principals/{principalId}:
+    get:
+      summary: Retrieve principal profile
+      operationId: getPrincipal
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Principal profile
+        "404":
+          description: Principal not found
+
+  /v1/principals/{principalId}/roles:
+    get:
+      summary: Retrieve effective role assignments
+      operationId: getPrincipalRoles
+      description: Returns entity-scoped, effective-dated role assignments.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Role assignments
+
+  /v1/principals/{principalId}/delegations:
+    get:
+      summary: Retrieve active delegated authority grants
+      operationId: getPrincipalDelegations
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Active delegations
+
+  /v1/principals/{principalId}/status:
+    put:
+      summary: Transition principal status
+      operationId: updatePrincipalStatus
+      description: |
+        Status transitions only (ACTIVE → SUSPENDED → DISABLED). 
+        No soft-delete per doctrine (data-model §2.11).
+        Idempotent — re-applying same status is a no-op.
+      parameters:
+        - name: principalId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Actor-Principal-ID
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdatePrincipalStatusRequest"
+      responses:
+        "204":
+          description: Status updated
+
+  /health:
+    get:
+      summary: Health check
+      operationId: healthCheck
+      security: []
+      responses:
+        "200":
+          description: Service healthy
+        "503":
+          description: Service degraded or dependency unavailable
