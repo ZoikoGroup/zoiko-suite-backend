@@ -79,24 +79,31 @@ func NewJWTSigner(cfg *config.Config) *JWTSigner {
 	return &JWTSigner{cfg: cfg}
 }
 
+// envelopeClaims wraps IdentityContextEnvelope so the jwt library can sign it.
+// We do NOT embed jwt.RegisteredClaims because IdentityContextEnvelope already
+// carries iss/aud/exp/iat/jti fields with their own json tags — embedding
+// RegisteredClaims would duplicate those tags and cause go vet warnings and
+// ambiguous JSON marshalling. Instead we implement the jwt.Claims interface
+// directly by forwarding to the envelope fields.
 type envelopeClaims struct {
 	domain.IdentityContextEnvelope
-	jwt.RegisteredClaims
 }
+
+func (e envelopeClaims) GetExpirationTime() (*jwt.NumericDate, error) {
+	return jwt.NewNumericDate(time.Unix(e.EXP, 0)), nil
+}
+func (e envelopeClaims) GetIssuedAt() (*jwt.NumericDate, error) {
+	return jwt.NewNumericDate(time.Unix(e.IAT, 0)), nil
+}
+func (e envelopeClaims) GetNotBefore() (*jwt.NumericDate, error) { return nil, nil }
+func (e envelopeClaims) GetIssuer() (string, error)              { return e.ISS, nil }
+func (e envelopeClaims) GetSubject() (string, error)             { return e.Principal.PrincipalID, nil }
+func (e envelopeClaims) GetAudience() (jwt.ClaimStrings, error)  { return jwt.ClaimStrings{e.AUD}, nil }
 
 // Sign produces a signed JWT for the given envelope.
 // The JWT's exp matches envelope.EXP; iss and aud are set from config.
 func (s *JWTSigner) Sign(envelope *domain.IdentityContextEnvelope) (string, error) {
-	claims := envelopeClaims{
-		IdentityContextEnvelope: *envelope,
-		RegisteredClaims: jwt.RegisteredClaims{
-			ID:        envelope.JTI,
-			Issuer:    envelope.ISS,
-			Audience:  jwt.ClaimStrings{envelope.AUD},
-			IssuedAt:  jwt.NewNumericDate(time.Unix(envelope.IAT, 0)),
-			ExpiresAt: jwt.NewNumericDate(time.Unix(envelope.EXP, 0)),
-		},
-	}
+	claims := envelopeClaims{IdentityContextEnvelope: *envelope}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	return token.SignedString([]byte(s.cfg.JWTSigningSecret))
 }

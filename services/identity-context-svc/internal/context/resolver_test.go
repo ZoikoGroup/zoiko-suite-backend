@@ -68,7 +68,7 @@ func (m *mockPrincipalStore) FindActiveRoleAssignments(_ context.Context, _ stri
 func (m *mockPrincipalStore) FindActiveDelegations(_ context.Context, _ string) ([]domain.DelegatedAuthority, error) {
 	return m.delegations, nil
 }
-func (m *mockPrincipalStore) UpdateStatus(_ context.Context, _, _ string, _ domain.PrincipalStatus, _ string) error {
+func (m *mockPrincipalStore) UpdateStatus(_ context.Context, _ string, _ domain.PrincipalStatus, _, _ string) error {
 	return nil
 }
 
