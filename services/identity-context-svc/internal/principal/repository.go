@@ -105,12 +105,13 @@ func (r *Repository) UpdateStatus(
 	ctx context.Context,
 	principalID string,
 	newStatus domain.PrincipalStatus,
-	actorID domain.PrincipalStatus, // re-using type — TODO: change to string after DB wiring
+	actorID string,
 	correlationID string,
 ) error {
 	r.log.Info("principal.status.changed",
 		zap.String("principal_id", principalID),
 		zap.String("new_status", string(newStatus)),
+		zap.String("actor_id", actorID),
 		zap.String("correlation_id", correlationID),
 	)
 	return nil // stub

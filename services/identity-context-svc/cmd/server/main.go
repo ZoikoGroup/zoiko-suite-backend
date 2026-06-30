@@ -141,5 +141,7 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+	log.Info("draining in-flight event goroutines")
+	resolver.Drain()
 	log.Info("identity-context-svc stopped")
 }

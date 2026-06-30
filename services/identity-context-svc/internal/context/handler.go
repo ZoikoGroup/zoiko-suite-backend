@@ -169,7 +169,7 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := h.principals.UpdateStatus(
-		r.Context(), principalID, req.Status, domain.PrincipalStatus(actorPrincipalID), correlationID,
+		r.Context(), principalID, req.Status, actorPrincipalID, correlationID,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update status")
 		return
