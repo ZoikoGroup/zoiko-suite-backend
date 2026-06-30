@@ -4,6 +4,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -29,6 +30,13 @@ type envelope struct {
 // — callers invoke them in goroutines. The producer uses an outbox-retry
 // pattern (TODO: implement outbox) for delivery guarantees.
 //
+// Gap 1 (fixed): PublishX methods return error so callers can detect and
+// log publish failures rather than silently discarding them.
+//
+// Gap 2 (known, not yet fixed): there is no WaitGroup or outbox drain on
+// process shutdown. In-flight goroutines may be lost on SIGTERM. Tracked
+// as a Phase 1 exit-criteria gap — see PR description.
+//
 // Events are facts, not commands. Published topics are append-only.
 type Publisher struct {
 	log   *zap.Logger
@@ -43,8 +51,8 @@ func NewPublisher(log *zap.Logger, topic string) *Publisher {
 func (p *Publisher) PublishContextResolved(
 	ctx context.Context,
 	principalID, tenantID, legalEntityID, sessionContextID, correlationID string,
-) {
-	p.emit("identity.context.resolved", map[string]any{
+) error {
+	return p.emit("identity.context.resolved", map[string]any{
 		"principal_id":       principalID,
 		"tenant_id":          tenantID,
 		"legal_entity_id":    legalEntityID,
@@ -56,8 +64,8 @@ func (p *Publisher) PublishContextResolved(
 func (p *Publisher) PublishResolutionFailed(
 	ctx context.Context,
 	subject, correlationID, reason string,
-) {
-	p.emit("identity.context.resolution_failed", map[string]any{
+) error {
+	return p.emit("identity.context.resolution_failed", map[string]any{
 		"principal_id_or_subject": subject,
 		"correlation_id":          correlationID,
 		"failure_reason":          reason,
@@ -69,8 +77,8 @@ func (p *Publisher) PublishSessionInvalidated(
 	sessionContextID, principalID string,
 	reason domain.InvalidationReason,
 	correlationID string,
-) {
-	p.emit("session.invalidated", map[string]any{
+) error {
+	return p.emit("session.invalidated", map[string]any{
 		"session_context_id":  sessionContextID,
 		"principal_id":        principalID,
 		"invalidation_reason": reason,
@@ -78,8 +86,8 @@ func (p *Publisher) PublishSessionInvalidated(
 	})
 }
 
-func (p *Publisher) PublishRiskSignalUnavailable(ctx context.Context, principalID, correlationID string) {
-	p.emit("session.risk.changed", map[string]any{
+func (p *Publisher) PublishRiskSignalUnavailable(ctx context.Context, principalID, correlationID string) error {
+	return p.emit("session.risk.changed", map[string]any{
 		"principal_id":   principalID,
 		"new_posture":    string(domain.TrustPostureStandard),
 		"signal_source":  "UNAVAILABLE",
@@ -92,8 +100,8 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 	principalID, tenantID string,
 	newStatus domain.PrincipalStatus,
 	actorID, correlationID string,
-) {
-	p.emit("principal.status.changed", map[string]any{
+) error {
+	return p.emit("principal.status.changed", map[string]any{
 		"principal_id":   principalID,
 		"tenant_id":      tenantID,
 		"new_status":     string(newStatus),
@@ -103,9 +111,13 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 }
 
 // emit serialises the payload and writes to the Kafka topic.
+// Returns an error so callers can detect failures (Gap 1 fix).
 // Stub: logs structured JSON until kafka.Writer is injected.
-func (p *Publisher) emit(eventType string, payload map[string]any) {
-	raw, _ := json.Marshal(payload)
+func (p *Publisher) emit(eventType string, payload map[string]any) error {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
+	}
 	env := envelope{
 		EventType:     eventType,
 		EmittedAt:     time.Now().UTC(),
@@ -113,14 +125,20 @@ func (p *Publisher) emit(eventType string, payload map[string]any) {
 		SourceService: "identity-context-svc",
 		Payload:       json.RawMessage(raw),
 	}
-	data, _ := json.Marshal(env)
+	data, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
+	}
 
 	// TODO: publish to Kafka
 	// msg := kafka.Message{Topic: p.topic, Value: data}
-	// if err := p.producer.WriteMessages(context.Background(), msg); err != nil { ... }
+	// if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
+	//     return fmt.Errorf("event %q: kafka write: %w", eventType, err)
+	// }
 
 	p.log.Info("event emitted (stub — wire Kafka producer)",
 		zap.String("event_type", eventType),
 		zap.ByteString("payload", data),
 	)
+	return nil
 }

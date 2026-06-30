@@ -3,6 +3,7 @@ package context_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,25 +154,117 @@ func (m *mockUpstreamRegistry) FetchActiveDelegations(_ context.Context, _, _ st
 	return m.delegations, m.delegationsErr
 }
 
-// mockEventPublisher
+// mockEventPublisher is a thread-safe event publisher for tests.
+//
+// The production Resolver launches publish calls in fire-and-forget goroutines
+// (e.g. go r.events.PublishContextResolved(...)). Those goroutines write to
+// this mock concurrently with the test goroutine reading the counters — a data
+// race without synchronization.
+//
+// Two fixes applied:
+//  1. sync.Mutex protects every counter read and write.
+//  2. Each publish method sends on a buffered channel so tests can block until
+//     the goroutine has actually completed, instead of using time.Sleep which
+//     only hides the race intermittently.
 type mockEventPublisher struct {
+	mu              sync.Mutex
 	resolved        int
 	failed          int
 	invalidated     int
 	riskUnavailable int
+
+	// Buffered channels (capacity 10) — each successful publish sends one token.
+	// Tests receive from these instead of sleeping.
+	ResolvedCh        chan struct{}
+	FailedCh          chan struct{}
+	InvalidatedCh     chan struct{}
+	RiskUnavailableCh chan struct{}
 }
 
-func (m *mockEventPublisher) PublishContextResolved(_ context.Context, _, _, _, _, _ string) {
+func newMockEventPublisher() *mockEventPublisher {
+	return &mockEventPublisher{
+		ResolvedCh:        make(chan struct{}, 10),
+		FailedCh:          make(chan struct{}, 10),
+		InvalidatedCh:     make(chan struct{}, 10),
+		RiskUnavailableCh: make(chan struct{}, 10),
+	}
+}
+
+// waitResolved blocks until n resolved events have been published or the
+// test deadline is exceeded. Returns the count observed.
+func (m *mockEventPublisher) waitResolved(t *testing.T, n int) int {
+	t.Helper()
+	return waitN(t, m.ResolvedCh, n)
+}
+func (m *mockEventPublisher) waitFailed(t *testing.T, n int) int {
+	t.Helper()
+	return waitN(t, m.FailedCh, n)
+}
+func (m *mockEventPublisher) waitRiskUnavailable(t *testing.T, n int) int {
+	t.Helper()
+	return waitN(t, m.RiskUnavailableCh, n)
+}
+
+// waitN drains n tokens from ch or fails the test on timeout.
+func waitN(t *testing.T, ch <-chan struct{}, n int) int {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for goroutine event (got %d of %d)", i, n)
+		}
+	}
+	return n
+}
+
+// Resolved returns the current resolved count, safe for concurrent access.
+func (m *mockEventPublisher) Resolved() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.resolved
+}
+func (m *mockEventPublisher) Failed() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failed
+}
+func (m *mockEventPublisher) RiskUnavailable() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.riskUnavailable
+}
+
+func (m *mockEventPublisher) PublishContextResolved(_ context.Context, _, _, _, _, _ string) error {
+	m.mu.Lock()
 	m.resolved++
+	m.mu.Unlock()
+	m.ResolvedCh <- struct{}{}
+	return nil
 }
-func (m *mockEventPublisher) PublishResolutionFailed(_ context.Context, _, _, _ string) { m.failed++ }
-func (m *mockEventPublisher) PublishSessionInvalidated(_ context.Context, _, _ string, _ domain.InvalidationReason, _ string) {
+func (m *mockEventPublisher) PublishResolutionFailed(_ context.Context, _, _, _ string) error {
+	m.mu.Lock()
+	m.failed++
+	m.mu.Unlock()
+	m.FailedCh <- struct{}{}
+	return nil
+}
+func (m *mockEventPublisher) PublishSessionInvalidated(_ context.Context, _, _ string, _ domain.InvalidationReason, _ string) error {
+	m.mu.Lock()
 	m.invalidated++
+	m.mu.Unlock()
+	m.InvalidatedCh <- struct{}{}
+	return nil
 }
-func (m *mockEventPublisher) PublishRiskSignalUnavailable(_ context.Context, _, _ string) {
+func (m *mockEventPublisher) PublishRiskSignalUnavailable(_ context.Context, _, _ string) error {
+	m.mu.Lock()
 	m.riskUnavailable++
+	m.mu.Unlock()
+	m.RiskUnavailableCh <- struct{}{}
+	return nil
 }
-func (m *mockEventPublisher) PublishPrincipalStatusChanged(_ context.Context, _, _ string, _ domain.PrincipalStatus, _, _ string) {
+func (m *mockEventPublisher) PublishPrincipalStatusChanged(_ context.Context, _, _ string, _ domain.PrincipalStatus, _, _ string) error {
+	return nil
 }
 
 // mockTokenVerifier
@@ -212,7 +305,7 @@ func defaultFixture() *resolverFixture {
 		sessions:    newMockSessionCache(),
 		riskSignals: &mockRiskSignalCache{signal: nil}, // cache miss → STANDARD
 		upstream:    defaultUpstream(),
-		events:      &mockEventPublisher{},
+		events:      newMockEventPublisher(),
 		verifier:    &mockTokenVerifier{claims: validClaims},
 		signer:      &mockEnvelopeSigner{},
 	}
@@ -246,9 +339,9 @@ func TestResolve_PublishesContextResolvedEvent(t *testing.T) {
 	f := defaultFixture()
 	_, err := f.build().Resolve(context.Background(), baseRequest)
 	require.NoError(t, err)
-	// Allow goroutine to fire
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 1, f.events.resolved)
+	// Block until the fire-and-forget goroutine has completed — no sleep.
+	f.events.waitResolved(t, 1)
+	assert.Equal(t, 1, f.events.Resolved())
 }
 
 func TestResolve_PersistsSessionContext(t *testing.T) {
@@ -271,8 +364,8 @@ func TestResolve_FailsClosed_TokenInvalid(t *testing.T) {
 	_, err := f.build().Resolve(context.Background(), baseRequest)
 
 	require.ErrorIs(t, err, identityctx.ErrTokenInvalid)
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 1, f.events.failed) // failure event published
+	f.events.waitFailed(t, 1)
+	assert.Equal(t, 1, f.events.Failed())
 }
 
 func TestResolve_FailsClosed_PrincipalSuspended(t *testing.T) {
@@ -281,8 +374,8 @@ func TestResolve_FailsClosed_PrincipalSuspended(t *testing.T) {
 	_, err := f.build().Resolve(context.Background(), baseRequest)
 
 	require.ErrorIs(t, err, identityctx.ErrPrincipalInactive)
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 1, f.events.failed)
+	f.events.waitFailed(t, 1)
+	assert.Equal(t, 1, f.events.Failed())
 }
 
 func TestResolve_FailsClosed_PrincipalNotFound(t *testing.T) {
@@ -337,8 +430,8 @@ func TestResolve_FailsClosed_TrustPostureBlocked(t *testing.T) {
 	_, err := f.build().Resolve(context.Background(), baseRequest)
 
 	require.ErrorIs(t, err, identityctx.ErrTrustPostureBlocked)
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 1, f.events.failed)
+	f.events.waitFailed(t, 1)
+	assert.Equal(t, 1, f.events.Failed())
 }
 
 // ── Q3: Risk signal cache unavailability (hot-path isolation) ─────────────────
@@ -352,8 +445,8 @@ func TestResolve_RiskCacheUnavailable_DefaultsToStandard_DoesNotBlock(t *testing
 	require.NoError(t, err)
 	assert.Equal(t, "signed-envelope-jwt", jwt)
 
-	time.Sleep(10 * time.Millisecond)
-	assert.Equal(t, 1, f.events.riskUnavailable) // event emitted
+	f.events.waitRiskUnavailable(t, 1)
+	assert.Equal(t, 1, f.events.RiskUnavailable())
 }
 
 func TestResolve_RiskCacheErrors_DefaultsToStandard_DoesNotBlock(t *testing.T) {

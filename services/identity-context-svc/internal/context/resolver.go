@@ -46,22 +46,22 @@ var (
 //  4. Partial envelopes are PROHIBITED. All six dimensions must resolve or
 //     the service fails closed. Never return a zero-value envelope.
 type Resolver struct {
-	cfg          *config.Config
-	log          *zap.Logger
+	cfg         *config.Config
+	log         *zap.Logger
 	// wg tracks all in-flight fire-and-forget event publish goroutines.
 	// Drain() blocks until every goroutine completes, allowing main.go to
 	// call it after srv.Shutdown() for a clean graceful shutdown.
 	// Gap 2 follow-up: add a context-aware bounded drain (see linked issue)
 	// so the process is not fully dependent on orchestrator SIGKILL if a
 	// goroutine truly hangs.
-	wg           sync.WaitGroup
-	principals   PrincipalStore
-	sessions     SessionCache
-	riskSignals  RiskSignalCache
-	upstream     UpstreamRegistry
-	events       EventPublisher
-	verifier     TokenVerifier
-	signer       EnvelopeSigner
+	wg          sync.WaitGroup
+	principals  PrincipalStore
+	sessions    SessionCache
+	riskSignals RiskSignalCache
+	upstream    UpstreamRegistry
+	events      EventPublisher
+	verifier    TokenVerifier
+	signer      EnvelopeSigner
 }
 
 // NewResolver constructs a Resolver with all required dependencies injected.
@@ -120,7 +120,13 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			r.events.PublishResolutionFailed(ctx, "unknown", req.CorrelationID, "token_invalid")
+			if err := r.events.PublishResolutionFailed(ctx, "unknown", req.CorrelationID, "token_invalid"); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "identity.context.resolution_failed"),
+					zap.String("subject", "unknown"),
+					zap.Error(err),
+				)
+			}
 		}()
 		return "", fmt.Errorf("%w: %v", ErrTokenInvalid, err)
 	}
@@ -130,7 +136,13 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			r.events.PublishResolutionFailed(ctx, claims.Subject, req.CorrelationID, "principal_inactive_or_not_found")
+			if err := r.events.PublishResolutionFailed(ctx, claims.Subject, req.CorrelationID, "principal_inactive_or_not_found"); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "identity.context.resolution_failed"),
+					zap.String("subject", claims.Subject),
+					zap.Error(err),
+				)
+			}
 		}()
 		return "", ErrPrincipalInactive
 	}
@@ -175,7 +187,13 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			r.events.PublishResolutionFailed(ctx, principal.PrincipalID, req.CorrelationID, "trust_posture_blocked")
+			if err := r.events.PublishResolutionFailed(ctx, principal.PrincipalID, req.CorrelationID, "trust_posture_blocked"); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "identity.context.resolution_failed"),
+					zap.String("principal_id", principal.PrincipalID),
+					zap.Error(err),
+				)
+			}
 		}()
 		return "", ErrTrustPostureBlocked
 	}
@@ -277,7 +295,13 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.events.PublishContextResolved(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, sessionContextID, req.CorrelationID)
+		if err := r.events.PublishContextResolved(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, sessionContextID, req.CorrelationID); err != nil {
+			r.log.Error("event publish failed",
+				zap.String("event_type", "identity.context.resolved"),
+				zap.String("principal_id", principal.PrincipalID),
+				zap.Error(err),
+			)
+		}
 	}()
 
 	r.log.Info("identity.context.resolved",
@@ -324,7 +348,13 @@ func (r *Resolver) InvalidateSession(
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		r.events.PublishSessionInvalidated(ctx, sessionContextID, existing.PrincipalID, reason, correlationID)
+		if err := r.events.PublishSessionInvalidated(ctx, sessionContextID, existing.PrincipalID, reason, correlationID); err != nil {
+			r.log.Error("event publish failed",
+				zap.String("event_type", "session.invalidated"),
+				zap.String("session_context_id", sessionContextID),
+				zap.Error(err),
+			)
+		}
 	}()
 
 	r.log.Info("session.invalidated",
@@ -402,7 +432,13 @@ func (r *Resolver) resolveTrustPosture(
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			r.events.PublishRiskSignalUnavailable(ctx, principalID, correlationID)
+			if err := r.events.PublishRiskSignalUnavailable(ctx, principalID, correlationID); err != nil {
+				r.log.Error("event publish failed",
+					zap.String("event_type", "session.risk.changed"),
+					zap.String("principal_id", principalID),
+					zap.Error(err),
+				)
+			}
 		}()
 	} else {
 		riskScore = signal.SignalValue

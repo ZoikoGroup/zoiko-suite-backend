@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "feat/**", "fix/**", "chore/**"]
+  pull_request:
+    branches: ["main"]
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ─── Go services ─────────────────────────────────────────────────────────────
+  go-services:
+    name: "${{ matrix.service }} — build · vet · test"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # show all failures, not just the first
+      matrix:
+        service:
+          - identity-context-svc
+          - tenant-entity-registry-svc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Read the Go version from the service's own go.mod so the matrix
+          # is self-describing and we never silently test against the wrong toolchain.
+          go-version-file: services/${{ matrix.service }}/go.mod
+          cache-dependency-path: services/${{ matrix.service }}/go.sum
+
+      # go.sum MUST exist in the repo and be current.
+      # If it is missing or stale this step will fail — which is the
+      # correct behavior: a missing go.sum means CI was not verifying
+      # the module graph integrity.
+      - name: Verify module graph (go mod verify)
+        working-directory: services/${{ matrix.service }}
+        run: go mod verify
+
+      - name: Build
+        working-directory: services/${{ matrix.service }}
+        run: go build ./...
+
+      - name: Vet
+        working-directory: services/${{ matrix.service }}
+        run: go vet ./...
+
+      - name: Test (with race detector)
+        working-directory: services/${{ matrix.service }}
+        # go list ./... pre-enumerates packages, excluding the bare module
+        # root which has no .go files (verified: this causes "no Go files
+        # in root directory" only with `go test -list=...`, not with plain
+        # ./... or with -race). Whether ./... alone has any failure mode on
+        # the GitHub Actions Ubuntu runner under -race has not been directly
+        # observed — this enumeration approach is used regardless because it
+        # removes that ambiguity entirely rather than relying on ./...'s
+        # implicit skip behavior.
+        run: |
+          pkgs=$(go list ./... 2>/dev/null | tr '\n' ' ')
+          if [ -n "$pkgs" ]; then
+            go test -race -count=1 -timeout=120s $pkgs
+          else
+            echo "No packages to test"
+          fi

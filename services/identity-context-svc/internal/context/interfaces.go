@@ -54,14 +54,19 @@ type UpstreamRegistry interface {
 }
 
 // EventPublisher emits append-only domain events to the event backbone.
-// Publish calls are fire-and-forget from Resolve()'s perspective —
-// the resolver does not block on event publication.
+// Publish calls are fire-and-forget from Resolve()'s perspective — the
+// resolver does not block on event publication, but errors returned by
+// these methods ARE logged at ERROR level with principal_id and event_type
+// context so they are observable (Gap 1 fix).
+// Gap 2 NOTE: there is still no drain/WaitGroup on shutdown — in-flight
+// goroutines may be lost on SIGTERM. Tracked as a Phase 1 exit-criteria
+// gap to be addressed in a follow-up PR with an outbox or WaitGroup drain.
 type EventPublisher interface {
-	PublishContextResolved(ctx context.Context, principalID, tenantID, legalEntityID, sessionContextID, correlationID string)
-	PublishResolutionFailed(ctx context.Context, subject, correlationID, reason string)
-	PublishSessionInvalidated(ctx context.Context, sessionContextID, principalID string, reason domain.InvalidationReason, correlationID string)
-	PublishRiskSignalUnavailable(ctx context.Context, principalID, correlationID string)
-	PublishPrincipalStatusChanged(ctx context.Context, principalID, tenantID string, newStatus domain.PrincipalStatus, actorID, correlationID string)
+	PublishContextResolved(ctx context.Context, principalID, tenantID, legalEntityID, sessionContextID, correlationID string) error
+	PublishResolutionFailed(ctx context.Context, subject, correlationID, reason string) error
+	PublishSessionInvalidated(ctx context.Context, sessionContextID, principalID string, reason domain.InvalidationReason, correlationID string) error
+	PublishRiskSignalUnavailable(ctx context.Context, principalID, correlationID string) error
+	PublishPrincipalStatusChanged(ctx context.Context, principalID, tenantID string, newStatus domain.PrincipalStatus, actorID, correlationID string) error
 }
 
 // TokenVerifier validates an inbound bearer token or SAML assertion
