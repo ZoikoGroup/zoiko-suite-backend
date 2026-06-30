@@ -2,6 +2,7 @@ package registry_test
 
 import (
 	"context"
+	"encoding/base64"
 	"testing"
 	"time"
 
@@ -20,9 +21,10 @@ import (
 // ---------------------------------------------------------------------------
 
 type memStore struct {
-	tenants  map[string]*domain.Tenant
-	entities map[string]*domain.LegalEntity
-	bundles  map[string]*domain.TaxIdentityBundle
+	tenants          map[string]*domain.Tenant
+	entities         map[string]*domain.LegalEntity
+	bundles          map[string]*domain.TaxIdentityBundle
+	lastUpdateActor  string // records ActorPrincipalID from the last UpdateEntity call
 	// Minimal set — add more maps as tests require.
 }
 
@@ -66,6 +68,7 @@ func (m *memStore) ListEntitiesByTenant(_ context.Context, _ string) ([]*domain.
 	return []*domain.LegalEntity{}, nil
 }
 func (m *memStore) UpdateEntity(_ context.Context, id string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error) {
+	m.lastUpdateActor = req.ActorPrincipalID // record for assertion in tests
 	e, ok := m.entities[id]
 	if !ok {
 		return nil, nil
@@ -542,4 +545,81 @@ func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.
 
 	_, err := svc.CreateTaxIdentityBundle(context.Background(), "jwt", "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
+}
+
+// ---------------------------------------------------------------------------
+// UpdateEntity actor audit tests (R3 fix)
+// ---------------------------------------------------------------------------
+
+// TestUpdateEntity_WritesRealActorPrincipalID confirms that the service
+// extracts principal_id from the envelope JWT and passes it to the store
+// as updated_by_principal_id — not the "system" fallback.
+//
+// actorFromJWT performs payload-only base64 decoding; it does NOT verify the
+// signature. We craft a minimal unsigned JWT to exercise the extraction path
+// without needing a real key or signing library in this test package.
+func TestUpdateEntity_WritesRealActorPrincipalID(t *testing.T) {
+	svc, ms := baseSvc(t)
+	ctx := context.Background()
+
+	// Pre-seed an entity so UpdateEntity finds it.
+	entityID := "ent-actor-test"
+	ms.entities[entityID] = &domain.LegalEntity{
+		LegalEntityID: entityID,
+		TenantID:      "ten-001",
+		LegalName:     "Original Name",
+		EntityStatus:  domain.EntityStatusActive,
+	}
+
+	wantPrincipalID := "usr_01J0000000000000000000001"
+
+	// Build a minimal unsigned JWT: header.payload.sig where:
+	//   header = {"alg":"none"}
+	//   payload = {"principal_id":"<id>"}
+	//   sig = empty (actorFromJWT ignores the signature entirely)
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"principal_id":"` + wantPrincipalID + `"}`),
+	)
+	envelopeJWT := header + "." + payload + "."
+
+	newName := "Updated Name"
+	req := domain.UpdateEntityRequest{
+		LegalName:     &newName,
+		CorrelationID: "corr-actor-test",
+	}
+
+	_, err := svc.UpdateEntity(ctx, envelopeJWT, entityID, req)
+	require.NoError(t, err)
+
+	// The store must have received the real principal_id, not "system".
+	assert.Equal(t, wantPrincipalID, ms.lastUpdateActor,
+		"updated_by_principal_id must be the real actor from the JWT, not the 'system' fallback")
+	assert.NotEqual(t, "system", ms.lastUpdateActor,
+		"hardcoded 'system' must not appear when a valid JWT is provided")
+}
+
+// TestUpdateEntity_FallsBackToSystem_WhenJWTAbsent confirms the documented
+// fallback: when no JWT is provided, actor is "system" and the update still
+// succeeds. This is intentional; it will be visible in audit logs as a signal
+// that the caller did not supply a JWT.
+func TestUpdateEntity_FallsBackToSystem_WhenJWTAbsent(t *testing.T) {
+	svc, ms := baseSvc(t)
+	ctx := context.Background()
+
+	entityID := "ent-no-jwt"
+	ms.entities[entityID] = &domain.LegalEntity{
+		LegalEntityID: entityID,
+		TenantID:      "ten-001",
+		LegalName:     "Name",
+		EntityStatus:  domain.EntityStatusActive,
+	}
+
+	newName := "Changed"
+	req := domain.UpdateEntityRequest{LegalName: &newName, CorrelationID: "corr-nojwt"}
+
+	_, err := svc.UpdateEntity(ctx, "" /* no JWT */, entityID, req)
+	require.NoError(t, err)
+	assert.Equal(t, "system", ms.lastUpdateActor,
+		"when JWT is absent, actor must be 'system' (visible in audit logs as a wiring signal)")
 }

@@ -309,7 +309,7 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 		now := time.Now().UTC()
 		return tx.QueryRow(ctx, query,
 			req.LegalName, req.TradingName, req.DefaultCurrencyCode,
-			now, "system", // actorID surfaced here would require passing it in req; accepted limitation
+			now, req.ActorPrincipalID,
 			legalEntityID,
 		).Scan(
 			&updated.LegalEntityID, &updated.TenantID, &updated.EntityCode,
