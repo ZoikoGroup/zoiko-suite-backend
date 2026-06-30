@@ -191,6 +191,10 @@ type UpdateEntityRequest struct {
 	TradingName         *string `json:"trading_name,omitempty"`
 	DefaultCurrencyCode *string `json:"default_currency_code,omitempty"`
 	CorrelationID       string  `json:"correlation_id"`
+	// ActorPrincipalID is populated server-side from the envelope JWT by the
+	// service layer before passing to the store. It is never accepted from the
+	// HTTP request body (json:"-") to prevent client-side privilege injection.
+	ActorPrincipalID    string  `json:"-"`
 }
 
 type TransitionEntityStatusRequest struct {

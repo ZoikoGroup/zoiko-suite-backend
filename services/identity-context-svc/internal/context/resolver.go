@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -45,15 +46,22 @@ var (
 //  4. Partial envelopes are PROHIBITED. All six dimensions must resolve or
 //     the service fails closed. Never return a zero-value envelope.
 type Resolver struct {
-	cfg          *config.Config
-	log          *zap.Logger
-	principals   PrincipalStore
-	sessions     SessionCache
-	riskSignals  RiskSignalCache
-	upstream     UpstreamRegistry
-	events       EventPublisher
-	verifier     TokenVerifier
-	signer       EnvelopeSigner
+	cfg         *config.Config
+	log         *zap.Logger
+	// wg tracks all in-flight fire-and-forget event publish goroutines.
+	// Drain() blocks until every goroutine completes, allowing main.go to
+	// call it after srv.Shutdown() for a clean graceful shutdown.
+	// Gap 2 follow-up: add a context-aware bounded drain (see linked issue)
+	// so the process is not fully dependent on orchestrator SIGKILL if a
+	// goroutine truly hangs.
+	wg          sync.WaitGroup
+	principals  PrincipalStore
+	sessions    SessionCache
+	riskSignals RiskSignalCache
+	upstream    UpstreamRegistry
+	events      EventPublisher
+	verifier    TokenVerifier
+	signer      EnvelopeSigner
 }
 
 // NewResolver constructs a Resolver with all required dependencies injected.
@@ -81,6 +89,18 @@ func NewResolver(
 	}
 }
 
+// Drain blocks until all in-flight event publish goroutines have completed.
+// Call this after srv.Shutdown() returns during graceful shutdown to avoid
+// losing events mid-flight on SIGTERM.
+//
+// NOTE: Drain is unbounded — it blocks indefinitely if a goroutine hangs.
+// A context-aware bounded drain with a configurable timeout is tracked as a
+// follow-up (see linked GitHub issue) so the process is not fully dependent
+// on the orchestrator's SIGKILL grace period in pathological cases.
+func (r *Resolver) Drain() {
+	r.wg.Wait()
+}
+
 // Resolve assembles and signs the IdentityContextEnvelope from all six dimensions.
 // Any single dimension failure causes a fail-closed rejection:
 //   - Dimension failures (invalid token, inactive principal/tenant/entity) → ErrXxx (→ 401)
@@ -97,7 +117,9 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	// ── Dimension 1: Verify inbound token → authenticated principal ─────────
 	claims, err := r.verifyToken(ctx, req)
 	if err != nil {
+		r.wg.Add(1)
 		go func() {
+			defer r.wg.Done()
 			if err := r.events.PublishResolutionFailed(ctx, "unknown", req.CorrelationID, "token_invalid"); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "identity.context.resolution_failed"),
@@ -111,7 +133,9 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 
 	principal, err := r.principals.FindByIDPSubject(ctx, claims.Subject, claims.TenantID)
 	if err != nil || principal == nil || principal.Status != domain.PrincipalStatusActive {
+		r.wg.Add(1)
 		go func() {
+			defer r.wg.Done()
 			if err := r.events.PublishResolutionFailed(ctx, claims.Subject, req.CorrelationID, "principal_inactive_or_not_found"); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "identity.context.resolution_failed"),
@@ -160,7 +184,9 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		return "", err
 	}
 	if posture == domain.TrustPostureBlocked {
+		r.wg.Add(1)
 		go func() {
+			defer r.wg.Done()
 			if err := r.events.PublishResolutionFailed(ctx, principal.PrincipalID, req.CorrelationID, "trust_posture_blocked"); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "identity.context.resolution_failed"),
@@ -266,7 +292,9 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	}
 
 	// Publish evidence event (non-blocking)
+	r.wg.Add(1)
 	go func() {
+		defer r.wg.Done()
 		if err := r.events.PublishContextResolved(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, sessionContextID, req.CorrelationID); err != nil {
 			r.log.Error("event publish failed",
 				zap.String("event_type", "identity.context.resolved"),
@@ -317,7 +345,9 @@ func (r *Resolver) InvalidateSession(
 		r.log.Warn("failed to evict session JWT from cache", zap.String("session_context_id", sessionContextID), zap.Error(err))
 	}
 
+	r.wg.Add(1)
 	go func() {
+		defer r.wg.Done()
 		if err := r.events.PublishSessionInvalidated(ctx, sessionContextID, existing.PrincipalID, reason, correlationID); err != nil {
 			r.log.Error("event publish failed",
 				zap.String("event_type", "session.invalidated"),
@@ -399,7 +429,9 @@ func (r *Resolver) resolveTrustPosture(
 			zap.String("principal_id", principalID),
 			zap.String("correlation_id", correlationID),
 		)
+		r.wg.Add(1)
 		go func() {
+			defer r.wg.Done()
 			if err := r.events.PublishRiskSignalUnavailable(ctx, principalID, correlationID); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "session.risk.changed"),

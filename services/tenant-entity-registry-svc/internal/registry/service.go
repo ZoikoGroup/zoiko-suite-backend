@@ -228,6 +228,11 @@ func (s *Service) UpdateEntity(
 		return nil, err
 	}
 
+	// Populate audit actor from the verified envelope JWT.
+	// actorFromJWT performs payload-only decoding — signature is already
+	// verified by the Authorization Service before this service is called.
+	req.ActorPrincipalID = actorFromJWT(envelopeJWT)
+
 	e, err := s.store.UpdateEntity(ctx, legalEntityID, req)
 	if err != nil {
 		return nil, fmt.Errorf("store.UpdateEntity: %w", err)
