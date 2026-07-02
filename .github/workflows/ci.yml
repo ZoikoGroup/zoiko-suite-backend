@@ -79,7 +79,7 @@ jobs:
         run: |
           pkgs=$(go list ./... 2>/dev/null | tr '\n' ' ')
           if [ -n "$pkgs" ]; then
-            go test -race -count=1 -timeout=120s $pkgs
+            go test -race -v -count=1 -timeout=120s $pkgs
           else
             echo "No packages to test"
           fi
