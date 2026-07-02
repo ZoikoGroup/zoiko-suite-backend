@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -24,6 +25,8 @@ type stubStore struct {
 	jurisdiction  *domain.Jurisdiction
 	jurisdictions []*domain.Jurisdiction
 	ancestors     []*domain.Jurisdiction
+	rules         []*domain.JurisdictionRule
+	rulesErr      error
 	err           error
 }
 
@@ -37,6 +40,62 @@ func (s *stubStore) List(_ context.Context, _ store.ListParams) ([]*domain.Juris
 
 func (s *stubStore) FindAncestors(_ context.Context, _ string) ([]*domain.Jurisdiction, error) {
 	return s.ancestors, s.err
+}
+
+func (s *stubStore) FindRules(_ context.Context, params store.FindRulesParams) ([]*domain.JurisdictionRule, error) {
+	if s.rulesErr != nil {
+		return nil, s.rulesErr
+	}
+	var filtered []*domain.JurisdictionRule
+	effectiveAt := params.EffectiveAt
+	if effectiveAt.IsZero() {
+		effectiveAt = time.Now().UTC()
+	}
+	for _, rule := range s.rules {
+		if rule.JurisdictionID != params.JurisdictionID {
+			continue
+		}
+		if params.Domain != "" && rule.RuleDomain != params.Domain {
+			continue
+		}
+		if rule.RuleStatus == "DRAFT" {
+			continue
+		}
+		if rule.EffectiveFrom.After(effectiveAt) {
+			continue
+		}
+		if rule.EffectiveTo != nil && !rule.EffectiveTo.After(effectiveAt) {
+			continue
+		}
+		filtered = append(filtered, rule)
+	}
+	// Sort by RuleDomain asc, EffectiveFrom asc
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].RuleDomain != filtered[j].RuleDomain {
+			return filtered[i].RuleDomain < filtered[j].RuleDomain
+		}
+		return filtered[i].EffectiveFrom.Before(filtered[j].EffectiveFrom)
+	})
+	// Apply limit and offset
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := params.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(filtered) {
+		offset = len(filtered)
+	}
+	end := offset + limit
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[offset:end], nil
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -362,5 +421,97 @@ func TestGetAncestors_503_StoreUnavailable(t *testing.T) {
 	if body["error"] != "store_unavailable" {
 		t.Errorf("expected error=store_unavailable, got %q", body["error"])
 	}
+}
+
+
+// TestFindRules_SupersededRuleReturnedForHistoricalQuery verifies that when querying
+// for a point-in-time where a SUPERSEDED rule is active, it is returned (and not the
+// later ACTIVE rule).
+func TestFindRules_SupersededRuleReturnedForHistoricalQuery(t *testing.T) {
+    // Arrange: two rules for the same jurisdiction and domain.
+    // Rule1: SUPERSEDED, active 2024-01-01 to 2025-01-01
+    // Rule2: ACTIVE, active 2025-01-01 onward (no end date)
+    // Query effective_at: 2024-06-01 (should return Rule1 only)
+
+    // Helper to create a JurisdictionRule with given fields.
+    makeRule := func(id, status string, start, end time.Time, payload map[string]any) *domain.JurisdictionRule {
+        pBytes, _ := json.Marshal(payload)
+        return &domain.JurisdictionRule{
+            JurisdictionRuleID: id,
+            JurisdictionID:     "test-jurisdiction-id",
+            RuleDomain:         "TAX",
+            RuleCode:           "RATE",
+            RuleName:           "Tax Rate",
+            EffectiveFrom:      start,
+            EffectiveTo:        func(t time.Time) *time.Time { if t.IsZero() { return nil }; return &t }(end),
+            RulePayload:        json.RawMessage(pBytes),
+            RuleStatus:         status,
+            LegalDriftState:    "CURRENT",
+            CreatedAt:          time.Now().UTC(),
+            CreatedByPrincipalID: "principal-test",
+            SchemaVersion:      "1.0",
+        }
+    }
+
+    // Define times
+    start1 := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+    end1   := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+    start2 := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+    // end2 is zero (meaning nil)
+
+    ruleSuperseded := makeRule(
+        "rule-superseded",
+        "SUPERSEDED",
+        start1,
+        end1,
+        map[string]any{"rate": 0.20},
+    )
+    ruleActive := makeRule(
+        "rule-active",
+        "ACTIVE",
+        start2,
+        time.Time{}, // zero time indicates no end date
+        map[string]any{"rate": 0.25},
+    )
+
+    store := &stubStore{
+        rules: []*domain.JurisdictionRule{ruleSuperseded, ruleActive},
+    }
+
+    h := newTestRouter(store)
+    // Build the request with query parameters
+    req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/test-jurisdiction-id/rules?domain=TAX&effective_at=2024-06-01T00:00:00Z", nil)
+    req.Header.Set("X-Correlation-ID", "corr-test")
+
+    rr := executeRequest(h, req)
+
+    // Assert
+    if rr.Code != http.StatusOK {
+        t.Fatalf("expected 200 OK, got %d - body: %s", rr.Code, rr.Body.String())
+    }
+
+    var rules []domain.JurisdictionRule
+    if err := json.NewDecoder(rr.Body).Decode(&rules); err != nil {
+        t.Fatalf("failed to decode response body: %v", err)
+    }
+
+    if len(rules) != 1 {
+        t.Fatalf("expected 1 rule, got %d", len(rules))
+    }
+
+    got := rules[0]
+    if got.JurisdictionRuleID != "rule-superseded" {
+        t.Errorf("expected rule ID 'rule-superseded', got %s", got.JurisdictionRuleID)
+    }
+    if got.RuleStatus != "SUPERSEDED" {
+        t.Errorf("expected rule status 'SUPERSEDED', got %s", got.RuleStatus)
+    }
+    // Additionally, ensure the effective dates are as expected
+    if !got.EffectiveFrom.Equal(start1) {
+        t.Errorf("expected effective_from %v, got %v", start1, got.EffectiveFrom)
+    }
+    if !(*got.EffectiveTo).Equal(end1) {
+        t.Errorf("expected effective_to %v, got %v", end1, *got.EffectiveTo)
+    }
 }
 
