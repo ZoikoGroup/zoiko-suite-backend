@@ -6,7 +6,10 @@
 // (per .agents/rules/doctrine.md and OQ-3 approval).
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Jurisdiction is the authoritative registry entry for a jurisdiction.
 // Jurisdictions nest via ParentJurisdictionID (country → state → tax authority).
@@ -69,8 +72,9 @@ type JurisdictionRule struct {
 	EffectiveTo   *time.Time `json:"effective_to"`
 
 	// RulePayload — applicability metadata ONLY (OQ-1 Model B).
-	// Stored as raw JSON; callers decode against schema_version.
-	RulePayload []byte `json:"rule_payload"`
+	// json.RawMessage so the payload is inlined in API responses as JSON,
+	// not base64-encoded bytes. Callers decode against schema_version.
+	RulePayload json.RawMessage `json:"rule_payload"`
 
 	SourceReference       *string `json:"source_reference"`
 	ExternalFeedReference *string `json:"external_feed_reference"`

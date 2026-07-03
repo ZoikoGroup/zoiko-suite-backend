@@ -51,13 +51,13 @@ CREATE TABLE jurisdictions (
     -- Audit
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_by_principal_id TEXT        NOT NULL,
-    schema_version          VARCHAR(16) NOT NULL DEFAULT '1.0',
-
-    -- Idempotent creation key: same code + type + parent = same jurisdiction.
-    -- NULL parent is included via COALESCE so the constraint works correctly.
-    CONSTRAINT jurisdictions_code_type_parent_unique
-        UNIQUE (jurisdiction_code, jurisdiction_type, COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID))
+    schema_version          VARCHAR(16) NOT NULL DEFAULT '1.0'
 );
+
+-- Idempotent creation key: same code + type + parent = same jurisdiction.
+-- NULL parent is included via COALESCE so the constraint works correctly.
+CREATE UNIQUE INDEX idx_jurisdictions_code_type_parent_unique
+    ON jurisdictions (jurisdiction_code, jurisdiction_type, COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID));
 
 -- Lookup by code (callers resolving by human code)
 CREATE INDEX idx_jurisdictions_code      ON jurisdictions (jurisdiction_code);
