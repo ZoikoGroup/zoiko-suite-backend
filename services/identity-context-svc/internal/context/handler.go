@@ -9,8 +9,8 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
-	"zoiko.io/identity-context-svc/internal/principal"
 	"zoiko.io/identity-context-svc/internal/session"
+	"zoiko.io/identity-context-svc/internal/store"
 )
 
 // Handler exposes the eight inbound REST endpoints defined in openapi.yaml.
@@ -197,6 +197,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // Ensure the interfaces defined in interfaces.go are satisfied at compile time.
 // The concrete implementations live in their own packages.
-var _ PrincipalStore = (*principal.Repository)(nil)
+var _ PrincipalStore = (*store.PgStore)(nil)
 var _ SessionCache = (*session.Cache)(nil)
 var _ RiskSignalCache = (*session.RiskSignalCache)(nil)
