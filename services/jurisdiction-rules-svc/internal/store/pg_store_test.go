@@ -43,7 +43,16 @@ func TestPgStore_FindRules_Integration(t *testing.T) {
 	// Drop tables if existing for clean state
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
 	if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
-		t.Fatalf("failed to execute migration: %v", err)
+		t.Fatalf("failed to execute migration 1: %v", err)
+	}
+
+	migPath2 := filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000002_add_audit_columns.up.sql")
+	migSQL2, err := os.ReadFile(migPath2)
+	if err != nil {
+		t.Fatalf("failed to read migration file %s: %v", migPath2, err)
+	}
+	if _, err := pool.Exec(ctx, string(migSQL2)); err != nil {
+		t.Fatalf("failed to execute migration 2: %v", err)
 	}
 
 	logger := zap.NewNop()

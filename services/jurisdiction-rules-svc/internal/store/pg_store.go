@@ -1,17 +1,19 @@
 // Package store provides the PostgreSQL implementation of the jurisdiction
-// rules read model.
+// rules read and write model.
 //
 // This package is the ONLY layer that touches the database directly.
 // No SQL appears in handlers, service, or domain packages.
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -56,31 +58,35 @@ type FindRulesParams struct {
 	Offset int
 }
 
-// Store is the interface consumed by the handler.
+// Store is the interface consumed by the handler for validation, queries, and admin mutations.
 type Store interface {
 	// FindByID returns the Jurisdiction with the given jurisdiction_id.
-	// Returns domain.ErrJurisdictionNotFound if no active record exists.
-	// Returns domain.ErrStoreUnavailable on any DB error.
 	FindByID(ctx context.Context, jurisdictionID string) (*domain.Jurisdiction, error)
 
 	// List returns a paginated slice of jurisdictions matching params.
-	// Returns domain.ErrStoreUnavailable on any DB error.
 	List(ctx context.Context, params ListParams) ([]*domain.Jurisdiction, error)
 
 	// FindAncestors walks the parent chain starting from jurisdictionID and
 	// returns the ordered slice from immediate parent up to the root.
-	// The input jurisdiction itself is NOT included in the result.
-	// Returns an empty slice (not an error) if jurisdictionID has no parent.
-	// Returns domain.ErrJurisdictionNotFound if jurisdictionID itself does not exist.
-	// Returns domain.ErrStoreUnavailable on any DB error.
 	FindAncestors(ctx context.Context, jurisdictionID string) ([]*domain.Jurisdiction, error)
 
 	// FindRules returns jurisdiction rules active at the given point in time.
-	// Uses half-open interval: effective_from <= at AND (effective_to IS NULL OR effective_to > at).
-	// DRAFT rules are excluded; SUPERSEDED rules ARE included for historical queries.
-	// Returns domain.ErrJurisdictionNotFound if jurisdictionID does not exist.
-	// Returns domain.ErrStoreUnavailable on any DB error.
 	FindRules(ctx context.Context, params FindRulesParams) ([]*domain.JurisdictionRule, error)
+
+	// CreateJurisdiction inserts a new jurisdiction idempotently.
+	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
+
+	// DeactivateJurisdiction sets active_flag=false and updates audit columns.
+	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
+
+	// FindRuleByID looks up a rule by ID.
+	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
+
+	// CreateRule inserts a new rule idempotently.
+	CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
+
+	// TransitionRuleStatus atomically updates rule_status if current status is in allowedPriors.
+	TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -92,63 +98,6 @@ type PgStore struct {
 // New returns an open PgStore. Caller must call pool.Close() when done.
 func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
-}
-
-// FindByID looks up a jurisdiction by its UUID primary key.
-//
-// Contract (matching HTTPJurisdictionValidator in tenant-entity-registry-svc):
-//   - Returns *Jurisdiction if jurisdiction_id exists AND active_flag = true
-//     AND (effective_to IS NULL OR effective_to > NOW()).
-//   - Returns domain.ErrJurisdictionNotFound if not found or inactive.
-//   - Returns domain.ErrStoreUnavailable on any database error.
-func (s *PgStore) FindByID(ctx context.Context, jurisdictionID string) (*domain.Jurisdiction, error) {
-	const query = `
-		SELECT
-			jurisdiction_id,
-			jurisdiction_code,
-			jurisdiction_name,
-			jurisdiction_type,
-			parent_jurisdiction_id,
-			authority_type,
-			effective_from,
-			effective_to,
-			active_flag,
-			created_at,
-			created_by_principal_id,
-			schema_version
-		FROM jurisdictions
-		WHERE jurisdiction_id    = $1
-		  AND active_flag        = TRUE
-		  AND (effective_to IS NULL OR effective_to > NOW())`
-
-	row := s.pool.QueryRow(ctx, query, jurisdictionID)
-
-	j := &domain.Jurisdiction{}
-	err := row.Scan(
-		&j.JurisdictionID,
-		&j.JurisdictionCode,
-		&j.JurisdictionName,
-		&j.JurisdictionType,
-		&j.ParentJurisdictionID,
-		&j.AuthorityType,
-		&j.EffectiveFrom,
-		&j.EffectiveTo,
-		&j.ActiveFlag,
-		&j.CreatedAt,
-		&j.CreatedByPrincipalID,
-		&j.SchemaVersion,
-	)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrJurisdictionNotFound
-		}
-		s.log.Error("pg FindByID failed",
-			zap.String("jurisdiction_id", jurisdictionID),
-			zap.Error(err),
-		)
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return j, nil
 }
 
 // jurisdictionColumns is the standard SELECT column list shared by all queries.
@@ -165,7 +114,9 @@ const jurisdictionColumns = `
 	active_flag,
 	created_at,
 	created_by_principal_id,
-	schema_version`
+	schema_version,
+	updated_at,
+	updated_by_principal_id`
 
 // scanJurisdiction scans one row produced by a jurisdictionColumns SELECT.
 func scanJurisdiction(row pgx.Row) (*domain.Jurisdiction, error) {
@@ -183,13 +134,118 @@ func scanJurisdiction(row pgx.Row) (*domain.Jurisdiction, error) {
 		&j.CreatedAt,
 		&j.CreatedByPrincipalID,
 		&j.SchemaVersion,
+		&j.UpdatedAt,
+		&j.UpdatedByPrincipalID,
 	)
 	return j, err
 }
 
+// FindByID looks up a jurisdiction by its UUID primary key.
+func (s *PgStore) FindByID(ctx context.Context, jurisdictionID string) (*domain.Jurisdiction, error) {
+	const query = `
+		SELECT ` + jurisdictionColumns + `
+		FROM jurisdictions
+		WHERE jurisdiction_id    = $1
+		  AND active_flag        = TRUE
+		  AND (effective_to IS NULL OR effective_to > NOW())`
+
+	row := s.pool.QueryRow(ctx, query, jurisdictionID)
+	j, err := scanJurisdiction(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrJurisdictionNotFound
+		}
+		s.log.Error("pg FindByID failed",
+			zap.String("jurisdiction_id", jurisdictionID),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return j, nil
+}
+
+// CreateJurisdiction inserts a new jurisdiction or returns existing on dedup match.
+func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
+	if params.JurisdictionID == "" {
+		params.JurisdictionID = uuid.New().String()
+	}
+	if params.SchemaVersion == "" {
+		params.SchemaVersion = "1.0"
+	}
+
+	const query = `
+		INSERT INTO jurisdictions (
+			jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type,
+			parent_jurisdiction_id, authority_type, effective_from, effective_to,
+			active_flag, created_by_principal_id, schema_version
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (jurisdiction_code, jurisdiction_type, COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID))
+		DO NOTHING
+		RETURNING ` + jurisdictionColumns + `;`
+
+	row := s.pool.QueryRow(ctx, query,
+		params.JurisdictionID, params.JurisdictionCode, params.JurisdictionName, params.JurisdictionType,
+		params.ParentJurisdictionID, params.AuthorityType, params.EffectiveFrom, params.EffectiveTo,
+		params.ActiveFlag, params.CreatedByPrincipalID, params.SchemaVersion,
+	)
+
+	j, err := scanJurisdiction(row)
+	if err == nil {
+		return j, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		s.log.Error("pg CreateJurisdiction failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	// Conflict occurred on (jurisdiction_code, jurisdiction_type, parent_jurisdiction_id). Lookup existing record.
+	const lookupQuery = `
+		SELECT ` + jurisdictionColumns + `
+		FROM jurisdictions
+		WHERE jurisdiction_code = $1
+		  AND jurisdiction_type = $2
+		  AND COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID) = COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::UUID);`
+
+	row = s.pool.QueryRow(ctx, lookupQuery, params.JurisdictionCode, params.JurisdictionType, params.ParentJurisdictionID)
+	j, err = scanJurisdiction(row)
+	if err != nil {
+		s.log.Error("pg CreateJurisdiction lookup existing failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	if j.JurisdictionName != params.JurisdictionName || j.AuthorityType != params.AuthorityType {
+		s.log.Warn("jurisdiction dedup match but attribute mismatch (409 conflict)",
+			zap.String("existing_id", j.JurisdictionID),
+			zap.String("req_id", params.JurisdictionID),
+		)
+		return nil, false, domain.ErrConflict
+	}
+
+	return j, false, nil
+}
+
+// DeactivateJurisdiction sets active_flag=false on an existing jurisdiction.
+func (s *PgStore) DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error) {
+	const query = `
+		UPDATE jurisdictions
+		SET active_flag = FALSE, updated_at = NOW(), updated_by_principal_id = $2
+		WHERE jurisdiction_id = $1
+		RETURNING ` + jurisdictionColumns + `;`
+
+	row := s.pool.QueryRow(ctx, query, jurisdictionID, actorID)
+	j, err := scanJurisdiction(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrJurisdictionNotFound
+		}
+		s.log.Error("pg DeactivateJurisdiction failed", zap.String("id", jurisdictionID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return j, nil
+}
+
 // List returns a paginated, optionally-filtered slice of jurisdictions.
-// Filters are applied via safe positional parameters — no string interpolation
-// of user-supplied values.
 func (s *PgStore) List(ctx context.Context, params ListParams) ([]*domain.Jurisdiction, error) {
 	limit := params.Limit
 	if limit <= 0 {
@@ -253,18 +309,12 @@ func (s *PgStore) List(ctx context.Context, params ListParams) ([]*domain.Jurisd
 	return results, nil
 }
 
-// maxAncestorDepth caps the parent-chain walk to prevent runaway on malformed
-// data. No real jurisdiction hierarchy exceeds ~5 levels.
 const maxAncestorDepth = 20
 
 // FindAncestors walks the parent chain of jurisdictionID iteratively.
-// Returns ancestors ordered from immediate parent to root.
-// The start jurisdiction itself is NOT included.
-// Returns empty slice (not error) when jurisdictionID has no parent.
 func (s *PgStore) FindAncestors(ctx context.Context, jurisdictionID string) ([]*domain.Jurisdiction, error) {
-	const query = `SELECT` + jurisdictionColumns + `FROM jurisdictions WHERE jurisdiction_id = $1`
+	const query = `SELECT ` + jurisdictionColumns + ` FROM jurisdictions WHERE jurisdiction_id = $1`
 
-	// Confirm starting jurisdiction exists.
 	start, err := scanJurisdiction(s.pool.QueryRow(ctx, query, jurisdictionID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -284,7 +334,6 @@ func (s *PgStore) FindAncestors(ctx context.Context, jurisdictionID string) ([]*
 		ancestor, scanErr := scanJurisdiction(s.pool.QueryRow(ctx, query, *currentParentID))
 		if scanErr != nil {
 			if errors.Is(scanErr, pgx.ErrNoRows) {
-				// Dangling FK — stop walk, return what we have.
 				s.log.Warn("pg FindAncestors: dangling parent reference",
 					zap.String("parent_jurisdiction_id", *currentParentID),
 				)
@@ -320,7 +369,9 @@ const ruleColumns = `
 	legal_drift_state,
 	created_at,
 	created_by_principal_id,
-	schema_version`
+	schema_version,
+	updated_at,
+	updated_by_principal_id`
 
 // scanJurisdictionRule scans one row produced by a ruleColumns SELECT.
 func scanJurisdictionRule(row pgx.Row) (*domain.JurisdictionRule, error) {
@@ -341,30 +392,130 @@ func scanJurisdictionRule(row pgx.Row) (*domain.JurisdictionRule, error) {
 		&r.CreatedAt,
 		&r.CreatedByPrincipalID,
 		&r.SchemaVersion,
+		&r.UpdatedAt,
+		&r.UpdatedByPrincipalID,
 	)
 	return r, err
 }
 
-// FindRules returns rules for a jurisdiction active at a point in time.
-//
-// Boundary contract (approved 2026-07-01):
-//
-//	Inclusion : effective_from <= at   (rule had started by at — inclusive)
-//	Exclusion : effective_to   > at    (rule had NOT yet ended at at — exclusive)
-//	DRAFT excluded always; SUPERSEDED included for historical at queries.
-//
-// $2 domain filter: Go string("") → SQL '' → ($2='' OR rule_domain=$2) is TRUE
-// → all domains returned. This cannot become NULL because r.URL.Query().Get()
-// returns "" not nil, and pgx maps Go string to SQL text, never NULL.
-func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*domain.JurisdictionRule, error) {
-	// Validate jurisdiction exists first — distinguishes "no rules" (200 [])
-	// from "unknown jurisdiction" (404).
-	_, err := s.FindByID(ctx, params.JurisdictionID)
+// FindRuleByID looks up a rule by ID without active status checks.
+func (s *PgStore) FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error) {
+	const query = `
+		SELECT ` + ruleColumns + `
+		FROM jurisdiction_rules
+		WHERE jurisdiction_rule_id = $1;`
+
+	row := s.pool.QueryRow(ctx, query, ruleID)
+	r, err := scanJurisdictionRule(row)
 	if err != nil {
-		return nil, err // propagates ErrJurisdictionNotFound or ErrStoreUnavailable
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrRuleNotFound
+		}
+		s.log.Error("pg FindRuleByID failed", zap.String("id", ruleID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
+}
+
+// CreateRule inserts a new rule idempotently.
+func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error) {
+	if params.JurisdictionRuleID == "" {
+		params.JurisdictionRuleID = uuid.New().String()
+	}
+	if params.SchemaVersion == "" {
+		params.SchemaVersion = "1.0"
+	}
+	if params.LegalDriftState == "" {
+		params.LegalDriftState = "CURRENT"
 	}
 
-	// Default effective_at to now when caller omits it.
+	const query = `
+		INSERT INTO jurisdiction_rules (
+			jurisdiction_rule_id, jurisdiction_id, rule_domain, rule_code, rule_name,
+			effective_from, effective_to, rule_payload, source_reference, rule_status,
+			external_feed_reference, legal_drift_state, created_by_principal_id, schema_version
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		ON CONFLICT (jurisdiction_id, rule_code, effective_from)
+		DO NOTHING
+		RETURNING ` + ruleColumns + `;`
+
+	row := s.pool.QueryRow(ctx, query,
+		params.JurisdictionRuleID, params.JurisdictionID, params.RuleDomain, params.RuleCode, params.RuleName,
+		params.EffectiveFrom, params.EffectiveTo, params.RulePayload, params.SourceReference, params.RuleStatus,
+		params.ExternalFeedReference, params.LegalDriftState, params.CreatedByPrincipalID, params.SchemaVersion,
+	)
+
+	r, err := scanJurisdictionRule(row)
+	if err == nil {
+		return r, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		s.log.Error("pg CreateRule failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	// Conflict occurred on (jurisdiction_id, rule_code, effective_from). Lookup existing record.
+	const lookupQuery = `
+		SELECT ` + ruleColumns + `
+		FROM jurisdiction_rules
+		WHERE jurisdiction_id = $1
+		  AND rule_code = $2
+		  AND effective_from = $3;`
+
+	row = s.pool.QueryRow(ctx, lookupQuery, params.JurisdictionID, params.RuleCode, params.EffectiveFrom)
+	r, err = scanJurisdictionRule(row)
+	if err != nil {
+		s.log.Error("pg CreateRule lookup existing failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	if !bytes.Equal(r.RulePayload, params.RulePayload) || r.RuleName != params.RuleName {
+		s.log.Warn("rule dedup match but payload/name mismatch (409 conflict)",
+			zap.String("existing_id", r.JurisdictionRuleID),
+			zap.String("req_id", params.JurisdictionRuleID),
+		)
+		return nil, false, domain.ErrConflict
+	}
+
+	return r, false, nil
+}
+
+// TransitionRuleStatus updates rule_status atomically with a state machine check and pre-read retry no-op check.
+func (s *PgStore) TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, error) {
+	current, err := s.FindRuleByID(ctx, ruleID)
+	if err != nil {
+		return nil, err
+	}
+	if current.RuleStatus == newStatus {
+		s.log.Debug("rule status transition idempotent no-op", zap.String("rule_id", ruleID), zap.String("status", newStatus))
+		return current, nil
+	}
+
+	const query = `
+		UPDATE jurisdiction_rules
+		SET rule_status = $1, updated_at = NOW(), updated_by_principal_id = $2
+		WHERE jurisdiction_rule_id = $3 AND rule_status = ANY($4::text[])
+		RETURNING ` + ruleColumns + `;`
+
+	row := s.pool.QueryRow(ctx, query, newStatus, actorID, ruleID, allowedPriors)
+	r, err := scanJurisdictionRule(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrInvalidTransition
+		}
+		s.log.Error("pg TransitionRuleStatus failed", zap.String("id", ruleID), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
+}
+
+// FindRules returns rules for a jurisdiction active at a point in time.
+func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*domain.JurisdictionRule, error) {
+	_, err := s.FindByID(ctx, params.JurisdictionID)
+	if err != nil {
+		return nil, err
+	}
+
 	at := params.EffectiveAt
 	if at.IsZero() {
 		at = time.Now().UTC()
@@ -390,11 +541,11 @@ func (s *PgStore) FindRules(ctx context.Context, params FindRulesParams) ([]*dom
 		LIMIT  $4 OFFSET $5`
 
 	rows, err := s.pool.Query(ctx, query,
-		params.JurisdictionID, // $1
-		params.Domain,         // $2 — "" when omitted; pgx → SQL '', not NULL
-		at,                    // $3
-		limit,                 // $4
-		params.Offset,         // $5
+		params.JurisdictionID,
+		params.Domain,
+		at,
+		limit,
+		params.Offset,
 	)
 	if err != nil {
 		s.log.Error("pg FindRules failed",

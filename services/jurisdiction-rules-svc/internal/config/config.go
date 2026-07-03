@@ -7,6 +7,7 @@ import (
 
 // Config holds all runtime configuration for jurisdiction-rules-svc.
 type Config struct {
+	Env  string
 	Port int
 
 	DB DBConfig
@@ -39,6 +40,7 @@ func (d DBConfig) DSN() string {
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
 	return &Config{
+		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8082),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),

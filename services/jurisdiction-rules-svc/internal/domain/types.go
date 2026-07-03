@@ -40,9 +40,11 @@ type Jurisdiction struct {
 
 	ActiveFlag bool `json:"active_flag"`
 
-	CreatedAt             time.Time `json:"created_at"`
-	CreatedByPrincipalID  string    `json:"created_by_principal_id"`
-	SchemaVersion         string    `json:"schema_version"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	SchemaVersion        string     `json:"schema_version"`
+	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
+	UpdatedByPrincipalID *string    `json:"updated_by_principal_id,omitempty"`
 }
 
 // JurisdictionRule is an effective-dated applicability rule record.
@@ -84,15 +86,60 @@ type JurisdictionRule struct {
 	// Current value only — full transition history is in drift_events table.
 	LegalDriftState string `json:"legal_drift_state"`
 
-	CreatedAt            time.Time `json:"created_at"`
-	CreatedByPrincipalID string    `json:"created_by_principal_id"`
-	SchemaVersion        string    `json:"schema_version"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	SchemaVersion        string     `json:"schema_version"`
+	UpdatedAt            *time.Time `json:"updated_at,omitempty"`
+	UpdatedByPrincipalID *string    `json:"updated_by_principal_id,omitempty"`
+}
+
+// CreateJurisdictionParams holds input parameters for creating a jurisdiction.
+type CreateJurisdictionParams struct {
+	JurisdictionID       string     `json:"jurisdiction_id"`
+	JurisdictionCode     string     `json:"jurisdiction_code"`
+	JurisdictionName     string     `json:"jurisdiction_name"`
+	JurisdictionType     string     `json:"jurisdiction_type"`
+	ParentJurisdictionID *string    `json:"parent_jurisdiction_id"`
+	AuthorityType        string     `json:"authority_type"`
+	EffectiveFrom        time.Time  `json:"effective_from"`
+	EffectiveTo          *time.Time `json:"effective_to"`
+	ActiveFlag           bool       `json:"active_flag"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	SchemaVersion        string     `json:"schema_version"`
+}
+
+// CreateRuleParams holds input parameters for creating a rule.
+type CreateRuleParams struct {
+	JurisdictionRuleID    string     `json:"jurisdiction_rule_id"`
+	JurisdictionID        string     `json:"jurisdiction_id"`
+	RuleDomain            string     `json:"rule_domain"`
+	RuleCode              string     `json:"rule_code"`
+	RuleName              string     `json:"rule_name"`
+	EffectiveFrom         time.Time  `json:"effective_from"`
+	EffectiveTo           *time.Time `json:"effective_to"`
+	RulePayload           []byte     `json:"rule_payload"`
+	SourceReference       *string    `json:"source_reference"`
+	ExternalFeedReference *string    `json:"external_feed_reference"`
+	RuleStatus            string     `json:"rule_status"`
+	LegalDriftState       string     `json:"legal_drift_state"`
+	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
+	SchemaVersion         string     `json:"schema_version"`
 }
 
 // ErrJurisdictionNotFound is returned when the jurisdiction_id does not exist
 // or is inactive. Callers (e.g. tenant-entity-registry-svc) must reject the
 // assignment fail-closed when they receive this error.
 var ErrJurisdictionNotFound = errorString("jurisdiction not found")
+
+// ErrRuleNotFound is returned when a jurisdiction rule does not exist.
+var ErrRuleNotFound = errorString("jurisdiction rule not found")
+
+// ErrInvalidTransition is returned when a rule status transition is illegal per state machine.
+var ErrInvalidTransition = errorString("invalid rule status transition")
+
+// ErrConflict is returned when an idempotent creation request matches an existing record's dedup key
+// but has differing payload or attributes (409 Conflict).
+var ErrConflict = errorString("conflict: record already exists with differing attributes")
 
 // ErrStoreUnavailable is returned when the database cannot be reached.
 // Callers must fail-closed — treat as unavailable, not as "not found".
