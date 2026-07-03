@@ -29,8 +29,7 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS jurisdiction_rules CASCADE;")
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS jurisdictions CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
 
 	mig1, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
 	if err != nil {

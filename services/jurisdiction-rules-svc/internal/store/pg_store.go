@@ -181,7 +181,7 @@ func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJu
 		)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (jurisdiction_code, jurisdiction_type, COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID))
-		DO UPDATE SET jurisdiction_code = EXCLUDED.jurisdiction_code
+		DO NOTHING
 		RETURNING ` + jurisdictionColumns + `;`
 
 	row := s.pool.QueryRow(ctx, query,
@@ -191,13 +191,27 @@ func (s *PgStore) CreateJurisdiction(ctx context.Context, params domain.CreateJu
 	)
 
 	j, err := scanJurisdiction(row)
-	if err != nil {
+	if err == nil {
+		return j, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		s.log.Error("pg CreateJurisdiction failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if j.JurisdictionID == params.JurisdictionID {
-		return j, true, nil
+	// Conflict occurred on (jurisdiction_code, jurisdiction_type, parent_jurisdiction_id). Lookup existing record.
+	const lookupQuery = `
+		SELECT ` + jurisdictionColumns + `
+		FROM jurisdictions
+		WHERE jurisdiction_code = $1
+		  AND jurisdiction_type = $2
+		  AND COALESCE(parent_jurisdiction_id, '00000000-0000-0000-0000-000000000000'::UUID) = COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::UUID);`
+
+	row = s.pool.QueryRow(ctx, lookupQuery, params.JurisdictionCode, params.JurisdictionType, params.ParentJurisdictionID)
+	j, err = scanJurisdiction(row)
+	if err != nil {
+		s.log.Error("pg CreateJurisdiction lookup existing failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
 	if j.JurisdictionName != params.JurisdictionName || j.AuthorityType != params.AuthorityType {
@@ -422,7 +436,7 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 			external_feed_reference, legal_drift_state, created_by_principal_id, schema_version
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		ON CONFLICT (jurisdiction_id, rule_code, effective_from)
-		DO UPDATE SET rule_code = EXCLUDED.rule_code
+		DO NOTHING
 		RETURNING ` + ruleColumns + `;`
 
 	row := s.pool.QueryRow(ctx, query,
@@ -432,13 +446,27 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 	)
 
 	r, err := scanJurisdictionRule(row)
-	if err != nil {
+	if err == nil {
+		return r, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		s.log.Error("pg CreateRule failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if r.JurisdictionRuleID == params.JurisdictionRuleID {
-		return r, true, nil
+	// Conflict occurred on (jurisdiction_id, rule_code, effective_from). Lookup existing record.
+	const lookupQuery = `
+		SELECT ` + ruleColumns + `
+		FROM jurisdiction_rules
+		WHERE jurisdiction_id = $1
+		  AND rule_code = $2
+		  AND effective_from = $3;`
+
+	row = s.pool.QueryRow(ctx, lookupQuery, params.JurisdictionID, params.RuleCode, params.EffectiveFrom)
+	r, err = scanJurisdictionRule(row)
+	if err != nil {
+		s.log.Error("pg CreateRule lookup existing failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
 	if !bytes.Equal(r.RulePayload, params.RulePayload) || r.RuleName != params.RuleName {
