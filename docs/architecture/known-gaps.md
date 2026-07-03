@@ -5,7 +5,7 @@ TestFindRules_SupersededRuleReturnedForHistoricalQuery (jurisdiction-
 rules-svc) verifies stubStore's Go reimplementation of date-interval
 filtering, not the real SQL query in pg_store.go. No integration-test
 infrastructure (testcontainers-go, docker-compose, or a CI Postgres
-service container) exists anywhere in services/ or ci.yml today.
+service container) exists anywhere in backend/ or ci.yml today.
 tenant-entity-registry-svc's pg_store.go additionally has ZERO test
 coverage of any kind.
 
