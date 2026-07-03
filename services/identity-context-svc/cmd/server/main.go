@@ -15,16 +15,17 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/auth"
-	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/config"
+	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
-	"zoiko.io/identity-context-svc/internal/principal"
 	"zoiko.io/identity-context-svc/internal/session"
+	"zoiko.io/identity-context-svc/internal/store"
 	"zoiko.io/identity-context-svc/internal/upstream"
 )
 
@@ -57,10 +58,35 @@ func main() {
 		zap.String("addr", fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port)),
 	)
 
+	// ── Postgres pool ─────────────────────────────────────────────────────
+	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
+	if err != nil {
+		log.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		log.Fatal("failed to create db pool", zap.Error(err))
+	}
+	defer pool.Close()
+
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		// Tier 0 — Postgres is a hard dependency. Fail fast on startup.
+		log.Fatal("Postgres unreachable on startup — aborting", zap.Error(err))
+	}
+	log.Info("Postgres connection established", zap.String("db_name", cfg.DB.Name))
+
 	// ── Domain dependencies ───────────────────────────────────────────────
 	sessionCache := session.NewCache(rdb, cfg.Redis.SessionTTLSeconds)
 	riskCache := session.NewRiskSignalCache(rdb)
-	principalRepo := principal.NewRepository(log)
+	principalRepo := store.New(pool, log)
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic)
 	verifier := auth.NewJWTVerifier(cfg)
@@ -104,7 +130,7 @@ func main() {
 	})
 
 	// Health probe (no auth required)
-	r.Handle("/health", health.NewHandler(rdb))
+	r.Handle("/health", health.NewHandler(rdb, pool))
 
 	// Domain routes (all under /v1/)
 	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, log)

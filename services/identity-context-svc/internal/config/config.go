@@ -20,6 +20,7 @@ type Config struct {
 	JWTAudienceInternal    string
 	EnvelopeJWTTTLSeconds  int
 
+	DB    DBConfig
 	Redis RedisConfig
 	Kafka KafkaConfig
 
@@ -27,6 +28,24 @@ type Config struct {
 	TenantRegistryURL      string
 	DelegatedAuthorityURL  string
 	AccessControlURL       string
+}
+
+type DBConfig struct {
+	Host     string
+	Port     int
+	Name     string
+	User     string
+	Password string
+	SSLMode  string
+}
+
+func (d DBConfig) DSN() string {
+	return "host=" + d.Host +
+		" port=" + strconv.Itoa(d.Port) +
+		" dbname=" + d.Name +
+		" user=" + d.User +
+		" password=" + d.Password +
+		" sslmode=" + d.SSLMode
 }
 
 type RedisConfig struct {
@@ -53,6 +72,14 @@ func Load() (*Config, error) {
 		JWTIssuer:             env("JWT_ISSUER", "identity-context-svc"),
 		JWTAudienceInternal:   env("JWT_AUDIENCE", "zoiko-internal"),
 		EnvelopeJWTTTLSeconds: envInt("ENVELOPE_JWT_TTL_SECONDS", 300),
+		DB: DBConfig{
+			Host:     env("DB_HOST", "localhost"),
+			Port:     envInt("DB_PORT", 5432),
+			Name:     env("DB_NAME", "identity_context"),
+			User:     env("DB_USER", "postgres"),
+			Password: env("DB_PASSWORD", ""),
+			SSLMode:  env("DB_SSLMODE", "require"),
+		},
 		Redis: RedisConfig{
 			Host:                  env("REDIS_HOST", "localhost"),
 			Port:                  envInt("REDIS_PORT", 6379),
