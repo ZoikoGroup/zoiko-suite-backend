@@ -1,0 +1,77 @@
+# docker-compose.yml — local development stack for audit-event-store-svc
+#
+# Starts:
+#   kafka     — Kafka 3.x in KRaft mode (no ZooKeeper required).
+#               Accessible from the host at localhost:9092.
+#   postgres  — PostgreSQL 16.  DB: audit_event_store, user: postgres, pass: postgres.
+#               Accessible at localhost:5432.
+#
+# Usage:
+#   docker compose up -d          # start background
+#   docker compose logs -f        # tail logs
+#   docker compose down -v        # stop and remove volumes
+#
+# After the stack is up, run the service:
+#   DB_SSLMODE=disable DB_PASSWORD=postgres go run ./cmd/server/
+#
+# Produce a test message (requires kafkacat / kcat):
+#   kcat -P -b localhost:9092 -t zoiko.identity.events \
+#        -H "X-Event-ID=test-evt-001" \
+#        -l /path/to/test-message.json
+#
+# Check audit_events:
+#   psql "host=localhost dbname=audit_event_store user=postgres password=postgres sslmode=disable" \
+#        -c "SELECT event_id, event_type, tenant_id, stored_at FROM audit_events ORDER BY stored_at;"
+
+services:
+  kafka:
+    image: bitnami/kafka:3.7
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode — no ZooKeeper.
+      KAFKA_CFG_NODE_ID: "1"
+      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+
+      # Listener config: PLAINTEXT for host access, INTERNAL for container-to-container.
+      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093"
+      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+
+      # Auto-create topics (convenience for local dev).
+      # TODO (production): set to false and pre-create topics with replication factor >= 3.
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_NUM_PARTITIONS: "1"
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: audit_event_store
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      # Mount the migration so the schema is applied automatically on first boot.
+      - ./migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d audit_event_store"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
