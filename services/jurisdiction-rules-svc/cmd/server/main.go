@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
@@ -82,6 +83,14 @@ func main() {
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 
+	// AuthZ client. Fails fast at startup if ENV is production/staging and
+	// AuthZServiceURL is still empty or the dev placeholder — no domain
+	// service may silently fall back to a permit-all stub in production.
+	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+	if err != nil {
+		log.Fatal("authz client construction failed", zap.Error(err))
+	}
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -90,7 +99,7 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, log)
+	h := handler.New(pgStore, authzClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes ──────────────────────────────────────────────────────
