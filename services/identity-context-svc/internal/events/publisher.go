@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
@@ -39,13 +40,13 @@ type envelope struct {
 //
 // Events are facts, not commands. Published topics are append-only.
 type Publisher struct {
-	log   *zap.Logger
-	topic string
-	// producer *kafka.Writer  — TODO: inject kafka.Writer before Phase 1 exit criteria
+	log      *zap.Logger
+	topic    string
+	producer *kafka.Writer
 }
 
-func NewPublisher(log *zap.Logger, topic string) *Publisher {
-	return &Publisher{log: log, topic: topic}
+func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publisher {
+	return &Publisher{log: log, topic: topic, producer: producer}
 }
 
 func (p *Publisher) PublishContextResolved(
@@ -130,15 +131,16 @@ func (p *Publisher) emit(eventType string, payload map[string]any) error {
 		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
 	}
 
-	// TODO: publish to Kafka
-	// msg := kafka.Message{Topic: p.topic, Value: data}
-	// if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
-	//     return fmt.Errorf("event %q: kafka write: %w", eventType, err)
-	// }
+	// Topic is set on the Writer itself (main.go), not here — kafka-go
+	// rejects a Message that also specifies Topic when the Writer already has one.
+	msg := kafka.Message{Value: data}
+	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
+		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
+	}
 
-	p.log.Info("event emitted (stub — wire Kafka producer)",
+	p.log.Info("event published",
 		zap.String("event_type", eventType),
-		zap.ByteString("payload", data),
+		zap.String("topic", p.topic),
 	)
 	return nil
 }
