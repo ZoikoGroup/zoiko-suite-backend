@@ -68,3 +68,12 @@ jobs:
           else
             echo "No packages to test"
           fi
+
+      - name: Integration test — health probes with embedded Postgres
+        if: matrix.service == 'audit-event-store-svc'
+        working-directory: services/${{ matrix.service }}
+        # Uses embedded-postgres (downloads real Postgres binaries automatically).
+        # No separate Postgres service container is needed.
+        # Proves /healthz and /readyz return 200 against a real DB.
+        run: go test -v -tags=integration -count=1 -timeout=120s ./cmd/server/
+
