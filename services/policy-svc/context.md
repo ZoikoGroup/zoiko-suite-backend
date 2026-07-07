@@ -262,15 +262,20 @@ scaffolding starts**. Status of each field for Policy Service:
 | Inbound / Outbound APIs | ✅ filled — **superseded by concrete endpoint list in §13** | §3, §13 |
 | Published / Consumed events | ✅ filled — **scope narrowed in §13** (consumed events explicitly deferred) | §3, §13 |
 | Governance dependencies (which Governance Plane engines this service calls) | ⚠️ still open, but now **explicitly deferred rather than blocking** | The approved build task does not wire calls to Authorization Service for admin writes (create/activate) — it isn't mentioned at all in the 3-batch task spec in §13. Same posture as `governance-decision-log-svc`'s precedent: ship without it, since Authorization Service doesn't exist yet, and revisit when it does. Not resolved, just consciously deferred. |
-| Evidence obligations | ✅ filled | §5 above |
-| Idempotency requirement | ✅ filled | §6, §13 — evaluation endpoint idempotency is free (pure read/compute), and admin writes get it via the `INSERT...ON CONFLICT DO NOTHING` / `ON CONFLICT` transition pattern (§13) |
-| **Failure mode** (fail closed / fail safe / degraded / compensating saga) | ✅ **resolved for the evaluation endpoint** | §13: no applicable ACTIVE policy version for a given type+scope → `404`, and the service explicitly does **not** guess fail-open vs fail-closed — that decision is pushed to the caller. This is a real architectural choice (not an omission) and should be treated as the answer to this spec field going forward. Caching/sidecar failure-mode (05-security.md §6.5) is still unaddressed since caching is explicitly out of scope for v1 (§13). |
+| Evidence obligations | ✅ filled, and as of §19 **actually enforced at runtime**, not just described | §5 above (spec text); §19 (the real gap this table entry originally glossed over, and how it was closed and verified against a live second service) |
+| Idempotency requirement | ✅ **fully met, including the evidence write** | §6, §13 — admin writes get it via `INSERT...ON CONFLICT DO NOTHING` / `ON CONFLICT` transition patterns. Evaluate's own *result* is idempotent (pure function of inputs); its write to `governance-decision-log-svc` is required to carry a caller-supplied `decision_id` as of §20, and that service is itself idempotent on it — proven live by calling `Evaluate` twice with the same `decision_id` and confirming exactly one decision record exists. |
+| **Failure mode** (fail closed / fail safe / degraded / compensating saga) | ✅ **resolved for the evaluation endpoint's own result; separately resolved for its evidence side-effect in §19** | §13: no applicable ACTIVE policy version for a given type+scope → `404`, fail-open/closed pushed to the caller. §19: the evidence-recording call is best-effort/fail-safe — a down `governance-decision-log-svc` never fails or blocks `Evaluate` (verified live), it only loses that one decision's durable record. Caching/sidecar failure-mode (05-security.md §6.5) is still unaddressed since caching is explicitly out of scope for v1 (§13). |
 
 **Net:** the spec is now effectively complete for the v1 scope actually
-being built (§13). What's still open — Authorization-Service wiring for
-admin writes, and cache-layer failure-mode — is deferred by explicit
-design choice, not by oversight, and only needs revisiting when
-Authorization Service exists or caching is added in a later version.
+being built (§13, §19, §20). What's still open — Authorization-Service
+wiring for admin writes and cache-layer failure-mode — is deferred by
+explicit design choice, not by oversight, and only needs revisiting when
+Authorization Service exists or caching is added. The four items outside
+this spec-field table (consumed events, caching itself, the 3
+unimplemented policy types, and the `policies` table's missing
+`tenant_id`/`legal_entity_id`) remain open and need input from you, not
+more unilateral engineering — see the standing list at the end of
+`progress.md`.
 
 ## 13. Concrete v1 implementation spec (task-approved, supersedes speculative design)
 
@@ -415,12 +420,14 @@ for four total cases.
 - `POST /v1/policies/evaluate` — body: `{policy_type, tenant_id,
   legal_entity_id, action_context: {...}, evaluated_by_principal_id,
   decision_id}`.
-  **Updated in §19 (Batch D):** `evaluated_by_principal_id` is required
-  and `decision_id` is optional — neither was in the original Batch B
-  design; both were added when wiring real evidence recording surfaced
-  that governance-decision-log-svc requires an actor and supports (but
-  doesn't require) an idempotency key. See §19 before trusting this list
-  as complete on its own.
+  **Updated in §19 and §20:** `evaluated_by_principal_id` and
+  `decision_id` are both **required** — neither was in the original
+  Batch B design. Added when wiring real evidence recording surfaced that
+  governance-decision-log-svc requires an actor (§19) and that leaving
+  the idempotency key optional left a real duplicate-evidence gap on
+  retries (§20). See both sections before trusting this list as complete
+  on its own — this endpoint's contract changed twice after it first
+  shipped.
   1. Look up the applicable ACTIVE version for that type+scope.
   2. **No applicable policy → `404`.** The service does not guess
      fail-open/fail-closed; that decision belongs to the caller. (This is
@@ -441,9 +448,14 @@ for four total cases.
 wiring, originally deferred as a "separate future task," was completed in
 §19.
 
-**Idempotency:** falls out naturally — this is a pure read/compute
-endpoint with no side effects. The only risk is accidentally introducing
-hidden state mutation (e.g. a "last evaluated at" write); don't.
+**Idempotency:** the endpoint's own *result* is a pure function of its
+inputs (policy-svc's own store is only ever read, never written, inside
+`Evaluate`). Its write to `governance-decision-log-svc` is a real side
+effect — as of §20, `decision_id` is a *required* field specifically so
+that write is idempotent too: a retried request with the same
+`decision_id` records the same decision, never a duplicate. (This was
+briefly true only "if the caller opts in" between §19 and §20 — see §20
+for why that was tightened.)
 
 **Caching:** explicitly **not required for v1**, even though
 05-security.md §6.5 allows it. Do not add Redis or any cache layer now —
@@ -882,16 +894,16 @@ have a basis for.
   type itself is the closest available analog. Not verified against any
   real downstream consumer of `action_type` — flag if this should instead
   be caller-supplied.
-- **Optional `decision_id`** lets callers who need exactly-once evidence
-  supply their own idempotency key (governance-decision-log-svc is
-  idempotent on it); omitted, a fresh UUID is generated per `Evaluate`
-  call. This means a client-side retry of `Evaluate` without a supplied
-  `decision_id` can record a duplicate decision — `Evaluate`'s own result
-  is still correct and idempotent, only this best-effort side channel
-  isn't, and only in that specific case. Documented, not fixed further:
-  closing it completely would require either mandating `decision_id`
-  (another breaking change) or deriving one from request content, both
-  of which felt like over-engineering relative to what was actually asked.
+- **`decision_id` was optional when this batch shipped — made required in
+  a follow-up pass, see §20.** The reasoning below (kept for the
+  historical record) was reconsidered once doctrine's idempotency
+  requirement was checked explicitly against the evidence write, not just
+  `Evaluate`'s returned result — the two are different guarantees and the
+  spec doesn't say only one of them counts.
+  <br>*(original reasoning, superseded)*: letting `decision_id` be
+  optional meant a client-side retry of `Evaluate` without one could
+  record a duplicate decision — accepted then as "not worth another
+  breaking change." §20 revisited that call.
 - **HTTP client timeout tightened from 5s to 2s** after live testing (see
   below) showed a fully-down dependency costs ~2.5s in DNS resolution
   alone with an unbounded-enough client — a concrete, measured number,
@@ -944,3 +956,49 @@ This is the same rigor level as Batches A–C, extended to a second
 service: nothing here was asserted without a live request/response to
 back it, and the one bug-shaped finding (the DNS timeout latency) was
 fixed based on a measured number, not a hypothetical.
+
+## 20. Closing the retry-duplicate-decision gap (2026-07-07, same day)
+
+A second spec-compliance pass (prompted directly: "so what we need to do
+to make it 100% aligned") re-checked doctrine's idempotency requirement
+("Every state-changing API and every event consumer must be idempotent")
+against `Evaluate` specifically — not just its returned result, but its
+write to `governance-decision-log-svc`. §19 had left that write
+idempotent only when the caller opted in by supplying `decision_id`.
+Judged: a governance service's evidence trail silently duplicating on
+ordinary network retries is a real correctness gap, not a stylistic one,
+and closing it didn't require any business input — only an
+implementation decision. Fixed directly rather than deferred again.
+
+**Change**: `decision_id` is now a *required* field on
+`POST /v1/policies/evaluate` (was optional in §19). The UUID-generation
+fallback in `evaluateApprovalThreshold` was removed entirely —
+`google/uuid` is no longer imported in `internal/handler`. This is
+another breaking change to the same endpoint §19 already broke once this
+session; both changes are captured together in `progress.md`'s Postman
+note so there's one place to look, not two.
+
+**Why this fully closes it, not just narrows it**: governance-decision-log-svc's
+`CreateDecision` is already idempotent on `decision_id` (confirmed in
+§19's investigation — a repeat `POST /v1/decisions` with the same ID
+returns `200`, not a second row). Requiring the caller to always supply
+one means every `Evaluate` retry, accidental or deliberate, resolves to
+at most one decision record. There is no remaining "sometimes idempotent"
+case — unlike caching or the other three policy types, this isn't a
+"needs more input" item, so it was fixed immediately rather than added to
+the open-questions list.
+
+### Verification
+
+1. `go build`, `go vet`, `go test ./... -v` → **35/35 pass** (34 from §19
+   + `TestEvaluate_MissingDecisionID`; `TestEvaluate_ApprovalRequired`
+   updated to assert the *supplied* `decision_id` is forwarded verbatim,
+   not that one gets generated).
+2. Live, against the real `governance-decision-log-svc` instance from
+   §19 (not a stub): `POST /v1/policies/evaluate` with `decision_id`
+   omitted → `400 {"error":"missing_field","field":"decision_id"}`.
+3. **The actual proof**: called `Evaluate` twice with the identical
+   `decision_id`, then queried `governance-decision-log-svc`'s
+   `GET /v1/decisions?actor=admin-1` and counted matches for that
+   `decision_id` — **exactly one**, after two calls. This is the
+   guarantee doctrine asks for, demonstrated, not asserted.

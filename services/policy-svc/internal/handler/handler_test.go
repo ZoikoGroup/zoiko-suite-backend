@@ -523,7 +523,7 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
 	tenantID := "t-1"
-	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"t-1","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1"}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"t-1","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -565,15 +565,28 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	if decisionLog.last.TenantID == nil || *decisionLog.last.TenantID != tenantID {
 		t.Errorf("expected TenantID t-1 forwarded, got %v", decisionLog.last.TenantID)
 	}
-	if decisionLog.last.DecisionID == "" {
-		t.Errorf("expected a generated DecisionID when none supplied")
+	if decisionLog.last.DecisionID != "dec-1" {
+		t.Errorf("expected DecisionID dec-1 forwarded as-is, got %s", decisionLog.last.DecisionID)
 	}
 }
 
 func TestEvaluate_MissingEvaluatedByPrincipalID(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000}}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"decision_id":"dec-1"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestEvaluate_MissingDecisionID(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -598,7 +611,7 @@ func TestEvaluate_DecisionLogFailure_StillReturns200(t *testing.T) {
 	decisionLog := &stubDecisionLog{err: fmt.Errorf("governance-decision-log-svc unreachable")}
 	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -627,7 +640,7 @@ func TestEvaluate_WithinThreshold(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -661,7 +674,7 @@ func TestEvaluate_AmountEqualsThreshold_IsWithinThreshold(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":5000},"evaluated_by_principal_id":"admin-1"}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":5000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -703,7 +716,7 @@ func TestEvaluate_MissingActionContextAmount(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{},"evaluated_by_principal_id":"admin-1"}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -717,7 +730,7 @@ func TestEvaluate_NoApplicablePolicy(t *testing.T) {
 	decisionLog := &stubDecisionLog{}
 	r := newTestRouterFull(&stubStore{applicable: nil}, &stubPublisher{}, decisionLog)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -739,7 +752,7 @@ func TestEvaluate_PolicyTypeNotImplemented(t *testing.T) {
 	decisionLog := &stubDecisionLog{}
 	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
-	body := `{"policy_type":"SPEND_CONTROL","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
+	body := `{"policy_type":"SPEND_CONTROL","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

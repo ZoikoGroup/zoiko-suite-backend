@@ -75,14 +75,11 @@ independently-running `governance-decision-log-svc` instance — see
     `POST /v1/policies/evaluate` — a breaking change to an
     already-shipped, already-Postman-tested endpoint. Updated all
     existing tests and this doc's earlier endpoint reference accordingly.
-- [x] Optional `decision_id` field added to the evaluate request for
-      callers that need exactly-once evidence (governance-decision-log-svc
-      is itself idempotent on `decision_id`); omitted, a fresh UUID is
-      generated per call — meaning a client-side retry of `Evaluate`
-      without a supplied `decision_id` could record a duplicate decision.
-      Documented as a known, accepted limitation, not fixed further:
-      `Evaluate`'s own result is still idempotent, only this best-effort
-      side channel is not.
+- [x] `decision_id` field added to the evaluate request — **shipped
+      optional in this batch, made required a follow-up pass later the
+      same day (see Batch E below) once the duplicate-evidence-on-retry
+      gap this created was judged worth closing immediately rather than
+      documenting and moving on.**
 - [x] Call is synchronous (matches this codebase's actual convention for
       Kafka publishing, not a goroutine) but best-effort: failures are
       logged, never surfaced or blocking — verified live by killing
@@ -106,15 +103,60 @@ and confirmed both come back as `"GLOBAL"`. Then stopped
 `governance-decision-log-svc` entirely and confirmed `Evaluate` still
 returns `200` with the failure only logged.
 
-### Postman impact
+### Postman impact (superseded by Batch E — see there for the current body shape)
 
 `POST /v1/policies/evaluate` now requires `evaluated_by_principal_id` in
 the body — existing saved requests need updating or they'll fail `400
-missing_field`. Example:
+missing_field`. Example (incomplete as of Batch E — `decision_id` is also
+required now):
 
 ```json
 {"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1"}
 ```
+
+## Batch E — Close the retry-duplicate-decision gap (same day, follow-up)
+
+Prompted by a direct "so what we need to do to make it 100% aligned"
+follow-up. §19/Batch D above left one loose end: `decision_id` was
+optional, so a client-side retry of `Evaluate` with none supplied could
+record a duplicate decision in `governance-decision-log-svc`. Re-checked
+against doctrine's idempotency requirement applied to the evidence write
+specifically (not just `Evaluate`'s returned result) and judged: this
+needed no business input, only an implementation decision, so it was
+fixed immediately instead of added to the standing gap list. **Done,
+tested, and verified live — see `context.md` §20.**
+
+- [x] `decision_id` changed from optional to **required** on
+      `POST /v1/policies/evaluate` — second breaking change to this
+      endpoint today (first was `evaluated_by_principal_id` in Batch D)
+- [x] Removed the `uuid.New()` fallback generation in
+      `evaluateApprovalThreshold` — `google/uuid` no longer imported in
+      `internal/handler`
+- [x] 35/35 tests pass (34 from Batch D + `TestEvaluate_MissingDecisionID`;
+      `TestEvaluate_ApprovalRequired` updated to assert the *supplied*
+      `decision_id` is forwarded verbatim rather than asserting one gets
+      generated)
+
+**Verified live (2026-07-07 — DONE):** `POST /v1/policies/evaluate` with
+`decision_id` omitted → `400 {"error":"missing_field","field":"decision_id"}`.
+Called `Evaluate` **twice** with the identical `decision_id` against the
+real `governance-decision-log-svc` instance, then queried
+`GET /v1/decisions?actor=admin-1` and counted matches — **exactly one**
+decision record after two calls. This is the actual guarantee, proven,
+not just documented.
+
+### Postman impact (current — supersedes the Batch D example above)
+
+`POST /v1/policies/evaluate` requires **both** `evaluated_by_principal_id`
+**and** `decision_id`. Current full example:
+
+```json
+{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1","decision_id":"some-unique-id-you-control"}
+```
+
+Use a stable, caller-generated ID (e.g. your own request/correlation ID)
+so retries of the same logical evaluation don't create duplicate evidence
+records in `governance-decision-log-svc`.
 
 Repo correction: remote is `ZoikoGroup/zoiko-suite-backend`. Services
 that exist now: `identity-context-svc` (8080), `tenant-entity-registry-svc`
@@ -263,11 +305,16 @@ amount of structure; no plugin/registry system for four total cases.
         "rule_basis": "<policy_code>:<policy_version_id>"}` — the
         `rule_basis` format is a documented choice, not specified by the
         task (§15 item 6); feeding `governance-decision-log-svc`'s
-        `POST /v1/decisions` is still a separate future task
+        `POST /v1/decisions` **was** a separate future task when this was
+        written — **done in Batch D below**, don't trust this line alone
   - [x] unimplemented `policy_type` (e.g. `SPEND_CONTROL`) → `501`, not a
         silent no-op or a crash
-- [x] idempotency falls out naturally (pure read/compute, no side
-      effects) — confirmed: no write path exists anywhere in this batch
+- [x] idempotency: **stale as originally written here — corrected by
+      Batch D below.** At the time this batch shipped, "no write path
+      exists anywhere in this batch" was true. As of Batch D, `Evaluate`
+      does write (best-effort) to `governance-decision-log-svc` on every
+      real evaluation; that write is idempotent only when the caller
+      supplies `decision_id`. See Batch D's section for the full story.
 - [x] **no caching** — not added; a direct Postgres read is used (this
       permanently supersedes the old speculative "Phase 9 — caching"
       plan; it's deferred indefinitely, not scheduled)
@@ -335,18 +382,38 @@ round trip from inside the container.
 
 - **Do not consume `entity.created`, `role.updated`, or
   `authority.delegated`** even though `03-microservices.md` §8.1 lists
-  them as consumed events. Nothing in the codebase publishes those for
-  real yet (all logged stubs in their respective services) — there's
-  nothing to actually consume. Follow-up once the producers are real.
+  them as consumed events.
+  - **`entity.created` — status changed since this was first written.**
+    `tenant-entity-registry-svc` now has a real Kafka producer for it
+    (confirmed after pulling `origin/main` — see "Synced with
+    `origin/main`" note above). Consuming it is technically unblocked,
+    but nothing in the docs specifies what policy-svc should *do* with
+    an `entity.created` event — building a consumer with no defined
+    business behavior would be infrastructure with no purpose. **Needs
+    an answer from you** (e.g. "validate `legal_entity_id` references,"
+    "invalidate a future cache entry," or "nothing, skip it") before
+    this is buildable, not more unilateral engineering.
+  - **`role.updated` / `authority.delegated` — still fully blocked.**
+    Access Control Service and Delegated Authority Service don't exist
+    at all yet. No amount of decision-making unblocks this; it needs
+    those services to exist first.
 - **Do not wire calls to Authorization Service** for admin writes
   (create/activate) — it doesn't exist yet. Same posture
   `governance-decision-log-svc` shipped with; revisit when Authorization
   Service exists.
 - **Do not add caching/Redis/sidecar evaluation** in v1 — explicitly
-  deferred (Batch B).
+  deferred (Batch B). Technically buildable now (no external blocker),
+  but the spec explicitly allows deferring it ("may be cached... not
+  required"), unlike the evidence obligation, which the spec does not
+  allow deferring and which Batches D/E closed. Needs a "yes, build it"
+  from you, not an assumption that it's wanted.
 - **Do not build evaluation logic for `SPEND_CONTROL`, `SOD_RULE`, or
   `SIGNATORY_MATRIX`** — only `APPROVAL_THRESHOLD` gets real logic in v1;
-  the others are future `switch` cases, not part of this build.
+  the others are future `switch` cases, not part of this build. **Cannot
+  be built without you supplying the actual business rules** — the docs
+  name these three policy types but give zero formulas or logic for any
+  of them, unlike `APPROVAL_THRESHOLD`'s explicit "compare against a
+  threshold" instruction.
 
 ## Blocking cross-service dependencies (tracked, not yet resolvable)
 
@@ -354,8 +421,25 @@ round trip from inside the container.
   above rather than blocking.
 - **Access Control Service** / **Delegated Authority Service** — don't
   exist; block real consumption of `role.updated` / `authority.delegated`
-  (deferred per non-goals above).
-- **Kafka event backbone** — not wired anywhere in the repo yet; all
-  event publishing across all services is a log-only stub. Policy
-  Service's publisher follows the same stub pattern, not a gap specific
-  to this service.
+  (deferred per non-goals above) — genuinely blocking, not a decision
+  policy-svc can make on its own.
+- **Kafka event backbone — status changed since this was first written.**
+  It's real now for `identity-context-svc` and `tenant-entity-registry-svc`
+  (real `kafka.Writer` producers, confirmed after the `origin/main` pull).
+  Policy Service's own publisher (`internal/events/publisher.go`) is
+  still a log-only stub — that part hasn't changed and isn't blocked by
+  anything except priority; wiring a real `kafka.Writer` there would
+  follow the same pattern those two services now use.
+
+## Remaining gaps against a strict reading of `03-microservices.md` §8.1
+
+As of Batch E, this is the complete, current list — nothing here has
+regressed and nothing here has been quietly fixed since the last review
+(see `context.md` §19/§20 for what *was* closed):
+
+1. Consuming `entity.created` — needs you to specify intended behavior (see above)
+2. Consuming `role.updated`/`authority.delegated` — blocked on services that don't exist
+3. Caching — needs a "yes, build it" from you (not required by spec)
+4. Evaluation logic for `SPEND_CONTROL`/`SOD_RULE`/`SIGNATORY_MATRIX` — needs business rules from you
+5. `policies` table has no `tenant_id`/`legal_entity_id` — needs a decision on whether to reverse the Batch A design precedent (mirrors `jurisdictions`)
+6. No literal separate "validate threshold applicability" endpoint (folded into `Evaluate`) — low value to fix, recommend leaving as-is unless you disagree
