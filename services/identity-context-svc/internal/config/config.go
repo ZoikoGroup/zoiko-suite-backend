@@ -14,6 +14,9 @@ type Config struct {
 
 	// JWT envelope signing (Q2 — signed short-lived JWT)
 	// Production: RS256 via KMS-backed keypair through Secret Vault Integration Service.
+	JWTSigningPrivateKeyPath string
+	JWTKeyID                 string
+
 	// TODO: replace JWTSigningSecret with KMS key reference before Phase 1 production cutover.
 	JWTSigningSecret       string
 	JWTIssuer              string
@@ -71,6 +74,9 @@ func Load() (*Config, error) {
 		JWTSigningSecret:      env("JWT_SIGNING_SECRET", ""),
 		JWTIssuer:             env("JWT_ISSUER", "identity-context-svc"),
 		JWTAudienceInternal:   env("JWT_AUDIENCE", "zoiko-internal"),
+		JWTSigningPrivateKeyPath: env("JWT_SIGNING_PRIVATE_KEY_PATH", "./envelope_signing_key.pem"),
+		JWTKeyID:                 env("JWT_KEY_ID", "envelope-signing-key-1"),
+
 		EnvelopeJWTTTLSeconds: envInt("ENVELOPE_JWT_TTL_SECONDS", 300),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
