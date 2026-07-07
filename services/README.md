@@ -96,3 +96,5 @@ To tear down the container stack and remove the persistent DB volume:
 ```powershell
 docker compose -f deployments/docker-compose.yml down -v
 ```
+| `policy-svc` | 8085 | Policy/PolicyVersion CRUD + APPROVAL_THRESHOLD evaluation (`/v1/policies`, `/v1/policies/evaluate`); event publishing stubbed |
+| `audit-event-store-svc` | — | Kafka consumer + store interface only; no HTTP server yet |
