@@ -48,35 +48,45 @@ services:
       start_period: 10s
 
   # ── Kafka (KRaft mode — no ZooKeeper) ────────────────────────────────────────
+  # Using apache/kafka:latest (official Apache image).
+  # bitnami/kafka:3.7 was removed from Docker Hub; apache/kafka works identically
+  # for a single-broker KRaft setup and is maintained by the Apache project.
   kafka:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:latest
     container_name: audit-kafka
     ports:
       - "9092:9092"
     environment:
       # KRaft mode — no ZooKeeper.
-      KAFKA_CFG_NODE_ID: "1"
-      KAFKA_CFG_PROCESS_ROLES: "broker,controller"
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      # apache/kafka uses plain KAFKA_* names (no KAFKA_CFG_ prefix).
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
 
       # Two listener bindings:
       #   PLAINTEXT  — used by the service container (internal Docker network, hostname "kafka")
       #   EXTERNAL   — used by tooling on the host (localhost:9092)
-      KAFKA_CFG_LISTENERS: "PLAINTEXT://:9094,EXTERNAL://:9092,CONTROLLER://:9093"
-      KAFKA_CFG_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9094,EXTERNAL://localhost:9092"
-      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
-      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://:9094,EXTERNAL://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9094,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
 
       # Auto-create topics (convenience for local dev).
       # TODO (production): set to false and pre-create topics with replication factor >= 3.
-      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_CFG_NUM_PARTITIONS: "1"
-      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
 
-      ALLOW_PLAINTEXT_LISTENER: "yes"
+      # KRaft requires a stable cluster ID. CLUSTER_ID is generated once by the
+      # image's entrypoint if not set; setting it explicitly prevents ID drift
+      # when the container is recreated without removing the volume.
+      CLUSTER_ID: "audit-event-store-local-dev"
     healthcheck:
-      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s
       timeout: 10s
       retries: 10
