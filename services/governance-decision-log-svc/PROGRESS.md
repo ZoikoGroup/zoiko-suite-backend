@@ -179,6 +179,20 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   network, and the built image removed after verification.
 - Committed and pushed to `shashi-changes`.
 
+### 2026-07-07 — Manual Postman session against `gdl-test-server` (post Phase 3)
+- Spun up `gdl-test-postgres` + `gdl-test-server` (`go run ./cmd/server`,
+  bind-mounted source) again for a live Postman session covering the
+  query surface: `GET /healthz` → 200, `GET /v1/decisions?from=<garbage>`
+  → 400 (invalid timestamp correctly rejected), `GET
+  /v1/decisions?entity=entity-A&rule_basis=policy-v3-sod` → 200 with an
+  empty result (correct — no decisions had been posted yet in this
+  session). No `POST` was sent in this pass, so no
+  `governance.decision.recorded` event fired; the Phase 3 event-emission
+  behavior remains verified by the earlier real-Docker-image pass above,
+  not by this session.
+- Test containers left running at the user's request for further manual
+  testing (not yet torn down as of this log entry).
+
 ## Next steps
 
 - [x] Scaffold Phase 1 (write path).
