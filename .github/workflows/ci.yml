@@ -70,7 +70,9 @@ jobs:
       - name: Test (with race detector)
         working-directory: services/${{ matrix.service }}
         env:
-          TEST_DATABASE_URL: ${{ (matrix.service == 'jurisdiction-rules-svc' || matrix.service == 'identity-context-svc' || matrix.service == 'governance-decision-log-svc' || matrix.service == 'policy-svc') && 'postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable' || '' }}
+
+                 TEST_DATABASE_URL: ${{ (matrix.service == 'jurisdiction-rules-svc' || matrix.service == 'identity-context-svc' || matrix.service == 'governance-decision-log-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'policy-svc') && 'postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable' || '' }}
+
         # go list ./... pre-enumerates packages, excluding the bare module
         # root which has no .go files (verified: this causes "no Go files
         # in root directory" only with `go test -list=...`, not with plain
