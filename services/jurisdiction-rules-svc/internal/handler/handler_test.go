@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
@@ -28,6 +29,44 @@ type stubStore struct {
 	rules         []*domain.JurisdictionRule
 	rulesErr      error
 	err           error
+
+	// admin-mutation fields — configured per-test, unused by the read tests above
+	createdJurisdiction    *domain.Jurisdiction
+	jurisdictionWasCreated bool
+	createJurisdictionErr  error
+
+	deactivatedJurisdiction *domain.Jurisdiction
+	deactivateErr           error
+
+	ruleByID    *domain.JurisdictionRule
+	ruleByIDErr error
+
+	createdRule    *domain.JurisdictionRule
+	ruleWasCreated bool
+	createRuleErr  error
+
+	transitionedRule *domain.JurisdictionRule
+	transitionErr    error
+}
+
+func (s *stubStore) CreateJurisdiction(_ context.Context, _ domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
+	return s.createdJurisdiction, s.jurisdictionWasCreated, s.createJurisdictionErr
+}
+
+func (s *stubStore) DeactivateJurisdiction(_ context.Context, _, _ string) (*domain.Jurisdiction, error) {
+	return s.deactivatedJurisdiction, s.deactivateErr
+}
+
+func (s *stubStore) FindRuleByID(_ context.Context, _ string) (*domain.JurisdictionRule, error) {
+	return s.ruleByID, s.ruleByIDErr
+}
+
+func (s *stubStore) CreateRule(_ context.Context, _ domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error) {
+	return s.createdRule, s.ruleWasCreated, s.createRuleErr
+}
+
+func (s *stubStore) TransitionRuleStatus(_ context.Context, _, _ string, _ []string, _ string) (*domain.JurisdictionRule, error) {
+	return s.transitionedRule, s.transitionErr
 }
 
 func (s *stubStore) FindByID(_ context.Context, _ string) (*domain.Jurisdiction, error) {
@@ -101,9 +140,16 @@ func (s *stubStore) FindRules(_ context.Context, params store.FindRulesParams) (
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // newTestRouter wires a Handler onto a chi router exactly as main.go does.
+// Read-path tests don't exercise AuthZ, so they get a permit-all stub.
 func newTestRouter(store handler.JurisdictionStore) http.Handler {
+	return newTestRouterWithAuthz(store, authz.NewStubAuthZClient(zap.NewNop()))
+}
+
+// newTestRouterWithAuthz is the same wiring, with an explicit AuthorizationClient
+// — used by admin-mutation tests that need to exercise 403/503 authz paths.
+func newTestRouterWithAuthz(store handler.JurisdictionStore, authzClient authz.AuthorizationClient) http.Handler {
 	r := chi.NewRouter()
-	h := handler.New(store, zap.NewNop())
+	h := handler.New(store, authzClient, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
