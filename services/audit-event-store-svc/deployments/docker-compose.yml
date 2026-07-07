@@ -1,0 +1,134 @@
+# docker-compose.yml — local development stack for audit-event-store-svc
+#
+# Starts:
+#   postgres              — PostgreSQL 16. DB: audit_event_store, user: postgres, pass: postgres.
+#                           Accessible at localhost:5432.
+#   kafka                 — Kafka 3.x in KRaft mode (no ZooKeeper required).
+#                           Accessible from the host at localhost:9092.
+#   audit-event-store-svc — The service itself, built from the Dockerfile in the parent dir.
+#                           Health probe at http://localhost:8080/healthz
+#
+# Usage:
+#   docker compose up --build          # build & start everything
+#   docker compose up -d --build       # background mode
+#   docker compose logs -f             # tail all logs
+#   docker compose logs -f audit-svc  # tail service logs only
+#   docker compose down -v             # stop and remove volumes
+#
+# Produce a test message (requires kafkacat / kcat):
+#   kcat -P -b localhost:9092 -t zoiko.identity.events \
+#        -H "X-Event-ID=test-evt-001" \
+#        <<< '{"event_type":"identity.context.resolved","emitted_at":"2026-07-06T08:00:00Z","schema_version":"1.0","source_service":"identity-context-svc","payload":{"principal_id":"u-001","tenant_id":"t-001","legal_entity_id":"e-001","session_context_id":"s-001","correlation_id":"c-001"}}'
+#
+# Verify events landed:
+#   psql "host=localhost dbname=audit_event_store user=postgres password=postgres sslmode=disable" \
+#        -c "SELECT event_id, event_type, tenant_id, stored_at FROM audit_events ORDER BY stored_at;"
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: audit-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: audit_event_store
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      # Mount the migration so the schema is applied automatically on first boot.
+      - ./migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d audit_event_store"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Kafka (KRaft mode — no ZooKeeper) ────────────────────────────────────────
+  # Using apache/kafka:latest (official Apache image).
+  # bitnami/kafka:3.7 was removed from Docker Hub; apache/kafka works identically
+  # for a single-broker KRaft setup and is maintained by the Apache project.
+  kafka:
+    image: apache/kafka:latest
+    container_name: audit-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      # KRaft mode — no ZooKeeper.
+      # apache/kafka uses plain KAFKA_* names (no KAFKA_CFG_ prefix).
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+
+      # Two listener bindings:
+      #   PLAINTEXT  — used by the service container (internal Docker network, hostname "kafka")
+      #   EXTERNAL   — used by tooling on the host (localhost:9092)
+      KAFKA_LISTENERS: "PLAINTEXT://:9094,EXTERNAL://:9092,CONTROLLER://:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9094,EXTERNAL://localhost:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+
+      # Auto-create topics (convenience for local dev).
+      # TODO (production): set to false and pre-create topics with replication factor >= 3.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+
+      # KRaft requires a stable cluster ID. CLUSTER_ID is generated once by the
+      # image's entrypoint if not set; setting it explicitly prevents ID drift
+      # when the container is recreated without removing the volume.
+      CLUSTER_ID: "audit-event-store-local-dev"
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── audit-event-store-svc ─────────────────────────────────────────────────────
+  audit-svc:
+    build:
+      context: ..                  # repo root of the service (where Dockerfile lives)
+      dockerfile: Dockerfile
+    container_name: audit-event-store-svc
+    image: audit-event-store-svc:local
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+
+      # PostgreSQL — connect via Docker internal network using the service name.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: audit_event_store
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable          # no TLS inside a local Docker network (safe for dev)
+
+      # Kafka — use the PLAINTEXT internal listener (kafka:9094).
+      # The EXTERNAL listener (localhost:9092) is only reachable from the host.
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: audit-event-store-svc
+      KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+volumes:
+  postgres_data:
