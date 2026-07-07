@@ -8,8 +8,14 @@ CONTEXT.md for the spec/context).
 ## Current status
 
 **Phase:** Phase 1 (write path) merged to `main` (PR #14). Phase 2
-(query surface) built and verified, on branch
-`feat/governance-decision-log-svc-query-surface`, not yet merged.
+(query surface) and Phase 3 (close the loop — events, CI, Dockerfile,
+README) both built, verified, and pushed to `shashi-changes` (mirrors
+the Phase 1 flow — commits landed on the personal working branch
+rather than per-phase feature branches). A full line-by-line audit
+against `CONTEXT.md` found and fixed one real gap
+(`domain.ErrStoreUnavailable` now actually wired into `PgStore`) — the
+service is now fully spec-compliant. PR into `main` not yet opened (to
+be opened manually).
 
 ## Roadmap — three phases, three branches, three PRs into `main`
 
@@ -23,8 +29,8 @@ on its own. Full technical detail for each phase is in CONTEXT.md
 | Phase | Branch (suggested) | Scope | Status |
 | --- | --- | --- | --- |
 | 1 | `feat/governance-decision-log-svc-write-path` | New service scaffold (cmd/config/handler/store/domain/health), migration, `POST /v1/decisions`, idempotent on `decision_id`, real `PgStore` wired into `main.go` | **Merged to `main`** (PR #14) |
-| 2 | `feat/governance-decision-log-svc-query-surface` | `GET /v1/decisions/{id}` + `GET /v1/decisions` with all 5 filters (actor, entity, action, rule_basis, time range), composable; handler unit tests + real Postgres integration tests | **Built + verified** (not yet merged) |
-| 3 | `feat/governance-decision-log-svc-close-loop` | Publish `governance.decision.recorded` (stub-Kafka convention), add service to CI matrix + `TEST_DATABASE_URL` condition, Dockerfile, `services/README.md` entry | Blocked on Phase 2 merge |
+| 2 | `feat/governance-decision-log-svc-query-surface` (actually landed on `shashi-changes`) | `GET /v1/decisions/{id}` + `GET /v1/decisions` with all 5 filters (actor, entity, action, rule_basis, time range), composable; handler unit tests + real Postgres integration tests | **Pushed, PR pending** |
+| 3 | `feat/governance-decision-log-svc-close-loop` (actually landed on `shashi-changes`) | Publish `governance.decision.recorded` (stub-Kafka convention), add service to CI matrix + `TEST_DATABASE_URL` condition, Dockerfile, `services/README.md` entry | **Pushed, PR pending** |
 
 ## Log
 
@@ -123,7 +129,97 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   `rule_basis`) queries narrow correctly with AND semantics, confirmed
   `from` time-range filtering, and confirmed `from=<garbage>` returns 400.
   Test containers torn down after verification.
-- Not yet committed/pushed — sitting as uncommitted files pending review.
+- Committed to `feat/governance-decision-log-svc-query-surface`
+  (`238a2b2`), separate from the manual Postman pass below.
+
+### 2026-07-07 — Manual Postman smoke test of Phase 2, committed to `shashi-changes`
+- Re-verified Phase 2 live via Postman against a fresh `gdl-test-server`
+  + `gdl-test-postgres` pair: `POST /v1/decisions` → 201, `GET
+  /v1/decisions/{decision_id}` → 200 for the created id, 404 for an
+  unknown id, `GET /v1/decisions` (unfiltered and filtered) → 200 with
+  correct results. Test containers torn down after verification.
+- Cherry-picked the Phase 2 commit (`238a2b2`) from
+  `feat/governance-decision-log-svc-query-surface` onto `shashi-changes`
+  (now `2092b32`) to match Phase 1's actual landing branch, and pushed.
+- PR into `main` not yet opened — title/description/URL handed off for
+  manual creation (`gh` CLI is unauthenticated on this machine).
+
+### 2026-07-07 — Phase 3 (close the loop) built and verified
+- Added `internal/events/publisher.go`: `Publisher.PublishDecisionRecorded`
+  emits `governance.decision.recorded` (stub — logs the full envelope,
+  does not write to Kafka yet), mirroring `identity-context-svc`'s and
+  `tenant-entity-registry-svc`'s envelope shape exactly. Payload includes
+  `tenant_id`, `legal_entity_id`, `actor_id`, `jurisdiction_context`
+  (populated from `rule_basis`, per CONTEXT.md), plus the remaining
+  decision fields.
+- Wired the publisher into `Handler` (new `EventPublisher` dependency)
+  and `main.go`. `CreateDecision` now publishes only on a genuine first
+  insert (`created == true`) — an idempotent replay must not re-emit the
+  event. A publish failure is logged but does not fail the HTTP request
+  (event delivery is a stubbed, non-blocking concern).
+- Added `governance-decision-log-svc` to `.github/workflows/ci.yml`'s
+  `matrix.service` list and to the `TEST_DATABASE_URL` conditional
+  (alongside `jurisdiction-rules-svc` / `identity-context-svc`).
+- Wrote a multi-stage `Dockerfile` + `.dockerignore`, mirroring the
+  structure of `audit-event-store-svc`'s Dockerfile (found on its
+  as-yet-unmerged `feat/audit-event-store-context-resolved` branch —
+  still absent from `main` as of this writing): `golang:1.25-alpine`
+  builder → `gcr.io/distroless/static-debian12:nonroot` runtime,
+  statically linked, non-root, `EXPOSE 8083`.
+- Added a service list table to `services/README.md` (previously just a
+  one-line header) covering all 5 existing services, not only this one.
+- 3 new handler unit tests: publish fires exactly once on 201, does not
+  fire on a 200 replay, and a publish error doesn't change the response
+  status. All existing tests still pass (29 total: unit + Postgres
+  integration).
+- Verified live end-to-end against the **actual built Docker image**
+  (not `go run`): `docker build` succeeded, container booted against a
+  real `postgres:16-alpine` container, `/healthz` and `/readyz` returned
+  200, `POST /v1/decisions` returned 201 and the container logs showed
+  the `governance.decision.recorded` envelope emitted exactly once,
+  `GET /v1/decisions/{id}` returned 200, and a replayed POST returned
+  200 with no second "event emitted" log line. All test containers,
+  network, and the built image removed after verification.
+- Committed and pushed to `shashi-changes`.
+
+### 2026-07-07 — Manual Postman session against `gdl-test-server` (post Phase 3)
+- Spun up `gdl-test-postgres` + `gdl-test-server` (`go run ./cmd/server`,
+  bind-mounted source) again for a live Postman session covering the
+  query surface: `GET /healthz` → 200, `GET /v1/decisions?from=<garbage>`
+  → 400 (invalid timestamp correctly rejected), `GET
+  /v1/decisions?entity=entity-A&rule_basis=policy-v3-sod` → 200 with an
+  empty result (correct — no decisions had been posted yet in this
+  session). No `POST` was sent in this pass, so no
+  `governance.decision.recorded` event fired; the Phase 3 event-emission
+  behavior remains verified by the earlier real-Docker-image pass above,
+  not by this session.
+- Test containers left running at the user's request for further manual
+  testing (not yet torn down as of this log entry). Later torn down.
+
+### 2026-07-07 — CONTEXT.md alignment audit: ErrStoreUnavailable now actually wired
+- Line-by-line audit against CONTEXT.md found the implementation fully
+  spec-compliant with one real gap: `domain.ErrStoreUnavailable` was
+  declared (referencing "jurisdiction-rules-svc's fail-closed
+  precedent") but `pg_store.go` never actually returned it — `Insert`,
+  `FindByID`, and `List` all wrapped raw pgx errors with a plain
+  `fmt.Errorf` instead. Functionally harmless (the handler already
+  treats any non-`ErrDecisionNotFound` error as 503), but the sentinel
+  was dead outside tests and callers couldn't `errors.Is` their way to
+  "store is down" the way the doctrine comment promised.
+- Fixed: all three methods now wrap genuine failures with
+  `fmt.Errorf("%w: ...", domain.ErrStoreUnavailable, err)`, mirroring
+  `jurisdiction-rules-svc`'s pattern exactly, plus added `s.log.Error`
+  calls on each failure path (previously silent at the store layer).
+- Added `TestPgStore_ErrorsWrapErrStoreUnavailable`: drops the table
+  mid-test to force a real Postgres failure distinct from "no rows",
+  then asserts `errors.Is(err, domain.ErrStoreUnavailable)` for
+  `Insert`, `FindByID`, and `List` individually.
+- Verified: full suite (30 tests: unit + Postgres integration) passes
+  inside `golang:1.25`, including the new test.
+- Remaining known deviations from the doc are process-only, not code:
+  work landed on `shashi-changes` instead of three separate
+  per-phase branches, and the Phase 2+3 PR into `main` is still open,
+  not yet merged.
 
 ## Next steps
 
@@ -135,10 +231,13 @@ on its own. Full technical detail for each phase is in CONTEXT.md
 - [x] Verify Phase 2 against a real Postgres container (single lookup,
       unfiltered list, each filter individually, composed filters,
       invalid timestamp rejection).
-- [ ] Commit Phase 2 to `feat/governance-decision-log-svc-query-surface` and open a PR into `main`.
-- [ ] Scaffold Phase 3 (events, CI, Dockerfile, README) on a fresh
-      branch off updated `main`; verify via a real Docker container
-      against real Postgres.
+- [x] Commit Phase 2 and push to `shashi-changes` (`2092b32`).
+- [x] Build Phase 3 (events, CI, Dockerfile, README).
+- [x] Verify Phase 3 via a real built Docker image against a real
+      Postgres container (health, POST with event emitted once, GET,
+      idempotent replay with no re-publish).
+- [x] Commit Phase 3 and push to `shashi-changes`.
+- [ ] Open a PR from `shashi-changes` into `main` covering Phase 2 + 3.
 - [ ] Before Authorization Service integration begins: revisit the
       fail-closed-vs-async question and the read-API auth model
       question, both currently deferred.

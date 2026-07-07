@@ -5,9 +5,10 @@
 //  2. Initialise structured logger (zap)
 //  3. Connect to PostgreSQL pool (pgxpool) — Tier 0 pool sizing
 //  4. Construct PgStore
-//  5. Construct HTTP handler + mount routes on chi router
-//  6. Mount health probes (/healthz, /readyz)
-//  7. Start HTTP server with graceful shutdown
+//  5. Construct event publisher (stub — logs until kafka.Writer is injected)
+//  6. Construct HTTP handler + mount routes on chi router
+//  7. Mount health probes (/healthz, /readyz)
+//  8. Start HTTP server with graceful shutdown
 package main
 
 import (
@@ -26,6 +27,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/governance-decision-log-svc/internal/config"
+	"zoiko.io/governance-decision-log-svc/internal/events"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
 	"zoiko.io/governance-decision-log-svc/internal/health"
 	"zoiko.io/governance-decision-log-svc/internal/store"
@@ -81,7 +83,10 @@ func main() {
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 
-	// ── 5. Router + handler ───────────────────────────────────────────────────
+	// ── 5. Event publisher (stub — logs until kafka.Writer is injected) ─────────
+	publisher := events.NewPublisher(log, "governance.decisions")
+
+	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -89,15 +94,15 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, log)
+	h := handler.New(pgStore, publisher, log)
 	handler.RegisterRoutes(r, h)
 
-	// ── 6. Health probes ──────────────────────────────────────────────────────
+	// ── 7. Health probes ──────────────────────────────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", healthH.Readiness)
 
-	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
+	// ── 8. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
 	srv := &http.Server{
 		Addr:         addr,

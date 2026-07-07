@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -141,6 +142,33 @@ func TestPgStore_FindByID_NotFound(t *testing.T) {
 	_, err := s.FindByID(ctx, "does-not-exist")
 	if err != domain.ErrDecisionNotFound {
 		t.Fatalf("expected ErrDecisionNotFound, got %v", err)
+	}
+}
+
+// TestPgStore_ErrorsWrapErrStoreUnavailable verifies that a genuine store
+// failure (as opposed to a legitimate "not found") on Insert, FindByID, and
+// List all wrap domain.ErrStoreUnavailable — callers must be able to tell
+// "store is down" apart from "row doesn't exist" via errors.Is, per
+// CONTEXT.md's fail-closed precedent (mirrors jurisdiction-rules-svc).
+func TestPgStore_ErrorsWrapErrStoreUnavailable(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	// Drop the table out from under the store to force a real Postgres
+	// error distinct from "no rows" on every method.
+	if _, err := pool.Exec(ctx, `DROP TABLE governance_decisions CASCADE;`); err != nil {
+		t.Fatalf("failed to drop table for test setup: %v", err)
+	}
+
+	if _, err := s.Insert(ctx, sampleDecision("dec-unavailable")); !errors.Is(err, domain.ErrStoreUnavailable) {
+		t.Errorf("Insert: expected error to wrap ErrStoreUnavailable, got %v", err)
+	}
+	if _, err := s.FindByID(ctx, "dec-unavailable"); !errors.Is(err, domain.ErrStoreUnavailable) {
+		t.Errorf("FindByID: expected error to wrap ErrStoreUnavailable, got %v", err)
+	}
+	if _, err := s.List(ctx, store.ListParams{}); !errors.Is(err, domain.ErrStoreUnavailable) {
+		t.Errorf("List: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
 }
 

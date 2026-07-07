@@ -3,6 +3,7 @@ package handler_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -46,9 +47,23 @@ func (s *stubStore) List(_ context.Context, params store.ListParams) ([]*domain.
 	return s.listResult, s.listErr
 }
 
-func newTestRouter(store handler.DecisionStore) http.Handler {
+// stubPublisher implements handler.EventPublisher for unit testing.
+// No Kafka, no network — purely in-memory, records what it was asked to publish.
+type stubPublisher struct {
+	err        error
+	publishes  int
+	gotDecision *domain.GovernanceDecision
+}
+
+func (p *stubPublisher) PublishDecisionRecorded(_ context.Context, d domain.GovernanceDecision) error {
+	p.publishes++
+	p.gotDecision = &d
+	return p.err
+}
+
+func newTestRouter(store handler.DecisionStore, pub handler.EventPublisher) http.Handler {
 	r := chi.NewRouter()
-	h := handler.New(store, zap.NewNop())
+	h := handler.New(store, pub, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -70,7 +85,7 @@ func validBody() string {
 // decision_id returns 201 with the stored decision echoed back.
 func TestCreateDecision_201_FirstInsert(t *testing.T) {
 	store := &stubStore{created: true}
-	h := newTestRouter(store)
+	h := newTestRouter(store, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
 	req.Header.Set("X-Correlation-ID", "corr-req-001")
 
@@ -95,13 +110,35 @@ func TestCreateDecision_201_FirstInsert(t *testing.T) {
 	}
 }
 
+// TestCreateDecision_201_PublishesDecisionRecorded verifies a first-time
+// insert publishes governance.decision.recorded exactly once, with the
+// stored decision as the payload.
+func TestCreateDecision_201_PublishesDecisionRecorded(t *testing.T) {
+	pub := &stubPublisher{}
+	h := newTestRouter(&stubStore{created: true}, pub)
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if pub.publishes != 1 {
+		t.Fatalf("expected exactly 1 publish, got %d", pub.publishes)
+	}
+	if pub.gotDecision == nil || pub.gotDecision.DecisionID != "dec-001" {
+		t.Errorf("expected published decision dec-001, got %+v", pub.gotDecision)
+	}
+}
+
 // TestCreateDecision_200_IdempotentReplay verifies that a repeat POST for an
 // already-stored decision_id returns 200, not 201 — proving the handler
 // surfaces the store's idempotency signal rather than always reporting
 // "created".
 func TestCreateDecision_200_IdempotentReplay(t *testing.T) {
 	store := &stubStore{created: false}
-	h := newTestRouter(store)
+	h := newTestRouter(store, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
 
 	rr := httptest.NewRecorder()
@@ -112,11 +149,47 @@ func TestCreateDecision_200_IdempotentReplay(t *testing.T) {
 	}
 }
 
+// TestCreateDecision_200_IdempotentReplay_DoesNotRePublish verifies that a
+// replayed decision_id (created=false) does not re-emit
+// governance.decision.recorded — only the first insert is a new fact.
+func TestCreateDecision_200_IdempotentReplay_DoesNotRePublish(t *testing.T) {
+	pub := &stubPublisher{}
+	h := newTestRouter(&stubStore{created: false}, pub)
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if pub.publishes != 0 {
+		t.Fatalf("expected 0 publishes on idempotent replay, got %d", pub.publishes)
+	}
+}
+
+// TestCreateDecision_201_PublishFailureDoesNotFailRequest verifies that a
+// publish failure is logged but does not change the HTTP response — the
+// write already succeeded and event delivery is a stubbed, non-blocking
+// concern.
+func TestCreateDecision_201_PublishFailureDoesNotFailRequest(t *testing.T) {
+	pub := &stubPublisher{err: errors.New("kafka unreachable")}
+	h := newTestRouter(&stubStore{created: true}, pub)
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 despite publish failure, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
 // TestCreateDecision_400_MissingField verifies that omitting any required
 // field is rejected with 400 and names the missing field.
 func TestCreateDecision_400_MissingField(t *testing.T) {
 	body := `{"tenant_id": "tenant-1"}` // missing everything else
-	h := newTestRouter(&stubStore{created: true})
+	h := newTestRouter(&stubStore{created: true}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body))
 
 	rr := httptest.NewRecorder()
@@ -137,7 +210,7 @@ func TestCreateDecision_400_MissingField(t *testing.T) {
 // TestCreateDecision_400_InvalidJSON verifies malformed JSON is rejected
 // with 400, not a 500 or panic.
 func TestCreateDecision_400_InvalidJSON(t *testing.T) {
-	h := newTestRouter(&stubStore{created: true})
+	h := newTestRouter(&stubStore{created: true}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{not json`))
 
 	rr := httptest.NewRecorder()
@@ -151,7 +224,7 @@ func TestCreateDecision_400_InvalidJSON(t *testing.T) {
 // TestCreateDecision_503_StoreUnavailable verifies that a store error
 // returns 503 — not a silently swallowed failure.
 func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
-	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable})
+	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
 
 	rr := httptest.NewRecorder()
@@ -173,7 +246,7 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 // the stored decision.
 func TestGetDecision_200_Found(t *testing.T) {
 	want := &domain.GovernanceDecision{DecisionID: "dec-001", TenantID: "tenant-1"}
-	h := newTestRouter(&stubStore{findByIDResult: want})
+	h := newTestRouter(&stubStore{findByIDResult: want}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
 
 	rr := httptest.NewRecorder()
@@ -194,7 +267,7 @@ func TestGetDecision_200_Found(t *testing.T) {
 // TestGetDecision_404_NotFound verifies an unknown decision_id returns 404,
 // distinct from a store failure (503).
 func TestGetDecision_404_NotFound(t *testing.T) {
-	h := newTestRouter(&stubStore{findByIDErr: domain.ErrDecisionNotFound})
+	h := newTestRouter(&stubStore{findByIDErr: domain.ErrDecisionNotFound}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/does-not-exist", nil)
 
 	rr := httptest.NewRecorder()
@@ -208,7 +281,7 @@ func TestGetDecision_404_NotFound(t *testing.T) {
 // TestGetDecision_503_StoreUnavailable verifies a non-not-found store error
 // returns 503, never conflated with a legitimate 404.
 func TestGetDecision_503_StoreUnavailable(t *testing.T) {
-	h := newTestRouter(&stubStore{findByIDErr: domain.ErrStoreUnavailable})
+	h := newTestRouter(&stubStore{findByIDErr: domain.ErrStoreUnavailable}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
 
 	rr := httptest.NewRecorder()
@@ -222,7 +295,7 @@ func TestGetDecision_503_StoreUnavailable(t *testing.T) {
 // TestListDecisions_200_Empty verifies an empty result set serialises as an
 // empty JSON array, never null.
 func TestListDecisions_200_Empty(t *testing.T) {
-	h := newTestRouter(&stubStore{listResult: nil})
+	h := newTestRouter(&stubStore{listResult: nil}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
 
 	rr := httptest.NewRecorder()
@@ -241,7 +314,7 @@ func TestListDecisions_200_Empty(t *testing.T) {
 // (all filters can be set simultaneously).
 func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 	s := &stubStore{listResult: []*domain.GovernanceDecision{{DecisionID: "dec-001"}}}
-	h := newTestRouter(s)
+	h := newTestRouter(s, &stubPublisher{})
 
 	q := url.Values{
 		"actor":      {"actor-1"},
@@ -276,7 +349,7 @@ func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 // TestListDecisions_400_InvalidFrom verifies a malformed from timestamp is
 // rejected with 400 rather than silently ignored or causing a 500.
 func TestListDecisions_400_InvalidFrom(t *testing.T) {
-	h := newTestRouter(&stubStore{})
+	h := newTestRouter(&stubStore{}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?from=not-a-timestamp", nil)
 
 	rr := httptest.NewRecorder()
@@ -290,7 +363,7 @@ func TestListDecisions_400_InvalidFrom(t *testing.T) {
 // TestListDecisions_400_InvalidTo verifies a malformed to timestamp is
 // rejected with 400.
 func TestListDecisions_400_InvalidTo(t *testing.T) {
-	h := newTestRouter(&stubStore{})
+	h := newTestRouter(&stubStore{}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?to=not-a-timestamp", nil)
 
 	rr := httptest.NewRecorder()
@@ -304,7 +377,7 @@ func TestListDecisions_400_InvalidTo(t *testing.T) {
 // TestListDecisions_503_StoreUnavailable verifies a store failure returns
 // 503, not a silently empty list.
 func TestListDecisions_503_StoreUnavailable(t *testing.T) {
-	h := newTestRouter(&stubStore{listErr: domain.ErrStoreUnavailable})
+	h := newTestRouter(&stubStore{listErr: domain.ErrStoreUnavailable}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
 
 	rr := httptest.NewRecorder()

@@ -23,15 +23,23 @@ type DecisionStore interface {
 	List(ctx context.Context, params store.ListParams) ([]*domain.GovernanceDecision, error)
 }
 
+// EventPublisher is the narrow interface the handler depends on for
+// publishing governance.decision.recorded. Allows the handler to be tested
+// without a real event backbone.
+type EventPublisher interface {
+	PublishDecisionRecorded(ctx context.Context, d domain.GovernanceDecision) error
+}
+
 // Handler holds all HTTP handler methods.
 type Handler struct {
-	store DecisionStore
-	log   *zap.Logger
+	store     DecisionStore
+	publisher EventPublisher
+	log       *zap.Logger
 }
 
 // New constructs a Handler.
-func New(store DecisionStore, log *zap.Logger) *Handler {
-	return &Handler{store: store, log: log}
+func New(store DecisionStore, publisher EventPublisher, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, log: log}
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -162,6 +170,18 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
+		// Only the first insert is a new fact — a replayed idempotent POST
+		// must not re-emit governance.decision.recorded. Publish failures
+		// are logged, not surfaced to the caller: the write already
+		// succeeded and event delivery is a stubbed, non-blocking concern
+		// (see events.Publisher doc comment).
+		if pubErr := h.publisher.PublishDecisionRecorded(r.Context(), d); pubErr != nil {
+			h.log.Error("CreateDecision: failed to publish governance.decision.recorded",
+				zap.String("decision_id", d.DecisionID),
+				zap.String("correlation_id", correlationID),
+				zap.Error(pubErr),
+			)
+		}
 	}
 	h.log.Info("governance decision recorded",
 		zap.String("decision_id", d.DecisionID),
