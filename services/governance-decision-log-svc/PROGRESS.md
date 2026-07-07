@@ -191,7 +191,32 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   behavior remains verified by the earlier real-Docker-image pass above,
   not by this session.
 - Test containers left running at the user's request for further manual
-  testing (not yet torn down as of this log entry).
+  testing (not yet torn down as of this log entry). Later torn down.
+
+### 2026-07-07 — CONTEXT.md alignment audit: ErrStoreUnavailable now actually wired
+- Line-by-line audit against CONTEXT.md found the implementation fully
+  spec-compliant with one real gap: `domain.ErrStoreUnavailable` was
+  declared (referencing "jurisdiction-rules-svc's fail-closed
+  precedent") but `pg_store.go` never actually returned it — `Insert`,
+  `FindByID`, and `List` all wrapped raw pgx errors with a plain
+  `fmt.Errorf` instead. Functionally harmless (the handler already
+  treats any non-`ErrDecisionNotFound` error as 503), but the sentinel
+  was dead outside tests and callers couldn't `errors.Is` their way to
+  "store is down" the way the doctrine comment promised.
+- Fixed: all three methods now wrap genuine failures with
+  `fmt.Errorf("%w: ...", domain.ErrStoreUnavailable, err)`, mirroring
+  `jurisdiction-rules-svc`'s pattern exactly, plus added `s.log.Error`
+  calls on each failure path (previously silent at the store layer).
+- Added `TestPgStore_ErrorsWrapErrStoreUnavailable`: drops the table
+  mid-test to force a real Postgres failure distinct from "no rows",
+  then asserts `errors.Is(err, domain.ErrStoreUnavailable)` for
+  `Insert`, `FindByID`, and `List` individually.
+- Verified: full suite (30 tests: unit + Postgres integration) passes
+  inside `golang:1.25`, including the new test.
+- Remaining known deviations from the doc are process-only, not code:
+  work landed on `shashi-changes` instead of three separate
+  per-phase branches, and the Phase 2+3 PR into `main` is still open,
+  not yet merged.
 
 ## Next steps
 

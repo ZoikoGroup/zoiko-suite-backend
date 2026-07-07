@@ -98,7 +98,8 @@ ON CONFLICT (decision_id) DO NOTHING`
 		d.DecidedAt,
 	)
 	if err != nil {
-		return false, fmt.Errorf("insert governance decision %q: %w", d.DecisionID, err)
+		s.log.Error("pg Insert failed", zap.String("decision_id", d.DecisionID), zap.Error(err))
+		return false, fmt.Errorf("%w: insert governance decision %q: %v", domain.ErrStoreUnavailable, d.DecisionID, err)
 	}
 
 	created := tag.RowsAffected() == 1
@@ -145,7 +146,8 @@ WHERE decision_id = $1`
 		return nil, domain.ErrDecisionNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("find governance decision %q: %w", decisionID, err)
+		s.log.Error("pg FindByID failed", zap.String("decision_id", decisionID), zap.Error(err))
+		return nil, fmt.Errorf("%w: find governance decision %q: %v", domain.ErrStoreUnavailable, decisionID, err)
 	}
 	return d, nil
 }
@@ -208,7 +210,8 @@ LIMIT  $%d OFFSET $%d`,
 
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list governance decisions: %w", err)
+		s.log.Error("pg List failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: list governance decisions: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer rows.Close()
 
@@ -216,12 +219,14 @@ LIMIT  $%d OFFSET $%d`,
 	for rows.Next() {
 		d, scanErr := scanDecision(rows)
 		if scanErr != nil {
-			return nil, fmt.Errorf("list governance decisions: scan: %w", scanErr)
+			s.log.Error("pg List scan failed", zap.Error(scanErr))
+			return nil, fmt.Errorf("%w: list governance decisions: scan: %v", domain.ErrStoreUnavailable, scanErr)
 		}
 		results = append(results, d)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list governance decisions: rows: %w", err)
+		s.log.Error("pg List rows error", zap.Error(err))
+		return nil, fmt.Errorf("%w: list governance decisions: rows: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
 }
