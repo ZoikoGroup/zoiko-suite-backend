@@ -8,8 +8,11 @@ CONTEXT.md for the spec/context).
 ## Current status
 
 **Phase:** Phase 1 (write path) merged to `main` (PR #14). Phase 2
-(query surface) built and verified, on branch
-`feat/governance-decision-log-svc-query-surface`, not yet merged.
+(query surface) built, verified (automated + manual Postman), and
+pushed to `shashi-changes` (mirrors the Phase 1 flow — commits landed
+on the personal working branch rather than the suggested
+`feat/governance-decision-log-svc-query-surface` branch). PR into
+`main` not yet opened (to be opened manually).
 
 ## Roadmap — three phases, three branches, three PRs into `main`
 
@@ -23,7 +26,7 @@ on its own. Full technical detail for each phase is in CONTEXT.md
 | Phase | Branch (suggested) | Scope | Status |
 | --- | --- | --- | --- |
 | 1 | `feat/governance-decision-log-svc-write-path` | New service scaffold (cmd/config/handler/store/domain/health), migration, `POST /v1/decisions`, idempotent on `decision_id`, real `PgStore` wired into `main.go` | **Merged to `main`** (PR #14) |
-| 2 | `feat/governance-decision-log-svc-query-surface` | `GET /v1/decisions/{id}` + `GET /v1/decisions` with all 5 filters (actor, entity, action, rule_basis, time range), composable; handler unit tests + real Postgres integration tests | **Built + verified** (not yet merged) |
+| 2 | `feat/governance-decision-log-svc-query-surface` (actually landed on `shashi-changes`) | `GET /v1/decisions/{id}` + `GET /v1/decisions` with all 5 filters (actor, entity, action, rule_basis, time range), composable; handler unit tests + real Postgres integration tests | **Pushed, PR pending** |
 | 3 | `feat/governance-decision-log-svc-close-loop` | Publish `governance.decision.recorded` (stub-Kafka convention), add service to CI matrix + `TEST_DATABASE_URL` condition, Dockerfile, `services/README.md` entry | Blocked on Phase 2 merge |
 
 ## Log
@@ -123,7 +126,20 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   `rule_basis`) queries narrow correctly with AND semantics, confirmed
   `from` time-range filtering, and confirmed `from=<garbage>` returns 400.
   Test containers torn down after verification.
-- Not yet committed/pushed — sitting as uncommitted files pending review.
+- Committed to `feat/governance-decision-log-svc-query-surface`
+  (`238a2b2`), separate from the manual Postman pass below.
+
+### 2026-07-07 — Manual Postman smoke test of Phase 2, committed to `shashi-changes`
+- Re-verified Phase 2 live via Postman against a fresh `gdl-test-server`
+  + `gdl-test-postgres` pair: `POST /v1/decisions` → 201, `GET
+  /v1/decisions/{decision_id}` → 200 for the created id, 404 for an
+  unknown id, `GET /v1/decisions` (unfiltered and filtered) → 200 with
+  correct results. Test containers torn down after verification.
+- Cherry-picked the Phase 2 commit (`238a2b2`) from
+  `feat/governance-decision-log-svc-query-surface` onto `shashi-changes`
+  (now `2092b32`) to match Phase 1's actual landing branch, and pushed.
+- PR into `main` not yet opened — title/description/URL handed off for
+  manual creation (`gh` CLI is unauthenticated on this machine).
 
 ## Next steps
 
@@ -135,7 +151,8 @@ on its own. Full technical detail for each phase is in CONTEXT.md
 - [x] Verify Phase 2 against a real Postgres container (single lookup,
       unfiltered list, each filter individually, composed filters,
       invalid timestamp rejection).
-- [ ] Commit Phase 2 to `feat/governance-decision-log-svc-query-surface` and open a PR into `main`.
+- [x] Commit Phase 2 and push to `shashi-changes` (`2092b32`).
+- [ ] Open a PR from `shashi-changes` into `main` for Phase 2.
 - [ ] Scaffold Phase 3 (events, CI, Dockerfile, README) on a fresh
       branch off updated `main`; verify via a real Docker container
       against real Postgres.
