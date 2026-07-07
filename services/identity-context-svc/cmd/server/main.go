@@ -102,7 +102,11 @@ func main() {
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	verifier := auth.NewJWTVerifier(cfg)
-	signer := auth.NewJWTSigner(cfg)
+	signer, err := auth.NewJWTSigner(cfg)
+
+	if err != nil {
+		log.Fatal("failed to initialise JWT signer", zap.Error(err))
+	}
 
 	// ── Resolver ──────────────────────────────────────────────────────────
 	resolver := identityctx.NewResolver(
@@ -143,6 +147,8 @@ func main() {
 
 	// Health probe (no auth required)
 	r.Handle("/health", health.NewHandler(rdb, pool))
+
+	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
 
 	// Domain routes (all under /v1/)
 	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, log)
