@@ -8,11 +8,11 @@ CONTEXT.md for the spec/context).
 ## Current status
 
 **Phase:** Phase 1 (write path) merged to `main` (PR #14). Phase 2
-(query surface) built, verified (automated + manual Postman), and
-pushed to `shashi-changes` (mirrors the Phase 1 flow — commits landed
-on the personal working branch rather than the suggested
-`feat/governance-decision-log-svc-query-surface` branch). PR into
-`main` not yet opened (to be opened manually).
+(query surface) and Phase 3 (close the loop — events, CI, Dockerfile,
+README) both built, verified, and pushed to `shashi-changes` (mirrors
+the Phase 1 flow — commits landed on the personal working branch
+rather than per-phase feature branches). PR into `main` not yet opened
+(to be opened manually).
 
 ## Roadmap — three phases, three branches, three PRs into `main`
 
@@ -27,7 +27,7 @@ on its own. Full technical detail for each phase is in CONTEXT.md
 | --- | --- | --- | --- |
 | 1 | `feat/governance-decision-log-svc-write-path` | New service scaffold (cmd/config/handler/store/domain/health), migration, `POST /v1/decisions`, idempotent on `decision_id`, real `PgStore` wired into `main.go` | **Merged to `main`** (PR #14) |
 | 2 | `feat/governance-decision-log-svc-query-surface` (actually landed on `shashi-changes`) | `GET /v1/decisions/{id}` + `GET /v1/decisions` with all 5 filters (actor, entity, action, rule_basis, time range), composable; handler unit tests + real Postgres integration tests | **Pushed, PR pending** |
-| 3 | `feat/governance-decision-log-svc-close-loop` | Publish `governance.decision.recorded` (stub-Kafka convention), add service to CI matrix + `TEST_DATABASE_URL` condition, Dockerfile, `services/README.md` entry | Blocked on Phase 2 merge |
+| 3 | `feat/governance-decision-log-svc-close-loop` (actually landed on `shashi-changes`) | Publish `governance.decision.recorded` (stub-Kafka convention), add service to CI matrix + `TEST_DATABASE_URL` condition, Dockerfile, `services/README.md` entry | **Pushed, PR pending** |
 
 ## Log
 
@@ -141,6 +141,44 @@ on its own. Full technical detail for each phase is in CONTEXT.md
 - PR into `main` not yet opened — title/description/URL handed off for
   manual creation (`gh` CLI is unauthenticated on this machine).
 
+### 2026-07-07 — Phase 3 (close the loop) built and verified
+- Added `internal/events/publisher.go`: `Publisher.PublishDecisionRecorded`
+  emits `governance.decision.recorded` (stub — logs the full envelope,
+  does not write to Kafka yet), mirroring `identity-context-svc`'s and
+  `tenant-entity-registry-svc`'s envelope shape exactly. Payload includes
+  `tenant_id`, `legal_entity_id`, `actor_id`, `jurisdiction_context`
+  (populated from `rule_basis`, per CONTEXT.md), plus the remaining
+  decision fields.
+- Wired the publisher into `Handler` (new `EventPublisher` dependency)
+  and `main.go`. `CreateDecision` now publishes only on a genuine first
+  insert (`created == true`) — an idempotent replay must not re-emit the
+  event. A publish failure is logged but does not fail the HTTP request
+  (event delivery is a stubbed, non-blocking concern).
+- Added `governance-decision-log-svc` to `.github/workflows/ci.yml`'s
+  `matrix.service` list and to the `TEST_DATABASE_URL` conditional
+  (alongside `jurisdiction-rules-svc` / `identity-context-svc`).
+- Wrote a multi-stage `Dockerfile` + `.dockerignore`, mirroring the
+  structure of `audit-event-store-svc`'s Dockerfile (found on its
+  as-yet-unmerged `feat/audit-event-store-context-resolved` branch —
+  still absent from `main` as of this writing): `golang:1.25-alpine`
+  builder → `gcr.io/distroless/static-debian12:nonroot` runtime,
+  statically linked, non-root, `EXPOSE 8083`.
+- Added a service list table to `services/README.md` (previously just a
+  one-line header) covering all 5 existing services, not only this one.
+- 3 new handler unit tests: publish fires exactly once on 201, does not
+  fire on a 200 replay, and a publish error doesn't change the response
+  status. All existing tests still pass (29 total: unit + Postgres
+  integration).
+- Verified live end-to-end against the **actual built Docker image**
+  (not `go run`): `docker build` succeeded, container booted against a
+  real `postgres:16-alpine` container, `/healthz` and `/readyz` returned
+  200, `POST /v1/decisions` returned 201 and the container logs showed
+  the `governance.decision.recorded` envelope emitted exactly once,
+  `GET /v1/decisions/{id}` returned 200, and a replayed POST returned
+  200 with no second "event emitted" log line. All test containers,
+  network, and the built image removed after verification.
+- Committed and pushed to `shashi-changes`.
+
 ## Next steps
 
 - [x] Scaffold Phase 1 (write path).
@@ -152,10 +190,12 @@ on its own. Full technical detail for each phase is in CONTEXT.md
       unfiltered list, each filter individually, composed filters,
       invalid timestamp rejection).
 - [x] Commit Phase 2 and push to `shashi-changes` (`2092b32`).
-- [ ] Open a PR from `shashi-changes` into `main` for Phase 2.
-- [ ] Scaffold Phase 3 (events, CI, Dockerfile, README) on a fresh
-      branch off updated `main`; verify via a real Docker container
-      against real Postgres.
+- [x] Build Phase 3 (events, CI, Dockerfile, README).
+- [x] Verify Phase 3 via a real built Docker image against a real
+      Postgres container (health, POST with event emitted once, GET,
+      idempotent replay with no re-publish).
+- [x] Commit Phase 3 and push to `shashi-changes`.
+- [ ] Open a PR from `shashi-changes` into `main` covering Phase 2 + 3.
 - [ ] Before Authorization Service integration begins: revisit the
       fail-closed-vs-async question and the read-API auth model
       question, both currently deferred.
