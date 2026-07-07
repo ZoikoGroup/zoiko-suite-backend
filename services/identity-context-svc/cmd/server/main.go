@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/auth"
@@ -83,12 +84,23 @@ func main() {
 	}
 	log.Info("Postgres connection established", zap.String("db_name", cfg.DB.Name))
 
+	// ── Kafka producer ────────────────────────────────────────────────────
+	// Connects lazily on first write — unlike Postgres/Redis this is not a
+	// fail-fast startup dependency. Publish failures are handled per-call by
+	// the resolver's existing error-return/log path (Gap 1 fix).
+	kafkaWriter := &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+	}
+	defer func() { _ = kafkaWriter.Close() }()
+
 	// ── Domain dependencies ───────────────────────────────────────────────
 	sessionCache := session.NewCache(rdb, cfg.Redis.SessionTTLSeconds)
 	riskCache := session.NewRiskSignalCache(rdb)
 	principalRepo := store.New(pool, log)
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic)
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	verifier := auth.NewJWTVerifier(cfg)
 	signer := auth.NewJWTSigner(cfg)
 
