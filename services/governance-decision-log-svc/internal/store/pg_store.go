@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -49,6 +50,10 @@ type Store interface {
 	// FindByID retrieves a single decision by its DecisionID.
 	// Returns domain.ErrDecisionNotFound if no row matches.
 	FindByID(ctx context.Context, decisionID string) (*domain.GovernanceDecision, error)
+
+	// List returns a paginated slice of decisions matching params. All
+	// filter fields are optional and compose with AND semantics.
+	List(ctx context.Context, params ListParams) ([]*domain.GovernanceDecision, error)
 }
 
 // PgStore implements Store against PostgreSQL via pgxpool.
@@ -105,16 +110,16 @@ ON CONFLICT (decision_id) DO NOTHING`
 	return created, nil
 }
 
-// FindByID retrieves a single decision row.
-func (s *PgStore) FindByID(ctx context.Context, decisionID string) (*domain.GovernanceDecision, error) {
-	const q = `
-SELECT decision_id, tenant_id, legal_entity_id, actor_id, action_type,
-       outcome, rule_basis, evaluation_context, correlation_id, decided_at
-FROM governance_decisions
-WHERE decision_id = $1`
+// decisionColumns is the standard SELECT column list shared by all queries.
+// Order must match scanDecision exactly.
+const decisionColumns = `
+	decision_id, tenant_id, legal_entity_id, actor_id, action_type,
+	outcome, rule_basis, evaluation_context, correlation_id, decided_at`
 
+// scanDecision scans one row produced by a decisionColumns SELECT.
+func scanDecision(row pgx.Row) (*domain.GovernanceDecision, error) {
 	var d domain.GovernanceDecision
-	err := s.pool.QueryRow(ctx, q, decisionID).Scan(
+	err := row.Scan(
 		&d.DecisionID,
 		&d.TenantID,
 		&d.LegalEntityID,
@@ -126,13 +131,99 @@ WHERE decision_id = $1`
 		&d.CorrelationID,
 		&d.DecidedAt,
 	)
+	return &d, err
+}
+
+// FindByID retrieves a single decision row.
+func (s *PgStore) FindByID(ctx context.Context, decisionID string) (*domain.GovernanceDecision, error) {
+	const q = `SELECT ` + decisionColumns + `
+FROM governance_decisions
+WHERE decision_id = $1`
+
+	d, err := scanDecision(s.pool.QueryRow(ctx, q, decisionID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrDecisionNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("find governance decision %q: %w", decisionID, err)
 	}
-	return &d, nil
+	return d, nil
+}
+
+// List returns a paginated, optionally-filtered slice of decisions, newest
+// first. All five filters (actor, entity, action, rule basis, time range)
+// are optional and compose with AND semantics.
+func (s *PgStore) List(ctx context.Context, params ListParams) ([]*domain.GovernanceDecision, error) {
+	limit := params.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	args := []any{}
+	conditions := []string{}
+	argIdx := 1
+
+	addCond := func(cond string, val any) {
+		conditions = append(conditions, fmt.Sprintf(cond, argIdx))
+		args = append(args, val)
+		argIdx++
+	}
+
+	if params.ActorID != "" {
+		addCond("actor_id = $%d", params.ActorID)
+	}
+	if params.LegalEntityID != "" {
+		addCond("legal_entity_id = $%d", params.LegalEntityID)
+	}
+	if params.ActionType != "" {
+		addCond("action_type = $%d", params.ActionType)
+	}
+	if params.RuleBasis != "" {
+		addCond("rule_basis = $%d", params.RuleBasis)
+	}
+	if !params.From.IsZero() {
+		addCond("decided_at >= $%d", params.From)
+	}
+	if !params.To.IsZero() {
+		addCond("decided_at <= $%d", params.To)
+	}
+
+	where := ""
+	if len(conditions) > 0 {
+		where = "WHERE " + strings.Join(conditions, " AND ")
+	}
+
+	query := fmt.Sprintf(`
+SELECT %s
+FROM   governance_decisions
+%s
+ORDER BY decided_at DESC
+LIMIT  $%d OFFSET $%d`,
+		decisionColumns, where, argIdx, argIdx+1,
+	)
+	args = append(args, limit, params.Offset)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list governance decisions: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*domain.GovernanceDecision
+	for rows.Next() {
+		d, scanErr := scanDecision(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("list governance decisions: scan: %w", scanErr)
+		}
+		results = append(results, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list governance decisions: rows: %w", err)
+	}
+	return results, nil
 }
 
 // nullableJSON converts an empty/nil RawMessage to nil so Postgres stores

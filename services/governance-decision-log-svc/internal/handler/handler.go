@@ -3,19 +3,24 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/governance-decision-log-svc/internal/domain"
+	"zoiko.io/governance-decision-log-svc/internal/store"
 )
 
 // DecisionStore is the narrow interface the handler depends on.
 // Allows the handler to be tested without a real database.
 type DecisionStore interface {
 	Insert(ctx context.Context, d domain.GovernanceDecision) (created bool, err error)
+	FindByID(ctx context.Context, decisionID string) (*domain.GovernanceDecision, error)
+	List(ctx context.Context, params store.ListParams) ([]*domain.GovernanceDecision, error)
 }
 
 // Handler holds all HTTP handler methods.
@@ -37,6 +42,8 @@ func New(store DecisionStore, log *zap.Logger) *Handler {
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Use(correlationIDMiddleware)
 	r.Post("/v1/decisions", h.CreateDecision)
+	r.Get("/v1/decisions", h.ListDecisions)
+	r.Get("/v1/decisions/{decision_id}", h.GetDecision)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -164,6 +171,116 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, status, d)
+}
+
+// GetDecision handles GET /v1/decisions/{decision_id}.
+//
+// Response:
+//
+//	200 → decision found
+//	404 → no decision with this decision_id
+//	503 → store unavailable
+func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
+	decisionID := chi.URLParam(r, "decision_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	d, err := h.store.FindByID(r.Context(), decisionID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrDecisionNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{
+				"error":       "decision_not_found",
+				"decision_id": decisionID,
+			})
+		default:
+			h.log.Error("GetDecision: store unavailable",
+				zap.String("decision_id", decisionID),
+				zap.String("correlation_id", correlationID),
+				zap.Error(err),
+			)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, d)
+}
+
+// ListDecisions handles GET /v1/decisions.
+//
+// Query parameters (all optional, compose with AND semantics):
+//
+//	actor=actor-1                filter by actor_id
+//	entity=entity-1              filter by legal_entity_id
+//	action=PAYROLL_RELEASE       filter by action_type
+//	rule_basis=policy-v3-sod     filter by rule_basis
+//	from=2024-01-01T00:00:00Z    decided_at lower bound (RFC3339, inclusive)
+//	to=2024-12-31T23:59:59Z      decided_at upper bound (RFC3339, inclusive)
+//	limit=50                     page size (max 200, default 50)
+//	offset=0                     zero-based page offset
+//
+// Response:
+//
+//	200 → JSON array of decisions (may be empty), newest first
+//	400 → invalid from/to timestamp
+//	503 → store unavailable
+func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+	q := r.URL.Query()
+
+	params := store.ListParams{
+		ActorID:       q.Get("actor"),
+		LegalEntityID: q.Get("entity"),
+		ActionType:    q.Get("action"),
+		RuleBasis:     q.Get("rule_basis"),
+	}
+	if v := q.Get("from"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_from",
+				"message": "from must be a valid RFC3339 timestamp",
+			})
+			return
+		}
+		params.From = t
+	}
+	if v := q.Get("to"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_to",
+				"message": "to must be a valid RFC3339 timestamp",
+			})
+			return
+		}
+		params.To = t
+	}
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			params.Limit = n
+		}
+	}
+	if v := q.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			params.Offset = n
+		}
+	}
+
+	results, err := h.store.List(r.Context(), params)
+	if err != nil {
+		h.log.Error("ListDecisions: store unavailable",
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	// Always return an array — never null.
+	if results == nil {
+		results = []*domain.GovernanceDecision{}
+	}
+	writeJSON(w, http.StatusOK, results)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.

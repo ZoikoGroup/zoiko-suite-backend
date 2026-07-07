@@ -143,3 +143,179 @@ func TestPgStore_FindByID_NotFound(t *testing.T) {
 		t.Fatalf("expected ErrDecisionNotFound, got %v", err)
 	}
 }
+
+// seedListFixtures inserts a small, deliberately varied set of decisions
+// covering every List filter dimension (actor, entity, action, rule basis,
+// and a spread of decided_at timestamps) so filter tests can assert on
+// exact membership.
+func seedListFixtures(t *testing.T, ctx context.Context, s *store.PgStore) {
+	t.Helper()
+	base := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	fixtures := []domain.GovernanceDecision{
+		{
+			DecisionID: "dec-list-1", TenantID: "tenant-1", LegalEntityID: "entity-A",
+			ActorID: "actor-1", ActionType: "PAYROLL_RELEASE", Outcome: "DENIED",
+			RuleBasis: "policy-v3-sod", CorrelationID: "corr-1", DecidedAt: base,
+		},
+		{
+			DecisionID: "dec-list-2", TenantID: "tenant-1", LegalEntityID: "entity-B",
+			ActorID: "actor-2", ActionType: "PAYROLL_RELEASE", Outcome: "GRANTED",
+			RuleBasis: "policy-v3-sod", CorrelationID: "corr-2", DecidedAt: base.AddDate(0, 0, 1),
+		},
+		{
+			DecisionID: "dec-list-3", TenantID: "tenant-1", LegalEntityID: "entity-A",
+			ActorID: "actor-1", ActionType: "TAX_FILING", Outcome: "GRANTED",
+			RuleBasis: "policy-v9-tax", CorrelationID: "corr-3", DecidedAt: base.AddDate(0, 0, 2),
+		},
+	}
+	for _, d := range fixtures {
+		if _, err := s.Insert(ctx, d); err != nil {
+			t.Fatalf("failed to seed fixture %q: %v", d.DecisionID, err)
+		}
+	}
+}
+
+// TestPgStore_List_NoFilters_ReturnsAllNewestFirst verifies List with no
+// filters returns every row, ordered by decided_at descending.
+func TestPgStore_List_NoFilters_ReturnsAllNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	results, err := s.List(ctx, store.ListParams{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+	if results[0].DecisionID != "dec-list-3" || results[2].DecisionID != "dec-list-1" {
+		t.Errorf("expected newest-first ordering, got order: %s, %s, %s",
+			results[0].DecisionID, results[1].DecisionID, results[2].DecisionID)
+	}
+}
+
+// TestPgStore_List_FilterByActor verifies the actor filter in isolation.
+func TestPgStore_List_FilterByActor(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	results, err := s.List(ctx, store.ListParams{ActorID: "actor-2"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].DecisionID != "dec-list-2" {
+		t.Fatalf("expected exactly dec-list-2, got %+v", results)
+	}
+}
+
+// TestPgStore_List_FilterByEntity verifies the entity (legal_entity_id)
+// filter in isolation.
+func TestPgStore_List_FilterByEntity(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	results, err := s.List(ctx, store.ListParams{LegalEntityID: "entity-A"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results for entity-A, got %d", len(results))
+	}
+}
+
+// TestPgStore_List_FilterByAction verifies the action_type filter in isolation.
+func TestPgStore_List_FilterByAction(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	results, err := s.List(ctx, store.ListParams{ActionType: "TAX_FILING"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].DecisionID != "dec-list-3" {
+		t.Fatalf("expected exactly dec-list-3, got %+v", results)
+	}
+}
+
+// TestPgStore_List_FilterByRuleBasis verifies the rule_basis filter in isolation.
+func TestPgStore_List_FilterByRuleBasis(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	results, err := s.List(ctx, store.ListParams{RuleBasis: "policy-v3-sod"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results for policy-v3-sod, got %d", len(results))
+	}
+}
+
+// TestPgStore_List_FilterByTimeRange verifies the from/to time range filter
+// in isolation, using a half-open-in-practice inclusive bound.
+func TestPgStore_List_FilterByTimeRange(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	base := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	results, err := s.List(ctx, store.ListParams{
+		From: base.AddDate(0, 0, 1),
+		To:   base.AddDate(0, 0, 2),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results in range, got %d: %+v", len(results), results)
+	}
+}
+
+// TestPgStore_List_FiltersCompose verifies multiple filters applied together
+// narrow the result set with AND semantics, not OR.
+func TestPgStore_List_FiltersCompose(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	results, err := s.List(ctx, store.ListParams{
+		ActorID:       "actor-1",
+		LegalEntityID: "entity-A",
+		RuleBasis:     "policy-v9-tax",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 1 || results[0].DecisionID != "dec-list-3" {
+		t.Fatalf("expected exactly dec-list-3, got %+v", results)
+	}
+}
+
+// TestPgStore_List_NoMatch_ReturnsEmptyNotError verifies a filter combination
+// matching nothing returns an empty slice, not an error.
+func TestPgStore_List_NoMatch_ReturnsEmptyNotError(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s)
+
+	results, err := s.List(ctx, store.ListParams{ActorID: "does-not-exist"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected 0 results, got %d", len(results))
+	}
+}

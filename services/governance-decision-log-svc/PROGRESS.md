@@ -7,8 +7,9 @@ CONTEXT.md for the spec/context).
 
 ## Current status
 
-**Phase:** Phase 1 (write path) built and verified. Not yet committed
-to a branch. Phase 2 (query surface) not started.
+**Phase:** Phase 1 (write path) merged to `main` (PR #14). Phase 2
+(query surface) built and verified, on branch
+`feat/governance-decision-log-svc-query-surface`, not yet merged.
 
 ## Roadmap — three phases, three branches, three PRs into `main`
 
@@ -21,9 +22,9 @@ on its own. Full technical detail for each phase is in CONTEXT.md
 
 | Phase | Branch (suggested) | Scope | Status |
 | --- | --- | --- | --- |
-| 1 | `feat/governance-decision-log-svc-write-path` | New service scaffold (cmd/config/handler/store/domain/health), migration, `POST /v1/decisions`, idempotent on `decision_id`, real `PgStore` wired into `main.go` | **Built + verified** (not committed yet) |
-| 2 | `feat/governance-decision-log-svc-query-surface` | `GET /v1/decisions/{id}` + `GET /v1/decisions` with all 5 filters (actor, entity, action, rule_basis, time range), composable; handler unit tests + real Postgres integration tests | Not started |
-| 3 | `feat/governance-decision-log-svc-close-loop` | Publish `governance.decision.recorded` (stub-Kafka convention), add service to CI matrix + `TEST_DATABASE_URL` condition, Dockerfile, `services/README.md` entry | Blocked on Phase 1 + 2 merge |
+| 1 | `feat/governance-decision-log-svc-write-path` | New service scaffold (cmd/config/handler/store/domain/health), migration, `POST /v1/decisions`, idempotent on `decision_id`, real `PgStore` wired into `main.go` | **Merged to `main`** (PR #14) |
+| 2 | `feat/governance-decision-log-svc-query-surface` | `GET /v1/decisions/{id}` + `GET /v1/decisions` with all 5 filters (actor, entity, action, rule_basis, time range), composable; handler unit tests + real Postgres integration tests | **Built + verified** (not yet merged) |
+| 3 | `feat/governance-decision-log-svc-close-loop` | Publish `governance.decision.recorded` (stub-Kafka convention), add service to CI matrix + `TEST_DATABASE_URL` condition, Dockerfile, `services/README.md` entry | Blocked on Phase 2 merge |
 
 ## Log
 
@@ -98,13 +99,43 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   changes. Fixed with `docker restart gdl-test-server`. **Any future code
   change to this service requires a container restart to take effect.**
 
+### 2026-07-07 — Phase 2 (query surface) built and verified
+- Branched `feat/governance-decision-log-svc-query-surface` off updated
+  `main` (post Phase-1 merge, PR #14).
+- Added `store.PgStore.List` (all 5 filters — `actor_id`, `legal_entity_id`,
+  `action_type`, `rule_basis`, `decided_at` time range — compose with AND,
+  default limit 50/max 200, newest-first), refactored `FindByID` to share
+  a `decisionColumns`/`scanDecision` helper with `List`.
+- Added `GET /v1/decisions/{decision_id}` (200/404/503) and
+  `GET /v1/decisions?actor=&entity=&action=&rule_basis=&from=&to=&limit=&offset=`
+  (200 with all filters composable, 400 on invalid `from`/`to`, 503 on
+  store failure) to the handler, mirroring `jurisdiction-rules-svc`'s
+  `ListJurisdictions`/`GetRules` filter-parsing pattern.
+- 8 new handler unit tests (mocked store) + 8 new Postgres integration
+  tests (one per filter in isolation, one composing three filters
+  together, one asserting empty-not-error on no match) — all passing,
+  run inside `golang:1.25` (still no local Go toolchain).
+- Verified live end-to-end: booted the real binary against a real
+  `postgres:16-alpine` container, POSTed two decisions, confirmed
+  `GET /v1/decisions/{id}` returns 200 for a known id and 404 for an
+  unknown one, confirmed unfiltered `GET /v1/decisions` returns all rows,
+  confirmed single-filter and composed multi-filter (`entity` +
+  `rule_basis`) queries narrow correctly with AND semantics, confirmed
+  `from` time-range filtering, and confirmed `from=<garbage>` returns 400.
+  Test containers torn down after verification.
+- Not yet committed/pushed — sitting as uncommitted files pending review.
+
 ## Next steps
 
 - [x] Scaffold Phase 1 (write path).
 - [x] Verify Phase 1 against a real Postgres container (boot, POST,
       confirm row, re-POST same `decision_id`, confirm no duplicate).
-- [ ] Commit Phase 1 to `feat/governance-decision-log-svc-write-path` and open a PR into `main`.
-- [ ] Scaffold Phase 2 (query surface) on a fresh branch off updated `main`.
+- [x] Commit Phase 1 to `feat/governance-decision-log-svc-write-path` and open a PR into `main`. (PR #14, merged)
+- [x] Scaffold Phase 2 (query surface) on a fresh branch off updated `main`.
+- [x] Verify Phase 2 against a real Postgres container (single lookup,
+      unfiltered list, each filter individually, composed filters,
+      invalid timestamp rejection).
+- [ ] Commit Phase 2 to `feat/governance-decision-log-svc-query-surface` and open a PR into `main`.
 - [ ] Scaffold Phase 3 (events, CI, Dockerfile, README) on a fresh
       branch off updated `main`; verify via a real Docker container
       against real Postgres.

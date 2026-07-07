@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 
 	"zoiko.io/governance-decision-log-svc/internal/domain"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
+	"zoiko.io/governance-decision-log-svc/internal/store"
 )
 
 // stubStore implements handler.DecisionStore for unit testing.
@@ -21,11 +23,27 @@ type stubStore struct {
 	created bool
 	err     error
 	got     *domain.GovernanceDecision
+
+	findByIDResult *domain.GovernanceDecision
+	findByIDErr    error
+
+	listResult    []*domain.GovernanceDecision
+	listErr       error
+	listGotParams store.ListParams
 }
 
 func (s *stubStore) Insert(_ context.Context, d domain.GovernanceDecision) (bool, error) {
 	s.got = &d
 	return s.created, s.err
+}
+
+func (s *stubStore) FindByID(_ context.Context, decisionID string) (*domain.GovernanceDecision, error) {
+	return s.findByIDResult, s.findByIDErr
+}
+
+func (s *stubStore) List(_ context.Context, params store.ListParams) ([]*domain.GovernanceDecision, error) {
+	s.listGotParams = params
+	return s.listResult, s.listErr
 }
 
 func newTestRouter(store handler.DecisionStore) http.Handler {
@@ -148,5 +166,151 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 	}
 	if got["error"] != "store_unavailable" {
 		t.Errorf("expected error=store_unavailable, got %q", got["error"])
+	}
+}
+
+// TestGetDecision_200_Found verifies a known decision_id returns 200 with
+// the stored decision.
+func TestGetDecision_200_Found(t *testing.T) {
+	want := &domain.GovernanceDecision{DecisionID: "dec-001", TenantID: "tenant-1"}
+	h := newTestRouter(&stubStore{findByIDResult: want})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	var got domain.GovernanceDecision
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("failed to decode response body: %v", err)
+	}
+	if got.DecisionID != "dec-001" {
+		t.Errorf("decision_id mismatch: got %q", got.DecisionID)
+	}
+}
+
+// TestGetDecision_404_NotFound verifies an unknown decision_id returns 404,
+// distinct from a store failure (503).
+func TestGetDecision_404_NotFound(t *testing.T) {
+	h := newTestRouter(&stubStore{findByIDErr: domain.ErrDecisionNotFound})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/does-not-exist", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestGetDecision_503_StoreUnavailable verifies a non-not-found store error
+// returns 503, never conflated with a legitimate 404.
+func TestGetDecision_503_StoreUnavailable(t *testing.T) {
+	h := newTestRouter(&stubStore{findByIDErr: domain.ErrStoreUnavailable})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestListDecisions_200_Empty verifies an empty result set serialises as an
+// empty JSON array, never null.
+func TestListDecisions_200_Empty(t *testing.T) {
+	h := newTestRouter(&stubStore{listResult: nil})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if strings.TrimSpace(rr.Body.String()) != "[]" {
+		t.Errorf("expected empty JSON array, got %q", rr.Body.String())
+	}
+}
+
+// TestListDecisions_FiltersComposeIntoListParams verifies every query
+// parameter is parsed and forwarded to the store, and that they compose
+// (all filters can be set simultaneously).
+func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
+	s := &stubStore{listResult: []*domain.GovernanceDecision{{DecisionID: "dec-001"}}}
+	h := newTestRouter(s)
+
+	q := url.Values{
+		"actor":      {"actor-1"},
+		"entity":     {"entity-1"},
+		"action":     {"PAYROLL_RELEASE"},
+		"rule_basis": {"policy-v3-sod"},
+		"from":       {"2024-01-01T00:00:00Z"},
+		"to":         {"2024-12-31T23:59:59Z"},
+		"limit":      {"10"},
+		"offset":     {"5"},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?"+q.Encode(), nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	p := s.listGotParams
+	if p.ActorID != "actor-1" || p.LegalEntityID != "entity-1" || p.ActionType != "PAYROLL_RELEASE" || p.RuleBasis != "policy-v3-sod" {
+		t.Errorf("filters not forwarded correctly: %+v", p)
+	}
+	if p.From.IsZero() || p.To.IsZero() {
+		t.Errorf("expected from/to to be parsed, got %+v", p)
+	}
+	if p.Limit != 10 || p.Offset != 5 {
+		t.Errorf("expected limit=10 offset=5, got limit=%d offset=%d", p.Limit, p.Offset)
+	}
+}
+
+// TestListDecisions_400_InvalidFrom verifies a malformed from timestamp is
+// rejected with 400 rather than silently ignored or causing a 500.
+func TestListDecisions_400_InvalidFrom(t *testing.T) {
+	h := newTestRouter(&stubStore{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?from=not-a-timestamp", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestListDecisions_400_InvalidTo verifies a malformed to timestamp is
+// rejected with 400.
+func TestListDecisions_400_InvalidTo(t *testing.T) {
+	h := newTestRouter(&stubStore{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?to=not-a-timestamp", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestListDecisions_503_StoreUnavailable verifies a store failure returns
+// 503, not a silently empty list.
+func TestListDecisions_503_StoreUnavailable(t *testing.T) {
+	h := newTestRouter(&stubStore{listErr: domain.ErrStoreUnavailable})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
 	}
 }
