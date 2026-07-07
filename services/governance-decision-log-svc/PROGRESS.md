@@ -221,6 +221,25 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   per-phase branches, and the Phase 2+3 PR into `main` is still open,
   not yet merged.
 
+### 2026-07-07 — Closing out active development on this service
+- All 3 build phases (write path, query surface, close the loop) are
+  code-complete, fully aligned with `CONTEXT.md`, and verified live
+  (real Postgres, real built Docker image, manual Postman). 30 tests
+  passing. Nothing left to build against the current spec.
+- Handed off: PR title/URL/description for `shashi-changes` → `main`
+  (covering Phase 2, Phase 3, and the `ErrStoreUnavailable` alignment
+  fix) given to the user to open and merge manually.
+- Only remaining open items are explicitly deferred, not blocking:
+  the fail-closed-vs-async delivery question and the read-API auth
+  model question, both to be revisited when Authorization Service
+  integration begins (a service that does not exist yet). Real Kafka
+  wiring (currently stubbed — logs instead of producing) is also
+  deferred, matching the same stub convention used by
+  `identity-context-svc` and `tenant-entity-registry-svc`.
+- Active development on this service pauses here. Next: moving to a
+  new service in Phase 1 "Sovereign Spine" (see
+  `docs/architecture/06-blueprint.md`).
+
 ## Next steps
 
 - [x] Scaffold Phase 1 (write path).
