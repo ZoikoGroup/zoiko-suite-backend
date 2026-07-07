@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/handler"
 )
@@ -95,13 +97,34 @@ func (p *stubPublisher) PublishRuleRetired(_ context.Context, _ domain.PolicyVer
 	return nil
 }
 
+// ── stub decision log client ─────────────────────────────────────────────────
+
+// stubDecisionLog implements handler.decisionlog.Client (via the
+// decisionlog.Client interface) for unit testing. Records every call so
+// tests can assert on recording behaviour.
+type stubDecisionLog struct {
+	calls int
+	last  decisionlog.RecordDecisionParams
+	err   error
+}
+
+func (d *stubDecisionLog) RecordDecision(_ context.Context, params decisionlog.RecordDecisionParams) error {
+	d.calls++
+	d.last = params
+	return d.err
+}
+
 func newTestRouter(s *stubStore) chi.Router {
-	return newTestRouterWithPublisher(s, &stubPublisher{})
+	return newTestRouterFull(s, &stubPublisher{}, &stubDecisionLog{})
 }
 
 func newTestRouterWithPublisher(s *stubStore, p *stubPublisher) chi.Router {
+	return newTestRouterFull(s, p, &stubDecisionLog{})
+}
+
+func newTestRouterFull(s *stubStore, p *stubPublisher, d *stubDecisionLog) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, zap.NewNop())
+	h := handler.New(s, p, d, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -496,9 +519,11 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 			},
 		},
 	}
-	r := newTestRouter(store)
+	decisionLog := &stubDecisionLog{}
+	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":7500}}`
+	tenantID := "t-1"
+	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"t-1","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -523,6 +548,68 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	if got.RuleBasis != "APPROVAL_5K:pv-1" {
 		t.Errorf("expected rule_basis APPROVAL_5K:pv-1, got %s", got.RuleBasis)
 	}
+
+	// The evidence obligation: every real evaluation must be recorded.
+	if decisionLog.calls != 1 {
+		t.Fatalf("expected RecordDecision called once, got %d", decisionLog.calls)
+	}
+	if decisionLog.last.ActorID != "admin-1" {
+		t.Errorf("expected ActorID admin-1, got %s", decisionLog.last.ActorID)
+	}
+	if decisionLog.last.Outcome != "APPROVAL_REQUIRED" {
+		t.Errorf("expected Outcome APPROVAL_REQUIRED, got %s", decisionLog.last.Outcome)
+	}
+	if decisionLog.last.RuleBasis != "APPROVAL_5K:pv-1" {
+		t.Errorf("expected RuleBasis APPROVAL_5K:pv-1, got %s", decisionLog.last.RuleBasis)
+	}
+	if decisionLog.last.TenantID == nil || *decisionLog.last.TenantID != tenantID {
+		t.Errorf("expected TenantID t-1 forwarded, got %v", decisionLog.last.TenantID)
+	}
+	if decisionLog.last.DecisionID == "" {
+		t.Errorf("expected a generated DecisionID when none supplied")
+	}
+}
+
+func TestEvaluate_MissingEvaluatedByPrincipalID(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000}}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestEvaluate_DecisionLogFailure_StillReturns200(t *testing.T) {
+	store := &stubStore{
+		applicable: []*domain.ApplicablePolicyVersion{
+			{
+				PolicyVersion: domain.PolicyVersion{
+					PolicyVersionID: "pv-1",
+					RulePayload:     []byte(`{"threshold_amount":5000}`),
+				},
+				PolicyCode: "APPROVAL_5K",
+			},
+		},
+	}
+	decisionLog := &stubDecisionLog{err: fmt.Errorf("governance-decision-log-svc unreachable")}
+	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
+
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	// Best-effort: evaluation must still succeed even if evidence recording fails.
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 even when decision-log call fails, got %d: %s", w.Code, w.Body.String())
+	}
+	if decisionLog.calls != 1 {
+		t.Errorf("expected RecordDecision to have been attempted once, got %d", decisionLog.calls)
+	}
 }
 
 func TestEvaluate_WithinThreshold(t *testing.T) {
@@ -540,7 +627,7 @@ func TestEvaluate_WithinThreshold(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000}}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -574,7 +661,7 @@ func TestEvaluate_AmountEqualsThreshold_IsWithinThreshold(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":5000}}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":5000},"evaluated_by_principal_id":"admin-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -616,7 +703,7 @@ func TestEvaluate_MissingActionContextAmount(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{}}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{},"evaluated_by_principal_id":"admin-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -627,15 +714,19 @@ func TestEvaluate_MissingActionContextAmount(t *testing.T) {
 }
 
 func TestEvaluate_NoApplicablePolicy(t *testing.T) {
-	r := newTestRouter(&stubStore{applicable: nil})
+	decisionLog := &stubDecisionLog{}
+	r := newTestRouterFull(&stubStore{applicable: nil}, &stubPublisher{}, decisionLog)
 
-	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000}}`
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
+	}
+	if decisionLog.calls != 0 {
+		t.Errorf("expected no decision recorded when nothing was evaluated, got %d calls", decisionLog.calls)
 	}
 }
 
@@ -645,14 +736,18 @@ func TestEvaluate_PolicyTypeNotImplemented(t *testing.T) {
 			{PolicyVersion: domain.PolicyVersion{PolicyVersionID: "pv-1"}},
 		},
 	}
-	r := newTestRouter(store)
+	decisionLog := &stubDecisionLog{}
+	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
-	body := `{"policy_type":"SPEND_CONTROL","action_context":{"amount":1000}}`
+	body := `{"policy_type":"SPEND_CONTROL","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusNotImplemented {
 		t.Fatalf("expected 501, got %d", w.Code)
+	}
+	if decisionLog.calls != 0 {
+		t.Errorf("expected no decision recorded for an unimplemented policy_type, got %d calls", decisionLog.calls)
 	}
 }

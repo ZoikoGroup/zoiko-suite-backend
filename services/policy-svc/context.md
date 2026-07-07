@@ -413,7 +413,14 @@ for four total cases.
   Returns the currently-ACTIVE policy version(s) applicable to that
   scope.
 - `POST /v1/policies/evaluate` — body: `{policy_type, tenant_id,
-  legal_entity_id, action_context: {...}}`.
+  legal_entity_id, action_context: {...}, evaluated_by_principal_id,
+  decision_id}`.
+  **Updated in §19 (Batch D):** `evaluated_by_principal_id` is required
+  and `decision_id` is optional — neither was in the original Batch B
+  design; both were added when wiring real evidence recording surfaced
+  that governance-decision-log-svc requires an actor and supports (but
+  doesn't require) an idempotency key. See §19 before trusting this list
+  as complete on its own.
   1. Look up the applicable ACTIVE version for that type+scope.
   2. **No applicable policy → `404`.** The service does not guess
      fail-open/fail-closed; that decision belongs to the caller. (This is
@@ -422,12 +429,17 @@ for four total cases.
      `rule_payload.threshold_amount` from the matched version.
   4. Response: `{"result": "APPROVAL_REQUIRED" | "WITHIN_THRESHOLD",
      "policy_version_id": "...", "rule_basis": "..."}`.
+  5. **(§19)** Records the decision in `governance-decision-log-svc` —
+     see §19 for the full design and live verification. Not implemented
+     until Batch D; if you're reading this section in isolation, it looks
+     like this endpoint is a pure read with no evidence trail — it no
+     longer is.
 
 **Why this response shape:** it's deliberately close to what
 `governance-decision-log-svc`'s `POST /v1/decisions` expects — especially
-`rule_basis` — because this evaluation result is meant to feed that
-service later. Wiring the actual call between them is explicitly a
-**separate future task**, not part of this build.
+`rule_basis` — because this evaluation result feeds that service. That
+wiring, originally deferred as a "separate future task," was completed in
+§19.
 
 **Idempotency:** falls out naturally — this is a pure read/compute
 endpoint with no side effects. The only risk is accidentally introducing
@@ -805,3 +817,130 @@ What's genuinely left, none of it blocking further use of what's built:
   restructure, per the design in §13.4.
 - Consume `entity.created`/`role.updated`/`authority.delegated` — deferred
   until their producers are real.
+
+## 19. Batch D — closing the evidence-obligation gap (2026-07-07)
+
+### How this was found
+
+A direct, section-by-section re-read of `03-microservices.md` §8.1
+against the actual code (not against this file's own summary of it —
+re-fetched the source doc fresh) found one clause not actually met:
+**"preserve evaluation basis for governed decisions"** (an Evidence
+Obligation). `Evaluate` computed and *returned* `rule_basis`/
+`policy_version_id` in its HTTP response, but nothing in policy-svc ever
+*persisted* that anywhere — confirmed by grepping the store package for
+`INSERT` and finding exactly two (`CreatePolicy`, `CreatePolicyVersion`),
+none for evaluations. Returning data in a response is not evidence;
+evidence has to survive after the response is sent. This was the one
+finding, out of several reviewed, judged a genuine unclosed gap rather
+than a documented, deliberate deferral (caching, consumed events) or a
+reasonable interpretation with existing precedent (`policies` having no
+`tenant_id`, mirroring `jurisdictions`).
+
+### What was built
+
+`internal/decisionlog/client.go` — a `Client` interface + `HTTPClient`
+that POSTs to `governance-decision-log-svc`'s `POST /v1/decisions` after
+every real `APPROVAL_THRESHOLD` evaluation. Wired into
+`evaluateApprovalThreshold` in `handler.go`, called synchronously (not a
+goroutine — matches this codebase's actual convention: even the *real*
+Kafka producers added to `identity-context-svc`/`tenant-entity-registry-svc`
+by the `origin/main` merge in §"Synced with origin/main" call
+`WriteMessages` synchronously, not fire-and-forget). Only called when an
+evaluation actually happened — not on `404` (no applicable policy) or
+`501` (unimplemented type) paths, since nothing was evaluated there to
+have a basis for.
+
+### Two contract mismatches this surfaced — not assumed away
+
+1. **Required-field mismatch.** governance-decision-log-svc's
+   `createDecisionRequest.missingField()` hard-requires `tenant_id` and
+   `legal_entity_id` non-empty. policy-svc's evaluate legitimately
+   supports both nil (global policies, §13.1). Confirmed the exact
+   validation live (`POST /v1/decisions` with them omitted → `400
+   {"error":"missing_field","field":"tenant_id"}`) before designing
+   around it, rather than assuming from the code read alone. Resolved
+   with a `"GLOBAL"` sentinel substituted when either is nil — confirmed
+   live that governance-decision-log-svc accepts this with no
+   special-casing (it has no format/UUID validation on these fields,
+   just a non-empty check).
+2. **Missing actor.** governance-decision-log-svc also requires
+   `actor_id`, but `Evaluate`'s original request shape (§13.4) had no
+   field identifying who's asking. Fixed by adding
+   **`evaluated_by_principal_id`** as a new *required* field on
+   `POST /v1/policies/evaluate` — this is a breaking change to an
+   endpoint that was already built, tested, and manually verified in
+   Postman earlier in this session. All existing tests and the earlier
+   endpoint reference needed updating to match (see `progress.md`
+   "Postman impact").
+
+### Other decisions made, not specified anywhere
+
+- **`ActionType` sent to governance-decision-log-svc is `req.PolicyType`**
+  (e.g. `"APPROVAL_THRESHOLD"`) — `Evaluate`'s request has no separate
+  field describing "what business action is this for," so the policy
+  type itself is the closest available analog. Not verified against any
+  real downstream consumer of `action_type` — flag if this should instead
+  be caller-supplied.
+- **Optional `decision_id`** lets callers who need exactly-once evidence
+  supply their own idempotency key (governance-decision-log-svc is
+  idempotent on it); omitted, a fresh UUID is generated per `Evaluate`
+  call. This means a client-side retry of `Evaluate` without a supplied
+  `decision_id` can record a duplicate decision — `Evaluate`'s own result
+  is still correct and idempotent, only this best-effort side channel
+  isn't, and only in that specific case. Documented, not fixed further:
+  closing it completely would require either mandating `decision_id`
+  (another breaking change) or deriving one from request content, both
+  of which felt like over-engineering relative to what was actually asked.
+- **HTTP client timeout tightened from 5s to 2s** after live testing (see
+  below) showed a fully-down dependency costs ~2.5s in DNS resolution
+  alone with an unbounded-enough client — a concrete, measured number,
+  not a guess, in a context (`03-microservices.md` §3.9) that explicitly
+  cares about governance enforcement not becoming a latency bottleneck.
+
+### Verification transcript
+
+Unlike Batches A–C's Postgres-only testing, this required a **second
+live service** to actually prove anything — a stub-only test could not
+have caught either contract mismatch above.
+
+1. Stood up `governance-decision-log-svc` for real: created a
+   `governance_decision_log` database in the same Postgres container,
+   applied its migration, built and ran it (`golang:1.25-alpine` bind
+   mount, same pattern as policy-svc itself) on the shared Docker
+   network, port 8083.
+2. Confirmed the required-field contract directly: `POST /v1/decisions`
+   with `tenant_id`/`legal_entity_id` omitted → `400`; with `"GLOBAL"`
+   sentinels → `201`. This ran *before* writing the client code, not
+   after, specifically to avoid designing against an assumption.
+3. Built `internal/decisionlog`, wired it in, updated `evaluateRequest`
+   and all affected tests. `go build`, `go vet`, `go test ./... -v` →
+   **34/34 pass** (29 from Batches A–C + 5 new: successful recording with
+   field assertions, missing-actor 400, best-effort-on-failure still
+   returns 200, plus the two no-recording-when-nothing-evaluated updates
+   to existing 404/501 tests).
+4. Rebuilt and restarted the live policy-svc container pointed at the
+   real `governance-decision-log-svc` container
+   (`GOVERNANCE_DECISION_LOG_SERVICE_URL=http://gov-decision-log-app:8083`).
+5. **End-to-end proof, not a mock**: called `Evaluate` with a
+   caller-supplied `decision_id` and real `tenant_id`/`legal_entity_id`,
+   then fetched that exact `decision_id` back from
+   `governance-decision-log-svc`'s own `GET /v1/decisions/{id}` — every
+   field matched (`actor_id`, `outcome`, `rule_basis`,
+   `evaluation_context`, and `correlation_id` matching policy-svc's own
+   request-ID). Repeated with tenant/entity omitted and confirmed both
+   came back as `"GLOBAL"` in the fetched record.
+6. **Failure-mode proof**: `docker stop`'d `governance-decision-log-svc`
+   mid-session, called `Evaluate` again — got `200` with the correct
+   result, and the failure appeared in policy-svc's logs as an `error`
+   level entry, never surfaced to the caller. This is the finding that
+   led to the 2s timeout (item above) — the failed call took ~2.56s
+   wall-clock before the fix.
+7. Restarted `governance-decision-log-svc`, rebuilt policy-svc with the
+   tightened timeout, re-ran the full test suite once more — still
+   34/34 clean.
+
+This is the same rigor level as Batches A–C, extended to a second
+service: nothing here was asserted without a live request/response to
+back it, and the one bug-shaped finding (the DNS timeout latency) was
+fixed based on a measured number, not a hypothetical.

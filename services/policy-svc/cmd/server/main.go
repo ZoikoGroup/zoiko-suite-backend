@@ -26,6 +26,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/config"
+	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/events"
 	"zoiko.io/policy-svc/internal/handler"
 	"zoiko.io/policy-svc/internal/health"
@@ -51,6 +52,7 @@ func main() {
 	log.Info("policy-svc starting",
 		zap.Int("port", cfg.Port),
 		zap.String("db_host", cfg.DB.Host),
+		zap.String("governance_decision_log_url", cfg.GovernanceDecisionLogServiceURL),
 	)
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
@@ -83,6 +85,7 @@ func main() {
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 	publisher := events.NewPublisher(log, "policy-events")
+	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -92,7 +95,7 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, log)
+	h := handler.New(pgStore, publisher, decisionLogClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes ──────────────────────────────────────────────────────

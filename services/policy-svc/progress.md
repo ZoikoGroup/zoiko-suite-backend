@@ -1,15 +1,19 @@
 # Policy Service — Progress & Phase Plan
 
-Status: **All 3 batches (A, B, C) built, tested, and verified — including
-a real Docker image build and run.** This supersedes the earlier
-15-phase speculative plan: the build was task-approved and scoped into
-3 sequential batches, each its own branch off `main` in
-`ZoikoGroup/zoiko-suite-backend`. Full citations, exact schema, exact
+Status: **All 3 original batches (A, B, C) plus a follow-up Batch D built,
+tested, and verified — including a real Docker image build and a real
+second live service (`governance-decision-log-svc`) for cross-service
+proof.** This supersedes the earlier 15-phase speculative plan: the build
+was task-approved and scoped into 3 sequential batches, each its own
+branch off `main` in `ZoikoGroup/zoiko-suite-backend`; Batch D followed
+from a spec-compliance self-review (see "so what we need to do to make it
+100% aligned" in conversation). Full citations, exact schema, exact
 endpoint contracts, and exact code patterns to mirror are in
-`context.md` §13. **policy-svc's v1 scope is now functionally complete**
-— see `context.md` §18 for the closing summary and what's genuinely left
-for a human to decide (Kafka wiring, Authorization Service integration,
-the 3 remaining policy types) versus what's actually done.
+`context.md` §13. **policy-svc's v1 scope, including its evidence
+obligation, is now functionally complete** — see `context.md` §19 for the
+closing summary and what's genuinely left for a human to decide (Kafka
+wiring, Authorization Service integration, the 3 remaining policy types,
+consuming `entity.created`) versus what's actually done.
 
 **Verification actually performed (2026-07-07):** no Go toolchain exists
 in the assistant's sandbox, so a Docker container (`golang:1.25-alpine`)
@@ -42,6 +46,75 @@ Dockerfile, and docker-compose entry. Merge was clean — no conflicts in
 `.github/workflows/ci.yml` or `services/README.md` despite both being
 touched on both sides. Re-ran the full test suite post-merge: still
 clean, nothing in policy-svc affected.
+
+## Batch D — Close the evidence-obligation gap (post-review, 2026-07-07)
+
+A spec-compliance review against the literal text of `03-microservices.md`
+§8.1 found one real, unclosed gap: `Evaluate` returned `rule_basis`/
+`policy_version_id` in its HTTP response but **never persisted anything**
+— the "preserve evaluation basis for governed decisions" evidence
+obligation was not actually met, only structurally set up for later. This
+batch closes it. **Done, built, tested, and verified against a real,
+independently-running `governance-decision-log-svc` instance — see
+`context.md` §19.**
+
+- [x] New `internal/decisionlog` package — `Client` interface +
+      `HTTPClient`, POSTs to `governance-decision-log-svc`'s
+      `POST /v1/decisions` after every real `APPROVAL_THRESHOLD`
+      evaluation (not on `404`/`501` paths — nothing was evaluated there)
+- [x] Two contract mismatches discovered and resolved while wiring this,
+      not assumed away:
+  - governance-decision-log-svc requires `tenant_id`/`legal_entity_id`
+    non-empty on every decision; policy-svc legitimately allows both nil
+    (global policies). Resolved with a `"GLOBAL"` sentinel value,
+    confirmed accepted by a real instance with no special-casing needed
+    on the decision-log side.
+  - governance-decision-log-svc requires `actor_id`; `Evaluate`'s
+    original request shape had no actor field at all. Added
+    **`evaluated_by_principal_id`** as a new required field on
+    `POST /v1/policies/evaluate` — a breaking change to an
+    already-shipped, already-Postman-tested endpoint. Updated all
+    existing tests and this doc's earlier endpoint reference accordingly.
+- [x] Optional `decision_id` field added to the evaluate request for
+      callers that need exactly-once evidence (governance-decision-log-svc
+      is itself idempotent on `decision_id`); omitted, a fresh UUID is
+      generated per call — meaning a client-side retry of `Evaluate`
+      without a supplied `decision_id` could record a duplicate decision.
+      Documented as a known, accepted limitation, not fixed further:
+      `Evaluate`'s own result is still idempotent, only this best-effort
+      side channel is not.
+- [x] Call is synchronous (matches this codebase's actual convention for
+      Kafka publishing, not a goroutine) but best-effort: failures are
+      logged, never surfaced or blocking — verified live by killing
+      `governance-decision-log-svc` mid-session and confirming `Evaluate`
+      still returned `200`.
+- [x] HTTP client timeout tightened from an initial 5s to **2s** after
+      live testing showed a DNS-resolution failure alone (fully-down
+      dependency) cost ~2.5s wall-clock — a real, measured latency risk
+      against the docs' "must not become a bottleneck" requirement for
+      Policy Service, not a hypothetical one.
+
+**Verified against a real, second live service (2026-07-07 — DONE):**
+stood up an actual `governance-decision-log-svc` instance (its own
+Postgres database, same Docker network) — not a stub. Ran `Evaluate`
+with a caller-supplied `decision_id` and real `tenant_id`/
+`legal_entity_id`, then fetched that exact `decision_id` back from
+`governance-decision-log-svc` directly and confirmed every field
+(`actor_id`, `outcome`, `rule_basis`, `evaluation_context`,
+`correlation_id`) matched. Repeated with no `tenant_id`/`legal_entity_id`
+and confirmed both come back as `"GLOBAL"`. Then stopped
+`governance-decision-log-svc` entirely and confirmed `Evaluate` still
+returns `200` with the failure only logged.
+
+### Postman impact
+
+`POST /v1/policies/evaluate` now requires `evaluated_by_principal_id` in
+the body — existing saved requests need updating or they'll fail `400
+missing_field`. Example:
+
+```json
+{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1"}
+```
 
 Repo correction: remote is `ZoikoGroup/zoiko-suite-backend`. Services
 that exist now: `identity-context-svc` (8080), `tenant-entity-registry-svc`
