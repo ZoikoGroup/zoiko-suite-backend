@@ -11,8 +11,11 @@ CONTEXT.md for the spec/context).
 (query surface) and Phase 3 (close the loop — events, CI, Dockerfile,
 README) both built, verified, and pushed to `shashi-changes` (mirrors
 the Phase 1 flow — commits landed on the personal working branch
-rather than per-phase feature branches). PR into `main` not yet opened
-(to be opened manually).
+rather than per-phase feature branches). A full line-by-line audit
+against `CONTEXT.md` found and fixed one real gap
+(`domain.ErrStoreUnavailable` now actually wired into `PgStore`) — the
+service is now fully spec-compliant. PR into `main` not yet opened (to
+be opened manually).
 
 ## Roadmap — three phases, three branches, three PRs into `main`
 
