@@ -62,17 +62,32 @@ curl http://localhost:8084/readyz
 ```
 
 ### 2. Produce a Test Kafka Event
-You can publish a test event using `kcat` (or `kafkacat`) from your host machine to confirm message ingestion:
+You can publish a test event using `kcat` (or `kafkacat`) from your host machine to confirm message ingestion.
+
+**On Bash (Linux/macOS/WSL):**
 ```bash
 kcat -P -b localhost:9092 -t zoiko.identity.events \
      -H "X-Event-ID=test-evt-001" \
      <<< '{"event_type":"identity.context.resolved","emitted_at":"2026-07-06T08:00:00Z","schema_version":"1.0","source_service":"identity-context-svc","payload":{"principal_id":"u-001","tenant_id":"t-001","legal_entity_id":"e-001","session_context_id":"s-001","correlation_id":"c-001"}}'
 ```
 
+**On Windows (PowerShell):**
+```powershell
+'{"event_type":"identity.context.resolved","emitted_at":"2026-07-06T08:00:00Z","schema_version":"1.0","source_service":"identity-context-svc","payload":{"principal_id":"u-001","tenant_id":"t-001","legal_entity_id":"e-001","session_context_id":"s-001","correlation_id":"c-001"}}' | kcat -P -b localhost:9092 -t zoiko.identity.events -H "X-Event-ID=test-evt-001"
+```
+
 ### 3. Verify Ingested Data Landed
-Check that `audit-event-store-svc` successfully consumed and saved the event:
+Check that `audit-event-store-svc` successfully consumed and saved the event.
+
+**On Bash (Linux/macOS/WSL):**
 ```bash
 psql "host=localhost dbname=audit_event_store user=postgres password=postgres sslmode=disable" \
+     -c "SELECT event_id, event_type, tenant_id, stored_at FROM audit_events ORDER BY stored_at;"
+```
+
+**On Windows (PowerShell):**
+```powershell
+psql "host=localhost dbname=audit_event_store user=postgres password=postgres sslmode=disable" `
      -c "SELECT event_id, event_type, tenant_id, stored_at FROM audit_events ORDER BY stored_at;"
 ```
 
