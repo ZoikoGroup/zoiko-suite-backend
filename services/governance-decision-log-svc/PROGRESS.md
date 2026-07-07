@@ -85,6 +85,19 @@ on its own. Full technical detail for each phase is in CONTEXT.md
   Test containers torn down after verification.
 - Not yet committed/pushed — sitting as uncommitted files pending review.
 
+### 2026-07-06 — Manual Postman smoke test against `gdl-test-server`
+- Re-verified Phase 1 via Postman against the `gdl-test-server` container
+  (`go run ./cmd/server`, source bind-mounted, backed by `gdl-test-postgres`):
+  `GET /healthz` → 200, `POST /v1/decisions` → 201 first time / 200 on
+  replay of the same `decision_id` (idempotency confirmed live, not just
+  in tests).
+- Hit a stale-process gotcha worth remembering: `/healthz` initially
+  returned Go's default 404 because the container's `go run` process had
+  been started before `/healthz` was added to `main.go` — `go run`
+  compiles once at container startup and does not hot-reload on source
+  changes. Fixed with `docker restart gdl-test-server`. **Any future code
+  change to this service requires a container restart to take effect.**
+
 ## Next steps
 
 - [x] Scaffold Phase 1 (write path).
