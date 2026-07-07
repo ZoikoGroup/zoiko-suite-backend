@@ -23,6 +23,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
@@ -90,7 +91,17 @@ func main() {
 
 	pgStore := store.New(pool, log)
 
-	eventPublisher := events.NewPublisher(log, cfg.Kafka.Topic)
+	// Kafka producer. Connects lazily on first write — not a fail-fast
+	// startup dependency like Postgres. Publish failures are logged inside
+	// Publisher.emit(), not propagated (see that method's doc comment).
+	kafkaWriter := &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+	}
+	defer func() { _ = kafkaWriter.Close() }()
+
+	eventPublisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
 	// Authorization client.
 	// Switch to authz.NewHTTPAuthZClient(cfg.AuthZServiceURL, log) before

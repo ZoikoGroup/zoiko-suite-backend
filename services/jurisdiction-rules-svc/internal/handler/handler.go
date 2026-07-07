@@ -6,11 +6,13 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
@@ -19,20 +21,84 @@ import (
 // Allows the handler to be tested without a real database.
 type JurisdictionStore interface {
 	FindByID(ctx context.Context, jurisdictionID string) (*domain.Jurisdiction, error)
+
 	List(ctx context.Context, params store.ListParams) ([]*domain.Jurisdiction, error)
+
 	FindAncestors(ctx context.Context, jurisdictionID string) ([]*domain.Jurisdiction, error)
+
 	FindRules(ctx context.Context, params store.FindRulesParams) ([]*domain.JurisdictionRule, error)
+  
+	// CreateJurisdiction inserts a new jurisdiction idempotently.
+	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
+
+	// DeactivateJurisdiction sets active_flag=false and updates audit columns.
+	DeactivateJurisdiction(ctx context.Context, jurisdictionID, actorID string) (*domain.Jurisdiction, error)
+
+	// FindRuleByID looks up a rule by ID.
+	FindRuleByID(ctx context.Context, ruleID string) (*domain.JurisdictionRule, error)
+
+	// CreateRule inserts a new rule idempotently.
+	CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
+
+	// TransitionRuleStatus atomically updates rule_status if current status is in allowedPriors.
+	TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, error)
 }
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
 	store JurisdictionStore
+	authz authz.AuthorizationClient
 	log   *zap.Logger
 }
 
 // New constructs a Handler.
-func New(store JurisdictionStore, log *zap.Logger) *Handler {
-	return &Handler{store: store, log: log}
+func New(store JurisdictionStore, authzClient authz.AuthorizationClient, log *zap.Logger) *Handler {
+	return &Handler{store: store, authz: authzClient, log: log}
+}
+
+// ruleStatusAllowedPriors defines the only legal prior rule_status for each
+// target status. Nothing else in the codebase or docs/architecture defines
+// this state machine, so it is owned here, at the boundary where "transition
+// to X" is first expressed as a concept.
+var ruleStatusAllowedPriors = map[string][]string{
+	"ACTIVE":     {"DRAFT"},
+	"SUPERSEDED": {"ACTIVE"},
+	"RETIRED":    {"ACTIVE", "SUPERSEDED"},
+}
+
+// CreateJurisdictionRequest is the caller-facing request body for
+// POST /v1/admin/jurisdictions. Deliberately narrower than
+// domain.CreateJurisdictionParams — the client must not be able to set
+// jurisdiction_id, active_flag, or created_by_principal_id itself.
+type CreateJurisdictionRequest struct {
+	JurisdictionCode     string     `json:"jurisdiction_code"`
+	JurisdictionName     string     `json:"jurisdiction_name"`
+	JurisdictionType     string     `json:"jurisdiction_type"`
+	ParentJurisdictionID *string    `json:"parent_jurisdiction_id"`
+	AuthorityType        string     `json:"authority_type"`
+	EffectiveFrom        time.Time  `json:"effective_from"`
+	EffectiveTo          *time.Time `json:"effective_to"`
+}
+
+// CreateRuleRequest is the caller-facing request body for
+// POST /v1/admin/jurisdictions/{jurisdiction_id}/rules.
+type CreateRuleRequest struct {
+	RuleDomain            string          `json:"rule_domain"`
+	RuleCode              string          `json:"rule_code"`
+	RuleName              string          `json:"rule_name"`
+	EffectiveFrom         time.Time       `json:"effective_from"`
+	EffectiveTo           *time.Time      `json:"effective_to"`
+	RulePayload           json.RawMessage `json:"rule_payload"`
+	SourceReference       *string         `json:"source_reference"`
+	ExternalFeedReference *string         `json:"external_feed_reference"`
+	RuleStatus            string          `json:"rule_status"`
+}
+
+// TransitionRuleStatusRequest is the caller-facing request body for
+// POST /v1/admin/rules/{jurisdiction_rule_id}/transition. The allowed prior
+// states are never client-supplied — see ruleStatusAllowedPriors.
+type TransitionRuleStatusRequest struct {
+	NewStatus string `json:"new_status"`
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -48,9 +114,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/ancestors", h.GetAncestors)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rules", h.GetRules)
 
-	// ── Admin mutations (AuthZ required — wired in next scaffold step) ────────
-	// r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
-	// r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
+	// ── Admin mutations (AuthZ required on every route) ───────────────────────
+	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
+	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
+	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
 }
 
 // correlationIDMiddleware echoes X-Correlation-ID from the request into the
@@ -297,6 +365,244 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, http.StatusOK, results)
+}
+
+// ── Admin mutations ──────────────────────────────────────────────────────────
+
+// CreateJurisdiction handles POST /v1/admin/jurisdictions.
+//
+// Response:
+//
+//	201 → new jurisdiction created
+//	200 → idempotent replay of an existing jurisdiction (same dedup key, same attributes)
+//	400 → malformed request body
+//	403 → authorization denied
+//	409 → dedup key matches an existing jurisdiction with differing attributes
+//	503 → authz or store unavailable
+func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if err := h.checkAuthz(r, "jurisdiction", "create"); err != nil {
+		h.writeAuthzError(w, err)
+		return
+	}
+
+	var req CreateJurisdictionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request_body"})
+		return
+	}
+
+	j, created, err := h.store.CreateJurisdiction(r.Context(), domain.CreateJurisdictionParams{
+		JurisdictionCode:     req.JurisdictionCode,
+		JurisdictionName:     req.JurisdictionName,
+		JurisdictionType:     req.JurisdictionType,
+		ParentJurisdictionID: req.ParentJurisdictionID,
+		AuthorityType:        req.AuthorityType,
+		EffectiveFrom:        req.EffectiveFrom,
+		EffectiveTo:          req.EffectiveTo,
+		ActiveFlag:           true,
+		CreatedByPrincipalID: actorIDFromRequest(r),
+	})
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	h.log.Info("CreateJurisdiction",
+		zap.String("jurisdiction_id", j.JurisdictionID),
+		zap.Bool("created", created),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, status, j)
+}
+
+// DeactivateJurisdiction handles POST /v1/admin/jurisdictions/{jurisdiction_id}/deactivate.
+//
+// Response:
+//
+//	200 → deactivated
+//	403 → authorization denied
+//	404 → jurisdiction_id not found
+//	503 → authz or store unavailable
+func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request) {
+	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if err := h.checkAuthz(r, "jurisdiction", "deactivate"); err != nil {
+		h.writeAuthzError(w, err)
+		return
+	}
+
+	j, err := h.store.DeactivateJurisdiction(r.Context(), jurisdictionID, actorIDFromRequest(r))
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+
+	h.log.Info("DeactivateJurisdiction",
+		zap.String("jurisdiction_id", jurisdictionID),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, j)
+}
+
+// CreateRule handles POST /v1/admin/jurisdictions/{jurisdiction_id}/rules.
+//
+// Response:
+//
+//	201 → new rule created
+//	200 → idempotent replay of an existing rule (same dedup key, same payload/name)
+//	400 → malformed request body
+//	403 → authorization denied
+//	409 → dedup key matches an existing rule with differing payload/name
+//	503 → authz or store unavailable
+func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
+	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if err := h.checkAuthz(r, "jurisdiction_rule", "create"); err != nil {
+		h.writeAuthzError(w, err)
+		return
+	}
+
+	var req CreateRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request_body"})
+		return
+	}
+
+	rule, created, err := h.store.CreateRule(r.Context(), domain.CreateRuleParams{
+		JurisdictionID:        jurisdictionID,
+		RuleDomain:            req.RuleDomain,
+		RuleCode:              req.RuleCode,
+		RuleName:              req.RuleName,
+		EffectiveFrom:         req.EffectiveFrom,
+		EffectiveTo:           req.EffectiveTo,
+		RulePayload:           req.RulePayload,
+		SourceReference:       req.SourceReference,
+		ExternalFeedReference: req.ExternalFeedReference,
+		RuleStatus:            req.RuleStatus,
+		CreatedByPrincipalID:  actorIDFromRequest(r),
+	})
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	h.log.Info("CreateRule",
+		zap.String("jurisdiction_rule_id", rule.JurisdictionRuleID),
+		zap.String("jurisdiction_id", jurisdictionID),
+		zap.Bool("created", created),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, status, rule)
+}
+
+// TransitionRuleStatus handles POST /v1/admin/rules/{jurisdiction_rule_id}/transition.
+//
+// Response:
+//
+//	200 → transitioned (or idempotent no-op if already in the target status)
+//	400 → malformed request body, or new_status is not a recognized target state
+//	403 → authorization denied
+//	404 → jurisdiction_rule_id not found
+//	409 → current status is not a legal prior state for new_status
+//	503 → authz or store unavailable
+func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
+	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if err := h.checkAuthz(r, "jurisdiction_rule", "transition"); err != nil {
+		h.writeAuthzError(w, err)
+		return
+	}
+
+	var req TransitionRuleStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request_body"})
+		return
+	}
+
+	allowedPriors, ok := ruleStatusAllowedPriors[req.NewStatus]
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_status"})
+		return
+	}
+
+	rule, err := h.store.TransitionRuleStatus(r.Context(), ruleID, req.NewStatus, allowedPriors, actorIDFromRequest(r))
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+
+	h.log.Info("TransitionRuleStatus",
+		zap.String("jurisdiction_rule_id", ruleID),
+		zap.String("new_status", req.NewStatus),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, rule)
+}
+
+// ── Shared admin helpers ─────────────────────────────────────────────────────
+
+// actorIDFromRequest extracts the acting principal from the trusted
+// X-Actor-Principal-ID header, falling back to "system" if absent — the same
+// convention used in identity-context-svc and tenant-entity-registry-svc.
+func actorIDFromRequest(r *http.Request) string {
+	if id := r.Header.Get("X-Actor-Principal-ID"); id != "" {
+		return id
+	}
+	return "system"
+}
+
+// checkAuthz extracts the caller's identity envelope from the Authorization
+// header and asks the AuthorizationClient for a decision. Doctrine: no domain
+// service self-authorizes a material action.
+func (h *Handler) checkAuthz(r *http.Request, resource, action string) error {
+	envelopeJWT := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return h.authz.Authorize(r.Context(), envelopeJWT, resource, action)
+}
+
+// writeAuthzError maps an AuthorizationClient error to an HTTP response.
+// Both the explicit denial and the unavailable case fail closed — no
+// mutation proceeds without a positive authz decision.
+func (h *Handler) writeAuthzError(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrUnauthorized) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "unauthorized"})
+		return
+	}
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+}
+
+// writeStoreError maps a store error to an HTTP response, extending the same
+// pattern already used by the read handlers above with the two admin-only
+// error types.
+func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationID string) {
+	switch {
+	case errors.Is(err, domain.ErrJurisdictionNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "jurisdiction_not_found"})
+	case errors.Is(err, domain.ErrRuleNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "rule_not_found"})
+	case errors.Is(err, domain.ErrConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict"})
+	case errors.Is(err, domain.ErrInvalidTransition):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+	default:
+		h.log.Error("admin store operation failed",
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	}
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.

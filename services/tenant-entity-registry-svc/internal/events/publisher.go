@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
@@ -37,13 +38,13 @@ type envelope struct {
 // (callers should invoke in goroutines or outbox). The DB write is NOT rolled back
 // on Kafka publish failure — the outbox pattern retries delivery.
 type Publisher struct {
-	log   *zap.Logger
-	topic string
-	// writer *kafka.Writer  — TODO: inject kafka.Writer before Phase 1 exit criteria
+	log    *zap.Logger
+	topic  string
+	writer *kafka.Writer
 }
 
-func NewPublisher(log *zap.Logger, topic string) *Publisher {
-	return &Publisher{log: log, topic: topic}
+func NewPublisher(log *zap.Logger, topic string, writer *kafka.Writer) *Publisher {
+	return &Publisher{log: log, topic: topic, writer: writer}
 }
 
 func (p *Publisher) PublishTenantCreated(ctx context.Context, tenant *domain.Tenant, correlationID string) {
@@ -131,7 +132,12 @@ func (p *Publisher) PublishEntityJurisdictionChanged(
 }
 
 // emit serializes the payload into the canonical envelope and writes to Kafka.
-// Stub: logs structured JSON until kafka.Writer is injected.
+//
+// Signature note: emit() and every PublishX method above are void by design
+// (existing contract, unchanged here) — publish failures are logged, not
+// propagated to callers. Widening this to return error would ripple into
+// registry.Service's call sites and tests; that's a separate, larger change
+// than "wire the producer," so it's left as-is.
 func (p *Publisher) emit(eventType, correlationID string, payload map[string]any) {
 	raw, _ := json.Marshal(payload)
 	env := envelope{
@@ -144,13 +150,21 @@ func (p *Publisher) emit(eventType, correlationID string, payload map[string]any
 	}
 	data, _ := json.Marshal(env)
 
-	// TODO: publish to Kafka topic
-	// msg := kafka.Message{Topic: p.topic, Value: data}
-	// if err := p.writer.WriteMessages(ctx, msg); err != nil { ... outbox retry ... }
+	// Topic is set on the Writer itself (main.go), not here — kafka-go
+	// rejects a Message that also specifies Topic when the Writer already has one.
+	msg := kafka.Message{Value: data}
+	if err := p.writer.WriteMessages(context.Background(), msg); err != nil {
+		p.log.Error("event publish failed",
+			zap.String("event_type", eventType),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+		return
+	}
 
-	p.log.Info("event emitted (stub — wire Kafka writer)",
+	p.log.Info("event published",
 		zap.String("event_type", eventType),
+		zap.String("topic", p.topic),
 		zap.String("correlation_id", correlationID),
-		zap.ByteString("payload", data),
 	)
 }
