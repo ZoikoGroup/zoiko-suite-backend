@@ -2,10 +2,12 @@
 package health
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -18,11 +20,12 @@ type status struct {
 // Handler returns HTTP 200 when all critical dependencies are reachable,
 // HTTP 503 otherwise (per 03-microservices.md §3.8 observability requirement).
 type Handler struct {
-	rdb *redis.Client
+	rdb  *redis.Client
+	pool *pgxpool.Pool
 }
 
-func NewHandler(rdb *redis.Client) *Handler {
-	return &Handler{rdb: rdb}
+func NewHandler(rdb *redis.Client, pool *pgxpool.Pool) *Handler {
+	return &Handler{rdb: rdb, pool: pool}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +40,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		checks["redis"] = "ok"
 	}
 
-	// TODO: add DB ping when pgx pool is wired
+	// Postgres check
+	pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := h.pool.Ping(pingCtx); err != nil {
+		checks["postgres"] = "unreachable: " + err.Error()
+		healthy = false
+	} else {
+		checks["postgres"] = "ok"
+	}
+
 	// TODO: add upstream Tenant Registry liveness check
 
 	s := status{
