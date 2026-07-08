@@ -26,6 +26,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     -o /governance-decision-log-svc \
     ./cmd/server/
 
+# Also build a tiny static healthcheck binary — distroless has no shell/wget,
+# and a dynamically-linked binary (e.g. busybox) can't exec in this image at
+# all since there's no libc to satisfy it. A CGO_ENABLED=0 Go binary works
+# here because it's fully static, same as the service binary above.
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags="-s -w" \
+    -o /healthcheck \
+    ./cmd/healthcheck/
+
 # ─── Stage 2: runtime ─────────────────────────────────────────────────────────
 # gcr.io/distroless/static-debian12 has no shell, no package manager, and no
 # libc — the smallest safe base for a statically-linked Go binary.
@@ -34,6 +43,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 # Copy the compiled binary from the builder stage.
 COPY --from=builder /governance-decision-log-svc /governance-decision-log-svc
+COPY --from=builder /healthcheck /healthcheck
 
 # distroless/static:nonroot already runs as uid 65532 (nonroot).
 # Declaring USER is explicit documentation and enforces the intent.
