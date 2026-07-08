@@ -279,8 +279,13 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "policy-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.policy.events"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8085/healthz"]
