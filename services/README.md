@@ -9,6 +9,7 @@ Go microservices monorepo — one `go.mod` per service, no shared build tool.
 | `jurisdiction-rules-svc` | 8082 | Real Postgres-backed read API for jurisdiction configuration |
 | `governance-decision-log-svc` | 8083 | Append-only evidence store for governance decisions (`POST`/`GET /v1/decisions`) |
 | `audit-event-store-svc` | 8084 | Kafka consumer + HTTP server health probes (`/healthz` and `/readyz`) |
+| `configuration-feature-flag-svc` | 8086 | Versioned config + feature flags (`/v1/config`, `/v1/flags`); event publishing stubbed |
 
 ---
 
