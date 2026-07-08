@@ -20,6 +20,7 @@ services:
       - ../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
+      - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -224,6 +225,33 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8084/healthz | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
+  policy-svc:
+    build:
+      context: ../services/policy-svc
+      dockerfile: Dockerfile
+    container_name: policy-svc
+    ports:
+      - "8085:8085"
+    environment:
+      PORT: "8085"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: policy
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8085/healthz | grep -q ok"]
       interval: 10s
       timeout: 5s
       retries: 5
