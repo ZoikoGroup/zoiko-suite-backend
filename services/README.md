@@ -12,6 +12,7 @@ Go microservices monorepo — one `go.mod` per service, no shared build tool.
 | `configuration-feature-flag-svc` | 8086 | Versioned config + feature flags (`/v1/config`, `/v1/flags`); event publishing stubbed |
 | `secret-vault-integration-svc` | 8087 | Secret access broker — policy-gated, leased, rotation-aware (`/v1/secrets/broker`); local-file encrypted-at-rest backend for v1, real Vault/KMS client pending |
 | `obligations-svc` | 8088 | Obligation/FilingRequirement CRUD (`/v1/obligations`), jurisdiction-bound with fail-closed validation against jurisdiction-rules-svc |
+| `authorization-svc` | 8089 | Runtime access-decision engine — RBAC + delegated-authority + Separation-of-Duties evaluation (`/v1/authorize`), append-only decision evidence (`/v1/access-decisions`) |
 
 
 ## Unified Local Platform Development Stack

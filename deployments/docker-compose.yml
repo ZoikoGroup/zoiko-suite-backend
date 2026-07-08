@@ -21,6 +21,7 @@ services:
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
+      - ../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -295,27 +296,33 @@ services:
       start_period: 10s
     restart: on-failure
 
-  # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
-  policy-svc:
+  # ── 7. authorization-svc (Port: 8089) ───────────────────────────────────────
+  authorization-svc:
     build:
-      context: ../services/policy-svc
+      context: ../services/authorization-svc
       dockerfile: Dockerfile
-    container_name: policy-svc
+    container_name: authorization-svc
     ports:
-      - "8085:8085"
+      - "8089:8089"
     environment:
-      PORT: "8085"
+      PORT: "8089"
       DB_HOST: postgres
       DB_PORT: "5432"
-      DB_NAME: policy
+      DB_NAME: authorization_svc
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "authorization-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
+      JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8085/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
