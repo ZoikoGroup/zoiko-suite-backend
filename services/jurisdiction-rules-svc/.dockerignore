@@ -1,0 +1,22 @@
+# .dockerignore for jurisdiction-rules-svc
+# Keep the build context lean — only source files go to the builder stage.
+
+# Test artifacts
+**/*_test.go
+**/testdata/
+
+# IDE / OS noise
+.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db
+
+# Deployment files that are not needed inside the image
+deployments/
+
+# Documentation
+docs/
+
+# Git metadata
+.git/
+.gitignore

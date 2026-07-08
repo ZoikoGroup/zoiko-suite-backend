@@ -2,6 +2,8 @@
 package auth
 
 import (
+	"crypto/rsa"
+	"os"
 	"context"
 	"encoding/json"
 	"errors"
@@ -76,10 +78,19 @@ func (v *JWTVerifier) VerifyBearer(_ context.Context, token string) (*domain.Ver
 //	services can verify envelopes independently.
 type JWTSigner struct {
 	cfg *config.Config
+	privateKey *rsa.PrivateKey
 }
 
-func NewJWTSigner(cfg *config.Config) *JWTSigner {
-	return &JWTSigner{cfg: cfg}
+func NewJWTSigner(cfg *config.Config) (*JWTSigner, error) {
+	keyBytes, err := os.ReadFile(cfg.JWTSigningPrivateKeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read private key: %w", err)
+	}
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(keyBytes) 
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+	return &JWTSigner{cfg: cfg, privateKey: privateKey}, nil
 }
 
 // Sign produces a signed JWT for the given envelope.
@@ -96,6 +107,7 @@ func (s *JWTSigner) Sign(envelope *domain.IdentityContextEnvelope) (string, erro
 	if err := json.Unmarshal(raw, &claims); err != nil {
 		return "", fmt.Errorf("unmarshal to MapClaims: %w", err)
 	}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(s.cfg.JWTSigningSecret))
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = s.cfg.JWTKeyID
+	return token.SignedString(s.privateKey)
 }

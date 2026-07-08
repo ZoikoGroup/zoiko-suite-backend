@@ -2,6 +2,12 @@ package auth_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -176,10 +182,44 @@ func TestVerifyBearer_WrongSecret_ReturnsError(t *testing.T) {
 }
 
 // ── JWTSigner: round-trip ─────────────────────────────────────────────────────
-// Confirms envelopeClaims.Get* methods are exercised by jwt library during Sign.
+// Confirms envelopeClaims.Get* methods are exercised by jwt library during Sign,
+// and — since Sign now uses RS256 — that the token only verifies against the
+// matching RSA public key, never the old HMAC secret.
+
+// newTestSigner generates a throwaway RSA keypair, writes the private key to a
+// temp file (mirroring how NewJWTSigner reads a real key off disk in
+// production), and returns both the signer and the public key so the test can
+// verify independently — the same relationship a real downstream service has
+// via the /.well-known/jwks.json endpoint.
+func newTestSigner(t *testing.T) (*auth.JWTSigner, *rsa.PublicKey) {
+	t.Helper()
+
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+
+	keyPath := filepath.Join(t.TempDir(), "test_signing_key.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	})
+	require.NoError(t, os.WriteFile(keyPath, pemBytes, 0o600))
+
+	cfg := &config.Config{
+		JWTIssuer:                testCfg.JWTIssuer,
+		JWTAudienceInternal:      testCfg.JWTAudienceInternal,
+		EnvelopeJWTTTLSeconds:    testCfg.EnvelopeJWTTTLSeconds,
+		JWTSigningPrivateKeyPath: keyPath,
+		JWTKeyID:                 "test-key-1",
+	}
+
+	signer, err := auth.NewJWTSigner(cfg)
+	require.NoError(t, err)
+
+	return signer, &privateKey.PublicKey
+}
 
 func TestJWTSigner_SignProducesVerifiableToken(t *testing.T) {
-	signer := auth.NewJWTSigner(testCfg)
+	signer, pubKey := newTestSigner(t)
 
 	now := time.Now()
 	envelope := &domain.IdentityContextEnvelope{
@@ -202,9 +242,13 @@ func TestJWTSigner_SignProducesVerifiableToken(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, signed)
 
-	// Parse back and confirm standard claims are correctly embedded
+	// Parse back using ONLY the public key — proving the asymmetric property:
+	// verification never needs, and never sees, the private key.
 	parsed, err := jwt.Parse(signed, func(tok *jwt.Token) (any, error) {
-		return []byte(testSecret), nil
+		if _, ok := tok.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, jwt.ErrTokenSignatureInvalid
+		}
+		return pubKey, nil
 	})
 	require.NoError(t, err)
 	assert.True(t, parsed.Valid)
@@ -217,4 +261,29 @@ func TestJWTSigner_SignProducesVerifiableToken(t *testing.T) {
 	assert.Equal(t, testCfg.JWTIssuer, gotIssuer)
 	assert.Contains(t, []string(gotAud), testCfg.JWTAudienceInternal)
 	assert.WithinDuration(t, time.Unix(envelope.EXP, 0), gotExp.Time, time.Second)
+}
+
+// TestJWTSigner_TamperedToken_FailsVerification proves the actual security
+// property: a token altered after signing must fail verification even though
+// it's still structurally a valid-looking JWT.
+func TestJWTSigner_TamperedToken_FailsVerification(t *testing.T) {
+	signer, pubKey := newTestSigner(t)
+
+	envelope := &domain.IdentityContextEnvelope{
+		JTI: "jti-002", ISS: testCfg.JWTIssuer, AUD: testCfg.JWTAudienceInternal,
+		IAT: time.Now().Unix(), EXP: time.Now().Add(5 * time.Minute).Unix(),
+		Principal:     domain.PrincipalClaims{PrincipalID: "principal-xyz", TenantID: "tenant-abc"},
+		TenantID:      "tenant-abc",
+		LegalEntityID: "entity-001",
+		SchemaVersion: "1.0",
+	}
+	signed, err := signer.Sign(envelope)
+	require.NoError(t, err)
+
+	tampered := signed[:len(signed)-2] + "xx" // flip the last two chars of the signature
+
+	_, err = jwt.Parse(tampered, func(tok *jwt.Token) (any, error) {
+		return pubKey, nil
+	})
+	require.Error(t, err, "a tampered token must not verify")
 }
