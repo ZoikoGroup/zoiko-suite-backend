@@ -64,6 +64,17 @@ type PolicyVersion struct {
 	// VersionStatus: DRAFT | ACTIVE | SUPERSEDED | RETIRED — VARCHAR, not enum.
 	VersionStatus string `json:"version_status"`
 
+	// ActivatedByPrincipalID is the principal who performed this version's
+	// DRAFT->ACTIVE transition. Nil until the version is activated for the
+	// first time; never overwritten afterwards, including when this
+	// version is later superseded — its own activation history stands.
+	ActivatedByPrincipalID *string `json:"activated_by_principal_id"`
+
+	// ActivatedAt is when this version's DRAFT->ACTIVE transition happened.
+	// Nil until activation, set exactly once, same lifecycle as
+	// ActivatedByPrincipalID.
+	ActivatedAt *time.Time `json:"activated_at"`
+
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }

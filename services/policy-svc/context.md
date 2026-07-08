@@ -1002,3 +1002,69 @@ the open-questions list.
    `GET /v1/decisions?actor=admin-1` and counted matches for that
    `decision_id` — **exactly one**, after two calls. This is the
    guarantee doctrine asks for, demonstrated, not asserted.
+
+## 21. Sign-off closing the remaining §11/`progress.md` gap list (2026-07-08)
+
+The four still-open items from `progress.md`'s "Remaining gaps" list
+(entity.created consumption, caching, the three unimplemented policy
+types, `policies` table tenant scoping) were each put to you directly as
+a single decision, rather than assumed or built speculatively — the same
+"needs input from you, not more unilateral engineering" posture §11 and
+`progress.md` already committed to. All four came back **confirmed as
+originally recommended: leave as-is.** No code changed as a result of
+this pass.
+
+This closes out the spec-alignment work for policy-svc v1: every clause
+of `03-microservices.md` §8.1 is now either implemented-and-verified
+(Batches A–E, §15–§20) or explicitly deferred with a recorded reason and
+a stated re-open trigger. The two items that remain open are not
+decisions at all — they're hard blocked on Authorization Service /
+Access Control Service / Delegated Authority Service not existing yet,
+and unblock automatically once those services land, per doctrine's "do
+not start a Tier 1 service until its Tier 0 dependency has met its exit
+criteria" sequencing (§8).
+
+## 22. Batch F — the activated_by/activated_at gap this section's own claim glossed over (2026-07-08)
+
+§21 declared spec-alignment work "closed" based on `03-microservices.md`
+§8.1 alone. Asked directly "can we be 100% aligned," a second pass
+against `04-data-model.md` §7.1's literal `PolicyVersion` field list
+(`activated_by`, `activated_at` — named in §4 of this file, drawn from
+that same doc) found neither field existed anywhere: not in the
+`policy_versions` table, not in the domain struct, not in any event
+payload. Yet `activated_by_principal_id` was already a *required* input
+on the activate endpoint (`400` if missing) — so the actor was being
+collected from every caller and then silently discarded. This is a
+sharper miss than it sounds: the evidence obligation "preserve
+effective-dated activation" (§5 above) was being satisfied for the *date*
+half only; the *who* half was never durable anywhere, contrary to what
+§21's "every clause is implemented-and-verified or explicitly deferred"
+claim implied.
+
+**Fixed, not deferred** — this needed no business input, only an
+implementation decision, matching the precedent set by Batches D/E. See
+`progress.md`'s "Batch F" section for the exact schema/code changes
+(new migration, two new `PolicyVersion` fields, `transitionVersionStatus`
+gains an optional actor parameter, event payload extended) and the
+design decision that activation audit fields are stamped once and never
+touched again by a later supersede.
+
+**Important caveat this section must not omit**: unlike every batch
+before it (A–E), **Batch F has not been compiled, vetted, or tested in
+this session** — no Go toolchain or running Docker daemon was available.
+Every other "done" claim in this file was backed by an actual `go build`/
+`go test`/live-HTTP run; this one is not, yet. Do not extend this
+section's confidence to Batch F until `progress.md`'s Batch F checklist's
+final unchecked item (`go build && go vet && go test ./... -v`) is
+actually run once, by a human or in CI, and this caveat is updated to
+reflect that.
+
+**For the current, single-source-of-truth list of every deferred item**
+(what's blocked on another service vs. needs business input from you vs.
+was your explicit choice vs. is just plain backlog), **see the "TODO —
+Deferred functionality" section near the top of `progress.md`** — it
+supersedes this file's own §11 status table and the older scattered
+mentions across `progress.md`'s "Explicit non-goals"/"Blocking
+cross-service dependencies"/"Remaining gaps" sections. Update that one
+section when any of these items change status; don't let a second copy
+of this list drift here.

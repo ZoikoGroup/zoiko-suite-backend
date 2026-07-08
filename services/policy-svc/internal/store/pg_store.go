@@ -179,6 +179,8 @@ const policyVersionColumns = `
 	effective_from,
 	effective_to,
 	version_status,
+	activated_by_principal_id,
+	activated_at,
 	created_at,
 	created_by_principal_id`
 
@@ -194,6 +196,8 @@ func scanPolicyVersion(row pgx.Row) (*domain.PolicyVersion, error) {
 		&v.EffectiveFrom,
 		&v.EffectiveTo,
 		&v.VersionStatus,
+		&v.ActivatedByPrincipalID,
+		&v.ActivatedAt,
 		&v.CreatedAt,
 		&v.CreatedByPrincipalID,
 	)
@@ -356,14 +360,22 @@ type queryRower interface {
 // exactly: the caller supplies allowedPriors, this function just enforces
 // them atomically via UPDATE ... WHERE version_status = ANY(allowedPriors).
 // It does not decide the state machine itself.
-func transitionVersionStatus(ctx context.Context, q queryRower, policyVersionID, newStatus string, allowedPriors []string) (*domain.PolicyVersion, error) {
+//
+// activatedByPrincipalID is optional (nil for transitions that aren't an
+// activation, e.g. a future dedicated retire endpoint): when non-nil, the
+// activation audit columns are stamped on this row; when nil, they are
+// left untouched. This keeps the helper generic rather than hardcoding
+// "activation" semantics for every caller.
+func transitionVersionStatus(ctx context.Context, q queryRower, policyVersionID, newStatus string, allowedPriors []string, activatedByPrincipalID *string) (*domain.PolicyVersion, error) {
 	const query = `
 		UPDATE policy_versions
-		SET version_status = $1
+		SET version_status = $1,
+		    activated_by_principal_id = COALESCE($4::text, activated_by_principal_id),
+		    activated_at = CASE WHEN $4::text IS NOT NULL THEN NOW() ELSE activated_at END
 		WHERE policy_version_id = $2 AND version_status = ANY($3::text[])
 		RETURNING ` + policyVersionColumns + `;`
 
-	row := q.QueryRow(ctx, query, newStatus, policyVersionID, allowedPriors)
+	row := q.QueryRow(ctx, query, newStatus, policyVersionID, allowedPriors, activatedByPrincipalID)
 	return scanPolicyVersion(row)
 }
 
@@ -433,8 +445,9 @@ func (s *PgStore) ActivateVersion(ctx context.Context, policyVersionID, actorID 
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	// 2. Activate the target version. Only legal from DRAFT.
-	activated, err := transitionVersionStatus(ctx, tx, policyVersionID, "ACTIVE", []string{"DRAFT"})
+	// 2. Activate the target version. Only legal from DRAFT. Stamps
+	// activated_by_principal_id/activated_at on this specific row.
+	activated, err := transitionVersionStatus(ctx, tx, policyVersionID, "ACTIVE", []string{"DRAFT"}, &actorID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, false, domain.ErrInvalidTransition

@@ -75,11 +75,13 @@ func (p *Publisher) PublishPolicyUpdated(ctx context.Context, version domain.Pol
 // version that just transitioned to ACTIVE.
 func (p *Publisher) PublishVersionActivated(ctx context.Context, version domain.PolicyVersion, correlationID string) error {
 	return p.emit("policy.version.activated", correlationID, map[string]any{
-		"policy_version_id": version.PolicyVersionID,
-		"policy_id":         version.PolicyID,
-		"tenant_id":         version.TenantID,
-		"legal_entity_id":   version.LegalEntityID,
-		"effective_from":    version.EffectiveFrom,
+		"policy_version_id":         version.PolicyVersionID,
+		"policy_id":                 version.PolicyID,
+		"tenant_id":                 version.TenantID,
+		"legal_entity_id":           version.LegalEntityID,
+		"effective_from":            version.EffectiveFrom,
+		"activated_by_principal_id": version.ActivatedByPrincipalID,
+		"activated_at":              version.ActivatedAt,
 	})
 }
 

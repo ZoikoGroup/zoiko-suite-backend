@@ -1,19 +1,26 @@
 # Policy Service — Progress & Phase Plan
 
-Status: **All 3 original batches (A, B, C) plus a follow-up Batch D built,
-tested, and verified — including a real Docker image build and a real
-second live service (`governance-decision-log-svc`) for cross-service
-proof.** This supersedes the earlier 15-phase speculative plan: the build
-was task-approved and scoped into 3 sequential batches, each its own
-branch off `main` in `ZoikoGroup/zoiko-suite-backend`; Batch D followed
-from a spec-compliance self-review (see "so what we need to do to make it
-100% aligned" in conversation). Full citations, exact schema, exact
-endpoint contracts, and exact code patterns to mirror are in
-`context.md` §13. **policy-svc's v1 scope, including its evidence
-obligation, is now functionally complete** — see `context.md` §19 for the
-closing summary and what's genuinely left for a human to decide (Kafka
-wiring, Authorization Service integration, the 3 remaining policy types,
-consuming `entity.created`) versus what's actually done.
+Status: **All 3 original batches (A, B, C) plus follow-ups Batch D, E, and
+F built.** A, B, C, D, and E were tested and verified live in a prior
+session — including a real Docker image build and a real second live
+service (`governance-decision-log-svc`) for cross-service proof. **Batch F
+(2026-07-08, below) was written the same way but has NOT been run in this
+session** — no Go toolchain or running Docker daemon was available this
+time. Treat Batch F as written-but-unverified until `go build`/
+`go vet`/`go test ./... -v` (with `TEST_DATABASE_URL` set) is actually run
+once, locally or in CI. This overall approach supersedes the earlier
+15-phase speculative plan: the build was task-approved and scoped into 3
+sequential batches, each its own branch off `main` in
+`ZoikoGroup/zoiko-suite-backend`; Batch D followed from a spec-compliance
+self-review (see "so what we need to do to make it 100% aligned" in
+conversation), and Batch F followed from a second such review (see
+"can we be 100% aligned" and its answer, this same day). Full citations,
+exact schema, exact endpoint contracts, and exact code patterns to mirror
+are in `context.md` §13. **policy-svc's v1 scope, including its evidence
+obligation, is now functionally complete pending Batch F's verification**
+— see `context.md` §19/§22 for the closing summaries and what's genuinely
+left for a human to decide (see the "TODO — Deferred functionality"
+section below) versus what's actually done.
 
 **Verification actually performed (2026-07-07):** no Go toolchain exists
 in the assistant's sandbox, so a Docker container (`golang:1.25-alpine`)
@@ -32,6 +39,65 @@ emitted in the logs, including `policy.rule.retired` correctly tied to
 the same correlation ID as the activation call that caused it. See
 `context.md` §16 (Batch A transcript), §17 (Batch B transcript), §18
 (Batch C transcript).
+
+## TODO — Deferred functionality (single source of truth, 2026-07-08)
+
+Everything below was deliberately left out of v1. Grouped by *why*, because
+that determines what actually unblocks each one — not all of it is waiting
+on another service, and it's a mistake to treat this list as one
+undifferentiated backlog. **This section supersedes the scattered mentions
+of these same items in "Explicit non-goals," "Blocking cross-service
+dependencies," and "Remaining gaps" further down this file — update this
+list, not those.**
+
+### Blocked on a service that doesn't exist yet (not a decision — unblocks automatically once it lands)
+
+1. **Consume `role.updated`** — blocked on Access Control Service not existing.
+2. **Consume `authority.delegated`** — blocked on Delegated Authority Service not existing.
+3. **Authorization-check the admin write endpoints** (`CreatePolicy`,
+   `CreatePolicyVersion`, `ActivateVersion`) — blocked on Authorization
+   Service not existing. **Live gap worth knowing about**: today, any
+   caller can create or activate a policy; there is no service-side check
+   on who is allowed to. Same posture every other Tier 0 service in this
+   repo currently ships with, not unique to policy-svc — but worth not
+   forgetting.
+
+### Needs business input only you can supply (not another service's problem)
+
+4. **Evaluation logic for `SPEND_CONTROL`, `SOD_RULE`, `SIGNATORY_MATRIX`**
+   — `03-microservices.md` names these three policy types but gives zero
+   formulas, unlike `APPROVAL_THRESHOLD`'s explicit "compare against a
+   threshold." Needs the actual business rule for each from you. Each is a
+   new `case` in `Evaluate`'s switch (`internal/handler/handler.go`) — not
+   a refactor — once supplied.
+5. **Consuming `entity.created`** — `tenant-entity-registry-svc` now
+   really publishes this event (confirmed after the `origin/main` merge),
+   so it is technically wireable, but nothing specifies what policy-svc
+   should *do* with it (e.g. validate `legal_entity_id` references?
+   invalidate a future cache entry? nothing?). Needs a specified behavior
+   from you before it's buildable — building a consumer with no defined
+   action would be dead infrastructure.
+
+### Deferred by your explicit choice, confirmed 2026-07-08 (not blocked — revisit only if you change your mind)
+
+6. **Caching layer** in front of policy reads — `05-security.md` §6.5
+   allows it, doesn't require it; direct Postgres reads are fine at
+   current scale.
+7. **`tenant_id`/`legal_entity_id` on the `policies` table itself** —
+   confirmed to stay off; all scoping lives on `PolicyVersion` rows,
+   mirroring `jurisdiction-rules-svc`'s design.
+8. **A standalone "validate threshold applicability" endpoint** — folded
+   into `Evaluate` instead; no separate endpoint exists.
+
+### Not blocked at all — just not done yet (pure backlog, pick up any time)
+
+9. **Real `kafka.Writer` in `internal/events/publisher.go`** — still a
+   logged stub (`// TODO: publish to Kafka topic`). Unlike when this was
+   first written, the Kafka backbone is now real for
+   `identity-context-svc` and `tenant-entity-registry-svc` — so this is
+   no longer blocked by "no Kafka backbone exists anywhere," it's simply
+   not been prioritized. Wiring it would follow the same pattern those two
+   services already use.
 
 **Synced with `origin/main` (2026-07-07):** pulled 13 commits from `main`
 into `shashi-changes` before committing this work. Notable changes that
@@ -156,6 +222,60 @@ not just documented.
 
 Use a stable, caller-generated ID (e.g. your own request/correlation ID)
 so retries of the same logical evaluation don't create duplicate evidence
+
+## Batch F — Persist activated_by/activated_at (2026-07-08, NOT YET VERIFIED LIVE)
+
+Found during a second spec-compliance pass, prompted by "can we be 100%
+aligned" — re-checking `04-data-model.md` §7.1's literal `PolicyVersion`
+field list (`activated_by`, `activated_at`) against the actual schema
+found neither existed. Tracing it through the code: `activated_by_principal_id`
+is required on `POST /v1/policies/{id}/versions/{id}/activate` (`400` if
+missing — this was already true), but the value was then dropped —
+`PgStore.ActivateVersion` accepted it as an `actorID` parameter and never
+used it again. Not persisted to the database (no such columns existed),
+not included in the `policy.version.activated` event payload, not sent
+anywhere else. "Who activated this policy version" was collected and
+discarded on every call. This needed no business input to fix — only an
+implementation decision — so it was fixed directly, same posture as
+Batches D/E.
+
+- [x] New migration `000002_add_activation_audit.{up,down}.sql` — adds
+      nullable `activated_by_principal_id TEXT` and
+      `activated_at TIMESTAMPTZ` to `policy_versions`. Nullable because
+      DRAFT versions have neither yet.
+- [x] `domain.PolicyVersion` gained `ActivatedByPrincipalID *string` and
+      `ActivatedAt *time.Time`.
+- [x] `pg_store.go`: `policyVersionColumns`/`scanPolicyVersion` extended;
+      `transitionVersionStatus` gained an `activatedByPrincipalID *string`
+      parameter — nil for non-activation transitions (keeps the helper
+      generic rather than hardcoding activation semantics into it), stamps
+      both columns via `COALESCE`/conditional `NOW()` when non-nil.
+      `ActivateVersion`'s call into it now passes `&actorID`.
+- [x] Design choice: activation audit fields are stamped **once** and
+      never overwritten — when a version is later superseded, its own
+      `activated_by`/`activated_at` are left untouched (that raw UPDATE is
+      a separate query from `transitionVersionStatus` and never touches
+      these columns). Superseding a version must not erase the record of
+      who originally activated it.
+- [x] `internal/events/publisher.go`: `PublishVersionActivated`'s payload
+      now includes `activated_by_principal_id`/`activated_at`.
+- [x] Tests extended in `pg_store_test.go` (not yet run):
+      `TestPgStore_ActivateVersion_SupersedesPreviousActiveAndIsIdempotent`
+      now asserts activation stamps both fields, that an idempotent retry
+      does not change `activated_at`, and that superseding a version
+      (with a *different* actor activating the replacement) leaves the
+      superseded version's own `activated_by`/`activated_at` untouched.
+      `setupTestDB` now also applies migration `000002`.
+- [ ] **Not run this session** — no Go toolchain, no running Docker
+      daemon available. Unlike every batch before it, this code has not
+      been compiled, vetted, or tested. **Required before trusting this
+      batch**: `go build ./... && go vet ./... && go test ./... -v`
+      (unit tests need no DB; the extended integration test needs
+      `TEST_DATABASE_URL` pointed at a Postgres instance with migrations
+      000001 and 000002 both applied — `setupTestDB` in
+      `pg_store_test.go` now does this automatically for the test DB, but
+      any manually-migrated environment, including a real deployment,
+      needs 000002 applied explicitly).
 records in `governance-decision-log-svc`.
 
 Repo correction: remote is `ZoikoGroup/zoiko-suite-backend`. Services
@@ -433,9 +553,10 @@ round trip from inside the container.
 
 ## Remaining gaps against a strict reading of `03-microservices.md` §8.1
 
-As of Batch E, this is the complete, current list — nothing here has
-regressed and nothing here has been quietly fixed since the last review
-(see `context.md` §19/§20 for what *was* closed):
+As of Batch E, this was the complete list. **Status as of 2026-07-08:
+every item that was awaiting a decision has now been explicitly decided
+— see "Sign-off" below. None were silently closed; each was a deliberate
+choice, not an oversight or a default.**
 
 1. Consuming `entity.created` — needs you to specify intended behavior (see above)
 2. Consuming `role.updated`/`authority.delegated` — blocked on services that don't exist
@@ -443,3 +564,45 @@ regressed and nothing here has been quietly fixed since the last review
 4. Evaluation logic for `SPEND_CONTROL`/`SOD_RULE`/`SIGNATORY_MATRIX` — needs business rules from you
 5. `policies` table has no `tenant_id`/`legal_entity_id` — needs a decision on whether to reverse the Batch A design precedent (mirrors `jurisdictions`)
 6. No literal separate "validate threshold applicability" endpoint (folded into `Evaluate`) — low value to fix, recommend leaving as-is unless you disagree
+
+## Sign-off on remaining gaps (2026-07-08)
+
+Asked directly, one decision per open item, rather than assuming any of
+them. All four decidable items were confirmed **as originally
+recommended** — no code changes resulted from this pass, only an
+explicit record that "not built" is a deliberate, approved state, not a
+gap:
+
+1. **`entity.created` consumption — confirmed skip.** No business
+   behavior has been specified for it; building a consumer with nothing
+   to do would be dead infrastructure. Revisit only if/when a concrete
+   use (e.g. validating `legal_entity_id` references) is specified.
+2. **`role.updated`/`authority.delegated` — still blocked, not a
+   decision.** Access Control Service and Delegated Authority Service
+   don't exist. Nothing to sign off on until they do.
+3. **Caching — confirmed skip.** Direct Postgres reads remain sufficient
+   at current scale; 05-security.md §6.5 permits caching but does not
+   require it for v1. Deferred indefinitely, not scheduled.
+4. **`SPEND_CONTROL`/`SOD_RULE`/`SIGNATORY_MATRIX` evaluation — confirmed
+   stay at `501 Not Implemented`.** No formulas exist anywhere in the
+   architecture docs for these three types; implementing them now would
+   mean inventing business logic rather than encoding a specified rule.
+   Each remains a single new `switch` case in `Evaluate`
+   (`handler.go`) whenever real rules are supplied — no refactor needed.
+5. **`policies` table `tenant_id`/`legal_entity_id` — confirmed leave
+   as-is.** `Policy` stays a global named container; all tenant/entity
+   scoping stays on `PolicyVersion` rows, per the original Batch A
+   design mirroring `jurisdiction-rules-svc`.
+6. **Separate "validate threshold applicability" endpoint — not raised
+   as an objection, so left folded into `Evaluate`** per the standing
+   recommendation.
+
+**Net effect: policy-svc's v1 scope is now fully aligned to
+`03-microservices.md` §8.1, `04-data-model.md` §7.1/7.2, and
+`05-security.md` §6.5/§9.2/§14 — every clause is either implemented and
+verified (Batches A–E) or explicitly, consciously deferred with a
+recorded reason and a re-open trigger (a service landing, or business
+rules being supplied). Nothing remains in an undecided state.** The two
+genuinely blocking items (row 2, and Authorization Service wiring for
+admin writes) cannot be resolved by any decision available today — they
+require other services to exist first.
