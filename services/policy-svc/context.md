@@ -1068,3 +1068,57 @@ mentions across `progress.md`'s "Explicit non-goals"/"Blocking
 cross-service dependencies"/"Remaining gaps" sections. Update that one
 section when any of these items change status; don't let a second copy
 of this list drift here.
+
+## 23. Quick Reference — Endpoints & How to Run (added 2026-07-08)
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/policies` | Create a named policy container (idempotent on `policy_code`) |
+| `POST` | `/v1/policies/{policy_id}/versions` | Create a new DRAFT version of a policy's rule content |
+| `POST` | `/v1/policies/{policy_id}/versions/{version_id}/activate` | Activate a DRAFT version; atomically supersedes whatever was previously ACTIVE in that scope |
+| `GET` | `/v1/policies/{policy_id}/versions` | Full version history for a policy, newest first (includes superseded versions) |
+| `GET` | `/v1/policies?policy_type=X&tenant_id=Y&legal_entity_id=Z` | "Get applicable policy set" — the current ACTIVE version(s) for a scope |
+| `POST` | `/v1/policies/evaluate` | Evaluate an action against the applicable policy (`APPROVAL_THRESHOLD` only in v1); records evidence in `governance-decision-log-svc` |
+| `GET` | `/healthz` | Liveness probe |
+| `GET` | `/readyz` | Readiness probe (DB connectivity) |
+
+### Running the server
+
+**Option A — native Go** (requires Go 1.25+ installed locally)
+```powershell
+cd services/policy-svc
+$env:DB_HOST="localhost"; $env:DB_PORT="5432"; $env:DB_NAME="policy"; $env:DB_USER="postgres"; $env:DB_PASSWORD="secretpassword"; $env:DB_SSLMODE="disable"; $env:PORT="8085"
+$env:GOVERNANCE_DECISION_LOG_SERVICE_URL="http://localhost:8083"
+go run ./cmd/server
+```
+(Postgres must already be running locally with both migrations applied — see step 2 below for the `psql` commands, pointed at `localhost` instead of a container name.)
+
+**Option B — Docker only, no local Go needed** (the exact method used to build/verify this service)
+
+1. Network + Postgres:
+```powershell
+docker network create policy-svc-net
+docker run -d --name policy-svc-pg --network policy-svc-net -e POSTGRES_PASSWORD=secretpassword -e POSTGRES_DB=policy -p 55433:5432 postgres:16-alpine
+```
+2. Apply both migrations, in order:
+```powershell
+Get-Content deployments\migrations\000001_initial_schema.up.sql | docker exec -i policy-svc-pg psql -U postgres -d policy
+Get-Content deployments\migrations\000002_add_activation_audit.up.sql | docker exec -i policy-svc-pg psql -U postgres -d policy
+```
+3. Build and run the service (run from the `services/policy-svc` directory):
+```powershell
+docker run -d --name policy-svc-app --network policy-svc-net -v "${PWD}:/src" -w /src -p 8085:8085 `
+  -e DB_HOST=policy-svc-pg -e DB_PORT=5432 -e DB_NAME=policy -e DB_USER=postgres -e DB_PASSWORD=secretpassword -e DB_SSLMODE=disable -e PORT=8085 `
+  golang:1.25-alpine sh -c "go build -o /tmp/svc ./cmd/server && exec /tmp/svc"
+```
+4. Confirm it's up: `curl http://localhost:8085/healthz` → `{"status":"ok"}`
+
+**Optional — wire up real evidence recording**: `Evaluate`'s calls to `governance-decision-log-svc` fail silently (logged, not surfaced) if that service isn't reachable, and `Evaluate` still returns `200`. To see evidence actually recorded, also start `governance-decision-log-svc` (see its own `CONTEXT.md` Quick Reference) on the **same** Docker network as this service, then add `-e GOVERNANCE_DECISION_LOG_SERVICE_URL=http://gov-decision-log-app:8083` to step 3's `docker run` command.
+
+**Tear down when done:**
+```powershell
+docker rm -f policy-svc-app policy-svc-pg
+docker network rm policy-svc-net
+```

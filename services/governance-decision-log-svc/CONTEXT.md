@@ -285,3 +285,49 @@ live status.
 - Verify: build the Docker image, run the container against a real
   Postgres, confirm `/healthz` responds and a real POST + GET
   round-trip works from inside the container
+
+## Quick Reference — Endpoints & How to Run (added 2026-07-08)
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/decisions` | Record a governance decision (idempotent on `decision_id`) — called by Policy/Authorization/Workflow services after each evaluation |
+| `GET` | `/v1/decisions/{decision_id}` | Retrieve one decision by ID |
+| `GET` | `/v1/decisions?actor=&entity=&action=&rule_basis=&from=&to=&limit=&offset=` | List/query decisions — all filters optional, compose with AND semantics |
+| `GET` | `/healthz` | Liveness probe |
+| `GET` | `/readyz` | Readiness probe (DB connectivity) |
+
+### Running the server
+
+**Option A — native Go** (requires Go 1.25+ installed locally)
+```powershell
+cd services/governance-decision-log-svc
+$env:DB_HOST="localhost"; $env:DB_PORT="5432"; $env:DB_NAME="governance_decision_log"; $env:DB_USER="postgres"; $env:DB_PASSWORD="secretpassword"; $env:DB_SSLMODE="disable"; $env:PORT="8083"
+go run ./cmd/server
+```
+
+**Option B — Docker only, no local Go needed**
+
+1. Network + Postgres:
+```powershell
+docker network create gdl-net
+docker run -d --name gov-decision-log-pg --network gdl-net -e POSTGRES_PASSWORD=secretpassword -e POSTGRES_DB=governance_decision_log -p 55434:5432 postgres:16-alpine
+```
+2. Apply the migration:
+```powershell
+Get-Content deployments\migrations\000001_initial_schema.up.sql | docker exec -i gov-decision-log-pg psql -U postgres -d governance_decision_log
+```
+3. Build and run (from the `services/governance-decision-log-svc` directory):
+```powershell
+docker run -d --name gov-decision-log-app --network gdl-net -v "${PWD}:/src" -w /src -p 8083:8083 `
+  -e DB_HOST=gov-decision-log-pg -e DB_PORT=5432 -e DB_NAME=governance_decision_log -e DB_USER=postgres -e DB_PASSWORD=secretpassword -e DB_SSLMODE=disable -e PORT=8083 `
+  golang:1.25-alpine sh -c "go build -o /tmp/svc ./cmd/server && exec /tmp/svc"
+```
+4. Confirm: `curl http://localhost:8083/healthz` → `{"status":"ok"}`
+
+**Tear down when done:**
+```powershell
+docker rm -f gov-decision-log-app gov-decision-log-pg
+docker network rm gdl-net
+```
