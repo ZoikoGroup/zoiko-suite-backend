@@ -59,9 +59,10 @@ type KafkaConfig struct {
 func Load() (*Config, error) {
 	return &Config{
 		Env: env("ENV", "local"),
-		// 8087: 8080-8086 are already taken by every other Phase 1 service
-		// built so far — see services/README.md.
-		Port: envInt("PORT", 8087),
+		// 8088: 8080-8087 are already taken by every other Phase 1 service
+		// built so far — secret-vault-integration-svc claimed 8087 while this
+		// service was in flight on a separate branch — see services/README.md.
+		Port: envInt("PORT", 8088),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),

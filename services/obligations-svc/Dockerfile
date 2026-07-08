@@ -49,8 +49,8 @@ COPY --from=builder /healthcheck /healthcheck
 # Declaring USER is explicit documentation and enforces the intent.
 USER nonroot:nonroot
 
-# Health probe port (matches config.Load() PORT default = 8087).
+# Health probe port (matches config.Load() PORT default = 8088).
 # Override with -e PORT=<n> when running the container.
-EXPOSE 8087
+EXPOSE 8088
 
 ENTRYPOINT ["/obligations-svc"]
