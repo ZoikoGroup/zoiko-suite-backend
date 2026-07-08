@@ -10,6 +10,7 @@ Go microservices monorepo — one `go.mod` per service, no shared build tool.
 | `governance-decision-log-svc` | 8083 | Append-only evidence store for governance decisions (`POST`/`GET /v1/decisions`) |
 | `audit-event-store-svc` | 8084 | Kafka consumer + HTTP server health probes (`/healthz` and `/readyz`) |
 | `configuration-feature-flag-svc` | 8086 | Versioned config + feature flags (`/v1/config`, `/v1/flags`); event publishing stubbed |
+| `secret-vault-integration-svc` | 8087 | Secret access broker — policy-gated, leased, rotation-aware (`/v1/secrets/broker`); local-file encrypted-at-rest backend for v1, real Vault/KMS client pending |
 
 ---
 
@@ -60,6 +61,10 @@ curl http://localhost:8083/readyz
 # audit-event-store-svc checks (remapped container port to 8084)
 curl http://localhost:8084/healthz
 curl http://localhost:8084/readyz
+
+# policy-svc checks
+curl http://localhost:8085/healthz
+curl http://localhost:8085/readyz
 ```
 
 ### 2. Produce a Test Kafka Event

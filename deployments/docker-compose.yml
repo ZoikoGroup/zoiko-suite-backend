@@ -295,6 +295,33 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
+  policy-svc:
+    build:
+      context: ../services/policy-svc
+      dockerfile: Dockerfile
+    container_name: policy-svc
+    ports:
+      - "8085:8085"
+    environment:
+      PORT: "8085"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: policy
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8085/healthz | grep -q ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
 volumes:
   postgres_data:
   identity_jwt_keys:
