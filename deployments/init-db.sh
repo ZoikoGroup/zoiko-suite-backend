@@ -1,13 +1,14 @@
 #!/bin/bash
 set -e
 
-# Create all 5 databases required by the services
+# Create all 6 databases required by the services
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
     CREATE DATABASE audit_event_store;
     CREATE DATABASE tenant_entity_registry;
     CREATE DATABASE jurisdiction_rules;
     CREATE DATABASE governance_decision_log;
     CREATE DATABASE identity_context;
+    CREATE DATABASE policy;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -33,5 +34,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules
 # Apply migrations for governance-decision-log-svc
 echo "Applying migrations for governance_decision_log..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000001_initial_schema.up.sql
+
+# Apply migrations for policy-svc
+echo "Applying migrations for policy..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."

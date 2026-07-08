@@ -61,6 +61,10 @@ curl http://localhost:8083/readyz
 # audit-event-store-svc checks (remapped container port to 8084)
 curl http://localhost:8084/healthz
 curl http://localhost:8084/readyz
+
+# policy-svc checks
+curl http://localhost:8085/healthz
+curl http://localhost:8085/readyz
 ```
 
 ### 2. Produce a Test Kafka Event
