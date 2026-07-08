@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/domain"
 )
 
@@ -37,14 +38,15 @@ type EventPublisher interface {
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
-	store     PolicyStore
-	publisher EventPublisher
-	log       *zap.Logger
+	store       PolicyStore
+	publisher   EventPublisher
+	decisionLog decisionlog.Client
+	log         *zap.Logger
 }
 
 // New constructs a Handler.
-func New(store PolicyStore, publisher EventPublisher, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, log: log}
+func New(store PolicyStore, publisher EventPublisher, decisionLog decisionlog.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, decisionLog: decisionLog, log: log}
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -533,17 +535,37 @@ func (h *Handler) ListApplicablePolicyVersions(w http.ResponseWriter, r *http.Re
 // ── POST /v1/policies/evaluate ───────────────────────────────────────────────
 
 // evaluateRequest is the wire shape for POST /v1/policies/evaluate.
+//
+// EvaluatedByPrincipalID is required — not part of the original spec's
+// evaluate contract, but required by governance-decision-log-svc's
+// POST /v1/decisions (actor_id is a required field there), which Evaluate
+// now calls to record every evaluation as evidence (see internal/decisionlog).
+// Without an actor, the evidence obligation this endpoint must satisfy
+// ("preserve evaluation basis for governed decisions", §8.1) cannot be met.
+//
+// DecisionID is also required, as of the idempotency-hardening pass that
+// followed §19 — it is the caller-supplied idempotency key that makes
+// evidence recording safely repeatable end to end. Making it optional
+// (as it was immediately after §19) meant a client-side retry of Evaluate
+// with no supplied ID would record a duplicate decision every time —
+// documented as an accepted limitation then, closed for real now that
+// doctrine's idempotency requirement applies to the evidence write too,
+// not just Evaluate's own returned result. governance-decision-log-svc is
+// itself idempotent on decision_id, so this closes the gap completely
+// rather than shifting it.
 type evaluateRequest struct {
-	PolicyType    string          `json:"policy_type"`
-	TenantID      *string         `json:"tenant_id,omitempty"`
-	LegalEntityID *string         `json:"legal_entity_id,omitempty"`
-	ActionContext json.RawMessage `json:"action_context,omitempty"`
+	PolicyType             string          `json:"policy_type"`
+	TenantID               *string         `json:"tenant_id,omitempty"`
+	LegalEntityID          *string         `json:"legal_entity_id,omitempty"`
+	ActionContext          json.RawMessage `json:"action_context,omitempty"`
+	EvaluatedByPrincipalID string          `json:"evaluated_by_principal_id"`
+	DecisionID             string          `json:"decision_id"`
 }
 
 // evaluateResponse is the wire shape returned by a successful evaluation.
 // Deliberately close to what governance-decision-log-svc's
-// POST /v1/decisions expects — RuleBasis especially — so this result can
-// feed that service later (wiring that call is a separate future task).
+// POST /v1/decisions expects — RuleBasis especially — because Evaluate
+// forwards this same data there (see internal/decisionlog).
 type evaluateResponse struct {
 	Result          string `json:"result"`
 	PolicyVersionID string `json:"policy_version_id"`
@@ -557,13 +579,17 @@ type evaluateResponse struct {
 // evaluation logic. Adding the next type is a new case in the switch
 // below, not a restructure — see PROGRESS.md.
 //
-// This endpoint is a pure read/compute with no side effects, so
-// idempotency (required by the spec) falls out naturally.
+// This endpoint's own result is a pure function of its inputs. Its
+// decision-log recording (evaluateApprovalThreshold) is best-effort but
+// fully idempotent end to end: DecisionID is required precisely so a
+// retried request is safely repeatable, not just its returned result —
+// governance-decision-log-svc is itself idempotent on decision_id, so a
+// repeated call never records a duplicate decision.
 //
 // Response:
 //
 //	200 → {"result": "APPROVAL_REQUIRED"|"WITHIN_THRESHOLD", "policy_version_id": "...", "rule_basis": "..."}
-//	400 → missing policy_type, or (for APPROVAL_THRESHOLD) missing/invalid action_context.amount
+//	400 → missing policy_type/evaluated_by_principal_id/decision_id, or (for APPROVAL_THRESHOLD) missing/invalid action_context.amount
 //	404 → no applicable ACTIVE policy for that type+scope — the caller
 //	      decides fail-open/fail-closed, this service does not guess
 //	501 → policy_type has no evaluation logic implemented yet
@@ -586,6 +612,20 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if req.EvaluatedByPrincipalID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": "evaluated_by_principal_id",
+		})
+		return
+	}
+	if req.DecisionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "missing_field",
+			"field": "decision_id",
+		})
+		return
+	}
 
 	matches, err := h.store.FindApplicableVersions(r.Context(), req.PolicyType, req.TenantID, req.LegalEntityID)
 	if err != nil {
@@ -600,6 +640,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	if len(matches) == 0 {
 		// No applicable policy for this type+scope. This service does not
 		// guess fail-open/fail-closed — that decision belongs to the caller.
+		// Nothing was evaluated, so nothing is recorded as a decision.
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error":       "no_applicable_policy",
 			"policy_type": req.PolicyType,
@@ -610,8 +651,9 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 
 	switch req.PolicyType {
 	case "APPROVAL_THRESHOLD":
-		h.evaluateApprovalThreshold(w, req, applicable, correlationID)
+		h.evaluateApprovalThreshold(w, r, req, applicable, correlationID)
 	default:
+		// No evaluation logic exists for this type, so nothing to record.
 		writeJSON(w, http.StatusNotImplemented, map[string]string{
 			"error":       "policy_type_not_implemented",
 			"policy_type": req.PolicyType,
@@ -623,7 +665,11 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 // rule: compare action_context.amount against the matched version's
 // rule_payload.threshold_amount. amount > threshold => APPROVAL_REQUIRED;
 // amount <= threshold (including exactly equal) => WITHIN_THRESHOLD.
-func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, req evaluateRequest, applicable *domain.ApplicablePolicyVersion, correlationID string) {
+//
+// After a successful evaluation, records the decision in
+// governance-decision-log-svc (best-effort — see internal/decisionlog's
+// doc comment on HTTPClient) before responding to the caller.
+func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Request, req evaluateRequest, applicable *domain.ApplicablePolicyVersion, correlationID string) {
 	var rule struct {
 		ThresholdAmount *float64 `json:"threshold_amount"`
 	}
@@ -651,11 +697,34 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, req evaluateR
 	if *action.Amount > *rule.ThresholdAmount {
 		result = "APPROVAL_REQUIRED"
 	}
+	ruleBasis := fmt.Sprintf("%s:%s", applicable.PolicyCode, applicable.PolicyVersionID)
+
+	if err := h.decisionLog.RecordDecision(r.Context(), decisionlog.RecordDecisionParams{
+		DecisionID:        req.DecisionID,
+		TenantID:          req.TenantID,
+		LegalEntityID:     req.LegalEntityID,
+		ActorID:           req.EvaluatedByPrincipalID,
+		ActionType:        req.PolicyType,
+		Outcome:           result,
+		RuleBasis:         ruleBasis,
+		EvaluationContext: req.ActionContext,
+		CorrelationID:     correlationID,
+	}); err != nil {
+		// Best-effort: the evaluation result is still correct and still
+		// returned to the caller. Evaluate's own availability must not
+		// depend on the evidence store's uptime (see HTTPClient doc comment).
+		h.log.Error("evaluateApprovalThreshold: failed to record decision in governance-decision-log-svc",
+			zap.String("policy_version_id", applicable.PolicyVersionID),
+			zap.String("decision_id", req.DecisionID),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+	}
 
 	writeJSON(w, http.StatusOK, evaluateResponse{
 		Result:          result,
 		PolicyVersionID: applicable.PolicyVersionID,
-		RuleBasis:       fmt.Sprintf("%s:%s", applicable.PolicyCode, applicable.PolicyVersionID),
+		RuleBasis:       ruleBasis,
 	})
 }
 

@@ -16,6 +16,14 @@ type Config struct {
 	Port int
 
 	DB DBConfig
+
+	// GovernanceDecisionLogServiceURL is the base URL of
+	// governance-decision-log-svc. Evaluate calls POST /v1/decisions there
+	// after every evaluation to satisfy the "preserve evaluation basis for
+	// governed decisions" evidence obligation (03-microservices.md §8.1).
+	// Called synchronously but treated as best-effort — a failure here is
+	// logged, not surfaced (see internal/decisionlog.HTTPClient doc comment).
+	GovernanceDecisionLogServiceURL string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -54,6 +62,7 @@ func Load() (*Config, error) {
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
+		GovernanceDecisionLogServiceURL: env("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-decision-log-svc:8083"),
 	}, nil
 }
 
