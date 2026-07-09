@@ -334,7 +334,13 @@ The core value — brokering:
   idempotent no-op if already `REVOKED`, `409` if attempting to revoke a
   non-`GRANTED` lease. Records a `REVOKED` audit entry.
 - `POST /v1/secret-policies/{secret_policy_id}/rotate` — body:
-  `{request_id}` (**required** — see idempotency note below). Triggers
+  `{request_id, rotated_by_principal_id}` (both **required** — see
+  idempotency note below for `request_id`; `rotated_by_principal_id` was
+  not in this section's original draft, added during implementation
+  because `secret_access_audit_log.requested_by_principal_id` is `NOT
+  NULL` and a `ROTATED` entry needs a real actor to attribute the action
+  to, the same way every other audit-producing endpoint in this service
+  already requires one). Triggers
   the vault backend's `Rotate` (§7.6) for that policy's `secret_path`,
   records a `ROTATED` audit entry, publishes `secret.rotation.completed`.
   Does **not** change the policy's access rules (who's allowed) — only

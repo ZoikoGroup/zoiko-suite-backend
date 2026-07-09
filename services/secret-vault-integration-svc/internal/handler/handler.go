@@ -420,6 +420,10 @@ type brokerRequest struct {
 	LegalEntityID          *string `json:"legal_entity_id,omitempty"`
 	RequestedByPrincipalID string  `json:"requested_by_principal_id"`
 	RequestID              string  `json:"request_id"`
+	// CorrelationID is part of the documented body shape (context.md
+	// §7.2). The X-Correlation-ID header, used by every other endpoint
+	// in this service, takes precedence if present.
+	CorrelationID string `json:"correlation_id,omitempty"`
 }
 
 func (req brokerRequest) missingField() string {
@@ -459,8 +463,6 @@ type brokerResponse struct {
 // context.md — flag if a byte-identical token on replay is actually
 // required.
 func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
-	correlationID := r.Header.Get("X-Correlation-ID")
-
 	var req brokerRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -469,6 +471,11 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
+	}
+
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		correlationID = req.CorrelationID
 	}
 
 	// Step 1: REQUESTED is recorded regardless of outcome.
@@ -492,8 +499,10 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound), errors.Is(err, domain.ErrSecretPolicyVersionNotFound):
-			// Step 3: deny-by-absence — no policy, or none ACTIVE for this scope.
-			h.recordDenial(r.Context(), req, nil, "no applicable secret policy for this path/scope", correlationID)
+			// Step 3: deny-by-absence — no policy, or none ACTIVE for this
+			// scope. secret_class is genuinely unknown here — no policy
+			// was ever resolved to read it from.
+			h.recordDenial(r.Context(), req, "", nil, "no applicable secret policy for this path/scope", correlationID)
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy", "secret_path": req.SecretPath})
 		default:
 			h.log.Error("Broker: store unavailable resolving policy", zap.String("correlation_id", correlationID), zap.Error(err))
@@ -510,7 +519,10 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !contains(allowedWorkloads, req.RequestedByPrincipalID) {
-		h.recordDenial(r.Context(), req, &applicable.SecretPolicyVersionID, "requesting principal not in allowed_workload_ids", correlationID)
+		// secret_class IS known here — a policy was resolved, it just
+		// didn't authorize this caller. Recording it keeps this DENIED
+		// entry as complete evidence as a GRANTED one (context.md §5).
+		h.recordDenial(r.Context(), req, applicable.SecretClass, &applicable.SecretPolicyVersionID, "requesting principal not in allowed_workload_ids", correlationID)
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied", "secret_path": req.SecretPath})
 		return
 	}
@@ -571,9 +583,10 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) recordDenial(ctx context.Context, req brokerRequest, secretPolicyVersionID *string, detail, correlationID string) {
+func (h *Handler) recordDenial(ctx context.Context, req brokerRequest, secretClass string, secretPolicyVersionID *string, detail, correlationID string) {
 	if _, err := h.store.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
 		EventType:              "DENIED",
+		SecretClass:            secretClass,
 		SecretPath:             req.SecretPath,
 		RequestedByPrincipalID: req.RequestedByPrincipalID,
 		TenantID:               req.TenantID,
