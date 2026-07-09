@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -280,7 +281,28 @@ func TestJWTSigner_TamperedToken_FailsVerification(t *testing.T) {
 	signed, err := signer.Sign(envelope)
 	require.NoError(t, err)
 
-	tampered := signed[:len(signed)-2] + "xx" // flip the last two chars of the signature
+	// Flip the FIRST character of the payload segment, not a character in
+	// the signature. Two reasons:
+	//   1. RSA-2048 signatures are always 256 bytes, which isn't a multiple
+	//      of 3 — so the base64url encoding's trailing character sits in a
+	//      partial quantum where several bits are unused padding, discarded
+	//      on decode. Flipping a character there can decode to the exact
+	//      same byte value it replaced (no real tampering occurred), which
+	//      made an earlier version of this test flaky roughly 1 in 4 runs.
+	//   2. The payload's first character has no such ambiguity — it always
+	//      encodes real bits of the first payload byte — so changing it
+	//      deterministically changes the signed content, which the
+	//      signature (computed over the original content) can never match.
+	parts := strings.SplitN(signed, ".", 3)
+	require.Len(t, parts, 3, "signed token must have header.payload.signature")
+	payload := parts[1]
+	firstChar := payload[0]
+	replacement := byte('A')
+	if firstChar == replacement {
+		replacement = 'B'
+	}
+	parts[1] = string(replacement) + payload[1:]
+	tampered := strings.Join(parts, ".")
 
 	_, err = jwt.Parse(tampered, func(tok *jwt.Token) (any, error) {
 		return pubKey, nil
