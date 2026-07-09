@@ -25,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/schema-registry-svc/internal/authz"
 	"zoiko.io/schema-registry-svc/internal/config"
 	"zoiko.io/schema-registry-svc/internal/handler"
 	"zoiko.io/schema-registry-svc/internal/health"
@@ -45,7 +46,11 @@ func main() {
 	}
 	defer func() { _ = log.Sync() }()
 
-	log.Info("schema-registry-svc starting", zap.Int("port", cfg.Port), zap.String("db_host", cfg.DB.Host))
+	log.Info("schema-registry-svc starting",
+		zap.Int("port", cfg.Port),
+		zap.String("db_host", cfg.DB.Host),
+		zap.String("authz_url", cfg.AuthorizationServiceURL),
+	)
 
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
@@ -71,6 +76,7 @@ func main() {
 	log.Info("db pool connected")
 
 	pgStore := store.New(pool, log)
+	authzClient := authz.NewHTTPClient(cfg.AuthorizationServiceURL, log)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -78,7 +84,7 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, log)
+	h := handler.New(pgStore, authzClient, log)
 	handler.RegisterRoutes(r, h)
 
 	healthH := health.New(pool, log)
