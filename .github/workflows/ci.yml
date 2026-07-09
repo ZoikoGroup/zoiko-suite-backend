@@ -43,6 +43,7 @@ jobs:
           - secret-vault-integration-svc
           - authorization-svc
           - workflow-svc
+          - gateway-auth-svc
 
     steps:
       - name: Checkout
