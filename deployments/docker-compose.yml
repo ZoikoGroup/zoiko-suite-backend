@@ -23,6 +23,7 @@ services:
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
       - ../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
       - ../services/workflow-svc/deployments/migrations:/migrations/workflow:ro
+      - ../services/schema-registry-svc/deployments/migrations:/migrations/schema-registry:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -453,6 +454,33 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8090/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 12. schema-registry-svc (Port: 8093) ─────────────────────────────────────
+  schema-registry-svc:
+    build:
+      context: ../services/schema-registry-svc
+      dockerfile: Dockerfile
+    container_name: schema-registry-svc
+    ports:
+      - "8093:8093"
+    environment:
+      PORT: "8093"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: schema_registry
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8093/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

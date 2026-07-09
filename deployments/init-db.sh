@@ -11,6 +11,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE policy;
     CREATE DATABASE authorization_svc;
     CREATE DATABASE workflow;
+    CREATE DATABASE schema_registry;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -48,5 +49,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc"
 # Apply migrations for workflow-svc
 echo "Applying migrations for workflow..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow" -f /migrations/workflow/000001_initial_schema.up.sql
+
+# Apply migrations for schema-registry-svc
+echo "Applying migrations for schema_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."
