@@ -9,8 +9,13 @@ Go microservices monorepo — one `go.mod` per service, no shared build tool.
 | `jurisdiction-rules-svc` | 8082 | Real Postgres-backed read API for jurisdiction configuration |
 | `governance-decision-log-svc` | 8083 | Append-only evidence store for governance decisions (`POST`/`GET /v1/decisions`) |
 | `audit-event-store-svc` | 8084 | Kafka consumer + HTTP server health probes (`/healthz` and `/readyz`) |
-
----
+| `policy-svc` | 8085 | Policy/PolicyVersion CRUD + APPROVAL_THRESHOLD evaluation (`/v1/policies`, `/v1/policies/evaluate`) |
+| `configuration-feature-flag-svc` | 8086 | Versioned config + feature flags (`/v1/config`, `/v1/flags`); event publishing stubbed |
+| `secret-vault-integration-svc` | 8087 | Secret access broker — policy-gated, leased, rotation-aware (`/v1/secrets/broker`); local-file encrypted-at-rest backend for v1, real Vault/KMS client pending |
+| `obligations-svc` | 8088 | Obligation/FilingRequirement CRUD (`/v1/obligations`), jurisdiction-bound with fail-closed validation against jurisdiction-rules-svc |
+| `authorization-svc` | 8089 | Runtime access-decision engine — RBAC + delegated-authority + Separation-of-Duties evaluation (`/v1/authorize`), append-only decision evidence (`/v1/access-decisions`) |
+| `workflow-svc` | 8090 | Multi-stage approval orchestration (`/v1/workflows`) — extends authorization-svc, doesn't replace it: every approval action is checked via `POST /v1/authorize` before it's applied |
+| `gateway-auth-svc` | 8092 | API Gateway ForwardAuth target — verifies every gated request's signed identity envelope against identity-context-svc's JWKS (`/verify`) before Traefik forwards it to a backend; stateless, no DB |
 
 ## Unified Local Platform Development Stack
 
@@ -100,5 +105,3 @@ To tear down the container stack and remove the persistent DB volume:
 ```powershell
 docker compose -f deployments/docker-compose.yml down -v
 ```
-| `policy-svc` | 8085 | Policy/PolicyVersion CRUD + APPROVAL_THRESHOLD evaluation (`/v1/policies`, `/v1/policies/evaluate`); event publishing stubbed |
-| `audit-event-store-svc` | — | Kafka consumer + store interface only; no HTTP server yet |

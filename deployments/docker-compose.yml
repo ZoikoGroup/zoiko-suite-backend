@@ -21,6 +21,8 @@ services:
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
+      - ../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
+      - ../services/workflow-svc/deployments/migrations:/migrations/workflow:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -70,6 +72,74 @@ services:
       retries: 10
       start_period: 15s
 
+  # ── One-shot: generate a throwaway RSA keypair for local/dev envelope signing ──
+  # Never used in staging/production — there, a real key is injected via the
+  # secrets manager. This exists only so `docker compose up` works out of the box
+  # without hand-generating a key or (far worse) baking a real one into the image.
+  identity-svc-keygen:
+    image: alpine:3.19
+    container_name: identity-svc-keygen
+    volumes:
+      - identity_jwt_keys:/keys
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        if [ ! -f /keys/envelope_signing_key.pem ]; then
+          openssl genrsa -out /keys/envelope_signing_key.pem 2048
+          echo "Generated throwaway dev signing key"
+        else
+          echo "Dev signing key already present, skipping"
+        fi
+        # identity-svc's runtime image runs as an unprivileged nonroot user
+        # (distroless), which needs read access to this file.
+        chmod 644 /keys/envelope_signing_key.pem
+    restart: "no"
+
+  # ── Docker socket proxy ──────────────────────────────────────────────────────
+  # Traefik's bundled Go Docker client is hardcoded to send its initial
+  # handshake as GET /v1.24/version, regardless of DOCKER_API_VERSION or
+  # image version (confirmed empirically — a plain curl against the same
+  # socket succeeds fine, and a versioned /v1.41/version call succeeds too,
+  # but /v1.24/version gets an empty-body 400 because this engine enforces
+  # MinAPIVersion 1.40). A custom nginx config (docker-proxy.nginx.conf)
+  # strips any old /vX.YY/ version prefix before forwarding to the real
+  # socket, and doubles as a read-only, containers-only allowlist so this
+  # gateway container's socket access can't be used for anything else.
+  docker-proxy:
+    image: nginx:1.27-alpine
+    container_name: zoiko-docker-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker-proxy.nginx.conf:/etc/nginx/nginx.conf:ro
+
+  # ── API Gateway (Traefik) ────────────────────────────────────────────────────
+  # Discovers routable services via Docker labels (see jurisdiction-svc below
+  # for the reference pattern, including the "gateway-auth" ForwardAuth
+  # middleware added in chunk 2). --api.insecure exposes the dashboard on
+  # 8091 for local dev visibility only — never do this in a real deployment.
+  gateway:
+    image: traefik:v3.1
+    container_name: zoiko-gateway
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://docker-proxy:2375"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+    ports:
+      - "80:80"
+      - "8091:8080" # Traefik's own dashboard, separate from every service's own port
+    depends_on:
+      docker-proxy:
+        condition: service_started
+      jurisdiction-svc:
+        condition: service_healthy
+      gateway-auth-svc:
+        condition: service_healthy
+
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
@@ -92,10 +162,16 @@ services:
       KAFKA_GROUP_ID: "identity-context-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.identity.events"
       JWT_SIGNING_SECRET: "local-dev-jwt-signing-secret-key-32-chars-long"
+      JWT_SIGNING_PRIVATE_KEY_PATH: "/keys/envelope_signing_key.pem"
+      JWT_KEY_ID: "local-dev-key-1"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       ACCESS_CONTROL_URL: "http://identity-svc:8080"
+    volumes:
+      - identity_jwt_keys:/keys:ro
     depends_on:
+      identity-svc-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -103,7 +179,35 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health | grep -q healthy"]
+      test: ["CMD", "/healthcheck", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── API Gateway chunk 2: ForwardAuth — verifies every gated request's
+  # signed identity envelope against identity-svc's JWKS before Traefik
+  # forwards it to any backend. Stateless: no DB, no Kafka. See
+  # jurisdiction-svc's labels below for how the "gateway-auth" middleware is
+  # wired into a route.
+  gateway-auth-svc:
+    build:
+      context: ../services/gateway-auth-svc
+      dockerfile: Dockerfile
+    container_name: gateway-auth-svc
+    ports:
+      - "8092:8092"
+    environment:
+      PORT: "8092"
+      IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      EXPECTED_ISSUER: "identity-context-svc"
+      EXPECTED_AUDIENCE: "zoiko-internal"
+    depends_on:
+      identity-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8092/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -137,7 +241,7 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8081/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -165,12 +269,35 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8082/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     restart: on-failure
+    # Gateway routing. PathPrefix /jurisdiction is stripped before
+    # forwarding, so this container never sees anything other than its
+    # normal /v1/... paths.
+    #
+    # Chunk 2 adds "gateway-auth": every request is forwarded to
+    # gateway-auth-svc first, which verifies the caller's signed identity
+    # envelope against identity-svc's JWKS. A rejected token never reaches
+    # this container at all — Traefik returns gateway-auth-svc's 401
+    # directly to the caller. On success, the principal/tenant/legal-entity
+    # identity resolved from the envelope is copied into X-Principal-Id /
+    # X-Tenant-Id / X-Legal-Entity-Id request headers this service can trust.
+    # This middleware is defined once here but referenced by name from any
+    # other service's router, since middleware names are global within the
+    # Traefik Docker provider.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jurisdiction.rule=PathPrefix(`/jurisdiction`)"
+      - "traefik.http.routers.jurisdiction.entrypoints=web"
+      - "traefik.http.services.jurisdiction.loadbalancer.server.port=8082"
+      - "traefik.http.middlewares.jurisdiction-strip.stripprefix.prefixes=/jurisdiction"
+      - "traefik.http.middlewares.gateway-auth.forwardauth.address=http://gateway-auth-svc:8092/verify"
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id"
+      - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
   governance-svc:
@@ -192,7 +319,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8083/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -224,7 +351,7 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8084/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8084/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -247,11 +374,85 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
+      GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "policy-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.policy.events"
     depends_on:
       postgres:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8085/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8085/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 7. authorization-svc (Port: 8089) ───────────────────────────────────────
+  authorization-svc:
+    build:
+      context: ../services/authorization-svc
+      dockerfile: Dockerfile
+    container_name: authorization-svc
+    ports:
+      - "8089:8089"
+    environment:
+      PORT: "8089"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: authorization_svc
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "authorization-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
+      JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 8. workflow-svc (Port: 8090) ────────────────────────────────────────────
+  workflow-svc:
+    build:
+      context: ../services/workflow-svc
+      dockerfile: Dockerfile
+    container_name: workflow-svc
+    ports:
+      - "8090:8090"
+    environment:
+      PORT: "8090"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: workflow
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "workflow-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.workflow.events"
+      AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8090/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -260,3 +461,4 @@ services:
 
 volumes:
   postgres_data:
+  identity_jwt_keys:

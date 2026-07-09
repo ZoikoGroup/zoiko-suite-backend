@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds all runtime configuration for policy-svc.
@@ -16,6 +17,16 @@ type Config struct {
 	Port int
 
 	DB DBConfig
+
+	// GovernanceDecisionLogServiceURL is the base URL of
+	// governance-decision-log-svc. Evaluate calls POST /v1/decisions there
+	// after every evaluation to satisfy the "preserve evaluation basis for
+	// governed decisions" evidence obligation (03-microservices.md §8.1).
+	// Called synchronously but treated as best-effort — a failure here is
+	// logged, not surfaced (see internal/decisionlog.HTTPClient doc comment).
+	GovernanceDecisionLogServiceURL string
+
+	Kafka KafkaConfig
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -26,6 +37,15 @@ type DBConfig struct {
 	User     string
 	Password string
 	SSLMode  string
+}
+
+// KafkaConfig mirrors identity-context-svc's and tenant-entity-registry-svc's
+// shape exactly. GroupID is unused today (this service only produces), kept
+// for shape consistency with the rest of the platform.
+type KafkaConfig struct {
+	Brokers []string
+	GroupID string
+	Topic   string
 }
 
 func (d DBConfig) DSN() string {
@@ -53,6 +73,12 @@ func Load() (*Config, error) {
 			User:     env("DB_USER", "postgres"),
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
+		},
+		GovernanceDecisionLogServiceURL: env("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-decision-log-svc:8083"),
+		Kafka: KafkaConfig{
+			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			GroupID: env("KAFKA_GROUP_ID", "policy-svc"),
+			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.policy.events"),
 		},
 	}, nil
 }

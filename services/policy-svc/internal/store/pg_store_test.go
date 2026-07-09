@@ -38,6 +38,14 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, string(mig1)); err != nil {
 		t.Fatalf("failed to execute migration 1: %v", err)
 	}
+
+	mig2, err := os.ReadFile("../../deployments/migrations/000002_add_activation_audit.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 2: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(mig2)); err != nil {
+		t.Fatalf("failed to execute migration 2: %v", err)
+	}
 }
 
 func strPtr(s string) *string { return &s }
@@ -213,6 +221,13 @@ func TestPgStore_ActivateVersion_SupersedesPreviousActiveAndIsIdempotent(t *test
 	if len(superseded1) != 0 {
 		t.Errorf("expected nothing superseded on first activation, got %d", len(superseded1))
 	}
+	if activated1.ActivatedByPrincipalID == nil || *activated1.ActivatedByPrincipalID != "actor-1" {
+		t.Errorf("expected activated_by_principal_id=actor-1 persisted, got %v", activated1.ActivatedByPrincipalID)
+	}
+	if activated1.ActivatedAt == nil {
+		t.Errorf("expected activated_at to be set on real activation")
+	}
+	firstActivatedAt := activated1.ActivatedAt
 
 	// 2. Idempotent retry: activating v1 again is a no-op, still ACTIVE.
 	retry, retrySuperseded, retryTransitioned, err := s.ActivateVersion(ctx, v1.PolicyVersionID, "actor-1")
@@ -228,6 +243,9 @@ func TestPgStore_ActivateVersion_SupersedesPreviousActiveAndIsIdempotent(t *test
 	if len(retrySuperseded) != 0 {
 		t.Errorf("expected nothing superseded on idempotent retry, got %d", len(retrySuperseded))
 	}
+	if retry.ActivatedAt == nil || !retry.ActivatedAt.Equal(*firstActivatedAt) {
+		t.Errorf("expected activated_at to be unchanged on idempotent no-op retry, first=%v retry=%v", firstActivatedAt, retry.ActivatedAt)
+	}
 
 	// 3. Create v2 in the SAME scope and activate it — must supersede v1.
 	v2, _, err := s.CreatePolicyVersion(ctx, domain.CreatePolicyVersionParams{
@@ -241,7 +259,7 @@ func TestPgStore_ActivateVersion_SupersedesPreviousActiveAndIsIdempotent(t *test
 		t.Fatalf("failed to create version 2: %v", err)
 	}
 
-	activated2, superseded2, transitioned2, err := s.ActivateVersion(ctx, v2.PolicyVersionID, "actor-1")
+	activated2, superseded2, transitioned2, err := s.ActivateVersion(ctx, v2.PolicyVersionID, "actor-2")
 	if err != nil {
 		t.Fatalf("unexpected error activating v2: %v", err)
 	}
@@ -251,11 +269,18 @@ func TestPgStore_ActivateVersion_SupersedesPreviousActiveAndIsIdempotent(t *test
 	if !transitioned2 {
 		t.Errorf("expected transitioned=true when activating v2")
 	}
+	if activated2.ActivatedByPrincipalID == nil || *activated2.ActivatedByPrincipalID != "actor-2" {
+		t.Errorf("expected activated_by_principal_id=actor-2 on v2, got %v", activated2.ActivatedByPrincipalID)
+	}
 	if len(superseded2) != 1 || superseded2[0].PolicyVersionID != v1.PolicyVersionID {
 		t.Fatalf("expected v1 to be returned as superseded, got %+v", superseded2)
 	}
 	if superseded2[0].VersionStatus != "SUPERSEDED" {
 		t.Errorf("expected superseded entry to report status SUPERSEDED, got %s", superseded2[0].VersionStatus)
+	}
+	// Superseding v1 must not erase who originally activated it.
+	if superseded2[0].ActivatedByPrincipalID == nil || *superseded2[0].ActivatedByPrincipalID != "actor-1" {
+		t.Errorf("expected v1's activation history (actor-1) to survive supersede, got %v", superseded2[0].ActivatedByPrincipalID)
 	}
 
 	v1AfterSupersede, err := s.FindPolicyVersionByID(ctx, v1.PolicyVersionID)
@@ -264,6 +289,9 @@ func TestPgStore_ActivateVersion_SupersedesPreviousActiveAndIsIdempotent(t *test
 	}
 	if v1AfterSupersede.VersionStatus != "SUPERSEDED" {
 		t.Errorf("expected v1 to be SUPERSEDED after activating v2, got %s", v1AfterSupersede.VersionStatus)
+	}
+	if v1AfterSupersede.ActivatedByPrincipalID == nil || *v1AfterSupersede.ActivatedByPrincipalID != "actor-1" {
+		t.Errorf("expected v1's activated_by_principal_id to remain actor-1 after supersede, got %v", v1AfterSupersede.ActivatedByPrincipalID)
 	}
 
 	// 4. Illegal transition: activating a SUPERSEDED version must fail.

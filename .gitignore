@@ -1,0 +1,11 @@
+.env
+*.pem
+
+# secret-vault-integration-svc's local dev vault store — never commit
+# encrypted-at-rest dev secret material, same spirit as *.pem above
+services/*/secret_store.local
+
+# stray compiled binaries from `go build` without -o (package-named
+# binaries left in a service's own root directory)
+services/*/server
+services/*/healthcheck

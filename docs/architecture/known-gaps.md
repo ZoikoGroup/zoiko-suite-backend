@@ -6,8 +6,9 @@ rules-svc) verifies stubStore's Go reimplementation of date-interval
 filtering, not the real SQL query in pg_store.go. No integration-test
 infrastructure (testcontainers-go, docker-compose, or a CI Postgres
 service container) exists anywhere in services/ or ci.yml today.
-tenant-entity-registry-svc's pg_store.go additionally has ZERO test
-coverage of any kind.
+tenant-entity-registry-svc's pg_store.go previously had ZERO test
+coverage of any kind (see "Resolved" section below).
+
 
 Fix in progress: internal/store/pg_store_test.go (env-guarded via
 TEST_DATABASE_URL, skips locally, runs in CI) + Postgres service
@@ -40,7 +41,22 @@ so those tables will read back empty until internal/events/consumer.go is
 wired to populate them from upstream events (tracked separately as the
 event-backbone gap).
 
-## Follow-up (separate tracked issue, not yet filed)
-Backfill integration tests for tenant-entity-registry-svc's pg_store.go —
-still zero test coverage of any kind, and its RLS-enforcing SQL is
-untested against a real database in CI.
+
+
+## Resolved: tenant-entity-registry-svc had zero test coverage
+internal/store/pg_store.go had no tests of any kind — including no
+verification that its Postgres Row-Level Security policies actually
+isolate tenants, despite that being this service's central architectural
+guarantee. Added internal/store/pg_store_test.go (env-guarded via
+TEST_DATABASE_URL, same convention as jurisdiction-rules-svc and
+identity-context-svc), covering CreateTenant/GetTenantByID,
+CreateEntity/GetEntityByID, and — the important one —
+TestPgStore_RLS_TenantIsolation, which creates two tenants each with
+their own entity and proves a query scoped to tenant A cannot see
+tenant B's data. Wired into ci.yml's TEST_DATABASE_URL matrix alongside
+the other three services.
+
+Follow-up (separate, not yet filed): the tests above cover Tenant and
+LegalEntity only. EntityHierarchy, EntityJurisdictionAssignment,
+DataResidencyPolicy, and TaxIdentityBundle still have no integration
+test coverage.

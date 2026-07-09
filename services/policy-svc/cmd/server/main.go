@@ -23,9 +23,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/config"
+	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/events"
 	"zoiko.io/policy-svc/internal/handler"
 	"zoiko.io/policy-svc/internal/health"
@@ -51,6 +53,7 @@ func main() {
 	log.Info("policy-svc starting",
 		zap.Int("port", cfg.Port),
 		zap.String("db_host", cfg.DB.Host),
+		zap.String("governance_decision_log_url", cfg.GovernanceDecisionLogServiceURL),
 	)
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
@@ -82,7 +85,19 @@ func main() {
 
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
-	publisher := events.NewPublisher(log, "policy-events")
+
+	// Kafka producer — connects lazily on first write, same posture as
+	// identity-context-svc/tenant-entity-registry-svc: not a fail-fast
+	// startup dependency like Postgres.
+	kafkaWriter := &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+	}
+	defer func() { _ = kafkaWriter.Close() }()
+
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -92,7 +107,7 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, log)
+	h := handler.New(pgStore, publisher, decisionLogClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes ──────────────────────────────────────────────────────
