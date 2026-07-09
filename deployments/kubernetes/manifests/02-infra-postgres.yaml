@@ -72,6 +72,10 @@ spec:
           mountPath: /migrations/governance-decision-log
         - name: policy-migrations
           mountPath: /migrations/policy
+        - name: authorization-migrations
+          mountPath: /migrations/authorization
+        - name: workflow-migrations
+          mountPath: /migrations/workflow
         livenessProbe:
           exec:
             command: ["pg_isready", "-U", "postgres", "-d", "postgres"]
@@ -112,6 +116,12 @@ spec:
       - name: policy-migrations
         configMap:
           name: policy-migrations
+      - name: authorization-migrations
+        configMap:
+          name: authorization-migrations
+      - name: workflow-migrations
+        configMap:
+          name: workflow-migrations
   volumeClaimTemplates:
   - metadata:
       name: postgres-data

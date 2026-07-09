@@ -166,6 +166,9 @@ spec:
     - namespaceSelector:
         matchLabels:
           name: zoiko-evidence
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-governance
     ports:
     - protocol: TCP
       port: 9092
@@ -452,6 +455,90 @@ spec:
       port: 5432
     - protocol: TCP
       port: 9092
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: authorization-svc-policy
+  namespace: zoiko-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: authorization-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8089
+  egress:
+  # Allow egress to Postgres and Kafka in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 9092
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workflow-svc-policy
+  namespace: zoiko-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: workflow-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8090
+  egress:
+  # Allow egress to Postgres and Kafka in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 9092
+  # Allow egress to authorization-svc in same namespace
+  - to:
+    - podSelector:
+        matchLabels:
+          app: authorization-svc
+    ports:
+    - protocol: TCP
+      port: 8089
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}

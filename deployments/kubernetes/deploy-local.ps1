@@ -68,7 +68,7 @@ kubectl config use-context kind-zoiko-cluster | Out-Null
 Write-Host "Active Kubernetes Context: $(kubectl config current-context)" -ForegroundColor Green
 
 # ── 4. Build Application Docker Images ────────────────────────────────────────
-Write-Host "Building Docker images for 6 services..." -ForegroundColor Cyan
+Write-Host "Building Docker images for 8 services..." -ForegroundColor Cyan
 
 $services = @{
     "identity-svc"         = "services/identity-context-svc"
@@ -77,6 +77,8 @@ $services = @{
     "governance-svc"       = "services/governance-decision-log-svc"
     "audit-svc"            = "services/audit-event-store-svc"
     "policy-svc"           = "services/policy-svc"
+    "authorization-svc"    = "services/authorization-svc"
+    "workflow-svc"         = "services/workflow-svc"
 }
 
 foreach ($svcName in $services.Keys) {
@@ -94,9 +96,25 @@ foreach ($svcName in $services.Keys) {
 }
 Write-Host "Docker images loaded into Kind." -ForegroundColor Green
 
-# ── 6. Setup Namespaces and ConfigMaps ────────────────────────────────────────
+# ── 6. Setup Namespaces, Secrets and ConfigMaps ───────────────────────────────
 Write-Host "Applying Namespaces..." -ForegroundColor Cyan
 kubectl apply -f deployments/kubernetes/manifests/00-namespaces.yaml
+
+Write-Host "Generating JWT signing private key locally via Docker openssl..." -ForegroundColor Cyan
+$keyPath = Join-Path $PSScriptRoot "envelope_signing_key.pem"
+if (-not (Test-Path $keyPath)) {
+    # Run openSSL generator inside Docker so it is cross-platform
+    & docker run --rm -v "${PSScriptRoot}:/keys" alpine:3.19 sh -c "apk add --no-cache openssl >/dev/null && openssl genrsa -out /keys/envelope_signing_key.pem 2048"
+    if (-not (Test-Path $keyPath)) {
+        throw "Failed to generate RSA private key."
+    }
+}
+
+Write-Host "Registering JWT private key secret in Kubernetes..." -ForegroundColor Cyan
+kubectl delete secret identity-signing-key -n zoiko-identity --ignore-not-found | Out-Null
+kubectl create secret generic identity-signing-key -n zoiko-identity --from-file="envelope_signing_key.pem=$keyPath" | Out-Null
+Remove-Item $keyPath -Force -ErrorAction SilentlyContinue
+Write-Host "Secret 'identity-signing-key' registered in zoiko-identity." -ForegroundColor Green
 
 Write-Host "Generating Migration ConfigMaps for PostgreSQL..." -ForegroundColor Cyan
 # Generate configmaps dynamically from folder contents, ensuring idempotency using dry-run output piped to apply
@@ -109,6 +127,8 @@ $migrationConfigs = @{
     "jurisdiction-migrations" = "services/jurisdiction-rules-svc/deployments/migrations"
     "governance-migrations"   = "services/governance-decision-log-svc/deployments/migrations"
     "policy-migrations"       = "services/policy-svc/deployments/migrations"
+    "authorization-migrations"= "services/authorization-svc/deployments/migrations"
+    "workflow-migrations"     = "services/workflow-svc/deployments/migrations"
 }
 
 foreach ($cmName in $migrationConfigs.Keys) {
@@ -142,6 +162,8 @@ kubectl apply -f deployments/kubernetes/manifests/07-app-jurisdiction.yaml
 kubectl apply -f deployments/kubernetes/manifests/08-app-governance.yaml
 kubectl apply -f deployments/kubernetes/manifests/09-app-audit.yaml
 kubectl apply -f deployments/kubernetes/manifests/10-app-policy.yaml
+kubectl apply -f deployments/kubernetes/manifests/11-app-authorization.yaml
+kubectl apply -f deployments/kubernetes/manifests/12-app-workflow.yaml
 
 # Wait for application services to spin up
 Write-Host "Waiting for application pods to roll out..." -ForegroundColor Yellow
@@ -151,18 +173,22 @@ kubectl rollout status deployment/jurisdiction-svc -n zoiko-governance --timeout
 kubectl rollout status deployment/governance-svc -n zoiko-governance --timeout=120s
 kubectl rollout status deployment/audit-svc -n zoiko-evidence --timeout=120s
 kubectl rollout status deployment/policy-svc -n zoiko-governance --timeout=120s
+kubectl rollout status deployment/authorization-svc -n zoiko-governance --timeout=120s
+kubectl rollout status deployment/workflow-svc -n zoiko-governance --timeout=120s
 Write-Host "All deployments rolled out successfully." -ForegroundColor Green
 
 # ── 9. Verify Deployments ─────────────────────────────────────────────────────
 Write-Host "`n=== Running Service Health Verification ===" -ForegroundColor Cyan
 
 $testPorts = @{
-    "identity-svc"     = @{ "port" = "8080"; "ns" = "zoiko-identity";   "path" = "health" }
-    "tenant-svc"       = @{ "port" = "8081"; "ns" = "zoiko-identity";   "path" = "healthz" }
-    "jurisdiction-svc" = @{ "port" = "8082"; "ns" = "zoiko-governance"; "path" = "healthz" }
-    "governance-svc"   = @{ "port" = "8083"; "ns" = "zoiko-governance"; "path" = "healthz" }
-    "audit-svc"        = @{ "port" = "8084"; "ns" = "zoiko-evidence";   "path" = "healthz" }
-    "policy-svc"       = @{ "port" = "8085"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "identity-svc"      = @{ "port" = "8080"; "ns" = "zoiko-identity";   "path" = "health" }
+    "tenant-svc"        = @{ "port" = "8081"; "ns" = "zoiko-identity";   "path" = "healthz" }
+    "jurisdiction-svc"  = @{ "port" = "8082"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "governance-svc"    = @{ "port" = "8083"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "audit-svc"         = @{ "port" = "8084"; "ns" = "zoiko-evidence";   "path" = "healthz" }
+    "policy-svc"        = @{ "port" = "8085"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "authorization-svc" = @{ "port" = "8089"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "workflow-svc"      = @{ "port" = "8090"; "ns" = "zoiko-governance"; "path" = "healthz" }
 }
 
 $pfProcesses = @()

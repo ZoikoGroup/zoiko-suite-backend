@@ -1,34 +1,34 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: identity-svc
-  namespace: zoiko-identity
+  name: authorization-svc
+  namespace: zoiko-governance
   labels:
-    app: identity-svc
+    app: authorization-svc
 spec:
   ports:
-  - port: 8080
-    targetPort: 8080
+  - port: 8089
+    targetPort: 8089
     name: http
   selector:
-    app: identity-svc
+    app: authorization-svc
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: identity-svc
-  namespace: zoiko-identity
+  name: authorization-svc
+  namespace: zoiko-governance
   labels:
-    app: identity-svc
+    app: authorization-svc
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: identity-svc
+      app: authorization-svc
   template:
     metadata:
       labels:
-        app: identity-svc
+        app: authorization-svc
     spec:
       securityContext:
         runAsNonRoot: true
@@ -36,11 +36,11 @@ spec:
         runAsGroup: 65532
         fsGroup: 65532
       containers:
-      - name: identity-svc
-        image: identity-svc:latest
+      - name: authorization-svc
+        image: authorization-svc:latest
         imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: 8080
+        - containerPort: 8089
           name: http
         securityContext:
           allowPrivilegeEscalation: false
@@ -52,55 +52,37 @@ spec:
             type: RuntimeDefault
         env:
         - name: PORT
-          value: "8080"
+          value: "8089"
         - name: DB_HOST
           value: "postgres.zoiko-infra.svc.cluster.local"
         - name: DB_PORT
           value: "5432"
         - name: DB_NAME
-          value: "identity_context"
+          value: "authorization_svc"
         - name: DB_USER
           value: "postgres"
         - name: DB_PASSWORD
           value: "postgres"
         - name: DB_SSLMODE
           value: "disable"
-        - name: REDIS_HOST
-          value: "redis.zoiko-infra.svc.cluster.local"
-        - name: REDIS_PORT
-          value: "6379"
         - name: KAFKA_BROKERS
           value: "kafka.zoiko-infra.svc.cluster.local:9092"
         - name: KAFKA_GROUP_ID
-          value: "identity-context-svc"
+          value: "authorization-svc"
         - name: KAFKA_EVENTS_TOPIC
-          value: "zoiko.identity.events"
-        - name: JWT_SIGNING_SECRET
-          value: "local-dev-jwt-signing-secret-key-32-chars-long"
-        - name: JWT_SIGNING_PRIVATE_KEY_PATH
-          value: "/keys/envelope_signing_key.pem"
-        - name: JWT_KEY_ID
-          value: "local-dev-key-1"
-        - name: TENANT_REGISTRY_URL
-          value: "http://tenant-svc.zoiko-identity.svc.cluster.local:8081"
-        - name: DELEGATED_AUTHORITY_URL
-          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080"
-        - name: ACCESS_CONTROL_URL
-          value: "http://identity-svc.zoiko-identity.svc.cluster.local:8080"
-        volumeMounts:
-        - name: signing-key-vol
-          mountPath: /keys
-          readOnly: true
+          value: "zoiko.authorization.events"
+        - name: JURISDICTION_RULES_URL
+          value: "http://jurisdiction-svc.zoiko-governance.svc.cluster.local:8082"
         livenessProbe:
           httpGet:
-            path: /health
-            port: 8080
+            path: /healthz
+            port: 8089
           initialDelaySeconds: 15
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /health
-            port: 8080
+            path: /healthz
+            port: 8089
           initialDelaySeconds: 15
           periodSeconds: 10
         resources:
@@ -110,7 +92,3 @@ spec:
           requests:
             cpu: "100m"
             memory: "128Mi"
-      volumes:
-      - name: signing-key-vol
-        secret:
-          secretName: identity-signing-key
