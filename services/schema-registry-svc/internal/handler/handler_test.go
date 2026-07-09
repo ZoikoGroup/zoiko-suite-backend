@@ -53,11 +53,38 @@ func (s *stubStore) Insert(_ context.Context, sch *domain.EventSchema) error {
 	return s.insertErr
 }
 
+// ── stub authz client ──────────────────────────────────────────────────────
+
+type stubAuthz struct {
+	err          error
+	gotPrincipal string
+}
+
+func (a *stubAuthz) CheckSchemaPublishAllowed(_ context.Context, principalID, _, _ string) error {
+	a.gotPrincipal = principalID
+	return a.err
+}
+
+// newRouter builds a router whose authz client always GRANTS — the default
+// for tests focused on store/compat behavior. Register requests must carry
+// the X-Principal-Id header the gateway would set (see withIdentity).
 func newRouter(s *stubStore) chi.Router {
+	return newRouterWithAuthz(s, &stubAuthz{})
+}
+
+func newRouterWithAuthz(s *stubStore, a *stubAuthz) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, zap.NewNop())
+	h := handler.New(s, a, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
+}
+
+// withIdentity stamps the identity headers gateway-auth-svc sets on a
+// verified request, so a register call clears the authorization gate.
+func withIdentity(req *http.Request) *http.Request {
+	req.Header.Set("X-Principal-Id", "principal-admin-001")
+	req.Header.Set("X-Legal-Entity-Id", "entity-001")
+	return req
 }
 
 // ── RegisterVersion ──────────────────────────────────────────────────────────
@@ -67,7 +94,7 @@ func TestRegisterVersion_FirstVersion_Returns201WithVersion1(t *testing.T) {
 	r := newRouter(s)
 
 	body := `{"json_schema":{"properties":{"principal_id":{"type":"string"}},"required":["principal_id"]}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/identity.context.resolved/versions", bytes.NewBufferString(body))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/identity.context.resolved/versions", bytes.NewBufferString(body)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -78,6 +105,7 @@ func TestRegisterVersion_FirstVersion_Returns201WithVersion1(t *testing.T) {
 	assert.Equal(t, "identity.context.resolved", got.EventName)
 	require.NotNil(t, s.insertedArg)
 	assert.Equal(t, 1, s.insertedArg.Version)
+	assert.Equal(t, "principal-admin-001", s.insertedArg.RegisteredBy)
 }
 
 func TestRegisterVersion_CompatibleEvolution_Returns201WithNextVersion(t *testing.T) {
@@ -89,7 +117,7 @@ func TestRegisterVersion_CompatibleEvolution_Returns201WithNextVersion(t *testin
 	r := newRouter(s)
 
 	body := `{"json_schema":{"properties":{"principal_id":{"type":"string"},"session_id":{"type":"string"}},"required":["principal_id"]}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/identity.context.resolved/versions", bytes.NewBufferString(body))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/identity.context.resolved/versions", bytes.NewBufferString(body)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -108,7 +136,7 @@ func TestRegisterVersion_BreakingChange_Returns409WithViolations(t *testing.T) {
 	r := newRouter(s)
 
 	body := `{"json_schema":{"properties":{"principal_id":{"type":"string"}},"required":["principal_id"]}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/identity.context.resolved/versions", bytes.NewBufferString(body))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/identity.context.resolved/versions", bytes.NewBufferString(body)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -123,7 +151,7 @@ func TestRegisterVersion_MissingSchema_Returns400(t *testing.T) {
 	s := &stubStore{}
 	r := newRouter(s)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(`{}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(`{}`)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -134,7 +162,7 @@ func TestRegisterVersion_MalformedJSONSchema_Returns400(t *testing.T) {
 	s := &stubStore{}
 	r := newRouter(s)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(`{"json_schema": not-json}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(`{"json_schema": not-json}`)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -146,11 +174,56 @@ func TestRegisterVersion_StoreUnavailable_Returns503(t *testing.T) {
 	r := newRouter(s)
 
 	body := `{"json_schema":{"properties":{},"required":[]}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+// ── Authorization gate (chunk 2) ────────────────────────────────────────────
+
+func TestRegisterVersion_NoIdentityHeader_Returns401(t *testing.T) {
+	s := &stubStore{}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{},"required":[]}}`
+	// No withIdentity — simulates a request that never passed the gateway.
+	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+	assert.Nil(t, s.insertedArg, "must not persist without a resolved identity")
+}
+
+func TestRegisterVersion_AuthorizationDenied_Returns403(t *testing.T) {
+	s := &stubStore{}
+	a := &stubAuthz{err: domain.ErrPublishDenied}
+	r := newRouterWithAuthz(s, a)
+
+	body := `{"json_schema":{"properties":{},"required":[]}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, "principal-admin-001", a.gotPrincipal)
+	assert.Nil(t, s.insertedArg, "must not persist a denied mutation")
+}
+
+func TestRegisterVersion_AuthorizationServiceUnavailable_Returns503FailClosed(t *testing.T) {
+	s := &stubStore{}
+	a := &stubAuthz{err: domain.ErrAuthorizationServiceUnavailable}
+	r := newRouterWithAuthz(s, a)
+
+	body := `{"json_schema":{"properties":{},"required":[]}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Nil(t, s.insertedArg, "must fail closed when authorization-svc is unreachable")
 }
 
 // ── GetLatest / GetVersion / ListVersions / ListEventNames ──────────────────

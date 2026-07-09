@@ -51,6 +51,16 @@ var (
 	ErrIncompatibleSchema = errors.New("incompatible schema change")
 	// ErrStoreUnavailable is returned when Postgres is unreachable — fail closed.
 	ErrStoreUnavailable = errors.New("schema store unavailable")
+	// ErrIdentityMissing is returned when a mutation request carries no
+	// resolved identity (no X-Principal-Id header) — the request never
+	// passed through the gateway's identity verification. Fail closed.
+	ErrIdentityMissing = errors.New("caller identity missing")
+	// ErrPublishDenied is returned when authorization-svc denies the
+	// principal the SCHEMA_PUBLISH action.
+	ErrPublishDenied = errors.New("not authorized to publish schemas")
+	// ErrAuthorizationServiceUnavailable is returned when authorization-svc
+	// cannot be reached — mutations fail closed, never silently permitted.
+	ErrAuthorizationServiceUnavailable = errors.New("authorization service unavailable")
 )
 
 // IncompatibleSchemaError carries the specific compatibility violations found,

@@ -24,6 +24,9 @@ func (d DBConfig) DSN() string {
 type Config struct {
 	Port int
 	DB   DBConfig
+	// AuthorizationServiceURL is authorization-svc's base URL (no trailing
+	// slash). Schema registration is gated through it, fail-closed.
+	AuthorizationServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -46,6 +49,7 @@ func Load() (*Config, error) {
 			Password: strEnv("DB_PASSWORD", "postgres"),
 			SSLMode:  strEnv("DB_SSLMODE", "disable"),
 		},
+		AuthorizationServiceURL: strEnv("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
 	}, nil
 }
 

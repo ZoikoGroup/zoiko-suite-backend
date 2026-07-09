@@ -476,8 +476,11 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
+      AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8093/healthz"]

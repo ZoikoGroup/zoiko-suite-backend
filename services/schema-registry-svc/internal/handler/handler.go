@@ -3,6 +3,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/schema-registry-svc/internal/authz"
 	"zoiko.io/schema-registry-svc/internal/compat"
 	"zoiko.io/schema-registry-svc/internal/domain"
 	"zoiko.io/schema-registry-svc/internal/store"
@@ -17,11 +19,12 @@ import (
 
 type Handler struct {
 	store store.Store
+	authz authz.Client
 	log   *zap.Logger
 }
 
-func New(s store.Store, log *zap.Logger) *Handler {
-	return &Handler{store: s, log: log}
+func New(s store.Store, authzClient authz.Client, log *zap.Logger) *Handler {
+	return &Handler{store: s, authz: authzClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -44,6 +47,29 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 	eventName := chi.URLParam(r, "eventName")
 	if eventName == "" {
 		writeError(w, http.StatusBadRequest, domain.ErrEventNameRequired.Error())
+		return
+	}
+
+	// ── Authorization gate (05-security.md §14.6 event-contract mutation
+	// rights). Identity is resolved by the gateway (gateway-auth-svc) and
+	// arrives as X-Principal-Id / X-Legal-Entity-Id headers. A request with
+	// no resolved principal never passed identity verification — fail closed.
+	principalID := r.Header.Get("X-Principal-Id")
+	legalEntityID := r.Header.Get("X-Legal-Entity-Id")
+	correlationID := r.Header.Get("X-Correlation-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, domain.ErrIdentityMissing.Error())
+		return
+	}
+	if err := h.authz.CheckSchemaPublishAllowed(r.Context(), principalID, legalEntityID, correlationID); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrPublishDenied):
+			writeError(w, http.StatusForbidden, domain.ErrPublishDenied.Error())
+		default:
+			h.log.Error("authorization check failed — failing closed",
+				zap.String("event_name", eventName), zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, domain.ErrAuthorizationServiceUnavailable.Error())
+		}
 		return
 	}
 
@@ -90,7 +116,7 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		EventName:    eventName,
 		Version:      nextVersion,
 		JSONSchema:   req.JSONSchema,
-		RegisteredBy: r.Header.Get("X-Actor-Principal-ID"),
+		RegisteredBy: principalID,
 		RegisteredAt: time.Now().UTC(),
 	}
 	if err := h.store.Insert(ctx, newSchema); err != nil {
