@@ -165,10 +165,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./docker-proxy.nginx.conf:/etc/nginx/nginx.conf:ro
 
-  # ── API Gateway (Traefik) — chunk 1: routing only, no auth yet ──────────────
+  # ── API Gateway (Traefik) ────────────────────────────────────────────────────
   # Discovers routable services via Docker labels (see jurisdiction-svc below
-  # for the reference pattern). --api.insecure exposes the dashboard on 8091
-  # for local dev visibility only — never do this in a real deployment.
+  # for the reference pattern, including the "gateway-auth" ForwardAuth
+  # middleware added in chunk 2). --api.insecure exposes the dashboard on
+  # 8091 for local dev visibility only — never do this in a real deployment.
   gateway:
     image: traefik:v3.1
     container_name: zoiko-gateway
@@ -186,6 +187,8 @@ services:
       docker-proxy:
         condition: service_started
       jurisdiction-svc:
+        condition: service_healthy
+      gateway-auth-svc:
         condition: service_healthy
 
   # ── Global Traffic & Residency Manager — Phase 1 demo ────────────────────────
@@ -297,6 +300,34 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # ── API Gateway chunk 2: ForwardAuth — verifies every gated request's
+  # signed identity envelope against identity-svc's JWKS before Traefik
+  # forwards it to any backend. Stateless: no DB, no Kafka. See
+  # jurisdiction-svc's labels below for how the "gateway-auth" middleware is
+  # wired into a route.
+  gateway-auth-svc:
+    build:
+      context: ../services/gateway-auth-svc
+      dockerfile: Dockerfile
+    container_name: gateway-auth-svc
+    ports:
+      - "8092:8092"
+    environment:
+      PORT: "8092"
+      IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
+      EXPECTED_ISSUER: "identity-context-svc"
+      EXPECTED_AUDIENCE: "zoiko-internal"
+    depends_on:
+      identity-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8092/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # ── 2. tenant-entity-registry-svc (Port: 8081) ────────────────────────────────
   tenant-svc:
     build:
@@ -362,16 +393,29 @@ services:
       retries: 5
       start_period: 10s
     restart: on-failure
-    # Gateway routing (chunk 1 — proves Traefik can route, no auth yet).
-    # PathPrefix /jurisdiction is stripped before forwarding, so this
-    # container never sees anything other than its normal /v1/... paths.
+    # Gateway routing. PathPrefix /jurisdiction is stripped before
+    # forwarding, so this container never sees anything other than its
+    # normal /v1/... paths.
+    #
+    # Chunk 2 adds "gateway-auth": every request is forwarded to
+    # gateway-auth-svc first, which verifies the caller's signed identity
+    # envelope against identity-svc's JWKS. A rejected token never reaches
+    # this container at all — Traefik returns gateway-auth-svc's 401
+    # directly to the caller. On success, the principal/tenant/legal-entity
+    # identity resolved from the envelope is copied into X-Principal-Id /
+    # X-Tenant-Id / X-Legal-Entity-Id request headers this service can trust.
+    # This middleware is defined once here but referenced by name from any
+    # other service's router, since middleware names are global within the
+    # Traefik Docker provider.
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.jurisdiction.rule=PathPrefix(`/jurisdiction`)"
       - "traefik.http.routers.jurisdiction.entrypoints=web"
       - "traefik.http.services.jurisdiction.loadbalancer.server.port=8082"
       - "traefik.http.middlewares.jurisdiction-strip.stripprefix.prefixes=/jurisdiction"
-      - "traefik.http.routers.jurisdiction.middlewares=jurisdiction-strip"
+      - "traefik.http.middlewares.gateway-auth.forwardauth.address=http://gateway-auth-svc:8092/verify"
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id"
+      - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
   governance-svc:
