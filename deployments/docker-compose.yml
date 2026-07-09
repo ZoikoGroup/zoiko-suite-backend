@@ -20,6 +20,8 @@ services:
       - ../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
+      - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
+      - ../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -69,6 +71,31 @@ services:
       retries: 10
       start_period: 15s
 
+  # ── One-shot: generate a throwaway RSA keypair for local/dev envelope signing ──
+  # Never used in staging/production — there, a real key is injected via the
+  # secrets manager. This exists only so `docker compose up` works out of the box
+  # without hand-generating a key or (far worse) baking a real one into the image.
+  identity-svc-keygen:
+    image: alpine:3.19
+    container_name: identity-svc-keygen
+    volumes:
+      - identity_jwt_keys:/keys
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        if [ ! -f /keys/envelope_signing_key.pem ]; then
+          openssl genrsa -out /keys/envelope_signing_key.pem 2048
+          echo "Generated throwaway dev signing key"
+        else
+          echo "Dev signing key already present, skipping"
+        fi
+        # identity-svc's runtime image runs as an unprivileged nonroot user
+        # (distroless), which needs read access to this file.
+        chmod 644 /keys/envelope_signing_key.pem
+    restart: "no"
+
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
@@ -91,10 +118,16 @@ services:
       KAFKA_GROUP_ID: "identity-context-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.identity.events"
       JWT_SIGNING_SECRET: "local-dev-jwt-signing-secret-key-32-chars-long"
+      JWT_SIGNING_PRIVATE_KEY_PATH: "/keys/envelope_signing_key.pem"
+      JWT_KEY_ID: "local-dev-key-1"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       ACCESS_CONTROL_URL: "http://identity-svc:8080"
+    volumes:
+      - identity_jwt_keys:/keys:ro
     depends_on:
+      identity-svc-keygen:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -102,7 +135,7 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health | grep -q healthy"]
+      test: ["CMD", "/healthcheck", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -136,7 +169,7 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8081/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -164,7 +197,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8082/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -191,7 +224,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8083/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -223,7 +256,73 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8084/healthz | grep -q ok"]
+      test: ["CMD", "/healthcheck", "http://localhost:8084/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 6. policy-svc (Port: 8085) ────────────────────────────────────────────────
+  policy-svc:
+    build:
+      context: ../services/policy-svc
+      dockerfile: Dockerfile
+    container_name: policy-svc
+    ports:
+      - "8085:8085"
+    environment:
+      PORT: "8085"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: policy
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "policy-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.policy.events"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8085/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 7. authorization-svc (Port: 8089) ───────────────────────────────────────
+  authorization-svc:
+    build:
+      context: ../services/authorization-svc
+      dockerfile: Dockerfile
+    container_name: authorization-svc
+    ports:
+      - "8089:8089"
+    environment:
+      PORT: "8089"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: authorization_svc
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "authorization-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
+      JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -232,3 +331,4 @@ services:
 
 volumes:
   postgres_data:
+  identity_jwt_keys:

@@ -4,8 +4,10 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/domain"
@@ -25,19 +27,17 @@ type envelope struct {
 
 // Publisher implements event publishing against the Kafka event backbone.
 //
-// Publishing is stubbed (logged, not written to Kafka) until a
-// kafka.Writer is injected — same posture as governance-decision-log-svc,
-// identity-context-svc, and tenant-entity-registry-svc; there is no real
-// Kafka event backbone wired anywhere in this repo yet.
+// Events are facts, not commands. Published topics are append-only. Same
+// posture as identity-context-svc and tenant-entity-registry-svc's producers.
 type Publisher struct {
-	log   *zap.Logger
-	topic string
-	// producer *kafka.Writer  — TODO: inject kafka.Writer before Phase 1 exit criteria
+	log      *zap.Logger
+	topic    string
+	producer *kafka.Writer
 }
 
-// NewPublisher constructs a Publisher bound to the given topic.
-func NewPublisher(log *zap.Logger, topic string) *Publisher {
-	return &Publisher{log: log, topic: topic}
+// NewPublisher constructs a Publisher bound to the given topic and Kafka writer.
+func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publisher {
+	return &Publisher{log: log, topic: topic, producer: producer}
 }
 
 // PublishPolicyCreated publishes policy.created for a newly-created
@@ -97,12 +97,13 @@ func (p *Publisher) PublishRuleRetired(ctx context.Context, version domain.Polic
 	})
 }
 
-// emit serialises the payload into the canonical envelope and writes to
-// Kafka. Stub: logs structured JSON until kafka.Writer is injected.
+// emit serialises the payload into the canonical envelope and writes it to
+// the Kafka topic set on the Writer (main.go) — not set here, since kafka-go
+// rejects a Message that also specifies Topic when the Writer already has one.
 func (p *Publisher) emit(eventType, correlationID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
 	}
 	env := envelope{
 		EventType:     eventType,
@@ -114,17 +115,18 @@ func (p *Publisher) emit(eventType, correlationID string, payload map[string]any
 	}
 	data, err := json.Marshal(env)
 	if err != nil {
-		return err
+		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
 	}
 
-	// TODO: publish to Kafka topic
-	// msg := kafka.Message{Topic: p.topic, Value: data}
-	// if err := p.producer.WriteMessages(ctx, msg); err != nil { ... outbox retry ... }
+	msg := kafka.Message{Value: data}
+	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
+		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
+	}
 
-	p.log.Info("event emitted (stub — wire Kafka writer)",
+	p.log.Info("event published",
 		zap.String("event_type", eventType),
+		zap.String("topic", p.topic),
 		zap.String("correlation_id", correlationID),
-		zap.ByteString("payload", data),
 	)
 	return nil
 }
