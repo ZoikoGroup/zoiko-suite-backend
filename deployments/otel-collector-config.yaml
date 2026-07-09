@@ -1,0 +1,31 @@
+# OTel Collector — trace-only pipeline for the Observability Baseline
+# retrofit (docs/architecture/03-microservices.md §3.8). Metrics are
+# deliberately NOT routed through this collector: Prometheus scrapes each
+# service's own /metrics endpoint directly (pull model), which keeps this
+# collector single-purpose (traces in, traces out to Jaeger) rather than a
+# second thing every service also has to push metrics into.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch: {}
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, debug]

@@ -1,7 +1,11 @@
 #!/bin/bash
 set -e
 
-# Create all 8 databases required by the services
+# Create all 11 databases required by the services. configuration_feature_flag,
+# secret_vault_integration, and obligations were added alongside the
+# Observability Baseline retrofit (docs/architecture/observability-baseline-plan.md)
+# — those three services never had a compose entry or a database provisioned
+# here before, a pre-existing gap found and closed in the same pass.
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
     CREATE DATABASE audit_event_store;
     CREATE DATABASE tenant_entity_registry;
@@ -11,6 +15,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE policy;
     CREATE DATABASE authorization_svc;
     CREATE DATABASE workflow;
+    CREATE DATABASE configuration_feature_flag;
+    CREATE DATABASE secret_vault_integration;
+    CREATE DATABASE obligations;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -48,5 +55,17 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc"
 # Apply migrations for workflow-svc
 echo "Applying migrations for workflow..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow" -f /migrations/workflow/000001_initial_schema.up.sql
+
+# Apply migrations for configuration-feature-flag-svc
+echo "Applying migrations for configuration_feature_flag..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "configuration_feature_flag" -f /migrations/configuration-feature-flag/000001_initial_schema.up.sql
+
+# Apply migrations for secret-vault-integration-svc
+echo "Applying migrations for secret_vault_integration..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integration" -f /migrations/secret-vault-integration/000001_initial_schema.up.sql
+
+# Apply migrations for obligations-svc
+echo "Applying migrations for obligations..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."

@@ -26,9 +26,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
 	"zoiko.io/audit-event-store-svc/internal/config"
@@ -36,6 +38,7 @@ import (
 	"zoiko.io/audit-event-store-svc/internal/health"
 	kafkarunner "zoiko.io/audit-event-store-svc/internal/kafka"
 	"zoiko.io/audit-event-store-svc/internal/store"
+	"zoiko.io/audit-event-store-svc/internal/telemetry"
 )
 
 func main() {
@@ -63,12 +66,28 @@ func main() {
 		zap.Strings("kafka_topics", cfg.Kafka.Topics),
 	)
 
+	// ── 2b. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "audit-event-store-svc", cfg.OTELExporterEndpoint)
+	if err != nil {
+		log.Fatal("otel tracing init failed", zap.Error(err))
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Error("otel tracer provider shutdown failed", zap.Error(err))
+		}
+	}()
+
+	metrics := telemetry.NewMetrics("audit-event-store-svc")
+
 	// ── 3. Database pool ─────────────────────────────────────────────────────
 	// Explicit pool configuration matching the other Tier 0 services.
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
 		log.Fatal("failed to parse db pool config", zap.Error(err))
 	}
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
 	poolCfg.MaxConns = 20
 	poolCfg.MinConns = 2
 	poolCfg.MaxConnLifetime = 30 * time.Minute
@@ -102,7 +121,7 @@ func main() {
 
 	runners := make([]*kafkarunner.Runner, 0, len(cfg.Kafka.Topics))
 	for _, topic := range cfg.Kafka.Topics {
-		r := kafkarunner.NewRunner(cfg.Kafka.Brokers, cfg.Kafka.GroupID, topic, c, log)
+		r := kafkarunner.NewRunner(cfg.Kafka.Brokers, cfg.Kafka.GroupID, topic, c, metrics, log)
 		runners = append(runners, r)
 		go r.Run(kafkaCtx)
 		log.Info("kafka consumer started", zap.String("topic", topic))
@@ -118,7 +137,8 @@ func main() {
 	// Health probes — no auth, no tenant context required.
 	healthH := health.New(pool, log)
 	router.Get("/healthz", healthH.Liveness)
-	router.Get("/readyz", healthH.Readiness)
+	router.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
+	router.Handle("/metrics", promhttp.Handler())
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + itoa(cfg.Port)

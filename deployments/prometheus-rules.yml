@@ -1,0 +1,28 @@
+# Alertable failure states (03-microservices.md §3.8's sixth criterion).
+# Native Prometheus alerting rules — evaluate and show up in Prometheus's
+# own /alerts UI as Pending/Firing without needing Alertmanager deployed.
+# Both rules are driven by metrics the per-service instrumentation
+# (internal/telemetry, copied per service) already emits — nothing
+# invented solely for alerting. Alertmanager + real paging integration is
+# real future work, explicitly deferred, not part of this baseline.
+groups:
+  - name: observability-baseline
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum by (service) (rate(http_requests_total{status_code=~"5.."}[5m]))
+          /
+          sum by (service) (rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.service }} 5xx rate above 5% for 5m"
+
+      - alert: ReadinessProbeFailing
+        expr: readiness_up == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.service }} readiness probe reports DB unreachable for 2m"

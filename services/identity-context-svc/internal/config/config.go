@@ -31,6 +31,10 @@ type Config struct {
 	TenantRegistryURL      string
 	DelegatedAuthorityURL  string
 	AccessControlURL       string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 type DBConfig struct {
@@ -100,6 +104,7 @@ func Load() (*Config, error) {
 		TenantRegistryURL:     env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
 		DelegatedAuthorityURL: env("DELEGATED_AUTHORITY_URL", "http://delegated-authority-svc"),
 		AccessControlURL:      env("ACCESS_CONTROL_URL", "http://access-control-svc"),
+		OTELExporterEndpoint:  env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}
 	return cfg, nil
 }

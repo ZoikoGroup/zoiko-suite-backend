@@ -23,6 +23,9 @@ services:
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
       - ../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
       - ../services/workflow-svc/deployments/migrations:/migrations/workflow:ro
+      - ../services/configuration-feature-flag-svc/deployments/migrations:/migrations/configuration-feature-flag:ro
+      - ../services/secret-vault-integration-svc/deployments/migrations:/migrations/secret-vault-integration:ro
+      - ../services/obligations-svc/deployments/migrations:/migrations/obligations:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -71,6 +74,54 @@ services:
       timeout: 10s
       retries: 10
       start_period: 15s
+
+  # ── Observability Baseline (03-microservices.md §3.8) ────────────────────────
+  # Trace-only OTel Collector — metrics stay pull-based via Prometheus
+  # scraping each service's own /metrics directly, so this collector has
+  # exactly one job (OTLP in, OTLP out to Jaeger).
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.153.0
+    container_name: zoiko-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  # Trace storage + UI — http://localhost:16686
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: zoiko-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+
+  # Metrics + alert evaluation — http://localhost:9090, alerts at /alerts
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: zoiko-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-rules.yml:/etc/prometheus/rules.yml:ro
+    ports:
+      - "9090:9090"
+
+  # Dashboards — http://localhost:3000 (admin/admin)
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: zoiko-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
 
   # ── One-shot: generate a throwaway RSA keypair for local/dev envelope signing ──
   # Never used in staging/production — there, a real key is injected via the
@@ -137,6 +188,68 @@ services:
       jurisdiction-svc:
         condition: service_healthy
 
+  # ── Global Traffic & Residency Manager — Phase 1 demo ────────────────────────
+  # Proves region-aware routing per docs/architecture/global-traffic-residency-
+  # manager-design.md (Phase 1 Exit Criteria: "region-aware routing is
+  # technically proven" — not a real multi-region deployment). Uses
+  # traefik/whoami (a minimal test HTTP server that echoes its own hostname)
+  # rather than duplicating any real service, so this demo can be removed
+  # without touching tested business logic. Region resolution is an explicit
+  # stand-in (caller supplies X-Tenant-Region directly) — tenant-entity-
+  # registry-svc's DataResidencyPolicy has no region reference field yet to
+  # resolve this from for real; see the design doc's Q2 for the follow-up.
+  #
+  # Two containers share the "region-eu" Traefik service name below (same
+  # loadbalancer.server.port label) — Traefik's Docker provider pools them
+  # into one load-balanced backend, which is what makes the failover demo
+  # provable: stop one, Traefik's healthcheck drops it from rotation.
+  region-eu-demo-1:
+    image: traefik/whoami
+    container_name: zoiko-region-eu-demo-1
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.region-eu.rule=Header(`X-Tenant-Region`, `eu`)"
+      - "traefik.http.routers.region-eu.priority=10"
+      - "traefik.http.services.region-eu.loadbalancer.server.port=80"
+      - "traefik.http.services.region-eu.loadbalancer.healthcheck.path=/health"
+      - "traefik.http.services.region-eu.loadbalancer.healthcheck.interval=5s"
+
+  region-eu-demo-2:
+    image: traefik/whoami
+    container_name: zoiko-region-eu-demo-2
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.region-eu.rule=Header(`X-Tenant-Region`, `eu`)"
+      - "traefik.http.routers.region-eu.priority=10"
+      - "traefik.http.services.region-eu.loadbalancer.server.port=80"
+      - "traefik.http.services.region-eu.loadbalancer.healthcheck.path=/health"
+      - "traefik.http.services.region-eu.loadbalancer.healthcheck.interval=5s"
+
+  region-us-demo:
+    image: traefik/whoami
+    container_name: zoiko-region-us-demo
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.region-us.rule=Header(`X-Tenant-Region`, `us`)"
+      - "traefik.http.routers.region-us.priority=10"
+      - "traefik.http.services.region-us.loadbalancer.server.port=80"
+      - "traefik.http.services.region-us.loadbalancer.healthcheck.path=/health"
+      - "traefik.http.services.region-us.loadbalancer.healthcheck.interval=5s"
+
+  # Quarantine target — higher router priority than the region routers above,
+  # so it wins regardless of X-Tenant-Region when X-Quarantine is present.
+  # Manual-trigger only for Phase 1 (design doc Q3): there is no automated
+  # signal yet that would flip this on, by design — that's blocked on
+  # Observability Baseline's alerting work existing first.
+  quarantine-demo:
+    image: traefik/whoami
+    container_name: zoiko-quarantine-demo
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.quarantine.rule=Header(`X-Quarantine`, `true`)"
+      - "traefik.http.routers.quarantine.priority=100"
+      - "traefik.http.services.quarantine.loadbalancer.server.port=80"
+
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
@@ -164,6 +277,7 @@ services:
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       ACCESS_CONTROL_URL: "http://identity-svc:8080"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     volumes:
       - identity_jwt_keys:/keys:ro
     depends_on:
@@ -204,6 +318,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.entity.events"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
       AUTHZ_SERVICE_URL: "http://tenant-svc:8081" # mock stub authz points back
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
         condition: service_healthy
@@ -234,9 +349,12 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       AUTHZ_SERVICE_URL: "http://jurisdiction-svc:8082" # mock stub authz points back
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
         condition: service_healthy
+      otel-collector:
+        condition: service_started
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8082/healthz"]
       interval: 10s
@@ -271,6 +389,7 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
         condition: service_healthy
@@ -301,6 +420,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "audit-event-store-svc"
       KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
         condition: service_healthy
@@ -331,6 +451,7 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.policy.events"
@@ -347,7 +468,106 @@ services:
       start_period: 10s
     restart: on-failure
 
-  # ── 7. authorization-svc (Port: 8089) ───────────────────────────────────────
+  # ── 7. configuration-feature-flag-svc (Port: 8086) ───────────────────────────
+  # No compose entry existed before the Observability Baseline retrofit — a
+  # pre-existing gap, not caused by this work (see
+  # docs/architecture/observability-baseline-plan.md).
+  configuration-feature-flag-svc:
+    build:
+      context: ../services/configuration-feature-flag-svc
+      dockerfile: Dockerfile
+    container_name: configuration-feature-flag-svc
+    ports:
+      - "8086:8086"
+    environment:
+      PORT: "8086"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: configuration_feature_flag
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # No healthcheck: this service's Dockerfile, unlike every other service's,
+    # never built a cmd/healthcheck binary or declared a HEALTHCHECK
+    # instruction — a pre-existing gap, not something to fake here with a
+    # test command referencing a binary that doesn't exist in this image.
+    restart: on-failure
+
+  # ── 8. secret-vault-integration-svc (Port: 8087) ─────────────────────────────
+  # No compose entry existed before the Observability Baseline retrofit —
+  # same pre-existing gap as configuration-feature-flag-svc above.
+  # VAULT_MASTER_KEY_HEX below is a throwaway local-dev key, same posture as
+  # identity-svc's envelope signing key — never used in staging/production.
+  secret-vault-integration-svc:
+    build:
+      context: ../services/secret-vault-integration-svc
+      dockerfile: Dockerfile
+    container_name: secret-vault-integration-svc
+    ports:
+      - "8087:8087"
+    environment:
+      PORT: "8087"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: secret_vault_integration
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      VAULT_MASTER_KEY_HEX: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      VAULT_LOCAL_STORE_PATH: "/tmp/secret_store.local"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8087/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 9. obligations-svc (Port: 8088) ──────────────────────────────────────────
+  # No compose entry existed before the Observability Baseline retrofit —
+  # same pre-existing gap as the two services above.
+  obligations-svc:
+    build:
+      context: ../services/obligations-svc
+      dockerfile: Dockerfile
+    container_name: obligations-svc
+    ports:
+      - "8088:8088"
+    environment:
+      PORT: "8088"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: obligations
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "obligations-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.obligations.events"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8088/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 10. authorization-svc (Port: 8089) ──────────────────────────────────────
   authorization-svc:
     build:
       context: ../services/authorization-svc
@@ -367,6 +587,7 @@ services:
       KAFKA_GROUP_ID: "authorization-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
         condition: service_healthy
@@ -380,7 +601,7 @@ services:
       start_period: 10s
     restart: on-failure
 
-  # ── 8. workflow-svc (Port: 8090) ────────────────────────────────────────────
+  # ── 11. workflow-svc (Port: 8090) ───────────────────────────────────────────
   workflow-svc:
     build:
       context: ../services/workflow-svc
@@ -400,6 +621,7 @@ services:
       KAFKA_GROUP_ID: "workflow-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.workflow.events"
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
         condition: service_healthy

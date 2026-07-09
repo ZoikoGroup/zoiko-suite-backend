@@ -20,9 +20,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/riandyrn/otelchi"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
@@ -35,6 +38,7 @@ import (
 	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
+	"zoiko.io/tenant-entity-registry-svc/internal/telemetry"
 )
 
 func main() {
@@ -61,12 +65,28 @@ func main() {
 		zap.String("authz_url", cfg.AuthZServiceURL),
 	)
 
+	// ── 2b. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "tenant-entity-registry-svc", cfg.OTELExporterEndpoint)
+	if err != nil {
+		log.Fatal("otel tracing init failed", zap.Error(err))
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Error("otel tracer provider shutdown failed", zap.Error(err))
+		}
+	}()
+
+	metrics := telemetry.NewMetrics("tenant-entity-registry-svc")
+
 	// ── 3. Database pool ─────────────────────────────────────────────────────
 	// F8: explicit pool configuration for a Tier 0 service.
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
 		log.Fatal("failed to parse db pool config", zap.Error(err))
 	}
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
 	poolCfg.MaxConns = 20
 	poolCfg.MinConns = 2
 	poolCfg.MaxConnLifetime = 30 * time.Minute
@@ -132,6 +152,8 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(otelchi.Middleware("tenant-entity-registry-svc", otelchi.WithChiRoutes(r)))
+	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	// F1: extract tenant_id from JWT into context so every DB call can set
 	// app.tenant_id on the Postgres session and RLS is actually enforced.
@@ -144,7 +166,8 @@ func main() {
 	// ── 7. Health probes (separate path, no auth) ────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
-	r.Get("/readyz", healthH.Readiness)
+	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
+	r.Handle("/metrics", promhttp.Handler())
 
 	// ── 8. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":8081"

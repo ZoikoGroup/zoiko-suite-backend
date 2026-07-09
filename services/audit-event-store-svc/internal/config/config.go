@@ -20,6 +20,10 @@ type Config struct {
 
 	// Kafka is the consumer configuration.
 	Kafka KafkaConfig
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 // DBConfig carries the PostgreSQL connection parameters.
@@ -85,6 +89,7 @@ func Load() (*Config, error) {
 				",",
 			),
 		},
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 
