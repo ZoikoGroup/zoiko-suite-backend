@@ -22,6 +22,7 @@ services:
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
       - ../services/authorization-svc/deployments/migrations:/migrations/authorization:ro
+      - ../services/workflow-svc/deployments/migrations:/migrations/workflow:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -323,6 +324,41 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── 8. workflow-svc (Port: 8090) ────────────────────────────────────────────
+  workflow-svc:
+    build:
+      context: ../services/workflow-svc
+      dockerfile: Dockerfile
+    container_name: workflow-svc
+    ports:
+      - "8090:8090"
+    environment:
+      PORT: "8090"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: workflow
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "workflow-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.workflow.events"
+      AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8090/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
