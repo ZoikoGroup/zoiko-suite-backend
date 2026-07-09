@@ -434,7 +434,8 @@ func TestBroker_NotAuthorized(t *testing.T) {
 				SecretPolicyVersionID: "spv-1",
 				AllowedWorkloadIDs:    json.RawMessage(`["svc-a"]`),
 			},
-			SecretPath: "kv/db",
+			SecretClass: "DATABASE_CREDENTIAL",
+			SecretPath:  "kv/db",
 		},
 	}
 	r := defaultRouter(s)
@@ -445,6 +446,51 @@ func TestBroker_NotAuthorized(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.auditEntries) != 2 { // REQUESTED + DENIED
+		t.Fatalf("expected 2 audit entries (REQUESTED, DENIED), got %d", len(s.auditEntries))
+	}
+	denied := s.auditEntries[1]
+	if denied.EventType != "DENIED" {
+		t.Errorf("expected second audit entry DENIED, got %s", denied.EventType)
+	}
+	// A policy WAS resolved here — the caller just wasn't authorized — so
+	// secret_class must be preserved, unlike the no-applicable-policy case.
+	if denied.SecretClass != "DATABASE_CREDENTIAL" {
+		t.Errorf("expected DENIED audit entry to carry the resolved secret_class, got %q", denied.SecretClass)
+	}
+}
+
+func TestBroker_CorrelationIDFromBody_UsedWhenHeaderAbsent(t *testing.T) {
+	s := &stubStore{
+		applicableByPath: &domain.ApplicableSecretPolicyVersion{
+			SecretPolicyVersion: domain.SecretPolicyVersion{
+				SecretPolicyVersionID:   "spv-1",
+				AllowedWorkloadIDs:      json.RawMessage(`["svc-a"]`),
+				MaxLeaseDurationSeconds: 300,
+			},
+			SecretClass: "DATABASE_CREDENTIAL",
+			SecretPath:  "kv/db",
+		},
+		lease: &domain.SecretLease{
+			LeaseID: "lease-1", SecretPath: "kv/db", ExpiresAt: time.Now().Add(5 * time.Minute),
+		},
+		leaseCreated: true,
+	}
+	r := defaultRouter(s)
+
+	body := `{"secret_path":"kv/db","requested_by_principal_id":"svc-a","request_id":"req-1","correlation_id":"corr-from-body"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	for _, e := range s.auditEntries {
+		if e.CorrelationID != "corr-from-body" {
+			t.Errorf("expected correlation_id %q from body to flow into audit entry, got %q", "corr-from-body", e.CorrelationID)
+		}
 	}
 }
 

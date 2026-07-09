@@ -519,6 +519,30 @@ const secretLeaseColumns = `
 	correlation_id,
 	created_at`
 
+// secretLeaseReadColumns is secretLeaseColumns with one difference: status
+// is computed at read time rather than trusted verbatim from the stored
+// column. context.md §7.1: EXPIRED is a computed read (status = 'GRANTED'
+// AND expires_at < NOW()), deliberately never a background job flipping
+// rows. Use this column set for every path that reports a lease's status
+// back to a caller (FindLeaseByID, findLeaseByRequestID, ListLeases); use
+// the raw secretLeaseColumns for INSERT/UPDATE RETURNING clauses, where
+// the row was just written and its stored status is by definition current.
+const secretLeaseReadColumns = `
+	lease_id,
+	request_id,
+	secret_policy_version_id,
+	secret_class,
+	secret_path,
+	requested_by_principal_id,
+	tenant_id,
+	legal_entity_id,
+	CASE WHEN status = 'GRANTED' AND expires_at < NOW() THEN 'EXPIRED' ELSE status END,
+	granted_at,
+	expires_at,
+	revoked_at,
+	correlation_id,
+	created_at`
+
 func scanSecretLease(row pgx.Row) (*domain.SecretLease, error) {
 	l := &domain.SecretLease{}
 	err := row.Scan(
@@ -561,7 +585,7 @@ func (s *PgStore) CreateLease(ctx context.Context, params domain.CreateLeasePara
 }
 
 func (s *PgStore) findLeaseByRequestID(ctx context.Context, requestID string) (*domain.SecretLease, error) {
-	const query = `SELECT ` + secretLeaseColumns + ` FROM secret_leases WHERE request_id = $1;`
+	const query = `SELECT ` + secretLeaseReadColumns + ` FROM secret_leases WHERE request_id = $1;`
 	l, err := scanSecretLease(s.pool.QueryRow(ctx, query, requestID))
 	if err != nil {
 		s.log.Error("pg findLeaseByRequestID failed", zap.Error(err))
@@ -570,9 +594,11 @@ func (s *PgStore) findLeaseByRequestID(ctx context.Context, requestID string) (*
 	return l, nil
 }
 
-// FindLeaseByID retrieves a single lease record.
+// FindLeaseByID retrieves a single lease record. Status reflects the
+// computed EXPIRED read (secretLeaseReadColumns), not just the stored
+// GRANTED/REVOKED value.
 func (s *PgStore) FindLeaseByID(ctx context.Context, leaseID string) (*domain.SecretLease, error) {
-	const query = `SELECT ` + secretLeaseColumns + ` FROM secret_leases WHERE lease_id = $1;`
+	const query = `SELECT ` + secretLeaseReadColumns + ` FROM secret_leases WHERE lease_id = $1;`
 	l, err := scanSecretLease(s.pool.QueryRow(ctx, query, leaseID))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -632,7 +658,7 @@ func (s *PgStore) ListLeases(ctx context.Context, filter LeaseListFilter) ([]*do
 		%s
 		ORDER BY granted_at DESC
 		LIMIT $%d OFFSET $%d`,
-		secretLeaseColumns, where, argIdx, argIdx+1,
+		secretLeaseReadColumns, where, argIdx, argIdx+1,
 	)
 	args = append(args, limit, filter.Offset)
 

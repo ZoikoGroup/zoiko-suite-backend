@@ -226,6 +226,62 @@ container.
 - No §9.6 "Sensitive Key Separation" (tenant/document/evidence/payment
   key-scope separation) — v2+ concern
 
+## Post-verification corrections (2026-07-09)
+
+A line-by-line spec-alignment audit (`context.md` vs. actual code, not
+just re-reading this file's own claims) found four gaps this file's
+"feature-complete" status didn't mention. All four fixed and verified the
+same way as every other batch — real Postgres via Docker, plus a fresh
+Docker Desktop start since it wasn't running:
+
+1. **Real correctness gap, now fixed**: `context.md` §7.1 defines lease
+   `status` as `GRANTED | EXPIRED | REVOKED`, with `EXPIRED` an explicitly
+   designed *computed read* (`status = 'GRANTED' AND expires_at < NOW()`),
+   never a background job. No query actually computed this — every read
+   returned the raw stored column, which was only ever `GRANTED` or
+   `REVOKED`, so an expired lease reported `status: "GRANTED"` forever.
+   Fixed in `internal/store/pg_store.go`: added `secretLeaseReadColumns`
+   (same as `secretLeaseColumns` but with a `CASE WHEN status = 'GRANTED'
+   AND expires_at < NOW() THEN 'EXPIRED' ELSE status END`), used by
+   `FindLeaseByID`, `findLeaseByRequestID`, and `ListLeases`. Raw
+   `secretLeaseColumns` stays on the INSERT/UPDATE `RETURNING` paths
+   (`CreateLease`, `RevokeLease`, `RevokeLeasesBySecretPath`), where the
+   row was just written and its stored status is current by definition.
+   `RevokeLease`'s existing `current.Status != "GRANTED" →
+   ErrInvalidTransition` check now actually rejects revoking an expired
+   lease, which its own doc comment already claimed it did. New test:
+   `TestPgStore_LeaseStatus_ExpiredIsComputedNotStored` (creates a lease
+   with `expires_at` in the past, confirms the stored column is still
+   `GRANTED`, confirms `FindLeaseByID`/`ListLeases` report `EXPIRED`,
+   confirms `RevokeLease` returns `ErrInvalidTransition`). All 11 store
+   tests pass against real Postgres (Docker), this one included.
+2. `POST /v1/secrets/broker`'s body per `context.md` §7.2 should include
+   `correlation_id`; the handler only read `X-Correlation-ID`. Fixed:
+   `brokerRequest` now has a `CorrelationID` field, used when the header
+   is absent (header still wins when both are present, matching every
+   other endpoint's precedent). New test:
+   `TestBroker_CorrelationIDFromBody_UsedWhenHeaderAbsent`.
+3. `DENIED` audit entries on the 403 (unauthorized-workload) path never
+   populated `secret_class`, even though it's known at that point
+   (`applicable.SecretClass`) — an evidence-completeness gap relative to
+   §5's "every denial must produce retrievable audit evidence." Fixed:
+   `recordDenial` now takes a `secretClass` parameter, populated from
+   `applicable.SecretClass` on the 403 path and left empty on the 404
+   (no-policy-at-all) path, where it's genuinely unknown. Extended
+   `TestBroker_NotAuthorized` to assert this.
+4. **Documentation fix, not a code change**: `context.md` §7.2's
+   documented `rotate` body was `{request_id}` only, but the handler has
+   always also required `rotated_by_principal_id` (needed because
+   `secret_access_audit_log.requested_by_principal_id` is `NOT NULL`).
+   Updated §7.2 to document both fields instead of changing working code
+   to match an incomplete spec.
+
+Verified: `go vet ./... && go build ./cmd/server && go build
+./cmd/healthcheck` clean; all 27 handler unit tests pass; all 11 store
+integration tests pass against real Postgres (`postgres:16-alpine` in
+Docker). Not re-run against the built Docker image this time — no
+runtime-shape change, only query text and struct fields.
+
 ## Open item flagged, not yet resolved
 
 `context.md`'s final section raised a real adversarial-security question

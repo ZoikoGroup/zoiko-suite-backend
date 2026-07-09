@@ -275,6 +275,53 @@ func TestPgStore_RevokeLease_TransitionAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestPgStore_LeaseStatus_ExpiredIsComputedNotStored(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	p := createTestPolicy(t, ctx, s, "DATABASE_CREDENTIAL", "kv/payroll/db")
+	v, _, _ := s.CreateSecretPolicyVersion(ctx, domain.CreateSecretPolicyVersionParams{
+		SecretPolicyID: p.SecretPolicyID, AllowedWorkloadIDs: []byte(`["svc-a"]`),
+		MaxLeaseDurationSeconds: 300, EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+
+	lease, _, err := s.CreateLease(ctx, domain.CreateLeaseParams{
+		RequestID: "req-expired", SecretPolicyVersionID: v.SecretPolicyVersionID,
+		SecretClass: "DATABASE_CREDENTIAL", SecretPath: "kv/payroll/db",
+		RequestedByPrincipalID: "svc-a", ExpiresAt: time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond),
+	})
+	if err != nil {
+		t.Fatalf("failed to create lease: %v", err)
+	}
+
+	// The stored column is still 'GRANTED' — EXPIRED is a read-time
+	// computation, context.md §7.1, never a background job.
+	var storedStatus string
+	if err := pool.QueryRow(ctx, `SELECT status FROM secret_leases WHERE lease_id = $1`, lease.LeaseID).Scan(&storedStatus); err != nil {
+		t.Fatalf("failed to read raw stored status: %v", err)
+	}
+	if storedStatus != "GRANTED" {
+		t.Fatalf("expected the stored column to remain GRANTED, got %q", storedStatus)
+	}
+
+	got, err := s.FindLeaseByID(ctx, lease.LeaseID)
+	if err != nil || got.Status != "EXPIRED" {
+		t.Fatalf("expected FindLeaseByID to report computed status EXPIRED, got %+v err=%v", got, err)
+	}
+
+	listed, err := s.ListLeases(ctx, store.LeaseListFilter{})
+	if err != nil || len(listed) != 1 || listed[0].Status != "EXPIRED" {
+		t.Fatalf("expected ListLeases to report computed status EXPIRED, got %+v err=%v", listed, err)
+	}
+
+	// Revoking an already-expired lease is not a valid transition — there
+	// is nothing left to revoke.
+	if _, _, err := s.RevokeLease(ctx, lease.LeaseID); !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("expected ErrInvalidTransition revoking an EXPIRED lease, got %v", err)
+	}
+}
+
 func TestPgStore_RevokeLeasesBySecretPath_MassRevokeForRotation(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
