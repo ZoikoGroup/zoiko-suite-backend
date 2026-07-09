@@ -97,6 +97,46 @@ services:
         chmod 644 /keys/envelope_signing_key.pem
     restart: "no"
 
+  # ── Docker socket proxy ──────────────────────────────────────────────────────
+  # Traefik's bundled Go Docker client is hardcoded to send its initial
+  # handshake as GET /v1.24/version, regardless of DOCKER_API_VERSION or
+  # image version (confirmed empirically — a plain curl against the same
+  # socket succeeds fine, and a versioned /v1.41/version call succeeds too,
+  # but /v1.24/version gets an empty-body 400 because this engine enforces
+  # MinAPIVersion 1.40). A custom nginx config (docker-proxy.nginx.conf)
+  # strips any old /vX.YY/ version prefix before forwarding to the real
+  # socket, and doubles as a read-only, containers-only allowlist so this
+  # gateway container's socket access can't be used for anything else.
+  docker-proxy:
+    image: nginx:1.27-alpine
+    container_name: zoiko-docker-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./docker-proxy.nginx.conf:/etc/nginx/nginx.conf:ro
+
+  # ── API Gateway (Traefik) — chunk 1: routing only, no auth yet ──────────────
+  # Discovers routable services via Docker labels (see jurisdiction-svc below
+  # for the reference pattern). --api.insecure exposes the dashboard on 8091
+  # for local dev visibility only — never do this in a real deployment.
+  gateway:
+    image: traefik:v3.1
+    container_name: zoiko-gateway
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=tcp://docker-proxy:2375"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+    ports:
+      - "80:80"
+      - "8091:8080" # Traefik's own dashboard, separate from every service's own port
+    depends_on:
+      docker-proxy:
+        condition: service_started
+      jurisdiction-svc:
+        condition: service_healthy
+
   # ── 1. identity-context-svc (Port: 8080) ─────────────────────────────────────
   identity-svc:
     build:
@@ -204,6 +244,16 @@ services:
       retries: 5
       start_period: 10s
     restart: on-failure
+    # Gateway routing (chunk 1 — proves Traefik can route, no auth yet).
+    # PathPrefix /jurisdiction is stripped before forwarding, so this
+    # container never sees anything other than its normal /v1/... paths.
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jurisdiction.rule=PathPrefix(`/jurisdiction`)"
+      - "traefik.http.routers.jurisdiction.entrypoints=web"
+      - "traefik.http.services.jurisdiction.loadbalancer.server.port=8082"
+      - "traefik.http.middlewares.jurisdiction-strip.stripprefix.prefixes=/jurisdiction"
+      - "traefik.http.routers.jurisdiction.middlewares=jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
   governance-svc:
