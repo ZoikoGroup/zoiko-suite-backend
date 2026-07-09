@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-svc
+  namespace: zoiko-evidence
+  labels:
+    app: audit-svc
+spec:
+  ports:
+  - port: 8084
+    targetPort: 8084
+    name: http
+  selector:
+    app: audit-svc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-svc
+  namespace: zoiko-evidence
+  labels:
+    app: audit-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: audit-svc
+  template:
+    metadata:
+      labels:
+        app: audit-svc
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: audit-svc
+        image: audit-svc:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8084
+          name: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        env:
+        - name: PORT
+          value: "8084"
+        - name: DB_HOST
+          value: "postgres.zoiko-infra.svc.cluster.local"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_NAME
+          value: "audit_event_store"
+        - name: DB_USER
+          value: "postgres"
+        - name: DB_PASSWORD
+          value: "postgres"
+        - name: DB_SSLMODE
+          value: "disable"
+        - name: KAFKA_BROKERS
+          value: "kafka.zoiko-infra.svc.cluster.local:9092"
+        - name: KAFKA_GROUP_ID
+          value: "audit-event-store-svc"
+        - name: KAFKA_TOPICS
+          value: "zoiko.identity.events,zoiko.entity.events"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8084
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8084
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"

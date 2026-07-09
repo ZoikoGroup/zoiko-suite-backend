@@ -1,0 +1,462 @@
+# ── Default Deny All (Best Practice SOC 2 / Zero Trust) ──────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: zoiko-infra
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: zoiko-identity
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: zoiko-governance
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: zoiko-evidence
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+# ── Allow DNS Resolution for App Namespaces ──────────────────────────────────
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: zoiko-identity
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: zoiko-governance
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: zoiko-evidence
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+# ── zoiko-infra Network Policies ──────────────────────────────────────────────
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-ingress
+  namespace: zoiko-infra
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-governance
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-evidence
+    ports:
+    - protocol: TCP
+      port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-ingress
+  namespace: zoiko-infra
+spec:
+  podSelector:
+    matchLabels:
+      app: redis
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+    ports:
+    - protocol: TCP
+      port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kafka-ingress
+  namespace: zoiko-infra
+spec:
+  podSelector:
+    matchLabels:
+      app: kafka
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-evidence
+    ports:
+    - protocol: TCP
+      port: 9092
+---
+# Allow infra components to talk to CoreDNS (necessary for Kafka internally etc.)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-infra-egress-dns
+  namespace: zoiko-infra
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - podSelector:
+        matchLabels:
+          app: kafka
+    ports:
+    - protocol: TCP
+      port: 9092
+    - protocol: TCP
+      port: 9093
+
+# ── zoiko-identity Network Policies ───────────────────────────────────────────
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: identity-svc-policy
+  namespace: zoiko-identity
+spec:
+  podSelector:
+    matchLabels:
+      app: identity-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow external requests (or ingress controller) and other namespaces
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  # Allow egress to Postgres, Redis, Kafka in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 6379
+    - protocol: TCP
+      port: 9092
+  # Allow egress to tenant-svc in same namespace
+  - to:
+    - podSelector:
+        matchLabels:
+          app: tenant-svc
+    ports:
+    - protocol: TCP
+      port: 8081
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tenant-svc-policy
+  namespace: zoiko-identity
+spec:
+  podSelector:
+    matchLabels:
+      app: tenant-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow requests from identity-svc and external ingress controller
+  - from:
+    - podSelector:
+        matchLabels:
+          app: identity-svc
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8081
+  egress:
+  # Allow egress to Postgres and Kafka in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 9092
+  # Allow egress to jurisdiction-svc in zoiko-governance
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-governance
+      podSelector:
+        matchLabels:
+          app: jurisdiction-svc
+    ports:
+    - protocol: TCP
+      port: 8082
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+# ── zoiko-governance Network Policies ─────────────────────────────────────────
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jurisdiction-svc-policy
+  namespace: zoiko-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: jurisdiction-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow requests from tenant-svc in zoiko-identity
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-identity
+      podSelector:
+        matchLabels:
+          app: tenant-svc
+    ports:
+    - protocol: TCP
+      port: 8082
+  egress:
+  # Allow egress to Postgres in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: governance-svc-policy
+  namespace: zoiko-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: governance-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow requests from other services for decision logging
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8083
+  egress:
+  # Allow egress to Postgres in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: policy-svc-policy
+  namespace: zoiko-governance
+spec:
+  podSelector:
+    matchLabels:
+      app: policy-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow requests on port 8085
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8085
+  egress:
+  # Allow egress to Postgres in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+# ── zoiko-evidence Network Policies ───────────────────────────────────────────
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: audit-svc-policy
+  namespace: zoiko-evidence
+spec:
+  podSelector:
+    matchLabels:
+      app: audit-svc
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Only allow health checks or direct queries
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8084
+  egress:
+  # Allow egress to Postgres and Kafka in zoiko-infra
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: zoiko-infra
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 9092
+  # Allow CoreDNS access
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
