@@ -16,6 +16,7 @@ Go microservices monorepo — one `go.mod` per service, no shared build tool.
 | `authorization-svc` | 8089 | Runtime access-decision engine — RBAC + delegated-authority + Separation-of-Duties evaluation (`/v1/authorize`), append-only decision evidence (`/v1/access-decisions`) |
 | `workflow-svc` | 8090 | Multi-stage approval orchestration (`/v1/workflows`) — extends authorization-svc, doesn't replace it: every approval action is checked via `POST /v1/authorize` before it's applied |
 | `gateway-auth-svc` | 8092 | API Gateway ForwardAuth target — verifies every gated request's signed identity envelope against identity-context-svc's JWKS (`/verify`) before Traefik forwards it to a backend; stateless, no DB |
+| `schema-registry-svc` | 8093 | Centralized, version-controlled event payload schemas (`/v1/schemas`) — enforces backward-compatible evolution (breaking changes `409`); schema registration is gated through authorization-svc (`SCHEMA_PUBLISH`), fail-closed |
 
 ## Unified Local Platform Development Stack
 

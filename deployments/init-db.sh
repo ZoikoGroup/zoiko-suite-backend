@@ -18,6 +18,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE configuration_feature_flag;
     CREATE DATABASE secret_vault_integration;
     CREATE DATABASE obligations;
+    CREATE DATABASE schema_registry;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -67,5 +68,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integ
 # Apply migrations for obligations-svc
 echo "Applying migrations for obligations..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000001_initial_schema.up.sql
+
+# Apply migrations for schema-registry-svc
+echo "Applying migrations for schema_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."
