@@ -128,3 +128,37 @@ func (m *Metrics) WrapReadiness(next http.HandlerFunc) http.HandlerFunc {
 		}
 	}
 }
+
+// MetricsHandler wraps the Prometheus scrape endpoint so that every scrape
+// first re-evaluates readiness and refreshes the readiness_up gauge.
+//
+// Without this, readiness_up only ever updates when something calls /readyz —
+// but nothing in this platform does on a schedule: the Docker healthcheck
+// probes /healthz (liveness) and Prometheus scrapes /metrics. So the gauge
+// would sit at its initial 0 forever and the ReadinessProbeFailing alert would
+// fire for every healthy service. Evaluating readiness at scrape time makes
+// the gauge reflect the service's actual current readiness, which is exactly
+// what the alert needs.
+func (m *Metrics) MetricsHandler(readyz http.HandlerFunc, promHandler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec := &statusRecorder{ResponseWriter: newDiscardResponseWriter(), status: http.StatusOK}
+		readyz(rec, r)
+		if rec.status == http.StatusOK {
+			m.ReadinessUp.Set(1)
+		} else {
+			m.ReadinessUp.Set(0)
+		}
+		promHandler.ServeHTTP(w, r)
+	})
+}
+
+// discardResponseWriter is a throwaway ResponseWriter used to run the readiness
+// probe during a /metrics scrape without writing its body to the client.
+type discardResponseWriter struct{ header http.Header }
+
+func newDiscardResponseWriter() *discardResponseWriter {
+	return &discardResponseWriter{header: make(http.Header)}
+}
+func (d *discardResponseWriter) Header() http.Header         { return d.header }
+func (d *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (d *discardResponseWriter) WriteHeader(int)             {}
