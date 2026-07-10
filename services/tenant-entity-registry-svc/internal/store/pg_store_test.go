@@ -15,7 +15,7 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
 )
 
-// openTestPool connects to a real Postgres and reapplies both migrations
+// openTestPool connects to a real Postgres and reapplies all migrations
 // from a clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set —
 // same convention as jurisdiction-rules-svc and identity-context-svc.
 func openTestPool(t *testing.T) *pgxpool.Pool {
@@ -40,6 +40,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	for _, mig := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_tenant_id_to_junction_tables.up.sql",
+		"000003_add_residency_region_to_policies.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", mig))
 		if err != nil {
