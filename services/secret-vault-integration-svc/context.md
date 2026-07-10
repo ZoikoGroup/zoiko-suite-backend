@@ -551,8 +551,81 @@ sections.
 
 ## 10. Implementation record
 
-Not yet built. Workflow: one branch for the whole service
-(`feat/secret-vault-integration-svc`) off `main`, PR when done — never
-commit directly to `main`. Verify against real Postgres (Docker) before
-calling any batch done, same bar as every other Tier 0 service in this
-repo. See `progress.md` (once created) for the batch-by-batch build log.
+Built across four batches, PR'd off `feat/secret-vault-integration-svc`,
+feature-complete for v1 and verified live end-to-end 2026-07-08, with a
+follow-up spec-alignment audit and fixes on 2026-07-09. See `progress.md`
+for the full batch-by-batch build log, the corrections found during
+verification, and the sign-off status.
+
+## 11. Quick Reference — Endpoints & How to Run (added 2026-07-09)
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v1/secret-policies` | Create a secret policy container (idempotent on `secret_path`) |
+| `GET` | `/v1/secret-policies?secret_class=X&tenant_id=Y&legal_entity_id=Z` | "Get applicable secret policy set" — ACTIVE version(s) for a class/scope; `secret_class` required |
+| `POST` | `/v1/secret-policies/{secret_policy_id}/versions` | Create a new DRAFT version (allowed workloads, max lease duration, effective dates) |
+| `POST` | `/v1/secret-policies/{secret_policy_id}/versions/{version_id}/activate` | Activate a DRAFT version; atomically supersedes whatever was previously ACTIVE in that scope |
+| `GET` | `/v1/secret-policies/{secret_policy_id}/versions` | Full version history for a policy, newest first |
+| `POST` | `/v1/secret-policies/{secret_policy_id}/material` | Admin-only: seed/overwrite the actual secret material in the vault backend (never called from the broker path) |
+| `POST` | `/v1/secret-policies/{secret_policy_id}/rotate` | Rotate the vault material, mass-revoke every `GRANTED` lease for that `secret_path`; idempotent on `request_id` |
+| `POST` | `/v1/secrets/broker` | The core endpoint — resolve policy by `secret_path`, grant (`200`) / deny (`403`/`404`); idempotent on `request_id` |
+| `GET` | `/v1/secrets/leases/{lease_id}` | One lease record (`status` is a computed read — reports `EXPIRED` once past `expires_at`, not just `GRANTED`/`REVOKED`) |
+| `GET` | `/v1/secrets/leases?principal=&secret_class=&tenant_id=&from=&to=&limit=&offset=` | Paginated lease list, all filters optional |
+| `POST` | `/v1/secrets/leases/{lease_id}/revoke` | `GRANTED`→`REVOKED`; idempotent no-op if already `REVOKED` |
+| `GET` | `/v1/secrets/audit?principal=&secret_path=&event_type=&from=&to=&limit=&offset=` | Paginated audit log — `REQUESTED`/`GRANTED`/`DENIED`/`REVOKED`/`ROTATED` |
+| `GET` | `/healthz` | Liveness probe |
+| `GET` | `/readyz` | Readiness probe (DB connectivity) |
+
+### Running the server
+
+**Option A — native Go** (requires Go 1.25+ installed locally)
+```powershell
+cd services/secret-vault-integration-svc
+$env:DB_HOST="localhost"; $env:DB_PORT="5432"; $env:DB_NAME="secret_vault_integration"; $env:DB_USER="postgres"; $env:DB_PASSWORD="postgres"; $env:DB_SSLMODE="disable"; $env:PORT="8087"
+$env:VAULT_MASTER_KEY_HEX="<32 random bytes, hex-encoded — see step 3 below, required, no default>"
+$env:VAULT_LOCAL_STORE_PATH="./secret_store.local"
+go run ./cmd/server
+```
+(Postgres must already be running locally with the migration applied — see step 2 below, pointed at `localhost` instead of a container name.)
+
+**Option B — Docker only, no local Go needed** (the exact method used to build/verify this service)
+
+1. Network + Postgres:
+```powershell
+docker network create svi-run-net
+docker run -d --name svi-run-pg --network svi-run-net -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=secret_vault_integration -p 55432:5432 postgres:16-alpine
+```
+2. Apply the migration:
+```powershell
+Get-Content deployments\migrations\000001_initial_schema.up.sql | docker exec -i svi-run-pg psql -U postgres -d secret_vault_integration
+```
+3. Generate a `VAULT_MASTER_KEY_HEX` — 32 random bytes, hex-encoded (AES-256 key; the vault backend refuses to start without one, no default):
+```powershell
+$bytes = New-Object byte[] 32
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+```
+4. Build the real image and run it (run from the `services/secret-vault-integration-svc` directory):
+```powershell
+docker build -t secret-vault-integration-svc:local .
+docker run -d --name svi-run-app --network svi-run-net -p 8087:8087 `
+  -e DB_HOST=svi-run-pg -e DB_PORT=5432 -e DB_NAME=secret_vault_integration -e DB_USER=postgres -e DB_PASSWORD=postgres -e DB_SSLMODE=disable `
+  -e VAULT_MASTER_KEY_HEX=<the hex key from step 3> -e VAULT_LOCAL_STORE_PATH=/tmp/secret_store.local -e PORT=8087 `
+  secret-vault-integration-svc:local
+```
+5. Confirm it's up: `docker ps` should show `svi-run-app` as `(healthy)` — the image's own `HEALTHCHECK` instruction, not just an externally-polled probe — and `curl http://localhost:8087/healthz` → `{"status":"ok"}`.
+
+**Tear down when done** (this stack is disposable, not meant to persist):
+```powershell
+docker rm -f svi-run-app svi-run-pg
+docker network rm svi-run-net
+```
+
+This is the exact stack a full 24-request Postman pass was run against on
+2026-07-09 — every endpoint above exercised live (grant, 403 deny, 404
+deny, revoke, rotate, audit query), not just asserted in `go test`. See
+`progress.md`'s "Endpoint reference" and "How to run the full local
+stack" sections for the fuller narrative version of this same
+information.

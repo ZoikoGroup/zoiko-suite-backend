@@ -24,6 +24,10 @@ type Config struct {
 	// to encrypt/decrypt secret material at rest. Never has a default —
 	// must be supplied, or the backend refuses to start.
 	VaultMasterKeyHex string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -60,6 +64,7 @@ func Load() (*Config, error) {
 		},
 		VaultKeyPath:      env("VAULT_LOCAL_STORE_PATH", "./secret_store.local"),
 		VaultMasterKeyHex: env("VAULT_MASTER_KEY_HEX", ""),
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

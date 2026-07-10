@@ -282,6 +282,108 @@ integration tests pass against real Postgres (`postgres:16-alpine` in
 Docker). Not re-run against the built Docker image this time — no
 runtime-shape change, only query text and struct fields.
 
+## Endpoint reference (brief, 2026-07-09)
+
+All 14 routes, manually verified via Postman against a real running
+stack (see "How to run the full local stack" below) — 24 request
+variations covering every success and denial/error path documented
+per-endpoint in `context.md` §7.2.
+
+**Health**
+- `GET /healthz` — liveness, no dependencies checked.
+- `GET /readyz` — readiness, checks DB connectivity.
+
+**Policy administration**
+- `POST /v1/secret-policies` — create a policy container; idempotent on
+  `secret_path`, `409` on same path with a different `secret_class`.
+- `GET /v1/secret-policies?secret_class=&tenant_id=&legal_entity_id=` —
+  applicable versions for a class/scope, most-specific-scope first;
+  `secret_class` required (`400` if missing).
+- `POST /v1/secret-policies/{id}/versions` — create a `DRAFT` version.
+- `POST /v1/secret-policies/{id}/versions/{version_id}/activate` —
+  `DRAFT`→`ACTIVE`, atomically supersedes whatever was previously
+  `ACTIVE` in that scope.
+- `GET /v1/secret-policies/{id}/versions` — full version history, newest
+  first.
+- `POST /v1/secret-policies/{id}/material` — admin-only seeding of the
+  vault backend (`material_base64`); never called from the broker path.
+- `POST /v1/secret-policies/{id}/rotate` — rotates the vault material,
+  mass-revokes every `GRANTED` lease for that `secret_path`, idempotent
+  on `request_id`; requires `rotated_by_principal_id` too (§7.2
+  addendum).
+
+**Brokering (the core value)**
+- `POST /v1/secrets/broker` — resolve policy by `secret_path` → grant
+  (`200`, real `lease_token`) / unauthorized (`403 access_denied`) /
+  no policy or none `ACTIVE` for scope (`404 no_applicable_secret_policy`);
+  idempotent on `request_id`. Deny-by-absence posture — see the still-open
+  404-vs-403 question below.
+- `GET /v1/secrets/leases/{lease_id}` — one lease; `status` reflects the
+  computed `EXPIRED` read (fixed 2026-07-09), not just the stored column.
+- `GET /v1/secrets/leases?principal=&secret_class=&tenant_id=&from=&to=&limit=&offset=`
+  — paginated lease list, all filters optional.
+- `POST /v1/secrets/leases/{lease_id}/revoke` — `GRANTED`→`REVOKED`,
+  idempotent no-op if already `REVOKED`, `409` on any other status
+  (including a lease that's actually `EXPIRED`).
+
+**Audit**
+- `GET /v1/secrets/audit?principal=&secret_path=&event_type=&from=&to=&limit=&offset=`
+  — paginated audit log surfacing all five event types (`REQUESTED`,
+  `GRANTED`, `DENIED`, `REVOKED`, `ROTATED`).
+
+## How to run the full local stack (verified 2026-07-09)
+
+Requires Docker Desktop running. No host Go toolchain needed — this runs
+the actual built `Dockerfile` image, not `go run`. A ready-to-import
+Postman collection covering every endpoint above (with auto-chained IDs
+between requests) is generated the same way; ask for it to be regenerated
+if it's not already at hand.
+
+1. **Network + Postgres:**
+   ```
+   docker network create svi-run-net
+   docker run -d --name svi-run-pg --network svi-run-net \
+     -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=secret_vault_integration \
+     -p 55432:5432 postgres:16-alpine
+   ```
+2. **Apply the schema** (from the service directory):
+   ```
+   Get-Content deployments/migrations/000001_initial_schema.up.sql | `
+     docker exec -i svi-run-pg psql -U postgres -d secret_vault_integration
+   ```
+3. **Build the real image:**
+   ```
+   docker build -t secret-vault-integration-svc:local services/secret-vault-integration-svc
+   ```
+4. **Generate a `VAULT_MASTER_KEY_HEX`** — 32 random bytes, hex-encoded
+   (AES-256 key; the backend refuses to start without one, no default):
+   ```powershell
+   $bytes = New-Object byte[] 32
+   [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+   ($bytes | ForEach-Object { $_.ToString("x2") }) -join ""
+   ```
+5. **Run the app container**, same network, port 8087 mapped to host:
+   ```
+   docker run -d --name svi-run-app --network svi-run-net -p 8087:8087 `
+     -e DB_HOST=svi-run-pg -e DB_PORT=5432 -e DB_NAME=secret_vault_integration `
+     -e DB_USER=postgres -e DB_PASSWORD=postgres -e DB_SSLMODE=disable `
+     -e VAULT_MASTER_KEY_HEX=<the hex key from step 4> `
+     -e VAULT_LOCAL_STORE_PATH=/tmp/secret_store.local `
+     -e PORT=8087 -e ENV=local `
+     secret-vault-integration-svc:local
+   ```
+6. **Confirm it's actually up:**
+   - `docker ps` shows `svi-run-app` as `(healthy)` — the image's own
+     `HEALTHCHECK` instruction, not just an externally-polled probe.
+   - `GET http://localhost:8087/healthz` and `/readyz` both return
+     `{"status":"ok"}`.
+7. **Tear down when done** (this stack is disposable, not meant to
+   persist): `docker rm -f svi-run-app svi-run-pg && docker network rm svi-run-net`.
+
+This exact stack is what the 24-request Postman pass above was run
+against — every endpoint in the "Endpoint reference" section was
+exercised live, not just asserted in `go test`.
+
 ## Open item flagged, not yet resolved
 
 `context.md`'s final section raised a real adversarial-security question

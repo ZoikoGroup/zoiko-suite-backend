@@ -60,6 +60,10 @@ type svc interface {
 	GetResidencyRegion(ctx context.Context, regionID string) (*domain.ResidencyRegion, error)
 	ListResidencyRegions(ctx context.Context) ([]*domain.ResidencyRegion, error)
 
+	// ResolveTenantRegion is the real tenant->region lookup consumed by
+	// the Global Traffic & Residency Manager's ingress layer.
+	ResolveTenantRegion(ctx context.Context, tenantID string) (*domain.ResolvedTenantRegion, error)
+
 	// TaxIdentityBundle
 	CreateTaxIdentityBundle(ctx context.Context, envelopeJWT, legalEntityID string, req domain.CreateTaxIdentityBundleRequest) (*domain.TaxIdentityBundle, error)
 	GetTaxIdentityBundle(ctx context.Context, bundleID string) (*domain.TaxIdentityBundle, error)
@@ -86,6 +90,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/tenants", h.ProvisionTenant)
 		r.Get("/tenants/{tenantID}", h.GetTenant)
 		r.Post("/tenants/{tenantID}/lifecycle", h.TransitionTenantLifecycle)
+		// Real tenant->region lookup for GTRM (design doc Q2) — replaces
+		// the Phase 1 routing demo's caller-supplied header stand-in.
+		r.Get("/tenants/{tenantID}/residency-region", h.ResolveTenantRegion)
 
 		// ── Entities ─────────────────────────────────────────────────────────
 		r.Get("/tenants/{tenantID}/entities", h.ListEntities)
@@ -144,6 +151,20 @@ func (h *Handler) GetTenant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
+}
+
+// ResolveTenantRegion handles GET /v1/tenants/{tenantID}/residency-region
+// — the real lookup for GTRM's ingress layer (design doc Q2). 404 if the
+// tenant doesn't exist; 409 if it exists but its residency policy has no
+// region assigned yet (registry.ErrRegionUnresolved) — a real, expected
+// state, not treated as "not found."
+func (h *Handler) ResolveTenantRegion(w http.ResponseWriter, r *http.Request) {
+	region, err := h.svc.ResolveTenantRegion(r.Context(), chi.URLParam(r, "tenantID"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, region)
 }
 
 func (h *Handler) TransitionTenantLifecycle(w http.ResponseWriter, r *http.Request) {
@@ -409,6 +430,8 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, registry.ErrInvalidInput):
 		writeErrJSON(w, http.StatusBadRequest, err.Error(), corrID)
 	case errors.Is(err, registry.ErrConflict):
+		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
+	case errors.Is(err, registry.ErrRegionUnresolved):
 		writeErrJSON(w, http.StatusConflict, err.Error(), corrID)
 	default:
 		h.log.Error("unhandled service error", zap.Error(err), zap.String("correlation_id", corrID))

@@ -11,6 +11,10 @@ type Config struct {
 	Port int
 
 	DB DBConfig
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -37,6 +41,7 @@ func Load() (*Config, error) {
 	return &Config{
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8086),
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),

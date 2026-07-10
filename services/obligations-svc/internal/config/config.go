@@ -25,6 +25,10 @@ type Config struct {
 	// (critical constraint: every obligation must be jurisdiction-bound) —
 	// see internal/jurisdiction.HTTPValidator.
 	JurisdictionRulesURL string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -77,6 +81,7 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.obligations.events"),
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

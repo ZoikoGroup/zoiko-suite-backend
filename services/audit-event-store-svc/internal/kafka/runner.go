@@ -31,9 +31,11 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"go.opentelemetry.io/otel/codes"
 	"go.uber.org/zap"
 
 	"zoiko.io/audit-event-store-svc/internal/consumer"
+	"zoiko.io/audit-event-store-svc/internal/telemetry"
 )
 
 // Runner manages the lifecycle of one kafka.Reader goroutine for one topic.
@@ -42,10 +44,16 @@ type Runner struct {
 	handler *consumer.Consumer
 	topic   string
 	log     *zap.Logger
+	metrics *telemetry.Metrics
 }
 
-// NewRunner constructs a Runner for a single topic.
-func NewRunner(brokers []string, groupID, topic string, h *consumer.Consumer, log *zap.Logger) *Runner {
+// NewRunner constructs a Runner for a single topic. metrics records one
+// messages_consumed_total observation per message and starts one OTel
+// span per message (Observability Baseline, 03-microservices.md §3.8 —
+// see internal/telemetry's doc comment on why this service's shape
+// differs from the HTTP-request-per-span pattern every other service
+// uses).
+func NewRunner(brokers []string, groupID, topic string, h *consumer.Consumer, metrics *telemetry.Metrics, log *zap.Logger) *Runner {
 	r := kafka.NewReader(kafka.ReaderConfig{
 		Brokers: brokers,
 		GroupID: groupID,
@@ -68,6 +76,7 @@ func NewRunner(brokers []string, groupID, topic string, h *consumer.Consumer, lo
 		handler: h,
 		topic:   topic,
 		log:     log.With(zap.String("kafka_topic", topic)),
+		metrics: metrics,
 	}
 }
 
@@ -106,7 +115,16 @@ func (r *Runner) Run(ctx context.Context) {
 			zap.Int("partition", msg.Partition),
 		)
 
-		if err := r.handler.Handle(ctx, eventID, msg.Value); err != nil {
+		spanCtx, span := telemetry.StartConsumeSpan(ctx, r.topic, eventID)
+		err = r.handler.Handle(spanCtx, eventID, msg.Value)
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+		span.End()
+
+		if err != nil {
+			r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "store_error").Inc()
 			// A non-nil error from Handle means a store (DB) failure.
 			// Do NOT commit so the broker re-delivers after restart.
 			r.log.Error("handler returned store error — not committing offset",
@@ -116,6 +134,7 @@ func (r *Runner) Run(ctx context.Context) {
 			)
 			continue
 		}
+		r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "ok").Inc()
 
 		// Commit after successful handling (or validated-rejection).
 		// CommitMessages is a synchronous, exactly-once commit for the

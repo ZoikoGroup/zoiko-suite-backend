@@ -23,9 +23,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/riandyrn/otelchi"
 	"go.uber.org/zap"
 
 	"zoiko.io/secret-vault-integration-svc/internal/config"
@@ -33,6 +36,7 @@ import (
 	"zoiko.io/secret-vault-integration-svc/internal/handler"
 	"zoiko.io/secret-vault-integration-svc/internal/health"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
+	"zoiko.io/secret-vault-integration-svc/internal/telemetry"
 	"zoiko.io/secret-vault-integration-svc/internal/vault"
 )
 
@@ -57,11 +61,27 @@ func main() {
 		zap.String("db_host", cfg.DB.Host),
 	)
 
+	// ── 2b. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "secret-vault-integration-svc", cfg.OTELExporterEndpoint)
+	if err != nil {
+		log.Fatal("otel tracing init failed", zap.Error(err))
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Error("otel tracer provider shutdown failed", zap.Error(err))
+		}
+	}()
+
+	metrics := telemetry.NewMetrics("secret-vault-integration-svc")
+
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
 		log.Fatal("failed to parse db pool config", zap.Error(err))
 	}
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
 	poolCfg.MaxConns = 20
 	poolCfg.MinConns = 2
 	poolCfg.MaxConnLifetime = 30 * time.Minute
@@ -98,16 +118,19 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(otelchi.Middleware("secret-vault-integration-svc", otelchi.WithChiRoutes(r)))
+	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
 	h := handler.New(pgStore, vaultBackend, publisher, log)
 	handler.RegisterRoutes(r, h)
 
-	// ── 8. Health probes ──────────────────────────────────────────────────────
+	// ── 8. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
-	r.Get("/readyz", healthH.Readiness)
+	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
+	r.Handle("/metrics", promhttp.Handler())
 
 	// ── 9. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)

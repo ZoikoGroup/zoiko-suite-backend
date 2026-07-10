@@ -18,6 +18,10 @@ type Config struct {
 	// AuthorizationServiceURL is called synchronously on every approval
 	// action submission — see internal/authz.HTTPClient.
 	AuthorizationServiceURL string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 type DBConfig struct {
@@ -65,6 +69,7 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.workflow.events"),
 		},
 		AuthorizationServiceURL: env("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
+		OTELExporterEndpoint:    env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

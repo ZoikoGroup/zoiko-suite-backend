@@ -105,6 +105,12 @@ type DataResidencyPolicy struct {
 	PolicyCode             string                 `json:"policy_code"`
 	ResidencyMode          ResidencyMode          `json:"residency_mode"`
 	ConflictResolutionMode ConflictResolutionMode `json:"conflict_resolution_mode"`
+	// ResidencyRegionID is nil for policies created before this field
+	// existed, or for any policy an operator hasn't assigned a concrete
+	// region to yet. Added to close a real gap found while implementing
+	// the Global Traffic & Residency Manager: ResidencyMode says HOW
+	// STRICTLY to enforce residency, this says WHICH region.
+	ResidencyRegionID      *string                `json:"residency_region_id"`
 	ActiveFlag             bool                   `json:"active_flag"`
 	CreatedAt              time.Time              `json:"created_at"`
 	UpdatedAt              time.Time              `json:"updated_at"`
@@ -231,7 +237,21 @@ type CreateResidencyPolicyRequest struct {
 	PolicyCode             string                 `json:"policy_code"`
 	ResidencyMode          ResidencyMode          `json:"residency_mode"`
 	ConflictResolutionMode ConflictResolutionMode `json:"conflict_resolution_mode"`
+	// ResidencyRegionID is optional — omit it for a policy that doesn't
+	// yet have a concrete region assigned (see DataResidencyPolicy's
+	// field comment).
+	ResidencyRegionID      *string                `json:"residency_region_id,omitempty"`
 	CorrelationID          string                 `json:"correlation_id"`
+}
+
+// ResolvedTenantRegion is the response shape for GET
+// /v1/tenants/{tenantID}/residency-region — the real lookup GTRM's
+// ingress layer uses to resolve which region a tenant's traffic belongs
+// in, replacing the header-stand-in used in the Phase 1 routing demo.
+type ResolvedTenantRegion struct {
+	TenantID   string `json:"tenant_id"`
+	RegionCode string `json:"region_code"`
+	RegionName string `json:"region_name"`
 }
 
 // CreateTaxIdentityBundleRequest creates a TaxIdentityBundle header.

@@ -18,6 +18,10 @@ type Config struct {
 	// JurisdictionRulesURL is used only when creating a jurisdiction-scoped
 	// SoD rule — see internal/jurisdiction.HTTPValidator.
 	JurisdictionRulesURL string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 type DBConfig struct {
@@ -70,6 +74,7 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.authorization.events"),
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

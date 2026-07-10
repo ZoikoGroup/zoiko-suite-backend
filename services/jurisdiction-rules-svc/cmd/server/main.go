@@ -20,9 +20,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/riandyrn/otelchi"
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
@@ -30,6 +33,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
+	"zoiko.io/jurisdiction-rules-svc/internal/telemetry"
 )
 
 func main() {
@@ -54,12 +58,28 @@ func main() {
 		zap.String("authz_url", cfg.AuthZServiceURL),
 	)
 
+	// ── 2b. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "jurisdiction-rules-svc", cfg.OTELExporterEndpoint)
+	if err != nil {
+		log.Fatal("otel tracing init failed", zap.Error(err))
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Error("otel tracer provider shutdown failed", zap.Error(err))
+		}
+	}()
+
+	metrics := telemetry.NewMetrics("jurisdiction-rules-svc")
+
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	// Tier 0 pool sizing — same values as tenant-entity-registry-svc.
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
 		log.Fatal("failed to parse db pool config", zap.Error(err))
 	}
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
 	poolCfg.MaxConns = 20
 	poolCfg.MinConns = 2
 	poolCfg.MaxConnLifetime = 30 * time.Minute
@@ -96,16 +116,19 @@ func main() {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(otelchi.Middleware("jurisdiction-rules-svc", otelchi.WithChiRoutes(r)))
+	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
 	h := handler.New(pgStore, authzClient, log)
 	handler.RegisterRoutes(r, h)
 
-	// ── 6. Health probes ──────────────────────────────────────────────────────
+	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
-	r.Get("/readyz", healthH.Readiness)
+	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
+	r.Handle("/metrics", promhttp.Handler())
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
