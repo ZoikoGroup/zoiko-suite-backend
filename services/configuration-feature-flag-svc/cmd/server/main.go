@@ -123,7 +123,7 @@ func main() {
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
-	r.Handle("/metrics", promhttp.Handler())
+	r.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
 
 	// ── 8. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
