@@ -68,6 +68,36 @@ func TestEmit_FailoverActive_RoutesToFallback(t *testing.T) {
 	}
 }
 
+// Manual BLOCK quarantine diverts the tenant to the residency-neutral
+// terminator with no resolved region and state=quarantined (§9, test F).
+func TestEmit_QuarantineBlock_DivertsToTerminator(t *testing.T) {
+	tn := validTenant() // QuarantineMode = BLOCK
+	tn.QuarantineActive = true
+	cfg := Emit(validMap(tn), testCatalog())
+
+	if got := cfg.HTTP.Services["gtrm-svc-acme"].LoadBalancer.Servers[0].URL; got != "http://quarantine-terminator:8080" {
+		t.Fatalf("BLOCK quarantine must divert to the terminator, got %s", got)
+	}
+	hdrs := cfg.HTTP.Middlewares["gtrm-ctx-acme"].Headers.CustomRequestHeaders
+	if hdrs["X-Zoiko-GTRM-State"] != "quarantined" {
+		t.Fatalf("expected state=quarantined, got %s", hdrs["X-Zoiko-GTRM-State"])
+	}
+	if hdrs["X-Zoiko-Resolved-Region"] != "" {
+		t.Fatalf("quarantined BLOCK request must resolve no region, got %s", hdrs["X-Zoiko-Resolved-Region"])
+	}
+}
+
+// Rollback: quarantine_active=false restores normal routing (§9.3, test K).
+func TestEmit_QuarantineInactive_NormalRoute(t *testing.T) {
+	cfg := Emit(validMap(validTenant()), testCatalog())
+	if got := cfg.HTTP.Services["gtrm-svc-acme"].LoadBalancer.Servers[0].URL; got != "http://eu-pool:8080" {
+		t.Fatalf("not quarantined -> normal eu-pool route, got %s", got)
+	}
+	if got := cfg.HTTP.Middlewares["gtrm-ctx-acme"].Headers.CustomRequestHeaders["X-Zoiko-GTRM-State"]; got != "normal" {
+		t.Fatalf("expected state=normal, got %s", got)
+	}
+}
+
 // Fail-closed: a SUSPENDED tenant gets NO data-bearing router (§8.1).
 func TestEmit_SuspendedTenant_NoRouter(t *testing.T) {
 	tn := validTenant()

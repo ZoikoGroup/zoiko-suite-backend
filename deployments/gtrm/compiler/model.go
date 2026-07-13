@@ -87,6 +87,13 @@ type Tenant struct {
 	FailoverActive bool `yaml:"failover_active"`
 	QuarantineMode        string   `yaml:"quarantine_mode"`
 	QuarantinePool        *string  `yaml:"quarantine_pool"`
+	// QuarantineActive is the manual incident-diversion switch (§9). Normally
+	// false. An operator sets it true via a reviewed, two-person routing-map
+	// change during an incident → traffic is diverted per QuarantineMode
+	// (BLOCK => residency-neutral terminator, no tenant data; ISOLATED_SERVE =>
+	// the region-scoped quarantine_pool). Rollback is setting it back to false
+	// (§9.3 states). Requires QuarantineMode != NONE.
+	QuarantineActive bool `yaml:"quarantine_active"`
 	RoutingStatus         string   `yaml:"routing_status"`
 	LastUpdatedAt         string   `yaml:"last_updated_at"`
 	UpdatedBy             string   `yaml:"updated_by"`

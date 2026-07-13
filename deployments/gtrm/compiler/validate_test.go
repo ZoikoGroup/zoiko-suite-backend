@@ -201,6 +201,27 @@ func TestValidate_ActiveTenant_MissingResidency_Rejected(t *testing.T) {
 	}
 }
 
+// ── Manual quarantine switch (§9) ─────────────────────────────────────────────
+
+func TestValidate_QuarantineActiveWithNoneMode_Rejected(t *testing.T) {
+	tn := validTenant()
+	tn.QuarantineMode = QuarantineNone
+	tn.QuarantineActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if !hasErrContaining(errs, "quarantine_active is true but quarantine_mode is NONE") {
+		t.Fatalf("expected quarantine-active-with-none violation, got: %v", errs)
+	}
+}
+
+func TestValidate_QuarantineActiveBlock_Valid(t *testing.T) {
+	tn := validTenant() // QuarantineMode = BLOCK
+	tn.QuarantineActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if len(errs) != 0 {
+		t.Fatalf("quarantine active in BLOCK mode should be valid, got: %v", errs)
+	}
+}
+
 // ── Manual failover switch (test D enforcement) ───────────────────────────────
 
 func TestValidate_FailoverActiveWithoutFallback_Rejected(t *testing.T) {

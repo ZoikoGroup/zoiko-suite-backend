@@ -5,8 +5,8 @@
 #
 #   map_version:      47
 #   compiler_version: 0.1.0
-#   commit:           effbe8c
-#   generated_at:     2026-07-13T09:17:45Z
+#   commit:           ce0a838
+#   generated_at:     2026-07-13T09:40:02Z
 # ─────────────────────────────────────────────────────────────────────────────
 http:
     routers:
@@ -57,18 +57,21 @@ http:
             headers:
                 customRequestHeaders:
                     X-Zoiko-GTRM-Map-Version: "47"
+                    X-Zoiko-GTRM-State: normal
                     X-Zoiko-Resolved-Region: eu
                     X-Zoiko-Resolved-Tenant: acme
         gtrm-ctx-atlas:
             headers:
                 customRequestHeaders:
                     X-Zoiko-GTRM-Map-Version: "47"
+                    X-Zoiko-GTRM-State: normal
                     X-Zoiko-Resolved-Region: eu
                     X-Zoiko-Resolved-Tenant: atlas
         gtrm-ctx-globex:
             headers:
                 customRequestHeaders:
                     X-Zoiko-GTRM-Map-Version: "47"
+                    X-Zoiko-GTRM-State: normal
                     X-Zoiko-Resolved-Region: us
                     X-Zoiko-Resolved-Tenant: globex
         gtrm-edge-strip:

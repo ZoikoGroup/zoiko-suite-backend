@@ -103,22 +103,36 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 		svcName := "gtrm-svc-" + slug
 		ctxMW := "gtrm-ctx-" + slug
 
-		// The region traffic is currently routed to: primary normally, or the
-		// approved fallback when an operator has manually activated failover
-		// (§8.3/§8.4). Failover and failback are compiled routing-map changes,
-		// which makes failback inherently STICKY — there is no Traefik auto
-		// flap-back when the primary recovers.
-		active := t.activeRegion()
+		// Decide the target pool + trusted routing context for this tenant.
+		//
+		// Precedence: an active quarantine (§9) overrides normal routing. Then
+		// the active region — primary normally, or the approved fallback when an
+		// operator has manually activated failover (§8.3/§8.4). Failover,
+		// failback and quarantine are all compiled routing-map changes, so all
+		// are inherently STICKY — no Traefik auto flap-back.
+		var targetPool, resolvedRegion, gtrmState string
+		switch {
+		case t.QuarantineActive && t.QuarantineMode == QuarantineBlock:
+			// BLOCK: divert to the residency-neutral terminator. No region is
+			// resolved because no tenant data is processed (§9.1).
+			targetPool, resolvedRegion, gtrmState = safeBackend, "", "quarantined"
+		case t.QuarantineActive && t.QuarantineMode == QuarantineIsolated:
+			// ISOLATED_SERVE: region-scoped quarantine pool (validated in-boundary).
+			targetPool, resolvedRegion, gtrmState = *t.QuarantinePool, t.activeRegion(), "quarantined"
+		default:
+			resolvedRegion = t.activeRegion()
+			targetPool, gtrmState = cat.pool(resolvedRegion), "normal"
+		}
 
-		// Per-tenant context middleware: set trusted internal headers AFTER
-		// the strip middleware has removed any client-supplied copies. The
-		// resolved region is the ACTIVE region, so backend region assertion in
-		// the target pool matches.
+		// Per-tenant context middleware: set trusted internal headers AFTER the
+		// strip middleware removed any client-supplied copies. The resolved
+		// region is the ACTIVE region, so backend region assertion matches.
 		cfg.HTTP.Middlewares[ctxMW] = traefikMiddleware{Headers: &traefikHeaders{
 			CustomRequestHeaders: map[string]string{
 				"X-Zoiko-Resolved-Tenant":  slug,
-				"X-Zoiko-Resolved-Region":  active,
+				"X-Zoiko-Resolved-Region":  resolvedRegion,
 				"X-Zoiko-GTRM-Map-Version": strconv.Itoa(m.MapVersion),
+				"X-Zoiko-GTRM-State":       gtrmState,
 			},
 		}}
 
@@ -129,12 +143,12 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 			Priority:    primaryPriority,
 		}
 
-		// Single load balancer to the active region's pool. A tenant with no
-		// approved fallback can never be failed over (validation rejects
-		// failover_active without a fallback), so when its single pool is down
-		// it simply fails — it never spills to a non-compliant region (test D).
+		// Single load balancer to the target pool. A tenant with no approved
+		// fallback can never be failed over (validation rejects failover_active
+		// without a fallback), so when its single pool is down it simply fails —
+		// it never spills to a non-compliant region (test D).
 		cfg.HTTP.Services[svcName] = traefikService{
-			LoadBalancer: &traefikLB{Servers: []traefikServer{{URL: poolURL(cat.pool(active))}}},
+			LoadBalancer: &traefikLB{Servers: []traefikServer{{URL: poolURL(targetPool)}}},
 		}
 	}
 

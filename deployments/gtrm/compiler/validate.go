@@ -139,6 +139,12 @@ func Validate(m RoutingMap, cat RegionCatalog, requireProdSafe bool) []string {
 			}
 		}
 
+		// Manual quarantine switch (§9): can only be activated when the tenant
+		// has a quarantine mode configured (BLOCK or ISOLATED_SERVE).
+		if t.QuarantineActive && t.QuarantineMode == QuarantineNone {
+			errs = append(errs, fmt.Sprintf("%s: quarantine_active is true but quarantine_mode is NONE", id))
+		}
+
 		// Manual failover switch (§8.3/§8.4): can only be activated when an
 		// approved in-boundary fallback exists. This is what makes a
 		// non-compliant fallback impossible (acceptance test D): a tenant with

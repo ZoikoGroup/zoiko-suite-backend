@@ -61,8 +61,7 @@ func poolHandler(name, region string) http.HandlerFunc {
 		// region, and it must match this pool. Anything else is a misroute —
 		// reject, log the violation, process no tenant data.
 		if resolved == "" || resolved != region {
-			log.Printf("REGION ASSERTION VIOLATION: pool=%s region=%s got X-Zoiko-Resolved-Region=%q host=%q path=%q",
-				name, region, resolved, r.Host, r.URL.Path)
+			logDecision(r, name, "region_assertion_failed", false)
 			writeJSON(w, http.StatusForbidden, map[string]any{
 				"error":            "region_assertion_failed",
 				"pool":             name,
@@ -73,6 +72,7 @@ func poolHandler(name, region string) http.HandlerFunc {
 			return
 		}
 
+		logDecision(r, name, "tenant_residency", true)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"pool":             name,
 			"pool_region":      region,
@@ -88,7 +88,7 @@ func poolHandler(name, region string) http.HandlerFunc {
 // data is processed; it never routes to a regional pool (§8.1, §9.1).
 func terminator(name string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("SAFE/QUARANTINE terminator hit: endpoint=%s host=%q path=%q", name, r.Host, r.URL.Path)
+		logDecision(r, name, "residency_unresolved_or_quarantined", false)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 			"incident":         true,
 			"endpoint":         name,
@@ -96,6 +96,30 @@ func terminator(name string) http.HandlerFunc {
 			"tenant_processed": false,
 			"note":             "residency-neutral endpoint — no tenant data processed",
 		})
+	}
+}
+
+// logDecision emits a structured, single-line JSON route-decision log (§11
+// auditability, test G). It contains only routing metadata from trusted,
+// gateway-set headers — no secrets, tokens, or tenant content (log hygiene,
+// test P). Fields not resolvable at the pool (policy_version,
+// data_residency_policy_id) are gateway/compiler-side and intentionally omitted
+// here rather than logged as blanks.
+func logDecision(r *http.Request, pool, reason string, processed bool) {
+	rec := map[string]any{
+		"event":            "gtrm_route_decision",
+		"pool":             pool,
+		"resolved_tenant":  r.Header.Get("X-Zoiko-Resolved-Tenant"),
+		"resolved_region":  r.Header.Get("X-Zoiko-Resolved-Region"),
+		"gtrm_map_version": r.Header.Get("X-Zoiko-GTRM-Map-Version"),
+		"gtrm_state":       r.Header.Get("X-Zoiko-GTRM-State"),
+		"decision_reason":  reason,
+		"tenant_processed": processed,
+		"host":             r.Host,
+		"path":             r.URL.Path,
+	}
+	if b, err := json.Marshal(rec); err == nil {
+		log.Println(string(b))
 	}
 }
 
