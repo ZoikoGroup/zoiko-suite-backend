@@ -13,18 +13,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/auth"
-	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/config"
+	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
-	"zoiko.io/identity-context-svc/internal/principal"
 	"zoiko.io/identity-context-svc/internal/session"
+	"zoiko.io/identity-context-svc/internal/store"
+	"zoiko.io/identity-context-svc/internal/telemetry"
 	"zoiko.io/identity-context-svc/internal/upstream"
 )
 
@@ -57,14 +63,70 @@ func main() {
 		zap.String("addr", fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port)),
 	)
 
+	// ── Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "identity-context-svc", cfg.OTELExporterEndpoint)
+	if err != nil {
+		log.Fatal("otel tracing init failed", zap.Error(err))
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(shutdownCtx); err != nil {
+			log.Error("otel tracer provider shutdown failed", zap.Error(err))
+		}
+	}()
+
+	metrics := telemetry.NewMetrics("identity-context-svc")
+
+	// ── Postgres pool ─────────────────────────────────────────────────────
+	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
+	if err != nil {
+		log.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		log.Fatal("failed to create db pool", zap.Error(err))
+	}
+	defer pool.Close()
+
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		// Tier 0 — Postgres is a hard dependency. Fail fast on startup.
+		log.Fatal("Postgres unreachable on startup — aborting", zap.Error(err))
+	}
+	log.Info("Postgres connection established", zap.String("db_name", cfg.DB.Name))
+
+	// ── Kafka producer ────────────────────────────────────────────────────
+	// Connects lazily on first write — unlike Postgres/Redis this is not a
+	// fail-fast startup dependency. Publish failures are handled per-call by
+	// the resolver's existing error-return/log path (Gap 1 fix).
+	kafkaWriter := &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+	}
+	defer func() { _ = kafkaWriter.Close() }()
+
 	// ── Domain dependencies ───────────────────────────────────────────────
 	sessionCache := session.NewCache(rdb, cfg.Redis.SessionTTLSeconds)
 	riskCache := session.NewRiskSignalCache(rdb)
-	principalRepo := principal.NewRepository(log)
+	principalRepo := store.New(pool, log)
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic)
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	verifier := auth.NewJWTVerifier(cfg)
-	signer := auth.NewJWTSigner(cfg)
+	signer, err := auth.NewJWTSigner(cfg)
+
+	if err != nil {
+		log.Fatal("failed to initialise JWT signer", zap.Error(err))
+	}
 
 	// ── Resolver ──────────────────────────────────────────────────────────
 	resolver := identityctx.NewResolver(
@@ -86,6 +148,8 @@ func main() {
 	r.Use(middleware.RequestID)    // injects X-Request-Id
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)    // never let a panic crash the Tier 0 service
+	r.Use(otelchi.Middleware("identity-context-svc", otelchi.WithChiRoutes(r)))
+	r.Use(metrics.HTTPMiddleware)
 
 	// Structured request logging
 	r.Use(func(next http.Handler) http.Handler {
@@ -104,7 +168,10 @@ func main() {
 	})
 
 	// Health probe (no auth required)
-	r.Handle("/health", health.NewHandler(rdb))
+	r.Handle("/health", metrics.WrapReadinessHandler(health.NewHandler(rdb, pool)))
+	r.Handle("/metrics", promhttp.Handler())
+
+	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
 
 	// Domain routes (all under /v1/)
 	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, log)

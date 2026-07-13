@@ -38,6 +38,13 @@ var (
 	// ErrConflict is returned when a unique constraint is violated (e.g. duplicate
 	// tenant_code). Handlers should map this to HTTP 409 Conflict.
 	ErrConflict           = errors.New("conflict: resource already exists")
+	// ErrRegionUnresolved is returned by ResolveTenantRegion when the
+	// tenant exists but its active residency policy has no
+	// ResidencyRegionID assigned yet — a real, expected state for
+	// policies created before that column existed (migration 000003),
+	// not a bug. Handlers should map this to HTTP 409 Conflict, distinct
+	// from ErrNotFound.
+	ErrRegionUnresolved   = errors.New("tenant's residency policy has no region assigned")
 )
 
 // Service orchestrates all registry operations.
@@ -481,6 +488,7 @@ func (s *Service) CreateResidencyPolicy(
 		PolicyCode:             req.PolicyCode,
 		ResidencyMode:          req.ResidencyMode,
 		ConflictResolutionMode: req.ConflictResolutionMode,
+		ResidencyRegionID:      req.ResidencyRegionID,
 		ActiveFlag:             true,
 		CreatedAt:              time.Now().UTC(),
 		CreatedByPrincipalID:   actorFromJWT(envelopeJWT),
@@ -524,6 +532,49 @@ func (s *Service) GetResidencyRegion(ctx context.Context, regionID string) (*dom
 // ListResidencyRegions returns all active residency regions.
 func (s *Service) ListResidencyRegions(ctx context.Context) ([]*domain.ResidencyRegion, error) {
 	return s.store.ListResidencyRegions(ctx)
+}
+
+// ResolveTenantRegion is the real tenant-to-region lookup for the Global
+// Traffic & Residency Manager (docs/architecture/global-traffic-
+// residency-manager-design.md, Q2) — replacing the Phase 1 routing demo's
+// header stand-in with an actual resolution against this service's own
+// data: Tenant.DefaultDataResidencyPolicyID -> DataResidencyPolicy.ResidencyRegionID
+// -> ResidencyRegion.RegionCode.
+//
+// Returns ErrNotFound if the tenant doesn't exist, and the new, distinct
+// ErrRegionUnresolved if the tenant exists but its policy has no region
+// assigned yet (migration 000003 added the column nullable, unbackfilled
+// — this is an expected, real state for existing policies, not a bug).
+func (s *Service) ResolveTenantRegion(ctx context.Context, tenantID string) (*domain.ResolvedTenantRegion, error) {
+	t, err := s.store.GetTenantByID(ctx, tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetTenantByID: %w", err)
+	}
+	if t == nil {
+		return nil, ErrNotFound
+	}
+
+	p, err := s.store.GetResidencyPolicyByID(ctx, t.DefaultDataResidencyPolicyID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetResidencyPolicyByID: %w", err)
+	}
+	if p == nil || p.ResidencyRegionID == nil {
+		return nil, ErrRegionUnresolved
+	}
+
+	r, err := s.store.GetResidencyRegionByID(ctx, *p.ResidencyRegionID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetResidencyRegionByID: %w", err)
+	}
+	if r == nil {
+		return nil, ErrRegionUnresolved
+	}
+
+	return &domain.ResolvedTenantRegion{
+		TenantID:   tenantID,
+		RegionCode: r.RegionCode,
+		RegionName: r.RegionName,
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

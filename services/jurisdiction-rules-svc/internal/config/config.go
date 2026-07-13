@@ -7,6 +7,7 @@ import (
 
 // Config holds all runtime configuration for jurisdiction-rules-svc.
 type Config struct {
+	Env  string
 	Port int
 
 	DB DBConfig
@@ -15,6 +16,10 @@ type Config struct {
 	// Every admin mutating API call must be authorized before proceeding.
 	// No service self-authorizes (doctrine).
 	AuthZServiceURL string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -39,6 +44,7 @@ func (d DBConfig) DSN() string {
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
 	return &Config{
+		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8082),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
@@ -48,7 +54,8 @@ func Load() (*Config, error) {
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
-		AuthZServiceURL: env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

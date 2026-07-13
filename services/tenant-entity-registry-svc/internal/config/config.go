@@ -22,6 +22,10 @@ type Config struct {
 	// AuthZServiceURL is the base URL of the Authorization Service.
 	// Every mutating API call must be authorized before proceeding.
 	AuthZServiceURL string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
 }
 
 type DBConfig struct {
@@ -66,6 +70,7 @@ func Load() (*Config, error) {
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc"),
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

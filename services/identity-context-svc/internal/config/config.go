@@ -14,12 +14,16 @@ type Config struct {
 
 	// JWT envelope signing (Q2 — signed short-lived JWT)
 	// Production: RS256 via KMS-backed keypair through Secret Vault Integration Service.
+	JWTSigningPrivateKeyPath string
+	JWTKeyID                 string
+
 	// TODO: replace JWTSigningSecret with KMS key reference before Phase 1 production cutover.
 	JWTSigningSecret       string
 	JWTIssuer              string
 	JWTAudienceInternal    string
 	EnvelopeJWTTTLSeconds  int
 
+	DB    DBConfig
 	Redis RedisConfig
 	Kafka KafkaConfig
 
@@ -27,6 +31,28 @@ type Config struct {
 	TenantRegistryURL      string
 	DelegatedAuthorityURL  string
 	AccessControlURL       string
+
+	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
+	// traces (03-microservices.md §3.8's Observability Baseline).
+	OTELExporterEndpoint string
+}
+
+type DBConfig struct {
+	Host     string
+	Port     int
+	Name     string
+	User     string
+	Password string
+	SSLMode  string
+}
+
+func (d DBConfig) DSN() string {
+	return "host=" + d.Host +
+		" port=" + strconv.Itoa(d.Port) +
+		" dbname=" + d.Name +
+		" user=" + d.User +
+		" password=" + d.Password +
+		" sslmode=" + d.SSLMode
 }
 
 type RedisConfig struct {
@@ -52,7 +78,18 @@ func Load() (*Config, error) {
 		JWTSigningSecret:      env("JWT_SIGNING_SECRET", ""),
 		JWTIssuer:             env("JWT_ISSUER", "identity-context-svc"),
 		JWTAudienceInternal:   env("JWT_AUDIENCE", "zoiko-internal"),
+		JWTSigningPrivateKeyPath: env("JWT_SIGNING_PRIVATE_KEY_PATH", "./envelope_signing_key.pem"),
+		JWTKeyID:                 env("JWT_KEY_ID", "envelope-signing-key-1"),
+
 		EnvelopeJWTTTLSeconds: envInt("ENVELOPE_JWT_TTL_SECONDS", 300),
+		DB: DBConfig{
+			Host:     env("DB_HOST", "localhost"),
+			Port:     envInt("DB_PORT", 5432),
+			Name:     env("DB_NAME", "identity_context"),
+			User:     env("DB_USER", "postgres"),
+			Password: env("DB_PASSWORD", ""),
+			SSLMode:  env("DB_SSLMODE", "require"),
+		},
 		Redis: RedisConfig{
 			Host:                  env("REDIS_HOST", "localhost"),
 			Port:                  envInt("REDIS_PORT", 6379),
@@ -67,6 +104,7 @@ func Load() (*Config, error) {
 		TenantRegistryURL:     env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
 		DelegatedAuthorityURL: env("DELEGATED_AUTHORITY_URL", "http://delegated-authority-svc"),
 		AccessControlURL:      env("ACCESS_CONTROL_URL", "http://access-control-svc"),
+		OTELExporterEndpoint:  env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}
 	return cfg, nil
 }

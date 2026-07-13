@@ -1,0 +1,44 @@
+# GTRM Routing Map — the single authored representation of routing policy.
+#
+# Per the approved Phase 1 decision (docs/architecture/
+# global-traffic-residency-manager-decision.md §4.1), this is the ONLY place
+# routing policy is authored. It is compiled into Traefik config by the
+# compiler (deployments/gtrm/compiler); Traefik config is never hand-edited.
+#
+# In production this map is generated from tenant records (the source of
+# truth). For Phase 1 it is file-based, as the decision explicitly allows.
+schema_version: 1
+map_version: 47            # monotonically increasing; stamped into compiled output + logs
+env: dev                   # dev | staging | prod — compiler rejects prod generation from a dev map
+env_domain: zoikosuite.dev.internal   # {tenant_slug}.{env_domain} is the routing key
+
+tenants:
+  - tenant_id: tenant_acme_eu
+    tenant_slug: acme
+    workspace_id: workspace_acme_primary
+    data_residency_policy_id: residency_eu_001
+    policy_version: 12
+    allowed_regions: [eu]          # closed set; primary/fallback must be within this
+    primary_region: eu
+    fallback_region: null          # null = no failover service emitted
+    quarantine_mode: BLOCK         # NONE | BLOCK | ISOLATED_SERVE
+    quarantine_pool: null          # required + region-compatible only for ISOLATED_SERVE
+    routing_status: ACTIVE         # ACTIVE | SUSPENDED | PENDING_RESOLUTION
+    last_updated_at: 2026-07-10T12:00:00Z
+    updated_by: platform-governance
+    change_reference: GTRM-47
+
+  - tenant_id: tenant_atlas_multi
+    tenant_slug: atlas
+    workspace_id: workspace_atlas_primary
+    data_residency_policy_id: residency_multi_002
+    policy_version: 6
+    allowed_regions: [eu, uk]
+    primary_region: eu
+    fallback_region: uk            # approved fallback within allowed_regions
+    quarantine_mode: BLOCK
+    quarantine_pool: null
+    routing_status: ACTIVE
+    last_updated_at: 2026-07-10T12:05:00Z
+    updated_by: platform-governance
+    change_reference: GTRM-48

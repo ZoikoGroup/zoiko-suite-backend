@@ -1,0 +1,20 @@
+# GTRM region catalog — the closed set of region codes the compiler will accept.
+#
+# Per the approved Phase 1 decision (docs/architecture/
+# global-traffic-residency-manager-decision.md §2), regions are platform-managed
+# / IaC-provisioned, NOT created through an API. This file is that catalog for
+# the compiler: any routing-map entry referencing a region code not listed here
+# is rejected (§4.2 "unknown region codes").
+#
+# Phase 1 uses simulated regional pools in the dev stack (Decision 4), so these
+# map to the logical pools defined in the routing map, not real cloud regions.
+regions:
+  - code: eu
+    name: European Union
+    pool: eu-pool
+  - code: us
+    name: United States
+    pool: us-pool
+  - code: uk
+    name: United Kingdom
+    pool: uk-pool

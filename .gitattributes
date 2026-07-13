@@ -1,0 +1,5 @@
+# Scripts executed inside Linux containers must always use LF, regardless of
+# a contributor's local core.autocrlf setting — a CRLF shebang line breaks
+# with "bad interpreter: No such file or directory" inside the container.
+*.sh text eol=lf
+Dockerfile text eol=lf

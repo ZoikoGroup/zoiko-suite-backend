@@ -560,14 +560,14 @@ func (s *PgStore) CreateResidencyPolicy(ctx context.Context, p *domain.DataResid
 		query := `
 			INSERT INTO data_residency_policies (
 				data_residency_policy_id, tenant_id, policy_name, policy_code,
-				residency_mode, conflict_resolution_mode, active_flag,
+				residency_mode, conflict_resolution_mode, residency_region_id, active_flag,
 				created_at, updated_at, created_by_principal_id, updated_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`
 		now := time.Now().UTC()
 		_, err := tx.Exec(ctx, query,
 			p.DataResidencyPolicyID, p.TenantID, p.PolicyName, p.PolicyCode,
-			string(p.ResidencyMode), string(p.ConflictResolutionMode), p.ActiveFlag,
+			string(p.ResidencyMode), string(p.ConflictResolutionMode), p.ResidencyRegionID, p.ActiveFlag,
 			p.CreatedAt, now, p.CreatedByPrincipalID, p.CreatedByPrincipalID,
 		)
 		if err != nil {
@@ -588,13 +588,13 @@ func (s *PgStore) GetResidencyPolicyByID(ctx context.Context, policyID string) (
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			SELECT data_residency_policy_id, tenant_id, policy_name, policy_code,
-			       residency_mode, conflict_resolution_mode, active_flag,
+			       residency_mode, conflict_resolution_mode, residency_region_id, active_flag,
 			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
 			FROM data_residency_policies WHERE data_residency_policy_id = $1
 		`
 		return tx.QueryRow(ctx, query, policyID).Scan(
 			&p.DataResidencyPolicyID, &p.TenantID, &p.PolicyName, &p.PolicyCode,
-			&p.ResidencyMode, &p.ConflictResolutionMode, &p.ActiveFlag,
+			&p.ResidencyMode, &p.ConflictResolutionMode, &p.ResidencyRegionID, &p.ActiveFlag,
 			&p.CreatedAt, &p.UpdatedAt, &p.CreatedByPrincipalID, &p.UpdatedByPrincipalID,
 		)
 	})
