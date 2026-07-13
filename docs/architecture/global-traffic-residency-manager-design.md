@@ -1,4 +1,13 @@
-# Global Traffic & Residency Manager — Design Proposal (DRAFT)
+# Global Traffic & Residency Manager — Design Proposal (DRAFT — SUPERSEDED)
+
+> **⚠️ SUPERSEDED (10 July 2026).** This draft proposal has been reviewed and
+> approved. The four decisions it raised were all accepted (Traefik-native
+> enforcement, tenant-residency routing, manual block-mode quarantine,
+> simulated regional pools), with additional governance controls added. The
+> authoritative, buildable spec is now
+> [`global-traffic-residency-manager-decision.md`](./global-traffic-residency-manager-decision.md)
+> (Final Approved v1.2). This file is retained for historical context only —
+> build against the decision doc, not this one.
 
 **Status: DRAFT — not approved. Requires a check-in with the CTO and
 whoever owns `feat/api-gateway` before any implementation starts.** This
