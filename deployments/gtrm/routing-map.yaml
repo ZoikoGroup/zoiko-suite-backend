@@ -42,3 +42,37 @@ tenants:
     last_updated_at: 2026-07-10T12:05:00Z
     updated_by: platform-governance
     change_reference: GTRM-48
+
+  # US-residency tenant — proves acceptance test B (US tenant routes to us-pool).
+  - tenant_id: tenant_globex_us
+    tenant_slug: globex
+    workspace_id: workspace_globex_primary
+    data_residency_policy_id: residency_us_003
+    policy_version: 3
+    allowed_regions: [us]
+    primary_region: us
+    fallback_region: null
+    quarantine_mode: BLOCK
+    quarantine_pool: null
+    routing_status: ACTIVE
+    last_updated_at: 2026-07-10T12:10:00Z
+    updated_by: platform-governance
+    change_reference: GTRM-49
+
+  # Onboarding tenant whose residency policy is not yet resolved — proves
+  # acceptance test C (fail-closed). PENDING_RESOLUTION => no data-bearing
+  # route is emitted, so its traffic falls through to the safe catch-all.
+  - tenant_id: tenant_newco_pending
+    tenant_slug: newco
+    workspace_id: null
+    data_residency_policy_id: null
+    policy_version: 0
+    allowed_regions: []
+    primary_region: null
+    fallback_region: null
+    quarantine_mode: NONE
+    quarantine_pool: null
+    routing_status: PENDING_RESOLUTION
+    last_updated_at: 2026-07-10T12:15:00Z
+    updated_by: platform-governance
+    change_reference: GTRM-50

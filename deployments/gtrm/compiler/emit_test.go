@@ -15,7 +15,7 @@ func TestEmit_NoFallback_SingleLoadBalancer(t *testing.T) {
 	if svc.Failover != nil {
 		t.Fatal("no fallback configured — must NOT emit a failover service (§4.2)")
 	}
-	if svc.LoadBalancer == nil || svc.LoadBalancer.Servers[0].URL != "http://eu-pool:80" {
+	if svc.LoadBalancer == nil || svc.LoadBalancer.Servers[0].URL != "http://eu-pool:8080" {
 		t.Fatalf("expected single LB to eu-pool, got: %+v", svc.LoadBalancer)
 	}
 
@@ -44,10 +44,10 @@ func TestEmit_ApprovedFallback_EmitsFailover(t *testing.T) {
 	if svc.Failover == nil {
 		t.Fatal("approved fallback → expected a failover service")
 	}
-	if cfg.HTTP.Services["gtrm-primary-atlas"].LoadBalancer.Servers[0].URL != "http://eu-pool:80" {
+	if cfg.HTTP.Services["gtrm-primary-atlas"].LoadBalancer.Servers[0].URL != "http://eu-pool:8080" {
 		t.Fatal("primary should target eu-pool")
 	}
-	if cfg.HTTP.Services["gtrm-fallback-atlas"].LoadBalancer.Servers[0].URL != "http://uk-pool:80" {
+	if cfg.HTTP.Services["gtrm-fallback-atlas"].LoadBalancer.Servers[0].URL != "http://uk-pool:8080" {
 		t.Fatal("fallback should target uk-pool")
 	}
 }
@@ -81,7 +81,7 @@ func TestEmit_CatchAllSafeRoute_Always(t *testing.T) {
 	if r.Priority >= primaryPriority {
 		t.Fatal("catch-all priority must be below tenant-route priority")
 	}
-	if cfg.HTTP.Services[safeService].LoadBalancer.Servers[0].URL != "http://quarantine-terminator:80" {
+	if cfg.HTTP.Services[safeService].LoadBalancer.Servers[0].URL != "http://quarantine-terminator:8080" {
 		t.Fatal("safe route must target the residency-neutral terminator")
 	}
 }

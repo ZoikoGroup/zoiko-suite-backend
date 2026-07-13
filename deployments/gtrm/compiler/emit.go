@@ -46,11 +46,18 @@ type traefikHealth struct {
 
 // traefikFailover models Traefik v3's failover service: route to Service while
 // healthy, else to Fallback. Emitted ONLY when an approved fallback exists.
+//
+// Traefik's failover.healthCheck is an EMPTY object — it only toggles health
+// checking on the failover service; the actual probe (path/interval) lives on
+// the primary load-balancer service's healthCheck, not here.
 type traefikFailover struct {
-	Service     string         `yaml:"service"`
-	Fallback    string         `yaml:"fallback"`
-	HealthCheck *traefikHealth `yaml:"healthCheck,omitempty"`
+	Service     string       `yaml:"service"`
+	Fallback    string       `yaml:"fallback"`
+	HealthCheck *emptyStruct `yaml:"healthCheck,omitempty"`
 }
+
+// emptyStruct marshals to `{}` — used for Traefik's toggle-only healthCheck.
+type emptyStruct struct{}
 
 type traefikMiddleware struct {
 	Headers *traefikHeaders `yaml:"headers,omitempty"`
@@ -75,7 +82,7 @@ var untrustedInboundHeaders = []string{
 }
 
 const (
-	backendPort       = "80"
+	backendPort       = "8080" // pools run as non-root (distroless); can't bind <1024
 	edgeStripMW       = "gtrm-edge-strip"
 	safeRouter        = "gtrm-catchall-safe"
 	safeService       = "gtrm-safe-endpoint"
@@ -153,14 +160,18 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 			cfg.HTTP.Services[svcName] = traefikService{Failover: &traefikFailover{
 				Service:     primarySvc,
 				Fallback:    fallbackSvc,
-				HealthCheck: &traefikHealth{Path: healthCheckPath, Interval: healthCheckPeriod},
+				HealthCheck: &emptyStruct{},
 			}}
 			cfg.HTTP.Services[primarySvc] = traefikService{LoadBalancer: &traefikLB{
 				Servers:     []traefikServer{{URL: primaryURL}},
 				HealthCheck: &traefikHealth{Path: healthCheckPath, Interval: healthCheckPeriod},
 			}}
+			// The fallback also needs a health check: Traefik requires health
+			// checks on BOTH members of a failover service to register the
+			// fallback as an updater.
 			cfg.HTTP.Services[fallbackSvc] = traefikService{LoadBalancer: &traefikLB{
-				Servers: []traefikServer{{URL: poolURL(cat.pool(*t.FallbackRegion))}},
+				Servers:     []traefikServer{{URL: poolURL(cat.pool(*t.FallbackRegion))}},
+				HealthCheck: &traefikHealth{Path: healthCheckPath, Interval: healthCheckPeriod},
 			}}
 		}
 	}

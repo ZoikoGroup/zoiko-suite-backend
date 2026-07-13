@@ -78,15 +78,24 @@ func Validate(m RoutingMap, cat RegionCatalog, requireProdSafe bool) []string {
 			}
 		}
 
-		if t.DataResidencyPolicyID == "" {
-			errs = append(errs, fmt.Sprintf("%s: data_residency_policy_id is required", id))
-		}
-
-		// Routing status enum.
+		// Routing status enum (always validated).
 		switch t.RoutingStatus {
 		case StatusActive, StatusSuspended, StatusPending:
 		default:
 			errs = append(errs, fmt.Sprintf("%s: routing_status %q invalid (want ACTIVE|SUSPENDED|PENDING_RESOLUTION)", id, t.RoutingStatus))
+		}
+
+		// Fail-closed modelling: only ACTIVE tenants get a data-bearing route
+		// emitted, so only ACTIVE tenants must have fully-resolved residency.
+		// A SUSPENDED or PENDING_RESOLUTION tenant may legitimately have no
+		// resolved policy/region yet — it routes to the safe catch-all (§8.1),
+		// so requiring those fields would wrongly reject a valid map.
+		if t.RoutingStatus != StatusActive {
+			continue
+		}
+
+		if t.DataResidencyPolicyID == "" {
+			errs = append(errs, fmt.Sprintf("%s: data_residency_policy_id is required for ACTIVE tenants", id))
 		}
 
 		// allowed_regions: non-empty, all known, no duplicates.
