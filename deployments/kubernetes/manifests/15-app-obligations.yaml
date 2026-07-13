@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: obligations-svc
+  namespace: zoiko-governance
+  labels:
+    app: obligations-svc
+spec:
+  ports:
+  - port: 8088
+    targetPort: 8088
+    name: http
+  selector:
+    app: obligations-svc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: obligations-svc
+  namespace: zoiko-governance
+  labels:
+    app: obligations-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: obligations-svc
+  template:
+    metadata:
+      labels:
+        app: obligations-svc
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: obligations-svc
+        image: obligations-svc:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8088
+          name: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        env:
+        - name: PORT
+          value: "8088"
+        - name: DB_HOST
+          value: "postgres.zoiko-infra.svc.cluster.local"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_NAME
+          value: "obligations"
+        - name: DB_USER
+          value: "postgres"
+        - name: DB_PASSWORD
+          value: "postgres"
+        - name: DB_SSLMODE
+          value: "disable"
+        - name: KAFKA_BROKERS
+          value: "kafka.zoiko-infra.svc.cluster.local:9092"
+        - name: KAFKA_GROUP_ID
+          value: "obligations-svc"
+        - name: KAFKA_EVENTS_TOPIC
+          value: "zoiko.obligations.events"
+        # In-cluster DNS name for jurisdiction-svc.
+        # Config default is "http://jurisdiction-rules-svc:8082" which is the compose
+        # short name and would NXDOMAIN inside K8s — override explicitly here.
+        - name: JURISDICTION_RULES_URL
+          value: "http://jurisdiction-svc.zoiko-governance.svc.cluster.local:8082"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://otel-collector.zoiko-infra.svc.cluster.local:4318"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8088
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8088
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
