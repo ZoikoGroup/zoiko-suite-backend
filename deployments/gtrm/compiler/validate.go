@@ -78,15 +78,24 @@ func Validate(m RoutingMap, cat RegionCatalog, requireProdSafe bool) []string {
 			}
 		}
 
-		if t.DataResidencyPolicyID == "" {
-			errs = append(errs, fmt.Sprintf("%s: data_residency_policy_id is required", id))
-		}
-
-		// Routing status enum.
+		// Routing status enum (always validated).
 		switch t.RoutingStatus {
 		case StatusActive, StatusSuspended, StatusPending:
 		default:
 			errs = append(errs, fmt.Sprintf("%s: routing_status %q invalid (want ACTIVE|SUSPENDED|PENDING_RESOLUTION)", id, t.RoutingStatus))
+		}
+
+		// Fail-closed modelling: only ACTIVE tenants get a data-bearing route
+		// emitted, so only ACTIVE tenants must have fully-resolved residency.
+		// A SUSPENDED or PENDING_RESOLUTION tenant may legitimately have no
+		// resolved policy/region yet — it routes to the safe catch-all (§8.1),
+		// so requiring those fields would wrongly reject a valid map.
+		if t.RoutingStatus != StatusActive {
+			continue
+		}
+
+		if t.DataResidencyPolicyID == "" {
+			errs = append(errs, fmt.Sprintf("%s: data_residency_policy_id is required for ACTIVE tenants", id))
 		}
 
 		// allowed_regions: non-empty, all known, no duplicates.
@@ -128,6 +137,20 @@ func Validate(m RoutingMap, cat RegionCatalog, requireProdSafe bool) []string {
 			case fb == t.PrimaryRegion:
 				errs = append(errs, fmt.Sprintf("%s: fallback_region %q must differ from primary_region", id, fb))
 			}
+		}
+
+		// Manual quarantine switch (§9): can only be activated when the tenant
+		// has a quarantine mode configured (BLOCK or ISOLATED_SERVE).
+		if t.QuarantineActive && t.QuarantineMode == QuarantineNone {
+			errs = append(errs, fmt.Sprintf("%s: quarantine_active is true but quarantine_mode is NONE", id))
+		}
+
+		// Manual failover switch (§8.3/§8.4): can only be activated when an
+		// approved in-boundary fallback exists. This is what makes a
+		// non-compliant fallback impossible (acceptance test D): a tenant with
+		// no fallback_region simply cannot be failed over anywhere.
+		if t.FailoverActive && t.FallbackRegion == nil {
+			errs = append(errs, fmt.Sprintf("%s: failover_active is true but no approved fallback_region exists", id))
 		}
 
 		// Quarantine validation (§4.2).

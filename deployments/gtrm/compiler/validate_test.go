@@ -172,6 +172,78 @@ func TestValidate_InvalidStatus_Rejected(t *testing.T) {
 	}
 }
 
+// ── Fail-closed modelling: non-ACTIVE tenants need no resolved residency ──────
+
+func TestValidate_PendingTenant_NoResidency_Valid(t *testing.T) {
+	// A PENDING_RESOLUTION tenant whose policy/region isn't resolved yet must
+	// be a VALID map entry (it fails closed to the safe path, not the compile).
+	pending := Tenant{
+		TenantID:       "tenant_newco_pending",
+		TenantSlug:     "newco",
+		AllowedRegions: nil,
+		PrimaryRegion:  "",
+		QuarantineMode: QuarantineNone,
+		RoutingStatus:  StatusPending,
+	}
+	errs := Validate(validMap(validTenant(), pending), testCatalog(), false)
+	if len(errs) != 0 {
+		t.Fatalf("pending tenant with unresolved residency should be valid, got: %v", errs)
+	}
+}
+
+func TestValidate_ActiveTenant_MissingResidency_Rejected(t *testing.T) {
+	// But an ACTIVE tenant still must have a resolved residency policy.
+	tn := validTenant()
+	tn.DataResidencyPolicyID = ""
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if !hasErrContaining(errs, "data_residency_policy_id is required") {
+		t.Fatalf("expected missing-policy violation for ACTIVE tenant, got: %v", errs)
+	}
+}
+
+// ── Manual quarantine switch (§9) ─────────────────────────────────────────────
+
+func TestValidate_QuarantineActiveWithNoneMode_Rejected(t *testing.T) {
+	tn := validTenant()
+	tn.QuarantineMode = QuarantineNone
+	tn.QuarantineActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if !hasErrContaining(errs, "quarantine_active is true but quarantine_mode is NONE") {
+		t.Fatalf("expected quarantine-active-with-none violation, got: %v", errs)
+	}
+}
+
+func TestValidate_QuarantineActiveBlock_Valid(t *testing.T) {
+	tn := validTenant() // QuarantineMode = BLOCK
+	tn.QuarantineActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if len(errs) != 0 {
+		t.Fatalf("quarantine active in BLOCK mode should be valid, got: %v", errs)
+	}
+}
+
+// ── Manual failover switch (test D enforcement) ───────────────────────────────
+
+func TestValidate_FailoverActiveWithoutFallback_Rejected(t *testing.T) {
+	tn := validTenant() // no fallback_region
+	tn.FailoverActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if !hasErrContaining(errs, "failover_active is true but no approved fallback_region") {
+		t.Fatalf("expected failover-without-fallback violation, got: %v", errs)
+	}
+}
+
+func TestValidate_FailoverActiveWithFallback_Valid(t *testing.T) {
+	tn := validTenant()
+	tn.AllowedRegions = []string{"eu", "uk"}
+	tn.FallbackRegion = ptr("uk")
+	tn.FailoverActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if len(errs) != 0 {
+		t.Fatalf("failover active with an approved fallback should be valid, got: %v", errs)
+	}
+}
+
 // ── Environment validation ────────────────────────────────────────────────────
 
 func TestValidate_ProdSafeFromDevMap_Rejected(t *testing.T) {

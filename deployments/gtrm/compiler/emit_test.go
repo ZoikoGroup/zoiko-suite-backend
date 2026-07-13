@@ -12,10 +12,7 @@ func TestEmit_NoFallback_SingleLoadBalancer(t *testing.T) {
 	if !ok {
 		t.Fatal("expected service gtrm-svc-acme")
 	}
-	if svc.Failover != nil {
-		t.Fatal("no fallback configured — must NOT emit a failover service (§4.2)")
-	}
-	if svc.LoadBalancer == nil || svc.LoadBalancer.Servers[0].URL != "http://eu-pool:80" {
+	if svc.LoadBalancer == nil || svc.LoadBalancer.Servers[0].URL != "http://eu-pool:8080" {
 		t.Fatalf("expected single LB to eu-pool, got: %+v", svc.LoadBalancer)
 	}
 
@@ -29,26 +26,75 @@ func TestEmit_NoFallback_SingleLoadBalancer(t *testing.T) {
 	}
 }
 
-// Approved fallback → failover service + primary/fallback LBs within allowed set.
-func TestEmit_ApprovedFallback_EmitsFailover(t *testing.T) {
+// Manual failover model: failover_active=false routes to the primary region.
+func TestEmit_FailoverInactive_RoutesToPrimary(t *testing.T) {
 	atlas := Tenant{
 		TenantID: "tenant_atlas_multi", TenantSlug: "atlas",
 		DataResidencyPolicyID: "residency_multi_002",
 		AllowedRegions:        []string{"eu", "uk"},
 		PrimaryRegion:         "eu", FallbackRegion: ptr("uk"),
+		FailoverActive: false,
 		QuarantineMode: QuarantineBlock, RoutingStatus: StatusActive,
 	}
 	cfg := Emit(validMap(atlas), testCatalog())
 
-	svc := cfg.HTTP.Services["gtrm-svc-atlas"]
-	if svc.Failover == nil {
-		t.Fatal("approved fallback → expected a failover service")
+	if got := cfg.HTTP.Services["gtrm-svc-atlas"].LoadBalancer.Servers[0].URL; got != "http://eu-pool:8080" {
+		t.Fatalf("failover inactive should route to primary eu-pool, got %s", got)
 	}
-	if cfg.HTTP.Services["gtrm-primary-atlas"].LoadBalancer.Servers[0].URL != "http://eu-pool:80" {
-		t.Fatal("primary should target eu-pool")
+	if got := cfg.HTTP.Middlewares["gtrm-ctx-atlas"].Headers.CustomRequestHeaders["X-Zoiko-Resolved-Region"]; got != "eu" {
+		t.Fatalf("resolved region should be eu when failover inactive, got %s", got)
 	}
-	if cfg.HTTP.Services["gtrm-fallback-atlas"].LoadBalancer.Servers[0].URL != "http://uk-pool:80" {
-		t.Fatal("fallback should target uk-pool")
+}
+
+// failover_active=true routes to the approved fallback, and the resolved-region
+// header follows so backend region assertion in the fallback pool matches.
+// (Sticky: nothing here auto-reverts — only a map change flips it back.)
+func TestEmit_FailoverActive_RoutesToFallback(t *testing.T) {
+	atlas := Tenant{
+		TenantID: "tenant_atlas_multi", TenantSlug: "atlas",
+		DataResidencyPolicyID: "residency_multi_002",
+		AllowedRegions:        []string{"eu", "uk"},
+		PrimaryRegion:         "eu", FallbackRegion: ptr("uk"),
+		FailoverActive: true,
+		QuarantineMode: QuarantineBlock, RoutingStatus: StatusActive,
+	}
+	cfg := Emit(validMap(atlas), testCatalog())
+
+	if got := cfg.HTTP.Services["gtrm-svc-atlas"].LoadBalancer.Servers[0].URL; got != "http://uk-pool:8080" {
+		t.Fatalf("failover active should route to fallback uk-pool, got %s", got)
+	}
+	if got := cfg.HTTP.Middlewares["gtrm-ctx-atlas"].Headers.CustomRequestHeaders["X-Zoiko-Resolved-Region"]; got != "uk" {
+		t.Fatalf("resolved region should be uk when failover active, got %s", got)
+	}
+}
+
+// Manual BLOCK quarantine diverts the tenant to the residency-neutral
+// terminator with no resolved region and state=quarantined (§9, test F).
+func TestEmit_QuarantineBlock_DivertsToTerminator(t *testing.T) {
+	tn := validTenant() // QuarantineMode = BLOCK
+	tn.QuarantineActive = true
+	cfg := Emit(validMap(tn), testCatalog())
+
+	if got := cfg.HTTP.Services["gtrm-svc-acme"].LoadBalancer.Servers[0].URL; got != "http://quarantine-terminator:8080" {
+		t.Fatalf("BLOCK quarantine must divert to the terminator, got %s", got)
+	}
+	hdrs := cfg.HTTP.Middlewares["gtrm-ctx-acme"].Headers.CustomRequestHeaders
+	if hdrs["X-Zoiko-GTRM-State"] != "quarantined" {
+		t.Fatalf("expected state=quarantined, got %s", hdrs["X-Zoiko-GTRM-State"])
+	}
+	if hdrs["X-Zoiko-Resolved-Region"] != "" {
+		t.Fatalf("quarantined BLOCK request must resolve no region, got %s", hdrs["X-Zoiko-Resolved-Region"])
+	}
+}
+
+// Rollback: quarantine_active=false restores normal routing (§9.3, test K).
+func TestEmit_QuarantineInactive_NormalRoute(t *testing.T) {
+	cfg := Emit(validMap(validTenant()), testCatalog())
+	if got := cfg.HTTP.Services["gtrm-svc-acme"].LoadBalancer.Servers[0].URL; got != "http://eu-pool:8080" {
+		t.Fatalf("not quarantined -> normal eu-pool route, got %s", got)
+	}
+	if got := cfg.HTTP.Middlewares["gtrm-ctx-acme"].Headers.CustomRequestHeaders["X-Zoiko-GTRM-State"]; got != "normal" {
+		t.Fatalf("expected state=normal, got %s", got)
 	}
 }
 
@@ -81,7 +127,7 @@ func TestEmit_CatchAllSafeRoute_Always(t *testing.T) {
 	if r.Priority >= primaryPriority {
 		t.Fatal("catch-all priority must be below tenant-route priority")
 	}
-	if cfg.HTTP.Services[safeService].LoadBalancer.Servers[0].URL != "http://quarantine-terminator:80" {
+	if cfg.HTTP.Services[safeService].LoadBalancer.Servers[0].URL != "http://quarantine-terminator:8080" {
 		t.Fatal("safe route must target the residency-neutral terminator")
 	}
 }

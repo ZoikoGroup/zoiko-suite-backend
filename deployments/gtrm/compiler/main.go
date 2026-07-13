@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -18,6 +19,7 @@ func main() {
 	outPath := flag.String("out", "", "output path for compiled Traefik config (stdout if empty)")
 	commit := flag.String("commit", "unknown", "commit SHA to stamp into provenance")
 	requireProdSafe := flag.Bool("require-prod-safe", false, "reject generation from a non-prod map")
+	check := flag.Bool("check", false, "drift check: compile and compare against --out; exit 1 on drift")
 	flag.Parse()
 
 	cat, err := loadRegions(*regionsPath)
@@ -46,6 +48,28 @@ func main() {
 		fatal("marshal traefik config: %v", err)
 	}
 
+	// Drift detection (§4.3, test I): compare freshly-compiled config against
+	// the committed artefact at --out, ignoring the provenance header (its
+	// timestamp/commit always differ). Drift means the map changed without a
+	// recompile, or the compiled artefact was hand-edited — either way, block.
+	if *check {
+		if *outPath == "" {
+			fatal("--check requires --out (the artefact to compare against)")
+		}
+		existing, err := os.ReadFile(*outPath)
+		if err != nil {
+			fatal("drift check: read %s: %v", *outPath, err)
+		}
+		if configBody(string(existing)) != string(body) {
+			fmt.Fprintf(os.Stderr, "GTRM DRIFT DETECTED — %s does not match the compiled routing map.\n", *outPath)
+			fmt.Fprintln(os.Stderr, "  The map changed without a recompile, or the artefact was hand-edited.")
+			fmt.Fprintln(os.Stderr, "  Regenerate with the compiler and commit the result.")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "GTRM drift check OK — %s matches the routing map.\n", *outPath)
+		return
+	}
+
 	header := provenanceHeader(m, *commit, time.Now().UTC())
 	out := append([]byte(header), body...)
 
@@ -57,6 +81,22 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "GTRM compile OK — map_version=%d, %d tenant(s), %d router(s)\n",
 		m.MapVersion, len(m.Tenants), len(cfg.HTTP.Routers))
+}
+
+// configBody strips the leading provenance comment block (comment/blank lines)
+// so drift comparison ignores the always-changing timestamp/commit header.
+func configBody(s string) string {
+	lines := strings.Split(s, "\n")
+	i := 0
+	for i < len(lines) {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "#") {
+			i++
+			continue
+		}
+		break
+	}
+	return strings.Join(lines[i:], "\n")
 }
 
 func loadRegions(path string) (RegionCatalog, error) {
