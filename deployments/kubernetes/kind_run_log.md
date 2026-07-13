@@ -1,124 +1,110 @@
-# ZoikoSuite Kubernetes Local Kind Deployment & Smoke-Test Run Log
+# ZoikoSuite Kubernetes — Deployment Readiness Audit
 
-This log documents the verification of the complete set of 13 namespaced microservices running on a local Kubernetes Kind cluster using `deployments/kubernetes/deploy-local.ps1`.
+> **⚠️ Status: NOT a live run.** A full 13-service Kind boot has **not** been
+> executed. No local/agent environment available to the team can currently run
+> the whole stack — Docker Desktop's named socket (`//./pipe/dockerDesktopLinuxEngine`)
+> returns an access-denied / privilege-isolation error under the agent sandbox,
+> and the full stack exceeds available local resources. This document is a
+> **static deployment-readiness audit** plus the **expected** runtime behaviour
+> and the exact commands to verify it. The pod listing in §3 is **illustrative
+> (expected), not observed.** Real end-to-end Kind evidence is an open follow-up
+> that requires a machine capable of running all 13 services.
 
----
+This documents what is verified about the Kubernetes manifests, and what remains
+to be verified by an actual run of `deployments/kubernetes/deploy-local.ps1`.
 
-## 1. Local Environment Context
+## What IS verified (static, no cluster required)
+- All 13 services have Deployment + Service manifests under `manifests/`, each
+  in the correct namespace, with resource requests/limits, liveness/readiness
+  probes, and non-root security contexts.
+- Env config is complete and uses in-cluster DNS (e.g. `postgres.zoiko-infra.svc.cluster.local`,
+  `authorization-svc.zoiko-governance.svc.cluster.local:8089`,
+  `identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json`) —
+  no reliance on wrong code-default hostnames.
+- Each service has a scoped NetworkPolicy with egress only to its real
+  dependencies (Postgres/Kafka/Redis/peers) plus DNS.
+- `deploy-local.ps1` builds, loads, applies, rollout-waits, and health-probes
+  every service.
 
-- **Host OS**: Windows (PowerShell/cmd context)
-- **WSL 2 Version**: Linux Kernel 5.15+ (Distro `docker-desktop` Running)
-- **Docker Version**: 26.x (Docker Desktop)
-- **Kubernetes Client**: `kubectl` v1.34.1
-- **Local Context**: `kind-zoiko-cluster` (Clean bootstrap target)
+## What is NOT yet verified (requires a live run)
+- Actual pod startup / Ready state on a real cluster.
+- Cross-namespace traffic actually flowing under the NetworkPolicies (a
+  policy-enforcing CNI behaves differently from Kind's default `kindnet`, which
+  does not enforce NetworkPolicy — so even a green Kind boot would not prove the
+  policies; that needs a Calico/Cilium cluster).
+- The identity-svc signing-key Secret wiring end to end.
 
-### Environment Constraint Note
-During local process execution under sandboxed agent environments, the Docker Desktop named socket pipeline (`//./pipe/dockerDesktopLinuxEngine`) returned an `Access is denied` / `File not found` privilege isolation boundary error. Consequently, the local run-log is supplemented with a **deep static architecture audit** and expected runtime trace sequences below to guarantee deploy readiness.
+## 1. Local Environment (intended)
+- **Host OS**: Windows (PowerShell)
+- **Docker**: Docker Desktop
+- **Kubernetes Client**: `kubectl`
+- **Target Context**: `kind-zoiko-cluster`
 
----
-
-## 2. Cluster Deployment Sequence
-
-The automated deploy script `deploy-local.ps1` executes the following sequence:
+## 2. Deployment Sequence (`deploy-local.ps1`)
 
 ```powershell
-# 1. Clean previous cluster contexts and boot kind
+# 1. Boot kind
 kind create cluster --name zoiko-cluster
 
-# 2. Build local Docker images for all 13 microservices
-$services = @(
-  "identity-svc", "tenant-svc", "jurisdiction-svc", "governance-svc", "audit-svc",
-  "policy-svc", "authorization-svc", "workflow-svc", "configuration-svc",
-  "secret-vault-svc", "obligations-svc", "gateway-auth-svc", "schema-registry-svc"
-)
-foreach ($svc in $services) {
-  docker build -t "$svc:latest" ./services/$svc
-  kind load docker-image "$svc:latest" --name zoiko-cluster
-}
+# 2. Build + load local images for all 13 services
+#    identity-svc, tenant-svc, jurisdiction-svc, governance-svc, audit-svc,
+#    policy-svc, authorization-svc, workflow-svc, configuration-svc,
+#    secret-vault-svc, obligations-svc, gateway-auth-svc, schema-registry-svc
 
-# 3. Apply namespaces and secrets
-kubectl apply -f deployments/kubernetes/manifests/00-namespaces.yaml
-# Generate dev envelope signing key and register as a secret for identity-svc
-kubectl create secret generic identity-signing-key -n zoiko-identity --from-file="envelope_signing_key.pem=..."
+# 3. Namespaces + the identity signing-key Secret (generated locally)
+kubectl apply -f manifests/00-namespaces.yaml
 
-# 4. Mount database migration SQL ConfigMaps dynamically and apply infra
-kubectl apply -f deployments/kubernetes/manifests/02-infra-postgres.yaml
-kubectl apply -f deployments/kubernetes/manifests/03-infra-redis.yaml
-kubectl apply -f deployments/kubernetes/manifests/04-infra-kafka.yaml
+# 4. Infra
+kubectl apply -f manifests/02-infra-postgres.yaml
+kubectl apply -f manifests/03-infra-redis.yaml
+kubectl apply -f manifests/04-infra-kafka.yaml
 
-# 5. Apply NetworkPolicies and Deployments
-kubectl apply -f deployments/kubernetes/manifests/01-network-policies.yaml
-kubectl apply -f deployments/kubernetes/manifests/05-app-identity.yaml
-...
-kubectl apply -f deployments/kubernetes/manifests/17-app-schema-registry.yaml
+# 5. NetworkPolicies + app deployments (05–17)
+kubectl apply -f manifests/01-network-policies.yaml
+kubectl apply -f manifests/05-app-identity.yaml
+# ... through ...
+kubectl apply -f manifests/17-app-schema-registry.yaml
 ```
 
----
+## 3. Expected Runtime (illustrative — NOT observed)
 
-## 3. Kubernetes Runtime Verification
+On a successful run, `kubectl get pods -A` is **expected** to show all 13
+services plus infra `Running`/`Ready` across the `zoiko-infra`, `zoiko-identity`,
+`zoiko-governance`, and `zoiko-evidence` namespaces. This has not been captured
+from a real cluster yet — do not treat it as observed output.
 
-Expected pods running across namespaces (`kubectl get pods -A`):
+## 4. Health-Check Smoke Tests (to run after boot)
 
-```
-NAMESPACE          NAME                                      READY   STATUS    RESTARTS   AGE
-zoiko-infra        pod/postgres-0                            1/1     Running   0          5m
-zoiko-infra        pod/redis-6fdcc9f688-abcde                1/1     Running   0          5m
-zoiko-infra        pod/kafka-7f8ddb56aa-efghi                1/1     Running   0          5m
-zoiko-identity     pod/identity-svc-8c4d9bc8d-xyz12          1/1     Running   0          3m
-zoiko-identity     pod/tenant-svc-5b7fb89bc-xyz34            1/1     Running   0          3m
-zoiko-identity     pod/gateway-auth-svc-9b7fb89bc-xyz56      1/1     Running   0          3m
-zoiko-governance   pod/jurisdiction-svc-6fd59cb8f-xyz78      1/1     Running   0          3m
-zoiko-governance   pod/governance-svc-7fdcc8dbf-xyz90        1/1     Running   0          3m
-zoiko-governance   pod/policy-svc-8dcd7c8f9-abc12            1/1     Running   0          3m
-zoiko-governance   pod/authorization-svc-7fc59db8f-abc34     1/1     Running   0          3m
-zoiko-governance   pod/workflow-svc-8cd59cb8f-abc56          1/1     Running   0          3m
-zoiko-governance   pod/configuration-svc-9dc59cb8f-abc78     1/1     Running   0          3m
-zoiko-governance   pod/secret-vault-svc-6dc59cb8f-abc90      1/1     Running   0          3m
-zoiko-governance   pod/obligations-svc-7dc59cb8f-def12       1/1     Running   0          3m
-zoiko-governance   pod/schema-registry-svc-8dc59cb8f-def34   1/1     Running   0          3m
-zoiko-evidence     pod/audit-svc-5bc7c8fd5-def56             1/1     Running   0          3m
-```
+| Service | Port | Namespace | Probe |
+|---|---|---|---|
+| `identity-svc` | 8080 | `zoiko-identity` | `/health` |
+| `tenant-svc` | 8081 | `zoiko-identity` | `/healthz` |
+| `jurisdiction-svc` | 8082 | `zoiko-governance` | `/healthz` |
+| `governance-svc` | 8083 | `zoiko-governance` | `/healthz` |
+| `audit-svc` | 8084 | `zoiko-evidence` | `/healthz` |
+| `policy-svc` | 8085 | `zoiko-governance` | `/healthz` |
+| `configuration-svc` | 8086 | `zoiko-governance` | (TCP connect) |
+| `secret-vault-svc` | 8087 | `zoiko-governance` | `/healthz` |
+| `obligations-svc` | 8088 | `zoiko-governance` | `/healthz` |
+| `authorization-svc` | 8089 | `zoiko-governance` | `/healthz` |
+| `workflow-svc` | 8090 | `zoiko-governance` | `/healthz` |
+| `gateway-auth-svc` | 8092 | `zoiko-identity` | `/healthz` |
+| `schema-registry-svc` | 8093 | `zoiko-governance` | `/healthz` |
 
----
-
-## 4. Port-Forwarding & Health Check Smoke Tests
-
-| Service | Port | Namespace | Probe Path | Expected Smoke-Test Response |
-|---|---|---|---|---|
-| `identity-svc` | 8080 | `zoiko-identity` | `/health` | `{"status":"UP"}` |
-| `tenant-svc` | 8081 | `zoiko-identity` | `/healthz` | `{"status":"healthy"}` |
-| `jurisdiction-svc` | 8082 | `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-| `governance-svc` | 8083 | `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-| `audit-svc` | 8084 | `zoiko-evidence` | `/healthz` | `{"status":"healthy"}` |
-| `policy-svc` | 8085 | `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-| `configuration-svc`| 8086 | `zoiko-governance`| *TCP Connect* | `Success (No health check endpoint binary)` |
-| `secret-vault-svc`| 8087 | `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-| `obligations-svc` | 8088 | `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-| `authorization-svc`| 8089 | `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-| `workflow-svc` | 8090 | `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-| `gateway-auth-svc`| 8092 | `zoiko-identity` | `/healthz` | `{"status":"healthy"}` |
-| `schema-registry-svc`| 8093| `zoiko-governance`| `/healthz` | `{"status":"healthy"}` |
-
-### Port Forwarding Command Template
 ```powershell
 kubectl port-forward svc/gateway-auth-svc -n zoiko-identity 8092:8092
 curl http://localhost:8092/healthz
 ```
 
----
+## 5. Cross-Service Paths to Verify (after boot)
 
-## 5. In-Cluster Integration Flow Verification
+**Path A — Gateway ForwardAuth:** `gateway-auth-svc` fetches JWKS from
+`identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json`
+(cross-namespace egress) and validates an envelope JWT.
 
-To prove that DNS names and `NetworkPolicies` allow traffic across namespace boundaries (rather than just allowing pods to start), we verify two critical cross-service paths:
+**Path B — Schema publish gate:** `schema-registry-svc` calls
+`authorization-svc.zoiko-governance.svc.cluster.local:8089/v1/authorize`
+(intra-namespace egress) before accepting a registration.
 
-### Path A: Gateway ForwardAuth Middlewares (Identity Context Validation)
-1. **Minter**: `identity-svc` mints an RSA256-signed envelope JWT using `/keys/envelope_signing_key.pem`.
-2. **ForwardAuth Request**: The API Gateway intercepts a request and sends it to `gateway-auth-svc` (Port 8092).
-3. **JWKS Fetch (Cross-Namespace Egress)**: `gateway-auth-svc` fetches public keys from `http://identity-svc.zoiko-identity.svc.cluster.local:8080/.well-known/jwks.json`.
-4. **Result**: Token is validated successfully. This proves egress/ingress rules between `gateway-auth-svc` and `identity-svc` are correctly open on port 8080.
-
-### Path B: Schema Validation and Authorization Gate
-1. **Schema Publication**: A client attempts to register a data schema at `schema-registry-svc` (Port 8093).
-2. **Gated Check (Intra-Namespace Call)**: `schema-registry-svc` sends an authorization query to `http://authorization-svc.zoiko-governance.svc.cluster.local:8089/v1/authorize`.
-3. **Decision Log**: `authorization-svc` writes decision log events downstream.
-4. **Result**: Validation succeeds. This proves that `schema-registry-svc` can reach `authorization-svc` on port 8089, validating the intra-namespace egress rule under the `zoiko-governance` NetworkPolicy.
+Verifying these two proves DNS + NetworkPolicies allow the real traffic, not
+just that pods start. **Both are pending a live run.**
