@@ -1,0 +1,8 @@
+# Generated Traefik config — produced by the compiler, not hand-authored.
+# Chunk G2 wires generation into the deploy flow; the committed artifact for
+# drift-checking is introduced there. Until then, don't track local output.
+compiled-traefik.yml
+
+# Built compiler binaries
+compiler/gtrm-compiler
+compiler/gtrm-compiler.exe
