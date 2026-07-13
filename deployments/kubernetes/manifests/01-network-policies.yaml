@@ -406,7 +406,7 @@ spec:
     - protocol: TCP
       port: 8085
   egress:
-  # Allow egress to Postgres in zoiko-infra
+  # Allow egress to Postgres and Kafka in zoiko-infra
   - to:
     - namespaceSelector:
         matchLabels:
@@ -414,6 +414,8 @@ spec:
     ports:
     - protocol: TCP
       port: 5432
+    - protocol: TCP
+      port: 9092
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
