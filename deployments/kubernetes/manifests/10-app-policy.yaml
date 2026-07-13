@@ -65,6 +65,14 @@ spec:
           value: "postgres"
         - name: DB_SSLMODE
           value: "disable"
+        - name: KAFKA_BROKERS
+          value: "kafka.zoiko-infra.svc.cluster.local:9092"
+        - name: KAFKA_GROUP_ID
+          value: "policy-svc"
+        - name: KAFKA_EVENTS_TOPIC
+          value: "zoiko.policy.events"
+        - name: GOVERNANCE_DECISION_LOG_SERVICE_URL
+          value: "http://governance-svc.zoiko-governance.svc.cluster.local:8083"
         livenessProbe:
           httpGet:
             path: /healthz
