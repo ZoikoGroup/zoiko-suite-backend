@@ -78,6 +78,13 @@ type Tenant struct {
 	AllowedRegions        []string `yaml:"allowed_regions"`
 	PrimaryRegion         string   `yaml:"primary_region"`
 	FallbackRegion        *string  `yaml:"fallback_region"`
+	// FailoverActive is the manual failover switch (§8.3/§8.4). Normally
+	// false → route to primary_region. An operator sets it true during a
+	// primary-region outage (a reviewed routing-map change) → route to
+	// fallback_region. It is STICKY: when the primary recovers, traffic stays
+	// on the fallback until an operator sets this back to false — there is no
+	// automatic flap-back. Requires an approved fallback_region to be true.
+	FailoverActive bool `yaml:"failover_active"`
 	QuarantineMode        string   `yaml:"quarantine_mode"`
 	QuarantinePool        *string  `yaml:"quarantine_pool"`
 	RoutingStatus         string   `yaml:"routing_status"`
@@ -94,4 +101,13 @@ func (t Tenant) allows(region string) bool {
 		}
 	}
 	return false
+}
+
+// activeRegion is the region traffic is currently routed to: the fallback when
+// an operator has manually activated failover, otherwise the primary.
+func (t Tenant) activeRegion() string {
+	if t.FailoverActive && t.FallbackRegion != nil {
+		return *t.FallbackRegion
+	}
+	return t.PrimaryRegion
 }

@@ -201,6 +201,28 @@ func TestValidate_ActiveTenant_MissingResidency_Rejected(t *testing.T) {
 	}
 }
 
+// ── Manual failover switch (test D enforcement) ───────────────────────────────
+
+func TestValidate_FailoverActiveWithoutFallback_Rejected(t *testing.T) {
+	tn := validTenant() // no fallback_region
+	tn.FailoverActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if !hasErrContaining(errs, "failover_active is true but no approved fallback_region") {
+		t.Fatalf("expected failover-without-fallback violation, got: %v", errs)
+	}
+}
+
+func TestValidate_FailoverActiveWithFallback_Valid(t *testing.T) {
+	tn := validTenant()
+	tn.AllowedRegions = []string{"eu", "uk"}
+	tn.FallbackRegion = ptr("uk")
+	tn.FailoverActive = true
+	errs := Validate(validMap(tn), testCatalog(), false)
+	if len(errs) != 0 {
+		t.Fatalf("failover active with an approved fallback should be valid, got: %v", errs)
+	}
+}
+
 // ── Environment validation ────────────────────────────────────────────────────
 
 func TestValidate_ProdSafeFromDevMap_Rejected(t *testing.T) {

@@ -36,6 +36,9 @@ tenants:
     allowed_regions: [eu, uk]
     primary_region: eu
     fallback_region: uk            # approved fallback within allowed_regions
+    failover_active: false         # manual switch: operator sets true during an
+                                   # EU outage -> routes to uk; STICKY (stays on
+                                   # uk after EU recovers until set back to false)
     quarantine_mode: BLOCK
     quarantine_pool: null
     routing_status: ACTIVE

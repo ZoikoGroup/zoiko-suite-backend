@@ -59,11 +59,28 @@ go run . --map ../routing-map.yaml --regions ../regions.yaml --require-prod-safe
 A bad map exits non-zero and prints every violation, producing **no** config
 (acceptance test H).
 
+## Manual failover & failback (chunk G3)
+
+Per the approved decision, **failback must be manual and sticky** (§8.4) — no
+automatic flap-back when a primary recovers. Traefik OSS's built-in failover
+service auto-fails-back, so instead failover/failback are modelled as **compiled
+routing-map changes**, which are inherently sticky:
+
+- Normal: `failover_active: false` → tenant routes to `primary_region`.
+- **Failover** (operator action during a primary-region outage): set
+  `failover_active: true` in the routing map, recompile, deploy → routes to
+  `fallback_region`. The compiler rejects `failover_active: true` for any tenant
+  with no approved `fallback_region`, so a non-compliant fallback is impossible.
+- **Failback** (operator action, reviewed): set `failover_active: false`,
+  recompile, deploy → routes back to `primary_region`. Because nothing else ever
+  changes the flag, traffic **stays** on the fallback until this happens — sticky.
+
+The trade-off (accepted for Phase 1): failover is operator-initiated, not
+health-triggered. §8.3 allows this ("health checks *may* trigger failover" —
+optional); it is the only way to guarantee sticky failback with Traefik OSS and
+no dedicated routing service (which §15 prohibits for Phase 1).
+
 ## Not yet built (later chunks)
 
-- **G2** — wire the compiled config into the Traefik gateway; simulated
-  `eu-pool` / `us-pool` / `quarantine-terminator`; edge host allow-listing.
-- **G3** — backend region assertion in each pool; approved-fallback failover
-  and manual sticky failback demos.
 - **G4** — manual BLOCK quarantine via GitOps two-person flow; drift detection;
   route-decision logs; the full A–P acceptance suite + evidence pack.

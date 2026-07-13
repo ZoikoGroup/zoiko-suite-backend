@@ -5,8 +5,8 @@
 #
 #   map_version:      47
 #   compiler_version: 0.1.0
-#   commit:           4d63c3d
-#   generated_at:     2026-07-13T08:50:04Z
+#   commit:           effbe8c
+#   generated_at:     2026-07-13T09:17:45Z
 # ─────────────────────────────────────────────────────────────────────────────
 http:
     routers:
@@ -36,20 +36,6 @@ http:
                 - gtrm-ctx-globex
             priority: 100
     services:
-        gtrm-fallback-atlas:
-            loadBalancer:
-                servers:
-                    - url: http://uk-pool:8080
-                healthCheck:
-                    path: /healthz
-                    interval: 10s
-        gtrm-primary-atlas:
-            loadBalancer:
-                servers:
-                    - url: http://eu-pool:8080
-                healthCheck:
-                    path: /healthz
-                    interval: 10s
         gtrm-safe-endpoint:
             loadBalancer:
                 servers:
@@ -59,10 +45,9 @@ http:
                 servers:
                     - url: http://eu-pool:8080
         gtrm-svc-atlas:
-            failover:
-                service: gtrm-primary-atlas
-                fallback: gtrm-fallback-atlas
-                healthCheck: {}
+            loadBalancer:
+                servers:
+                    - url: http://eu-pool:8080
         gtrm-svc-globex:
             loadBalancer:
                 servers:

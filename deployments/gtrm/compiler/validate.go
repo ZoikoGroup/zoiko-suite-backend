@@ -139,6 +139,14 @@ func Validate(m RoutingMap, cat RegionCatalog, requireProdSafe bool) []string {
 			}
 		}
 
+		// Manual failover switch (§8.3/§8.4): can only be activated when an
+		// approved in-boundary fallback exists. This is what makes a
+		// non-compliant fallback impossible (acceptance test D): a tenant with
+		// no fallback_region simply cannot be failed over anywhere.
+		if t.FailoverActive && t.FallbackRegion == nil {
+			errs = append(errs, fmt.Sprintf("%s: failover_active is true but no approved fallback_region exists", id))
+		}
+
 		// Quarantine validation (§4.2).
 		switch t.QuarantineMode {
 		case QuarantineNone, QuarantineBlock:

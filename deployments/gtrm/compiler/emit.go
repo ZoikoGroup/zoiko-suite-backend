@@ -26,38 +26,16 @@ type traefikRouter struct {
 }
 
 type traefikService struct {
-	LoadBalancer *traefikLB       `yaml:"loadBalancer,omitempty"`
-	Failover     *traefikFailover `yaml:"failover,omitempty"`
+	LoadBalancer *traefikLB `yaml:"loadBalancer,omitempty"`
 }
 
 type traefikLB struct {
-	Servers     []traefikServer `yaml:"servers"`
-	HealthCheck *traefikHealth  `yaml:"healthCheck,omitempty"`
+	Servers []traefikServer `yaml:"servers"`
 }
 
 type traefikServer struct {
 	URL string `yaml:"url"`
 }
-
-type traefikHealth struct {
-	Path     string `yaml:"path"`
-	Interval string `yaml:"interval"`
-}
-
-// traefikFailover models Traefik v3's failover service: route to Service while
-// healthy, else to Fallback. Emitted ONLY when an approved fallback exists.
-//
-// Traefik's failover.healthCheck is an EMPTY object — it only toggles health
-// checking on the failover service; the actual probe (path/interval) lives on
-// the primary load-balancer service's healthCheck, not here.
-type traefikFailover struct {
-	Service     string       `yaml:"service"`
-	Fallback    string       `yaml:"fallback"`
-	HealthCheck *emptyStruct `yaml:"healthCheck,omitempty"`
-}
-
-// emptyStruct marshals to `{}` — used for Traefik's toggle-only healthCheck.
-type emptyStruct struct{}
 
 type traefikMiddleware struct {
 	Headers *traefikHeaders `yaml:"headers,omitempty"`
@@ -87,10 +65,8 @@ const (
 	safeRouter        = "gtrm-catchall-safe"
 	safeService       = "gtrm-safe-endpoint"
 	safeBackend       = "quarantine-terminator" // residency-neutral, no tenant data (§8.1)
-	primaryPriority   = 100
-	catchAllPriority  = 1 // lowest, so explicit tenant routes always win (§Appendix D)
-	healthCheckPath   = "/healthz"
-	healthCheckPeriod = "10s"
+	primaryPriority  = 100
+	catchAllPriority = 1 // lowest, so explicit tenant routes always win (§Appendix D)
 )
 
 // Emit compiles a validated routing map + region catalog into Traefik dynamic
@@ -127,12 +103,21 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 		svcName := "gtrm-svc-" + slug
 		ctxMW := "gtrm-ctx-" + slug
 
+		// The region traffic is currently routed to: primary normally, or the
+		// approved fallback when an operator has manually activated failover
+		// (§8.3/§8.4). Failover and failback are compiled routing-map changes,
+		// which makes failback inherently STICKY — there is no Traefik auto
+		// flap-back when the primary recovers.
+		active := t.activeRegion()
+
 		// Per-tenant context middleware: set trusted internal headers AFTER
-		// the strip middleware has removed any client-supplied copies.
+		// the strip middleware has removed any client-supplied copies. The
+		// resolved region is the ACTIVE region, so backend region assertion in
+		// the target pool matches.
 		cfg.HTTP.Middlewares[ctxMW] = traefikMiddleware{Headers: &traefikHeaders{
 			CustomRequestHeaders: map[string]string{
 				"X-Zoiko-Resolved-Tenant":  slug,
-				"X-Zoiko-Resolved-Region":  t.PrimaryRegion,
+				"X-Zoiko-Resolved-Region":  active,
 				"X-Zoiko-GTRM-Map-Version": strconv.Itoa(m.MapVersion),
 			},
 		}}
@@ -144,35 +129,12 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 			Priority:    primaryPriority,
 		}
 
-		primaryURL := poolURL(cat.pool(t.PrimaryRegion))
-
-		if t.FallbackRegion == nil {
-			// No approved fallback → single load balancer, no failover service
-			// (§4.2 fallback validation: restraint enforced by absence).
-			cfg.HTTP.Services[svcName] = traefikService{
-				LoadBalancer: &traefikLB{Servers: []traefikServer{{URL: primaryURL}}},
-			}
-		} else {
-			// Approved fallback → Traefik failover service with a health check
-			// on the primary; fallback stays within allowed_regions (validated).
-			primarySvc := "gtrm-primary-" + slug
-			fallbackSvc := "gtrm-fallback-" + slug
-			cfg.HTTP.Services[svcName] = traefikService{Failover: &traefikFailover{
-				Service:     primarySvc,
-				Fallback:    fallbackSvc,
-				HealthCheck: &emptyStruct{},
-			}}
-			cfg.HTTP.Services[primarySvc] = traefikService{LoadBalancer: &traefikLB{
-				Servers:     []traefikServer{{URL: primaryURL}},
-				HealthCheck: &traefikHealth{Path: healthCheckPath, Interval: healthCheckPeriod},
-			}}
-			// The fallback also needs a health check: Traefik requires health
-			// checks on BOTH members of a failover service to register the
-			// fallback as an updater.
-			cfg.HTTP.Services[fallbackSvc] = traefikService{LoadBalancer: &traefikLB{
-				Servers:     []traefikServer{{URL: poolURL(cat.pool(*t.FallbackRegion))}},
-				HealthCheck: &traefikHealth{Path: healthCheckPath, Interval: healthCheckPeriod},
-			}}
+		// Single load balancer to the active region's pool. A tenant with no
+		// approved fallback can never be failed over (validation rejects
+		// failover_active without a fallback), so when its single pool is down
+		// it simply fails — it never spills to a non-compliant region (test D).
+		cfg.HTTP.Services[svcName] = traefikService{
+			LoadBalancer: &traefikLB{Servers: []traefikServer{{URL: poolURL(cat.pool(active))}}},
 		}
 	}
 
