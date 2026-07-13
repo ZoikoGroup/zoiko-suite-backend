@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: governance-svc
+  namespace: zoiko-governance
+  labels:
+    app: governance-svc
+spec:
+  ports:
+  - port: 8083
+    targetPort: 8083
+    name: http
+  selector:
+    app: governance-svc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: governance-svc
+  namespace: zoiko-governance
+  labels:
+    app: governance-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: governance-svc
+  template:
+    metadata:
+      labels:
+        app: governance-svc
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+      - name: governance-svc
+        image: governance-svc:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8083
+          name: http
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+          seccompProfile:
+            type: RuntimeDefault
+        env:
+        - name: PORT
+          value: "8083"
+        - name: DB_HOST
+          value: "postgres.zoiko-infra.svc.cluster.local"
+        - name: DB_PORT
+          value: "5432"
+        - name: DB_NAME
+          value: "governance_decision_log"
+        - name: DB_USER
+          value: "postgres"
+        - name: DB_PASSWORD
+          value: "postgres"
+        - name: DB_SSLMODE
+          value: "disable"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8083
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8083
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
