@@ -76,6 +76,14 @@ spec:
           mountPath: /migrations/authorization
         - name: workflow-migrations
           mountPath: /migrations/workflow
+        - name: configuration-migrations
+          mountPath: /migrations/configuration-feature-flag
+        - name: secret-vault-migrations
+          mountPath: /migrations/secret-vault-integration
+        - name: obligations-migrations
+          mountPath: /migrations/obligations
+        - name: schema-registry-migrations
+          mountPath: /migrations/schema-registry
         livenessProbe:
           exec:
             command: ["pg_isready", "-U", "postgres", "-d", "postgres"]
@@ -122,6 +130,18 @@ spec:
       - name: workflow-migrations
         configMap:
           name: workflow-migrations
+      - name: configuration-migrations
+        configMap:
+          name: configuration-migrations
+      - name: secret-vault-migrations
+        configMap:
+          name: secret-vault-migrations
+      - name: obligations-migrations
+        configMap:
+          name: obligations-migrations
+      - name: schema-registry-migrations
+        configMap:
+          name: schema-registry-migrations
   volumeClaimTemplates:
   - metadata:
       name: postgres-data

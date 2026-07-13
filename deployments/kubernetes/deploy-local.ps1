@@ -68,7 +68,7 @@ kubectl config use-context kind-zoiko-cluster | Out-Null
 Write-Host "Active Kubernetes Context: $(kubectl config current-context)" -ForegroundColor Green
 
 # ── 4. Build Application Docker Images ────────────────────────────────────────
-Write-Host "Building Docker images for 8 services..." -ForegroundColor Cyan
+Write-Host "Building Docker images for 13 services..." -ForegroundColor Cyan
 
 $services = @{
     "identity-svc"         = "services/identity-context-svc"
@@ -79,6 +79,11 @@ $services = @{
     "policy-svc"           = "services/policy-svc"
     "authorization-svc"    = "services/authorization-svc"
     "workflow-svc"         = "services/workflow-svc"
+    "configuration-svc"    = "services/configuration-feature-flag-svc"
+    "secret-vault-svc"     = "services/secret-vault-integration-svc"
+    "obligations-svc"      = "services/obligations-svc"
+    "gateway-auth-svc"     = "services/gateway-auth-svc"
+    "schema-registry-svc" = "services/schema-registry-svc"
 }
 
 foreach ($svcName in $services.Keys) {
@@ -121,14 +126,18 @@ Write-Host "Generating Migration ConfigMaps for PostgreSQL..." -ForegroundColor 
 kubectl create configmap postgres-init-script -n zoiko-infra --from-file=init-db.sh=deployments/init-db.sh --dry-run=client -o yaml | kubectl apply -f -
 
 $migrationConfigs = @{
-    "audit-migrations"        = "services/audit-event-store-svc/deployments/migrations"
-    "identity-migrations"     = "services/identity-context-svc/deployments/migrations"
-    "tenant-migrations"       = "services/tenant-entity-registry-svc/deployments/migrations"
-    "jurisdiction-migrations" = "services/jurisdiction-rules-svc/deployments/migrations"
-    "governance-migrations"   = "services/governance-decision-log-svc/deployments/migrations"
-    "policy-migrations"       = "services/policy-svc/deployments/migrations"
-    "authorization-migrations"= "services/authorization-svc/deployments/migrations"
-    "workflow-migrations"     = "services/workflow-svc/deployments/migrations"
+    "audit-migrations"           = "services/audit-event-store-svc/deployments/migrations"
+    "identity-migrations"        = "services/identity-context-svc/deployments/migrations"
+    "tenant-migrations"          = "services/tenant-entity-registry-svc/deployments/migrations"
+    "jurisdiction-migrations"    = "services/jurisdiction-rules-svc/deployments/migrations"
+    "governance-migrations"      = "services/governance-decision-log-svc/deployments/migrations"
+    "policy-migrations"          = "services/policy-svc/deployments/migrations"
+    "authorization-migrations"   = "services/authorization-svc/deployments/migrations"
+    "workflow-migrations"        = "services/workflow-svc/deployments/migrations"
+    "configuration-migrations"   = "services/configuration-feature-flag-svc/deployments/migrations"
+    "secret-vault-migrations"    = "services/secret-vault-integration-svc/deployments/migrations"
+    "obligations-migrations"     = "services/obligations-svc/deployments/migrations"
+    "schema-registry-migrations" = "services/schema-registry-svc/deployments/migrations"
 }
 
 foreach ($cmName in $migrationConfigs.Keys) {
@@ -164,6 +173,11 @@ kubectl apply -f deployments/kubernetes/manifests/09-app-audit.yaml
 kubectl apply -f deployments/kubernetes/manifests/10-app-policy.yaml
 kubectl apply -f deployments/kubernetes/manifests/11-app-authorization.yaml
 kubectl apply -f deployments/kubernetes/manifests/12-app-workflow.yaml
+kubectl apply -f deployments/kubernetes/manifests/13-app-configuration.yaml
+kubectl apply -f deployments/kubernetes/manifests/14-app-secret-vault.yaml
+kubectl apply -f deployments/kubernetes/manifests/15-app-obligations.yaml
+kubectl apply -f deployments/kubernetes/manifests/16-app-gateway-auth.yaml
+kubectl apply -f deployments/kubernetes/manifests/17-app-schema-registry.yaml
 
 # Wait for application services to spin up
 Write-Host "Waiting for application pods to roll out..." -ForegroundColor Yellow
@@ -175,20 +189,30 @@ kubectl rollout status deployment/audit-svc -n zoiko-evidence --timeout=120s
 kubectl rollout status deployment/policy-svc -n zoiko-governance --timeout=120s
 kubectl rollout status deployment/authorization-svc -n zoiko-governance --timeout=120s
 kubectl rollout status deployment/workflow-svc -n zoiko-governance --timeout=120s
+kubectl rollout status deployment/configuration-svc -n zoiko-governance --timeout=120s
+kubectl rollout status deployment/secret-vault-svc -n zoiko-governance --timeout=120s
+kubectl rollout status deployment/obligations-svc -n zoiko-governance --timeout=120s
+kubectl rollout status deployment/gateway-auth-svc -n zoiko-identity --timeout=120s
+kubectl rollout status deployment/schema-registry-svc -n zoiko-governance --timeout=120s
 Write-Host "All deployments rolled out successfully." -ForegroundColor Green
 
 # ── 9. Verify Deployments ─────────────────────────────────────────────────────
 Write-Host "`n=== Running Service Health Verification ===" -ForegroundColor Cyan
 
 $testPorts = @{
-    "identity-svc"      = @{ "port" = "8080"; "ns" = "zoiko-identity";   "path" = "health" }
-    "tenant-svc"        = @{ "port" = "8081"; "ns" = "zoiko-identity";   "path" = "healthz" }
-    "jurisdiction-svc"  = @{ "port" = "8082"; "ns" = "zoiko-governance"; "path" = "healthz" }
-    "governance-svc"    = @{ "port" = "8083"; "ns" = "zoiko-governance"; "path" = "healthz" }
-    "audit-svc"         = @{ "port" = "8084"; "ns" = "zoiko-evidence";   "path" = "healthz" }
-    "policy-svc"        = @{ "port" = "8085"; "ns" = "zoiko-governance"; "path" = "healthz" }
-    "authorization-svc" = @{ "port" = "8089"; "ns" = "zoiko-governance"; "path" = "healthz" }
-    "workflow-svc"      = @{ "port" = "8090"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "identity-svc"        = @{ "port" = "8080"; "ns" = "zoiko-identity";   "path" = "health" }
+    "tenant-svc"          = @{ "port" = "8081"; "ns" = "zoiko-identity";   "path" = "healthz" }
+    "jurisdiction-svc"    = @{ "port" = "8082"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "governance-svc"      = @{ "port" = "8083"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "audit-svc"           = @{ "port" = "8084"; "ns" = "zoiko-evidence";   "path" = "healthz" }
+    "policy-svc"          = @{ "port" = "8085"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "authorization-svc"   = @{ "port" = "8089"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "workflow-svc"        = @{ "port" = "8090"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    # configuration-svc has no /healthz binary; tcpSocket only — skip HTTP probe here
+    "secret-vault-svc"    = @{ "port" = "8087"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "obligations-svc"     = @{ "port" = "8088"; "ns" = "zoiko-governance"; "path" = "healthz" }
+    "gateway-auth-svc"    = @{ "port" = "8092"; "ns" = "zoiko-identity";   "path" = "healthz" }
+    "schema-registry-svc" = @{ "port" = "8093"; "ns" = "zoiko-governance"; "path" = "healthz" }
 }
 
 $pfProcesses = @()
