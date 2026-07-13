@@ -416,6 +416,14 @@ spec:
       port: 5432
     - protocol: TCP
       port: 9092
+  # Allow egress to governance-svc in same namespace for decision log evidence
+  - to:
+    - podSelector:
+        matchLabels:
+          app: governance-svc
+    ports:
+    - protocol: TCP
+      port: 8083
   # Allow CoreDNS access
   - to:
     - namespaceSelector: {}
