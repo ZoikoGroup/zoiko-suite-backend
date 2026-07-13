@@ -43,7 +43,13 @@ metadata:
 2. Installed **Terraform CLI** (v1.5.0+).
 3. Installed **kubectl**.
 
-### Deployment Flow
+### 1. Configure Remote State Backend (Collaborative Dev)
+Before executing Terraform commands with multiple team members:
+1. Create an S3 Bucket (e.g., `zoiko-terraform-state`) and a DynamoDB table for locking (e.g., `zoiko-terraform-locks` with Partition Key `LockID`).
+2. Uncomment the `backend "s3"` block in `providers.tf` and supply your actual resource names.
+3. Run `terraform init`.
+
+### 2. Provisioning the Cluster
 1. Initialize Terraform:
    ```bash
    terraform init
@@ -61,7 +67,41 @@ metadata:
    # Use the command from Terraform outputs
    aws eks update-kubeconfig --region us-east-1 --name zoiko-eks-cluster
    ```
-5. Deploy application manifests:
+
+---
+
+## Bridging Kind Local Manifests to Production (EKS)
+
+The base manifests under `../manifests/` are pre-configured with dev defaults suitable for local verification via `kind` (e.g. `:latest` tags, local database coordinates, and test-key secrets). 
+
+To deploy these workloads onto a live **AWS EKS** cluster, apply the following steps:
+
+### 1. Build, Tag & Push to AWS ECR
+EKS cannot pull local Docker images or `:latest` tags from a local registry.
+1. Authenticate Docker to AWS ECR:
    ```bash
-   kubectl apply -f ../manifests/
+   aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com
    ```
+2. Create repositories for each microservice and push version-tagged images:
+   ```bash
+   # Example for identity-svc
+   docker tag identity-svc:latest <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/identity-svc:v1.0.0
+   docker push <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/identity-svc:v1.0.0
+   ```
+3. Update the deployment manifests to reference the ECR image URI and version tag (e.g. `<aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/identity-svc:v1.0.0`) instead of `identity-svc:latest`.
+
+### 2. Environment Differentiation & Secret Management
+> [!WARNING]
+> Never deploy hardcoded credentials (such as `DB_PASSWORD: postgres`) or plaintext JWT signing secrets directly to production AWS EKS.
+
+* **Kustomize / Helm**: Define environment overlays (`base/`, `overlays/development/`, `overlays/production/`) or Helm values configuration to inject environment-specific configuration maps, database hosts, replica counts, and ingress routing rules dynamically.
+* **Secret Vault Integration Service**:
+  * For production, integrate with AWS Secrets Manager or HashiCorp Vault.
+  * We recommend deploying the **External Secrets Operator (ESO)** in the EKS cluster. ESO fetches key material securely from AWS Secrets Manager and synchronizes them directly as Kubernetes Secrets (like `identity-signing-key`), keeping secret management completely separated from raw YAML repository commits.
+
+### 3. Deploying Manifests
+Once overlays or templated values are generated:
+```bash
+# E.g. using Kustomize overlays:
+kubectl apply -k ../manifests/overlays/production/
+```

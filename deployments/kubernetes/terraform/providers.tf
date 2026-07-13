@@ -1,5 +1,15 @@
 terraform {
   required_version = ">= 1.5.0"
+
+  # Uncomment and configure the backend for remote state storage & locks
+  # backend "s3" {
+  #   bucket         = "zoiko-terraform-state"
+  #   key            = "eks/base-platform/terraform.tfstate"
+  #   region         = "us-east-1"
+  #   dynamodb_table = "zoiko-terraform-locks"
+  #   encrypt        = true
+  # }
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
