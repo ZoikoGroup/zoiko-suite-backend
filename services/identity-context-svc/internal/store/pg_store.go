@@ -19,6 +19,7 @@ import (
 	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
 
+	"zoiko.io/identity-context-svc/internal/classification"
 	"zoiko.io/identity-context-svc/internal/domain"
 )
 
@@ -84,6 +85,15 @@ func (s *PgStore) scanOnePrincipal(row pgx.Row) (*domain.Principal, error) {
 	)
 	if err != nil {
 		return nil, err
+	}
+	if p.DataClassification != "" {
+		if !classification.Classification(p.DataClassification).Valid() {
+			s.log.Warn("loaded principal with invalid data classification",
+				zap.String("principal_id", p.PrincipalID),
+				zap.String("classification", p.DataClassification),
+			)
+			p.DataClassification = string(classification.Restricted)
+		}
 	}
 	return &p, nil
 }

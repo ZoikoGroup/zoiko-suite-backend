@@ -1,6 +1,6 @@
 # Data Classification Audit & Applied Baseline Map
 
-Per the mandate of **docs/architecture/04-data-model.md §20**, this document establishes the taxonomy, audit results, and enforcement design patterns for the ZoikoSuite data classification model.
+Per the mandate of **docs/architecture/04-data-model.md §20**, this document establishes the taxonomy, audit results, and enforcement design patterns for the ZoikoSuite data classification model across all platform services.
 
 ---
 
@@ -17,51 +17,113 @@ Every data entity in ZoikoSuite is bound to one of the following classification 
 
 ---
 
-## 2. Platform Audit: RESTRICTED Columns & Fields (§20.2)
+## 2. Platform-wide Service Audit (§20.2)
 
-An audit of all 13 services' schemas identifies the following tables and fields carrying **RESTRICTED** classification:
+An audit of all platform services (both currently implemented and planned) maps every domain to its data classification profiles:
 
 ### 2.1 Identity Plane (`identity-context-svc`)
-- **`principals` table**:
-  - `email` (PII - email address)
-  - `display_name` (PII - name)
-  - `identity_provider_subject` (PII - authentication identifier)
-- **`delegated_authorities` table**:
-  - `authority_limit_value` (can contain sensitive financial thresholds or privilege ranges)
+- **Tiers represented**: RESTRICTED, INTERNAL.
+- **RESTRICTED fields**:
+  - `principals.email` (PII - email address)
+  - `principals.display_name` (PII - name)
+  - `principals.identity_provider_subject` (PII - authentication identifier)
+- **INTERNAL fields**:
+  - `principals.principal_id`, `principals.tenant_id`, `principals.principal_type`
 
 ### 2.2 Tenant & Entity Plane (`tenant-entity-registry-svc`)
-- **`tax_identity_bundles` table**:
-  - Entire table represents the link to tax identifiers (RESTRICTED).
-- **`legal_entities` table**:
-  - `registration_number` (corporate tax identifier / legal registration)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL, INTERNAL.
+- **RESTRICTED fields**:
+  - `tax_identity_bundles` table: Holds structural links to regulatory tax registrations (RESTRICTED metadata).
+- **CONFIDENTIAL fields**:
+  - `data_residency_policies` table: Data residency boundaries and compliance policy codes.
+  - `legal_entities.registration_number` (corporate tax identifier / legal registration)
+- **INTERNAL fields**:
+  - `tenants`, `legal_entities` general metadata, and `entity_hierarchies` structure.
 
-### 2.3 Evidence Plane (`audit-event-store-svc`)
-- **`audit_events` table**:
-  - `payload` JSONB: Downstream consumer of event payloads which may carry RESTRICTED fields (e.g., individual payroll figures, banking detail updates, user PII).
+### 2.3 Security Plane (`secret-vault-integration-svc`)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL.
+- **RESTRICTED fields**:
+  - `secret_policies.secret_path` (contains credential/token paths referencing master secrets)
+  - `secret_leases.secret_path` (path of the leased credentials)
+  - `secret_access_audit_log.secret_path` (path metadata of brokered secrets)
+- **CONFIDENTIAL fields**:
+  - `secret_policy_versions.allowed_workload_ids` (identity/workload permission mappings)
 
-### 2.4 Security Plane (`secret-vault-integration-svc`)
-- **`secret_policies` table**:
-  - `secret_path` (contains credential/token paths referencing master secrets)
-- **`secret_leases` table**:
-  - `secret_path` (path of the leased credentials)
-- **`secret_access_audit_log` table**:
-  - `secret_path` (path metadata of brokered secrets)
+### 2.4 Evidence Plane (`audit-event-store-svc`)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL, INTERNAL.
+- **RESTRICTED fields**:
+  - `audit_events.payload` JSONB: Downstream consumer of event payloads which may carry RESTRICTED fields (e.g. principal context, individual compensation updates, database credential rotations).
 
 ### 2.5 Governance Plane (`authorization-svc`)
-- **`principal_role_assignments` table**:
-  - `principal_id` + `role_id` (privilege-sensitive relationship mapping)
-- **`delegated_authorities` table**:
-  - `delegator_principal_id` + `delegate_principal_id` + limits (privilege delegation)
-- **`access_decision_log` table**:
-  - `decision_outcome` + `decision_basis` (security evaluation details)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL.
+- **RESTRICTED fields**:
+  - `principal_role_assignments` table: principal_id + role_id mappings (privilege-sensitive metadata).
+  - `delegated_authorities` table: delegator/delegate relations and limits.
+  - `access_decision_log` table: details of access grants/denials and basis.
+- **CONFIDENTIAL fields**:
+  - `permission_bundles` table: action-type lists and bundles.
 
 ### 2.6 Work Management Plane (`workflow-svc`)
-- **`workflow_stages` table**:
-  - `approver_principal_id` + `rationale` (potential sensitive payroll/spend comments or actor identifiers)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL.
+- **RESTRICTED fields**:
+  - `workflow_stages.approver_principal_id` + `workflow_stages.rationale` (potential sensitive PII or approval comments on payroll/spend).
+- **CONFIDENTIAL fields**:
+  - `workflow_instances` and `workflow_transitions` (tracking state transitions of corporate approvals).
 
 ### 2.7 Configuration Plane (`configuration-feature-flag-svc`)
-- **`config_entries` table**:
-  - `value` JSONB (could carry secrets-adjacent configs, credential endpoints, or tokens)
+- **Tiers represented**: RESTRICTED, INTERNAL.
+- **RESTRICTED fields**:
+  - `config_entries.value` JSONB (could carry credentials or token references if not stored in Vault).
+- **INTERNAL fields**:
+  - `feature_flags` and environment settings.
+
+### 2.8 Governance Decision Log Service (`governance-decision-log-svc`)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL.
+- **RESTRICTED fields**:
+  - `governance_decisions.actor_id` (principal identifier mapping to physical actor).
+  - `governance_decisions.evaluation_context` JSONB (can contain transaction values or payroll figures).
+- **CONFIDENTIAL fields**:
+  - `governance_decisions.rule_basis` and metadata.
+
+### 2.9 Obligations Service (`obligations-svc`)
+- **Tiers represented**: CONFIDENTIAL, INTERNAL.
+- **CONFIDENTIAL fields**:
+  - `obligations.source_reference` (details referencing corporate contracts or specific regulatory filing rules).
+  - `filing_requirements` table (filing status, authority, and submission channels).
+
+### 2.10 Policy Service (`policy-svc`)
+- **Tiers represented**: CONFIDENTIAL, INTERNAL.
+- **CONFIDENTIAL fields**:
+  - `policy_versions.rule_payload` (contains company-wide spend thresholds and signing matrices).
+
+### 2.11 Jurisdiction Rules Service (`jurisdiction-rules-svc`)
+- **Tiers represented**: PUBLIC, INTERNAL.
+- **PUBLIC fields**:
+  - `jurisdictions` (names, region codes, country codes).
+- **INTERNAL fields**:
+  - `jurisdiction_rules` (rule domain settings and legislative metadata).
+
+### 2.12 Schema Registry Service (`schema-registry-svc`)
+- **Tiers represented**: INTERNAL.
+- **INTERNAL fields**:
+  - `event_schemas` (event schemas are structural definitions of payload contracts).
+
+### 2.13 API Gateway ForwardAuth Service (`gateway-auth-svc`)
+- **Tiers represented**: Stateless / RESTRICTED.
+- **RESTRICTED fields**:
+  - Exposes no DB, but parses and transiently caches JWT envelopes containing principal IDs, roles, and session trust postures.
+
+### 2.14 Document Vault Service (`document-vault-svc` — Planned)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL, PUBLIC.
+- **RESTRICTED fields**:
+  - Document payloads containing tax returns, UBO identity verification, payroll summaries, or individual contracts.
+- **CONFIDENTIAL fields**:
+  - Corporate board resolutions, draft policies, internal workflow documents.
+
+### 2.15 Evidence Manifest Service (`evidence-manifest-svc` — Planned)
+- **Tiers represented**: RESTRICTED, CONFIDENTIAL.
+- **RESTRICTED fields**:
+  - Contains cryptographic hash links and actor/principal details pointing to specific regulatory actions.
 
 ---
 

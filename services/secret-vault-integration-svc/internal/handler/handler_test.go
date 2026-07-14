@@ -217,6 +217,20 @@ func TestCreateSecretPolicy_Conflict(t *testing.T) {
 	}
 }
 
+func TestCreateSecretPolicy_InvalidDataClassification(t *testing.T) {
+	r := defaultRouter(&stubStore{})
+	body := `{"secret_class":"DATABASE_CREDENTIAL","secret_path":"kv/db","created_by_principal_id":"admin-1","data_classification":"INVALID_CLASSIFICATION"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "invalid_classification") {
+		t.Fatalf("expected invalid_classification error message, got %s", w.Body.String())
+	}
+}
+
 // ── CreateSecretPolicyVersion ────────────────────────────────────────────────
 
 func TestCreateSecretPolicyVersion_Created(t *testing.T) {
