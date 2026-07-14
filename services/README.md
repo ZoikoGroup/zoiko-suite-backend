@@ -17,6 +17,7 @@ Go microservices monorepo — one `go.mod` per service, no shared build tool.
 | `workflow-svc` | 8090 | Multi-stage approval orchestration (`/v1/workflows`) — extends authorization-svc, doesn't replace it: every approval action is checked via `POST /v1/authorize` before it's applied |
 | `gateway-auth-svc` | 8092 | API Gateway ForwardAuth target — verifies every gated request's signed identity envelope against identity-context-svc's JWKS (`/verify`) before Traefik forwards it to a backend; stateless, no DB |
 | `schema-registry-svc` | 8093 | Centralized, version-controlled event payload schemas (`/v1/schemas`) — enforces backward-compatible evolution (breaking changes `409`); schema registration is gated through authorization-svc (`SCHEMA_PUBLISH`), fail-closed |
+| `document-vault-svc` | 8094 | Phase 2 — versioned document storage with SHA-256 integrity (verified on every read), append-only access lineage, retention, and jurisdiction-aware residency checks against tenant-entity-registry-svc's GTRM resolution (`/v1/documents`); local encrypted-at-rest backend for v1 |
 | `evidence-manifest-svc` | 8095 | Phase 2 — assembles structured evidence sets from governance-decision-log-svc, authorization-svc, and workflow-svc (`/v1/evidence-manifests`) for audit/regulator/legal-discovery scenarios; fails closed (whole manifest, never partial) if any source is unreachable |
 
 ## Unified Local Platform Development Stack
