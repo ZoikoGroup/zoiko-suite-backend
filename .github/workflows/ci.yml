@@ -47,6 +47,8 @@ jobs:
           - schema-registry-svc
           - document-vault-svc
           - evidence-manifest-svc
+          - search-client
+          - search-indexer-svc
 
     steps:
       - name: Checkout
