@@ -27,6 +27,7 @@ services:
       - ../services/secret-vault-integration-svc/deployments/migrations:/migrations/secret-vault-integration:ro
       - ../services/obligations-svc/deployments/migrations:/migrations/obligations:ro
       - ../services/schema-registry-svc/deployments/migrations:/migrations/schema-registry:ro
+      - ../services/document-vault-svc/deployments/migrations:/migrations/document-vault:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -746,6 +747,66 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # ── One-shot: chown the document-vault storage volume ───────────────────────
+  # Docker creates named volumes root-owned. document-vault-svc's distroless
+  # image runs as nonroot (uid 65532) and needs write access to encrypt
+  # blobs into it — same class of permission gap identity-svc hit with its
+  # signing-key volume, fixed the same way: a one-shot init container chowns
+  # it before the real service starts.
+  document-vault-storage-init:
+    image: alpine:3.19
+    container_name: document-vault-storage-init
+    volumes:
+      - document_vault_storage:/data/documents
+    entrypoint: ["/bin/sh", "-c", "chown -R 65532:65532 /data/documents"]
+    restart: "no"
+
+  # ── Phase 2: Document Vault Service (Port: 8094) ─────────────────────────────
+  # Stores critical documents with version lineage, access lineage, integrity
+  # controls (SHA-256, verified on every read), retention, and jurisdiction-
+  # aware residency (docs/architecture/01-backend.md §8.3). Local encrypted-
+  # at-rest file backend for v1 — same "real encryption now, real object
+  # storage later" posture as secret-vault-integration-svc's local vault
+  # backend; document_vault_storage is where the encrypted blobs live.
+  document-vault-svc:
+    build:
+      context: ../services/document-vault-svc
+      dockerfile: Dockerfile
+    container_name: document-vault-svc
+    ports:
+      - "8094:8094"
+    environment:
+      PORT: "8094"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: document_vault
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      STORAGE_DIR: "/data/documents"
+      # Throwaway local-dev key — never used in staging/production, same
+      # posture as identity-svc's envelope signing key and secret-vault's
+      # VAULT_MASTER_KEY_HEX.
+      DOCUMENT_VAULT_MASTER_KEY_HEX: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+      TENANT_REGISTRY_URL: "http://tenant-svc:8081"
+    volumes:
+      - document_vault_storage:/data/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      tenant-svc:
+        condition: service_healthy
+      document-vault-storage-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8094/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
 volumes:
   postgres_data:
   identity_jwt_keys:
+  document_vault_storage:
