@@ -1,0 +1,12 @@
+# .dockerignore for document-vault-svc
+**/*_test.go
+**/testdata/
+.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db
+deployments/
+docs/
+.git/
+.gitignore
+data/

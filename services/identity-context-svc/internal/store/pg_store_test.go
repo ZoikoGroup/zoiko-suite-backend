@@ -30,15 +30,18 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, filename, _, _ := runtime.Caller(0)
-	migPath := filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000001_initial_schema.up.sql")
-	migSQL, err := os.ReadFile(migPath)
-	if err != nil {
-		t.Fatalf("failed to read migration file %s: %v", migPath, err)
-	}
+	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS access_decision_log, delegated_authorities, principal_role_assignments, principals CASCADE;`)
-	if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
-		t.Fatalf("failed to execute migration: %v", err)
+
+	for _, mFile := range []string{"000001_initial_schema.up.sql", "000002_add_data_classification.up.sql"} {
+		migSQL, err := os.ReadFile(filepath.Join(migDir, mFile))
+		if err != nil {
+			t.Fatalf("failed to read migration file %s: %v", mFile, err)
+		}
+		if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
+			t.Fatalf("failed to execute migration %s: %v", mFile, err)
+		}
 	}
 
 	return pool
@@ -69,6 +72,9 @@ func TestPgStore_FindByIDPSubject_Integration(t *testing.T) {
 	}
 	if got == nil || got.PrincipalID != "p-active" {
 		t.Fatalf("expected active principal, got %+v", got)
+	}
+	if got.DataClassification != "RESTRICTED" {
+		t.Fatalf("expected DataClassification to be RESTRICTED, got %q", got.DataClassification)
 	}
 
 	// DISABLED principals are excluded per the query's status filter.

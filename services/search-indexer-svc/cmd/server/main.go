@@ -106,7 +106,7 @@ type config struct {
 
 func loadConfig() (config, error) {
 	c := config{
-		port:                envOr("PORT", "8094"),
+		port:                envOr("PORT", "8096"),
 		obligationsSvcURL:   envOr("OBLIGATIONS_SVC_URL", "http://obligations-svc:8088"),
 		tenantSvcURL:        envOr("TENANT_SVC_URL", "http://tenant-svc:8081"),
 		opensearchAddresses: envOr("OPENSEARCH_ADDRESSES", "http://opensearch:9200"),

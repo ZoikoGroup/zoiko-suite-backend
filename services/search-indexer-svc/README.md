@@ -20,7 +20,7 @@ or its database.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `PORT` | `8094` | HTTP port |
+| `PORT` | `8096` | HTTP port |
 | `OBLIGATIONS_SVC_URL` | `http://obligations-svc:8088` | Base URL of obligations-svc |
 | `TENANT_SVC_URL` | `http://tenant-svc:8081` | Base URL of tenant-entity-registry-svc |
 | `OPENSEARCH_ADDRESSES` | `http://opensearch:9200` | Comma-separated list of OS nodes |

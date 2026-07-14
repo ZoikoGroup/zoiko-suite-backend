@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/secret-vault-integration-svc/internal/classification"
 	"zoiko.io/secret-vault-integration-svc/internal/domain"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
 )
@@ -111,6 +112,7 @@ type createSecretPolicyRequest struct {
 	SecretClass          string `json:"secret_class"`
 	SecretPath           string `json:"secret_path"`
 	CreatedByPrincipalID string `json:"created_by_principal_id"`
+	DataClassification   string `json:"data_classification,omitempty"`
 }
 
 func (req createSecretPolicyRequest) missingField() string {
@@ -141,11 +143,19 @@ func (h *Handler) CreateSecretPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.DataClassification != "" {
+		if !classification.Classification(req.DataClassification).Valid() {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_classification", "message": "data_classification must be PUBLIC, INTERNAL, CONFIDENTIAL, or RESTRICTED"})
+			return
+		}
+	}
+
 	p, created, err := h.store.CreateSecretPolicy(r.Context(), domain.CreateSecretPolicyParams{
 		SecretPolicyID:       req.SecretPolicyID,
 		SecretClass:          req.SecretClass,
 		SecretPath:           req.SecretPath,
 		CreatedByPrincipalID: req.CreatedByPrincipalID,
+		DataClassification:   req.DataClassification,
 	})
 	if err != nil {
 		switch {

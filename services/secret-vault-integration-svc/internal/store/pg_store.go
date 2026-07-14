@@ -93,11 +93,12 @@ const secretPolicyColumns = `
 	secret_class,
 	secret_path,
 	created_at,
-	created_by_principal_id`
+	created_by_principal_id,
+	data_classification`
 
 func scanSecretPolicy(row pgx.Row) (*domain.SecretPolicy, error) {
 	p := &domain.SecretPolicy{}
-	err := row.Scan(&p.SecretPolicyID, &p.SecretClass, &p.SecretPath, &p.CreatedAt, &p.CreatedByPrincipalID)
+	err := row.Scan(&p.SecretPolicyID, &p.SecretClass, &p.SecretPath, &p.CreatedAt, &p.CreatedByPrincipalID, &p.DataClassification)
 	return p, err
 }
 
@@ -138,14 +139,19 @@ func (s *PgStore) findSecretPolicyByPath(ctx context.Context, secretPath string)
 // column would fail, not silently succeed, so this is deliberately never
 // referenced in the INSERT below.
 func (s *PgStore) CreateSecretPolicy(ctx context.Context, params domain.CreateSecretPolicyParams) (*domain.SecretPolicy, bool, error) {
+	classificationStr := params.DataClassification
+	if classificationStr == "" {
+		classificationStr = "RESTRICTED"
+	}
+
 	const query = `
-		INSERT INTO secret_policies (secret_class, secret_path, created_by_principal_id)
-		VALUES ($1, $2, $3)
+		INSERT INTO secret_policies (secret_class, secret_path, created_by_principal_id, data_classification)
+		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (secret_path)
 		DO NOTHING
 		RETURNING ` + secretPolicyColumns + `;`
 
-	p, err := scanSecretPolicy(s.pool.QueryRow(ctx, query, params.SecretClass, params.SecretPath, params.CreatedByPrincipalID))
+	p, err := scanSecretPolicy(s.pool.QueryRow(ctx, query, params.SecretClass, params.SecretPath, params.CreatedByPrincipalID, classificationStr))
 	if err == nil {
 		return p, true, nil
 	}

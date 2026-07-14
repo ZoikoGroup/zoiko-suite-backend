@@ -39,6 +39,7 @@ type SecretPolicy struct {
 
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	DataClassification   string    `json:"data_classification"`
 }
 
 // SecretPolicyVersion is an effective-dated, state-machined access-rule
@@ -155,6 +156,7 @@ type CreateSecretPolicyParams struct {
 	SecretClass          string
 	SecretPath           string
 	CreatedByPrincipalID string
+	DataClassification   string
 }
 
 // CreateSecretPolicyVersionParams holds input parameters for creating a

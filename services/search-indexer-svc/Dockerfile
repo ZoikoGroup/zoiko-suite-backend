@@ -33,6 +33,6 @@ COPY --from=builder /out/healthcheck /healthcheck
 
 USER nonroot:nonroot
 
-EXPOSE 8094
+EXPOSE 8096
 
 ENTRYPOINT ["/server"]
