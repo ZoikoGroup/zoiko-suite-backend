@@ -149,3 +149,22 @@ func TestSearch_EmptyTenantIDIsRejected(t *testing.T) {
 		"expected ErrTenantIDRequired, got: %v", err,
 	)
 }
+
+// TestIndex_EmptyTenantIDIsRejected verifies that Index returns
+// ErrTenantIDRequired before making any network call when TenantID is empty.
+func TestIndex_EmptyTenantIDIsRejected(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(t)
+
+	err := c.Index(ctx, searchclient.IndexObligations, searchclient.Document{
+		ID:            "some-id",
+		TenantID:      "", // deliberately empty
+		LegalEntityID: "some-le-id",
+		Body:          map[string]any{"foo": "bar"},
+	})
+	require.Error(t, err)
+	assert.True(t,
+		errors.Is(err, searchclient.ErrTenantIDRequired),
+		"expected ErrTenantIDRequired, got: %v", err,
+	)
+}

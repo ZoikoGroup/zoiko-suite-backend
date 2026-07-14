@@ -6,10 +6,30 @@ package health
 import (
 	"encoding/json"
 	"net/http"
+	"sync"
 )
 
 type statusResponse struct {
 	Status string `json:"status"`
+}
+
+var (
+	readyMu sync.RWMutex
+	ready   = false // Start false until first successful sync cycle completes
+)
+
+// SetReady updates the readiness status of the service.
+func SetReady(isReady bool) {
+	readyMu.Lock()
+	defer readyMu.Unlock()
+	ready = isReady
+}
+
+// IsReady returns the current readiness status.
+func IsReady() bool {
+	readyMu.RLock()
+	defer readyMu.RUnlock()
+	return ready
 }
 
 // HandleHealthz responds 200 {"status":"healthy"}.
@@ -20,10 +40,15 @@ func HandleHealthz(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(statusResponse{Status: "healthy"})
 }
 
-// HandleReadyz responds 200 {"status":"ready"}.
-// Can be extended to gate on OpenSearch connectivity before marking ready.
+// HandleReadyz responds 200 {"status":"ready"} or 503 {"status":"not_ready"}.
+// Reflects whether the background sync loops are successfully running.
 func HandleReadyz(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if !IsReady() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(statusResponse{Status: "not_ready"})
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(statusResponse{Status: "ready"})
 }

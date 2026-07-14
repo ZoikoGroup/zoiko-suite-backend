@@ -801,8 +801,8 @@ services:
   # goroutine — see services/search-indexer-svc/README.md.
   search-indexer-svc:
     build:
-      context: ../services/search-indexer-svc
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: services/search-indexer-svc/Dockerfile
     container_name: search-indexer-svc
     ports:
       - "8094:8094"

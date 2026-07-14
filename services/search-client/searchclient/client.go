@@ -135,7 +135,7 @@ type Client interface {
 
 // client is the concrete implementation of Client.
 type client struct {
-	os *opensearch.Client
+	os *opensearchapi.Client
 }
 
 // New constructs a Client from cfg. Returns an error if the configuration
@@ -151,7 +151,9 @@ func New(cfg Config) (Client, error) {
 		osCfg.Username = cfg.Username
 		osCfg.Password = cfg.Password
 	}
-	c, err := opensearch.NewClient(osCfg)
+	c, err := opensearchapi.NewClient(opensearchapi.Config{
+		Client: osCfg,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("searchclient: failed to create opensearch client: %w", err)
 	}
@@ -194,11 +196,11 @@ func (c *client) EnsureIndex(ctx context.Context, index IndexName) error {
 	if err != nil {
 		return fmt.Errorf("searchclient: EnsureIndex create: %w", err)
 	}
-	defer createResp.Body.Close()
+	defer createResp.Inspect().Response.Body.Close()
 
-	if createResp.IsError() {
-		raw, _ := io.ReadAll(createResp.Body)
-		return fmt.Errorf("searchclient: EnsureIndex create failed [%d]: %s", createResp.StatusCode, raw)
+	if createResp.Inspect().Response.IsError() {
+		raw, _ := io.ReadAll(createResp.Inspect().Response.Body)
+		return fmt.Errorf("searchclient: EnsureIndex create failed [%d]: %s", createResp.Inspect().Response.StatusCode, raw)
 	}
 	return nil
 }
@@ -209,7 +211,7 @@ func (c *client) Index(ctx context.Context, index IndexName, doc Document) error
 		return errors.New("searchclient: Index: doc.ID must not be empty")
 	}
 	if doc.TenantID == "" {
-		return errors.New("searchclient: Index: doc.TenantID must not be empty")
+		return ErrTenantIDRequired
 	}
 	if doc.LegalEntityID == "" {
 		return errors.New("searchclient: Index: doc.LegalEntityID must not be empty")
@@ -239,11 +241,11 @@ func (c *client) Index(ctx context.Context, index IndexName, doc Document) error
 	if err != nil {
 		return fmt.Errorf("searchclient: Index request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Inspect().Response.Body.Close()
 
-	if resp.IsError() {
-		raw, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("searchclient: Index failed [%d]: %s", resp.StatusCode, raw)
+	if resp.Inspect().Response.IsError() {
+		raw, _ := io.ReadAll(resp.Inspect().Response.Body)
+		return fmt.Errorf("searchclient: Index failed [%d]: %s", resp.Inspect().Response.StatusCode, raw)
 	}
 	return nil
 }
@@ -293,11 +295,11 @@ func (c *client) Search(ctx context.Context, index IndexName, q SearchQuery) ([]
 	if err != nil {
 		return nil, fmt.Errorf("searchclient: Search request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer resp.Inspect().Response.Body.Close()
 
-	if resp.IsError() {
-		raw, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("searchclient: Search failed [%d]: %s", resp.StatusCode, raw)
+	if resp.Inspect().Response.IsError() {
+		raw, _ := io.ReadAll(resp.Inspect().Response.Body)
+		return nil, fmt.Errorf("searchclient: Search failed [%d]: %s", resp.Inspect().Response.StatusCode, raw)
 	}
 
 	var result struct {
@@ -309,7 +311,7 @@ func (c *client) Search(ctx context.Context, index IndexName, q SearchQuery) ([]
 			} `json:"hits"`
 		} `json:"hits"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.NewDecoder(resp.Inspect().Response.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("searchclient: Search decode response: %w", err)
 	}
 

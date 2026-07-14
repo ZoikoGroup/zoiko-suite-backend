@@ -3,13 +3,13 @@
 # ── Stage 1: build ───────────────────────────────────────────────────────────
 FROM golang:1.22-alpine AS builder
 
-WORKDIR /build
+WORKDIR /workspace
 
-# Copy search-client (local replace directive in go.mod)
-COPY ../search-client /search-client
+# Copy search-client and search-indexer-svc keeping directory structure
+COPY services/search-client ./services/search-client
+COPY services/search-indexer-svc ./services/search-indexer-svc
 
-# Copy this service's source
-COPY . .
+WORKDIR /workspace/services/search-indexer-svc
 
 RUN go mod download
 
@@ -19,7 +19,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /out/server \
     ./cmd/server
 
-# Build the healthcheck helper (same pattern as obligations-svc)
+# Build the healthcheck helper
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w" \
     -o /out/healthcheck \

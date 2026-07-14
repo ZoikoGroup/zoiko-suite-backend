@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/search-client/searchclient"
+	"zoiko.io/search-indexer-svc/internal/health"
 )
 
 // Metrics exposed by the syncer.
@@ -125,15 +126,24 @@ func (s *ObligationsSyncer) Start(ctx context.Context) {
 }
 
 func (s *ObligationsSyncer) runCycle(ctx context.Context) {
+	if err := s.cfg.SearchClient.EnsureIndex(ctx, searchclient.IndexObligations); err != nil {
+		s.cfg.Log.Error("obligations sync: failed to ensure index", zap.Error(err))
+		health.SetReady(false)
+		syncErrorsTotal.Inc()
+		return
+	}
+
 	obligations, err := s.fetchObligations(ctx)
 	if err != nil {
 		s.cfg.Log.Error("obligations sync: fetch failed", zap.Error(err))
+		health.SetReady(false)
 		syncErrorsTotal.Inc()
 		return
 	}
 
 	s.cfg.Log.Info("obligations sync: fetched records", zap.Int("count", len(obligations)))
 
+	cycleFailed := false
 	for _, ob := range obligations {
 		tenantID, err := s.resolveTenantID(ctx, ob.LegalEntityID)
 		if err != nil {
@@ -170,11 +180,18 @@ func (s *ObligationsSyncer) runCycle(ctx context.Context) {
 				zap.Error(err),
 			)
 			indexedTotal.WithLabelValues("error").Inc()
+			cycleFailed = true
 			continue
 		}
 		indexedTotal.WithLabelValues("ok").Inc()
 	}
 
+	if cycleFailed {
+		health.SetReady(false)
+		return
+	}
+
+	health.SetReady(true)
 	s.cfg.Log.Info("obligations sync: cycle complete", zap.Int("indexed", len(obligations)))
 }
 
