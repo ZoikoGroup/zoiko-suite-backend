@@ -519,6 +519,26 @@ func TestCreateTaxIdentityBundle_Success(t *testing.T) {
 	assert.Equal(t, bundle.TaxIdentityBundleID, stored.TaxIdentityBundleID)
 }
 
+func TestCreateTaxIdentityBundle_InvalidDataClassification_Fails(t *testing.T) {
+	svc, ms := baseSvc(t)
+
+	ms.entities["ent-100"] = &domain.LegalEntity{
+		LegalEntityID: "ent-100",
+		TenantID:      "tenant-001",
+		EntityStatus:  domain.EntityStatusActive,
+	}
+
+	req := domain.CreateTaxIdentityBundleRequest{
+		JurisdictionID:     "JUR-US",
+		EffectiveFrom:      time.Now().UTC(),
+		CorrelationID:      "corr-010",
+		DataClassification: "INVALID_CLASSIFICATION",
+	}
+
+	_, err := svc.CreateTaxIdentityBundle(context.Background(), "jwt", "ent-100", req)
+	assert.ErrorIs(t, err, registry.ErrInvalidInput)
+}
+
 func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, permitAllAuthZ{}, rejectJurisd{})

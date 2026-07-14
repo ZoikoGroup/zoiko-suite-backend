@@ -158,6 +158,7 @@ type TaxIdentityBundle struct {
 	UpdatedAt           time.Time               `json:"updated_at"`
 	CreatedByPrincipalID string                 `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string                 `json:"updated_by_principal_id"`
+	DataClassification   string                  `json:"data_classification"`
 }
 
 // ---------------------------------------------------------------------------
@@ -263,10 +264,11 @@ type ResolvedTenantRegion struct {
 type CreateTaxIdentityBundleRequest struct {
 	// JurisdictionID is validated synchronously against the Jurisdiction Rules
 	// Service before persistence (fail-closed per Q2 resolution).
-	JurisdictionID string     `json:"jurisdiction_id"`
-	EffectiveFrom  time.Time  `json:"effective_from"`
-	EffectiveTo    *time.Time `json:"effective_to,omitempty"`
-	CorrelationID  string     `json:"correlation_id"`
+	JurisdictionID     string     `json:"jurisdiction_id"`
+	EffectiveFrom      time.Time  `json:"effective_from"`
+	EffectiveTo        *time.Time `json:"effective_to,omitempty"`
+	CorrelationID      string     `json:"correlation_id"`
+	DataClassification string     `json:"data_classification,omitempty"`
 }
 
 // TransitionTaxIdentityBundleStatusRequest applies a status transition on a bundle header.

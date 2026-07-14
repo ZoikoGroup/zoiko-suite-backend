@@ -28,14 +28,16 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	migSQL, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration file: %v", err)
-	}
-
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS secret_access_audit_log, secret_leases, secret_policy_versions, secret_policies CASCADE;`)
-	if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
-		t.Fatalf("failed to execute migration: %v", err)
+
+	for _, migFile := range []string{"000001_initial_schema.up.sql", "000002_add_data_classification.up.sql"} {
+		sql, err := os.ReadFile("../../deployments/migrations/" + migFile)
+		if err != nil {
+			t.Fatalf("failed to read migration file %s: %v", migFile, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to execute migration %s: %v", migFile, err)
+		}
 	}
 	return pool
 }

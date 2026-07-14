@@ -23,6 +23,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
+	"zoiko.io/tenant-entity-registry-svc/internal/classification"
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 )
@@ -597,6 +598,12 @@ func (s *Service) CreateTaxIdentityBundle(
 		return nil, err
 	}
 
+	if req.DataClassification != "" {
+		if !classification.Classification(req.DataClassification).Valid() {
+			return nil, fmt.Errorf("%w: invalid data classification %q", ErrInvalidInput, req.DataClassification)
+		}
+	}
+
 	// Validate jurisdiction existence — fail-closed.
 	if err := s.jurisd.ValidateExists(ctx, req.JurisdictionID); err != nil {
 		return nil, s.mapJurisdictionErr(err, req.JurisdictionID)
@@ -612,6 +619,7 @@ func (s *Service) CreateTaxIdentityBundle(
 		EffectiveTo:          req.EffectiveTo,
 		CreatedAt:            time.Now().UTC(),
 		CreatedByPrincipalID: actorFromJWT(envelopeJWT),
+		DataClassification:   req.DataClassification,
 	}
 
 	if err := s.store.CreateTaxIdentityBundle(ctx, b); err != nil {
