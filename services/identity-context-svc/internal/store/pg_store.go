@@ -45,7 +45,7 @@ func (s *PgStore) FindByIDPSubject(ctx context.Context, subject, tenantID string
 
 	const query = `
 		SELECT principal_id, tenant_id, principal_type, identity_provider_subject,
-		       email, display_name, status, created_at
+		       email, display_name, status, created_at, data_classification
 		FROM principals
 		WHERE identity_provider_subject = $1
 		  AND tenant_id = $2
@@ -65,7 +65,7 @@ func (s *PgStore) FindByID(ctx context.Context, principalID string) (*domain.Pri
 
 	const query = `
 		SELECT principal_id, tenant_id, principal_type, identity_provider_subject,
-		       email, display_name, status, created_at
+		       email, display_name, status, created_at, data_classification
 		FROM principals
 		WHERE principal_id = $1
 	`
@@ -80,7 +80,7 @@ func (s *PgStore) scanOnePrincipal(row pgx.Row) (*domain.Principal, error) {
 	var p domain.Principal
 	err := row.Scan(
 		&p.PrincipalID, &p.TenantID, &p.PrincipalType, &p.IdentityProviderSubject,
-		&p.Email, &p.DisplayName, &p.Status, &p.CreatedAt,
+		&p.Email, &p.DisplayName, &p.Status, &p.CreatedAt, &p.DataClassification,
 	)
 	if err != nil {
 		return nil, err

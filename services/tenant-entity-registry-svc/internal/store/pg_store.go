@@ -667,19 +667,26 @@ func (s *PgStore) CreateTaxIdentityBundle(ctx context.Context, b *domain.TaxIden
 	s.log.Debug("store.CreateTaxIdentityBundle", zap.String("bundle_id", b.TaxIdentityBundleID))
 	tid := tenantFromCtxOrFallback(ctx, b.TenantID)
 
+	classificationStr := b.DataClassification
+	if classificationStr == "" {
+		classificationStr = "RESTRICTED"
+	}
+
 	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
 		query := `
 			INSERT INTO tax_identity_bundles (
 				tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
 				effective_from, effective_to,
-				created_at, updated_at, created_by_principal_id, updated_by_principal_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				created_at, updated_at, created_by_principal_id, updated_by_principal_id,
+				data_classification
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		`
 		now := time.Now().UTC()
 		_, err := tx.Exec(ctx, query,
 			b.TaxIdentityBundleID, b.TenantID, b.LegalEntityID, b.JurisdictionID, string(b.Status),
 			b.EffectiveFrom, b.EffectiveTo,
 			b.CreatedAt, now, b.CreatedByPrincipalID, b.CreatedByPrincipalID,
+			classificationStr,
 		)
 		return err
 	})
@@ -694,13 +701,13 @@ func (s *PgStore) GetTaxIdentityBundleByID(ctx context.Context, bundleID string)
 		query := `
 			SELECT tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
 			       effective_from, effective_to, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id
+			       created_by_principal_id, updated_by_principal_id, data_classification
 			FROM tax_identity_bundles WHERE tax_identity_bundle_id = $1
 		`
 		return tx.QueryRow(ctx, query, bundleID).Scan(
 			&b.TaxIdentityBundleID, &b.TenantID, &b.LegalEntityID, &b.JurisdictionID, &b.Status,
 			&b.EffectiveFrom, &b.EffectiveTo, &b.CreatedAt, &b.UpdatedAt,
-			&b.CreatedByPrincipalID, &b.UpdatedByPrincipalID,
+			&b.CreatedByPrincipalID, &b.UpdatedByPrincipalID, &b.DataClassification,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -718,7 +725,7 @@ func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntit
 		query := `
 			SELECT tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
 			       effective_from, effective_to, created_at, updated_at,
-			       created_by_principal_id, updated_by_principal_id
+			       created_by_principal_id, updated_by_principal_id, data_classification
 			FROM tax_identity_bundles WHERE legal_entity_id = $1
 		`
 		rows, err := tx.Query(ctx, query, legalEntityID)
@@ -732,7 +739,7 @@ func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntit
 			if err := rows.Scan(
 				&b.TaxIdentityBundleID, &b.TenantID, &b.LegalEntityID, &b.JurisdictionID, &b.Status,
 				&b.EffectiveFrom, &b.EffectiveTo, &b.CreatedAt, &b.UpdatedAt,
-				&b.CreatedByPrincipalID, &b.UpdatedByPrincipalID,
+				&b.CreatedByPrincipalID, &b.UpdatedByPrincipalID, &b.DataClassification,
 			); err != nil {
 				return err
 			}

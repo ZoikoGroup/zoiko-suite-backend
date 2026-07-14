@@ -19,6 +19,7 @@ type Principal struct {
 	DisplayName              string          `json:"display_name"` // PII
 	Status                   PrincipalStatus `json:"status"`
 	CreatedAt                time.Time       `json:"created_at"`
+	DataClassification       string          `json:"data_classification"`
 }
 
 // ---------------------------------------------------------------------------

@@ -158,6 +158,7 @@ type TaxIdentityBundle struct {
 	UpdatedAt           time.Time               `json:"updated_at"`
 	CreatedByPrincipalID string                 `json:"created_by_principal_id"`
 	UpdatedByPrincipalID string                 `json:"updated_by_principal_id"`
+	DataClassification   string                  `json:"data_classification"`
 }
 
 // ---------------------------------------------------------------------------

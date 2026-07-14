@@ -41,6 +41,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		"000001_initial_schema.up.sql",
 		"000002_add_tenant_id_to_junction_tables.up.sql",
 		"000003_add_residency_region_to_policies.up.sql",
+		"000004_add_data_classification.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", mig))
 		if err != nil {
