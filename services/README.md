@@ -19,6 +19,7 @@ Go microservices monorepo — one `go.mod` per service, no shared build tool.
 | `schema-registry-svc` | 8093 | Centralized, version-controlled event payload schemas (`/v1/schemas`) — enforces backward-compatible evolution (breaking changes `409`); schema registration is gated through authorization-svc (`SCHEMA_PUBLISH`), fail-closed |
 | `document-vault-svc` | 8094 | Phase 2 — versioned document storage with SHA-256 integrity (verified on every read), append-only access lineage, retention, and jurisdiction-aware residency checks against tenant-entity-registry-svc's GTRM resolution (`/v1/documents`); local encrypted-at-rest backend for v1 |
 | `evidence-manifest-svc` | 8095 | Phase 2 — assembles structured evidence sets from governance-decision-log-svc, authorization-svc, and workflow-svc (`/v1/evidence-manifests`) for audit/regulator/legal-discovery scenarios; fails closed (whole manifest, never partial) if any source is unreachable |
+| `general-ledger-svc` | 8098 | Phase 3 — authoritative owner of journalized financial postings (`/v1/journals`); Tri-Phase Commit States (PENDING → VALIDATED → FINALIZED → REVERSED), double-entry balance enforced at validation, no finalized journal ever hard-edited (corrections only via a new reversing journal); every mutating action gated through authorization-svc, real HTTP client from day one; Postgres RLS for tenant isolation |
 
 ## Unified Local Platform Development Stack
 
