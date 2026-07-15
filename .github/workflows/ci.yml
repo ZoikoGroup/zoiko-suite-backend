@@ -43,6 +43,7 @@ jobs:
           - secret-vault-integration-svc
           - authorization-svc
           - workflow-svc
+          - workflow-history-svc
           - gateway-auth-svc
           - schema-registry-svc
           - document-vault-svc
@@ -100,7 +101,7 @@ jobs:
           fi
 
       - name: Integration test — health probes with embedded Postgres
-        if: matrix.service == 'audit-event-store-svc'
+        if: matrix.service == 'audit-event-store-svc' || matrix.service == 'workflow-history-svc'
         working-directory: services/${{ matrix.service }}
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
         # No separate Postgres service container is needed.

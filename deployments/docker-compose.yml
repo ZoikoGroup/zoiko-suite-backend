@@ -29,6 +29,7 @@ services:
       - ../services/schema-registry-svc/deployments/migrations:/migrations/schema-registry:ro
       - ../services/document-vault-svc/deployments/migrations:/migrations/document-vault:ro
       - ../services/evidence-manifest-svc/deployments/migrations:/migrations/evidence-manifest:ro
+      - ../services/workflow-history-svc/deployments/migrations:/migrations/workflow-history:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -935,6 +936,42 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    restart: on-failure
+
+  # ── Phase 2: Workflow History Service (Port: 8097) ───────────────────────────
+  # Durably consumes workflow events from zoiko.workflow.events and serves history.
+  workflow-history-svc:
+    build:
+      context: ../services/workflow-history-svc
+      dockerfile: Dockerfile
+    container_name: workflow-history-svc
+    ports:
+      - "8097:8097"
+    environment:
+      PORT: "8097"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: workflow_history
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "workflow-history-svc"
+      KAFKA_TOPIC: "zoiko.workflow.events"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      workflow-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8097/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: on-failure
 
 volumes:
