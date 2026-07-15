@@ -82,6 +82,14 @@ func NewService(
 // ProvisionTenant creates a new tenant in ONBOARDING lifecycle state.
 // Idempotent: if the tenant already exists the store returns a duplicate error
 // which the caller surfaces as a conflict.
+//
+// A default DataResidencyPolicy is always generated here, rather than taken
+// from the caller — data_residency_policies.tenant_id has a FK to tenants,
+// so no policy can exist before this tenant does, meaning a client can never
+// legitimately supply a pre-existing policy ID at provisioning time. The
+// policy starts with no ResidencyRegionID and ConflictResolutionFailClosed;
+// an operator assigns a concrete region afterward via the residency-policies
+// API.
 func (s *Service) ProvisionTenant(
 	ctx context.Context,
 	envelopeJWT string,
@@ -92,8 +100,13 @@ func (s *Service) ProvisionTenant(
 		return nil, err
 	}
 
+	tenantID := newID()
+	policyID := newID()
+	now := time.Now().UTC()
+	actor := actorFromJWT(envelopeJWT)
+
 	t := &domain.Tenant{
-		TenantID:                     newID(),
+		TenantID:                     tenantID,
 		TenantCode:                   req.TenantCode,
 		LegalName:                    req.LegalName,
 		TradingName:                  nullableString(req.TradingName),
@@ -101,15 +114,27 @@ func (s *Service) ProvisionTenant(
 		DefaultCurrencyCode:          req.DefaultCurrencyCode,
 		PrimaryTimezone:              req.PrimaryTimezone,
 		PrimaryLocale:                req.PrimaryLocale,
-		DefaultDataResidencyPolicyID: req.DefaultDataResidencyPolicyID,
+		DefaultDataResidencyPolicyID: policyID,
 		LifecycleState:               domain.TenantLifecycleOnboarding,
-		CreatedAt:                    time.Now().UTC(),
-		CreatedByPrincipalID:         actorFromJWT(envelopeJWT),
+		CreatedAt:                    now,
+		CreatedByPrincipalID:         actor,
 	}
 
-	if err := s.store.CreateTenant(ctx, t); err != nil {
+	defaultPolicy := &domain.DataResidencyPolicy{
+		DataResidencyPolicyID:  policyID,
+		TenantID:               tenantID,
+		PolicyName:             req.LegalName + " - Default Residency Policy",
+		PolicyCode:             req.TenantCode + "-DEFAULT",
+		ResidencyMode:          domain.ResidencyModePreferredRegion,
+		ConflictResolutionMode: domain.ConflictResolutionFailClosed,
+		ActiveFlag:             true,
+		CreatedAt:              now,
+		CreatedByPrincipalID:   actor,
+	}
+
+	if err := s.store.CreateTenantWithDefaultResidencyPolicy(ctx, t, defaultPolicy); err != nil {
 		s.log.Error("create tenant failed", zap.Error(err), zap.String("correlation_id", correlationID))
-		return nil, fmt.Errorf("store.CreateTenant: %w", err)
+		return nil, fmt.Errorf("store.CreateTenantWithDefaultResidencyPolicy: %w", err)
 	}
 
 	go s.events.PublishTenantCreated(ctx, t, correlationID)

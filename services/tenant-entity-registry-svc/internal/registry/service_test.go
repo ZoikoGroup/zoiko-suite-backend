@@ -21,23 +21,30 @@ import (
 // ---------------------------------------------------------------------------
 
 type memStore struct {
-	tenants          map[string]*domain.Tenant
-	entities         map[string]*domain.LegalEntity
-	bundles          map[string]*domain.TaxIdentityBundle
-	lastUpdateActor  string // records ActorPrincipalID from the last UpdateEntity call
+	tenants           map[string]*domain.Tenant
+	entities          map[string]*domain.LegalEntity
+	bundles           map[string]*domain.TaxIdentityBundle
+	residencyPolicies map[string]*domain.DataResidencyPolicy
+	lastUpdateActor   string // records ActorPrincipalID from the last UpdateEntity call
 	// Minimal set — add more maps as tests require.
 }
 
 func newMemStore() *memStore {
 	return &memStore{
-		tenants:  make(map[string]*domain.Tenant),
-		entities: make(map[string]*domain.LegalEntity),
-		bundles:  make(map[string]*domain.TaxIdentityBundle),
+		tenants:           make(map[string]*domain.Tenant),
+		entities:          make(map[string]*domain.LegalEntity),
+		bundles:           make(map[string]*domain.TaxIdentityBundle),
+		residencyPolicies: make(map[string]*domain.DataResidencyPolicy),
 	}
 }
 
 func (m *memStore) CreateTenant(_ context.Context, t *domain.Tenant) error {
 	m.tenants[t.TenantID] = t
+	return nil
+}
+func (m *memStore) CreateTenantWithDefaultResidencyPolicy(_ context.Context, t *domain.Tenant, p *domain.DataResidencyPolicy) error {
+	m.tenants[t.TenantID] = t
+	m.residencyPolicies[p.DataResidencyPolicyID] = p
 	return nil
 }
 func (m *memStore) GetTenantByID(_ context.Context, id string) (*domain.Tenant, error) {
@@ -131,11 +138,16 @@ func (m *memStore) ListJurisdictionAssignments(_ context.Context, _ string) ([]*
 func (m *memStore) EndDateJurisdictionAssignment(_ context.Context, _ string, _ time.Time, _, _ string) error {
 	return nil
 }
-func (m *memStore) CreateResidencyPolicy(_ context.Context, _ *domain.DataResidencyPolicy) error {
+func (m *memStore) CreateResidencyPolicy(_ context.Context, p *domain.DataResidencyPolicy) error {
+	m.residencyPolicies[p.DataResidencyPolicyID] = p
 	return nil
 }
-func (m *memStore) GetResidencyPolicyByID(_ context.Context, _ string) (*domain.DataResidencyPolicy, error) {
-	return nil, nil
+func (m *memStore) GetResidencyPolicyByID(_ context.Context, id string) (*domain.DataResidencyPolicy, error) {
+	p, ok := m.residencyPolicies[id]
+	if !ok {
+		return nil, nil
+	}
+	return p, nil
 }
 func (m *memStore) GetResidencyRegionByID(_ context.Context, _ string) (*domain.ResidencyRegion, error) {
 	return nil, nil
