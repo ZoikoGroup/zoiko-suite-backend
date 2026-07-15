@@ -7,11 +7,22 @@
 //     service subscribes to only one topic (zoiko.workflow.events) so a
 //     single Runner goroutine handles all five workflow event types.
 //
-//   - Event ID extraction: every message is expected to carry an "X-Event-ID"
-//     Kafka header (a convention mirroring the HTTP correlation header). If
-//     the header is absent, a stable synthetic ID is derived from
-//     "<topic>:<partition>:<offset>" so that the upstream dedup INSERT …
-//     ON CONFLICT DO NOTHING still functions correctly.
+//   - Event ID extraction: the Runner calls extractEventID(msg) to obtain a
+//     stable dedup key for every message before passing it to Consumer.Handle.
+//     Two dedup paths exist, in preference order:
+//
+//     (1) X-Event-ID Kafka header — a UUID set by workflow-svc's publisher
+//     (internal/events/publisher.go) since the fix in this PR. This is the
+//     correct path: the same UUID is preserved across broker-level redeliveries
+//     of the same offset, so ON CONFLICT (event_id) DO NOTHING absorbs them.
+//
+//     (2) Synthetic topic:partition:offset fallback — used when the header is
+//     absent (e.g. messages published before the publisher fix, or messages
+//     from other producers that don't set the header). This correctly dedupes
+//     broker redelivery of the same offset, but a producer-side retry that
+//     succeeds on a different offset will produce a distinct synthetic ID and
+//     therefore a second row. This is the expected at-least-once posture for
+//     the fallback path.
 //
 //   - Error handling:
 //       • Validation errors (Consumer.Handle returns nil)  → commit & continue.
