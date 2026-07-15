@@ -128,10 +128,11 @@ func main() {
 	r.Use(otelchi.Middleware("general-ledger-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
-	// Extracts tenant_id from the envelope JWT into context so every DB call
-	// can set app.tenant_id on the Postgres session and RLS is enforced —
-	// same pattern as tenant-entity-registry-svc.
-	r.Use(svcmiddleware.TenantContext(log))
+	// Reads the caller's tenant scope from X-Tenant-Id (set by
+	// gateway-auth-svc's ForwardAuth verification) into context, so every DB
+	// call can filter by it explicitly — see internal/store's doc comment
+	// on why RLS alone is not sufficient here.
+	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
 	h := handler.New(pgStore, publisher, authzClient, log)

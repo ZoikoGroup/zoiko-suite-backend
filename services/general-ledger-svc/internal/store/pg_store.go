@@ -2,9 +2,20 @@
 // persistence layer.
 //
 // Every write is wrapped in withRLS, which sets app.tenant_id on the
-// transaction before running any query, enforcing the Row-Level Security
-// policies defined in deployments/migrations/000001_initial_schema.up.sql —
-// same doctrine as tenant-entity-registry-svc.
+// transaction before running any query — the Row-Level Security policies in
+// deployments/migrations/000001_initial_schema.up.sql are real and correctly
+// written. But every method ALSO filters explicitly by tenant_id in its own
+// SQL, rather than relying on RLS alone: this pool connects as a Postgres
+// superuser (DB_USER=postgres, same as every other service in this
+// platform), and Postgres superusers unconditionally bypass Row-Level
+// Security regardless of policy — see
+// https://www.postgresql.org/docs/current/ddl-rowsecurity.html ("the default
+// deny policy is not enforced ... for superuser roles"). Found via a genuine
+// CI failure (TestPgStore_RLS_TenantIsolation caught real cross-tenant
+// leakage on GetJournal, which had no explicit tenant_id filter), not a
+// theoretical concern. The explicit filters here are the actual isolation
+// guarantee; RLS is defense-in-depth for the day this connects as a
+// non-superuser role instead.
 package store
 
 import (
@@ -96,9 +107,21 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 }
 
 // GetJournal returns a journal header plus its lines. Returns (nil, nil, nil)
-// if not found.
+// if not found — including when the caller's tenant scope doesn't match the
+// journal's tenant.
+//
+// The tenant_id column is filtered explicitly here, not left to RLS alone:
+// the pool connects as a Postgres superuser (same posture as every other
+// service in this platform), and Postgres superusers unconditionally bypass
+// Row-Level Security regardless of policy — RLS alone provides no real
+// isolation guarantee under this connection. Found via a genuine CI failure
+// (TestPgStore_RLS_TenantIsolation caught real cross-tenant leakage), not
+// theoretical.
 func (s *PgStore) GetJournal(ctx context.Context, journalID string) (*domain.JournalHeader, []domain.JournalLine, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, nil, nil
+	}
 
 	var h domain.JournalHeader
 	var status string
@@ -108,8 +131,8 @@ func (s *PgStore) GetJournal(ctx context.Context, journalID string) (*domain.Jou
 			       reversal_of_journal_id, description, created_by_principal_id,
 			       validated_by_principal_id, posted_by_principal_id, reversed_by_principal_id,
 			       correlation_id, created_at, validated_at, posted_at, reversed_at
-			FROM journal_headers WHERE journal_id = $1
-		`, journalID)
+			FROM journal_headers WHERE journal_id = $1 AND tenant_id = $2
+		`, journalID, tenantID)
 		if err := row.Scan(
 			&h.JournalID, &h.TenantID, &h.LegalEntityID, &h.FiscalPeriod, &status,
 			&h.ReversalOfJournalID, &h.Description, &h.CreatedByPrincipalID,
@@ -141,8 +164,8 @@ func (s *PgStore) listLines(ctx context.Context, tenantID, journalID string) ([]
 		rows, err := tx.Query(ctx, `
 			SELECT journal_line_id, journal_id, line_number, account_code,
 			       debit_amount, credit_amount, COALESCE(description, '')
-			FROM journal_lines WHERE journal_id = $1 ORDER BY line_number ASC
-		`, journalID)
+			FROM journal_lines WHERE journal_id = $1 AND tenant_id = $2 ORDER BY line_number ASC
+		`, journalID, tenantID)
 		if err != nil {
 			return err
 		}
@@ -213,12 +236,12 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 	query := fmt.Sprintf(`
 		UPDATE journal_headers
 		SET status = $1, %s = $2, %s = $3
-		WHERE journal_id = $4 AND status = $5
+		WHERE journal_id = $4 AND status = $5 AND tenant_id = $6
 	`, actorColumn, timeColumn)
 
 	var affected int64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), journalID, string(fromStatus))
+		tag, err := tx.Exec(ctx, query, string(toStatus), actorPrincipalID, time.Now().UTC(), journalID, string(fromStatus), tenantID)
 		if err != nil {
 			return err
 		}
@@ -254,8 +277,8 @@ func (s *PgStore) SumLines(ctx context.Context, tenantID, journalID string) (deb
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT COALESCE(SUM(debit_amount), 0), COALESCE(SUM(credit_amount), 0)
-			FROM journal_lines WHERE journal_id = $1
-		`, journalID)
+			FROM journal_lines WHERE journal_id = $1 AND tenant_id = $2
+		`, journalID, tenantID)
 		return row.Scan(&debitTotal, &creditTotal)
 	})
 	return debitTotal, creditTotal, err
