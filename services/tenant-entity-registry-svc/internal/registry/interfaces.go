@@ -24,6 +24,13 @@ type Store interface {
 	// ── Tenant ──────────────────────────────────────────────────────────────
 
 	CreateTenant(ctx context.Context, t *domain.Tenant) error
+	// CreateTenantWithDefaultResidencyPolicy inserts a tenant and its default
+	// DataResidencyPolicy in a single transaction. tenants.default_data_residency_policy_id
+	// is NOT NULL, but data_residency_policies.tenant_id has a FK back to tenants —
+	// so the policy cannot exist before the tenant, and the tenant cannot reference
+	// a policy that doesn't exist yet. This method breaks that cycle by inserting
+	// both rows atomically: the tenant first, then the policy that references it.
+	CreateTenantWithDefaultResidencyPolicy(ctx context.Context, t *domain.Tenant, p *domain.DataResidencyPolicy) error
 	GetTenantByID(ctx context.Context, tenantID string) (*domain.Tenant, error)
 	TransitionTenantLifecycle(ctx context.Context, tenantID string, newState domain.TenantLifecycleState, actorID, correlationID string) error
 
