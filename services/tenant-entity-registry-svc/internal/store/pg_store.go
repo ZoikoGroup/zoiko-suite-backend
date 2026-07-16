@@ -200,9 +200,9 @@ func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.T
 			       default_currency_code, primary_timezone, primary_locale,
 			       default_data_residency_policy_id, lifecycle_state,
 			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
-			FROM tenants WHERE tenant_id = $1
+			FROM tenants WHERE tenant_id = $1 AND tenant_id = $2
 		`
-		return tx.QueryRow(ctx, query, tid).Scan(
+		return tx.QueryRow(ctx, query, tenantID, tid).Scan(
 			&t.TenantID, &t.TenantCode, &t.LegalName, &t.TradingName, &t.Status,
 			&t.DefaultCurrencyCode, &t.PrimaryTimezone, &t.PrimaryLocale,
 			&t.DefaultDataResidencyPolicyID, &t.LifecycleState,
@@ -226,9 +226,9 @@ func (s *PgStore) TransitionTenantLifecycle(ctx context.Context, tenantID string
 		query := `
 			UPDATE tenants
 			SET lifecycle_state = $1, updated_at = $2, updated_by_principal_id = $3
-			WHERE tenant_id = $4 AND lifecycle_state != $1
+			WHERE tenant_id = $4 AND tenant_id = $5 AND lifecycle_state != $1
 		`
-		_, err := tx.Exec(ctx, query, string(newState), time.Now().UTC(), actorID, tenantID)
+		_, err := tx.Exec(ctx, query, string(newState), time.Now().UTC(), actorID, tenantID, tid)
 		return err
 	})
 }

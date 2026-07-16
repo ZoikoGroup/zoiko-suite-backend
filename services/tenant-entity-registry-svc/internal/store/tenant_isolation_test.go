@@ -484,3 +484,44 @@ func TestPgStore_TenantIsolation_TransitionTaxIdentityBundleStatus(t *testing.T)
 	assert.Equal(t, domain.TaxIdentityBundleActive, bundle.Status,
 		"ISOLATION FAILURE: tenant B expired tenant A's tax identity bundle")
 }
+
+func TestPgStore_TenantIsolation_GetTenantByID(t *testing.T) {
+	s := testStore
+	ctx := context.Background()
+
+	a := setupIsolationFixture(t, s, "ISO-A-GetTenant")
+	b := setupIsolationFixture(t, s, "ISO-B-GetTenant")
+
+	// Probe: tenant B's context, tenant A's tenant ID.
+	ctxB := domain.WithTenant(ctx, b.tenantID)
+	got, err := s.GetTenantByID(ctxB, a.tenantID)
+	require.NoError(t, err)
+	assert.Nil(t, got, "ISOLATION FAILURE: GetTenantByID returned Tenant A's row or Tenant B's own row in mismatch context")
+
+	// Sanity: tenant B can still read its own tenant.
+	gotOwn, err := s.GetTenantByID(ctxB, b.tenantID)
+	require.NoError(t, err)
+	require.NotNil(t, gotOwn)
+	assert.Equal(t, b.tenantID, gotOwn.TenantID)
+}
+
+func TestPgStore_TenantIsolation_TransitionTenantLifecycle(t *testing.T) {
+	s := testStore
+	ctx := context.Background()
+
+	a := setupIsolationFixture(t, s, "ISO-A-TransitionTenant")
+	b := setupIsolationFixture(t, s, "ISO-B-TransitionTenant")
+
+	// Tenant B attempts to transition Tenant A's lifecycle state.
+	ctxB := domain.WithTenant(ctx, b.tenantID)
+	err := s.TransitionTenantLifecycle(ctxB, a.tenantID, domain.TenantLifecycleActive, "attacker", "corr-x")
+	require.NoError(t, err)
+
+	// Verify Tenant A's state remains ONBOARDING.
+	ctxA := domain.WithTenant(ctx, a.tenantID)
+	tenant, err := s.GetTenantByID(ctxA, a.tenantID)
+	require.NoError(t, err)
+	require.NotNil(t, tenant)
+	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState, "ISOLATION FAILURE: tenant B transitioned tenant A's lifecycle state")
+}
+
