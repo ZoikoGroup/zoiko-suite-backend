@@ -55,7 +55,6 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-
 func TestPgStore_CreateTenant_And_GetTenantByID(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
@@ -87,7 +86,6 @@ func TestPgStore_CreateTenant_And_GetTenantByID(t *testing.T) {
 		t.Errorf("expected tenant_code ACME, got %q", got.TenantCode)
 	}
 }
-
 
 func TestPgStore_CreateEntity_And_GetEntityByID(t *testing.T) {
 	ctx := context.Background()
@@ -132,7 +130,7 @@ func TestPgStore_CreateEntity_And_GetEntityByID(t *testing.T) {
 		DefaultCurrencyCode:   "USD",
 		FiscalCalendarID:      uuid.New().String(), // no FK on this one
 		EntityStatus:          domain.EntityStatusActive,
-		PrimaryJurisdictionID: uuid.New().String(), // no FK — validated via HTTP elsewhere, not DB
+		PrimaryJurisdictionID: uuid.New().String(),          // no FK — validated via HTTP elsewhere, not DB
 		DataResidencyPolicyID: policy.DataResidencyPolicyID, // MUST be real — this one has an FK
 		CreatedByPrincipalID:  "test-admin",
 	}
@@ -147,9 +145,15 @@ func TestPgStore_CreateEntity_And_GetEntityByID(t *testing.T) {
 	if got.EntityCode != "ACME-US" {
 		t.Errorf("expected entity_code ACME-US, got %q", got.EntityCode)
 	}
-}
-
-
+} // TestPgStore_RLS_TenantIsolation tests RLS tenant isolation using ListEntitiesByTenant.
+//
+// NOTE: This test originally passed even before the superuser bypass was fixed
+// because ListEntitiesByTenant happened to have an explicit 'WHERE tenant_id = $1'
+// filter in its SQL query. It did NOT catch leaks in methods that were missing
+// explicit tenant_id filters (like GetEntityByID, GetTaxIdentityBundleByID, etc.),
+// which were successfully bypassed by the superuser connection.
+//
+// For complete isolation coverage of all audited methods, see internal/store/tenant_isolation_test.go.
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	ctx := context.Background()
 	pool := openTestPool(t)
@@ -174,9 +178,9 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 		policy := &domain.DataResidencyPolicy{
 			DataResidencyPolicyID: uuid.New().String(), TenantID: tenantID,
 			PolicyName: "Default", PolicyCode: tenantCode + "-POLICY",
-			ResidencyMode: domain.ResidencyModeFollowEntity,
+			ResidencyMode:          domain.ResidencyModeFollowEntity,
 			ConflictResolutionMode: domain.ConflictResolutionFailClosed,
-			ActiveFlag: true, CreatedByPrincipalID: "test-admin",
+			ActiveFlag:             true, CreatedByPrincipalID: "test-admin",
 		}
 		if err := s.CreateResidencyPolicy(tctx, policy); err != nil {
 			t.Fatalf("CreateResidencyPolicy(%s) failed: %v", tenantCode, err)
