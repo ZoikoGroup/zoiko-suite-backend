@@ -110,13 +110,10 @@ jobs:
         # Proves /healthz and /readyz return 200 against a real DB.
         run: go test -v -tags=integration -count=1 -timeout=120s ./cmd/server/
 
-      - name: Integration test — consumer pipeline (consumer.Handle → PgStore → DB)
-        if: matrix.service == 'workflow-history-svc'
+      - name: Integration test — store isolation/pipeline (PgStore → DB)
+        if: matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc'
         working-directory: services/${{ matrix.service }}
-        # Tests the full pipeline that cmd/server tests bypass:
-        #   raw message bytes → consumer.Consumer.Handle() → real PgStore.Append()
-        #   → embedded Postgres → read-back via PgStore.ListByInstance()
-        # Proves: publisher message format, tenant context inheritance, ON CONFLICT
-        # idempotency, fail-closed behaviour, and all 5 workflow event types.
+        # Runs integration tests under internal/store to verify isolation or the consumer pipeline.
+        # Uses embedded-postgres (downloads real Postgres binaries automatically).
         run: go test -v -tags=integration -count=1 -timeout=120s ./internal/store/
 

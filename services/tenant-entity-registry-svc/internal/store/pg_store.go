@@ -1,15 +1,27 @@
 // Package store provides the PostgreSQL implementation of registry.Store.
 //
-// Every public method is guaranteed to set app.tenant_id on the transaction
-// before any query runs, enforcing the Postgres Row-Level Security policies
-// defined in deployments/migrations/000001_initial_schema.up.sql.
+// # Tenant Isolation — Why RLS Alone Is Not Enough
 //
-// The withRLS helper wraps every write in a transaction and issues:
+// Every method that reads or mutates tenant-scoped data filters EXPLICITLY by
+// tenant_id in its own SQL WHERE clause. This is the actual isolation
+// guarantee; RLS is defense-in-depth only.
 //
-//	SELECT set_config('app.tenant_id', $1, true)
+// Root cause: every service in this platform connects to Postgres as the
+// postgres superuser (DB_USER=postgres). Postgres superusers unconditionally
+// bypass Row-Level Security regardless of policy — see
+// https://www.postgresql.org/docs/current/ddl-rowsecurity.html. The withRLS
+// helper still calls set_config('app.tenant_id', ...) so that RLS will apply
+// correctly if the connection role is ever changed to a non-superuser; but
+// under the current posture set_config has no isolation effect.
 //
-// before the business query. ResidencyRegion reads bypass RLS because that
-// table has no tenant_id column and carries no per-tenant data.
+// This is a real vulnerability, not a theoretical concern: it was discovered
+// via genuine integration test failures (TestPgStore_TenantIsolation caught
+// real cross-tenant data leaks), mirroring the same fix applied to
+// general-ledger-svc. Every method in this file was audited; the ones that
+// were vulnerable now carry an AND tenant_id = $N in their WHERE clause.
+//
+// ResidencyRegion reads correctly have no tenant_id filter: that table has no
+// tenant_id column and carries no per-tenant data.
 package store
 
 import (
@@ -188,9 +200,9 @@ func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.T
 			       default_currency_code, primary_timezone, primary_locale,
 			       default_data_residency_policy_id, lifecycle_state,
 			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
-			FROM tenants WHERE tenant_id = $1
+			FROM tenants WHERE tenant_id = $1 AND tenant_id = $2
 		`
-		return tx.QueryRow(ctx, query, tenantID).Scan(
+		return tx.QueryRow(ctx, query, tenantID, tid).Scan(
 			&t.TenantID, &t.TenantCode, &t.LegalName, &t.TradingName, &t.Status,
 			&t.DefaultCurrencyCode, &t.PrimaryTimezone, &t.PrimaryLocale,
 			&t.DefaultDataResidencyPolicyID, &t.LifecycleState,
@@ -214,9 +226,9 @@ func (s *PgStore) TransitionTenantLifecycle(ctx context.Context, tenantID string
 		query := `
 			UPDATE tenants
 			SET lifecycle_state = $1, updated_at = $2, updated_by_principal_id = $3
-			WHERE tenant_id = $4 AND lifecycle_state != $1
+			WHERE tenant_id = $4 AND tenant_id = $5 AND lifecycle_state != $1
 		`
-		_, err := tx.Exec(ctx, query, string(newState), time.Now().UTC(), actorID, tenantID)
+		_, err := tx.Exec(ctx, query, string(newState), time.Now().UTC(), actorID, tenantID, tid)
 		return err
 	})
 }
@@ -261,9 +273,10 @@ func (s *PgStore) CreateEntity(ctx context.Context, e *domain.LegalEntity) error
 
 func (s *PgStore) GetEntityByID(ctx context.Context, legalEntityID string) (*domain.LegalEntity, error) {
 	s.log.Debug("store.GetEntityByID", zap.String("legal_entity_id", legalEntityID))
-	// F2: tenant must already be in context (set by TenantContext middleware).
-	// If absent (e.g. platform-internal call), RLS will scope to empty string
-	// which returns zero rows — safer than bypassing RLS.
+	// Tenant must be in context (set by TenantContext middleware).
+	// If absent, tid is empty and the explicit AND tenant_id = $2 filter returns
+	// zero rows — fail-closed. We do NOT rely on RLS: this pool connects as the
+	// postgres superuser, which unconditionally bypasses RLS.
 	tid := domain.TenantFromContext(ctx)
 
 	var e domain.LegalEntity
@@ -275,9 +288,9 @@ func (s *PgStore) GetEntityByID(ctx context.Context, legalEntityID string) (*dom
 			       parent_legal_entity_id, entity_status, primary_jurisdiction_id,
 			       data_residency_policy_id, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id
-			FROM legal_entities WHERE legal_entity_id = $1
+			FROM legal_entities WHERE legal_entity_id = $1 AND tenant_id = $2
 		`
-		return tx.QueryRow(ctx, query, legalEntityID).Scan(
+		return tx.QueryRow(ctx, query, legalEntityID, tid).Scan(
 			&e.LegalEntityID, &e.TenantID, &e.EntityCode, &e.LegalName, &e.TradingName,
 			&e.RegistrationNumber, &e.TaxIdentityBundleID, &e.EntityType,
 			&e.IncorporationDate, &e.DefaultCurrencyCode, &e.FiscalCalendarID,
@@ -351,7 +364,7 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 				default_currency_code  = COALESCE($3, default_currency_code),
 				updated_at             = $4,
 				updated_by_principal_id = $5
-			WHERE legal_entity_id = $6
+			WHERE legal_entity_id = $6 AND tenant_id = $7
 			RETURNING legal_entity_id, tenant_id, entity_code, legal_name, trading_name,
 			          registration_number, tax_identity_bundle_id, entity_type,
 			          incorporation_date, default_currency_code, fiscal_calendar_id,
@@ -363,7 +376,7 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 		return tx.QueryRow(ctx, query,
 			req.LegalName, req.TradingName, req.DefaultCurrencyCode,
 			now, req.ActorPrincipalID,
-			legalEntityID,
+			legalEntityID, tid,
 		).Scan(
 			&updated.LegalEntityID, &updated.TenantID, &updated.EntityCode,
 			&updated.LegalName, &updated.TradingName,
@@ -410,12 +423,12 @@ func (s *PgStore) TransitionEntityStatus(
 		query := `
 			UPDATE legal_entities
 			SET entity_status = $1, updated_at = $2, updated_by_principal_id = $3
-			WHERE legal_entity_id = $4 AND entity_status = ANY($5::text[])
+			WHERE legal_entity_id = $4 AND entity_status = ANY($5::text[]) AND tenant_id = $6
 			RETURNING tenant_id
 		`
 		row := tx.QueryRow(ctx, query,
 			string(newStatus), time.Now().UTC(), actorID,
-			legalEntityID, priors,
+			legalEntityID, priors, tid,
 		)
 		if err := row.Scan(&tenantID); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -439,8 +452,8 @@ func (s *PgStore) GetEntityStatus(ctx context.Context, legalEntityID string) (*d
 	resp.EntityID = legalEntityID
 
 	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
-		query := `SELECT tenant_id, entity_status FROM legal_entities WHERE legal_entity_id = $1`
-		return tx.QueryRow(ctx, query, legalEntityID).Scan(&resp.TenantID, &resp.EntityStatus)
+		query := `SELECT tenant_id, entity_status FROM legal_entities WHERE legal_entity_id = $1 AND tenant_id = $2`
+		return tx.QueryRow(ctx, query, legalEntityID, tid).Scan(&resp.TenantID, &resp.EntityStatus)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -482,9 +495,9 @@ func (s *PgStore) EndDateHierarchy(ctx context.Context, hierarchyID string, endD
 		query := `
 			UPDATE entity_hierarchies
 			SET effective_to = $1, updated_at = $2, updated_by_principal_id = $3
-			WHERE hierarchy_id = $4 AND effective_to IS NULL
+			WHERE hierarchy_id = $4 AND effective_to IS NULL AND tenant_id = $5
 		`
-		_, err := tx.Exec(ctx, query, endDate, time.Now().UTC(), actorID, hierarchyID)
+		_, err := tx.Exec(ctx, query, endDate, time.Now().UTC(), actorID, hierarchyID, tid)
 		return err
 	})
 }
@@ -500,9 +513,9 @@ func (s *PgStore) ListHierarchiesByEntity(ctx context.Context, legalEntityID str
 			       relationship_type, effective_from, effective_to, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id
 			FROM entity_hierarchies
-			WHERE parent_legal_entity_id = $1 OR child_legal_entity_id = $1
+			WHERE (parent_legal_entity_id = $1 OR child_legal_entity_id = $1) AND tenant_id = $2
 		`
-		rows, err := tx.Query(ctx, query, legalEntityID)
+		rows, err := tx.Query(ctx, query, legalEntityID, tid)
 		if err != nil {
 			return err
 		}
@@ -562,9 +575,9 @@ func (s *PgStore) ListJurisdictionAssignments(ctx context.Context, legalEntityID
 			SELECT assignment_id, tenant_id, legal_entity_id, jurisdiction_id, assignment_type,
 			       effective_from, effective_to, source_basis, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id
-			FROM entity_jurisdiction_assignments WHERE legal_entity_id = $1
+			FROM entity_jurisdiction_assignments WHERE legal_entity_id = $1 AND tenant_id = $2
 		`
-		rows, err := tx.Query(ctx, query, legalEntityID)
+		rows, err := tx.Query(ctx, query, legalEntityID, tid)
 		if err != nil {
 			return err
 		}
@@ -594,9 +607,9 @@ func (s *PgStore) EndDateJurisdictionAssignment(ctx context.Context, assignmentI
 		query := `
 			UPDATE entity_jurisdiction_assignments
 			SET effective_to = $1, updated_at = $2, updated_by_principal_id = $3
-			WHERE assignment_id = $4 AND effective_to IS NULL
+			WHERE assignment_id = $4 AND effective_to IS NULL AND tenant_id = $5
 		`
-		_, err := tx.Exec(ctx, query, endDate, time.Now().UTC(), actorID, assignmentID)
+		_, err := tx.Exec(ctx, query, endDate, time.Now().UTC(), actorID, assignmentID, tid)
 		return err
 	})
 }
@@ -643,9 +656,9 @@ func (s *PgStore) GetResidencyPolicyByID(ctx context.Context, policyID string) (
 			SELECT data_residency_policy_id, tenant_id, policy_name, policy_code,
 			       residency_mode, conflict_resolution_mode, residency_region_id, active_flag,
 			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
-			FROM data_residency_policies WHERE data_residency_policy_id = $1
+			FROM data_residency_policies WHERE data_residency_policy_id = $1 AND tenant_id = $2
 		`
-		return tx.QueryRow(ctx, query, policyID).Scan(
+		return tx.QueryRow(ctx, query, policyID, tid).Scan(
 			&p.DataResidencyPolicyID, &p.TenantID, &p.PolicyName, &p.PolicyCode,
 			&p.ResidencyMode, &p.ConflictResolutionMode, &p.ResidencyRegionID, &p.ActiveFlag,
 			&p.CreatedAt, &p.UpdatedAt, &p.CreatedByPrincipalID, &p.UpdatedByPrincipalID,
@@ -755,9 +768,9 @@ func (s *PgStore) GetTaxIdentityBundleByID(ctx context.Context, bundleID string)
 			SELECT tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
 			       effective_from, effective_to, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id, data_classification
-			FROM tax_identity_bundles WHERE tax_identity_bundle_id = $1
+			FROM tax_identity_bundles WHERE tax_identity_bundle_id = $1 AND tenant_id = $2
 		`
-		return tx.QueryRow(ctx, query, bundleID).Scan(
+		return tx.QueryRow(ctx, query, bundleID, tid).Scan(
 			&b.TaxIdentityBundleID, &b.TenantID, &b.LegalEntityID, &b.JurisdictionID, &b.Status,
 			&b.EffectiveFrom, &b.EffectiveTo, &b.CreatedAt, &b.UpdatedAt,
 			&b.CreatedByPrincipalID, &b.UpdatedByPrincipalID, &b.DataClassification,
@@ -779,9 +792,9 @@ func (s *PgStore) ListTaxIdentityBundlesByEntity(ctx context.Context, legalEntit
 			SELECT tax_identity_bundle_id, tenant_id, legal_entity_id, jurisdiction_id, status,
 			       effective_from, effective_to, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id, data_classification
-			FROM tax_identity_bundles WHERE legal_entity_id = $1
+			FROM tax_identity_bundles WHERE legal_entity_id = $1 AND tenant_id = $2
 		`
-		rows, err := tx.Query(ctx, query, legalEntityID)
+		rows, err := tx.Query(ctx, query, legalEntityID, tid)
 		if err != nil {
 			return err
 		}
@@ -814,9 +827,9 @@ func (s *PgStore) TransitionTaxIdentityBundleStatus(ctx context.Context, bundleI
 		query := `
 			UPDATE tax_identity_bundles
 			SET status = $1, updated_at = $2, updated_by_principal_id = $3
-			WHERE tax_identity_bundle_id = $4 AND status != $1
+			WHERE tax_identity_bundle_id = $4 AND status != $1 AND tenant_id = $5
 		`
-		_, err := tx.Exec(ctx, query, string(newStatus), time.Now().UTC(), actorID, bundleID)
+		_, err := tx.Exec(ctx, query, string(newStatus), time.Now().UTC(), actorID, bundleID, tid)
 		return err
 	})
 }
