@@ -43,6 +43,7 @@ jobs:
           - secret-vault-integration-svc
           - authorization-svc
           - workflow-svc
+          - workflow-history-svc
           - gateway-auth-svc
           - schema-registry-svc
           - document-vault-svc
@@ -101,10 +102,20 @@ jobs:
           fi
 
       - name: Integration test — health probes with embedded Postgres
-        if: matrix.service == 'audit-event-store-svc'
+        if: matrix.service == 'audit-event-store-svc' || matrix.service == 'workflow-history-svc'
         working-directory: services/${{ matrix.service }}
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
         # No separate Postgres service container is needed.
         # Proves /healthz and /readyz return 200 against a real DB.
         run: go test -v -tags=integration -count=1 -timeout=120s ./cmd/server/
+
+      - name: Integration test — consumer pipeline (consumer.Handle → PgStore → DB)
+        if: matrix.service == 'workflow-history-svc'
+        working-directory: services/${{ matrix.service }}
+        # Tests the full pipeline that cmd/server tests bypass:
+        #   raw message bytes → consumer.Consumer.Handle() → real PgStore.Append()
+        #   → embedded Postgres → read-back via PgStore.ListByInstance()
+        # Proves: publisher message format, tenant context inheritance, ON CONFLICT
+        # idempotency, fail-closed behaviour, and all 5 workflow event types.
+        run: go test -v -tags=integration -count=1 -timeout=120s ./internal/store/
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
@@ -94,12 +95,32 @@ func (p *Publisher) emit(eventType, correlationID string, payload map[string]any
 		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
 	}
 
-	msg := kafka.Message{Value: data}
+	// Assign a stable per-event UUID and surface it as an X-Event-ID Kafka header.
+	// This is the key that workflow-history-svc (and audit-event-store-svc) use
+	// as their primary dedup key via INSERT … ON CONFLICT (event_id) DO NOTHING.
+	// Using a header (rather than embedding only in the JSON payload) lets the
+	// consumer extract the ID before deserialising the payload, matching the
+	// pattern expected by internal/kafka/runner.go's extractEventID().
+	//
+	// Producer-retry safety: if the caller retries emit() after a transient
+	// Kafka write failure, a NEW uuid is generated for the retry — the previous
+	// call may or may not have reached the broker. This is the correct posture
+	// for an at-least-once producer: the consumer's ON CONFLICT dedup absorbs
+	// broker-level re-deliveries (same offset, same ID), while producer retries
+	// that succeed on a second attempt are inherently new logical publications.
+	eventID := uuid.New().String()
+	msg := kafka.Message{
+		Value: data,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(eventID)},
+		},
+	}
 	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
 		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
 	}
 
 	p.log.Info("event published",
+		zap.String("event_id", eventID),
 		zap.String("event_type", eventType),
 		zap.String("topic", p.topic),
 		zap.String("correlation_id", correlationID),
