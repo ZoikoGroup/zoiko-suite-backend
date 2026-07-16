@@ -166,13 +166,18 @@ type TaxIdentityBundle struct {
 // ---------------------------------------------------------------------------
 
 type ProvisionTenantRequest struct {
-	TenantCode                   string `json:"tenant_code"`
-	LegalName                    string `json:"legal_name"`
-	TradingName                  string `json:"trading_name,omitempty"`
-	DefaultCurrencyCode          string `json:"default_currency_code"`
-	PrimaryTimezone              string `json:"primary_timezone"`
-	PrimaryLocale                string `json:"primary_locale"`
-	DefaultDataResidencyPolicyID string `json:"default_data_residency_policy_id"`
+	TenantCode          string `json:"tenant_code"`
+	LegalName           string `json:"legal_name"`
+	TradingName         string `json:"trading_name,omitempty"`
+	DefaultCurrencyCode string `json:"default_currency_code"`
+	PrimaryTimezone     string `json:"primary_timezone"`
+	PrimaryLocale       string `json:"primary_locale"`
+	// DefaultDataResidencyPolicyID is deprecated and ignored: no residency
+	// policy can exist before this tenant does (see registry.Service.ProvisionTenant),
+	// so a caller can never legitimately supply a real one here. The service
+	// always generates a fresh default policy instead. Field kept only so
+	// older clients sending this key don't fail JSON decoding.
+	DefaultDataResidencyPolicyID string `json:"default_data_residency_policy_id,omitempty"`
 }
 
 type TransitionTenantLifecycleRequest struct {

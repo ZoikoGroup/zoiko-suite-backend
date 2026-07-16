@@ -124,6 +124,59 @@ func (s *PgStore) CreateTenant(ctx context.Context, t *domain.Tenant) error {
 	})
 }
 
+// CreateTenantWithDefaultResidencyPolicy inserts a tenant and its default
+// DataResidencyPolicy in one transaction, breaking the cycle described on
+// the Store interface: the tenant row must exist before the policy row (FK),
+// but the tenant row requires a non-null policy ID. Both inserts share the
+// same transaction as CreateTenant/CreateResidencyPolicy individually use.
+func (s *PgStore) CreateTenantWithDefaultResidencyPolicy(ctx context.Context, t *domain.Tenant, p *domain.DataResidencyPolicy) error {
+	s.log.Debug("store.CreateTenantWithDefaultResidencyPolicy",
+		zap.String("tenant_id", t.TenantID), zap.String("policy_id", p.DataResidencyPolicyID))
+	tenantID := tenantFromCtxOrFallback(ctx, t.TenantID)
+
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		tenantQuery := `
+			INSERT INTO tenants (
+				tenant_id, tenant_code, legal_name, trading_name, status,
+				default_currency_code, primary_timezone, primary_locale,
+				default_data_residency_policy_id, lifecycle_state,
+				created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+		`
+		if _, err := tx.Exec(ctx, tenantQuery,
+			t.TenantID, t.TenantCode, t.LegalName, t.TradingName, string(t.Status),
+			t.DefaultCurrencyCode, t.PrimaryTimezone, t.PrimaryLocale,
+			t.DefaultDataResidencyPolicyID, string(t.LifecycleState),
+			t.CreatedAt, now, t.CreatedByPrincipalID, t.CreatedByPrincipalID,
+		); err != nil {
+			if isUniqueViolation(err) {
+				return fmt.Errorf("%w: tenant_code %s", registry.ErrConflict, t.TenantCode)
+			}
+			return err
+		}
+
+		policyQuery := `
+			INSERT INTO data_residency_policies (
+				data_residency_policy_id, tenant_id, policy_name, policy_code,
+				residency_mode, conflict_resolution_mode, residency_region_id, active_flag,
+				created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		`
+		if _, err := tx.Exec(ctx, policyQuery,
+			p.DataResidencyPolicyID, p.TenantID, p.PolicyName, p.PolicyCode,
+			string(p.ResidencyMode), string(p.ConflictResolutionMode), p.ResidencyRegionID, p.ActiveFlag,
+			p.CreatedAt, now, p.CreatedByPrincipalID, p.CreatedByPrincipalID,
+		); err != nil {
+			if isUniqueViolation(err) {
+				return fmt.Errorf("%w: policy_code %s", registry.ErrConflict, p.PolicyCode)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
 func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.Tenant, error) {
 	s.log.Debug("store.GetTenantByID", zap.String("tenant_id", tenantID))
 	tid := tenantFromCtxOrFallback(ctx, tenantID)

@@ -30,6 +30,7 @@ services:
       - ../services/document-vault-svc/deployments/migrations:/migrations/document-vault:ro
       - ../services/evidence-manifest-svc/deployments/migrations:/migrations/evidence-manifest:ro
       - ../services/workflow-history-svc/deployments/migrations:/migrations/workflow-history:ro
+      - ../services/general-ledger-svc/deployments/migrations:/migrations/general-ledger:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -968,6 +969,45 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8097/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── Phase 3: General Ledger Service (Port: 8098) ─────────────────────────────
+  # Authoritative owner of journalized financial postings (03-microservices.md
+  # §10.1) — Tri-Phase Commit States (Pending -> Validated -> Finalized).
+  # Every mutating action is checked against authorization-svc first, real
+  # HTTP client from day one (this is financial ledger data). Postgres RLS
+  # enforces tenant isolation, same posture as tenant-entity-registry-svc.
+  general-ledger-svc:
+    build:
+      context: ../services/general-ledger-svc
+      dockerfile: Dockerfile
+    container_name: general-ledger-svc
+    ports:
+      - "8098:8098"
+    environment:
+      PORT: "8098"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: general_ledger
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.general-ledger.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8098/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

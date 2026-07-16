@@ -22,6 +22,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE document_vault;
     CREATE DATABASE evidence_manifest;
     CREATE DATABASE workflow_history;
+    CREATE DATABASE general_ledger;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -88,5 +89,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_manifest"
 # Apply migrations for workflow-history-svc
 echo "Applying migrations for workflow_history..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000001_initial_schema.up.sql
+
+# Apply migrations for general-ledger-svc
+echo "Applying migrations for general_ledger..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."
