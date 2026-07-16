@@ -31,6 +31,7 @@ services:
       - ../services/evidence-manifest-svc/deployments/migrations:/migrations/evidence-manifest:ro
       - ../services/workflow-history-svc/deployments/migrations:/migrations/workflow-history:ro
       - ../services/general-ledger-svc/deployments/migrations:/migrations/general-ledger:ro
+      - ../services/accounts-payable-svc/deployments/migrations:/migrations/accounts-payable:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1008,6 +1009,47 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8098/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── Phase 3: Accounts Payable Service (Port: 8099) ───────────────────────────
+  # Owns vendor invoice intake, liability-side invoice lifecycle, and payment
+  # readiness state (03-microservices.md §10.3) — RECEIVED -> VALIDATED ->
+  # APPROVED -> PAYMENT_REQUESTED. Every mutating action is checked against
+  # authorization-svc first, real HTTP client from day one (financial data).
+  # Postgres RLS + explicit tenant_id filters in every query — RLS alone is
+  # insufficient given this platform connects as a Postgres superuser (found
+  # via general-ledger-svc's CI failure).
+  accounts-payable-svc:
+    build:
+      context: ../services/accounts-payable-svc
+      dockerfile: Dockerfile
+    container_name: accounts-payable-svc
+    ports:
+      - "8099:8099"
+    environment:
+      PORT: "8099"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: accounts_payable
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.accounts-payable.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8099/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
