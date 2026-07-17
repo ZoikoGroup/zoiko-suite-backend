@@ -13,13 +13,6 @@ const (
 	InvoiceStatusPaid    InvoiceStatus = "PAID"
 )
 
-// ValidInvoiceTransitions defines valid state-machine paths.
-var ValidInvoiceTransitions = map[InvoiceStatus][]InvoiceStatus{
-	InvoiceStatusIssued:  {InvoiceStatusSent},
-	InvoiceStatusSent:    {InvoiceStatusOverdue, InvoiceStatusPaid},
-	InvoiceStatusOverdue: {InvoiceStatusPaid},
-	InvoiceStatusPaid:    {},
-}
 
 // CustomerInvoice models a customer invoice header.
 type CustomerInvoice struct {

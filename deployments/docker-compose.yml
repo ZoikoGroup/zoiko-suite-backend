@@ -1057,7 +1057,7 @@ services:
       start_period: 10s
     restart: on-failure
 
-  # ── Phase 3: Accounts Receivable Service (Port: 8100) ──────────────────────────
+  # ── Phase 3: Accounts Receivable Service (Port: 8101) ──────────────────────────
   # Owns customer invoice lifecycle and payment readiness state.
   # ISSUED -> SENT -> OVERDUE | PAID. Gated by authz, queries general-ledger-svc
   # for validation check before payment transition.
@@ -1067,9 +1067,9 @@ services:
       dockerfile: Dockerfile
     container_name: accounts-receivable-svc
     ports:
-      - "8100:8100"
+      - "8101:8101"
     environment:
-      PORT: "8100"
+      PORT: "8101"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: accounts_receivable
@@ -1090,7 +1090,7 @@ services:
       general-ledger-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8100/healthz"]
+      test: ["CMD", "/healthcheck", "http://localhost:8101/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

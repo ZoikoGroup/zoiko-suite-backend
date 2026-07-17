@@ -57,7 +57,7 @@ type KafkaConfig struct {
 func Load() (*Config, error) {
 	return &Config{
 		Env:  env("ENV", "local"),
-		Port: envInt("PORT", 8100),
+		Port: envInt("PORT", 8101),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),

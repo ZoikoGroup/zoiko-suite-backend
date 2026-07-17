@@ -28,6 +28,6 @@ COPY --from=builder /healthcheck /healthcheck
 
 USER nonroot:nonroot
 
-EXPOSE 8100
+EXPOSE 8101
 
 ENTRYPOINT ["/accounts-receivable-svc"]

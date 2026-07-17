@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -292,8 +293,13 @@ type journalHeader struct {
 }
 
 func (h *Handler) verifyLedgerFinalized(ctx context.Context, tenantID, legalEntityID, invoiceID string) error {
-	url := fmt.Sprintf("%s/v1/journals?tenant_id=%s&legal_entity_id=%s&status=FINALIZED", h.ledgerURL, tenantID, legalEntityID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	params := url.Values{}
+	params.Set("tenant_id", tenantID)
+	params.Set("legal_entity_id", legalEntityID)
+	params.Set("status", "FINALIZED")
+
+	u := fmt.Sprintf("%s/v1/journals?%s", h.ledgerURL, params.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}

@@ -7,8 +7,8 @@ metadata:
     app: accounts-receivable-svc
 spec:
   ports:
-  - port: 8100
-    targetPort: 8100
+  - port: 8101
+    targetPort: 8101
     name: http
   selector:
     app: accounts-receivable-svc
@@ -40,7 +40,7 @@ spec:
         image: accounts-receivable-svc:latest
         imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: 8100
+        - containerPort: 8101
           name: http
         securityContext:
           allowPrivilegeEscalation: false
@@ -52,7 +52,7 @@ spec:
             type: RuntimeDefault
         env:
         - name: PORT
-          value: "8100"
+          value: "8101"
         - name: DB_HOST
           value: "postgres.zoiko-infra.svc.cluster.local"
         - name: DB_PORT
@@ -80,13 +80,13 @@ spec:
         livenessProbe:
           httpGet:
             path: /healthz
-            port: 8100
+            port: 8101
           initialDelaySeconds: 15
           periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /healthz
-            port: 8100
+            port: 8101
           initialDelaySeconds: 15
           periodSeconds: 10
         resources:
