@@ -33,6 +33,7 @@ services:
       - ../services/general-ledger-svc/deployments/migrations:/migrations/general-ledger:ro
       - ../services/accounts-payable-svc/deployments/migrations:/migrations/accounts-payable:ro
       - ../services/accounts-receivable-svc/deployments/migrations:/migrations/accounts-receivable:ro
+      - ../services/purchase-request-svc/deployments/migrations:/migrations/purchase-request:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1057,10 +1058,39 @@ services:
       start_period: 10s
     restart: on-failure
 
-  # ── Phase 3: Accounts Receivable Service (Port: 8101) ──────────────────────────
-  # Owns customer invoice lifecycle and payment readiness state.
-  # ISSUED -> SENT -> OVERDUE | PAID. Gated by authz, queries general-ledger-svc
-  # for validation check before payment transition.
+  purchase-request-svc:
+    build:
+      context: ../services/purchase-request-svc
+      dockerfile: Dockerfile
+    container_name: purchase-request-svc
+    ports:
+      - "8100:8100"
+    environment:
+      PORT: "8100"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: purchase_request
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.purchase-request.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8100/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   accounts-receivable-svc:
     build:
       context: ../services/accounts-receivable-svc
