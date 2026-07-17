@@ -230,3 +230,41 @@ func TestReceivePayment_LedgerFinalizedJournalCheck(t *testing.T) {
 		t.Fatalf("expected payment.received event to be published, got %d", pub.paymentReceived)
 	}
 }
+
+func TestReceivePayment_LedgerServiceConnectionRefused_Returns503(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	badURL := server.URL
+	server.Close()
+
+	s := newStubStore()
+	s.invoices["i1"] = &domain.CustomerInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusSent}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, badURL)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/pay", nil, "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 service unavailable, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.invoices["i1"].Status != domain.InvoiceStatusSent {
+		t.Fatalf("expected invoice status to remain SENT, got %s", s.invoices["i1"].Status)
+	}
+}
+
+func TestReceivePayment_LedgerService503_Returns503(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	s := newStubStore()
+	s.invoices["i1"] = &domain.CustomerInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusSent}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, server.URL)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/pay", nil, "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 service unavailable, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.invoices["i1"].Status != domain.InvoiceStatusSent {
+		t.Fatalf("expected invoice status to remain SENT, got %s", s.invoices["i1"].Status)
+	}
+}
+
