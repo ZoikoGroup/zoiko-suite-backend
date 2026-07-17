@@ -4,12 +4,12 @@ package store_test
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -19,34 +19,81 @@ import (
 	"zoiko.io/accounts-receivable-svc/internal/store"
 )
 
-func openTestPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
+var (
+	testPool  *pgxpool.Pool
+	testStore *store.PgStore
+)
+
+func TestMain(m *testing.M) {
+	dbPort := uint32(15901 + uint32(os.Getpid()%499))
+	pg := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(dbPort).
+			Database("ar_isolation_test").
+			Username("postgres").
+			Password("postgres"),
+	)
+	if err := pg.Start(); err != nil {
+		fmt.Printf("failed to start embedded postgres: %v\n", err)
+		os.Exit(1)
 	}
+
+	dsn := fmt.Sprintf(
+		"host=localhost port=%d dbname=ar_isolation_test user=postgres password=postgres sslmode=disable",
+		dbPort,
+	)
 
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
+	var err error
+	testPool, err = pgxpool.New(ctx, dsn)
 	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
+		fmt.Printf("failed to connect to postgres: %v\n", err)
+		_ = pg.Stop()
+		os.Exit(1)
 	}
-	t.Cleanup(pool.Close)
 
-	_, filename, _, _ := runtime.Caller(0)
-	base := filepath.Dir(filename)
-
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS customer_invoices CASCADE;`)
-
-	sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations/000001_initial_schema.up.sql"))
+	for i := 0; i < 75; i++ {
+		if err = testPool.Ping(ctx); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	if err != nil {
-		t.Fatalf("failed to read migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(sql)); err != nil {
-		t.Fatalf("failed to apply migration: %v", err)
+		fmt.Printf("postgres did not become ready: %v\n", err)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
 	}
 
-	return pool
+	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
+	if err != nil {
+		fmt.Printf("failed to read migration: %v\n", err)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+		fmt.Printf("failed to apply migration: %v\n", err)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+
+	testStore = store.New(testPool, zap.NewNop())
+
+	code := m.Run()
+
+	testPool.Close()
+	_ = pg.Stop()
+	os.Exit(code)
+}
+
+func cleanTable(t *testing.T) {
+	t.Helper()
+	_, err := testPool.Exec(context.Background(), "DELETE FROM customer_invoices;")
+	if err != nil {
+		t.Fatalf("failed to clean customer_invoices: %v", err)
+	}
 }
 
 func newTestInvoice(tenantID string) *domain.CustomerInvoice {
@@ -66,8 +113,8 @@ func newTestInvoice(tenantID string) *domain.CustomerInvoice {
 }
 
 func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	cleanTable(t)
+	s := testStore
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -90,8 +137,8 @@ func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
 }
 
 func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	cleanTable(t)
+	s := testStore
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
@@ -114,8 +161,8 @@ func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
 }
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	cleanTable(t)
+	s := testStore
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
@@ -153,8 +200,8 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 }
 
 func TestPgStore_ListInvoices_TenantScoped(t *testing.T) {
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	cleanTable(t)
+	s := testStore
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
