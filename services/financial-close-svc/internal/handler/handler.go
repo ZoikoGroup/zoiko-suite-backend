@@ -224,7 +224,7 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fp.CloseStatus != "OPEN" {
-		writeError(w, http.StatusBadRequest, "period_already_locked", string(domain.ErrPeriodAlreadyLocked))
+		writeError(w, http.StatusUnprocessableEntity, "period_already_locked", string(domain.ErrPeriodAlreadyLocked))
 		return
 	}
 
