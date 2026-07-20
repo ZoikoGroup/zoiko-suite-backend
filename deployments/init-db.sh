@@ -31,6 +31,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE bank_reconciliation;
     CREATE DATABASE intercompany_accounting;
     CREATE DATABASE consolidation_svc;
+    CREATE DATABASE invoice_approval;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -133,5 +134,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "intercompany_accou
 # Apply migrations for consolidation-svc
 echo "Applying migrations for consolidation..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "consolidation_svc" -f /migrations/consolidation/000001_initial_schema.up.sql
+
+# Apply migrations for invoice-approval-svc
+echo "Applying migrations for invoice_approval..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "invoice_approval" -f /migrations/invoice-approval/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."
