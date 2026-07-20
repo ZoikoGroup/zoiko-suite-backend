@@ -35,6 +35,7 @@ services:
       - ../services/accounts-receivable-svc/deployments/migrations:/migrations/accounts-receivable:ro
       - ../services/purchase-request-svc/deployments/migrations:/migrations/purchase-request:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
+      - ../services/intercompany-accounting-svc/deployments/migrations:/migrations/intercompany-accounting:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1164,6 +1165,52 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8102/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Intercompany Accounting Service — PENDING splits into MATCHED or
+  # MISMATCHED as the system-detected OUTCOME of a single link-target
+  # action (never a separate human choice); MISMATCHED can later resolve to
+  # MATCHED by re-attempting with a corrected target journal. Both the
+  # source and target journal are verified independently against real
+  # FINALIZED journals in general-ledger-svc before an entry is ever
+  # persisted as MATCHED. Postgres RLS + explicit tenant_id filters in
+  # every query from day one. Critical constraint: source and target legal
+  # entities are always kept as two distinct fields, never netted into one
+  # position.
+  intercompany-accounting-svc:
+    build:
+      context: ../services/intercompany-accounting-svc
+      dockerfile: Dockerfile
+    container_name: intercompany-accounting-svc
+    ports:
+      - "8104:8104"
+    environment:
+      PORT: "8104"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: intercompany_accounting
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.intercompany-accounting.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8104/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
