@@ -115,7 +115,7 @@ jobs:
         run: go test -v -tags=integration -count=1 -timeout=120s ./cmd/server/
 
       - name: Integration test — store isolation/pipeline (PgStore → DB)
-        if: matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'treasury-svc'
+        if: matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc'
         working-directory: services/${{ matrix.service }}
         # Runs integration tests under internal/store to verify isolation or the consumer pipeline.
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
