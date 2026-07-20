@@ -37,6 +37,7 @@ services:
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
       - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
+      - ../services/intercompany-accounting-svc/deployments/migrations:/migrations/intercompany-accounting:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1256,6 +1257,42 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8102/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  intercompany-accounting-svc:
+    build:
+      context: ../services/intercompany-accounting-svc
+      dockerfile: Dockerfile
+    container_name: intercompany-accounting-svc
+    ports:
+      - "8105:8105"
+    environment:
+      PORT: "8105"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: intercompany_accounting
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.intercompany.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8105/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
