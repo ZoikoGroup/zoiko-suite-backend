@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS fiscal_periods (
     period_end         TIMESTAMP WITH TIME ZONE NOT NULL,
     close_status       VARCHAR(50) NOT NULL, -- 'OPEN', 'CLOSED', 'LOCKED'
     close_locked_at    TIMESTAMP WITH TIME ZONE,
-    evidence_document_id UUID,
+    evidence_document_id TEXT,
     UNIQUE (tenant_id, legal_entity_id, period_name)
 );
 

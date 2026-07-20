@@ -45,6 +45,9 @@ type DBConfig struct {
 }
 
 func (d DBConfig) DSN() string {
+	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
+		return dsn
+	}
 	return "host=" + d.Host +
 		" port=" + strconv.Itoa(d.Port) +
 		" dbname=" + d.Name +

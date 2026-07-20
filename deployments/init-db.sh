@@ -28,6 +28,10 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE purchase_request;
     CREATE DATABASE treasury;
     CREATE DATABASE financial_close;
+    CREATE DATABASE bank_reconciliation;
+    CREATE DATABASE intercompany_accounting;
+    CREATE DATABASE consolidation_svc;
+    CREATE DATABASE invoice_approval;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -118,5 +122,21 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "treasury" -f /migr
 # Apply migrations for financial-close-svc
 echo "Applying migrations for financial_close..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "financial_close" -f /migrations/financial-close/000001_initial_schema.up.sql
+
+# Apply migrations for bank-reconciliation-svc
+echo "Applying migrations for bank_reconciliation..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliation" -f /migrations/bank-reconciliation/000001_initial_schema.up.sql
+
+# Apply migrations for intercompany-accounting-svc
+echo "Applying migrations for intercompany_accounting..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "intercompany_accounting" -f /migrations/intercompany-accounting/000001_initial_schema.up.sql
+
+# Apply migrations for consolidation-svc
+echo "Applying migrations for consolidation..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "consolidation_svc" -f /migrations/consolidation/000001_initial_schema.up.sql
+
+# Apply migrations for invoice-approval-svc
+echo "Applying migrations for invoice_approval..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "invoice_approval" -f /migrations/invoice-approval/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."
