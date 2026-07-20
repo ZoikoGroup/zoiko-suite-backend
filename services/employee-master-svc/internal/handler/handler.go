@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -18,13 +19,15 @@ import (
 type Store interface {
 	CreateEmployee(ctx context.Context, emp *domain.Employee) error
 	GetEmployee(ctx context.Context, id string) (*domain.Employee, error)
-	ListEmployees(ctx context.Context, legalEntityID, status, workerType string) ([]domain.Employee, error)
+	ListEmployees(ctx context.Context, legalEntityID, status, workerType, departmentID, managerEmployeeID string) ([]domain.Employee, error)
+	UpdateEmployee(ctx context.Context, emp *domain.Employee) error
 	UpdateStatus(ctx context.Context, id, newStatus string, terminationDate *string) error
 }
 
 type Publisher interface {
 	PublishEmployeeCreated(ctx context.Context, correlationID string, emp domain.Employee)
 	PublishEmployeeHired(ctx context.Context, correlationID string, emp domain.Employee)
+	PublishEmployeeUpdated(ctx context.Context, correlationID string, emp domain.Employee)
 	PublishStatusChanged(ctx context.Context, correlationID string, emp domain.Employee, oldStatus string)
 	PublishEmployeeTerminated(ctx context.Context, correlationID string, emp domain.Employee)
 }
@@ -36,6 +39,7 @@ type AuthZClient interface {
 const (
 	actionEmployeeCreate       = "EMPLOYEE_CREATE"
 	actionEmployeeView         = "EMPLOYEE_VIEW"
+	actionEmployeeUpdate       = "EMPLOYEE_UPDATE"
 	actionEmployeeUpdateStatus = "EMPLOYEE_UPDATE_STATUS"
 )
 
@@ -60,6 +64,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.CreateEmployee)
 		r.Get("/", h.ListEmployees)
 		r.Get("/{id}", h.GetEmployee)
+		r.Put("/{id}", h.UpdateEmployee)
 		r.Put("/{id}/status", h.UpdateStatus)
 	})
 }
@@ -96,24 +101,42 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	correlationID := getCorrelationID(r)
 
+	empNum := req.EmployeeNumber
+	if empNum == "" {
+		empNum = fmt.Sprintf("EMP-%s", uuid.NewString()[:8])
+	}
+
+	jobTitle := req.JobTitle
+	if jobTitle == "" {
+		jobTitle = "Employee"
+	}
+
 	now := time.Now().UTC()
 	emp := &domain.Employee{
-		EmployeeID:    uuid.NewString(),
-		TenantID:      tenantID,
-		LegalEntityID: req.LegalEntityID,
-		FirstName:     req.FirstName,
-		LastName:      req.LastName,
-		Email:         req.Email,
-		WorkerType:    req.WorkerType,
-		Status:        "ACTIVE",
-		HireDate:      req.HireDate,
-		EffectiveFrom: now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		EmployeeID:        uuid.NewString(),
+		TenantID:          tenantID,
+		LegalEntityID:     req.LegalEntityID,
+		EmployeeNumber:    empNum,
+		FirstName:         req.FirstName,
+		LastName:          req.LastName,
+		Email:             req.Email,
+		Phone:             req.Phone,
+		JobTitle:          jobTitle,
+		DepartmentID:      req.DepartmentID,
+		ManagerEmployeeID: req.ManagerEmployeeID,
+		WorkerType:        req.WorkerType,
+		Status:            "ACTIVE",
+		HireDate:          req.HireDate,
+		EffectiveFrom:     now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 
 	if err := h.store.CreateEmployee(r.Context(), emp); errors.Is(err, domain.ErrEmailAlreadyExists) {
 		writeError(w, http.StatusConflict, "email_exists", err.Error())
+		return
+	} else if errors.Is(err, domain.ErrEmployeeNumberExists) {
+		writeError(w, http.StatusConflict, "employee_number_exists", err.Error())
 		return
 	} else if err != nil {
 		h.log.Error("failed to create employee", zap.Error(err))
@@ -133,6 +156,8 @@ func (h *Handler) ListEmployees(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	status := r.URL.Query().Get("status")
 	workerType := r.URL.Query().Get("worker_type")
+	departmentID := r.URL.Query().Get("department_id")
+	managerEmployeeID := r.URL.Query().Get("manager_employee_id")
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -146,7 +171,7 @@ func (h *Handler) ListEmployees(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	list, err := h.store.ListEmployees(r.Context(), legalEntityID, status, workerType)
+	list, err := h.store.ListEmployees(r.Context(), legalEntityID, status, workerType, departmentID, managerEmployeeID)
 	if err != nil {
 		h.log.Error("failed to list employees", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -184,6 +209,78 @@ func (h *Handler) GetEmployee(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
+
+	writeJSON(w, http.StatusOK, emp)
+}
+
+// ── PUT /v1/employees/{id} ────────────────────────────────────────────────────────
+
+func (h *Handler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var req domain.UpdateEmployeeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	emp, err := h.store.GetEmployee(r.Context(), id)
+	if errors.Is(err, domain.ErrEmployeeNotFound) {
+		writeError(w, http.StatusNotFound, "employee_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch employee for update", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, emp.LegalEntityID, actionEmployeeUpdate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if req.FirstName != nil {
+		emp.FirstName = *req.FirstName
+	}
+	if req.LastName != nil {
+		emp.LastName = *req.LastName
+	}
+	if req.Phone != nil {
+		emp.Phone = req.Phone
+	}
+	if req.JobTitle != nil {
+		emp.JobTitle = *req.JobTitle
+	}
+	if req.DepartmentID != nil {
+		emp.DepartmentID = req.DepartmentID
+	}
+	if req.ManagerEmployeeID != nil {
+		emp.ManagerEmployeeID = req.ManagerEmployeeID
+	}
+	if req.WorkerType != nil {
+		if *req.WorkerType != "FULL_TIME" && *req.WorkerType != "PART_TIME" && *req.WorkerType != "CONTRACTOR" {
+			writeError(w, http.StatusBadRequest, "invalid_worker_type", "worker_type must be FULL_TIME, PART_TIME, or CONTRACTOR")
+			return
+		}
+		emp.WorkerType = *req.WorkerType
+	}
+
+	emp.UpdatedAt = time.Now().UTC()
+
+	if err := h.store.UpdateEmployee(r.Context(), emp); err != nil {
+		h.log.Error("failed to update employee profile", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	correlationID := getCorrelationID(r)
+	h.publisher.PublishEmployeeUpdated(r.Context(), correlationID, *emp)
 
 	writeJSON(w, http.StatusOK, emp)
 }

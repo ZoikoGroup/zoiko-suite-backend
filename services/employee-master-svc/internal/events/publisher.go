@@ -55,6 +55,23 @@ func (p *Publisher) PublishEmployeeHired(ctx context.Context, correlationID stri
 	})
 }
 
+func (p *Publisher) PublishEmployeeUpdated(ctx context.Context, correlationID string, emp domain.Employee) {
+	p.emit(ctx, "employee.updated", correlationID, map[string]any{
+		"employee_id":         emp.EmployeeID,
+		"tenant_id":           emp.TenantID,
+		"legal_entity_id":     emp.LegalEntityID,
+		"employee_number":     emp.EmployeeNumber,
+		"first_name":          emp.FirstName,
+		"last_name":           emp.LastName,
+		"phone":               emp.Phone,
+		"job_title":           emp.JobTitle,
+		"department_id":       emp.DepartmentID,
+		"manager_employee_id": emp.ManagerEmployeeID,
+		"worker_type":         emp.WorkerType,
+		"updated_at":          emp.UpdatedAt,
+	})
+}
+
 func (p *Publisher) PublishStatusChanged(ctx context.Context, correlationID string, emp domain.Employee, oldStatus string) {
 	p.emit(ctx, "employee.status.changed", correlationID, map[string]any{
 		"employee_id":     emp.EmployeeID,

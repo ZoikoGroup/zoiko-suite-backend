@@ -34,6 +34,9 @@ func (s *stubStore) CreateEmployee(_ context.Context, emp *domain.Employee) erro
 		if existing.TenantID == emp.TenantID && existing.Email == emp.Email {
 			return domain.ErrEmailAlreadyExists
 		}
+		if existing.TenantID == emp.TenantID && existing.EmployeeNumber == emp.EmployeeNumber {
+			return domain.ErrEmployeeNumberExists
+		}
 	}
 	s.employees[emp.EmployeeID] = emp
 	return nil
@@ -47,7 +50,7 @@ func (s *stubStore) GetEmployee(_ context.Context, id string) (*domain.Employee,
 	return emp, nil
 }
 
-func (s *stubStore) ListEmployees(_ context.Context, legalEntityID, status, workerType string) ([]domain.Employee, error) {
+func (s *stubStore) ListEmployees(_ context.Context, legalEntityID, status, workerType, departmentID, managerEmployeeID string) ([]domain.Employee, error) {
 	var out []domain.Employee
 	for _, emp := range s.employees {
 		if legalEntityID != "" && emp.LegalEntityID != legalEntityID {
@@ -59,9 +62,24 @@ func (s *stubStore) ListEmployees(_ context.Context, legalEntityID, status, work
 		if workerType != "" && emp.WorkerType != workerType {
 			continue
 		}
+		if departmentID != "" && (emp.DepartmentID == nil || *emp.DepartmentID != departmentID) {
+			continue
+		}
+		if managerEmployeeID != "" && (emp.ManagerEmployeeID == nil || *emp.ManagerEmployeeID != managerEmployeeID) {
+			continue
+		}
 		out = append(out, *emp)
 	}
 	return out, nil
+}
+
+func (s *stubStore) UpdateEmployee(_ context.Context, emp *domain.Employee) error {
+	_, ok := s.employees[emp.EmployeeID]
+	if !ok {
+		return domain.ErrEmployeeNotFound
+	}
+	s.employees[emp.EmployeeID] = emp
+	return nil
 }
 
 func (s *stubStore) UpdateStatus(_ context.Context, id, newStatus string, terminationDate *string) error {
@@ -76,7 +94,7 @@ func (s *stubStore) UpdateStatus(_ context.Context, id, newStatus string, termin
 }
 
 type stubPublisher struct {
-	created, hired, statusChanged, terminated int
+	created, hired, updated, statusChanged, terminated int
 }
 
 func (p *stubPublisher) PublishEmployeeCreated(_ context.Context, _ string, _ domain.Employee) {
@@ -84,6 +102,9 @@ func (p *stubPublisher) PublishEmployeeCreated(_ context.Context, _ string, _ do
 }
 func (p *stubPublisher) PublishEmployeeHired(_ context.Context, _ string, _ domain.Employee) {
 	p.hired++
+}
+func (p *stubPublisher) PublishEmployeeUpdated(_ context.Context, _ string, _ domain.Employee) {
+	p.updated++
 }
 func (p *stubPublisher) PublishStatusChanged(_ context.Context, _ string, _ domain.Employee, _ string) {
 	p.statusChanged++
@@ -163,11 +184,17 @@ func TestCreateEmployee_HappyPath(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
 
+	deptID := "dept-eng"
+	jobTitle := "Senior Staff Engineer"
+
 	rr := doReq(r, http.MethodPost, "/v1/employees/", map[string]any{
 		"legal_entity_id": "le-us",
+		"employee_number": "EMP-9001",
 		"first_name":      "John",
 		"last_name":       "Doe",
 		"email":           "john.doe@example.com",
+		"job_title":       jobTitle,
+		"department_id":   deptID,
 		"worker_type":     "FULL_TIME",
 		"hire_date":       "2024-01-15",
 	}, "principal-1")
@@ -181,6 +208,15 @@ func TestCreateEmployee_HappyPath(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
+	if emp.EmployeeNumber != "EMP-9001" {
+		t.Errorf("expected EMP-9001 got %q", emp.EmployeeNumber)
+	}
+	if emp.JobTitle != jobTitle {
+		t.Errorf("expected %q got %q", jobTitle, emp.JobTitle)
+	}
+	if emp.DepartmentID == nil || *emp.DepartmentID != deptID {
+		t.Errorf("expected department %q", deptID)
+	}
 	if emp.Status != "ACTIVE" {
 		t.Errorf("expected status ACTIVE got %q", emp.Status)
 	}
@@ -189,6 +225,52 @@ func TestCreateEmployee_HappyPath(t *testing.T) {
 	}
 	if pub.hired != 1 {
 		t.Errorf("expected 1 hired event got %d", pub.hired)
+	}
+}
+
+// ── UpdateEmployee Tests ───────────────────────────────────────────────────────
+
+func TestUpdateEmployee_ProfileAndDepartment(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
+
+	// 1. Create
+	rrCreate := doReq(r, http.MethodPost, "/v1/employees/", map[string]any{
+		"legal_entity_id": "le-us",
+		"first_name":      "Alice",
+		"last_name":       "Vance",
+		"email":           "alice@example.com",
+		"worker_type":     "FULL_TIME",
+		"hire_date":       "2024-01-01",
+	}, "hr-admin")
+
+	var emp domain.Employee
+	_ = json.NewDecoder(rrCreate.Body).Decode(&emp)
+
+	// 2. Update profile
+	newTitle := "VP of Engineering"
+	newDept := "dept-executive"
+	rrUpdate := doReq(r, http.MethodPut, "/v1/employees/"+emp.EmployeeID, map[string]any{
+		"job_title":     newTitle,
+		"department_id": newDept,
+	}, "hr-admin")
+
+	if rrUpdate.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rrUpdate.Code, rrUpdate.Body.String())
+	}
+
+	var updated domain.Employee
+	_ = json.NewDecoder(rrUpdate.Body).Decode(&updated)
+
+	if updated.JobTitle != newTitle {
+		t.Errorf("expected %q got %q", newTitle, updated.JobTitle)
+	}
+	if updated.DepartmentID == nil || *updated.DepartmentID != newDept {
+		t.Errorf("expected department %q", newDept)
+	}
+	if pub.updated != 1 {
+		t.Errorf("expected 1 updated event got %d", pub.updated)
 	}
 }
 
