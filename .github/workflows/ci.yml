@@ -55,6 +55,7 @@ jobs:
           - accounts-receivable-svc
           - purchase-request-svc
           - treasury-svc
+          - financial-close-svc
 
     steps:
       - name: Checkout

@@ -139,4 +139,7 @@ var (
 	// passed through gateway-auth-svc's ForwardAuth verification. Fail
 	// closed, same pattern as schema-registry-svc.
 	ErrIdentityMissing = errorString("caller identity missing")
+
+	ErrPeriodLocked             = errorString("accounting period is closed or locked")
+	ErrCloseServiceUnavailable = errorString("financial-close-svc unavailable")
 )

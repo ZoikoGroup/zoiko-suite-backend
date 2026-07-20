@@ -1,13 +1,3 @@
-// Package main is the entry point for general-ledger-svc.
-//
-// Wiring order:
-//  1. Load config from environment
-//  2. Initialise structured logger (zap)
-//  3. Connect to PostgreSQL pool (pgxpool) — Tier 0 pool sizing
-//  4. Construct PgStore, Kafka producer, jurisdiction-rules-svc validator
-//  5. Construct HTTP handler + mount routes on chi router
-//  6. Mount health probes (/healthz, /readyz)
-//  7. Start HTTP server with graceful shutdown
 package main
 
 import (
@@ -29,15 +19,14 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
-	"zoiko.io/general-ledger-svc/internal/authz"
-	"zoiko.io/general-ledger-svc/internal/close"
-	"zoiko.io/general-ledger-svc/internal/config"
-	"zoiko.io/general-ledger-svc/internal/events"
-	"zoiko.io/general-ledger-svc/internal/handler"
-	"zoiko.io/general-ledger-svc/internal/health"
-	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
-	"zoiko.io/general-ledger-svc/internal/store"
-	"zoiko.io/general-ledger-svc/internal/telemetry"
+	"zoiko.io/financial-close-svc/internal/clients"
+	"zoiko.io/financial-close-svc/internal/config"
+	"zoiko.io/financial-close-svc/internal/events"
+	"zoiko.io/financial-close-svc/internal/handler"
+	"zoiko.io/financial-close-svc/internal/health"
+	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
+	"zoiko.io/financial-close-svc/internal/store"
+	"zoiko.io/financial-close-svc/internal/telemetry"
 )
 
 func main() {
@@ -56,14 +45,18 @@ func main() {
 	}
 	defer func() { _ = log.Sync() }()
 
-	log.Info("general-ledger-svc starting",
+	log.Info("financial-close-svc starting",
 		zap.Int("port", cfg.Port),
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("authz_url", cfg.AuthZServiceURL),
+		zap.String("ledger_url", cfg.LedgerServiceURL),
+		zap.String("ap_url", cfg.APServiceURL),
+		zap.String("ar_url", cfg.ARServiceURL),
+		zap.String("vault_url", cfg.VaultServiceURL),
 	)
 
-	// ── 2b. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
-	shutdownTracing, err := telemetry.InitTracing(context.Background(), "general-ledger-svc", cfg.OTELExporterEndpoint)
+	// ── 2b. Tracing ──────────────────────────────────────────────────────────
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "financial-close-svc", cfg.OTELExporterEndpoint)
 	if err != nil {
 		log.Fatal("otel tracing init failed", zap.Error(err))
 	}
@@ -75,11 +68,9 @@ func main() {
 		}
 	}()
 
-	metrics := telemetry.NewMetrics("general-ledger-svc")
+	metrics := telemetry.NewMetrics("financial-close-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
-	// Tier 0 pool sizing — same values as policy-svc/jurisdiction-rules-svc/
-	// tenant-entity-registry-svc.
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
 		log.Fatal("failed to parse db pool config", zap.Error(err))
@@ -97,7 +88,7 @@ func main() {
 	}
 	defer pool.Close()
 
-	// Verify connectivity at startup — fail fast rather than silently degrade.
+	// Verify connectivity at startup
 	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer pingCancel()
 	if err := pool.Ping(pingCtx); err != nil {
@@ -105,12 +96,9 @@ func main() {
 	}
 	log.Info("db pool connected")
 
-	// ── 4. Store, Kafka producer, jurisdiction validator ─────────────────────
-	pgStore := store.New(pool, log)
+	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
+	pgStore := store.New(pool)
 
-	// Kafka producer — connects lazily on first write, same posture as
-	// identity-context-svc/tenant-entity-registry-svc/policy-svc: not a
-	// fail-fast startup dependency like Postgres.
 	kafkaWriter := &kafka.Writer{
 		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:    cfg.Kafka.Topic,
@@ -119,25 +107,20 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
-	closeClient := close.NewHTTPClient(cfg.CloseServiceURL, log)
+	clientsWrapper := clients.New(cfg.AuthZServiceURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(otelchi.Middleware("general-ledger-svc", otelchi.WithChiRoutes(r)))
+	r.Use(otelchi.Middleware("financial-close-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
-	// Reads the caller's tenant scope from X-Tenant-Id (set by
-	// gateway-auth-svc's ForwardAuth verification) into context, so every DB
-	// call can filter by it explicitly — see internal/store's doc comment
-	// on why RLS alone is not sufficient here.
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, authzClient, closeClient, log)
+	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
@@ -181,7 +164,6 @@ func main() {
 	log.Info("server stopped")
 }
 
-// correlationIDMiddleware propagates X-Correlation-ID through every request.
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Correlation-ID") == "" {
