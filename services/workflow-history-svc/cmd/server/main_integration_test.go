@@ -47,6 +47,7 @@ func TestIntegration(t *testing.T) {
 	dbPort := uint32(freePort(t))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("workflow_history_test").
 			Username("postgres").
