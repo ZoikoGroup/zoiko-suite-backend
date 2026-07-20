@@ -49,7 +49,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 		log:     log,
 		// Tight timeout — an invoice action must not stall indefinitely
 		// because authorization-svc is slow.
-		http: &http.Client{Timeout: 2 * time.Second},
+		http: &http.Client{Timeout: 2 * time.Second, Transport: newRetryTransport()},
 	}
 }
 

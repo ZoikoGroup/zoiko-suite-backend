@@ -80,7 +80,7 @@ type HTTPClient struct {
 func NewHTTPClient(baseURL string) *HTTPClient {
 	return &HTTPClient{
 		baseURL: baseURL,
-		http:    &http.Client{Timeout: 3 * time.Second},
+		http:    &http.Client{Timeout: 3 * time.Second, Transport: newRetryTransport()},
 	}
 }
 
