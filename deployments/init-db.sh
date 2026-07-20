@@ -24,6 +24,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE workflow_history;
     CREATE DATABASE general_ledger;
     CREATE DATABASE accounts_payable;
+    CREATE DATABASE accounts_receivable;
     CREATE DATABASE purchase_request;
     CREATE DATABASE bank_reconciliation;
 EOSQL
@@ -100,6 +101,10 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f
 # Apply migrations for accounts-payable-svc
 echo "Applying migrations for accounts_payable..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000001_initial_schema.up.sql
+
+# Apply migrations for accounts-receivable-svc
+echo "Applying migrations for accounts_receivable..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_receivable" -f /migrations/accounts-receivable/000001_initial_schema.up.sql
 
 # Apply migrations for purchase-request-svc
 echo "Applying migrations for purchase_request..."
