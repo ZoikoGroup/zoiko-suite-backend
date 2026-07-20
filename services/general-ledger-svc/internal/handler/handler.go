@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
 )
 
@@ -47,14 +48,15 @@ const (
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	log       *zap.Logger
+	store       Store
+	publisher   Publisher
+	authz       AuthZClient
+	closeClient close.Client
+	log         *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+func New(store Store, publisher Publisher, authz AuthZClient, closeClient close.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, authz: authz, closeClient: closeClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -97,6 +99,16 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCreateJournal); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// Enforce Period Lock Check
+	if err := h.closeClient.CheckPeriodOpen(r.Context(), req.TenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
+		if errors.Is(err, domain.ErrPeriodLocked) {
+			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "close_check_failed", err.Error())
+		}
 		return
 	}
 
@@ -245,6 +257,16 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce Period Lock Check
+	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+		if errors.Is(err, domain.ErrPeriodLocked) {
+			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "close_check_failed", err.Error())
+		}
+		return
+	}
+
 	if err := h.store.TransitionJournal(r.Context(), header.TenantID, journalID,
 		domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {
 		h.handleTransitionErr(w, err)
@@ -298,6 +320,16 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionReverseJournal); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// Enforce Period Lock Check
+	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+		if errors.Is(err, domain.ErrPeriodLocked) {
+			writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "close_check_failed", err.Error())
+		}
 		return
 	}
 

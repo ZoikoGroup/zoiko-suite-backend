@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	"zoiko.io/general-ledger-svc/internal/handler"
 )
@@ -98,9 +99,22 @@ type stubAuthZ struct {
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+type stubClose struct {
+	err error
+}
+
+func (c *stubClose) CheckPeriodOpen(_ context.Context, _, _, _ string) error { return c.err }
+
+// Ensure stubClose satisfies the interface at compile-time.
+var _ close.Client = (*stubClose)(nil)
+
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
+	return newRouterWithClose(s, p, a, &stubClose{})
+}
+
+func newRouterWithClose(s *stubStore, p *stubPublisher, a *stubAuthZ, c close.Client) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, a, zap.NewNop())
+	h := handler.New(s, p, a, c, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
