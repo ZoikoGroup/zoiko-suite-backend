@@ -35,6 +35,8 @@ services:
       - ../services/accounts-receivable-svc/deployments/migrations:/migrations/accounts-receivable:ro
       - ../services/purchase-request-svc/deployments/migrations:/migrations/purchase-request:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
+      - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
+      - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/intercompany-accounting-svc/deployments/migrations:/migrations/intercompany-accounting:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -1165,6 +1167,96 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8102/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  treasury-svc:
+    build:
+      context: ../services/treasury-svc
+      dockerfile: Dockerfile
+    container_name: treasury-svc
+    ports:
+      - "8103:8103"
+    environment:
+      PORT: "8103"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: treasury
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.treasury.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      AP_SERVICE_URL: "http://accounts-payable-svc:8099"
+      AR_SERVICE_URL: "http://accounts-receivable-svc:8101"
+      OBLIGATIONS_SERVICE_URL: "http://obligations-svc:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+      accounts-payable-svc:
+        condition: service_healthy
+      accounts-receivable-svc:
+        condition: service_healthy
+      obligations-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8103/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  financial-close-svc:
+    build:
+      context: ../services/financial-close-svc
+      dockerfile: Dockerfile
+    container_name: financial-close-svc
+    ports:
+      - "8104:8104"
+    environment:
+      PORT: "8104"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: financial_close
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.close.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      AP_SERVICE_URL: "http://accounts-payable-svc:8099"
+      AR_SERVICE_URL: "http://accounts-receivable-svc:8101"
+      VAULT_SERVICE_URL: "http://document-vault-svc:8092"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+      accounts-payable-svc:
+        condition: service_healthy
+      accounts-receivable-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8104/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
