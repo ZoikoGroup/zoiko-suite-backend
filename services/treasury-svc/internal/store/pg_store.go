@@ -289,6 +289,13 @@ func (s *PgStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID stri
 		return domain.ErrIdentityMissing
 	}
 
+	// Store-layer invariant: amount must be strictly positive. The handler rejects
+	// non-positive amounts first, but we assert here too so this store method is safe
+	// to call from any future code path without relying on the handler as the sole gate.
+	if amount <= 0 {
+		return domain.ErrInvalidAmount
+	}
+
 	now := time.Now().UTC()
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {

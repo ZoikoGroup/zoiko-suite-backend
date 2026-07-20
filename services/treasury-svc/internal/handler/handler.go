@@ -290,16 +290,24 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Pending AP Commitments
+	// 2. Pending AP Commitments — fail closed: if AP is unavailable the figure is
+	// unreliable; return an error rather than presenting a partial cash position
+	// as authoritative (consistent with evidence-manifest-svc doctrine).
 	apSum, err := h.clients.GetPendingAPCommitments(r.Context(), tenantID, legalEntityID, currencyCode)
 	if err != nil {
-		h.log.Warn("AP service query failed — proceeding with zero commitments fallback", zap.Error(err))
+		h.log.Error("AP service unavailable — failing closed on effective cash", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "upstream_dependency_unavailable",
+			"accounts-payable-svc is unreachable; effective cash figure cannot be computed reliably")
+		return
 	}
 
-	// 3. Obligations (Tax, payroll, etc)
+	// 3. Obligations (Tax, payroll, etc) — same fail-closed doctrine.
 	payrollSum, taxSum, err := h.clients.GetOutstandingObligations(r.Context(), tenantID, legalEntityID, currencyCode)
 	if err != nil {
-		h.log.Warn("Obligations service query failed — proceeding with zero obligations fallback", zap.Error(err))
+		h.log.Error("Obligations service unavailable — failing closed on effective cash", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "upstream_dependency_unavailable",
+			"obligations-svc is unreachable; effective cash figure cannot be computed reliably")
+		return
 	}
 
 	effectiveCash := bankSum - apSum - payrollSum - taxSum
@@ -346,6 +354,16 @@ func (h *Handler) InitiateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// BLOCKING FIX #1: Reject non-positive amounts before any account or balance
+	// lookup. A negative amount reverses the transfer direction — draining the
+	// target and crediting the source — bypassing the insufficient-funds check
+	// entirely (srcBal < negativeAmount is trivially false). Zero-amount transfers
+	// are a no-op that must not produce balance records.
+	if req.Amount <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -357,21 +375,48 @@ func (h *Handler) InitiateTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Authorize against the source account's legal entity.
 	if err := h.authz.CheckAllowed(r.Context(), principalID, srcAcct.LegalEntityID, actionInitiateTransfer); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	// Calculate if transfer breaches minimum balance threshold
-	bal, err := h.store.GetLatestCashBalance(r.Context(), req.SourceBankAccountID)
-	if err == nil && bal != nil {
-		threshold, err := h.store.GetLiquidityThreshold(r.Context(), srcAcct.LegalEntityID, req.CurrencyCode)
-		if err == nil && threshold != nil {
-			if bal.AvailableBalance-req.Amount < threshold.MinimumRequiredBalance {
-				h.log.Warn("transfer blocked: threshold breach on source account", zap.String("account_id", req.SourceBankAccountID))
-				writeError(w, http.StatusPreconditionFailed, "minimum_balance_breach", string(domain.ErrMinimumBalanceBreach))
-				return
-			}
+	// FIX #3: Also authorize against the TARGET account's legal entity.
+	// A principal authorized over entity A must not be able to move funds into
+	// (or out of, via negative amounts) an entity B account without authorization.
+	tgtAcct, err := h.store.GetBankAccount(r.Context(), req.TargetBankAccountID)
+	if err != nil || tgtAcct == nil {
+		writeError(w, http.StatusNotFound, "target_account_not_found", "")
+		return
+	}
+	if tgtAcct.LegalEntityID != srcAcct.LegalEntityID {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, tgtAcct.LegalEntityID, actionInitiateTransfer); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	// FIX #2: Fail CLOSED on liquidity threshold errors (not open).
+	// Every other cross-service check in this codebase fails closed on store error.
+	// If we cannot read the balance or threshold, block the transfer — do not silently
+	// skip the check and allow the transfer to proceed unguarded.
+	bal, balErr := h.store.GetLatestCashBalance(r.Context(), req.SourceBankAccountID)
+	if balErr != nil {
+		h.log.Error("failed to read cash balance for threshold check — failing closed", zap.Error(balErr))
+		writeError(w, http.StatusServiceUnavailable, "balance_check_failed", "cannot verify balance before transfer")
+		return
+	}
+	if bal != nil {
+		threshold, threshErr := h.store.GetLiquidityThreshold(r.Context(), srcAcct.LegalEntityID, req.CurrencyCode)
+		if threshErr != nil {
+			h.log.Error("failed to read liquidity threshold — failing closed", zap.Error(threshErr))
+			writeError(w, http.StatusServiceUnavailable, "threshold_check_failed", "cannot verify liquidity threshold before transfer")
+			return
+		}
+		if threshold != nil && bal.AvailableBalance-req.Amount < threshold.MinimumRequiredBalance {
+			h.log.Warn("transfer blocked: threshold breach on source account", zap.String("account_id", req.SourceBankAccountID))
+			writeError(w, http.StatusPreconditionFailed, "minimum_balance_breach", string(domain.ErrMinimumBalanceBreach))
+			return
 		}
 	}
 

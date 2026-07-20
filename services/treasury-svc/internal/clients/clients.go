@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
-	"regexp"
-	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -139,29 +137,16 @@ func (c *Clients) GetOutstandingObligations(ctx context.Context, tenantID, legal
 	}
 
 	var payrollSum, taxSum float64
-	re := regexp.MustCompile(`\d+(?:\.\d+)?`)
 
-	for _, o := range list {
-		if o.ObligationStatus == "CLOSED" {
-			continue
-		}
-		// Extract value from SourceReference or ObligationCode
-		matches := re.FindStringSubmatch(o.SourceReference)
-		if len(matches) == 0 {
-			matches = re.FindStringSubmatch(o.ObligationID) // Fallback to parsing UUID numeric prefix if any
-		}
-		var val float64
-		if len(matches) > 0 {
-			val, _ = strconv.ParseFloat(matches[0], 64)
-		}
-
-		if o.ObligationType == "TAX_PAYMENT" {
-			taxSum += val
-		} else if o.ObligationType == "FILING" || o.ObligationType == "REGULATORY_REPORT" {
-			// Other regulatory/payroll obligations
-			payrollSum += val
-		}
-	}
+	// V1 DOCUMENTED GAP: obligations-svc's Obligation struct carries no monetary
+	// field — SourceReference is a human-readable citation string (e.g.
+	// "Contract #4821 Clause 12.3", "IN-GST-FILING-RULE-07"), not a dollar amount.
+	// Parsing digits from it produces fabricated numbers that flow into
+	// EffectiveCash and liquidity-breach decisions. Until obligations-svc exposes
+	// a real amount field, we return 0/0 here rather than presenting invented
+	// figures as authoritative financial data. Track resolution in:
+	// https://github.com/ZoikoGroup/zoiko-suite-backend/issues (obligations-svc amount field).
+	_ = list // list is decoded to validate the response is well-formed
 
 	return payrollSum, taxSum, nil
 }
@@ -285,21 +270,14 @@ func (c *Clients) GetLiquidityForecastData(ctx context.Context, tenantID, legalE
 			if err == nil && resp.StatusCode == http.StatusOK {
 				var list []obligation
 				if json.NewDecoder(resp.Body).Decode(&list) == nil {
-					re := regexp.MustCompile(`\d+(?:\.\d+)?`)
+					// V1 DOCUMENTED GAP: no monetary field on Obligation — use due_date
+					// for schedule forecasting only; amount is excluded until the field exists.
 					for _, o := range list {
 						if o.ObligationStatus == "CLOSED" {
 							continue
 						}
-						matches := re.FindStringSubmatch(o.SourceReference)
-						if len(matches) == 0 {
-							matches = re.FindStringSubmatch(o.ObligationID)
-						}
-						var val float64
-						if len(matches) > 0 {
-							val, _ = strconv.ParseFloat(matches[0], 64)
-						}
 						outflows = append(outflows, domain.ExpectedCashFlow{
-							Amount:   val,
+							Amount:   0, // No monetary field available in obligations-svc v1
 							DueDate:  o.DueDate,
 							Category: "OBLIGATION",
 						})
