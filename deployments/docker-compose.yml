@@ -34,6 +34,7 @@ services:
       - ../services/accounts-payable-svc/deployments/migrations:/migrations/accounts-payable:ro
       - ../services/accounts-receivable-svc/deployments/migrations:/migrations/accounts-receivable:ro
       - ../services/purchase-request-svc/deployments/migrations:/migrations/purchase-request:ro
+      - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1121,6 +1122,48 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8101/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Bank Reconciliation Service — UNMATCHED forks to MATCHED or EXCEPTION;
+  # EXCEPTION can later resolve to MATCHED once the right ledger entry is
+  # found. A MATCH is verified against a real FINALIZED journal in
+  # general-ledger-svc (status, legal entity, and net amount all
+  # cross-checked) before it's ever persisted. Postgres RLS + explicit
+  # tenant_id filters in every query from day one.
+  bank-reconciliation-svc:
+    build:
+      context: ../services/bank-reconciliation-svc
+      dockerfile: Dockerfile
+    container_name: bank-reconciliation-svc
+    ports:
+      - "8102:8102"
+    environment:
+      PORT: "8102"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: bank_reconciliation
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.bank-reconciliation.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8102/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
