@@ -58,6 +58,7 @@ jobs:
           - financial-close-svc
           - bank-reconciliation-svc
           - intercompany-accounting-svc
+          - consolidation-svc
 
     steps:
       - name: Checkout
@@ -90,7 +91,7 @@ jobs:
       - name: Test (with race detector)
         working-directory: services/${{ matrix.service }}
         env:
-          TEST_DATABASE_URL: ${{ (matrix.service == 'jurisdiction-rules-svc' || matrix.service == 'identity-context-svc' || matrix.service == 'governance-decision-log-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'policy-svc' || matrix.service == 'configuration-feature-flag-svc' || matrix.service == 'obligations-svc' || matrix.service == 'secret-vault-integration-svc' || matrix.service == 'authorization-svc' || matrix.service == 'workflow-svc' || matrix.service == 'schema-registry-svc' || matrix.service == 'document-vault-svc' || matrix.service == 'evidence-manifest-svc' || matrix.service == 'general-ledger-svc' || matrix.service == 'accounts-payable-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc') && 'postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable' || '' }}
+          TEST_DATABASE_URL: ${{ (matrix.service == 'jurisdiction-rules-svc' || matrix.service == 'identity-context-svc' || matrix.service == 'governance-decision-log-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'policy-svc' || matrix.service == 'configuration-feature-flag-svc' || matrix.service == 'obligations-svc' || matrix.service == 'secret-vault-integration-svc' || matrix.service == 'authorization-svc' || matrix.service == 'workflow-svc' || matrix.service == 'schema-registry-svc' || matrix.service == 'document-vault-svc' || matrix.service == 'evidence-manifest-svc' || matrix.service == 'general-ledger-svc' || matrix.service == 'accounts-payable-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc') && 'postgres://postgres:secretpassword@localhost:5432/testdb?sslmode=disable' || '' }}
 
         # go list ./... pre-enumerates packages, excluding the bare module
         # root which has no .go files (verified: this causes "no Go files
@@ -117,7 +118,7 @@ jobs:
         run: go test -v -tags=integration -count=1 -timeout=120s ./cmd/server/
 
       - name: Integration test — store isolation/pipeline (PgStore → DB)
-        if: matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc'
+        if: matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc'
         working-directory: services/${{ matrix.service }}
         # Runs integration tests under internal/store to verify isolation or the consumer pipeline.
         # Uses embedded-postgres (downloads real Postgres binaries automatically).
