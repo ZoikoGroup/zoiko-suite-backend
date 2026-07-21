@@ -171,6 +171,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "compensation" -f /
 # Apply migrations for benefits-svc
 echo "Applying migrations for benefits..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "benefits" -f /migrations/benefits/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "benefits" -f /migrations/benefits/000002_fix_lookup_and_idempotency.up.sql
 
 # Apply migrations for payroll-tax-svc
 echo "Applying migrations for payroll_tax..."

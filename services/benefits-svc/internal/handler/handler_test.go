@@ -20,20 +20,33 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	plans     map[string]*domain.BenefitPlan
-	elections map[string]*domain.BenefitElection
+	plans           map[string]*domain.BenefitPlan
+	plansByCorr     map[string]string
+	elections       map[string]*domain.BenefitElection
+	electionsByCorr map[string]string
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		plans:     make(map[string]*domain.BenefitPlan),
-		elections: make(map[string]*domain.BenefitElection),
+		plans:           make(map[string]*domain.BenefitPlan),
+		plansByCorr:     make(map[string]string),
+		elections:       make(map[string]*domain.BenefitElection),
+		electionsByCorr: make(map[string]string),
 	}
 }
 
-func (s *stubStore) CreatePlan(_ context.Context, p *domain.BenefitPlan) error {
+func (s *stubStore) CreatePlan(_ context.Context, p *domain.BenefitPlan) (bool, error) {
+	if p.CorrelationID != "" {
+		if existingID, ok := s.plansByCorr[p.CorrelationID]; ok {
+			*p = *s.plans[existingID]
+			return false, nil
+		}
+	}
 	s.plans[p.PlanID] = p
-	return nil
+	if p.CorrelationID != "" {
+		s.plansByCorr[p.CorrelationID] = p.PlanID
+	}
+	return true, nil
 }
 
 func (s *stubStore) ListPlans(_ context.Context, legalEntityID, status string) ([]domain.BenefitPlan, error) {
@@ -58,9 +71,26 @@ func (s *stubStore) GetPlan(_ context.Context, planID string) (*domain.BenefitPl
 	return p, nil
 }
 
-func (s *stubStore) CreateElection(_ context.Context, e *domain.BenefitElection) error {
+func (s *stubStore) CreateElection(_ context.Context, e *domain.BenefitElection) (bool, error) {
+	if e.CorrelationID != "" {
+		if existingID, ok := s.electionsByCorr[e.CorrelationID]; ok {
+			*e = *s.elections[existingID]
+			return false, nil
+		}
+	}
 	s.elections[e.ElectionID] = e
-	return nil
+	if e.CorrelationID != "" {
+		s.electionsByCorr[e.CorrelationID] = e.ElectionID
+	}
+	return true, nil
+}
+
+func (s *stubStore) GetElection(_ context.Context, electionID string) (*domain.BenefitElection, error) {
+	e, ok := s.elections[electionID]
+	if !ok {
+		return nil, domain.ErrElectionNotFound
+	}
+	return e, nil
 }
 
 func (s *stubStore) UpdateElection(_ context.Context, e *domain.BenefitElection) error {
@@ -167,6 +197,7 @@ func TestCreatePlan_MissingPrincipal(t *testing.T) {
 		"provider_name":           "Aetna",
 		"deduction_tax_treatment": "PRE_TAX",
 		"currency":                "USD",
+		"correlation_id":          "corr-plan-missing-principal",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -186,6 +217,7 @@ func TestCreatePlan_HappyPath(t *testing.T) {
 		"employer_contribution_pct":    50.0,
 		"employee_contribution_amount": 200.0,
 		"currency":                     "USD",
+		"correlation_id":               "corr-plan-1",
 	}, "hr-admin")
 
 	if rr.Code != http.StatusCreated {
@@ -216,6 +248,7 @@ func TestEnrollAndDeductionSummary(t *testing.T) {
 		"employer_contribution_pct":    50.0,
 		"employee_contribution_amount": 300.0,
 		"currency":                     "USD",
+		"correlation_id":               "corr-plan-pretax",
 	}, "hr-admin")
 
 	var planPreTax domain.BenefitPlan
@@ -231,6 +264,7 @@ func TestEnrollAndDeductionSummary(t *testing.T) {
 		"employer_contribution_pct":    0.0,
 		"employee_contribution_amount": 50.0,
 		"currency":                     "USD",
+		"correlation_id":               "corr-plan-posttax",
 	}, "hr-admin")
 
 	var planPostTax domain.BenefitPlan
@@ -242,6 +276,7 @@ func TestEnrollAndDeductionSummary(t *testing.T) {
 		"plan_id":        planPreTax.PlanID,
 		"coverage_level": "EMPLOYEE_PLUS_FAMILY",
 		"effective_from": "2024-01-01",
+		"correlation_id": "corr-elect-pretax",
 	}, "hr-admin")
 
 	if rrE1.Code != http.StatusCreated {
@@ -254,6 +289,7 @@ func TestEnrollAndDeductionSummary(t *testing.T) {
 		"plan_id":        planPostTax.PlanID,
 		"coverage_level": "EMPLOYEE_ONLY",
 		"effective_from": "2024-01-01",
+		"correlation_id": "corr-elect-posttax",
 	}, "hr-admin")
 
 	if rrE2.Code != http.StatusCreated {
@@ -284,5 +320,171 @@ func TestEnrollAndDeductionSummary(t *testing.T) {
 	}
 	if summary.ElectionsCount != 2 {
 		t.Errorf("expected 2 elections got %d", summary.ElectionsCount)
+	}
+}
+
+// ── UpdateElection / CancelElection Tests ───────────────────────────────────────
+
+func TestUpdateElection_HappyPath(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	rrP := doReq(r, http.MethodPost, "/v1/benefits/plans", map[string]any{
+		"legal_entity_id":         "le-us",
+		"name":                    "Health Plan",
+		"plan_type":               "HEALTH_INSURANCE",
+		"provider_name":           "Aetna",
+		"deduction_tax_treatment": "PRE_TAX",
+		"currency":                "USD",
+		"correlation_id":          "corr-plan-update",
+	}, "hr-admin")
+	var plan domain.BenefitPlan
+	_ = json.NewDecoder(rrP.Body).Decode(&plan)
+
+	rrE := doReq(r, http.MethodPost, "/v1/benefits/elections", map[string]any{
+		"employee_id":    "emp-301",
+		"plan_id":        plan.PlanID,
+		"coverage_level": "EMPLOYEE_ONLY",
+		"effective_from": "2024-01-01",
+		"correlation_id": "corr-elect-update",
+	}, "hr-admin")
+	var election domain.BenefitElection
+	_ = json.NewDecoder(rrE.Body).Decode(&election)
+
+	rrU := doReq(r, http.MethodPut, "/v1/benefits/elections/"+election.ElectionID, map[string]any{
+		"coverage_level": "EMPLOYEE_PLUS_SPOUSE",
+	}, "hr-admin")
+	if rrU.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rrU.Code, rrU.Body.String())
+	}
+
+	var updated domain.BenefitElection
+	_ = json.NewDecoder(rrU.Body).Decode(&updated)
+	if updated.CoverageLevel != "EMPLOYEE_PLUS_SPOUSE" {
+		t.Errorf("expected coverage_level updated, got %q", updated.CoverageLevel)
+	}
+}
+
+func TestUpdateElection_NotFound(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	rrU := doReq(r, http.MethodPut, "/v1/benefits/elections/does-not-exist", map[string]any{
+		"coverage_level": "EMPLOYEE_ONLY",
+	}, "hr-admin")
+	if rrU.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d: %s", rrU.Code, rrU.Body.String())
+	}
+}
+
+func TestUpdateElection_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	rrP := doReq(r, http.MethodPost, "/v1/benefits/plans", map[string]any{
+		"legal_entity_id":         "le-us",
+		"name":                    "Health Plan",
+		"plan_type":               "HEALTH_INSURANCE",
+		"provider_name":           "Aetna",
+		"deduction_tax_treatment": "PRE_TAX",
+		"currency":                "USD",
+		"correlation_id":          "corr-plan-update-2",
+	}, "hr-admin")
+	var plan domain.BenefitPlan
+	_ = json.NewDecoder(rrP.Body).Decode(&plan)
+
+	rrE := doReq(r, http.MethodPost, "/v1/benefits/elections", map[string]any{
+		"employee_id":    "emp-302",
+		"plan_id":        plan.PlanID,
+		"coverage_level": "EMPLOYEE_ONLY",
+		"effective_from": "2024-01-01",
+		"correlation_id": "corr-elect-update-2",
+	}, "hr-admin")
+	var election domain.BenefitElection
+	_ = json.NewDecoder(rrE.Body).Decode(&election)
+
+	// Simulate employee-master-svc being unreachable for the update itself.
+	downValidator := &stubEmployeeValidator{err: domain.ErrStoreUnavailable}
+	rDown := newRouter(s, &stubPublisher{}, &stubAuthZ{}, downValidator)
+
+	rrU := doReq(rDown, http.MethodPut, "/v1/benefits/elections/"+election.ElectionID, map[string]any{
+		"coverage_level": "EMPLOYEE_PLUS_SPOUSE",
+	}, "hr-admin")
+	if rrU.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (fail closed) got %d: %s", rrU.Code, rrU.Body.String())
+	}
+}
+
+func TestCancelElection_HappyPath(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	rrP := doReq(r, http.MethodPost, "/v1/benefits/plans", map[string]any{
+		"legal_entity_id":         "le-us",
+		"name":                    "Health Plan",
+		"plan_type":               "HEALTH_INSURANCE",
+		"provider_name":           "Aetna",
+		"deduction_tax_treatment": "PRE_TAX",
+		"currency":                "USD",
+		"correlation_id":          "corr-plan-cancel",
+	}, "hr-admin")
+	var plan domain.BenefitPlan
+	_ = json.NewDecoder(rrP.Body).Decode(&plan)
+
+	rrE := doReq(r, http.MethodPost, "/v1/benefits/elections", map[string]any{
+		"employee_id":    "emp-303",
+		"plan_id":        plan.PlanID,
+		"coverage_level": "EMPLOYEE_ONLY",
+		"effective_from": "2024-01-01",
+		"correlation_id": "corr-elect-cancel",
+	}, "hr-admin")
+	var election domain.BenefitElection
+	_ = json.NewDecoder(rrE.Body).Decode(&election)
+
+	rrC := doReq(r, http.MethodPost, "/v1/benefits/elections/"+election.ElectionID+"/cancel", nil, "hr-admin")
+	if rrC.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rrC.Code, rrC.Body.String())
+	}
+	if pub.terminated != 1 {
+		t.Errorf("expected 1 terminated event got %d", pub.terminated)
+	}
+
+	// A second cancel of the same election must not succeed twice.
+	rrC2 := doReq(r, http.MethodPost, "/v1/benefits/elections/"+election.ElectionID+"/cancel", nil, "hr-admin")
+	if rrC2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 on double-cancel got %d: %s", rrC2.Code, rrC2.Body.String())
+	}
+}
+
+func TestCreatePlan_Idempotent_ReplayReturns200(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	body := map[string]any{
+		"legal_entity_id":         "le-us",
+		"name":                    "Gold Health Plan",
+		"plan_type":               "HEALTH_INSURANCE",
+		"provider_name":           "Aetna",
+		"deduction_tax_treatment": "PRE_TAX",
+		"currency":                "USD",
+		"correlation_id":          "corr-plan-replay",
+	}
+
+	rr1 := doReq(r, http.MethodPost, "/v1/benefits/plans", body, "hr-admin")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var p1 domain.BenefitPlan
+	_ = json.NewDecoder(rr1.Body).Decode(&p1)
+
+	rr2 := doReq(r, http.MethodPost, "/v1/benefits/plans", body, "hr-admin")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on replay got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var p2 domain.BenefitPlan
+	_ = json.NewDecoder(rr2.Body).Decode(&p2)
+	if p2.PlanID != p1.PlanID {
+		t.Errorf("expected replay to resolve to the original plan %q, got %q", p1.PlanID, p2.PlanID)
 	}
 }
