@@ -57,6 +57,7 @@ services:
       - ../services/board-resolutions-svc/deployments/migrations:/migrations/board-resolutions:ro
       - ../services/corporate-actions-svc/deployments/migrations:/migrations/corporate-actions:ro
       - ../services/counterparty-management-svc/deployments/migrations:/migrations/counterparty-management:ro
+      - ../services/tax-rules-svc/deployments/migrations:/migrations/tax-rules:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1956,6 +1957,35 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  tax-rules-svc:
+    build:
+      context: ../services/tax-rules-svc
+      dockerfile: Dockerfile
+    container_name: tax-rules-svc
+    ports:
+      - "8125:8125"
+    environment:
+      PORT: "8125"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_rules?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
     depends_on:

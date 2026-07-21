@@ -256,4 +256,14 @@ EOSQL
 echo "Applying migrations for counterparty_management..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "counterparty_management" -f /migrations/counterparty-management/000001_initial_schema.up.sql
 
+# Create database for tax-rules-svc
+echo "Creating database: tax_rules..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE tax_rules;
+EOSQL
+
+# Apply migrations for tax-rules-svc
+echo "Applying migrations for tax_rules..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_rules" -f /migrations/tax-rules/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
