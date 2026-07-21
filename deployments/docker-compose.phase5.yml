@@ -1,0 +1,393 @@
+# Phase 5 — Legal, Tax & Compliance Engine
+# Standalone compose for local development and Postman testing.
+# Starts only infrastructure + the 10 Phase 5 services.
+# Usage:
+#   docker compose -f deployments/docker-compose.phase5.yml up --build -d
+#   docker compose -f deployments/docker-compose.phase5.yml logs -f
+#   docker compose -f deployments/docker-compose.phase5.yml down -v
+
+services:
+
+  # ─── Infrastructure ──────────────────────────────────────────────────────────
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper-p5
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-p5
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-p5
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - ./init-db-phase5.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+      - ../services/contract-lifecycle-svc/deployments/migrations:/migrations/contract-lifecycle:ro
+      - ../services/clause-template-svc/deployments/migrations:/migrations/clause-template:ro
+      - ../services/obligation-tracking-svc/deployments/migrations:/migrations/obligation-tracking:ro
+      - ../services/board-resolutions-svc/deployments/migrations:/migrations/board-resolutions:ro
+      - ../services/corporate-actions-svc/deployments/migrations:/migrations/corporate-actions:ro
+      - ../services/counterparty-management-svc/deployments/migrations:/migrations/counterparty-management:ro
+      - ../services/tax-rules-svc/deployments/migrations:/migrations/tax-rules:ro
+      - ../services/tax-determination-svc/deployments/migrations:/migrations/tax-determination:ro
+      - ../services/vat-gst-svc/deployments/migrations:/migrations/vat-gst:ro
+      - ../services/corporate-tax-svc/deployments/migrations:/migrations/corporate-tax:ro
+      - postgres_p5_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # Stub authz-svc so Phase 5 services start without the full identity stack.
+  # Returns 200 {"allowed":true} for all requests.
+  authorization-svc:
+    image: hashicorp/http-echo:1.0.0
+    container_name: authorization-svc-p5
+    command: ["-listen=:8089", "-text={\"allowed\":true}"]
+    ports:
+      - "8089:8089"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8089/v1/authorize || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Phase 5 Services ────────────────────────────────────────────────────────
+
+  contract-lifecycle-svc:
+    build:
+      context: ../services/contract-lifecycle-svc
+      dockerfile: Dockerfile
+    container_name: contract-lifecycle-svc-p5
+    ports:
+      - "8119:8119"
+    environment:
+      PORT: "8119"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/contract_lifecycle?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  clause-template-svc:
+    build:
+      context: ../services/clause-template-svc
+      dockerfile: Dockerfile
+    container_name: clause-template-svc-p5
+    ports:
+      - "8120:8120"
+    environment:
+      PORT: "8120"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/clause_template?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  obligation-tracking-svc:
+    build:
+      context: ../services/obligation-tracking-svc
+      dockerfile: Dockerfile
+    container_name: obligation-tracking-svc-p5
+    ports:
+      - "8121:8121"
+    environment:
+      PORT: "8121"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/obligation_tracking?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.obligation-tracking.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  board-resolutions-svc:
+    build:
+      context: ../services/board-resolutions-svc
+      dockerfile: Dockerfile
+    container_name: board-resolutions-svc-p5
+    ports:
+      - "8122:8122"
+    environment:
+      PORT: "8122"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/board_resolutions?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.board-resolutions.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  corporate-actions-svc:
+    build:
+      context: ../services/corporate-actions-svc
+      dockerfile: Dockerfile
+    container_name: corporate-actions-svc-p5
+    ports:
+      - "8123:8123"
+    environment:
+      PORT: "8123"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_actions?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  counterparty-management-svc:
+    build:
+      context: ../services/counterparty-management-svc
+      dockerfile: Dockerfile
+    container_name: counterparty-management-svc-p5
+    ports:
+      - "8124:8124"
+    environment:
+      PORT: "8124"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/counterparty_management?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  tax-rules-svc:
+    build:
+      context: ../services/tax-rules-svc
+      dockerfile: Dockerfile
+    container_name: tax-rules-svc-p5
+    ports:
+      - "8125:8125"
+    environment:
+      PORT: "8125"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_rules?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  tax-determination-svc:
+    build:
+      context: ../services/tax-determination-svc
+      dockerfile: Dockerfile
+    container_name: tax-determination-svc-p5
+    ports:
+      - "8126:8126"
+    environment:
+      PORT: "8126"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_determination?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.tax-determination.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  vat-gst-svc:
+    build:
+      context: ../services/vat-gst-svc
+      dockerfile: Dockerfile
+    container_name: vat-gst-svc-p5
+    ports:
+      - "8127:8127"
+    environment:
+      PORT: "8127"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/vat_gst?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.vat-gst.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  corporate-tax-svc:
+    build:
+      context: ../services/corporate-tax-svc
+      dockerfile: Dockerfile
+    container_name: corporate-tax-svc-p5
+    ports:
+      - "8128:8128"
+    environment:
+      PORT: "8128"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_tax?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.corporate-tax.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      GENERAL_LEDGER_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+volumes:
+  postgres_p5_data:
