@@ -1,0 +1,1088 @@
+{
+    "variable":  [
+                     {
+                         "key":  "baseUrl",
+                         "type":  "string",
+                         "value":  "http://localhost"
+                     },
+                     {
+                         "key":  "tenantId",
+                         "type":  "string",
+                         "value":  "tenant-demo-01"
+                     },
+                     {
+                         "key":  "contractId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "clauseId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "obligationId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "resolutionId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "actionId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "counterpartyId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "taxRuleId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "determinationId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "vatReturnId",
+                         "type":  "string",
+                         "value":  ""
+                     },
+                     {
+                         "key":  "corpTaxReturnId",
+                         "type":  "string",
+                         "value":  ""
+                     }
+                 ],
+    "info":  {
+                 "description":  "Complete API collection for all 10 Phase 5 microservices. Header X-Tenant-Id required on all requests.",
+                 "name":  "ZoikoSuite - Phase 5: Legal, Tax \u0026 Compliance Engine",
+                 "schema":  "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+                 "_postman_id":  "zoiko-phase5-legal-tax-compliance"
+             },
+    "item":  [
+                 {
+                     "name":  "01 - Contract Lifecycle Service (8119)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8119/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"counterparty_id\":\"cp-vendor-001\",\"contract_type\":\"SUPPLY_AGREEMENT\",\"title\":\"Annual Software Supply Agreement 2026\",\"jurisdiction_id\":\"uk-england\",\"effective_from\":\"2026-01-01\",\"effective_to\":\"2026-12-31\",\"value\":250000.00,\"currency\":\"GBP\",\"created_by\":\"legal-manager-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8119/v1/contracts",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Contract",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027contractId\u0027,b.contract_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Contracts",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8119/v1/contracts?legal_entity_id=le-uk-001",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Contract by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8119/v1/contracts/{{contractId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Execute Contract",
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"executed_by\":\"legal-director-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8119/v1/contracts/{{contractId}}/execute",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "02 - Clause Template Service (8120)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8120/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"name\":\"Standard Confidentiality Clause\",\"clause_type\":\"CONFIDENTIALITY\",\"jurisdiction_id\":\"uk-england\",\"content\":\"The parties agree to maintain strict confidentiality...\",\"version\":\"1.0\",\"effective_from\":\"2026-01-01\",\"created_by\":\"legal-officer-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8120/v1/clause-templates",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Clause Template",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027clauseId\u0027,b.template_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Clause Templates",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8120/v1/clause-templates",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Clause Template by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8120/v1/clause-templates/{{clauseId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "03 - Obligation Tracking Service (8121)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8121/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"jurisdiction_id\":\"uk-england\",\"obligation_type\":\"REGULATORY\",\"title\":\"Annual HMRC Corporation Tax Filing\",\"description\":\"Submit annual corporate tax return to HMRC\",\"due_date\":\"2027-03-31\",\"effective_from\":\"2026-01-01\",\"created_by\":\"compliance-officer-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8121/v1/obligations",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Obligation",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027obligationId\u0027,b.obligation_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Obligations",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8121/v1/obligations?legal_entity_id=le-uk-001",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Obligation by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8121/v1/obligations/{{obligationId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Complete Obligation",
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"completed_by\":\"compliance-director-01\",\"notes\":\"Filed via HMRC portal. Ref: CT600-2026-001\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8121/v1/obligations/{{obligationId}}/complete",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "04 - Board Resolutions Service (8122)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8122/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"resolution_type\":\"ORDINARY\",\"title\":\"Approval of Annual Budget FY2026\",\"description\":\"Board resolution to approve consolidated operating budget for FY2026\",\"meeting_date\":\"2026-02-15\",\"jurisdiction_id\":\"uk-england\",\"effective_from\":\"2026-02-15\",\"created_by\":\"company-secretary-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8122/v1/resolutions",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Board Resolution",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027resolutionId\u0027,b.resolution_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Resolutions",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8122/v1/resolutions?legal_entity_id=le-uk-001",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Resolution by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8122/v1/resolutions/{{resolutionId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Adopt Resolution",
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"adopted_by\":\"chairperson-01\",\"votes_for\":5,\"votes_against\":0,\"votes_abstained\":1}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8122/v1/resolutions/{{resolutionId}}/adopt",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "05 - Corporate Actions Service (8123)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8123/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"action_type\":\"SHARE_ISSUANCE\",\"title\":\"Series B Share Issuance\",\"description\":\"Issuance of 1000000 ordinary shares at GBP 2.50\",\"jurisdiction_id\":\"uk-england\",\"effective_date\":\"2026-03-01\",\"effective_from\":\"2026-03-01\",\"value\":2500000.00,\"currency\":\"GBP\",\"created_by\":\"cfo-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8123/v1/corporate-actions",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Corporate Action",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027actionId\u0027,b.action_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Corporate Actions",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8123/v1/corporate-actions?legal_entity_id=le-uk-001",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Corporate Action by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8123/v1/corporate-actions/{{actionId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Approve Corporate Action",
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"approved_by\":\"board-chairperson-01\",\"resolution_reference\":\"BR-2026-001\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8123/v1/corporate-actions/{{actionId}}/approve",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "06 - Counterparty Management Service (8124)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8124/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"counterparty_type\":\"VENDOR\",\"name\":\"Acme Technology Solutions Ltd\",\"registration_number\":\"GB12345678\",\"jurisdiction_id\":\"uk-england\",\"tax_id\":\"GB999888777\",\"contact_email\":\"accounts@acme-tech.co.uk\",\"effective_from\":\"2026-01-01\",\"created_by\":\"procurement-manager-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8124/v1/counterparties",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Counterparty",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027counterpartyId\u0027,b.counterparty_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Counterparties",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8124/v1/counterparties?counterparty_type=VENDOR",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Counterparty by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8124/v1/counterparties/{{counterpartyId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Update Counterparty",
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"contact_email\":\"finance@acme-tech.co.uk\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "PUT",
+                                                      "url":  "{{baseUrl}}:8124/v1/counterparties/{{counterpartyId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "07 - Tax Rules Service (8125)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8125/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"jurisdiction_id\":\"uk-england\",\"tax_type\":\"VAT\",\"name\":\"UK Standard VAT Rate 2026\",\"rate_percent\":20.0,\"applies_to\":\"GOODS_AND_SERVICES\",\"effective_from\":\"2026-01-01\",\"created_by\":\"tax-admin-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8125/v1/tax-rules",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Tax Rule",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027taxRuleId\u0027,b.rule_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Tax Rules",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8125/v1/tax-rules?jurisdiction_id=uk-england",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Tax Rule by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8125/v1/tax-rules/{{taxRuleId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "08 - Tax Determination Service (8126)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8126/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"jurisdiction_id\":\"uk-england\",\"transaction_type\":\"SALE\",\"gross_amount\":10000.00,\"currency\":\"GBP\",\"transaction_date\":\"2026-03-15\",\"created_by\":\"finance-system\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8126/v1/tax-determinations",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Determine Tax",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027determinationId\u0027,b.determination_id||b.id||\u0027\u0027);}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Tax Determinations",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8126/v1/tax-determinations?legal_entity_id=le-uk-001",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Tax Determination by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8126/v1/tax-determinations/{{determinationId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "09 - VAT/GST Service (8127)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8127/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Readiness /readyz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8127/readyz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"jurisdiction_id\":\"uk-england\",\"tax_registration_number\":\"GB999888777\",\"tax_period\":\"2026-Q1\",\"total_sales_amount\":500000.00,\"total_purchase_amount\":200000.00,\"output_tax_amount\":100000.00,\"input_tax_amount\":40000.00,\"currency\":\"GBP\",\"effective_from\":\"2026-01-01\",\"created_by\":\"tax-officer-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8127/v1/vat-returns",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create VAT Return",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027vatReturnId\u0027,b.return_id||\u0027\u0027);pm.test(\u0027net_tax_payable correct\u0027,()=\u003epm.expect(b.net_tax_payable).to.eql(b.output_tax_amount-b.input_tax_amount));}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List VAT Returns",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8127/v1/vat-returns?legal_entity_id=le-uk-001",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get VAT Return by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8127/v1/vat-returns/{{vatReturnId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Update VAT Return",
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"total_sales_amount\":510000.00,\"total_purchase_amount\":205000.00,\"output_tax_amount\":102000.00,\"input_tax_amount\":41000.00}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "PUT",
+                                                      "url":  "{{baseUrl}}:8127/v1/vat-returns/{{vatReturnId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"filed_by\":\"tax-director-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8127/v1/vat-returns/{{vatReturnId}}/file",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "File VAT Return",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "pm.test(\u0027status FILED\u0027,()=\u003e{const b=pm.response.json();pm.expect(b.status).to.eql(\u0027FILED\u0027);});"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  }
+                              ]
+                 },
+                 {
+                     "name":  "10 - Corporate Tax Service (8128)",
+                     "item":  [
+                                  {
+                                      "name":  "Health /healthz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8128/healthz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Readiness /readyz",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8128/readyz",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"legal_entity_id\":\"le-uk-001\",\"jurisdiction_id\":\"uk-england\",\"tax_registration_number\":\"UTR9876543210\",\"fiscal_year\":2026,\"accounting_period_start\":\"2026-01-01\",\"accounting_period_end\":\"2026-12-31\",\"gross_revenue\":2000000.00,\"allowable_deductions\":400000.00,\"tax_rate_percent\":25.0,\"tax_credits\":15000.00,\"tax_already_paid\":100000.00,\"currency\":\"GBP\",\"notes\":\"FY2026 annual corporation tax return\",\"effective_from\":\"2026-01-01\",\"created_by\":\"tax-manager-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8128/v1/corporate-tax-returns",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Create Corporate Tax Return",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set(\u0027corpTaxReturnId\u0027,b.return_id||\u0027\u0027);pm.test(\u0027taxable_income correct\u0027,()=\u003epm.expect(b.taxable_income).to.eql(b.gross_revenue-b.allowable_deductions));}"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "name":  "List Corporate Tax Returns",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8128/v1/corporate-tax-returns?legal_entity_id=le-uk-001\u0026fiscal_year=2026",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Get Corporate Tax Return by ID",
+                                      "request":  {
+                                                      "method":  "GET",
+                                                      "url":  "{{baseUrl}}:8128/v1/corporate-tax-returns/{{corpTaxReturnId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "name":  "Update Corporate Tax Return",
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"gross_revenue\":2100000.00,\"allowable_deductions\":420000.00,\"tax_rate_percent\":25.0,\"tax_credits\":16000.00,\"tax_already_paid\":105000.00,\"notes\":\"FY2026 revised\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "PUT",
+                                                      "url":  "{{baseUrl}}:8128/v1/corporate-tax-returns/{{corpTaxReturnId}}",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  }
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"submitted_by\":\"tax-director-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8128/v1/corporate-tax-returns/{{corpTaxReturnId}}/submit",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Submit Corporate Tax Return",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "pm.test(\u0027status SUBMITTED\u0027,()=\u003e{const b=pm.response.json();pm.expect(b.status).to.eql(\u0027SUBMITTED\u0027);});"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  },
+                                  {
+                                      "request":  {
+                                                      "body":  {
+                                                                   "raw":  "{\"assessed_tax_amount\":420000.00,\"assessment_reference\":\"HMRC-CT600-2026-REF-00123\",\"notes\":\"HMRC assessment confirmed 2026-11-01\"}",
+                                                                   "mode":  "raw"
+                                                               },
+                                                      "method":  "POST",
+                                                      "url":  "{{baseUrl}}:8128/v1/corporate-tax-returns/{{corpTaxReturnId}}/assess",
+                                                      "header":  [
+                                                                     {
+                                                                         "key":  "Content-Type",
+                                                                         "value":  "application/json"
+                                                                     },
+                                                                     {
+                                                                         "key":  "X-Tenant-Id",
+                                                                         "value":  "{{tenantId}}"
+                                                                     }
+                                                                 ]
+                                                  },
+                                      "name":  "Record Assessment",
+                                      "event":  [
+                                                    {
+                                                        "script":  {
+                                                                       "exec":  [
+                                                                                    "pm.test(\u0027status ASSESSED\u0027,()=\u003e{const b=pm.response.json();pm.expect(b.status).to.eql(\u0027ASSESSED\u0027);});"
+                                                                                ]
+                                                                   },
+                                                        "listen":  "test"
+                                                    }
+                                                ]
+                                  }
+                              ]
+                 }
+             ]
+}
