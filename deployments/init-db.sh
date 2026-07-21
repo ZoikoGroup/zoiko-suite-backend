@@ -102,6 +102,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" 
 # Apply migrations for general-ledger-svc
 echo "Applying migrations for general_ledger..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000002_add_idempotency_index.up.sql
 
 # Apply migrations for accounts-payable-svc
 echo "Applying migrations for accounts_payable..."

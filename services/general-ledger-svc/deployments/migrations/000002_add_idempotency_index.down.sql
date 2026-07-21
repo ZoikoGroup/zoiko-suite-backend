@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_journal_headers_tenant_correlation;
