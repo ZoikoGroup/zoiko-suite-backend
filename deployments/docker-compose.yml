@@ -46,6 +46,7 @@ services:
       - ../services/compensation-svc/deployments/migrations:/migrations/compensation:ro
       - ../services/benefits-svc/deployments/migrations:/migrations/benefits:ro
       - ../services/payroll-tax-svc/deployments/migrations:/migrations/payroll-tax:ro
+      - ../services/payroll-exceptions-svc/deployments/migrations:/migrations/payroll-exceptions:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1595,6 +1596,42 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8113/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  payroll-exceptions-svc:
+    build:
+      context: ../services/payroll-exceptions-svc
+      dockerfile: Dockerfile
+    container_name: payroll-exceptions-svc
+    ports:
+      - "8114:8114"
+    environment:
+      PORT: "8114"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: payroll_exceptions
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payrollexceptions.events"
+      EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8114/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
