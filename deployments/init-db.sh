@@ -194,4 +194,16 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severa
 echo "Applying migrations for workforce_compliance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
 
+# ── Phase 5 ─────────────────────────────────────────────────────────────────
+
+# Create database for contract-lifecycle-svc
+echo "Creating database: contract_lifecycle..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE contract_lifecycle;
+EOSQL
+
+# Apply migrations for contract-lifecycle-svc
+echo "Applying migrations for contract_lifecycle..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "contract_lifecycle" -f /migrations/contract-lifecycle/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
