@@ -44,26 +44,56 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) error {
+// CreatePayrollRun inserts a payroll run in INITIATED status.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call (e.g. a client
+// timeout on a POST that actually succeeded server-side) hits the partial
+// unique index added in 000002 and resolves to the ORIGINAL run —
+// mutating *r in place to reflect it — rather than creating a duplicate
+// payroll run for the same period.
+func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO payroll_runs (
 				run_id, tenant_id, legal_entity_id, run_number, pay_period_start,
 				pay_period_end, pay_date, status, is_shadow_run, total_gross_pay,
 				total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
-				created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+				correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, r.RunID, tenantID, r.LegalEntityID, r.RunNumber, r.PayPeriodStart,
 			r.PayPeriodEnd, r.PayDate, r.Status, r.IsShadowRun, r.TotalGrossPay,
 			r.TotalNetPay, r.TotalTaxDeductions, r.TotalOtherDeductions, r.EmployeeCount,
-			r.CreatedAt, r.UpdatedAt)
-		return err
+			r.CorrelationID, r.CreatedAt, r.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT run_id, run_number, pay_period_start::text, pay_period_end::text, pay_date::text,
+				       status, is_shadow_run, total_gross_pay, total_net_pay, total_tax_deductions,
+				       total_other_deductions, employee_count, created_at, updated_at, finalized_at
+				FROM payroll_runs WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, r.CorrelationID)
+			if err := row.Scan(
+				&r.RunID, &r.RunNumber, &r.PayPeriodStart, &r.PayPeriodEnd, &r.PayDate,
+				&r.Status, &r.IsShadowRun, &r.TotalGrossPay, &r.TotalNetPay, &r.TotalTaxDeductions,
+				&r.TotalOtherDeductions, &r.EmployeeCount, &r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) GetPayrollRun(ctx context.Context, id string) (*domain.PayrollRun, error) {
@@ -75,8 +105,8 @@ func (s *PgStore) GetPayrollRun(ctx context.Context, id string) (*domain.Payroll
 	var r domain.PayrollRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start,
-			       pay_period_end, pay_date, status, is_shadow_run, total_gross_pay,
+			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start::text,
+			       pay_period_end::text, pay_date::text, status, is_shadow_run, total_gross_pay,
 			       total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
 			       created_at, updated_at, finalized_at
 			FROM payroll_runs
@@ -106,8 +136,8 @@ func (s *PgStore) ListPayrollRuns(ctx context.Context, legalEntityID, status str
 	var out []domain.PayrollRun
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := `
-			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start,
-			       pay_period_end, pay_date, status, is_shadow_run, total_gross_pay,
+			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start::text,
+			       pay_period_end::text, pay_date::text, status, is_shadow_run, total_gross_pay,
 			       total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
 			       created_at, updated_at, finalized_at
 			FROM payroll_runs
@@ -244,7 +274,7 @@ func (s *PgStore) GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.
 		rows, err := tx.Query(ctx, `
 			SELECT slip_id, tenant_id, run_id, employee_id, employee_number,
 			       employee_name, gross_pay, tax_withheld, benefits_deductions,
-			       net_pay, currency, effective_date, created_at
+			       net_pay, currency, effective_date::text, created_at
 			FROM pay_slips
 			WHERE run_id = $1 AND tenant_id = $2
 			ORDER BY employee_name ASC

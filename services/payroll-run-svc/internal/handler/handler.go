@@ -21,7 +21,7 @@ import (
 )
 
 type Store interface {
-	CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) error
+	CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (created bool, err error)
 	GetPayrollRun(ctx context.Context, id string) (*domain.PayrollRun, error)
 	ListPayrollRuns(ctx context.Context, legalEntityID, status string, isShadowRun *bool) ([]domain.PayrollRun, error)
 	SaveCalculatedResults(ctx context.Context, runID string, totalGross, totalNet, totalTax, totalDeductions float64, slips []domain.PaySlip, shadowComps []domain.ShadowComparison) error
@@ -101,6 +101,10 @@ func (h *Handler) InitiateRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, pay_period_start, pay_period_end, pay_date are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -122,20 +126,28 @@ func (h *Handler) InitiateRun(w http.ResponseWriter, r *http.Request) {
 	payrollRun := &domain.PayrollRun{
 		RunID:          uuid.NewString(),
 		TenantID:       tenantID,
-		LegalEntityID: req.LegalEntityID,
+		LegalEntityID:  req.LegalEntityID,
 		RunNumber:      runNum,
 		PayPeriodStart: req.PayPeriodStart,
 		PayPeriodEnd:   req.PayPeriodEnd,
 		PayDate:        req.PayDate,
 		Status:         "INITIATED",
 		IsShadowRun:    req.IsShadowRun,
+		CorrelationID:  req.CorrelationID,
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
 
-	if err := h.store.CreatePayrollRun(r.Context(), payrollRun); err != nil {
+	created, err := h.store.CreatePayrollRun(r.Context(), payrollRun)
+	if err != nil {
 		h.log.Error("failed to create payroll run", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		// Replay of a prior request with the same correlation_id — return
+		// the original run, do not re-publish the initiated event.
+		writeJSON(w, http.StatusOK, payrollRun)
 		return
 	}
 
@@ -181,12 +193,18 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 
-	// 1. Fetch active workers for legal entity
+	// 1. Fetch active workers for legal entity. Fail closed: if
+	// employee-master-svc is unreachable, we cannot know who should be
+	// paid, so this must not silently proceed as if the entity has zero
+	// active employees (which would "successfully" calculate an empty,
+	// wrong payroll run instead of surfacing the real outage).
 	var activeEmployees []employee.Employee
 	if h.empClient != nil {
 		activeEmployees, err = h.empClient.ListActiveEmployeesByEntity(r.Context(), tenantID, principalID, run.LegalEntityID)
 		if err != nil {
-			h.log.Warn("failed to fetch active workers from employee-master-svc, proceeding with fallback baseline", zap.Error(err))
+			h.log.Error("failed to fetch active workers from employee-master-svc", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "employee_lookup_failed", "cannot verify active employees: employee-master-svc unavailable")
+			return
 		}
 	}
 
@@ -206,20 +224,46 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 		totalDeductions float64
 	)
 
-	// Process workers
+	// Process workers. Fail closed on the salary source: this loop used to
+	// default an employee's gross pay to a hardcoded $8000/month baseline
+	// whenever the contract lookup failed or returned no active contract,
+	// silently computing (and potentially finalizing) real disbursement
+	// figures off a made-up number. Any employee whose real salary can't
+	// be confirmed now blocks the entire calculation instead. Each
+	// employee's contract is fetched exactly once and cached here.
 	if len(activeEmployees) > 0 {
+		contracts := make(map[string]*contract.ActiveContract, len(activeEmployees))
+		var missingContracts []string
 		for _, emp := range activeEmployees {
-			gross := 8000.0 // Default monthly baseline
-			curr := "USD"
+			if h.ctrClient == nil {
+				missingContracts = append(missingContracts, emp.EmployeeID)
+				continue
+			}
+			ctr, err := h.ctrClient.GetActiveContract(r.Context(), tenantID, principalID, emp.EmployeeID)
+			if err != nil || ctr == nil || ctr.BaseSalaryAmount <= 0 {
+				h.log.Error("failed to verify active salary contract for employee",
+					zap.String("employee_id", emp.EmployeeID), zap.Error(err))
+				missingContracts = append(missingContracts, emp.EmployeeID)
+				continue
+			}
+			contracts[emp.EmployeeID] = ctr
+		}
+		if len(missingContracts) > 0 {
+			h.publisher.PublishRunBlocked(r.Context(), getCorrelationID(r), *run, domain.ErrContractLookupFailed.Error())
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error_code":         "contract_lookup_failed",
+				"error_message":      domain.ErrContractLookupFailed.Error(),
+				"employees_affected": missingContracts,
+			})
+			return
+		}
 
-			if h.ctrClient != nil {
-				ctr, err := h.ctrClient.GetActiveContract(r.Context(), tenantID, principalID, emp.EmployeeID)
-				if err == nil && ctr != nil && ctr.BaseSalaryAmount > 0 {
-					gross = ctr.BaseSalaryAmount
-					if ctr.Currency != "" {
-						curr = ctr.Currency
-					}
-				}
+		for _, emp := range activeEmployees {
+			ctr := contracts[emp.EmployeeID]
+			gross := ctr.BaseSalaryAmount
+			curr := "USD"
+			if ctr.Currency != "" {
+				curr = ctr.Currency
 			}
 
 			tax := gross * 0.20

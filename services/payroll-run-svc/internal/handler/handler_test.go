@@ -23,6 +23,7 @@ import (
 
 type stubStore struct {
 	runs        map[string]*domain.PayrollRun
+	runsByCorr  map[string]string
 	slips       map[string][]domain.PaySlip
 	shadowComps map[string][]domain.ShadowComparison
 }
@@ -30,14 +31,24 @@ type stubStore struct {
 func newStubStore() *stubStore {
 	return &stubStore{
 		runs:        make(map[string]*domain.PayrollRun),
+		runsByCorr:  make(map[string]string),
 		slips:       make(map[string][]domain.PaySlip),
 		shadowComps: make(map[string][]domain.ShadowComparison),
 	}
 }
 
-func (s *stubStore) CreatePayrollRun(_ context.Context, r *domain.PayrollRun) error {
+func (s *stubStore) CreatePayrollRun(_ context.Context, r *domain.PayrollRun) (bool, error) {
+	if r.CorrelationID != "" {
+		if existingID, ok := s.runsByCorr[r.CorrelationID]; ok {
+			*r = *s.runs[existingID]
+			return false, nil
+		}
+	}
 	s.runs[r.RunID] = r
-	return nil
+	if r.CorrelationID != "" {
+		s.runsByCorr[r.CorrelationID] = r.RunID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetPayrollRun(_ context.Context, id string) (*domain.PayrollRun, error) {
@@ -199,6 +210,7 @@ func TestInitiateRun_MissingPrincipal(t *testing.T) {
 		"pay_period_start": "2024-01-01",
 		"pay_period_end":   "2024-01-31",
 		"pay_date":         "2024-02-05",
+		"correlation_id":   "corr-1",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -217,6 +229,7 @@ func TestInitiateRun_HappyPath(t *testing.T) {
 		"pay_period_end":   "2024-01-31",
 		"pay_date":         "2024-02-05",
 		"is_shadow_run":    true,
+		"correlation_id":   "corr-init-1",
 	}, "payroll-admin")
 
 	if rr.Code != http.StatusCreated {
@@ -266,6 +279,7 @@ func TestCalculateRun_StandardAndShadowMode(t *testing.T) {
 		"pay_period_end":   "2024-01-31",
 		"pay_date":         "2024-02-05",
 		"is_shadow_run":    true,
+		"correlation_id":   "corr-calc-init-1",
 	}, "payroll-admin")
 
 	var initRun domain.PayrollRun
@@ -288,9 +302,9 @@ func TestCalculateRun_StandardAndShadowMode(t *testing.T) {
 	}
 
 	var calcRes struct {
-		Run              domain.PayrollRun         `json:"run"`
-		PaySlips         []domain.PaySlip          `json:"pay_slips"`
-		ShadowComps      []domain.ShadowComparison `json:"shadow_comparisons"`
+		Run         domain.PayrollRun         `json:"run"`
+		PaySlips    []domain.PaySlip          `json:"pay_slips"`
+		ShadowComps []domain.ShadowComparison `json:"shadow_comparisons"`
 	}
 	_ = json.NewDecoder(rrCalc.Body).Decode(&calcRes)
 
@@ -318,6 +332,53 @@ func TestCalculateRun_StandardAndShadowMode(t *testing.T) {
 	}
 }
 
+// TestCalculateRun_ContractLookupFailure_FailsClosed_NoFallbackSalary proves
+// that when the contract lookup fails for an active employee, the run is
+// blocked (422) rather than silently computing pay off a fabricated
+// baseline salary. No pay slip must be persisted in this case.
+func TestCalculateRun_ContractLookupFailure_FailsClosed_NoFallbackSalary(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+
+	empC := &stubEmployeeClient{
+		employees: []employee.Employee{
+			{EmployeeID: "emp-1", EmployeeNumber: "E-001", FirstName: "Alice", LastName: "Smith", LegalEntityID: "le-us", Status: "ACTIVE"},
+		},
+	}
+	// No contract registered for emp-1 — GetActiveContract returns an error.
+	ctrC := &stubContractClient{contracts: map[string]*contract.ActiveContract{}}
+
+	r := newRouter(s, pub, &stubAuthZ{}, empC, ctrC)
+
+	rrInit := doReq(r, http.MethodPost, "/v1/payroll/runs", map[string]any{
+		"legal_entity_id":  "le-us",
+		"pay_period_start": "2024-01-01",
+		"pay_period_end":   "2024-01-31",
+		"pay_date":         "2024-02-05",
+		"correlation_id":   "corr-contract-fail-1",
+	}, "payroll-admin")
+	var initRun domain.PayrollRun
+	_ = json.NewDecoder(rrInit.Body).Decode(&initRun)
+
+	rrCalc := doReq(r, http.MethodPost, "/v1/payroll/runs/"+initRun.RunID+"/calculate", nil, "payroll-admin")
+	if rrCalc.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when an employee's active contract can't be verified, got %d: %s", rrCalc.Code, rrCalc.Body.String())
+	}
+
+	slips, _ := s.GetPaySlipsByRun(context.Background(), initRun.RunID)
+	if len(slips) != 0 {
+		t.Fatalf("expected no pay slips to be persisted when contract lookup fails, got %d — this is the $8000 fallback-salary bug if any exist", len(slips))
+	}
+
+	got, err := s.GetPayrollRun(context.Background(), initRun.RunID)
+	if err != nil {
+		t.Fatalf("GetPayrollRun failed: %v", err)
+	}
+	if got.Status == "CALCULATED" {
+		t.Fatal("run must not be marked CALCULATED when a contract lookup failed")
+	}
+}
+
 // ── FinalizeRun & Immutability Tests ──────────────────────────────────────────
 
 func TestFinalizeRun_LocksRunAndEnforcesImmutability(t *testing.T) {
@@ -331,6 +392,7 @@ func TestFinalizeRun_LocksRunAndEnforcesImmutability(t *testing.T) {
 		"pay_period_start": "2024-01-01",
 		"pay_period_end":   "2024-01-31",
 		"pay_date":         "2024-02-05",
+		"correlation_id":   "corr-finalize-init-1",
 	}, "payroll-admin")
 	var run domain.PayrollRun
 	_ = json.NewDecoder(rrInit.Body).Decode(&run)

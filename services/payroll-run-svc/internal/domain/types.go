@@ -17,6 +17,7 @@ type PayrollRun struct {
 	TotalTaxDeductions   float64    `json:"total_tax_deductions"`
 	TotalOtherDeductions float64    `json:"total_other_deductions"`
 	EmployeeCount        int        `json:"employee_count"`
+	CorrelationID        string     `json:"correlation_id"`
 	CreatedAt            time.Time  `json:"created_at"`
 	UpdatedAt            time.Time  `json:"updated_at"`
 	FinalizedAt          *time.Time `json:"finalized_at,omitempty"`
@@ -63,6 +64,7 @@ type InitiatePayrollRunRequest struct {
 	PayPeriodEnd   string `json:"pay_period_end"`
 	PayDate        string `json:"pay_date"`
 	IsShadowRun    bool   `json:"is_shadow_run"`
+	CorrelationID  string `json:"correlation_id"`
 }
 
 type ShadowInputItem struct {
@@ -93,4 +95,11 @@ var (
 	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
 	ErrIdentityMissing         = errorString("caller identity missing")
 	ErrStoreUnavailable        = errorString("payroll store unavailable")
+
+	// ErrContractLookupFailed means employment-contracts-svc could not
+	// confirm a real active salary contract for one or more employees in
+	// this run. Calculation must fail closed here rather than falling
+	// back to a fabricated baseline salary — computing real pay off a
+	// made-up number is worse than refusing to compute it at all.
+	ErrContractLookupFailed = errorString("failed to verify an active salary contract for one or more employees")
 )
