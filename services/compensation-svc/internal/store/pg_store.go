@@ -6,11 +6,19 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/compensation-svc/internal/domain"
 	svcmiddleware "zoiko.io/compensation-svc/internal/middleware"
 )
+
+// isUniqueViolation reports whether err is a Postgres unique-constraint
+// violation (SQLSTATE 23505).
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
 
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -43,22 +51,48 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreateStructure(ctx context.Context, str *domain.CompensationStructure) error {
+// CreateStructure inserts a compensation structure.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to
+// the ORIGINAL structure — mutating *str in place to reflect it — rather
+// than creating a duplicate.
+func (s *PgStore) CreateStructure(ctx context.Context, str *domain.CompensationStructure) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO compensation_structures (
 				structure_id, tenant_id, legal_entity_id, name, pay_type,
-				min_amount, max_amount, currency, overtime_multiplier, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				min_amount, max_amount, currency, overtime_multiplier, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, str.StructureID, tenantID, str.LegalEntityID, str.Name, str.PayType,
-			str.MinAmount, str.MaxAmount, str.Currency, str.OvertimeMultiplier, str.CreatedAt, str.UpdatedAt)
-		return err
+			str.MinAmount, str.MaxAmount, str.Currency, str.OvertimeMultiplier, str.CorrelationID, str.CreatedAt, str.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT structure_id, legal_entity_id, name, pay_type, min_amount, max_amount,
+				       currency, overtime_multiplier, created_at, updated_at
+				FROM compensation_structures WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, str.CorrelationID)
+			if err := row.Scan(
+				&str.StructureID, &str.LegalEntityID, &str.Name, &str.PayType, &str.MinAmount, &str.MaxAmount,
+				&str.Currency, &str.OvertimeMultiplier, &str.CreatedAt, &str.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) ListStructures(ctx context.Context, legalEntityID string) ([]domain.CompensationStructure, error) {
@@ -107,14 +141,51 @@ func (s *PgStore) ListStructures(ctx context.Context, legalEntityID string) ([]d
 	return out, nil
 }
 
-func (s *PgStore) CreateWageRevision(ctx context.Context, rev *domain.WageRevision) error {
+// CreateWageRevision supersedes the employee's current active revision
+// (if any) and inserts a new one.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to
+// the ORIGINAL revision — mutating *rev in place — rather than superseding
+// an already-superseded chain a second time.
+//
+// Race safety: a unique partial index on (tenant_id, employee_id) WHERE
+// status = 'ACTIVE' (migration 000002) makes the final INSERT fail with a
+// constraint violation if a concurrent call already committed a new
+// ACTIVE row for this employee between this transaction's supersede step
+// and its insert — surfaced as domain.ErrConcurrentWageRevision rather
+// than silently leaving two ACTIVE rows for one employee.
+func (s *PgStore) CreateWageRevision(ctx context.Context, rev *domain.WageRevision) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		// 1. Update active wage revision for employee (set status SUPERSEDED and effective_to)
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if rev.CorrelationID != "" {
+			var existingID string
+			err := tx.QueryRow(ctx, `SELECT revision_id FROM wage_revisions WHERE tenant_id = $1 AND correlation_id = $2`,
+				tenantID, rev.CorrelationID).Scan(&existingID)
+			if err == nil {
+				row := tx.QueryRow(ctx, `
+					SELECT revision_id, employee_id, structure_id, pay_type, amount, currency,
+					       effective_from::text, effective_to::text, reason, revised_by, status, created_at
+					FROM wage_revisions WHERE revision_id = $1 AND tenant_id = $2
+				`, existingID, tenantID)
+				if err := row.Scan(
+					&rev.RevisionID, &rev.EmployeeID, &rev.StructureID, &rev.PayType, &rev.Amount, &rev.Currency,
+					&rev.EffectiveFrom, &rev.EffectiveTo, &rev.Reason, &rev.RevisedBy, &rev.Status, &rev.CreatedAt,
+				); err != nil {
+					return err
+				}
+				created = false
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+
+		// 1. Supersede the employee's current active revision, if any.
 		_, err := tx.Exec(ctx, `
 			UPDATE wage_revisions
 			SET status = 'SUPERSEDED', effective_to = $1
@@ -124,16 +195,27 @@ func (s *PgStore) CreateWageRevision(ctx context.Context, rev *domain.WageRevisi
 			return err
 		}
 
-		// 2. Insert new active wage revision
+		// 2. Insert new active wage revision. A concurrent call that
+		// superseded the same row and is racing to insert its own new
+		// ACTIVE row will have exactly one of the two INSERTs rejected by
+		// idx_wage_revisions_one_active.
 		_, err = tx.Exec(ctx, `
 			INSERT INTO wage_revisions (
 				revision_id, tenant_id, employee_id, structure_id, pay_type,
-				amount, currency, effective_from, effective_to, reason, revised_by, status, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				amount, currency, effective_from, effective_to, reason, revised_by, status, correlation_id, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		`, rev.RevisionID, tenantID, rev.EmployeeID, rev.StructureID, rev.PayType,
-			rev.Amount, rev.Currency, rev.EffectiveFrom, rev.EffectiveTo, rev.Reason, rev.RevisedBy, rev.Status, rev.CreatedAt)
-		return err
+			rev.Amount, rev.Currency, rev.EffectiveFrom, rev.EffectiveTo, rev.Reason, rev.RevisedBy, rev.Status, rev.CorrelationID, rev.CreatedAt)
+		if err != nil {
+			if isUniqueViolation(err) {
+				return domain.ErrConcurrentWageRevision
+			}
+			return err
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) GetActiveWageRevision(ctx context.Context, employeeID string) (*domain.WageRevision, error) {
@@ -146,7 +228,7 @@ func (s *PgStore) GetActiveWageRevision(ctx context.Context, employeeID string) 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT revision_id, tenant_id, employee_id, structure_id, pay_type,
-			       amount, currency, effective_from, effective_to, reason, revised_by, status, created_at
+			       amount, currency, effective_from::text, effective_to::text, reason, revised_by, status, created_at
 			FROM wage_revisions
 			WHERE tenant_id = $1 AND employee_id = $2 AND status = 'ACTIVE'
 			LIMIT 1
@@ -174,7 +256,7 @@ func (s *PgStore) GetWageRevisionHistory(ctx context.Context, employeeID string)
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT revision_id, tenant_id, employee_id, structure_id, pay_type,
-			       amount, currency, effective_from, effective_to, reason, revised_by, status, created_at
+			       amount, currency, effective_from::text, effective_to::text, reason, revised_by, status, created_at
 			FROM wage_revisions
 			WHERE tenant_id = $1 AND employee_id = $2
 			ORDER BY effective_from DESC, created_at DESC
@@ -202,22 +284,78 @@ func (s *PgStore) GetWageRevisionHistory(ctx context.Context, employeeID string)
 	return out, nil
 }
 
-func (s *PgStore) CreateBonusGrant(ctx context.Context, b *domain.BonusGrant) error {
+// CreateBonusGrant inserts a bonus grant in PENDING status.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to
+// the ORIGINAL grant — mutating *b in place — rather than creating a
+// second, independently-approvable duplicate bonus payout.
+func (s *PgStore) CreateBonusGrant(ctx context.Context, b *domain.BonusGrant) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO bonus_grants (
 				grant_id, tenant_id, employee_id, bonus_type, amount,
-				currency, grant_date, status, approved_by, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				currency, grant_date, status, approved_by, correlation_id, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, b.GrantID, tenantID, b.EmployeeID, b.BonusType, b.Amount,
-			b.Currency, b.GrantDate, b.Status, b.ApprovedBy, b.CreatedAt)
-		return err
+			b.Currency, b.GrantDate, b.Status, b.ApprovedBy, b.CorrelationID, b.CreatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT grant_id, employee_id, bonus_type, amount, currency,
+				       grant_date::text, status, approved_by, created_at
+				FROM bonus_grants WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, b.CorrelationID)
+			if err := row.Scan(
+				&b.GrantID, &b.EmployeeID, &b.BonusType, &b.Amount, &b.Currency,
+				&b.GrantDate, &b.Status, &b.ApprovedBy, &b.CreatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
+}
+
+// GetBonusGrant resolves a bonus grant by its primary key — used by the
+// handler to authorize an approval against the grant's real employee
+// (and thus legal entity) instead of listing every bonus grant in the
+// tenant and scanning for a match in Go.
+func (s *PgStore) GetBonusGrant(ctx context.Context, grantID string) (*domain.BonusGrant, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var b domain.BonusGrant
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT grant_id, tenant_id, employee_id, bonus_type, amount,
+			       currency, grant_date::text, status, approved_by, created_at
+			FROM bonus_grants WHERE grant_id = $1 AND tenant_id = $2
+		`, grantID, tenantID).Scan(
+			&b.GrantID, &b.TenantID, &b.EmployeeID, &b.BonusType, &b.Amount,
+			&b.Currency, &b.GrantDate, &b.Status, &b.ApprovedBy, &b.CreatedAt,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrBonusNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
 }
 
 func (s *PgStore) ApproveBonusGrant(ctx context.Context, grantID, approvedBy string) error {
@@ -259,7 +397,7 @@ func (s *PgStore) ListBonusGrants(ctx context.Context, employeeID, status string
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := `
 			SELECT grant_id, tenant_id, employee_id, bonus_type, amount,
-			       currency, grant_date, status, approved_by, created_at
+			       currency, grant_date::text, status, approved_by, created_at
 			FROM bonus_grants
 			WHERE tenant_id = $1
 		`

@@ -17,12 +17,13 @@ import (
 )
 
 type Store interface {
-	CreateStructure(ctx context.Context, s *domain.CompensationStructure) error
+	CreateStructure(ctx context.Context, s *domain.CompensationStructure) (created bool, err error)
 	ListStructures(ctx context.Context, legalEntityID string) ([]domain.CompensationStructure, error)
-	CreateWageRevision(ctx context.Context, rev *domain.WageRevision) error
+	CreateWageRevision(ctx context.Context, rev *domain.WageRevision) (created bool, err error)
 	GetActiveWageRevision(ctx context.Context, employeeID string) (*domain.WageRevision, error)
 	GetWageRevisionHistory(ctx context.Context, employeeID string) ([]domain.WageRevision, error)
-	CreateBonusGrant(ctx context.Context, b *domain.BonusGrant) error
+	CreateBonusGrant(ctx context.Context, b *domain.BonusGrant) (created bool, err error)
+	GetBonusGrant(ctx context.Context, grantID string) (*domain.BonusGrant, error)
 	ApproveBonusGrant(ctx context.Context, grantID, approvedBy string) error
 	ListBonusGrants(ctx context.Context, employeeID, status string) ([]domain.BonusGrant, error)
 }
@@ -95,6 +96,14 @@ func (h *Handler) CreateStructure(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, name, pay_type, min_amount, max_amount, currency are required")
 		return
 	}
+	if req.MinAmount > req.MaxAmount {
+		writeError(w, http.StatusBadRequest, "invalid_range", "min_amount must not exceed max_amount")
+		return
+	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -123,13 +132,19 @@ func (h *Handler) CreateStructure(w http.ResponseWriter, r *http.Request) {
 		MaxAmount:          req.MaxAmount,
 		Currency:           req.Currency,
 		OvertimeMultiplier: otMult,
+		CorrelationID:      req.CorrelationID,
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
 
-	if err := h.store.CreateStructure(r.Context(), str); err != nil {
+	created, err := h.store.CreateStructure(r.Context(), str)
+	if err != nil {
 		h.log.Error("failed to create compensation structure", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, str)
 		return
 	}
 
@@ -179,6 +194,10 @@ func (h *Handler) ReviseWage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "employee_id, pay_type, amount, currency, effective_from, reason are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -186,19 +205,9 @@ func (h *Handler) ReviseWage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
-
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, req.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionWageRevise); err != nil {
@@ -219,16 +228,26 @@ func (h *Handler) ReviseWage(w http.ResponseWriter, r *http.Request) {
 		Reason:        req.Reason,
 		RevisedBy:     principalID,
 		Status:        "ACTIVE",
+		CorrelationID: req.CorrelationID,
 		CreatedAt:     now,
 	}
 
-	if err := h.store.CreateWageRevision(r.Context(), rev); err != nil {
+	created, err := h.store.CreateWageRevision(r.Context(), rev)
+	if err != nil {
+		if errors.Is(err, domain.ErrConcurrentWageRevision) {
+			writeError(w, http.StatusConflict, "concurrent_revision", err.Error())
+			return
+		}
 		h.log.Error("failed to create wage revision", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	correlationID := getCorrelationID(r)
+	if !created {
+		writeJSON(w, http.StatusOK, rev)
+		return
+	}
 	h.publisher.PublishCompensationUpdated(r.Context(), correlationID, *rev)
 	h.publisher.PublishEffectiveChanged(r.Context(), correlationID, *rev)
 
@@ -240,8 +259,18 @@ func (h *Handler) ReviseWage(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetWageHistory(w http.ResponseWriter, r *http.Request) {
 	employeeID := chi.URLParam(r, "employee_id")
 
-	_, ok := h.requirePrincipal(w, r)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, employeeID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionCompView); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -263,8 +292,18 @@ func (h *Handler) GetWageHistory(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetActiveWage(w http.ResponseWriter, r *http.Request) {
 	employeeID := chi.URLParam(r, "employee_id")
 
-	_, ok := h.requirePrincipal(w, r)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, employeeID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionCompView); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -295,6 +334,10 @@ func (h *Handler) GrantBonus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "employee_id, bonus_type, amount, currency, grant_date are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -302,19 +345,9 @@ func (h *Handler) GrantBonus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
-
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, req.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionBonusGrant); err != nil {
@@ -324,20 +357,26 @@ func (h *Handler) GrantBonus(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	grant := &domain.BonusGrant{
-		GrantID:    uuid.NewString(),
-		TenantID:   tenantID,
-		EmployeeID: req.EmployeeID,
-		BonusType:  req.BonusType,
-		Amount:     req.Amount,
-		Currency:   req.Currency,
-		GrantDate:  req.GrantDate,
-		Status:     "PENDING",
-		CreatedAt:  now,
+		GrantID:       uuid.NewString(),
+		TenantID:      tenantID,
+		EmployeeID:    req.EmployeeID,
+		BonusType:     req.BonusType,
+		Amount:        req.Amount,
+		Currency:      req.Currency,
+		GrantDate:     req.GrantDate,
+		Status:        "PENDING",
+		CorrelationID: req.CorrelationID,
+		CreatedAt:     now,
 	}
 
-	if err := h.store.CreateBonusGrant(r.Context(), grant); err != nil {
+	created, err := h.store.CreateBonusGrant(r.Context(), grant)
+	if err != nil {
 		h.log.Error("failed to create bonus grant", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, grant)
 		return
 	}
 
@@ -354,33 +393,21 @@ func (h *Handler) ApproveBonus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	list, err := h.store.ListBonusGrants(r.Context(), "", "")
+	target, err := h.store.GetBonusGrant(r.Context(), id)
+	if errors.Is(err, domain.ErrBonusNotFound) {
+		writeError(w, http.StatusNotFound, "bonus_not_found", "")
+		return
+	}
 	if err != nil {
 		h.log.Error("failed to fetch bonus grant for approval", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
-	var target *domain.BonusGrant
-	for _, b := range list {
-		if b.GrantID == id {
-			target = &b
-			break
-		}
-	}
-
-	if target == nil {
-		writeError(w, http.StatusNotFound, "bonus_not_found", "")
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, target.EmployeeID)
+	if !ok {
 		return
-	}
-
-	legalEntityID := "GLOBAL"
-	if h.employee != nil {
-		tenantID := svcmiddleware.TenantFromContext(r.Context())
-		emp, _ := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, target.EmployeeID)
-		if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionBonusApprove); err != nil {
@@ -413,8 +440,26 @@ func (h *Handler) ListBonuses(w http.ResponseWriter, r *http.Request) {
 	employeeID := r.URL.Query().Get("employee_id")
 	status := r.URL.Query().Get("status")
 
-	_, ok := h.requirePrincipal(w, r)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+
+	// Bonus data is compensation-sensitive: require the caller to scope
+	// the request to one employee (authorized against that employee's
+	// real legal entity) rather than allowing an unscoped, unauthorized
+	// tenant-wide listing of every bonus grant.
+	if employeeID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "employee_id is required")
+		return
+	}
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, employeeID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionCompView); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -432,6 +477,34 @@ func (h *Handler) ListBonuses(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
+
+// resolveEmployeeEntity confirms an employee exists and returns their real
+// legal entity, to be used as the authorization scope for the action
+// being performed. Fails closed: if employee-master-svc is unreachable or
+// returns anything other than a clean "not found," the request is
+// rejected (503) rather than proceeding under a placeholder entity that
+// authorization would evaluate meaninglessly — a prior version logged a
+// warning and continued, which let compensation actions bypass real
+// entity-scoped authorization whenever employee-master-svc had a blip.
+func (h *Handler) resolveEmployeeEntity(w http.ResponseWriter, r *http.Request, tenantID, principalID, employeeID string) (string, bool) {
+	if h.employee == nil {
+		return "GLOBAL", true
+	}
+	emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, employeeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrEmployeeNotFound) {
+			writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
+			return "", false
+		}
+		h.log.Error("employee validation failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+		return "", false
+	}
+	if emp == nil || emp.LegalEntityID == "" {
+		return "GLOBAL", true
+	}
+	return emp.LegalEntityID, true
+}
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
