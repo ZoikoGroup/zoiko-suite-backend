@@ -35,6 +35,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE employee_master;
     CREATE DATABASE employment_contracts;
     CREATE DATABASE payroll_run;
+    CREATE DATABASE compensation;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -153,5 +154,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contrac
 # Apply migrations for payroll-run-svc
 echo "Applying migrations for payroll_run..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000001_initial_schema.up.sql
+
+# Apply migrations for compensation-svc
+echo "Applying migrations for compensation..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "compensation" -f /migrations/compensation/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."
