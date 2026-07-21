@@ -45,20 +45,48 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreateFiscalPeriod(ctx context.Context, fp *domain.FiscalPeriod) error {
+// CreateFiscalPeriod inserts a fiscal period header in OPEN status.
+//
+// Idempotent on the existing (tenant_id, legal_entity_id, period_name)
+// unique constraint: a retried call (e.g. a client timeout on a POST that
+// actually succeeded server-side) resolves to the ORIGINAL period — mutating
+// *fp in place to reflect it — rather than erroring out as a 503 (the
+// previous behavior: any constraint violation was reported identically to
+// a genuine store outage). Returns created=false when the row already
+// existed. Two distinct periods can never legitimately share a name for
+// the same legal entity, so this collision is always a safe one to treat
+// as a replay.
+func (s *PgStore) CreateFiscalPeriod(ctx context.Context, fp *domain.FiscalPeriod) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO fiscal_periods (
 				fiscal_period_id, tenant_id, legal_entity_id, period_name, period_start, period_end, close_status
 			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (tenant_id, legal_entity_id, period_name) DO NOTHING
 		`, fp.FiscalPeriodID, tenantID, fp.LegalEntityID, fp.PeriodName, fp.PeriodStart, fp.PeriodEnd, fp.CloseStatus)
-		return err
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT fiscal_period_id, period_start, period_end, close_status, close_locked_at, evidence_document_id
+				FROM fiscal_periods WHERE tenant_id = $1 AND legal_entity_id = $2 AND period_name = $3
+			`, tenantID, fp.LegalEntityID, fp.PeriodName)
+			if err := row.Scan(&fp.FiscalPeriodID, &fp.PeriodStart, &fp.PeriodEnd, &fp.CloseStatus, &fp.CloseLockedAt, &fp.EvidenceDocumentID); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) GetFiscalPeriod(ctx context.Context, id string) (*domain.FiscalPeriod, error) {
