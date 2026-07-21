@@ -44,24 +44,53 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) IssueContract(ctx context.Context, c *domain.EmploymentContract) error {
+// IssueContract inserts a new employment contract.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL contract — mutating *c in place — rather than creating a
+// duplicate. contract_number alone is not unique, so it can't provide this
+// guarantee on its own.
+func (s *PgStore) IssueContract(ctx context.Context, c *domain.EmploymentContract) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO employment_contracts (
 				contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 				version, contract_type, status, title, base_salary_amount, currency,
-				pay_frequency, effective_from, effective_to, document_vault_ref, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+				pay_frequency, effective_from, effective_to, document_vault_ref, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, c.ContractID, tenantID, c.LegalEntityID, c.EmployeeID, c.ContractNumber,
 			c.Version, c.ContractType, c.Status, c.Title, c.BaseSalaryAmount, c.Currency,
-			c.PayFrequency, c.EffectiveFrom, c.EffectiveTo, c.DocumentVaultRef, c.CreatedAt, c.UpdatedAt)
-		return err
+			c.PayFrequency, c.EffectiveFrom, c.EffectiveTo, c.DocumentVaultRef, c.CorrelationID, c.CreatedAt, c.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT contract_id, legal_entity_id, employee_id, contract_number, version, contract_type,
+				       status, title, base_salary_amount, currency, pay_frequency,
+				       effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
+				FROM employment_contracts WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, c.CorrelationID)
+			if err := row.Scan(
+				&c.ContractID, &c.LegalEntityID, &c.EmployeeID, &c.ContractNumber, &c.Version, &c.ContractType,
+				&c.Status, &c.Title, &c.BaseSalaryAmount, &c.Currency, &c.PayFrequency,
+				&c.EffectiveFrom, &c.EffectiveTo, &c.DocumentVaultRef, &c.CreatedAt, &c.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.EmploymentContract, error) {
@@ -75,7 +104,7 @@ func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.Employmen
 		return tx.QueryRow(ctx, `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from, effective_to, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
 			FROM employment_contracts
 			WHERE contract_id = $1 AND tenant_id = $2
 		`, id, tenantID).Scan(
@@ -104,7 +133,7 @@ func (s *PgStore) GetActiveContractByEmployee(ctx context.Context, employeeID st
 		return tx.QueryRow(ctx, `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from, effective_to, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
 			FROM employment_contracts
 			WHERE tenant_id = $1 AND employee_id = $2 AND status = 'ACTIVE'
 			ORDER BY version DESC LIMIT 1
@@ -134,7 +163,7 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID, employeeID, 
 		query := `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from, effective_to, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
 			FROM employment_contracts
 			WHERE tenant_id = $1
 		`
@@ -190,7 +219,7 @@ func (s *PgStore) GetContractVersionHistory(ctx context.Context, contractNumber 
 		rows, err := tx.Query(ctx, `
 			SELECT contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
 			       version, contract_type, status, title, base_salary_amount, currency,
-			       pay_frequency, effective_from, effective_to, document_vault_ref, created_at, updated_at
+			       pay_frequency, effective_from::text, effective_to::text, document_vault_ref, created_at, updated_at
 			FROM employment_contracts
 			WHERE tenant_id = $1 AND contract_number = $2
 			ORDER BY version ASC

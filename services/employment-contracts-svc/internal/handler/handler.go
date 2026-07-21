@@ -19,7 +19,7 @@ import (
 )
 
 type Store interface {
-	IssueContract(ctx context.Context, c *domain.EmploymentContract) error
+	IssueContract(ctx context.Context, c *domain.EmploymentContract) (created bool, err error)
 	GetContract(ctx context.Context, id string) (*domain.EmploymentContract, error)
 	GetActiveContractByEmployee(ctx context.Context, employeeID string) (*domain.EmploymentContract, error)
 	ListContracts(ctx context.Context, legalEntityID, employeeID, status string) ([]domain.EmploymentContract, error)
@@ -91,6 +91,10 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, employee_id, contract_type, title, base_salary_amount, currency, pay_frequency, effective_from are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -104,12 +108,19 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	if h.employee != nil {
-		if _, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID); err != nil {
+		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
+		if err != nil {
 			if errors.Is(err, domain.ErrEmployeeNotFound) {
 				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
 				return
 			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
+			h.log.Error("employee validation failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+			return
+		}
+		if emp != nil && emp.LegalEntityID != "" && emp.LegalEntityID != req.LegalEntityID {
+			writeError(w, http.StatusBadRequest, "employee_legal_entity_mismatch", domain.ErrEmployeeLegalEntityMismatch.Error())
+			return
 		}
 	}
 
@@ -122,7 +133,7 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 	contract := &domain.EmploymentContract{
 		ContractID:       uuid.NewString(),
 		TenantID:         tenantID,
-		LegalEntityID:   req.LegalEntityID,
+		LegalEntityID:    req.LegalEntityID,
 		EmployeeID:       req.EmployeeID,
 		ContractNumber:   contractNum,
 		Version:          1,
@@ -135,13 +146,19 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom:    req.EffectiveFrom,
 		EffectiveTo:      req.EffectiveTo,
 		DocumentVaultRef: req.DocumentVaultRef,
+		CorrelationID:    req.CorrelationID,
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
 
-	if err := h.store.IssueContract(r.Context(), contract); err != nil {
+	created, err := h.store.IssueContract(r.Context(), contract)
+	if err != nil {
 		h.log.Error("failed to issue contract", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, contract)
 		return
 	}
 
@@ -163,11 +180,14 @@ func (h *Handler) ListContracts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if legalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionContractView); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionContractView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListContracts(r.Context(), legalEntityID, employeeID, status)
@@ -307,7 +327,7 @@ func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
 	newContract := &domain.EmploymentContract{
 		ContractID:       uuid.NewString(),
 		TenantID:         oldContract.TenantID,
-		LegalEntityID:   oldContract.LegalEntityID,
+		LegalEntityID:    oldContract.LegalEntityID,
 		EmployeeID:       oldContract.EmployeeID,
 		ContractNumber:   oldContract.ContractNumber,
 		Version:          oldContract.Version + 1,
