@@ -42,6 +42,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE leave_absence;
     CREATE DATABASE org_structure;
     CREATE DATABASE offboarding_severance;
+    CREATE DATABASE workforce_compliance;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -188,5 +189,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f 
 # Apply migrations for offboarding-severance-svc
 echo "Applying migrations for offboarding_severance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severance" -f /migrations/offboarding-severance/000001_initial_schema.up.sql
+
+# Apply migrations for workforce-compliance-svc
+echo "Applying migrations for workforce_compliance..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."

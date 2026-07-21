@@ -50,6 +50,7 @@ services:
       - ../services/leave-absence-svc/deployments/migrations:/migrations/leave-absence:ro
       - ../services/org-structure-svc/deployments/migrations:/migrations/org-structure:ro
       - ../services/offboarding-severance-svc/deployments/migrations:/migrations/offboarding-severance:ro
+      - ../services/workforce-compliance-svc/deployments/migrations:/migrations/workforce-compliance:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1746,6 +1747,45 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8117/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  workforce-compliance-svc:
+    build:
+      context: ../services/workforce-compliance-svc
+      dockerfile: Dockerfile
+    container_name: workforce-compliance-svc
+    ports:
+      - "8118:8118"
+    environment:
+      PORT: "8118"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: workforce_compliance
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.compliance.events"
+      EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+      jurisdiction-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8118/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
