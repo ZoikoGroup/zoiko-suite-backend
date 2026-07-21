@@ -206,4 +206,14 @@ EOSQL
 echo "Applying migrations for contract_lifecycle..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "contract_lifecycle" -f /migrations/contract-lifecycle/000001_initial_schema.up.sql
 
+# Create database for clause-template-svc
+echo "Creating database: clause_template..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE clause_template;
+EOSQL
+
+# Apply migrations for clause-template-svc
+echo "Applying migrations for clause_template..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "clause_template" -f /migrations/clause-template/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."

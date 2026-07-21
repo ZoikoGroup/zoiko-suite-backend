@@ -52,6 +52,7 @@ services:
       - ../services/offboarding-severance-svc/deployments/migrations:/migrations/offboarding-severance:ro
       - ../services/workforce-compliance-svc/deployments/migrations:/migrations/workforce-compliance:ro
       - ../services/contract-lifecycle-svc/deployments/migrations:/migrations/contract-lifecycle:ro
+      - ../services/clause-template-svc/deployments/migrations:/migrations/clause-template:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1806,6 +1807,35 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/contract_lifecycle?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  clause-template-svc:
+    build:
+      context: ../services/clause-template-svc
+      dockerfile: Dockerfile
+    container_name: clause-template-svc
+    ports:
+      - "8120:8120"
+    environment:
+      PORT: "8120"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/clause_template?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
     depends_on:
