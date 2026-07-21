@@ -65,18 +65,23 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		fmt.Printf("failed to read migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
-	}
-	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-		fmt.Printf("failed to apply migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
+	for _, migration := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_idempotency_index.up.sql",
+	} {
+		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+		if err != nil {
+			fmt.Printf("failed to read migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+			fmt.Printf("failed to apply migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
 	}
 
 	testStore = store.New(testPool, zap.NewNop())
@@ -108,7 +113,7 @@ func newTestInvoice(tenantID string) *domain.CustomerInvoice {
 		DueDate:              time.Now().Add(15 * 24 * time.Hour),
 		Status:               domain.InvoiceStatusIssued,
 		CreatedByPrincipalID: "test-admin",
-		CorrelationID:        "corr-1",
+		CorrelationID:        "corr-" + uuid.New().String(),
 	}
 }
 
@@ -120,7 +125,7 @@ func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
@@ -136,6 +141,50 @@ func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
 	}
 }
 
+// TestPgStore_CreateInvoice_RetriedCorrelationID_IsIdempotent proves the
+// idempotency guarantee against a REAL Postgres unique index — this is the
+// exact scenario a network-timeout-triggered client retry produces, and it
+// must resolve to the original invoice, never a duplicate receivable.
+func TestPgStore_CreateInvoice_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+	cleanTable(t)
+	s := testStore
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv1 := newTestInvoice(tenantID)
+	inv1.CorrelationID = "corr-retry-1"
+	created1, err := s.CreateInvoice(ctx, inv1)
+	if err != nil {
+		t.Fatalf("first CreateInvoice failed: %v", err)
+	}
+	if !created1 {
+		t.Fatal("expected created=true on the first call")
+	}
+
+	inv2 := newTestInvoice(tenantID)
+	inv2.CorrelationID = "corr-retry-1"
+	created2, err := s.CreateInvoice(ctx, inv2)
+	if err != nil {
+		t.Fatalf("retried CreateInvoice failed: %v", err)
+	}
+	if created2 {
+		t.Fatal("expected created=false on the retried call — this is a duplicate-receivable bug if it's true")
+	}
+	if inv2.InvoiceID != inv1.InvoiceID {
+		t.Fatalf("retried call resolved to a different invoice_id (%s) than the original (%s)", inv2.InvoiceID, inv1.InvoiceID)
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM customer_invoices WHERE tenant_id = $1 AND correlation_id = $2`,
+		tenantID, "corr-retry-1").Scan(&count); err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("DUPLICATE RECEIVABLE: expected exactly 1 customer_invoices row for this correlation_id, got %d", count)
+	}
+}
+
 func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
 	cleanTable(t)
 	s := testStore
@@ -144,7 +193,7 @@ func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
@@ -170,7 +219,7 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 
 	invA := newTestInvoice(tenantA)
-	if err := s.CreateInvoice(ctxA, invA); err != nil {
+	if _, err := s.CreateInvoice(ctxA, invA); err != nil {
 		t.Fatalf("CreateInvoice (tenant A) failed: %v", err)
 	}
 
@@ -208,7 +257,7 @@ func TestPgStore_ListInvoices_TenantScoped(t *testing.T) {
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)
 
 	invA := newTestInvoice(tenantA)
-	if err := s.CreateInvoice(ctxA, invA); err != nil {
+	if _, err := s.CreateInvoice(ctxA, invA); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
