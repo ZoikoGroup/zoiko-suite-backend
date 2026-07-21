@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -20,21 +21,37 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	requests   map[string]*domain.TerminationRequest
-	checklists map[string]*domain.OffboardingChecklist
+	requests          map[string]*domain.TerminationRequest
+	checklists        map[string]*domain.OffboardingChecklist
+	requestsByCorr    map[string]string
+	checklistsByCorr  map[string]string
+	nextTerminationID int
+	nextChecklistID   int
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		requests:   make(map[string]*domain.TerminationRequest),
-		checklists: make(map[string]*domain.OffboardingChecklist),
+		requests:         make(map[string]*domain.TerminationRequest),
+		checklists:       make(map[string]*domain.OffboardingChecklist),
+		requestsByCorr:   make(map[string]string),
+		checklistsByCorr: make(map[string]string),
 	}
 }
 
-func (s *stubStore) CreateTerminationRequest(_ context.Context, req *domain.TerminationRequest) error {
-	req.TerminationID = "term-1"
+func (s *stubStore) CreateTerminationRequest(_ context.Context, req *domain.TerminationRequest) (bool, error) {
+	if req.CorrelationID != "" {
+		if existingID, ok := s.requestsByCorr[req.CorrelationID]; ok {
+			*req = *s.requests[existingID]
+			return false, nil
+		}
+	}
+	s.nextTerminationID++
+	req.TerminationID = fmt.Sprintf("term-%d", s.nextTerminationID)
 	s.requests[req.TerminationID] = req
-	return nil
+	if req.CorrelationID != "" {
+		s.requestsByCorr[req.CorrelationID] = req.TerminationID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetTerminationRequest(_ context.Context, id string) (*domain.TerminationRequest, error) {
@@ -74,24 +91,52 @@ func (s *stubStore) FinalizeEmployeeTermination(_ context.Context, id string) (*
 	if !ok {
 		return nil, domain.ErrTerminationNotFound
 	}
+	if req.Status == domain.TerminationStatusTerminated {
+		return nil, domain.ErrAlreadyTerminated
+	}
+	if req.Status != domain.TerminationStatusApproved {
+		return nil, domain.ErrNotApproved
+	}
 	req.Status = domain.TerminationStatusTerminated
 	effTo := "2024-12-31"
 	req.EffectiveTo = &effTo
 	return req, nil
 }
 
-func (s *stubStore) CreateOffboardingChecklist(_ context.Context, chk *domain.OffboardingChecklist) error {
-	chk.ChecklistID = "chk-1"
-	s.checklists[chk.EmployeeID] = chk
-	return nil
+func (s *stubStore) CreateOffboardingChecklist(_ context.Context, chk *domain.OffboardingChecklist) (bool, error) {
+	if chk.CorrelationID != "" {
+		if existingID, ok := s.checklistsByCorr[chk.CorrelationID]; ok {
+			*chk = *s.checklists[existingID]
+			return false, nil
+		}
+	}
+	s.nextChecklistID++
+	chk.ChecklistID = fmt.Sprintf("chk-%d", s.nextChecklistID)
+	s.checklists[chk.ChecklistID] = chk
+	if chk.CorrelationID != "" {
+		s.checklistsByCorr[chk.CorrelationID] = chk.ChecklistID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetOffboardingChecklist(_ context.Context, employeeID string) (*domain.OffboardingChecklist, error) {
-	chk, ok := s.checklists[employeeID]
-	if !ok {
-		return nil, domain.ErrChecklistNotFound
+	for _, chk := range s.checklists {
+		if chk.EmployeeID == employeeID {
+			return chk, nil
+		}
 	}
-	return chk, nil
+	return nil, domain.ErrChecklistNotFound
+}
+
+func (s *stubStore) GetChecklistItemLegalEntity(_ context.Context, itemID string) (string, error) {
+	for _, chk := range s.checklists {
+		for i := range chk.Items {
+			if chk.Items[i].ItemID == itemID {
+				return chk.LegalEntityID, nil
+			}
+		}
+	}
+	return "", domain.ErrItemNotFound
 }
 
 func (s *stubStore) UpdateChecklistItemStatus(_ context.Context, itemID string, status domain.ChecklistItemStatus, completedBy string) error {
@@ -104,7 +149,7 @@ func (s *stubStore) UpdateChecklistItemStatus(_ context.Context, itemID string, 
 			}
 		}
 	}
-	return nil
+	return domain.ErrItemNotFound
 }
 
 type stubPublisher struct {
@@ -214,6 +259,7 @@ func TestOffboardingSeveranceLifecycle(t *testing.T) {
 		"effective_from":     "2024-12-31",
 		"severance_amount":   15000.00,
 		"currency":           "USD",
+		"correlation_id":     "corr-term-1",
 	}, "hr-admin")
 
 	if rrInit.Code != http.StatusCreated {
@@ -244,6 +290,7 @@ func TestOffboardingSeveranceLifecycle(t *testing.T) {
 		"legal_entity_id": "le-us",
 		"employee_id":     "emp-101",
 		"termination_id":  req.TerminationID,
+		"correlation_id":  "corr-chk-1",
 	}, "hr-admin")
 	if rrChk.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rrChk.Code, rrChk.Body.String())

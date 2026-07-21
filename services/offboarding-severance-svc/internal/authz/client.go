@@ -1,17 +1,17 @@
 package authz
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"time"
 
-	"zoiko.io/offboarding-severance-svc/internal/middleware"
+	"zoiko.io/offboarding-severance-svc/internal/domain"
 )
 
 type Authorizer interface {
-	CheckAllowed(ctx context.Context, principalID, action, resource string) error
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
 type Client struct {
@@ -28,38 +28,43 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
-type CheckResponse struct {
-	Allowed bool   `json:"allowed"`
-	Reason  string `json:"reason,omitempty"`
-}
-
-func (c *Client) CheckAllowed(ctx context.Context, principalID, action, resource string) error {
-	if c.baseURL == "" || principalID == "" {
-		return nil
-	}
-
-	url := fmt.Sprintf("%s/v1/authz/check", c.baseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+// CheckAllowed calls authorization-svc's real /v1/authorize endpoint.
+// Fails closed: any transport error or non-200 response is reported as
+// domain.ErrAuthzServiceUnavailable, never treated as an implicit allow.
+func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	body, err := json.Marshal(map[string]string{
+		"principal_id":    principalID,
+		"legal_entity_id": legalEntityID,
+		"action_type":     actionType,
+	})
 	if err != nil {
 		return err
 	}
 
-	tenantID := middleware.GetTenantID(ctx)
-	req.Header.Set("X-Tenant-Id", tenantID)
-	req.Header.Set("X-Principal-Id", principalID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil
+		return domain.ErrAuthzServiceUnavailable
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		var res CheckResponse
-		if err := json.NewDecoder(resp.Body).Decode(&res); err == nil && !res.Allowed {
-			return fmt.Errorf("authorization denied for action %s: %s", action, res.Reason)
-		}
+	if resp.StatusCode != http.StatusOK {
+		return domain.ErrAuthzServiceUnavailable
 	}
 
+	var res struct {
+		Allowed bool `json:"allowed"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return domain.ErrAuthzServiceUnavailable
+	}
+	if !res.Allowed {
+		return domain.ErrAuthorizationDenied
+	}
 	return nil
 }
