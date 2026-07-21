@@ -44,6 +44,7 @@ type LeaveRequest struct {
 	ReviewerID    *string    `json:"reviewer_id,omitempty"`
 	ReviewerNotes *string    `json:"reviewer_notes,omitempty"`
 	ReviewedAt    *time.Time `json:"reviewed_at,omitempty"`
+	CorrelationID string     `json:"correlation_id"`
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 }
@@ -64,12 +65,13 @@ type AccrueBalanceRequest struct {
 }
 
 type SubmitLeaveRequest struct {
-	EmployeeID  string  `json:"employee_id"`
-	LeaveTypeID string  `json:"leave_type_id"`
-	StartDate   string  `json:"start_date"`
-	EndDate     string  `json:"end_date"`
-	TotalHours  float64 `json:"total_hours"`
-	Reason      *string `json:"reason,omitempty"`
+	EmployeeID    string  `json:"employee_id"`
+	LeaveTypeID   string  `json:"leave_type_id"`
+	StartDate     string  `json:"start_date"`
+	EndDate       string  `json:"end_date"`
+	TotalHours    float64 `json:"total_hours"`
+	Reason        *string `json:"reason,omitempty"`
+	CorrelationID string  `json:"correlation_id"`
 }
 
 type ReviewLeaveRequest struct {
@@ -91,4 +93,10 @@ var (
 	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
 	ErrIdentityMissing         = errorString("caller identity missing")
 	ErrStoreUnavailable        = errorString("leave & absence store unavailable")
+
+	// ErrEmployeeValidationFailed means employee-master-svc could not be
+	// reached to confirm the employee's real legal entity — fail closed
+	// rather than proceeding with a placeholder entity that authorization
+	// would evaluate meaninglessly.
+	ErrEmployeeValidationFailed = errorString("failed to verify employee's legal entity: employee-master-svc unavailable")
 )

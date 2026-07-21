@@ -184,6 +184,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_exceptions
 # Apply migrations for leave-absence-svc
 echo "Applying migrations for leave_absence..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f /migrations/leave-absence/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f /migrations/leave-absence/000002_fix_race_and_idempotency.up.sql
 
 # Apply migrations for org-structure-svc
 echo "Applying migrations for org_structure..."

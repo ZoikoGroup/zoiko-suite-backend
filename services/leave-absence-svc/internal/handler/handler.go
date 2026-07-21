@@ -45,14 +45,14 @@ type EmployeeValidator interface {
 }
 
 const (
-	actionLeaveTypeCreate   = "LEAVE_TYPE_CREATE"
-	actionLeaveTypeView     = "LEAVE_TYPE_VIEW"
-	actionLeaveBalanceView  = "LEAVE_BALANCE_VIEW"
-	actionLeaveBalanceUpdate= "LEAVE_BALANCE_UPDATE"
-	actionLeaveRequestSubmit= "LEAVE_REQUEST_SUBMIT"
-	actionLeaveRequestView  = "LEAVE_REQUEST_VIEW"
-	actionLeaveRequestApprove= "LEAVE_REQUEST_APPROVE"
-	actionLeaveRequestReject = "LEAVE_REQUEST_REJECT"
+	actionLeaveTypeCreate     = "LEAVE_TYPE_CREATE"
+	actionLeaveTypeView       = "LEAVE_TYPE_VIEW"
+	actionLeaveBalanceView    = "LEAVE_BALANCE_VIEW"
+	actionLeaveBalanceUpdate  = "LEAVE_BALANCE_UPDATE"
+	actionLeaveRequestSubmit  = "LEAVE_REQUEST_SUBMIT"
+	actionLeaveRequestView    = "LEAVE_REQUEST_VIEW"
+	actionLeaveRequestApprove = "LEAVE_REQUEST_APPROVE"
+	actionLeaveRequestReject  = "LEAVE_REQUEST_REJECT"
 )
 
 type Handler struct {
@@ -179,19 +179,9 @@ func (h *Handler) GetLeaveBalances(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
-
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, empID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusNotFound, "employee_not_found", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, empID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionLeaveBalanceView); err != nil {
@@ -232,19 +222,9 @@ func (h *Handler) AccrueLeaveBalance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
-
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, req.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionLeaveBalanceUpdate); err != nil {
@@ -278,6 +258,10 @@ func (h *Handler) SubmitLeaveRequest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "employee_id, leave_type_id, start_date, end_date, total_hours are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -285,19 +269,9 @@ func (h *Handler) SubmitLeaveRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
-
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, req.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionLeaveRequestSubmit); err != nil {
@@ -406,13 +380,10 @@ func (h *Handler) handleLeaveReview(w http.ResponseWriter, r *http.Request, acti
 		return
 	}
 
-	legalEntityID := "GLOBAL"
-	if h.employee != nil {
-		tenantID := svcmiddleware.TenantFromContext(r.Context())
-		emp, _ := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, lr.EmployeeID)
-		if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, lr.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
@@ -465,6 +436,33 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// resolveEmployeeEntity confirms an employee exists and returns their real
+// legal entity, to be used as the authorization scope for the action being
+// performed. Fails closed: if employee-master-svc is unreachable or returns
+// anything other than a clean "not found," the request is rejected (503)
+// rather than proceeding under a placeholder entity that authorization
+// would evaluate meaninglessly — prior versions of these call sites either
+// logged a warning and proceeded, or discarded the error entirely.
+func (h *Handler) resolveEmployeeEntity(w http.ResponseWriter, r *http.Request, tenantID, principalID, employeeID string) (string, bool) {
+	if h.employee == nil {
+		return "GLOBAL", true
+	}
+	emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, employeeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrEmployeeNotFound) {
+			writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
+			return "", false
+		}
+		h.log.Error("employee validation failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+		return "", false
+	}
+	if emp == nil || emp.LegalEntityID == "" {
+		return "GLOBAL", true
+	}
+	return emp.LegalEntityID, true
 }
 
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
