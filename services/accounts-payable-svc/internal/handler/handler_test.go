@@ -19,7 +19,8 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	invoices map[string]*domain.VendorInvoice
+	invoices     map[string]*domain.VendorInvoice
+	byCorrelation map[string]string
 
 	createErr     error
 	getErr        error
@@ -28,15 +29,23 @@ type stubStore struct {
 }
 
 func newStubStore() *stubStore {
-	return &stubStore{invoices: map[string]*domain.VendorInvoice{}}
+	return &stubStore{invoices: map[string]*domain.VendorInvoice{}, byCorrelation: map[string]string{}}
 }
 
-func (s *stubStore) CreateInvoice(_ context.Context, inv *domain.VendorInvoice) error {
+func (s *stubStore) CreateInvoice(_ context.Context, inv *domain.VendorInvoice) (bool, error) {
 	if s.createErr != nil {
-		return s.createErr
+		return false, s.createErr
+	}
+	key := inv.TenantID + "|" + inv.CorrelationID
+	if inv.CorrelationID != "" {
+		if existingID, ok := s.byCorrelation[key]; ok {
+			*inv = *s.invoices[existingID]
+			return false, nil
+		}
+		s.byCorrelation[key] = inv.InvoiceID
 	}
 	s.invoices[inv.InvoiceID] = inv
-	return nil
+	return true, nil
 }
 
 func (s *stubStore) GetInvoice(_ context.Context, invoiceID string) (*domain.VendorInvoice, error) {
@@ -121,6 +130,7 @@ func validCreateReq() domain.CreateVendorInvoiceRequest {
 		Amount:        1000,
 		CurrencyCode:  "USD",
 		DueDate:       time.Now().Add(30 * 24 * time.Hour),
+		CorrelationID: "corr-1",
 	}
 }
 
@@ -163,6 +173,42 @@ func TestCreateInvoice_ZeroAmount_Rejected(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a zero-amount invoice, got %d", rec.Code)
+	}
+}
+
+func TestCreateInvoice_MissingCorrelationID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.CorrelationID = ""
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no correlation_id, got %d", rec.Code)
+	}
+}
+
+func TestCreateInvoice_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	req := validCreateReq()
+
+	first := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstInv domain.VendorInvoice
+	_ = json.NewDecoder(first.Body).Decode(&firstInv)
+
+	retry := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("expected 200 on retried call with the same correlation_id, got %d: %s", retry.Code, retry.Body.String())
+	}
+	var retryInv domain.VendorInvoice
+	_ = json.NewDecoder(retry.Body).Decode(&retryInv)
+	if retryInv.InvoiceID != firstInv.InvoiceID {
+		t.Fatalf("retried call resolved to a different invoice_id (%s) than the original (%s)", retryInv.InvoiceID, firstInv.InvoiceID)
+	}
+	if pub.received != 1 {
+		t.Fatalf("expected exactly 1 PublishVendorInvoiceReceived call, got %d — replay must not re-publish", pub.received)
 	}
 }
 
