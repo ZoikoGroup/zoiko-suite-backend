@@ -89,18 +89,23 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		fmt.Printf("failed to read migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
-	}
-	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-		fmt.Printf("failed to apply migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
+	for _, migration := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_idempotency_index.up.sql",
+	} {
+		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+		if err != nil {
+			fmt.Printf("failed to read migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+			fmt.Printf("failed to apply migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
 	}
 
 	testStore = store.New(testPool, zap.NewNop())
@@ -130,7 +135,7 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
 	}
 	tctx := svcmiddleware.WithTenant(ctx, f.tenantID)
 
-	require.NoError(t, testStore.CreateRequest(tctx, &domain.PurchaseRequest{
+	_, err := testStore.CreateRequest(tctx, &domain.PurchaseRequest{
 		RequestID:              f.requestID,
 		TenantID:               f.tenantID,
 		LegalEntityID:          f.entityID,
@@ -139,10 +144,56 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
 		Amount:                 1000,
 		CurrencyCode:           "USD",
 		Status:                 domain.RequestStatusPending,
-		CorrelationID:          "corr-" + tenantLabel,
-	}))
+		CorrelationID:          "corr-" + tenantLabel + "-" + f.requestID,
+	})
+	require.NoError(t, err)
 
 	return f
+}
+
+// TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent proves the
+// idempotency guarantee against a REAL Postgres unique index — this is the
+// exact scenario a network-timeout-triggered client retry produces, and it
+// must resolve to the original request, never a duplicate.
+func TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	req1 := &domain.PurchaseRequest{
+		RequestID:              uuid.New().String(),
+		TenantID:               tenantID,
+		LegalEntityID:          uuid.New().String(),
+		RequestedByPrincipalID: "test-admin",
+		Description:            "50 laptops",
+		Amount:                 50000,
+		CurrencyCode:           "USD",
+		Status:                 domain.RequestStatusPending,
+		CorrelationID:          "corr-retry-1",
+	}
+	created1, err := testStore.CreateRequest(ctx, req1)
+	require.NoError(t, err)
+	assert.True(t, created1, "expected created=true on the first call")
+
+	req2 := &domain.PurchaseRequest{
+		RequestID:              uuid.New().String(),
+		TenantID:               tenantID,
+		LegalEntityID:          uuid.New().String(),
+		RequestedByPrincipalID: "test-admin",
+		Description:            "50 laptops",
+		Amount:                 50000,
+		CurrencyCode:           "USD",
+		Status:                 domain.RequestStatusPending,
+		CorrelationID:          "corr-retry-1",
+	}
+	created2, err := testStore.CreateRequest(ctx, req2)
+	require.NoError(t, err)
+	assert.False(t, created2, "expected created=false on the retried call — this is a duplicate-request bug if it's true")
+	assert.Equal(t, req1.RequestID, req2.RequestID, "retried call must resolve to the original request_id")
+
+	var count int
+	require.NoError(t, testPool.QueryRow(ctx, `SELECT COUNT(*) FROM purchase_requests WHERE tenant_id = $1 AND correlation_id = $2`,
+		tenantID, "corr-retry-1").Scan(&count))
+	assert.Equal(t, 1, count, "DUPLICATE REQUEST: expected exactly 1 purchase_requests row for this correlation_id")
 }
 
 func TestPgStore_TenantIsolation_GetRequest(t *testing.T) {

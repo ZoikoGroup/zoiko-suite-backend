@@ -60,24 +60,52 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 }
 
 // CreateRequest inserts a purchase request header in PENDING status.
-func (s *PgStore) CreateRequest(ctx context.Context, req *domain.PurchaseRequest) error {
+//
+// Idempotent on (tenant_id, correlation_id): a retried call (e.g. a client
+// timeout on a POST that actually succeeded server-side) hits the partial
+// unique index added in 000002 and resolves to the ORIGINAL request —
+// mutating *req in place to reflect it — rather than creating a duplicate.
+// Returns created=false when the row already existed.
+func (s *PgStore) CreateRequest(ctx context.Context, req *domain.PurchaseRequest) (created bool, err error) {
 	tenantID := tenantFromCtxOrFallback(ctx, req.TenantID)
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO purchase_requests (
 				request_id, tenant_id, legal_entity_id, requested_by_principal_id,
 				description, amount, currency_code, status, correlation_id, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, req.RequestID, req.TenantID, req.LegalEntityID, req.RequestedByPrincipalID,
 			req.Description, req.Amount, req.CurrencyCode, string(req.Status), req.CorrelationID, now)
 		if err != nil {
 			return err
 		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT request_id, legal_entity_id, requested_by_principal_id, description, amount,
+				       currency_code, status, approved_by_principal_id, rejected_by_principal_id,
+				       rejection_reason, created_at, approved_at, rejected_at
+				FROM purchase_requests WHERE tenant_id = $1 AND correlation_id = $2
+			`, req.TenantID, req.CorrelationID)
+			var status string
+			if err := row.Scan(
+				&req.RequestID, &req.LegalEntityID, &req.RequestedByPrincipalID, &req.Description, &req.Amount,
+				&req.CurrencyCode, &status, &req.ApprovedByPrincipalID, &req.RejectedByPrincipalID,
+				&req.RejectionReason, &req.CreatedAt, &req.ApprovedAt, &req.RejectedAt,
+			); err != nil {
+				return err
+			}
+			req.Status = domain.RequestStatus(status)
+			created = false
+			return nil
+		}
 		req.CreatedAt = now
+		created = true
 		return nil
 	})
+	return created, err
 }
 
 // GetRequest returns (nil, nil) if not found — including when the caller's
