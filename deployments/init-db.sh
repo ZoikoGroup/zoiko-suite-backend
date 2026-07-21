@@ -226,4 +226,14 @@ EOSQL
 echo "Applying migrations for obligation_tracking..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligation_tracking" -f /migrations/obligation-tracking/000001_initial_schema.up.sql
 
+# Create database for board-resolutions-svc
+echo "Creating database: board_resolutions..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE board_resolutions;
+EOSQL
+
+# Apply migrations for board-resolutions-svc
+echo "Applying migrations for board_resolutions..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "board_resolutions" -f /migrations/board-resolutions/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
