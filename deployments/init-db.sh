@@ -246,4 +246,14 @@ EOSQL
 echo "Applying migrations for corporate_actions..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_actions" -f /migrations/corporate-actions/000001_initial_schema.up.sql
 
+# Create database for counterparty-management-svc
+echo "Creating database: counterparty_management..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE counterparty_management;
+EOSQL
+
+# Apply migrations for counterparty-management-svc
+echo "Applying migrations for counterparty_management..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "counterparty_management" -f /migrations/counterparty-management/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
