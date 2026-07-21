@@ -39,6 +39,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE benefits;
     CREATE DATABASE payroll_tax;
     CREATE DATABASE payroll_exceptions;
+    CREATE DATABASE leave_absence;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -173,5 +174,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_tax" -f /m
 # Apply migrations for payroll-exceptions-svc
 echo "Applying migrations for payroll_exceptions..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_exceptions" -f /migrations/payroll-exceptions/000001_initial_schema.up.sql
+
+# Apply migrations for leave-absence-svc
+echo "Applying migrations for leave_absence..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f /migrations/leave-absence/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."
