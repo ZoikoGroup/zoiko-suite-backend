@@ -176,6 +176,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "benefits" -f /migr
 # Apply migrations for payroll-tax-svc
 echo "Applying migrations for payroll_tax..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_tax" -f /migrations/payroll-tax/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_tax" -f /migrations/payroll-tax/000002_add_idempotency.up.sql
 
 # Apply migrations for payroll-exceptions-svc
 echo "Applying migrations for payroll_exceptions..."

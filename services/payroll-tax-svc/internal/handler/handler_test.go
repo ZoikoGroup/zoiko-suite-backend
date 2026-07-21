@@ -20,16 +20,18 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	profiles     map[string]*domain.TaxJurisdictionProfile
-	calculations map[string]*domain.TaxCalculationRecord
-	audits       map[string]*domain.TaxBasisAudit
+	profiles           map[string]*domain.TaxJurisdictionProfile
+	calculations       map[string]*domain.TaxCalculationRecord
+	calculationsByCorr map[string]string
+	audits             map[string]*domain.TaxBasisAudit
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		profiles:     make(map[string]*domain.TaxJurisdictionProfile),
-		calculations: make(map[string]*domain.TaxCalculationRecord),
-		audits:       make(map[string]*domain.TaxBasisAudit),
+		profiles:           make(map[string]*domain.TaxJurisdictionProfile),
+		calculations:       make(map[string]*domain.TaxCalculationRecord),
+		calculationsByCorr: make(map[string]string),
+		audits:             make(map[string]*domain.TaxBasisAudit),
 	}
 }
 
@@ -52,10 +54,19 @@ func (s *stubStore) ListProfiles(_ context.Context, legalEntityID, jurisdictionC
 	return out, nil
 }
 
-func (s *stubStore) CreateCalculationWithAudit(_ context.Context, calc *domain.TaxCalculationRecord, audit *domain.TaxBasisAudit) error {
+func (s *stubStore) CreateCalculationWithAudit(_ context.Context, calc *domain.TaxCalculationRecord, audit *domain.TaxBasisAudit) (bool, error) {
+	if calc.CorrelationID != "" {
+		if existingID, ok := s.calculationsByCorr[calc.CorrelationID]; ok {
+			*calc = *s.calculations[existingID]
+			return false, nil
+		}
+	}
 	s.calculations[calc.CalculationID] = calc
 	s.audits[calc.CalculationID] = audit
-	return nil
+	if calc.CorrelationID != "" {
+		s.calculationsByCorr[calc.CorrelationID] = calc.CalculationID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetCalculation(_ context.Context, calculationID string) (*domain.TaxCalculationRecord, error) {
@@ -206,6 +217,7 @@ func TestCalculateTax_AndGetAuditLog(t *testing.T) {
 		"gross_taxable_amount":     10000.0,
 		"pre_tax_deduction_amount": 1000.0,
 		"currency":                 "USD",
+		"correlation_id":           "corr-tax-calc-1",
 	}, "payroll-admin")
 
 	if rrCalc.Code != http.StatusCreated {
@@ -257,5 +269,68 @@ func TestCalculateTax_AndGetAuditLog(t *testing.T) {
 	}
 	if pub.adjusted != 1 {
 		t.Errorf("expected 1 adjusted event got %d", pub.adjusted)
+	}
+}
+
+func TestCalculateTax_MissingCorrelationID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodPost, "/v1/payroll-tax/calculate", map[string]any{
+		"payroll_run_id":       "prun-302",
+		"employee_id":          "emp-302",
+		"jurisdiction_code":    "US-NY",
+		"gross_taxable_amount": 5000.0,
+	}, "payroll-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCalculateTax_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	downValidator := &stubEmployeeValidator{err: domain.ErrStoreUnavailable}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, downValidator)
+	rr := doReq(r, http.MethodPost, "/v1/payroll-tax/calculate", map[string]any{
+		"payroll_run_id":       "prun-303",
+		"employee_id":          "emp-303",
+		"jurisdiction_code":    "US-NY",
+		"gross_taxable_amount": 5000.0,
+		"correlation_id":       "corr-tax-down",
+	}, "payroll-admin")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (fail closed) got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCalculateTax_RetriedCorrelationID_ReturnsOriginal(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	body := map[string]any{
+		"payroll_run_id":       "prun-304",
+		"employee_id":          "emp-304",
+		"jurisdiction_code":    "US-NY",
+		"gross_taxable_amount": 5000.0,
+		"correlation_id":       "corr-tax-retry",
+	}
+
+	rr1 := doReq(r, http.MethodPost, "/v1/payroll-tax/calculate", body, "payroll-admin")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var c1 domain.TaxCalculationRecord
+	_ = json.NewDecoder(rr1.Body).Decode(&c1)
+
+	rr2 := doReq(r, http.MethodPost, "/v1/payroll-tax/calculate", body, "payroll-admin")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on replay got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var c2 domain.TaxCalculationRecord
+	_ = json.NewDecoder(rr2.Body).Decode(&c2)
+
+	if c2.CalculationID != c1.CalculationID {
+		t.Errorf("expected replay to resolve to the original calculation %q, got %q", c1.CalculationID, c2.CalculationID)
+	}
+	if pub.calculated != 1 {
+		t.Errorf("expected exactly 1 calculated event (no re-publish on replay) got %d", pub.calculated)
 	}
 }
