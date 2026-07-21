@@ -49,6 +49,7 @@ services:
       - ../services/payroll-exceptions-svc/deployments/migrations:/migrations/payroll-exceptions:ro
       - ../services/leave-absence-svc/deployments/migrations:/migrations/leave-absence:ro
       - ../services/org-structure-svc/deployments/migrations:/migrations/org-structure:ro
+      - ../services/offboarding-severance-svc/deployments/migrations:/migrations/offboarding-severance:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1706,6 +1707,45 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8116/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  offboarding-severance-svc:
+    build:
+      context: ../services/offboarding-severance-svc
+      dockerfile: Dockerfile
+    container_name: offboarding-severance-svc
+    ports:
+      - "8117:8117"
+    environment:
+      PORT: "8117"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: offboarding_severance
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.offboarding.events"
+      EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+      jurisdiction-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8117/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
