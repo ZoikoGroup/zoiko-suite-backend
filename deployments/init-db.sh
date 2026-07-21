@@ -216,4 +216,14 @@ EOSQL
 echo "Applying migrations for clause_template..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "clause_template" -f /migrations/clause-template/000001_initial_schema.up.sql
 
+# Create database for obligation-tracking-svc
+echo "Creating database: obligation_tracking..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE obligation_tracking;
+EOSQL
+
+# Apply migrations for obligation-tracking-svc
+echo "Applying migrations for obligation_tracking..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligation_tracking" -f /migrations/obligation-tracking/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
