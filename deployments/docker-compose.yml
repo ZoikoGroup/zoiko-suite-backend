@@ -44,6 +44,7 @@ services:
       - ../services/employment-contracts-svc/deployments/migrations:/migrations/employment-contracts:ro
       - ../services/payroll-run-svc/deployments/migrations:/migrations/payroll-run:ro
       - ../services/compensation-svc/deployments/migrations:/migrations/compensation:ro
+      - ../services/benefits-svc/deployments/migrations:/migrations/benefits:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1521,6 +1522,42 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8111/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  benefits-svc:
+    build:
+      context: ../services/benefits-svc
+      dockerfile: Dockerfile
+    container_name: benefits-svc
+    ports:
+      - "8112:8112"
+    environment:
+      PORT: "8112"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: benefits
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.benefits.events"
+      EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8112/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
