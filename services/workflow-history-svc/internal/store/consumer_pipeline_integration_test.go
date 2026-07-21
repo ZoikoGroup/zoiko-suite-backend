@@ -86,7 +86,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 	dbPort := uint32(15433 + uint32(os.Getpid()%500))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.PostgresVersion("16.1.0")).
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("workflow_history_consumer_test").
 			Username("postgres").
