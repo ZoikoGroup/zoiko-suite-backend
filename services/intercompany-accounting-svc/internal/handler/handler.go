@@ -19,7 +19,7 @@ import (
 )
 
 type Store interface {
-	CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry) error
+	CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry) (created bool, err error)
 	GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error)
 	ListEntries(ctx context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error)
 	UpdateMatch(ctx context.Context, id, targetJournalID, matchStatus string, mismatchReason *string) error
@@ -123,9 +123,16 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 		UpdatedAt:           now,
 	}
 
-	if err := h.store.CreateEntry(r.Context(), entry); err != nil {
+	created, err := h.store.CreateEntry(r.Context(), entry)
+	if err != nil {
 		h.log.Error("failed to create intercompany entry", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		// Replay of a prior request for the same source_journal_id — return
+		// the original entry, do not re-publish the created event.
+		writeJSON(w, http.StatusOK, entry)
 		return
 	}
 
