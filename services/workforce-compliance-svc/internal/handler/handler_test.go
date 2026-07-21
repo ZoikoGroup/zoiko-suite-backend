@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -20,28 +21,57 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	workAuths map[string]*domain.WorkAuthorization
-	visas     map[string]*domain.VisaRecord
-	hourLogs  []domain.WorkingHourLog
-	alerts    map[string]*domain.ComplianceAlert
+	workAuths       map[string]*domain.WorkAuthorization
+	workAuthsByCorr map[string]string
+	visas           map[string]*domain.VisaRecord
+	visasByCorr     map[string]string
+	hourLogs        []domain.WorkingHourLog
+	hourLogsByCorr  map[string]int
+	alerts          map[string]*domain.ComplianceAlert
+	nextAuthID      int
+	nextVisaID      int
+	nextLogID       int
+	nextAlertID     int
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		workAuths: make(map[string]*domain.WorkAuthorization),
-		visas:     make(map[string]*domain.VisaRecord),
-		alerts:    make(map[string]*domain.ComplianceAlert),
+		workAuths:       make(map[string]*domain.WorkAuthorization),
+		workAuthsByCorr: make(map[string]string),
+		visas:           make(map[string]*domain.VisaRecord),
+		visasByCorr:     make(map[string]string),
+		hourLogsByCorr:  make(map[string]int),
+		alerts:          make(map[string]*domain.ComplianceAlert),
 	}
 }
 
-func (s *stubStore) CreateWorkAuth(_ context.Context, auth *domain.WorkAuthorization) error {
-	auth.AuthID = "auth-1"
-	s.workAuths[auth.EmployeeID] = auth
-	return nil
+func (s *stubStore) CreateWorkAuth(_ context.Context, auth *domain.WorkAuthorization) (bool, error) {
+	if auth.CorrelationID != "" {
+		if existingID, ok := s.workAuthsByCorr[auth.CorrelationID]; ok {
+			*auth = *s.workAuths[existingID]
+			return false, nil
+		}
+	}
+	s.nextAuthID++
+	auth.AuthID = fmt.Sprintf("auth-%d", s.nextAuthID)
+	s.workAuths[auth.AuthID] = auth
+	if auth.CorrelationID != "" {
+		s.workAuthsByCorr[auth.CorrelationID] = auth.AuthID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetWorkAuth(_ context.Context, employeeID string) (*domain.WorkAuthorization, error) {
-	auth, ok := s.workAuths[employeeID]
+	for _, auth := range s.workAuths {
+		if auth.EmployeeID == employeeID {
+			return auth, nil
+		}
+	}
+	return nil, domain.ErrRecordNotFound
+}
+
+func (s *stubStore) GetWorkAuthByID(_ context.Context, authID string) (*domain.WorkAuthorization, error) {
+	auth, ok := s.workAuths[authID]
 	if !ok {
 		return nil, domain.ErrRecordNotFound
 	}
@@ -49,29 +79,38 @@ func (s *stubStore) GetWorkAuth(_ context.Context, employeeID string) (*domain.W
 }
 
 func (s *stubStore) VerifyWorkAuth(_ context.Context, authID string, verifiedBy string) (*domain.WorkAuthorization, error) {
-	for _, auth := range s.workAuths {
-		if auth.AuthID == authID {
-			auth.Status = domain.VerificationStatusVerified
-			auth.VerifiedBy = &verifiedBy
-			return auth, nil
-		}
-	}
-	return nil, domain.ErrRecordNotFound
-}
-
-func (s *stubStore) CreateVisaRecord(_ context.Context, visa *domain.VisaRecord) error {
-	visa.VisaID = "visa-1"
-	s.visas[visa.VisaID] = visa
-	s.visas[visa.EmployeeID] = visa
-	return nil
-}
-
-func (s *stubStore) GetVisaRecord(_ context.Context, employeeID string) (*domain.VisaRecord, error) {
-	visa, ok := s.visas[employeeID]
+	auth, ok := s.workAuths[authID]
 	if !ok {
 		return nil, domain.ErrRecordNotFound
 	}
-	return visa, nil
+	auth.Status = domain.VerificationStatusVerified
+	auth.VerifiedBy = &verifiedBy
+	return auth, nil
+}
+
+func (s *stubStore) CreateVisaRecord(_ context.Context, visa *domain.VisaRecord) (bool, error) {
+	if visa.CorrelationID != "" {
+		if existingID, ok := s.visasByCorr[visa.CorrelationID]; ok {
+			*visa = *s.visas[existingID]
+			return false, nil
+		}
+	}
+	s.nextVisaID++
+	visa.VisaID = fmt.Sprintf("visa-%d", s.nextVisaID)
+	s.visas[visa.VisaID] = visa
+	if visa.CorrelationID != "" {
+		s.visasByCorr[visa.CorrelationID] = visa.VisaID
+	}
+	return true, nil
+}
+
+func (s *stubStore) GetVisaRecord(_ context.Context, employeeID string) (*domain.VisaRecord, error) {
+	for _, visa := range s.visas {
+		if visa.EmployeeID == employeeID {
+			return visa, nil
+		}
+	}
+	return nil, domain.ErrRecordNotFound
 }
 
 func (s *stubStore) FlagVisaExpiration(_ context.Context, visaID string) (*domain.VisaRecord, error) {
@@ -79,14 +118,27 @@ func (s *stubStore) FlagVisaExpiration(_ context.Context, visaID string) (*domai
 	if !ok {
 		return nil, domain.ErrRecordNotFound
 	}
+	if visa.FlaggedForExpiry {
+		return visa, domain.ErrAlreadyFlagged
+	}
 	visa.FlaggedForExpiry = true
 	return visa, nil
 }
 
-func (s *stubStore) LogWorkingHours(_ context.Context, log *domain.WorkingHourLog) error {
-	log.LogID = "log-1"
+func (s *stubStore) LogWorkingHours(_ context.Context, log *domain.WorkingHourLog) (bool, error) {
+	if log.CorrelationID != "" {
+		if idx, ok := s.hourLogsByCorr[log.CorrelationID]; ok {
+			*log = s.hourLogs[idx]
+			return false, nil
+		}
+	}
+	s.nextLogID++
+	log.LogID = fmt.Sprintf("log-%d", s.nextLogID)
 	s.hourLogs = append(s.hourLogs, *log)
-	return nil
+	if log.CorrelationID != "" {
+		s.hourLogsByCorr[log.CorrelationID] = len(s.hourLogs) - 1
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetWeeklyHours(_ context.Context, employeeID string, startDate string) (float64, error) {
@@ -100,9 +152,18 @@ func (s *stubStore) GetWeeklyHours(_ context.Context, employeeID string, startDa
 }
 
 func (s *stubStore) CreateComplianceAlert(_ context.Context, alert *domain.ComplianceAlert) error {
-	alert.AlertID = "alt-1"
+	s.nextAlertID++
+	alert.AlertID = fmt.Sprintf("alt-%d", s.nextAlertID)
 	s.alerts[alert.AlertID] = alert
 	return nil
+}
+
+func (s *stubStore) GetComplianceAlert(_ context.Context, alertID string) (*domain.ComplianceAlert, error) {
+	a, ok := s.alerts[alertID]
+	if !ok {
+		return nil, domain.ErrAlertNotFound
+	}
+	return a, nil
 }
 
 func (s *stubStore) ListComplianceAlerts(_ context.Context, legalEntityID string) ([]domain.ComplianceAlert, error) {
@@ -118,10 +179,11 @@ func (s *stubStore) ListComplianceAlerts(_ context.Context, legalEntityID string
 
 func (s *stubStore) ResolveComplianceAlert(_ context.Context, alertID string, resolvedBy string) error {
 	a, ok := s.alerts[alertID]
-	if ok {
-		a.IsResolved = true
-		a.ResolvedBy = &resolvedBy
+	if !ok {
+		return domain.ErrAlertNotFound
 	}
+	a.IsResolved = true
+	a.ResolvedBy = &resolvedBy
 	return nil
 }
 
@@ -222,6 +284,7 @@ func TestWorkforceComplianceLifecycle(t *testing.T) {
 		"document_number": "DOC-999",
 		"issue_date":      "2024-01-01",
 		"effective_from":  "2024-01-01",
+		"correlation_id":  "corr-auth-1",
 	}, "hr-admin")
 
 	if rrAuth.Code != http.StatusCreated {
@@ -246,6 +309,7 @@ func TestWorkforceComplianceLifecycle(t *testing.T) {
 		"visa_type":       "H1B",
 		"issuing_country": "USA",
 		"expiration_date": "2024-12-31",
+		"correlation_id":  "corr-visa-1",
 	}, "hr-admin")
 	if rrVisa.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rrVisa.Code, rrVisa.Body.String())
@@ -268,6 +332,7 @@ func TestWorkforceComplianceLifecycle(t *testing.T) {
 		"work_date":       "2024-06-01",
 		"hours_worked":    45.0,
 		"overtime_hours":  5.0,
+		"correlation_id":  "corr-hours-1",
 	}, "hr-admin")
 	if rrHours.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rrHours.Code, rrHours.Body.String())
