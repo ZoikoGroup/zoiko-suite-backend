@@ -47,26 +47,56 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 }
 
 // CreateInvoice inserts a customer invoice header in ISSUED status.
-func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice) error {
+//
+// Idempotent on (tenant_id, correlation_id): a retried call (e.g. a client
+// timeout on a POST that actually succeeded server-side) hits the partial
+// unique index added in 000002 and resolves to the ORIGINAL invoice —
+// mutating *inv in place to reflect it — rather than creating a duplicate
+// receivable. Returns created=false when the row already existed.
+func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice) (created bool, err error) {
 	tenantID := tenantFromCtxOrFallback(ctx, inv.TenantID)
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO customer_invoices (
 				invoice_id, tenant_id, legal_entity_id, customer_id, invoice_number,
 				amount, currency_code, due_date, status, created_by_principal_id,
 				correlation_id, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, inv.InvoiceID, inv.TenantID, inv.LegalEntityID, inv.CustomerID, inv.InvoiceNumber,
 			inv.Amount, inv.CurrencyCode, inv.DueDate, string(inv.Status), inv.CreatedByPrincipalID,
 			inv.CorrelationID, now)
 		if err != nil {
 			return err
 		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT invoice_id, legal_entity_id, customer_id, invoice_number, amount, currency_code,
+				       due_date, status, created_by_principal_id, sent_by_principal_id,
+				       marked_overdue_by_principal_id, payment_received_by_principal_id,
+				       created_at, sent_at, marked_overdue_at, payment_received_at
+				FROM customer_invoices WHERE tenant_id = $1 AND correlation_id = $2
+			`, inv.TenantID, inv.CorrelationID)
+			var status string
+			if err := row.Scan(
+				&inv.InvoiceID, &inv.LegalEntityID, &inv.CustomerID, &inv.InvoiceNumber, &inv.Amount, &inv.CurrencyCode,
+				&inv.DueDate, &status, &inv.CreatedByPrincipalID, &inv.SentByPrincipalID,
+				&inv.MarkedOverdueByPrincipalID, &inv.PaymentReceivedByPrincipalID,
+				&inv.CreatedAt, &inv.SentAt, &inv.MarkedOverdueAt, &inv.PaymentReceivedAt,
+			); err != nil {
+				return err
+			}
+			inv.Status = domain.InvoiceStatus(status)
+			created = false
+			return nil
+		}
 		inv.CreatedAt = now
+		created = true
 		return nil
 	})
+	return created, err
 }
 
 // GetInvoice returns a customer invoice by ID, scoped to the caller's tenant.
