@@ -276,4 +276,14 @@ EOSQL
 echo "Applying migrations for tax_determination..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_determination" -f /migrations/tax-determination/000001_initial_schema.up.sql
 
+# Create database for vat-gst-svc
+echo "Creating database: vat_gst..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE vat_gst;
+EOSQL
+
+# Apply migrations for vat-gst-svc
+echo "Applying migrations for vat_gst..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vat_gst" -f /migrations/vat-gst/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
