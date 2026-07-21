@@ -58,6 +58,7 @@ services:
       - ../services/corporate-actions-svc/deployments/migrations:/migrations/corporate-actions:ro
       - ../services/counterparty-management-svc/deployments/migrations:/migrations/counterparty-management:ro
       - ../services/tax-rules-svc/deployments/migrations:/migrations/tax-rules:ro
+      - ../services/tax-determination-svc/deployments/migrations:/migrations/tax-determination:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1994,6 +1995,38 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  tax-determination-svc:
+    build:
+      context: ../services/tax-determination-svc
+      dockerfile: Dockerfile
+    container_name: tax-determination-svc
+    ports:
+      - "8126:8126"
+    environment:
+      PORT: "8126"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_determination?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.tax-determination.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      tax-rules-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

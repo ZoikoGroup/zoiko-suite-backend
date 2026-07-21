@@ -266,4 +266,14 @@ EOSQL
 echo "Applying migrations for tax_rules..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_rules" -f /migrations/tax-rules/000001_initial_schema.up.sql
 
+# Create database for tax-determination-svc
+echo "Creating database: tax_determination..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE tax_determination;
+EOSQL
+
+# Apply migrations for tax-determination-svc
+echo "Applying migrations for tax_determination..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_determination" -f /migrations/tax-determination/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
