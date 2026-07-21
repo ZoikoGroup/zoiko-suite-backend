@@ -83,24 +83,54 @@ func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) erro
 }
 
 // CreateStatementLine inserts an ingested bank statement line in UNMATCHED status.
-func (s *PgStore) CreateStatementLine(ctx context.Context, l *domain.StatementLine) error {
+// CreateStatementLine inserts an ingested bank statement line in UNMATCHED
+// status.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call (e.g. a client
+// timeout on a POST that actually succeeded server-side) hits the partial
+// unique index added in 000002 and resolves to the ORIGINAL line — mutating
+// *l in place to reflect it — rather than creating a duplicate. Returns
+// created=false when the row already existed.
+func (s *PgStore) CreateStatementLine(ctx context.Context, l *domain.StatementLine) (created bool, err error) {
 	tenantID := tenantFromCtxOrFallback(ctx, l.TenantID)
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO statement_lines (
 				statement_line_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
 				amount, currency_code, bank_reference, status, correlation_id, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, l.StatementLineID, l.TenantID, l.LegalEntityID, l.BankAccountID, l.StatementDate,
 			l.Amount, l.CurrencyCode, l.BankReference, string(l.Status), l.CorrelationID, now)
 		if err != nil {
 			return err
 		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT statement_line_id, legal_entity_id, bank_account_id, statement_date, amount,
+				       currency_code, bank_reference, status, matched_journal_id, matched_by_principal_id,
+				       matched_at, exception_reason, flagged_by_principal_id, flagged_at, created_at
+				FROM statement_lines WHERE tenant_id = $1 AND correlation_id = $2
+			`, l.TenantID, l.CorrelationID)
+			var status string
+			if err := row.Scan(
+				&l.StatementLineID, &l.LegalEntityID, &l.BankAccountID, &l.StatementDate, &l.Amount,
+				&l.CurrencyCode, &l.BankReference, &status, &l.MatchedJournalID, &l.MatchedByPrincipalID,
+				&l.MatchedAt, &l.ExceptionReason, &l.FlaggedByPrincipalID, &l.FlaggedAt, &l.CreatedAt,
+			); err != nil {
+				return err
+			}
+			l.Status = domain.StatementLineStatus(status)
+			created = false
+			return nil
+		}
 		l.CreatedAt = now
+		created = true
 		return nil
 	})
+	return created, err
 }
 
 // GetStatementLine returns (nil, nil) if not found — including when the
