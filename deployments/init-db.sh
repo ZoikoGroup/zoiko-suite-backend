@@ -161,6 +161,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contrac
 # Apply migrations for payroll-run-svc
 echo "Applying migrations for payroll_run..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000002_add_idempotency_index.up.sql
 
 # Apply migrations for compensation-svc
 echo "Applying migrations for compensation..."
