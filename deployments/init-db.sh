@@ -125,6 +125,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_receivabl
 # Apply migrations for purchase-request-svc
 echo "Applying migrations for purchase_request..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_request" -f /migrations/purchase-request/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_request" -f /migrations/purchase-request/000002_add_idempotency_index.up.sql
 
 # Apply migrations for treasury-svc
 echo "Applying migrations for treasury..."
