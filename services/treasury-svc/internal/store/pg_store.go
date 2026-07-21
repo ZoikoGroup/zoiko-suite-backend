@@ -283,25 +283,50 @@ func (s *PgStore) GetLiquidityThreshold(ctx context.Context, legalEntityID, curr
 }
 
 // ExecuteTransfer processes a cash transfer between two bank accounts under RLS.
-func (s *PgStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) error {
+// ExecuteTransfer moves funds between two bank accounts by writing a new
+// cash_balances row for each leg.
+//
+// Idempotent on (tenant_id, correlation_id): the transfer's own two
+// cash_balances rows deliberately share one correlation_id, so uniqueness
+// can't live on that table — it lives on the transfers table instead, one
+// row per transfer intent. A retried call hits that table's partial unique
+// index and is rejected as a no-op BEFORE either balance leg is written,
+// so a retry can never double-debit the source or double-credit the
+// target. Returns created=false when the transfer already existed.
+func (s *PgStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
 	// Store-layer invariant: amount must be strictly positive. The handler rejects
 	// non-positive amounts first, but we assert here too so this store method is safe
 	// to call from any future code path without relying on the handler as the sole gate.
 	if amount <= 0 {
-		return domain.ErrInvalidAmount
+		return false, domain.ErrInvalidAmount
 	}
 
 	now := time.Now().UTC()
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO transfers (
+				tenant_id, source_bank_account_id, target_bank_account_id, amount, currency_code, correlation_id
+			) VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
+		`, tenantID, srcAcctID, tgtAcctID, amount, currencyCode, correlationID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			created = false
+			return nil
+		}
+		created = true
+
 		// Retrieve and lock both accounts to prevent concurrency race
 		var srcAcct, tgtAcct domain.BankAccount
-		err := tx.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			SELECT bank_account_id, tenant_id, legal_entity_id, currency_code, account_status
 			FROM bank_accounts WHERE bank_account_id = $1 AND tenant_id = $2 FOR UPDATE
 		`, srcAcctID, tenantID).Scan(&srcAcct.BankAccountID, &srcAcct.TenantID, &srcAcct.LegalEntityID, &srcAcct.CurrencyCode, &srcAcct.AccountStatus)
@@ -369,4 +394,5 @@ func (s *PgStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID stri
 
 		return nil
 	})
+	return created, err
 }
