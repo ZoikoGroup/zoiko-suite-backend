@@ -52,7 +52,7 @@ func TestMain(m *testing.M) {
 	dbPort := uint32(15801 + uint32(os.Getpid()%499))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.V16).
+			Version(embeddedpostgres.PostgresVersion("16.0.0")).
 			Port(dbPort).
 			Database("pr_isolation_test").
 			Username("postgres").

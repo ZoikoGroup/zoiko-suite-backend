@@ -76,7 +76,7 @@ func TestServerHealthProbes(t *testing.T) {
 	// ── Start embedded Postgres ───────────────────────────────────────────
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.V16).
+			Version(embeddedpostgres.PostgresVersion("16.0.0")).
 			Username("testuser").
 			Password("testpass").
 			Database("audit_event_store").
