@@ -60,6 +60,7 @@ services:
       - ../services/tax-rules-svc/deployments/migrations:/migrations/tax-rules:ro
       - ../services/tax-determination-svc/deployments/migrations:/migrations/tax-determination:ro
       - ../services/vat-gst-svc/deployments/migrations:/migrations/vat-gst:ro
+      - ../services/corporate-tax-svc/deployments/migrations:/migrations/corporate-tax:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -2052,6 +2053,39 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  corporate-tax-svc:
+    build:
+      context: ../services/corporate-tax-svc
+      dockerfile: Dockerfile
+    container_name: corporate-tax-svc
+    ports:
+      - "8128:8128"
+    environment:
+      PORT: "8128"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_tax?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.corporate-tax.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      GENERAL_LEDGER_URL: "http://general-ledger-svc:8091"
     depends_on:
       postgres:
         condition: service_healthy
