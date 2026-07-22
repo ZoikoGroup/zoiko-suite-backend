@@ -1083,6 +1083,130 @@
                                                 ]
                                   }
                               ]
+                 },
+                 {
+                     "name": "11. Withholding Tax Service",
+                     "item": [
+                         {
+                             "name": "Calculate Withholding Tax",
+                             "request": {
+                                 "method": "POST",
+                                 "header": [
+                                     { "key": "Content-Type", "value": "application/json" },
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "body": {
+                                     "mode": "raw",
+                                     "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"counterparty_id\":\"vendor-crossborder-01\",\"payment_reference\":\"INV-2026-901\",\"payment_type\":\"ROYALTIES\",\"gross_payment_amount\":50000.00,\"taxable_base_amount\":50000.00,\"withholding_rate_percent\":15.00,\"currency\":\"USD\"}"
+                                 },
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax/calculate"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                             "pm.test('withheld amount calculated', ()=>{const b=pm.response.json();pm.expect(b.withheld_amount).to.eql(7500);});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "Create Withholding Tax Obligation",
+                             "request": {
+                                 "method": "POST",
+                                 "header": [
+                                     { "key": "Content-Type", "value": "application/json" },
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "body": {
+                                     "mode": "raw",
+                                     "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"counterparty_id\":\"vendor-crossborder-01\",\"payment_reference\":\"INV-2026-901\",\"payment_type\":\"ROYALTIES\",\"gross_payment_amount\":50000.00,\"taxable_base_amount\":50000.00,\"withholding_rate_percent\":15.00,\"currency\":\"USD\",\"notes\":\"Cross border royalty payment WHT\",\"effective_from\":\"2026-07-22\",\"created_by\":\"tax_mgr\"}"
+                                 },
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                             "const b=pm.response.json();",
+                                             "pm.environment.set('whtObligationId', b.obligation_id);"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "List Withholding Tax Obligations",
+                             "request": {
+                                 "method": "GET",
+                                 "header": [
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax?legal_entity_id={{legalEntityId}}"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "Get Withholding Tax Obligation by ID",
+                             "request": {
+                                 "method": "GET",
+                                 "header": [
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax/{{whtObligationId}}"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "Remit Withholding Tax Obligation",
+                             "request": {
+                                 "method": "POST",
+                                 "header": [
+                                     { "key": "Content-Type", "value": "application/json" },
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "body": {
+                                     "mode": "raw",
+                                     "raw": "{\"remittance_reference\":\"HMRC-WHT-REMIT-2026-0099\",\"remitted_by\":\"treasury_officer\",\"notes\":\"Remitted to HMRC bank account\"}"
+                                 },
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax/{{whtObligationId}}/remit"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                             "pm.test('Status REMITTED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('REMITTED');});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         }
+                     ]
                  }
              ]
 }

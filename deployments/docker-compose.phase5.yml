@@ -65,6 +65,7 @@ services:
       - ../services/tax-determination-svc/deployments/migrations:/migrations/tax-determination:ro
       - ../services/vat-gst-svc/deployments/migrations:/migrations/vat-gst:ro
       - ../services/corporate-tax-svc/deployments/migrations:/migrations/corporate-tax:ro
+      - ../services/withholding-tax-svc/deployments/migrations:/migrations/withholding-tax:ro
       - postgres_p5_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -73,19 +74,21 @@ services:
       retries: 10
       start_period: 30s
 
-  # Stub authz-svc so Phase 5 services start without the full identity stack.
-  # Returns 200 {"allowed":true} for all requests.
+  # Stub authz-svc — nginx:alpine returns {"allowed":true} for every request.
+  # Config is mounted from nginx-authz-stub.conf to avoid shell quoting issues.
   authorization-svc:
-    image: hashicorp/http-echo:1.0.0
+    image: nginx:alpine
     container_name: authorization-svc-p5
-    command: ["-listen=:8089", "-text={\"allowed\":true}"]
     ports:
-      - "8089:8089"
+      - "8089:80"
+    volumes:
+      - ./nginx-authz-stub.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8089/v1/authorize || exit 1"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 5s
 
   # ─── Phase 5 Services ────────────────────────────────────────────────────────
 
@@ -101,8 +104,8 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/contract_lifecycle?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
-      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:80"
+      JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,8 +133,8 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/clause_template?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
-      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:80"
+      JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
       postgres:
         condition: service_healthy
@@ -159,8 +162,8 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/obligation_tracking?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.obligation-tracking.events"
-      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:80"
+      JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
       postgres:
         condition: service_healthy
@@ -188,8 +191,8 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/board_resolutions?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.board-resolutions.events"
-      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:80"
+      JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
       postgres:
         condition: service_healthy
@@ -217,8 +220,8 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_actions?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
-      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:80"
+      JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
       postgres:
         condition: service_healthy
@@ -246,8 +249,8 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
-      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:80"
+      JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
       postgres:
         condition: service_healthy
@@ -275,8 +278,8 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_rules?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
-      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:80"
+      JURISDICTION_RULES_URL: "http://authorization-svc:80"
     depends_on:
       postgres:
         condition: service_healthy
@@ -372,6 +375,38 @@ services:
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
       JURISDICTION_RULES_URL: "http://authorization-svc:8089"
       GENERAL_LEDGER_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  withholding-tax-svc:
+    build:
+      context: ../services/withholding-tax-svc
+      dockerfile: Dockerfile
+    container_name: withholding-tax-svc-p5
+    ports:
+      - "8129:8129"
+    environment:
+      PORT: "8129"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/withholding_tax?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.withholding-tax.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
         condition: service_healthy

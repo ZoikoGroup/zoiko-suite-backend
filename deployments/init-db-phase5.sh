@@ -58,4 +58,8 @@ apply_migration vat_gst /migrations/vat-gst/000001_initial_schema.up.sql
 create_db corporate_tax
 apply_migration corporate_tax /migrations/corporate-tax/000001_initial_schema.up.sql
 
+# ── Withholding Tax ───────────────────────────────────────────────────────────
+create_db withholding_tax
+apply_migration withholding_tax /migrations/withholding-tax/000001_initial_schema.up.sql
+
 echo "=== Phase 5 databases initialised successfully ==="
