@@ -1375,6 +1375,92 @@
                               ]
                           }
                       ]
+                  },
+                  {
+                      "name": "14. Compliance Status Service",
+                      "item": [
+                          {
+                              "name": "Evaluate Compliance Health",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"domain_name\":\"TAX\",\"total_obligations\":10,\"fulfilled_obligations\":9,\"pending_obligations\":1,\"overdue_obligations\":0,\"open_exceptions\":0,\"effective_from\":\"2026-01-01\",\"created_by\":\"risk_officer\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8132/v1/compliance-status/evaluate"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "const b=pm.response.json();",
+                                              "pm.expect(b.health_score).to.eql(90);",
+                                              "pm.environment.set('compStatusId', b.status_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Create Compliance Gap",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"domain_name\":\"TAX\",\"gap_type\":\"MISSING_EVIDENCE\",\"severity\":\"HIGH\",\"source_reference\":\"whto-2026-001\",\"description\":\"Missing exemption certificate for cross-border WHT\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8132/v1/compliance-status/gaps"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('complianceGapId', b.gap_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Resolve Compliance Gap",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"remediation_notes\":\"Exemption certificate provided by counterparty\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8132/v1/compliance-status/gaps/{{complianceGapId}}/resolve"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status RESOLVED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('RESOLVED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
                   }
              ]
 }
