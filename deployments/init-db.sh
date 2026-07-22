@@ -194,4 +194,106 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severa
 echo "Applying migrations for workforce_compliance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
 
+# ── Phase 5 ─────────────────────────────────────────────────────────────────
+
+# Create database for contract-lifecycle-svc
+echo "Creating database: contract_lifecycle..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE contract_lifecycle;
+EOSQL
+
+# Apply migrations for contract-lifecycle-svc
+echo "Applying migrations for contract_lifecycle..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "contract_lifecycle" -f /migrations/contract-lifecycle/000001_initial_schema.up.sql
+
+# Create database for clause-template-svc
+echo "Creating database: clause_template..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE clause_template;
+EOSQL
+
+# Apply migrations for clause-template-svc
+echo "Applying migrations for clause_template..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "clause_template" -f /migrations/clause-template/000001_initial_schema.up.sql
+
+# Create database for obligation-tracking-svc
+echo "Creating database: obligation_tracking..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE obligation_tracking;
+EOSQL
+
+# Apply migrations for obligation-tracking-svc
+echo "Applying migrations for obligation_tracking..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligation_tracking" -f /migrations/obligation-tracking/000001_initial_schema.up.sql
+
+# Create database for board-resolutions-svc
+echo "Creating database: board_resolutions..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE board_resolutions;
+EOSQL
+
+# Apply migrations for board-resolutions-svc
+echo "Applying migrations for board_resolutions..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "board_resolutions" -f /migrations/board-resolutions/000001_initial_schema.up.sql
+
+# Create database for corporate-actions-svc
+echo "Creating database: corporate_actions..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE corporate_actions;
+EOSQL
+
+# Apply migrations for corporate-actions-svc
+echo "Applying migrations for corporate_actions..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_actions" -f /migrations/corporate-actions/000001_initial_schema.up.sql
+
+# Create database for counterparty-management-svc
+echo "Creating database: counterparty_management..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE counterparty_management;
+EOSQL
+
+# Apply migrations for counterparty-management-svc
+echo "Applying migrations for counterparty_management..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "counterparty_management" -f /migrations/counterparty-management/000001_initial_schema.up.sql
+
+# Create database for tax-rules-svc
+echo "Creating database: tax_rules..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE tax_rules;
+EOSQL
+
+# Apply migrations for tax-rules-svc
+echo "Applying migrations for tax_rules..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_rules" -f /migrations/tax-rules/000001_initial_schema.up.sql
+
+# Create database for tax-determination-svc
+echo "Creating database: tax_determination..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE tax_determination;
+EOSQL
+
+# Apply migrations for tax-determination-svc
+echo "Applying migrations for tax_determination..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_determination" -f /migrations/tax-determination/000001_initial_schema.up.sql
+
+# Create database for vat-gst-svc
+echo "Creating database: vat_gst..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE vat_gst;
+EOSQL
+
+# Apply migrations for vat-gst-svc
+echo "Applying migrations for vat_gst..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vat_gst" -f /migrations/vat-gst/000001_initial_schema.up.sql
+
+# Create database for corporate-tax-svc
+echo "Creating database: corporate_tax..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE corporate_tax;
+EOSQL
+
+# Apply migrations for corporate-tax-svc
+echo "Applying migrations for corporate_tax..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_tax" -f /migrations/corporate-tax/000001_initial_schema.up.sql
+
 echo "All migrations applied successfully."
