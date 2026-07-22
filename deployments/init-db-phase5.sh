@@ -58,4 +58,24 @@ apply_migration vat_gst /migrations/vat-gst/000001_initial_schema.up.sql
 create_db corporate_tax
 apply_migration corporate_tax /migrations/corporate-tax/000001_initial_schema.up.sql
 
+# ── Withholding Tax ───────────────────────────────────────────────────────────
+create_db withholding_tax
+apply_migration withholding_tax /migrations/withholding-tax/000001_initial_schema.up.sql
+
+# ── Filing Preparation ────────────────────────────────────────────────────────
+create_db filing_preparation
+apply_migration filing_preparation /migrations/filing-preparation/000001_initial_schema.up.sql
+
+# ── Filing Tracker ────────────────────────────────────────────────────────────
+create_db filing_tracker
+apply_migration filing_tracker /migrations/filing-tracker/000001_initial_schema.up.sql
+
+# ── Compliance Status ─────────────────────────────────────────────────────────
+create_db compliance_status
+apply_migration compliance_status /migrations/compliance-status/000001_initial_schema.up.sql
+
+# ── Exception & Escalation ───────────────────────────────────────────────────
+create_db exception_escalation
+apply_migration exception_escalation /migrations/exception-escalation/000001_initial_schema.up.sql
+
 echo "=== Phase 5 databases initialised successfully ==="
