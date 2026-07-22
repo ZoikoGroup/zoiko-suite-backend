@@ -1,0 +1,181 @@
+{
+	"info": {
+		"_postman_id": "phase6-trust-intelligence-collection",
+		"name": "ZoikoSuite — Phase 6: Trust Maturity & Intelligence Engine",
+		"description": "Postman API Collection for Phase 6 microservices starting with Anomaly Detection Service.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost",
+			"type": "string"
+		},
+		{
+			"key": "tenantId",
+			"value": "tenant-default-001",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "01 - Anomaly Detection Service (Port 8134)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}:8134/healthz",
+							"host": ["{{baseUrl}}"],
+							"port": "8134",
+							"path": ["healthz"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200', function () { pm.response.to.have.status(200); });",
+									"pm.test('Response is ok', function () { var jsonData = pm.response.json(); pm.expect(jsonData.status).to.eql('ok'); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Create Anomaly Detection Rule",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"rule_name\": \"Unusual Wire Transfer Limit\",\n  \"domain_name\": \"FINANCE\",\n  \"metric_type\": \"wire_transfer_amount\",\n  \"threshold_value\": 100000.00,\n  \"z_score_cutoff\": 3.50\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8134/v1/anomalies/rules",
+							"host": ["{{baseUrl}}"],
+							"port": "8134",
+							"path": ["v1", "anomalies", "rules"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 201 Created', function () { pm.response.to.have.status(201); });",
+									"var jsonData = pm.response.json();",
+									"pm.test('Rule created with rule_id', function () { pm.expect(jsonData.rule_id).to.exist; });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Detect Anomaly Event",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"domain_name\": \"FINANCE\",\n  \"source_entity_id\": \"tx-2026-99123\",\n  \"metric_type\": \"wire_transfer_amount\",\n  \"observed_value\": 750000.00,\n  \"expected_value\": 25000.00,\n  \"std_deviation\": 8000.00,\n  \"description\": \"Large wire transfer spike outside historical range\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8134/v1/anomalies/detect",
+							"host": ["{{baseUrl}}"],
+							"port": "8134",
+							"path": ["v1", "anomalies", "detect"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 201 Created', function () { pm.response.to.have.status(201); });",
+									"var jsonData = pm.response.json();",
+									"pm.test('Anomaly recorded with CRITICAL severity', function () { pm.expect(jsonData.severity).to.eql('CRITICAL'); });",
+									"pm.environment.set('anomalyId', jsonData.anomaly_id);"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "List Anomalies",
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8134/v1/anomalies?domain_name=FINANCE",
+							"host": ["{{baseUrl}}"],
+							"port": "8134",
+							"path": ["v1", "anomalies"],
+							"query": [
+								{ "key": "domain_name", "value": "FINANCE" }
+							]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Update Anomaly Status",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"status\": \"UNDER_INVESTIGATION\",\n  \"investigated_by\": \"sec_analyst_01\",\n  \"resolution_notes\": \"Investigating wire transfer velocity and recipient bank details\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8134/v1/anomalies/{{anomalyId}}/status",
+							"host": ["{{baseUrl}}"],
+							"port": "8134",
+							"path": ["v1", "anomalies", "{{anomalyId}}", "status"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });",
+									"var jsonData = pm.response.json();",
+									"pm.test('Status updated to UNDER_INVESTIGATION', function () { pm.expect(jsonData.status).to.eql('UNDER_INVESTIGATION'); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				}
+			]
+		}
+	]
+}
