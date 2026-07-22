@@ -1207,6 +1207,174 @@
                              ]
                          }
                      ]
-                 }
+                 },
+                  {
+                      "name": "12. Filing Preparation Service",
+                      "item": [
+                          {
+                              "name": "Create Filing Draft",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"filing_type\":\"VAT\",\"period_key\":\"2026-Q2\",\"due_date\":\"2026-08-07\",\"payload_data\":\"{\\\"total_vat_due\\\":15400.00}\",\"evidence_manifest_ref\":\"manifest-2026-q2-vat\",\"notes\":\"Q2 statutory VAT return draft\",\"created_by\":\"compliance_mgr\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8130/v1/filing-preparation/drafts"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('filingDraftId', b.draft_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Validate Filing Draft",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"required_document_types\":[\"INVOICE_SUMMARY\",\"RECONCILIATION\"],\"validated_by\":\"auditor\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8130/v1/filing-preparation/drafts/{{filingDraftId}}/validate"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status PREPARED', ()=>{const b=pm.response.json();pm.expect(b.validation_status).to.eql('PREPARED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Finalize Filing Draft",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"finalized_by\":\"tax_head\",\"notes\":\"Approved for submission to HMRC\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8130/v1/filing-preparation/drafts/{{filingDraftId}}/finalize"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status READY_FOR_SUBMISSION', ()=>{const b=pm.response.json();pm.expect(b.validation_status).to.eql('READY_FOR_SUBMISSION');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
+                  },
+                  {
+                      "name": "13. Filing Tracker Service",
+                      "item": [
+                          {
+                              "name": "Schedule Filing Requirement",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"filing_authority\":\"HMRC\",\"filing_type\":\"VAT\",\"period_key\":\"2026-Q2\",\"due_date\":\"2026-08-07\",\"notes\":\"Q2 VAT statutory deadline\",\"created_by\":\"system\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8131/v1/filing-tracker/requirements"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('filingReqId', b.filing_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Submit Filing Requirement",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"submission_reference\":\"HMRC-SUB-2026-88001\",\"submitted_by\":\"tax_specialist\",\"notes\":\"Submitted via HMRC portal\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8131/v1/filing-tracker/requirements/{{filingReqId}}/submit"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status SUBMITTED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('SUBMITTED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Confirm Filing Requirement",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"confirmation_reference\":\"HMRC-CONFIRM-88001-SUCCESS\",\"notes\":\"Receipt confirmed by HMRC\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8131/v1/filing-tracker/requirements/{{filingReqId}}/confirm"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status CONFIRMED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('CONFIRMED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
+                  }
              ]
 }

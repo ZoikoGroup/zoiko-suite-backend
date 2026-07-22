@@ -66,6 +66,8 @@ services:
       - ../services/vat-gst-svc/deployments/migrations:/migrations/vat-gst:ro
       - ../services/corporate-tax-svc/deployments/migrations:/migrations/corporate-tax:ro
       - ../services/withholding-tax-svc/deployments/migrations:/migrations/withholding-tax:ro
+      - ../services/filing-preparation-svc/deployments/migrations:/migrations/filing-preparation:ro
+      - ../services/filing-tracker-svc/deployments/migrations:/migrations/filing-tracker:ro
       - postgres_p5_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -415,6 +417,65 @@ services:
       authorization-svc:
         condition: service_healthy
       tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  filing-preparation-svc:
+    build:
+      context: ../services/filing-preparation-svc
+      dockerfile: Dockerfile
+    container_name: filing-preparation-svc-p5
+    ports:
+      - "8130:8130"
+    environment:
+      PORT: "8130"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/filing_preparation?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.filing-prep.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EVIDENCE_MANIFEST_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  filing-tracker-svc:
+    build:
+      context: ../services/filing-tracker-svc
+      dockerfile: Dockerfile
+    container_name: filing-tracker-svc-p5
+    ports:
+      - "8131:8131"
+    environment:
+      PORT: "8131"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/filing_tracker?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.filing-tracker.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

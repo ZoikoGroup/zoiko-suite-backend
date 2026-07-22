@@ -62,4 +62,12 @@ apply_migration corporate_tax /migrations/corporate-tax/000001_initial_schema.up
 create_db withholding_tax
 apply_migration withholding_tax /migrations/withholding-tax/000001_initial_schema.up.sql
 
+# ── Filing Preparation ────────────────────────────────────────────────────────
+create_db filing_preparation
+apply_migration filing_preparation /migrations/filing-preparation/000001_initial_schema.up.sql
+
+# ── Filing Tracker ────────────────────────────────────────────────────────────
+create_db filing_tracker
+apply_migration filing_tracker /migrations/filing-tracker/000001_initial_schema.up.sql
+
 echo "=== Phase 5 databases initialised successfully ==="
