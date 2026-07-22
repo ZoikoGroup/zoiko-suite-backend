@@ -221,4 +221,52 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 	if resolvedGap.Status != domain.GapResolved {
 		t.Errorf("expected gap status RESOLVED, got %s", resolvedGap.Status)
 	}
+
+	// Resolve Gap Second Time -> 409 Conflict
+	resReq2 := httptest.NewRequest("POST", "/v1/compliance-status/gaps/"+createdGap.GapID+"/resolve", bytes.NewBuffer(resBody))
+	resReq2.Header.Set("Content-Type", "application/json")
+	resW2 := httptest.NewRecorder()
+	r.ServeHTTP(resW2, resReq2)
+	if resW2.Code != http.StatusConflict {
+		t.Errorf("expected status 409 on duplicate gap resolve, got %d", resW2.Code)
+	}
+}
+
+func TestGetAndListComplianceStatusRecords(t *testing.T) {
+	r, _ := setupTestRouter()
+
+	// Evaluate two records
+	req1 := domain.EvaluateComplianceRequest{
+		LegalEntityID:        "entity-101",
+		JurisdictionID:       "GB-UK",
+		DomainName:           "FINANCE",
+		TotalObligations:     5,
+		FulfilledObligations: 5,
+		EffectiveFrom:        "2026-01-01",
+		CreatedBy:            "auditor",
+	}
+	body1, _ := json.Marshal(req1)
+	r1 := httptest.NewRequest("POST", "/v1/compliance-status/evaluate", bytes.NewBuffer(body1))
+	r1.Header.Set("Content-Type", "application/json")
+	w1 := httptest.NewRecorder()
+	r.ServeHTTP(w1, r1)
+
+	var rec1 domain.ComplianceHealth
+	_ = json.NewDecoder(w1.Body).Decode(&rec1)
+
+	// Get by ID
+	rGet := httptest.NewRequest("GET", "/v1/compliance-status/"+rec1.StatusID, nil)
+	wGet := httptest.NewRecorder()
+	r.ServeHTTP(wGet, rGet)
+	if wGet.Code != http.StatusOK {
+		t.Errorf("expected status 200 on GetByID, got %d", wGet.Code)
+	}
+
+	// List records
+	rList := httptest.NewRequest("GET", "/v1/compliance-status?legal_entity_id=entity-101", nil)
+	wList := httptest.NewRecorder()
+	r.ServeHTTP(wList, rList)
+	if wList.Code != http.StatusOK {
+		t.Errorf("expected status 200 on List, got %d", wList.Code)
+	}
 }

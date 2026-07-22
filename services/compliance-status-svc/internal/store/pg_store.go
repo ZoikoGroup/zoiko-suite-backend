@@ -57,6 +57,9 @@ func (s *PgStore) Evaluate(ctx context.Context, c *domain.ComplianceHealth) erro
 	if c.DomainName == "" {
 		c.DomainName = "OVERALL"
 	}
+	if c.EffectiveFrom == "" {
+		c.EffectiveFrom = now.Format("2006-01-02")
+	}
 	c.CalculateHealthScore()
 
 	_, err = tx.Exec(ctx, `

@@ -114,7 +114,12 @@ type ResolveGapRequest struct {
 
 // CalculateHealthScore computes numeric health score (0-100) and overall status.
 func (c *ComplianceHealth) CalculateHealthScore() {
-	if c.TotalObligations == 0 {
+	if c.TotalObligations <= 0 {
+		if c.OverdueObligations > 0 || c.OpenExceptions > 0 {
+			c.HealthScore = 50.00
+			c.OverallStatus = StatusWarning
+			return
+		}
 		c.HealthScore = 100.00
 		c.OverallStatus = StatusCompliant
 		return
