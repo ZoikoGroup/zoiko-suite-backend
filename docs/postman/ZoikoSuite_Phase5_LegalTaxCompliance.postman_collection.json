@@ -1461,6 +1461,91 @@
                               ]
                           }
                       ]
+                  },
+                  {
+                      "name": "15. Exception & Escalation Service",
+                      "item": [
+                          {
+                              "name": "Create Exception Case",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"exception_type\":\"OVERDUE_FILING\",\"severity_level\":\"HIGH\",\"linked_object_type\":\"FILING\",\"linked_object_id\":\"ftrk-2026-9901\",\"description\":\"VAT return not submitted before due date\",\"assigned_to_role\":\"TAX_MANAGER\",\"created_by\":\"filing_tracker_svc\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8133/v1/exception-escalation/exceptions"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('exceptionCaseId', b.exception_case_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Escalate Exception Case",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"escalated_to_role\":\"COMPLIANCE_HEAD\",\"escalation_reason\":\"High severity overdue filing exceeding 7 days\",\"escalated_by\":\"tax_manager\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8133/v1/exception-escalation/exceptions/{{exceptionCaseId}}/escalate"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "const b=pm.response.json();",
+                                              "pm.expect(b.exception_case.case_status).to.eql('ESCALATED');"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Resolve Exception Case",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"closed_by\":\"compliance_head\",\"closure_reason\":\"Late filing approved and submitted with penalty waiver\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8133/v1/exception-escalation/exceptions/{{exceptionCaseId}}/resolve"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status CLOSED', ()=>{const b=pm.response.json();pm.expect(b.case_status).to.eql('CLOSED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
                   }
              ]
 }

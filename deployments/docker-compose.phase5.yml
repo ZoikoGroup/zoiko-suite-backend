@@ -69,6 +69,7 @@ services:
       - ../services/filing-preparation-svc/deployments/migrations:/migrations/filing-preparation:ro
       - ../services/filing-tracker-svc/deployments/migrations:/migrations/filing-tracker:ro
       - ../services/compliance-status-svc/deployments/migrations:/migrations/compliance-status:ro
+      - ../services/exception-escalation-svc/deployments/migrations:/migrations/exception-escalation:ro
       - postgres_p5_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -498,6 +499,35 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/compliance_status?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.compliance-status.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      JURISDICTION_RULES_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: on-failure
+
+  exception-escalation-svc:
+    build:
+      context: ../services/exception-escalation-svc
+      dockerfile: Dockerfile
+    container_name: exception-escalation-svc-p5
+    ports:
+      - "8133:8133"
+    environment:
+      PORT: "8133"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/exception_escalation?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.exception-escalation.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://authorization-svc:8089"
     depends_on:

@@ -74,4 +74,8 @@ apply_migration filing_tracker /migrations/filing-tracker/000001_initial_schema.
 create_db compliance_status
 apply_migration compliance_status /migrations/compliance-status/000001_initial_schema.up.sql
 
+# ── Exception & Escalation ───────────────────────────────────────────────────
+create_db exception_escalation
+apply_migration exception_escalation /migrations/exception-escalation/000001_initial_schema.up.sql
+
 echo "=== Phase 5 databases initialised successfully ==="
