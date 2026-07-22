@@ -176,6 +176,858 @@
 					]
 				}
 			]
+		},
+		{
+			"name": "02 - Forecasting Service (Port 8135)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}:8135/healthz",
+							"host": ["{{baseUrl}}"],
+							"port": "8135",
+							"path": ["healthz"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200', function () { pm.response.to.have.status(200); });",
+									"pm.test('Response is ok', function () { var jsonData = pm.response.json(); pm.expect(jsonData.status).to.eql('ok'); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Generate Forecast Model & Projections",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"model_name\": \"Q3 Cash Flow & Liquidity Forecast\",\n  \"domain\": \"CASH_FLOW\",\n  \"scenario_type\": \"OPTIMISTIC\",\n  \"algorithm_type\": \"LINEAR_TREND\",\n  \"granularity\": \"MONTHLY\",\n  \"horizon_periods\": 6,\n  \"historical_data\": [50000, 52000, 51500, 54000, 58000, 62000],\n  \"historical_start_date\": \"2025-01-01\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8135/v1/forecasts/generate",
+							"host": ["{{baseUrl}}"],
+							"port": "8135",
+							"path": ["v1", "forecasts", "generate"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 201 Created', function () { pm.response.to.have.status(201); });",
+									"var jsonData = pm.response.json();",
+									"pm.test('Model generated with ID', function () { pm.expect(jsonData.id).to.exist; });",
+									"pm.test('Projections generated for horizon', function () { pm.expect(jsonData.projections.length).to.eql(6); });",
+									"pm.environment.set('forecastModelId', jsonData.id);"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "List Forecast Models",
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8135/v1/forecasts?legal_entity_id=entity-uk-001&domain=CASH_FLOW",
+							"host": ["{{baseUrl}}"],
+							"port": "8135",
+							"path": ["v1", "forecasts"],
+							"query": [
+								{ "key": "legal_entity_id", "value": "entity-uk-001" },
+								{ "key": "domain", "value": "CASH_FLOW" }
+							]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Get Forecast Model by ID",
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8135/v1/forecasts/{{forecastModelId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8135",
+							"path": ["v1", "forecasts", "{{forecastModelId}}"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Recalculate Forecast Projections",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"growth_rate_adjustment\": 0.05,\n  \"scenario_type\": \"OPTIMISTIC\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8135/v1/forecasts/{{forecastModelId}}/recalculate",
+							"host": ["{{baseUrl}}"],
+							"port": "8135",
+							"path": ["v1", "forecasts", "{{forecastModelId}}", "recalculate"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Archive Forecast Model",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8135/v1/forecasts/{{forecastModelId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8135",
+							"path": ["v1", "forecasts", "{{forecastModelId}}"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "03 - Compliance Risk Scoring Service (Port 8136)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}:8136/healthz",
+							"host": ["{{baseUrl}}"],
+							"port": "8136",
+							"path": ["healthz"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200', function () { pm.response.to.have.status(200); });",
+									"pm.test('Response is ok', function () { var jsonData = pm.response.json(); pm.expect(jsonData.status).to.eql('ok'); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Calculate Compliance Risk Score",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"assessment_name\": \"Q3 Organization Risk Review\",\n  \"open_obligations_count\": 5,\n  \"policy_violations_count\": 2,\n  \"audit_exceptions_count\": 3,\n  \"privacy_incidents_count\": 1,\n  \"tax_penalties_count\": 1\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8136/v1/risk-scores/calculate",
+							"host": ["{{baseUrl}}"],
+							"port": "8136",
+							"path": ["v1", "risk-scores", "calculate"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 201 Created', function () { pm.response.to.have.status(201); });",
+									"var jsonData = pm.response.json();",
+									"pm.test('Assessment created with composite_risk_score', function () { pm.expect(jsonData.composite_risk_score).to.exist; });",
+									"pm.environment.set('riskAssessmentId', jsonData.id);"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "List Risk Score Assessments",
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8136/v1/risk-scores?legal_entity_id=entity-uk-001",
+							"host": ["{{baseUrl}}"],
+							"port": "8136",
+							"path": ["v1", "risk-scores"],
+							"query": [
+								{ "key": "legal_entity_id", "value": "entity-uk-001" }
+							]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Get Risk Assessment by ID",
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8136/v1/risk-scores/{{riskAssessmentId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8136",
+							"path": ["v1", "risk-scores", "{{riskAssessmentId}}"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Create Risk Threshold Rule",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"rule_name\": \"High Policy Breach Alert\",\n  \"risk_category\": \"POLICY_VIOLATIONS\",\n  \"high_threshold\": 50.00,\n  \"critical_threshold\": 75.00,\n  \"notification_channel\": \"COMPLIANCE_OPS_SLACK\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8136/v1/risk-scores/thresholds",
+							"host": ["{{baseUrl}}"],
+							"port": "8136",
+							"path": ["v1", "risk-scores", "thresholds"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 201 Created', function () { pm.response.to.have.status(201); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Archive Risk Assessment",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8136/v1/risk-scores/{{riskAssessmentId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8136",
+							"path": ["v1", "risk-scores", "{{riskAssessmentId}}"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "04 - Reconciliation Intelligence Service (Port 8137)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}:8137/healthz",
+							"host": ["{{baseUrl}}"],
+							"port": "8137",
+							"path": ["healthz"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200', function () { pm.response.to.have.status(200); });",
+									"pm.test('Response is ok', function () { var jsonData = pm.response.json(); pm.expect(jsonData.status).to.eql('ok'); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Analyze Reconciliation Batch",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"job_name\": \"Q3 Bank vs GL Reconciliation\",\n  \"source_system_a\": \"GENERAL_LEDGER\",\n  \"source_system_b\": \"BANK_STATEMENTS\",\n  \"transactions_a\": [\n    { \"ref_id\": \"TX-101\", \"amount\": 500.00, \"date\": \"2026-07-01\" },\n    { \"ref_id\": \"TX-102\", \"amount\": 1200.50, \"date\": \"2026-07-02\" },\n    { \"ref_id\": \"TX-103\", \"amount\": 75.00, \"date\": \"2026-07-03\" }\n  ],\n  \"transactions_b\": [\n    { \"ref_id\": \"TX-101\", \"amount\": 500.00, \"date\": \"2026-07-01\" },\n    { \"ref_id\": \"TX-102\", \"amount\": 1220.50, \"date\": \"2026-07-02\" }\n  ]\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8137/v1/reconciliations/analyze",
+							"host": ["{{baseUrl}}"],
+							"port": "8137",
+							"path": ["v1", "reconciliations", "analyze"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 201 Created', function () { pm.response.to.have.status(201); });",
+									"var jsonData = pm.response.json();",
+									"pm.test('Reconciliation job created with ID', function () { pm.expect(jsonData.id).to.exist; });",
+									"pm.environment.set('reconciliationJobId', jsonData.id);",
+									"if (jsonData.unmatched_items && jsonData.unmatched_items.length > 0) { pm.environment.set('unmatchedItemId', jsonData.unmatched_items[0].id); }"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "List Reconciliation Jobs",
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8137/v1/reconciliations?legal_entity_id=entity-uk-001",
+							"host": ["{{baseUrl}}"],
+							"port": "8137",
+							"path": ["v1", "reconciliations"],
+							"query": [
+								{ "key": "legal_entity_id", "value": "entity-uk-001" }
+							]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Get Reconciliation Job by ID",
+					"request": {
+						"method": "GET",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8137/v1/reconciliations/{{reconciliationJobId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8137",
+							"path": ["v1", "reconciliations", "{{reconciliationJobId}}"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Apply Resolution to Unmatched Item",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"resolution_status\": \"APPROVED\",\n  \"resolution_notes\": \"Approved write-off of $20.00 timing difference\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8137/v1/reconciliations/{{reconciliationJobId}}/resolutions/{{unmatchedItemId}}/apply",
+							"host": ["{{baseUrl}}"],
+							"port": "8137",
+							"path": ["v1", "reconciliations", "{{reconciliationJobId}}", "resolutions", "{{unmatchedItemId}}", "apply"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				},
+				{
+					"name": "Archive Reconciliation Job",
+					"request": {
+						"method": "DELETE",
+						"header": [
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"url": {
+							"raw": "{{baseUrl}}:8137/v1/reconciliations/{{reconciliationJobId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8137",
+							"path": ["v1", "reconciliations", "{{reconciliationJobId}}"]
+						}
+					},
+					"event": [
+						{
+							"listen": "test",
+							"script": {
+								"exec": [
+									"pm.test('Status code is 200 OK', function () { pm.response.to.have.status(200); });"
+								],
+								"type": "text/javascript"
+							}
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "05 - Reporting Orchestration Service (Port 8138)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{baseUrl}}:8138/healthz",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["healthz"]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Create Report Definition",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"report_name\": \"Q3 Financial Summary Report\",\n  \"report_type\": \"FINANCIAL_SUMMARY\",\n  \"output_format\": \"JSON\",\n  \"data_sources\": [\"ledger-svc\", \"treasury-svc\"],\n  \"is_scheduled\": false\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8138/v1/reports/definitions",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["v1", "reports", "definitions"]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 201', () => pm.response.to.have.status(201));", "var d = pm.response.json(); pm.environment.set('reportDefinitionId', d.id);"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "List Report Definitions",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": {
+							"raw": "{{baseUrl}}:8138/v1/reports/definitions?legal_entity_id=entity-uk-001",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["v1", "reports", "definitions"],
+							"query": [{ "key": "legal_entity_id", "value": "entity-uk-001" }]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Get Report Definition by ID",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": {
+							"raw": "{{baseUrl}}:8138/v1/reports/definitions/{{reportDefinitionId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["v1", "reports", "definitions", "{{reportDefinitionId}}"]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Trigger Report Run (Manual)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"triggered_by\": \"MANUAL\",\n  \"period_start\": \"2026-07-01\",\n  \"period_end\": \"2026-09-30\"\n}"
+						},
+						"url": {
+							"raw": "{{baseUrl}}:8138/v1/reports/definitions/{{reportDefinitionId}}/runs",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["v1", "reports", "definitions", "{{reportDefinitionId}}", "runs"]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 201', () => pm.response.to.have.status(201));", "var r = pm.response.json(); pm.environment.set('reportRunId', r.id); pm.test('Status is COMPLETED', () => pm.expect(r.status).to.eql('COMPLETED'));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Get Report Run by ID",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": {
+							"raw": "{{baseUrl}}:8138/v1/reports/runs/{{reportRunId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["v1", "reports", "runs", "{{reportRunId}}"]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "List Report Runs",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": {
+							"raw": "{{baseUrl}}:8138/v1/reports/runs?definition_id={{reportDefinitionId}}",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["v1", "reports", "runs"],
+							"query": [{ "key": "definition_id", "value": "{{reportDefinitionId}}" }]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Pause Report Definition",
+					"request": {
+						"method": "PATCH",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": { "mode": "raw", "raw": "{\"status\": \"PAUSED\"}" },
+						"url": {
+							"raw": "{{baseUrl}}:8138/v1/reports/definitions/{{reportDefinitionId}}/status",
+							"host": ["{{baseUrl}}"],
+							"port": "8138",
+							"path": ["v1", "reports", "definitions", "{{reportDefinitionId}}", "status"]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				}
+			]
+		},
+		{
+			"name": "06 - Migration Integrity Service (Port 8139)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}:8139/healthz", "host": ["{{baseUrl}}"], "port": "8139", "path": ["healthz"] } },
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Validate Migration Batch",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"migration_name\": \"Legacy ERP to Ledger Migration\",\n  \"source_system\": \"LEGACY_ERP\",\n  \"target_service\": \"ledger-svc\",\n  \"required_fields\": [\"employee_id\", \"amount\", \"cost_centre\"],\n  \"records\": [\n    { \"ref\": \"REC-001\", \"fields\": { \"employee_id\": \"EMP-1\", \"amount\": \"5000.00\", \"cost_centre\": \"CC-100\" } },\n    { \"ref\": \"REC-002\", \"fields\": { \"employee_id\": \"EMP-2\", \"amount\": \"3000.00\" } },\n    { \"ref\": \"REC-003\", \"fields\": { \"employee_id\": \"EMP-4\", \"amount\": \"N/A\", \"cost_centre\": \"CC-102\" } }\n  ]\n}"
+						},
+						"url": { "raw": "{{baseUrl}}:8139/v1/migrations/validate", "host": ["{{baseUrl}}"], "port": "8139", "path": ["v1", "migrations", "validate"] }
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 201', () => pm.response.to.have.status(201));", "var j = pm.response.json(); pm.environment.set('migJobId', j.id); if(j.audit_entries && j.audit_entries.length > 0) pm.environment.set('migAuditEntryId', j.audit_entries[0].id);"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Get Migration Job by ID",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": { "raw": "{{baseUrl}}:8139/v1/migrations/{{migJobId}}", "host": ["{{baseUrl}}"], "port": "8139", "path": ["v1", "migrations", "{{migJobId}}"] }
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "List Migration Jobs",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": {
+							"raw": "{{baseUrl}}:8139/v1/migrations?legal_entity_id=entity-uk-001",
+							"host": ["{{baseUrl}}"], "port": "8139", "path": ["v1", "migrations"],
+							"query": [{ "key": "legal_entity_id", "value": "entity-uk-001" }]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Remediate Audit Entry",
+					"request": {
+						"method": "POST",
+						"header": [
+							{ "key": "Content-Type", "value": "application/json" },
+							{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }
+						],
+						"body": { "mode": "raw", "raw": "{\"notes\": \"Corrected in source system\"}" },
+						"url": {
+							"raw": "{{baseUrl}}:8139/v1/migrations/{{migJobId}}/audit/{{migAuditEntryId}}/remediate",
+							"host": ["{{baseUrl}}"], "port": "8139",
+							"path": ["v1", "migrations", "{{migJobId}}", "audit", "{{migAuditEntryId}}", "remediate"]
+						}
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				},
+				{
+					"name": "Archive Migration Job",
+					"request": {
+						"method": "DELETE",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": { "raw": "{{baseUrl}}:8139/v1/migrations/{{migJobId}}", "host": ["{{baseUrl}}"], "port": "8139", "path": ["v1", "migrations", "{{migJobId}}"] }
+					},
+					"event": [{ "listen": "test", "script": { "exec": ["pm.test('Status 200', () => pm.response.to.have.status(200));"], "type": "text/javascript" } }]
+				}
+			]
+		},
+		{
+			"name": "07 - mTLS Management Service (Port 8140)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}:8140/healthz", "host": ["{{baseUrl}}"], "port": "8140", "path": ["healthz"] } }
+				},
+				{
+					"name": "Provision Certificate",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"body": { "mode": "raw", "raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"service_name\": \"ledger-svc\",\n  \"common_name\": \"ledger-svc.zoiko.internal\",\n  \"rotation_days\": 90,\n  \"auto_rotate\": true\n}" },
+						"url": { "raw": "{{baseUrl}}:8140/v1/mtls/certificates", "host": ["{{baseUrl}}"], "port": "8140", "path": ["v1", "mtls", "certificates"] }
+					}
+				},
+				{
+					"name": "List Certificates",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": { "raw": "{{baseUrl}}:8140/v1/mtls/certificates?legal_entity_id=entity-uk-001", "host": ["{{baseUrl}}"], "port": "8140", "path": ["v1", "mtls", "certificates"], "query": [{ "key": "legal_entity_id", "value": "entity-uk-001" }] }
+					}
+				}
+			]
+		},
+		{
+			"name": "08 - SIEM Integration Service (Port 8141)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}:8141/healthz", "host": ["{{baseUrl}}"], "port": "8141", "path": ["healthz"] } }
+				},
+				{
+					"name": "Create Exporter",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"body": { "mode": "raw", "raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"name\": \"Splunk Production HEC\",\n  \"platform\": \"SPLUNK\",\n  \"endpoint_url\": \"https://splunk.corp:8088/services/collector\"\n}" },
+						"url": { "raw": "{{baseUrl}}:8141/v1/siem/exporters", "host": ["{{baseUrl}}"], "port": "8141", "path": ["v1", "siem", "exporters"] }
+					}
+				},
+				{
+					"name": "List Exporters",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": { "raw": "{{baseUrl}}:8141/v1/siem/exporters", "host": ["{{baseUrl}}"], "port": "8141", "path": ["v1", "siem", "exporters"] }
+					}
+				}
+			]
+		},
+		{
+			"name": "09 - CARTA Service (Port 8142)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}:8142/healthz", "host": ["{{baseUrl}}"], "port": "8142", "path": ["healthz"] } }
+				},
+				{
+					"name": "Evaluate Access Request",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"body": { "mode": "raw", "raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"context\": {\n    \"subject_id\": \"USR-007\",\n    \"subject_type\": \"USER\",\n    \"device_trust_level\": 95,\n    \"ip_address\": \"10.0.0.15\",\n    \"is_known_location\": true,\n    \"resource_sensitivity\": \"HIGH\",\n    \"action_requested\": \"APPROVE_PAYROLL\",\n    \"time_of_day_hour\": 14\n  }\n}" },
+						"url": { "raw": "{{baseUrl}}:8142/v1/carta/evaluate", "host": ["{{baseUrl}}"], "port": "8142", "path": ["v1", "carta", "evaluate"] }
+					}
+				},
+				{
+					"name": "List Assessments",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": { "raw": "{{baseUrl}}:8142/v1/carta/assessments", "host": ["{{baseUrl}}"], "port": "8142", "path": ["v1", "carta", "assessments"] }
+					}
+				}
+			]
+		},
+		{
+			"name": "10 - Key Management Service BYOK/HYOK (Port 8143)",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": { "method": "GET", "header": [], "url": { "raw": "{{baseUrl}}:8143/healthz", "host": ["{{baseUrl}}"], "port": "8143", "path": ["healthz"] } }
+				},
+				{
+					"name": "Register BYOK Key",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"body": { "mode": "raw", "raw": "{\n  \"legal_entity_id\": \"entity-uk-001\",\n  \"key_alias\": \"finance-master-key\",\n  \"key_model\": \"BYOK\",\n  \"key_provider\": \"AWS_KMS\",\n  \"external_key_arn\": \"arn:aws:kms:eu-west-1:123456789012:key/abc-123\"\n}" },
+						"url": { "raw": "{{baseUrl}}:8143/v1/keys", "host": ["{{baseUrl}}"], "port": "8143", "path": ["v1", "keys"] }
+					}
+				},
+				{
+					"name": "List Registered Keys",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "X-Tenant-ID", "value": "{{tenantId}}" }],
+						"url": { "raw": "{{baseUrl}}:8143/v1/keys", "host": ["{{baseUrl}}"], "port": "8143", "path": ["v1", "keys"] }
+					}
+				}
+			]
 		}
 	]
 }
+
+
+
+
+
+
