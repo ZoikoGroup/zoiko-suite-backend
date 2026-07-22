@@ -1,0 +1,352 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres-p6
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-db-phase6.sh:/docker-entrypoint-initdb.d/init-db-phase6.sh:ro
+      - ../services/anomaly-detection-svc/deployments/migrations:/migrations/anomaly-detection:ro
+      - ../services/forecasting-svc/deployments/migrations:/migrations/forecasting:ro
+      - ../services/compliance-risk-scoring-svc/deployments/migrations:/migrations/compliance-risk-scoring:ro
+      - ../services/reconciliation-intelligence-svc/deployments/migrations:/migrations/reconciliation-intelligence:ro
+      - ../services/reporting-orchestration-svc/deployments/migrations:/migrations/reporting-orchestration:ro
+      - ../services/migration-integrity-svc/deployments/migrations:/migrations/migration-integrity:ro
+      - postgres_p6_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper-p6
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-p6
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  authorization-svc:
+    build:
+      context: ../services/authorization-svc
+      dockerfile: Dockerfile
+    container_name: authorization-svc-p6
+    ports:
+      - "8089:8089"
+    environment:
+      PORT: "8089"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/authorization?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 01. Anomaly Detection Service ─────────────────────────────────────────
+  anomaly-detection-svc:
+    build:
+      context: ../services/anomaly-detection-svc
+      dockerfile: Dockerfile
+    container_name: anomaly-detection-svc-p6
+    ports:
+      - "8134:8134"
+    environment:
+      PORT: "8134"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/anomaly_detection?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: zoiko.anomaly-detection.events
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 02. Forecasting Service ───────────────────────────────────────────────
+  forecasting-svc:
+    build:
+      context: ../services/forecasting-svc
+      dockerfile: Dockerfile
+    container_name: forecasting-svc-p6
+    ports:
+      - "8135:8135"
+    environment:
+      PORT: "8135"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/forecasting?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: zoiko.forecasting.events
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 03. Compliance Risk Scoring Service ────────────────────────────────────
+  compliance-risk-scoring-svc:
+    build:
+      context: ../services/compliance-risk-scoring-svc
+      dockerfile: Dockerfile
+    container_name: compliance-risk-scoring-svc-p6
+    ports:
+      - "8136:8136"
+    environment:
+      PORT: "8136"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/compliance_risk_scoring?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: zoiko.compliance-risk-scoring.events
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 04. Reconciliation Intelligence Service ────────────────────────────────
+  reconciliation-intelligence-svc:
+    build:
+      context: ../services/reconciliation-intelligence-svc
+      dockerfile: Dockerfile
+    container_name: reconciliation-intelligence-svc-p6
+    ports:
+      - "8137:8137"
+    environment:
+      PORT: "8137"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/reconciliation_intelligence?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: zoiko.reconciliation-intelligence.events
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 05. Reporting Orchestration Service ───────────────────────────────────
+  reporting-orchestration-svc:
+    build:
+      context: ../services/reporting-orchestration-svc
+      dockerfile: Dockerfile
+    container_name: reporting-orchestration-svc-p6
+    ports:
+      - "8138:8138"
+    environment:
+      PORT: "8138"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/reporting_orchestration?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: zoiko.reporting-orchestration.events
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 06. Migration Integrity Service ──────────────────────────────────────
+  migration-integrity-svc:
+    build:
+      context: ../services/migration-integrity-svc
+      dockerfile: Dockerfile
+    container_name: migration-integrity-svc-p6
+    ports:
+      - "8139:8139"
+    environment:
+      PORT: "8139"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/migration_integrity?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: zoiko.migration-integrity.events
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 07. Mutual TLS Management Service ─────────────────────────────────────
+  mtls-management-svc:
+    build:
+      context: ../services/mtls-management-svc
+      dockerfile: Dockerfile
+    container_name: mtls-management-svc-p6
+    ports:
+      - "8140:8140"
+    environment:
+      PORT: "8140"
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 08. SIEM Integration Service ──────────────────────────────────────────
+  siem-integration-svc:
+    build:
+      context: ../services/siem-integration-svc
+      dockerfile: Dockerfile
+    container_name: siem-integration-svc-p6
+    ports:
+      - "8141:8141"
+    environment:
+      PORT: "8141"
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 09. CARTA Service ───────────────────────────────────────────────────────
+  carta-svc:
+    build:
+      context: ../services/carta-svc
+      dockerfile: Dockerfile
+    container_name: carta-svc-p6
+    ports:
+      - "8142:8142"
+    environment:
+      PORT: "8142"
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ── 10. BYOK / HYOK Key Management Service ─────────────────────────────────
+  key-management-svc:
+    build:
+      context: ../services/key-management-svc
+      dockerfile: Dockerfile
+    container_name: key-management-svc-p6
+    ports:
+      - "8143:8143"
+    environment:
+      PORT: "8143"
+      AUTHZ_SERVICE_URL: http://authorization-svc:8089
+    depends_on:
+      authorization-svc:
+        condition: service_healthy
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  postgres_p6_data:
+
+
+
+
+
