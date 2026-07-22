@@ -21,16 +21,23 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStoreReal struct {
-	entries map[string]*domain.IntercompanyEntry
+	entries       map[string]*domain.IntercompanyEntry
+	bySourceJournal map[string]string
 }
 
 func newStubStoreReal() *stubStoreReal {
-	return &stubStoreReal{entries: make(map[string]*domain.IntercompanyEntry)}
+	return &stubStoreReal{entries: make(map[string]*domain.IntercompanyEntry), bySourceJournal: make(map[string]string)}
 }
 
-func (s *stubStoreReal) CreateEntry(_ context.Context, entry *domain.IntercompanyEntry) error {
+func (s *stubStoreReal) CreateEntry(_ context.Context, entry *domain.IntercompanyEntry) (bool, error) {
+	key := entry.TenantID + "|" + entry.SourceJournalID
+	if existingID, ok := s.bySourceJournal[key]; ok {
+		*entry = *s.entries[existingID]
+		return false, nil
+	}
+	s.bySourceJournal[key] = entry.IntercompanyEntryID
 	s.entries[entry.IntercompanyEntryID] = entry
-	return nil
+	return true, nil
 }
 
 func (s *stubStoreReal) GetEntry(_ context.Context, id string) (*domain.IntercompanyEntry, error) {
@@ -196,6 +203,42 @@ func TestCreateEntry_HappyPath(t *testing.T) {
 	}
 	if pub.created != 1 {
 		t.Errorf("expected 1 created event got %d", pub.created)
+	}
+}
+
+func TestCreateEntry_RetriedSourceJournalID_ReturnsOriginalNotDuplicate(t *testing.T) {
+	pub := &stubPublisher{}
+	s := newStubStoreReal()
+	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{})
+	body := map[string]any{
+		"source_legal_entity_id": "le-us",
+		"target_legal_entity_id": "le-uk",
+		"source_journal_id":      "j-001",
+		"amount":                 5000.0,
+		"currency_code":          "USD",
+	}
+
+	first := doReq(r, http.MethodPost, "/v1/intercompany/entries/", body, "principal-1")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstEntry domain.IntercompanyEntry
+	_ = json.NewDecoder(first.Body).Decode(&firstEntry)
+
+	retry := doReq(r, http.MethodPost, "/v1/intercompany/entries/", body, "principal-1")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("expected 200 on retried call for the same source_journal_id, got %d: %s", retry.Code, retry.Body.String())
+	}
+	var retryEntry domain.IntercompanyEntry
+	_ = json.NewDecoder(retry.Body).Decode(&retryEntry)
+	if retryEntry.IntercompanyEntryID != firstEntry.IntercompanyEntryID {
+		t.Fatalf("retried call resolved to a different intercompany_entry_id (%s) than the original (%s)", retryEntry.IntercompanyEntryID, firstEntry.IntercompanyEntryID)
+	}
+	if pub.created != 1 {
+		t.Fatalf("expected exactly 1 created event, got %d — replay must not re-publish", pub.created)
+	}
+	if len(s.entries) != 1 {
+		t.Fatalf("expected exactly 1 intercompany entry to exist, got %d — a retry must not create a duplicate", len(s.entries))
 	}
 }
 
