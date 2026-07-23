@@ -1,0 +1,82 @@
+###############################################################################
+# 38-app-external-data-feed.yaml
+# Phase 7 — External Data Feed Service  (port 8149)
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-data-feed-svc
+  namespace: zoiko-extensions
+  labels:
+    app: external-data-feed-svc
+    phase: "7"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: external-data-feed-svc
+  template:
+    metadata:
+      labels:
+        app: external-data-feed-svc
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: external-data-feed-svc
+          image: zoiko/external-data-feed-svc:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8149
+          env:
+            - name: PORT
+              value: "8149"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: external-data-feed-db-secret
+                  key: url
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: KAFKA_EVENTS_TOPIC
+              value: "zoiko.external.data.feed.events"
+            - name: AUTHZ_SERVICE_URL
+              value: "http://authorization-svc.zoiko-governance:8081"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8149
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8149
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-data-feed-svc
+  namespace: zoiko-extensions
+spec:
+  selector:
+    app: external-data-feed-svc
+  ports:
+    - protocol: TCP
+      port: 8149
+      targetPort: 8149

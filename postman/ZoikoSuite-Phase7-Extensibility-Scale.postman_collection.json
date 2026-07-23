@@ -1,0 +1,425 @@
+{
+  "info": {
+    "name": "ZoikoSuite Phase 7 — Extensibility & Scale",
+    "_postman_id": "p7-extensibility-scale-2026",
+    "description": "End-to-end API tests for all 6 Phase 7 microservices: Connectivity API Bridge, Banking Connector, HRIS Connector, Tax Authority Interface, eSignature Integration, and External Data Feed.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "tenant_id", "value": "tenant-zoiko-001" },
+    { "key": "legal_entity_id", "value": "le-gb-001" },
+    { "key": "connectivity_url", "value": "http://localhost:8144" },
+    { "key": "banking_url", "value": "http://localhost:8145" },
+    { "key": "hris_url", "value": "http://localhost:8146" },
+    { "key": "tax_url", "value": "http://localhost:8147" },
+    { "key": "esig_url", "value": "http://localhost:8148" },
+    { "key": "feed_url", "value": "http://localhost:8149" },
+    { "key": "connection_id", "value": "" },
+    { "key": "bank_account_id", "value": "" },
+    { "key": "hris_sync_id", "value": "" },
+    { "key": "tax_interface_id", "value": "" },
+    { "key": "submission_id", "value": "" },
+    { "key": "envelope_id", "value": "" },
+    { "key": "feed_id", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "🔌 Connectivity API Bridge (8144)",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{connectivity_url}}/healthz",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "Create API Connection",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('connection_id', body.connection_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{connectivity_url}}/v1/api-bridge/connections",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"provider_name\": \"Xero UK\",\n  \"provider_type\": \"ACCOUNTING\",\n  \"protocol\": \"OAuth2\",\n  \"base_url\": \"https://api.xero.com\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get API Connection",
+          "request": {
+            "method": "GET",
+            "url": "{{connectivity_url}}/v1/api-bridge/connections/{{connection_id}}",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "List API Connections",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{connectivity_url}}/v1/api-bridge/connections?legal_entity_id={{legal_entity_id}}",
+              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
+            },
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "🏦 Banking Connector (8145)",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{banking_url}}/healthz",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "Register Bank Account",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('bank_account_id', body.account_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{banking_url}}/v1/banking/accounts",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"bank_name\": \"Barclays UK\",\n  \"iban\": \"GB29NWBK60161331926819\",\n  \"swift_bic\": \"BARCGB22\",\n  \"currency\": \"GBP\",\n  \"account_type\": \"CURRENT\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get Bank Account",
+          "request": {
+            "method": "GET",
+            "url": "{{banking_url}}/v1/banking/accounts/{{bank_account_id}}",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "List Bank Accounts",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{banking_url}}/v1/banking/accounts?legal_entity_id={{legal_entity_id}}",
+              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
+            },
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "👥 HRIS Connector (8146)",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{hris_url}}/healthz",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "Create HRIS Sync",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('hris_sync_id', body.sync_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{hris_url}}/v1/hris/syncs",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"provider\": \"Workday\",\n  \"sync_type\": \"EMPLOYEE_MASTER\",\n  \"direction\": \"INBOUND\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Get HRIS Sync",
+          "request": {
+            "method": "GET",
+            "url": "{{hris_url}}/v1/hris/syncs/{{hris_sync_id}}",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "List HRIS Syncs",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{hris_url}}/v1/hris/syncs?legal_entity_id={{legal_entity_id}}",
+              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
+            },
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "🧾 Tax Authority Interface (8147)",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{tax_url}}/healthz",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "Create Tax Interface",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('tax_interface_id', body.interface_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{tax_url}}/v1/tax-authority/interfaces",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"jurisdiction\": \"GB\",\n  \"authority_name\": \"HMRC MTD\",\n  \"protocol\": \"REST/OAuth2\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Submit Tax Filing",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('submission_id', body.submission_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{tax_url}}/v1/tax-authority/filings",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"interface_id\": \"{{tax_interface_id}}\",\n  \"tax_period\": \"2026-Q2\",\n  \"filing_type\": \"VAT_RETURN\",\n  \"tax_amount\": 15450.50,\n  \"payload\": \"{\\\"vat_due\\\": 15450.50}\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Tax Filings",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{tax_url}}/v1/tax-authority/filings?interface_id={{tax_interface_id}}",
+              "query": [{ "key": "interface_id", "value": "{{tax_interface_id}}" }]
+            },
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "✍️ eSignature Integration (8148)",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{esig_url}}/healthz",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "Create Signature Envelope",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('envelope_id', body.envelope_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{esig_url}}/v1/esignature/envelopes",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"provider\": \"DOCUSIGN\",\n  \"document_title\": \"Employment Contract — Jane Smith\",\n  \"signer_email\": \"jane.smith@zoiko.com\",\n  \"signer_name\": \"Jane Smith\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Update Envelope Status (SIGNED)",
+          "request": {
+            "method": "POST",
+            "url": "{{esig_url}}/v1/esignature/envelopes/{{envelope_id}}/status",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"SIGNED\",\n  \"external_ref\": \"DSIGN-ENV-99887\"\n}"
+            }
+          }
+        },
+        {
+          "name": "List Envelopes",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{esig_url}}/v1/esignature/envelopes?legal_entity_id={{legal_entity_id}}",
+              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
+            },
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        }
+      ]
+    },
+    {
+      "name": "📡 External Data Feed (8149)",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{feed_url}}/healthz",
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "Create Feed Subscription",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('status 201', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('feed_id', body.feed_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{feed_url}}/v1/external-data-feeds/subscriptions",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"provider\": \"Bloomberg\",\n  \"feed_type\": \"FX_RATE\",\n  \"symbol\": \"GBP/USD\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Ingest Feed Event",
+          "request": {
+            "method": "POST",
+            "url": "{{feed_url}}/v1/external-data-feeds/events/ingest",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-ID", "value": "{{tenant_id}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"feed_id\": \"{{feed_id}}\",\n  \"event_type\": \"fx.rate.update\",\n  \"payload\": {\n    \"pair\": \"GBP/USD\",\n    \"rate\": 1.2745,\n    \"timestamp\": \"2026-07-23T06:00:00Z\"\n  }\n}"
+            }
+          }
+        },
+        {
+          "name": "List Feed Events",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{feed_url}}/v1/external-data-feeds/events?feed_id={{feed_id}}",
+              "query": [{ "key": "feed_id", "value": "{{feed_id}}" }]
+            },
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        },
+        {
+          "name": "List Subscriptions",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{feed_url}}/v1/external-data-feeds/subscriptions?legal_entity_id={{legal_entity_id}}",
+              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
+            },
+            "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
+          }
+        }
+      ]
+    }
+  ]
+}
