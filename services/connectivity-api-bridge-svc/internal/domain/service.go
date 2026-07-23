@@ -20,12 +20,15 @@ const (
 
 type ApiBridge struct {
 	BridgeID      string    `json:"bridge_id"`
+	ConnectionID  string    `json:"connection_id"`
 	TenantID      string    `json:"tenant_id"`
 	LegalEntityID string    `json:"legal_entity_id"`
-	BridgeName    string    `json:"bridge_name"`
+	BridgeName    string    `json:"bridge_name,omitempty"`
+	ProviderName  string    `json:"provider_name,omitempty"`
 	Protocol      string    `json:"protocol"`
-	EndpointURL   string    `json:"endpoint_url"`
-	AuthType      string    `json:"auth_type"`
+	EndpointURL   string    `json:"endpoint_url,omitempty"`
+	BaseURL       string    `json:"base_url,omitempty"`
+	AuthType      string    `json:"auth_type,omitempty"`
 	Status        string    `json:"status"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -44,8 +47,10 @@ type IngestionLog struct {
 type CreateBridgeRequest struct {
 	LegalEntityID string `json:"legal_entity_id"`
 	BridgeName    string `json:"bridge_name"`
+	ProviderName  string `json:"provider_name"`
 	Protocol      string `json:"protocol"`
 	EndpointURL   string `json:"endpoint_url"`
+	BaseURL       string `json:"base_url"`
 	AuthType      string `json:"auth_type"`
 }
 

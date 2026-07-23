@@ -32,6 +32,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/envelopes", h.ListEnvelopes)
 		r.Get("/envelopes/{id}", h.GetByID)
 		r.Post("/envelopes/{id}/status", h.UpdateStatus)
+		r.Patch("/envelopes/{id}/status", h.UpdateStatus)
 	})
 }
 

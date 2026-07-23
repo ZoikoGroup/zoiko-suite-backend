@@ -25,6 +25,12 @@ services:
     volumes:
       - postgres_p7_data:/var/lib/postgresql/data
       - ./init-db-phase7.sh:/docker-entrypoint-initdb.d/init-db-phase7.sh:ro
+      - ../services/connectivity-api-bridge-svc/deployments/migrations:/migrations/connectivity-api-bridge:ro
+      - ../services/banking-connector-svc/deployments/migrations:/migrations/banking-connector:ro
+      - ../services/hris-connector-svc/deployments/migrations:/migrations/hris-connector:ro
+      - ../services/tax-authority-interface-svc/deployments/migrations:/migrations/tax-authority-interface:ro
+      - ../services/esignature-integration-svc/deployments/migrations:/migrations/esignature-integration:ro
+      - ../services/external-data-feed-svc/deployments/migrations:/migrations/external-data-feed:ro
     ports:
       - "5442:5432"
     healthcheck:

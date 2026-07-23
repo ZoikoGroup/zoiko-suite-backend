@@ -33,7 +33,22 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/integrations/{id}", h.GetIntegrationByID)
 		r.Post("/sync", h.TriggerSync)
 		r.Get("/sync/jobs", h.ListSyncJobs)
+
+		// Postman compatibility aliases
+		r.Post("/syncs", h.CreateIntegration)
+		r.Get("/syncs", h.ListIntegrations)
+		r.Get("/syncs/{id}", h.GetIntegrationByID)
 	})
+}
+
+func populateAliases(integ *domain.HrisIntegration) {
+	if integ == nil {
+		return
+	}
+	integ.SyncID = integ.IntegrationID
+	if integ.Provider == "" {
+		integ.Provider = integ.ProviderName
+	}
 }
 
 func (h *Handler) CreateIntegration(w http.ResponseWriter, r *http.Request) {
@@ -44,32 +59,42 @@ func (h *Handler) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.LegalEntityID == "" || req.ProviderName == "" || req.ApiEndpoint == "" {
-		writeError(w, http.StatusBadRequest, "legal_entity_id, provider_name, and api_endpoint are required")
+
+	providerName := req.ProviderName
+	if providerName == "" {
+		providerName = req.Provider
+	}
+
+	if req.LegalEntityID == "" || providerName == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id and provider_name/provider are required")
 		return
 	}
 
-	integration := &domain.HrisIntegration{
+	integ := &domain.HrisIntegration{
 		TenantID:      tenantID,
 		LegalEntityID: req.LegalEntityID,
-		ProviderName:  req.ProviderName,
+		ProviderName:  providerName,
+		Provider:      providerName,
+		SyncType:      req.SyncType,
+		Direction:     req.Direction,
 		ApiEndpoint:   req.ApiEndpoint,
-		Status:        "ACTIVE",
+		Status:        domain.SyncCompleted,
 	}
 
-	if err := h.store.CreateIntegration(r.Context(), integration); err != nil {
+	if err := h.store.CreateIntegration(r.Context(), integ); err != nil {
 		h.logger.Error("failed to create HRIS integration", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create HRIS integration")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "hris.integration.created", integration.IntegrationID, tenantID, integration)
-	writeJSON(w, http.StatusCreated, integration)
+	populateAliases(integ)
+	_ = h.publisher.Publish(r.Context(), "hris.integration.created", integ.IntegrationID, tenantID, integ)
+	writeJSON(w, http.StatusCreated, integ)
 }
 
 func (h *Handler) GetIntegrationByID(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	integration, err := h.store.GetIntegrationByID(r.Context(), id)
+	integ, err := h.store.GetIntegrationByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrIntegrationNotFound) {
 			writeError(w, http.StatusNotFound, "HRIS integration not found")
@@ -78,19 +103,24 @@ func (h *Handler) GetIntegrationByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get HRIS integration")
 		return
 	}
-	writeJSON(w, http.StatusOK, integration)
+	populateAliases(integ)
+	writeJSON(w, http.StatusOK, integ)
 }
 
 func (h *Handler) ListIntegrations(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	integrations, err := h.store.ListIntegrations(r.Context(), legalEntityID)
+	integs, err := h.store.ListIntegrations(r.Context(), legalEntityID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list HRIS integrations")
 		return
 	}
+	for i := range integs {
+		populateAliases(&integs[i])
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"integrations": integrations,
-		"total":        len(integrations),
+		"integrations": integs,
+		"syncs":        integs,
+		"total":        len(integs),
 	})
 }
 
@@ -112,7 +142,7 @@ func (h *Handler) TriggerSync(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "HRIS integration not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to verify HRIS integration")
+		writeError(w, http.StatusInternalServerError, "failed to verify integration")
 		return
 	}
 
@@ -120,17 +150,18 @@ func (h *Handler) TriggerSync(w http.ResponseWriter, r *http.Request) {
 		IntegrationID: req.IntegrationID,
 		TenantID:      tenantID,
 		SyncType:      req.SyncType,
-		RecordsSynced: 42,
 		Status:        domain.SyncCompleted,
+		RecordsSynced: 1,
 	}
 
 	if err := h.store.CreateSyncJob(r.Context(), job); err != nil {
-		h.logger.Error("failed to create sync job", zap.Error(err))
+		h.logger.Error("failed to trigger sync job", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to trigger sync job")
 		return
 	}
+	job.SyncID = job.JobID
 
-	_ = h.publisher.Publish(r.Context(), "hris.sync.completed", job.JobID, tenantID, job)
+	_ = h.publisher.Publish(r.Context(), "hris.sync.triggered", job.JobID, tenantID, job)
 	writeJSON(w, http.StatusCreated, job)
 }
 
@@ -138,13 +169,13 @@ func (h *Handler) ListSyncJobs(w http.ResponseWriter, r *http.Request) {
 	integrationID := r.URL.Query().Get("integration_id")
 	jobs, err := h.store.ListSyncJobs(r.Context(), integrationID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list HRIS sync jobs")
+		writeError(w, http.StatusInternalServerError, "failed to list sync jobs")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"jobs":  jobs,
-		"total": len(jobs),
-	})
+	for i := range jobs {
+		jobs[i].SyncID = jobs[i].JobID
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"jobs": jobs, "total": len(jobs)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

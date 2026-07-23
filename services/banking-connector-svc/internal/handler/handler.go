@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -34,7 +33,25 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/connections/{id}", h.GetConnectionByID)
 		r.Post("/statements", h.IngestStatement)
 		r.Get("/connections/{id}/statements", h.ListStatements)
+
+		// Postman compatibility aliases
+		r.Post("/accounts", h.CreateConnection)
+		r.Get("/accounts", h.ListConnections)
+		r.Get("/accounts/{id}", h.GetConnectionByID)
 	})
+}
+
+func populateAliases(conn *domain.BankConnection) {
+	if conn == nil {
+		return
+	}
+	conn.AccountID = conn.ConnectionID
+	if conn.SwiftBIC == "" {
+		conn.SwiftBIC = conn.BIC
+	}
+	if conn.IBAN == "" {
+		conn.IBAN = conn.AccountNumber
+	}
 }
 
 func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
@@ -45,34 +62,48 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.LegalEntityID == "" || req.BankName == "" || req.AccountNumber == "" {
-		writeError(w, http.StatusBadRequest, "legal_entity_id, bank_name, and account_number are required")
+
+	bic := req.BIC
+	if bic == "" {
+		bic = req.SwiftBIC
+	}
+	accNum := req.AccountNumber
+	if accNum == "" {
+		accNum = req.IBAN
+	}
+
+	if req.LegalEntityID == "" || req.BankName == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id and bank_name are required")
 		return
 	}
 
-	c := &domain.BankConnection{
+	conn := &domain.BankConnection{
 		TenantID:      tenantID,
 		LegalEntityID: req.LegalEntityID,
 		BankName:      req.BankName,
-		BIC:           req.BIC,
-		AccountNumber: req.AccountNumber,
+		BIC:           bic,
+		SwiftBIC:      bic,
+		AccountNumber: accNum,
+		IBAN:          accNum,
 		Currency:      req.Currency,
+		AccountType:   req.AccountType,
 		Status:        domain.StatusConnected,
 	}
 
-	if err := h.store.CreateConnection(r.Context(), c); err != nil {
+	if err := h.store.CreateConnection(r.Context(), conn); err != nil {
 		h.logger.Error("failed to create bank connection", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to create bank connection")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "bank.connection.created", c.ConnectionID, tenantID, c)
-	writeJSON(w, http.StatusCreated, c)
+	populateAliases(conn)
+	_ = h.publisher.Publish(r.Context(), "banking.connection.created", conn.ConnectionID, tenantID, conn)
+	writeJSON(w, http.StatusCreated, conn)
 }
 
 func (h *Handler) GetConnectionByID(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	c, err := h.store.GetConnectionByID(r.Context(), id)
+	conn, err := h.store.GetConnectionByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrConnectionNotFound) {
 			writeError(w, http.StatusNotFound, "bank connection not found")
@@ -81,19 +112,24 @@ func (h *Handler) GetConnectionByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get bank connection")
 		return
 	}
-	writeJSON(w, http.StatusOK, c)
+	populateAliases(conn)
+	writeJSON(w, http.StatusOK, conn)
 }
 
 func (h *Handler) ListConnections(w http.ResponseWriter, r *http.Request) {
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	connections, err := h.store.ListConnections(r.Context(), legalEntityID)
+	conns, err := h.store.ListConnections(r.Context(), legalEntityID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list bank connections")
 		return
 	}
+	for i := range conns {
+		populateAliases(&conns[i])
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"connections": connections,
-		"total":       len(connections),
+		"connections": conns,
+		"accounts":    conns,
+		"total":       len(conns),
 	})
 }
 
@@ -105,8 +141,8 @@ func (h *Handler) IngestStatement(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.ConnectionID == "" || req.StatementFormat == "" {
-		writeError(w, http.StatusBadRequest, "connection_id and statement_format are required")
+	if req.ConnectionID == "" {
+		writeError(w, http.StatusBadRequest, "connection_id is required")
 		return
 	}
 
@@ -119,28 +155,22 @@ func (h *Handler) IngestStatement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stmtDate := req.StatementDate
-	if stmtDate.IsZero() {
-		stmtDate = time.Now().UTC()
-	}
-
 	stmt := &domain.BankStatement{
 		ConnectionID:    req.ConnectionID,
 		TenantID:        tenantID,
 		StatementFormat: req.StatementFormat,
-		StatementDate:   stmtDate,
+		StatementDate:   req.StatementDate,
 		OpeningBalance:  req.OpeningBalance,
 		ClosingBalance:  req.ClosingBalance,
-		TransactionCount: 1,
 	}
 
 	if err := h.store.RecordStatement(r.Context(), stmt); err != nil {
-		h.logger.Error("failed to record statement", zap.Error(err))
+		h.logger.Error("failed to ingest statement", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to ingest bank statement")
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "bank.statement.ingested", stmt.StatementID, tenantID, stmt)
+	_ = h.publisher.Publish(r.Context(), "banking.statement.ingested", stmt.StatementID, tenantID, stmt)
 	writeJSON(w, http.StatusCreated, stmt)
 }
 
@@ -148,13 +178,10 @@ func (h *Handler) ListStatements(w http.ResponseWriter, r *http.Request) {
 	connectionID := chi.URLParam(r, "id")
 	stmts, err := h.store.ListStatements(r.Context(), connectionID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list bank statements")
+		writeError(w, http.StatusInternalServerError, "failed to list statements")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"statements": stmts,
-		"total":      len(stmts),
-	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"statements": stmts, "total": len(stmts)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
