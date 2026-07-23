@@ -58,7 +58,7 @@ services:
   # ─── Connectivity & API Bridge (8144) ───────────────────────────────────────
   connectivity-api-bridge-svc:
     build:
-      context: ../../services/connectivity-api-bridge-svc
+      context: ../services/connectivity-api-bridge-svc
       dockerfile: Dockerfile
     networks: [zoiko-p7]
     depends_on:
@@ -75,7 +75,7 @@ services:
     ports:
       - "8144:8144"
     healthcheck:
-      test: ["/app/healthcheck"]
+      test: ["CMD", "/app/healthcheck"]
       interval: 20s
       timeout: 5s
       retries: 3
@@ -83,7 +83,7 @@ services:
   # ─── Banking Connector (8145) ────────────────────────────────────────────────
   banking-connector-svc:
     build:
-      context: ../../services/banking-connector-svc
+      context: ../services/banking-connector-svc
       dockerfile: Dockerfile
     networks: [zoiko-p7]
     depends_on:
@@ -100,7 +100,7 @@ services:
     ports:
       - "8145:8145"
     healthcheck:
-      test: ["/app/healthcheck"]
+      test: ["CMD", "/app/healthcheck"]
       interval: 20s
       timeout: 5s
       retries: 3
@@ -108,7 +108,7 @@ services:
   # ─── HRIS Connector (8146) ──────────────────────────────────────────────────
   hris-connector-svc:
     build:
-      context: ../../services/hris-connector-svc
+      context: ../services/hris-connector-svc
       dockerfile: Dockerfile
     networks: [zoiko-p7]
     depends_on:
@@ -125,7 +125,7 @@ services:
     ports:
       - "8146:8146"
     healthcheck:
-      test: ["/app/healthcheck"]
+      test: ["CMD", "/app/healthcheck"]
       interval: 20s
       timeout: 5s
       retries: 3
@@ -133,7 +133,7 @@ services:
   # ─── Tax Authority Interface (8147) ─────────────────────────────────────────
   tax-authority-interface-svc:
     build:
-      context: ../../services/tax-authority-interface-svc
+      context: ../services/tax-authority-interface-svc
       dockerfile: Dockerfile
     networks: [zoiko-p7]
     depends_on:
@@ -150,7 +150,7 @@ services:
     ports:
       - "8147:8147"
     healthcheck:
-      test: ["/app/healthcheck"]
+      test: ["CMD", "/app/healthcheck"]
       interval: 20s
       timeout: 5s
       retries: 3
@@ -158,7 +158,7 @@ services:
   # ─── eSignature Integration (8148) ──────────────────────────────────────────
   esignature-integration-svc:
     build:
-      context: ../../services/esignature-integration-svc
+      context: ../services/esignature-integration-svc
       dockerfile: Dockerfile
     networks: [zoiko-p7]
     depends_on:
@@ -175,7 +175,7 @@ services:
     ports:
       - "8148:8148"
     healthcheck:
-      test: ["/app/healthcheck"]
+      test: ["CMD", "/app/healthcheck"]
       interval: 20s
       timeout: 5s
       retries: 3
@@ -183,7 +183,7 @@ services:
   # ─── External Data Feed (8149) ──────────────────────────────────────────────
   external-data-feed-svc:
     build:
-      context: ../../services/external-data-feed-svc
+      context: ../services/external-data-feed-svc
       dockerfile: Dockerfile
     networks: [zoiko-p7]
     depends_on:
@@ -200,7 +200,7 @@ services:
     ports:
       - "8149:8149"
     healthcheck:
-      test: ["/app/healthcheck"]
+      test: ["CMD", "/app/healthcheck"]
       interval: 20s
       timeout: 5s
       retries: 3
