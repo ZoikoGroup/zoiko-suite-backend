@@ -35,7 +35,7 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
-	_, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID)
+	_, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID))
 	return err
 }
 

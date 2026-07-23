@@ -36,7 +36,7 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 }
 
 func (s *PgStore) setTenant(ctx context.Context, tx interface{ Exec(ctx context.Context, sql string, args ...interface{}) (interface{ RowsAffected() int64 }, error) }, tenantID string) error {
-	_, err := s.pool.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID)
+	_, err := s.pool.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID))
 	return err
 }
 
@@ -46,7 +46,7 @@ func (s *PgStore) CreateDefinition(ctx context.Context, tenantID string, def *do
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 	def.ID = uuid.New().String()
@@ -76,7 +76,7 @@ func (s *PgStore) GetDefinitionByID(ctx context.Context, tenantID, id string) (*
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 	var d domain.ReportDefinition
@@ -108,7 +108,7 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID string, run *domain.Re
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 	run.ID = uuid.New().String()

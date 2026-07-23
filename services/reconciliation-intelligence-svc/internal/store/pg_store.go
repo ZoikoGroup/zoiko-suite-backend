@@ -34,7 +34,7 @@ func (s *PgStore) CreateJob(ctx context.Context, tenantID string, job *domain.Re
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 
@@ -93,7 +93,7 @@ func (s *PgStore) GetJobByID(ctx context.Context, tenantID, id string) (*domain.
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -138,7 +138,7 @@ func (s *PgStore) ListJobs(ctx context.Context, tenantID, legalEntityID, sourceA
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -189,7 +189,7 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -229,7 +229,7 @@ func (s *PgStore) ArchiveJob(ctx context.Context, tenantID, id string) error {
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 

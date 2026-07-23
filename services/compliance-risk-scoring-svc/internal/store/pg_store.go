@@ -35,7 +35,7 @@ func (s *PgStore) CreateAssessment(ctx context.Context, tenantID string, assessm
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 
@@ -93,7 +93,7 @@ func (s *PgStore) GetAssessmentByID(ctx context.Context, tenantID, id string) (*
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -137,7 +137,7 @@ func (s *PgStore) ListAssessments(ctx context.Context, tenantID, legalEntityID, 
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -186,7 +186,7 @@ func (s *PgStore) CreateThresholdRule(ctx context.Context, tenantID string, rule
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 
@@ -213,7 +213,7 @@ func (s *PgStore) ListThresholdRules(ctx context.Context, tenantID string) ([]do
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -244,7 +244,7 @@ func (s *PgStore) ArchiveAssessment(ctx context.Context, tenantID, id string) er
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 

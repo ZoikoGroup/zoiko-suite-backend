@@ -40,6 +40,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}", h.GetTemplate)
 		r.Put("/{id}", h.UpdateTemplate)
 	})
+
+	r.Route("/v1/clause-templates", func(r chi.Router) {
+		r.Post("/", h.CreateTemplate)
+		r.Get("/", h.ListTemplates)
+		r.Get("/{id}", h.GetTemplate)
+		r.Put("/{id}", h.UpdateTemplate)
+	})
 }
 
 // --- Clause Handlers ---

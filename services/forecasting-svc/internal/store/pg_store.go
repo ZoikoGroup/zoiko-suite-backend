@@ -34,7 +34,7 @@ func (s *PgStore) CreateForecast(ctx context.Context, tenantID string, model *do
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 
@@ -101,7 +101,7 @@ func (s *PgStore) GetForecastByID(ctx context.Context, tenantID, id string) (*do
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -151,7 +151,7 @@ func (s *PgStore) ListForecasts(ctx context.Context, tenantID, legalEntityID, do
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -223,7 +223,7 @@ func (s *PgStore) RecalculateForecast(ctx context.Context, tenantID, id string, 
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return nil, err
 	}
 
@@ -243,7 +243,7 @@ func (s *PgStore) ArchiveForecast(ctx context.Context, tenantID, id string) erro
 	}
 	defer tx.Rollback(ctx)
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)); err != nil {
 		return err
 	}
 
