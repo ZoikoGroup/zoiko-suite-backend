@@ -73,10 +73,7 @@
           "name": "List API Connections",
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{connectivity_url}}/v1/api-bridge/connections?legal_entity_id={{legal_entity_id}}",
-              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
-            },
+            "url": "{{connectivity_url}}/v1/api-bridge/connections?legal_entity_id={{legal_entity_id}}",
             "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
           }
         }
@@ -132,10 +129,7 @@
           "name": "List Bank Accounts",
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{banking_url}}/v1/banking/accounts?legal_entity_id={{legal_entity_id}}",
-              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
-            },
+            "url": "{{banking_url}}/v1/banking/accounts?legal_entity_id={{legal_entity_id}}",
             "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
           }
         }
@@ -191,10 +185,7 @@
           "name": "List HRIS Syncs",
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{hris_url}}/v1/hris/syncs?legal_entity_id={{legal_entity_id}}",
-              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
-            },
+            "url": "{{hris_url}}/v1/hris/syncs?legal_entity_id={{legal_entity_id}}",
             "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
           }
         }
@@ -269,10 +260,7 @@
           "name": "List Tax Filings",
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{tax_url}}/v1/tax-authority/filings?interface_id={{tax_interface_id}}",
-              "query": [{ "key": "interface_id", "value": "{{tax_interface_id}}" }]
-            },
+            "url": "{{tax_url}}/v1/tax-authority/filings?interface_id={{tax_interface_id}}",
             "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
           }
         }
@@ -335,10 +323,7 @@
           "name": "List Envelopes",
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{esig_url}}/v1/esignature/envelopes?legal_entity_id={{legal_entity_id}}",
-              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
-            },
+            "url": "{{esig_url}}/v1/esignature/envelopes?legal_entity_id={{legal_entity_id}}",
             "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
           }
         }
@@ -401,10 +386,7 @@
           "name": "List Feed Events",
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{feed_url}}/v1/external-data-feeds/events?feed_id={{feed_id}}",
-              "query": [{ "key": "feed_id", "value": "{{feed_id}}" }]
-            },
+            "url": "{{feed_url}}/v1/external-data-feeds/events?feed_id={{feed_id}}",
             "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
           }
         },
@@ -412,10 +394,7 @@
           "name": "List Subscriptions",
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{feed_url}}/v1/external-data-feeds/subscriptions?legal_entity_id={{legal_entity_id}}",
-              "query": [{ "key": "legal_entity_id", "value": "{{legal_entity_id}}" }]
-            },
+            "url": "{{feed_url}}/v1/external-data-feeds/subscriptions?legal_entity_id={{legal_entity_id}}",
             "header": [{ "key": "X-Tenant-ID", "value": "{{tenant_id}}" }]
           }
         }
