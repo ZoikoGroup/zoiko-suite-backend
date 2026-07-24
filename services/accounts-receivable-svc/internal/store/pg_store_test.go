@@ -4,12 +4,12 @@ package store_test
 
 import (
 	"context"
-	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
