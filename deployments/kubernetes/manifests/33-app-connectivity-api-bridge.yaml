@@ -1,0 +1,82 @@
+###############################################################################
+# 33-app-connectivity-api-bridge.yaml
+# Phase 7 — Connectivity & API Bridge Service  (port 8144)
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connectivity-api-bridge-svc
+  namespace: zoiko-extensions
+  labels:
+    app: connectivity-api-bridge-svc
+    phase: "7"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: connectivity-api-bridge-svc
+  template:
+    metadata:
+      labels:
+        app: connectivity-api-bridge-svc
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: connectivity-api-bridge-svc
+          image: zoiko/connectivity-api-bridge-svc:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8144
+          env:
+            - name: PORT
+              value: "8144"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: connectivity-api-bridge-db-secret
+                  key: url
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: KAFKA_EVENTS_TOPIC
+              value: "zoiko.connectivity.api.bridge.events"
+            - name: AUTHZ_SERVICE_URL
+              value: "http://authorization-svc.zoiko-governance:8081"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8144
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8144
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: connectivity-api-bridge-svc
+  namespace: zoiko-extensions
+spec:
+  selector:
+    app: connectivity-api-bridge-svc
+  ports:
+    - protocol: TCP
+      port: 8144
+      targetPort: 8144

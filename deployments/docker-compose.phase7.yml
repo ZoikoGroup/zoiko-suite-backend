@@ -1,0 +1,212 @@
+version: "3.9"
+
+###############################################################################
+# Phase 7 — Extensibility & Scale Services
+# Ports: 8144-8149
+###############################################################################
+
+networks:
+  zoiko-p7:
+    driver: bridge
+
+volumes:
+  postgres_p7_data:
+
+services:
+  # ─── Infrastructure ─────────────────────────────────────────────────────────
+  postgres-p7:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    networks: [zoiko-p7]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres_p7_data:/var/lib/postgresql/data
+      - ./init-db-phase7.sh:/docker-entrypoint-initdb.d/init-db-phase7.sh:ro
+      - ../services/connectivity-api-bridge-svc/deployments/migrations:/migrations/connectivity-api-bridge:ro
+      - ../services/banking-connector-svc/deployments/migrations:/migrations/banking-connector:ro
+      - ../services/hris-connector-svc/deployments/migrations:/migrations/hris-connector:ro
+      - ../services/tax-authority-interface-svc/deployments/migrations:/migrations/tax-authority-interface:ro
+      - ../services/esignature-integration-svc/deployments/migrations:/migrations/esignature-integration:ro
+      - ../services/external-data-feed-svc/deployments/migrations:/migrations/external-data-feed:ro
+    ports:
+      - "5442:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper-p7:
+    image: confluentinc/cp-zookeeper:7.6.0
+    networks: [zoiko-p7]
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka-p7:
+    image: confluentinc/cp-kafka:7.6.0
+    networks: [zoiko-p7]
+    depends_on: [zookeeper-p7]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-p7:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-p7:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka-p7:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # ─── Connectivity & API Bridge (8144) ───────────────────────────────────────
+  connectivity-api-bridge-svc:
+    build:
+      context: ../services/connectivity-api-bridge-svc
+      dockerfile: Dockerfile
+    networks: [zoiko-p7]
+    depends_on:
+      postgres-p7:
+        condition: service_healthy
+      kafka-p7:
+        condition: service_healthy
+    environment:
+      PORT: "8144"
+      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_connectivity_api_bridge?sslmode=disable"
+      KAFKA_BROKERS: "kafka-p7:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.connectivity.api.bridge.events"
+      AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+    ports:
+      - "8144:8144"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ─── Banking Connector (8145) ────────────────────────────────────────────────
+  banking-connector-svc:
+    build:
+      context: ../services/banking-connector-svc
+      dockerfile: Dockerfile
+    networks: [zoiko-p7]
+    depends_on:
+      postgres-p7:
+        condition: service_healthy
+      kafka-p7:
+        condition: service_healthy
+    environment:
+      PORT: "8145"
+      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_banking_connector?sslmode=disable"
+      KAFKA_BROKERS: "kafka-p7:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.banking.connector.events"
+      AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+    ports:
+      - "8145:8145"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ─── HRIS Connector (8146) ──────────────────────────────────────────────────
+  hris-connector-svc:
+    build:
+      context: ../services/hris-connector-svc
+      dockerfile: Dockerfile
+    networks: [zoiko-p7]
+    depends_on:
+      postgres-p7:
+        condition: service_healthy
+      kafka-p7:
+        condition: service_healthy
+    environment:
+      PORT: "8146"
+      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_hris_connector?sslmode=disable"
+      KAFKA_BROKERS: "kafka-p7:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.hris.connector.events"
+      AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+    ports:
+      - "8146:8146"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ─── Tax Authority Interface (8147) ─────────────────────────────────────────
+  tax-authority-interface-svc:
+    build:
+      context: ../services/tax-authority-interface-svc
+      dockerfile: Dockerfile
+    networks: [zoiko-p7]
+    depends_on:
+      postgres-p7:
+        condition: service_healthy
+      kafka-p7:
+        condition: service_healthy
+    environment:
+      PORT: "8147"
+      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_tax_authority_interface?sslmode=disable"
+      KAFKA_BROKERS: "kafka-p7:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.tax.authority.interface.events"
+      AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+    ports:
+      - "8147:8147"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ─── eSignature Integration (8148) ──────────────────────────────────────────
+  esignature-integration-svc:
+    build:
+      context: ../services/esignature-integration-svc
+      dockerfile: Dockerfile
+    networks: [zoiko-p7]
+    depends_on:
+      postgres-p7:
+        condition: service_healthy
+      kafka-p7:
+        condition: service_healthy
+    environment:
+      PORT: "8148"
+      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_esignature_integration?sslmode=disable"
+      KAFKA_BROKERS: "kafka-p7:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.esignature.integration.events"
+      AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+    ports:
+      - "8148:8148"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+
+  # ─── External Data Feed (8149) ──────────────────────────────────────────────
+  external-data-feed-svc:
+    build:
+      context: ../services/external-data-feed-svc
+      dockerfile: Dockerfile
+    networks: [zoiko-p7]
+    depends_on:
+      postgres-p7:
+        condition: service_healthy
+      kafka-p7:
+        condition: service_healthy
+    environment:
+      PORT: "8149"
+      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_external_data_feed?sslmode=disable"
+      KAFKA_BROKERS: "kafka-p7:9092"
+      KAFKA_EVENTS_TOPIC: "zoiko.external.data.feed.events"
+      AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
+    ports:
+      - "8149:8149"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
