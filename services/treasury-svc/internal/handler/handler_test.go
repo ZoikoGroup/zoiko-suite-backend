@@ -21,6 +21,7 @@ type mockStore struct {
 	bankAccounts  map[string]*domain.BankAccount
 	cashBalances  map[string]*domain.CashBalance
 	thresholds    map[string]*domain.LiquidityThreshold
+	transfers     map[string]bool
 	createErr     error
 	getErr        error
 	listErr       error
@@ -35,6 +36,7 @@ func newMockStore() *mockStore {
 		bankAccounts: make(map[string]*domain.BankAccount),
 		cashBalances: make(map[string]*domain.CashBalance),
 		thresholds:   make(map[string]*domain.LiquidityThreshold),
+		transfers:    make(map[string]bool),
 	}
 }
 
@@ -109,11 +111,17 @@ func (m *mockStore) GetLiquidityThreshold(ctx context.Context, legalEntityID, cu
 	return m.thresholds[key], nil
 }
 
-func (m *mockStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) error {
+func (m *mockStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (bool, error) {
 	if m.transferErr != nil {
-		return m.transferErr
+		return false, m.transferErr
 	}
-	return nil
+	if correlationID != "" && m.transfers[correlationID] {
+		return false, nil
+	}
+	if correlationID != "" {
+		m.transfers[correlationID] = true
+	}
+	return true, nil
 }
 
 type mockPublisher struct {
@@ -317,7 +325,8 @@ func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
 		"source_bank_account_id": "src-1",
 		"target_bank_account_id": "tgt-2",
 		"amount": 400.0,
-		"currency_code": "USD"
+		"currency_code": "USD",
+		"correlation_id": "corr-transfer-1"
 	}`)
 	req1 := httptest.NewRequest(http.MethodPost, "/v1/treasury/transfers", bytes.NewReader(body1))
 	req1.Header.Set("X-Tenant-Id", "tenant-abc")
@@ -335,7 +344,8 @@ func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
 		"source_bank_account_id": "src-1",
 		"target_bank_account_id": "tgt-2",
 		"amount": 100.0,
-		"currency_code": "USD"
+		"currency_code": "USD",
+		"correlation_id": "corr-transfer-2"
 	}`)
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/treasury/transfers", bytes.NewReader(body2))
 	req2.Header.Set("X-Tenant-Id", "tenant-abc")
@@ -346,6 +356,86 @@ func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
 
 	if rr2.Code != http.StatusOK {
 		t.Fatalf("expected status 200 OK, got %d. Body: %s", rr2.Code, rr2.Body.String())
+	}
+}
+
+func TestHandler_InitiateTransfer_MissingCorrelationID_Rejected(t *testing.T) {
+	s := newMockStore()
+	p := &mockPublisher{}
+	az := &mockAuthz{allowed: true}
+	c := &mockClients{}
+	log := zap.NewNop()
+
+	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
+
+	h := handler.New(s, p, az, c, log)
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	body := []byte(`{
+		"source_bank_account_id": "src-1",
+		"target_bank_account_id": "tgt-2",
+		"amount": 100.0,
+		"currency_code": "USD"
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/treasury/transfers", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no correlation_id, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandler_InitiateTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t *testing.T) {
+	s := newMockStore()
+	p := &mockPublisher{}
+	az := &mockAuthz{allowed: true}
+	c := &mockClients{}
+	log := zap.NewNop()
+
+	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
+	s.cashBalances["tgt-2"] = &domain.CashBalance{BankAccountID: "tgt-2", AvailableBalance: 100.0}
+
+	h := handler.New(s, p, az, c, log)
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	body := []byte(`{
+		"source_bank_account_id": "src-1",
+		"target_bank_account_id": "tgt-2",
+		"amount": 100.0,
+		"currency_code": "USD",
+		"correlation_id": "corr-retry-1"
+	}`)
+
+	doTransfer := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/treasury/transfers", bytes.NewReader(body))
+		req.Header.Set("X-Tenant-Id", "tenant-abc")
+		req.Header.Set("X-Principal-Id", "usr-999")
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+		return rr
+	}
+
+	first := doTransfer()
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected 200 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+
+	retry := doTransfer()
+	if retry.Code != http.StatusOK {
+		t.Fatalf("expected 200 on retried call, got %d: %s", retry.Code, retry.Body.String())
+	}
+	if len(p.cashPositions) != 2 {
+		t.Fatalf("expected exactly 2 PublishCashPositionUpdated calls (one transfer, two legs), got %d — a retry must not move money again", len(p.cashPositions))
 	}
 }
 
