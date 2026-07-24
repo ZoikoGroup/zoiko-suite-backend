@@ -117,6 +117,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f
 # Apply migrations for accounts-payable-svc
 echo "Applying migrations for accounts_payable..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000002_add_idempotency_index.up.sql
 
 # Apply migrations for accounts-receivable-svc
 echo "Applying migrations for accounts_receivable..."
