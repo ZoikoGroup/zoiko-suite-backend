@@ -141,6 +141,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliatio
 # Apply migrations for intercompany-accounting-svc
 echo "Applying migrations for intercompany_accounting..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "intercompany_accounting" -f /migrations/intercompany-accounting/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "intercompany_accounting" -f /migrations/intercompany-accounting/000002_add_idempotency_index.up.sql
 
 # Apply migrations for consolidation-svc
 echo "Applying migrations for consolidation..."
