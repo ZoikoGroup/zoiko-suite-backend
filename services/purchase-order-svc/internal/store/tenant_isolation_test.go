@@ -1,0 +1,220 @@
+//go:build integration
+
+// Package store_test contains cross-tenant isolation tests for PgStore.
+//
+// Services in this platform connect as the Postgres superuser
+// (DB_USER=postgres). Postgres superusers unconditionally bypass Row-Level
+// Security regardless of policy text — set_config('app.tenant_id', …) has no
+// effect because RLS never runs. The only real isolation guarantee is an
+// explicit AND tenant_id = $N in every query's WHERE clause — this file
+// proves that guarantee actually holds for every tenant-scoped method in
+// this service, mirroring purchase-request-svc's and general-ledger-svc's
+// isolation test suites (both found real, live-reproducible bugs this exact
+// pattern was designed to catch).
+//
+// Run:
+//
+//	go test -v -tags=integration -count=1 -timeout=120s ./internal/store/
+package store_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"zoiko.io/purchase-order-svc/internal/domain"
+	svcmiddleware "zoiko.io/purchase-order-svc/internal/middleware"
+	"zoiko.io/purchase-order-svc/internal/store"
+)
+
+var (
+	testPool  *pgxpool.Pool
+	testStore *store.PgStore
+)
+
+func TestMain(m *testing.M) {
+	dbPort := uint32(15901 + uint32(os.Getpid()%499))
+	pg := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Port(dbPort).
+			Database("po_isolation_test").
+			Username("postgres").
+			Password("postgres"),
+	)
+	if err := pg.Start(); err != nil {
+		fmt.Printf("failed to start embedded postgres: %v\n", err)
+		os.Exit(1)
+	}
+
+	dsn := fmt.Sprintf(
+		"host=localhost port=%d dbname=po_isolation_test user=postgres password=postgres sslmode=disable",
+		dbPort,
+	)
+
+	ctx := context.Background()
+	var err error
+	testPool, err = pgxpool.New(ctx, dsn)
+	if err != nil {
+		fmt.Printf("failed to connect to postgres: %v\n", err)
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+
+	for i := 0; i < 75; i++ {
+		if err = testPool.Ping(ctx); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err != nil {
+		fmt.Printf("postgres did not become ready: %v\n", err)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+
+	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
+	if err != nil {
+		fmt.Printf("failed to read migration: %v\n", err)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+		fmt.Printf("failed to apply migration: %v\n", err)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+
+	testStore = store.New(testPool, zap.NewNop())
+
+	code := m.Run()
+
+	testPool.Close()
+	_ = pg.Stop()
+	os.Exit(code)
+}
+
+// orderFixture holds the key IDs for one tenant's seeded purchase order.
+type orderFixture struct {
+	tenantID string
+	entityID string
+	orderID  string
+}
+
+func setupIsolationFixture(t *testing.T, tenantLabel string) orderFixture {
+	t.Helper()
+	ctx := context.Background()
+
+	f := orderFixture{
+		tenantID: uuid.New().String(),
+		entityID: uuid.New().String(),
+		orderID:  uuid.New().String(),
+	}
+	tctx := svcmiddleware.WithTenant(ctx, f.tenantID)
+
+	o := &domain.PurchaseOrder{
+		PurchaseOrderID:     f.orderID,
+		TenantID:            f.tenantID,
+		LegalEntityID:       f.entityID,
+		IssuedByPrincipalID: "test-" + tenantLabel,
+		TotalAmount:         1000,
+		CurrencyCode:        "USD",
+		CorrelationID:       "corr-" + tenantLabel,
+	}
+	created, err := testStore.CreateOrder(tctx, o)
+	require.NoError(t, err)
+	require.True(t, created)
+
+	return f
+}
+
+func TestPgStore_TenantIsolation_GetOrder(t *testing.T) {
+	a := setupIsolationFixture(t, "A-GetOrder")
+	b := setupIsolationFixture(t, "B-GetOrder")
+
+	// Probe: tenant B's context, tenant A's order ID.
+	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
+	got, err := testStore.GetOrder(ctxB, a.orderID)
+	require.NoError(t, err)
+	assert.Nil(t, got, "ISOLATION FAILURE: GetOrder returned Tenant A's row under Tenant B's context")
+
+	// Sanity: tenant B can still read its own order.
+	gotOwn, err := testStore.GetOrder(ctxB, b.orderID)
+	require.NoError(t, err)
+	require.NotNil(t, gotOwn)
+	assert.Equal(t, b.orderID, gotOwn.PurchaseOrderID)
+}
+
+func TestPgStore_TenantIsolation_AmendOrder(t *testing.T) {
+	a := setupIsolationFixture(t, "A-Amend")
+	b := setupIsolationFixture(t, "B-Amend")
+
+	// Tenant B attempts to amend Tenant A's order, using tenant B's own
+	// tenantID as the scope argument — exactly what a handler bug would
+	// look like if TenantID were taken from the request body instead of
+	// the caller's real context.
+	_, err := testStore.AmendOrder(context.Background(), b.tenantID, a.orderID, 9999, "attacker amend", "attacker")
+	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+		"ISOLATION FAILURE: tenant B was able to amend tenant A's order")
+
+	// Verify tenant A's order is unchanged.
+	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
+	got, err := testStore.GetOrder(ctxA, a.orderID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, float64(1000), got.TotalAmount,
+		"ISOLATION FAILURE: tenant A's order total_amount was mutated by tenant B")
+	assert.Equal(t, 1, got.Version)
+
+	// Sanity: tenant B can still amend its OWN order.
+	updated, err := testStore.AmendOrder(context.Background(), b.tenantID, b.orderID, 2000, "legit amend", "b-admin")
+	require.NoError(t, err)
+	assert.Equal(t, float64(2000), updated.TotalAmount)
+	assert.Equal(t, 2, updated.Version)
+}
+
+func TestPgStore_TenantIsolation_CloseOrder(t *testing.T) {
+	a := setupIsolationFixture(t, "A-Close")
+	b := setupIsolationFixture(t, "B-Close")
+
+	_, err := testStore.CloseOrder(context.Background(), b.tenantID, a.orderID, "attacker")
+	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
+		"ISOLATION FAILURE: tenant B was able to close tenant A's order")
+
+	ctxA := svcmiddleware.WithTenant(context.Background(), a.tenantID)
+	got, err := testStore.GetOrder(ctxA, a.orderID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, domain.OrderStatusIssued, got.Status,
+		"ISOLATION FAILURE: tenant A's order status was mutated by tenant B's close attempt")
+
+	// Sanity: tenant B can still close its OWN order.
+	updated, err := testStore.CloseOrder(context.Background(), b.tenantID, b.orderID, "b-admin")
+	require.NoError(t, err)
+	assert.Equal(t, domain.OrderStatusClosed, updated.Status)
+}
+
+func TestPgStore_TenantIsolation_ListOrders(t *testing.T) {
+	a := setupIsolationFixture(t, "A-List")
+	_ = setupIsolationFixture(t, "B-List")
+
+	// ListOrders requires tenant_id as a mandatory filter argument (not
+	// derived from context), so it's structurally safe by construction —
+	// this test proves that holds, not just assumes it.
+	list, err := testStore.ListOrders(context.Background(), domain.ListOrdersFilter{TenantID: a.tenantID})
+	require.NoError(t, err)
+	for _, o := range list {
+		assert.Equal(t, a.tenantID, o.TenantID, "ISOLATION FAILURE: ListOrders returned another tenant's row")
+	}
+}
