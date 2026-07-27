@@ -91,18 +91,23 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		fmt.Printf("failed to read migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
-	}
-	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-		fmt.Printf("failed to apply migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
+	for _, migration := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_idempotency_index.up.sql",
+	} {
+		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+		if err != nil {
+			fmt.Printf("failed to read migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+			fmt.Printf("failed to apply migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
 	}
 
 	testStore = store.New(testPool, zap.NewNop())
@@ -134,7 +139,7 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) lineFixture {
 	}
 	tctx := svcmiddleware.WithTenant(ctx, f.tenantID)
 
-	require.NoError(t, testStore.CreateStatementLine(tctx, &domain.StatementLine{
+	_, err := testStore.CreateStatementLine(tctx, &domain.StatementLine{
 		StatementLineID: f.statementLineID,
 		TenantID:        f.tenantID,
 		LegalEntityID:   f.entityID,
@@ -144,10 +149,58 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) lineFixture {
 		CurrencyCode:    "USD",
 		BankReference:   "ACH-" + tenantLabel,
 		Status:          domain.StatementLineStatusUnmatched,
-		CorrelationID:   "corr-" + tenantLabel,
-	}))
+		CorrelationID:   "corr-" + tenantLabel + "-" + f.statementLineID,
+	})
+	require.NoError(t, err)
 
 	return f
+}
+
+// TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent proves
+// the idempotency guarantee against a REAL Postgres unique index — this is
+// the exact scenario a network-timeout-triggered client retry produces, and
+// it must resolve to the original line, never a duplicate.
+func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	line1 := &domain.StatementLine{
+		StatementLineID: uuid.New().String(),
+		TenantID:        tenantID,
+		LegalEntityID:   uuid.New().String(),
+		BankAccountID:   uuid.New().String(),
+		StatementDate:   time.Now().UTC().Truncate(24 * time.Hour),
+		Amount:          1000,
+		CurrencyCode:    "USD",
+		BankReference:   "ACH-retry",
+		Status:          domain.StatementLineStatusUnmatched,
+		CorrelationID:   "corr-retry-1",
+	}
+	created1, err := testStore.CreateStatementLine(ctx, line1)
+	require.NoError(t, err)
+	assert.True(t, created1, "expected created=true on the first call")
+
+	line2 := &domain.StatementLine{
+		StatementLineID: uuid.New().String(),
+		TenantID:        tenantID,
+		LegalEntityID:   uuid.New().String(),
+		BankAccountID:   uuid.New().String(),
+		StatementDate:   time.Now().UTC().Truncate(24 * time.Hour),
+		Amount:          1000,
+		CurrencyCode:    "USD",
+		BankReference:   "ACH-retry",
+		Status:          domain.StatementLineStatusUnmatched,
+		CorrelationID:   "corr-retry-1",
+	}
+	created2, err := testStore.CreateStatementLine(ctx, line2)
+	require.NoError(t, err)
+	assert.False(t, created2, "expected created=false on the retried call — this is a duplicate-line bug if it's true")
+	assert.Equal(t, line1.StatementLineID, line2.StatementLineID, "retried call must resolve to the original statement_line_id")
+
+	var count int
+	require.NoError(t, testPool.QueryRow(ctx, `SELECT COUNT(*) FROM statement_lines WHERE tenant_id = $1 AND correlation_id = $2`,
+		tenantID, "corr-retry-1").Scan(&count))
+	assert.Equal(t, 1, count, "DUPLICATE LINE: expected exactly 1 statement_lines row for this correlation_id")
 }
 
 func TestPgStore_TenantIsolation_GetStatementLine(t *testing.T) {

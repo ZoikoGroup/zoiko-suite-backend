@@ -25,7 +25,7 @@ type Store interface {
 	GetLatestCashBalance(ctx context.Context, bankAccountID string) (*domain.CashBalance, error)
 	SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error
 	GetLiquidityThreshold(ctx context.Context, legalEntityID, currencyCode string) (*domain.LiquidityThreshold, error)
-	ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) error
+	ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (created bool, err error)
 }
 
 // Publisher defines Kafka event publication contract.
@@ -363,6 +363,14 @@ func (h *Handler) InitiateTransfer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
 		return
 	}
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if req.CorrelationID != "" {
+		correlationID = req.CorrelationID
+	}
+	if correlationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -420,14 +428,16 @@ func (h *Handler) InitiateTransfer(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	correlationID := r.Header.Get("X-Correlation-ID")
-	if req.CorrelationID != "" {
-		correlationID = req.CorrelationID
-	}
-
-	if err := h.store.ExecuteTransfer(r.Context(), req.SourceBankAccountID, req.TargetBankAccountID, req.Amount, req.CurrencyCode, correlationID); err != nil {
+	created, err := h.store.ExecuteTransfer(r.Context(), req.SourceBankAccountID, req.TargetBankAccountID, req.Amount, req.CurrencyCode, correlationID)
+	if err != nil {
 		h.log.Error("transfer execution failed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "transfer_failed", err.Error())
+		return
+	}
+	if !created {
+		// Replay of a prior request with the same correlation_id — the
+		// transfer already happened, do not execute it a second time.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "already_transferred", "correlation_id": correlationID})
 		return
 	}
 

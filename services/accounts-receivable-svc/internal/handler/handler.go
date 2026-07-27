@@ -59,7 +59,7 @@ func New(store Store, publisher Publisher, authz AuthZClient, ledgerURL string, 
 		store:      store,
 		publisher:  publisher,
 		authz:      authz,
-		httpClient: &http.Client{Timeout: 3 * time.Second},
+		httpClient: &http.Client{Timeout: 3 * time.Second, Transport: newRetryTransport()},
 		ledgerURL:  ledgerURL,
 		log:        log,
 	}

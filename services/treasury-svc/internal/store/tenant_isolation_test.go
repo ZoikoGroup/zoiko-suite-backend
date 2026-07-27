@@ -65,18 +65,23 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		fmt.Printf("failed to read migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
-	}
-	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-		fmt.Printf("failed to apply migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
+	for _, migration := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_idempotency_index.up.sql",
+	} {
+		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+		if err != nil {
+			fmt.Printf("failed to read migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+			fmt.Printf("failed to apply migration %s: %v\n", migration, err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
 	}
 
 	testStore = store.New(testPool, zap.NewNop())
@@ -90,7 +95,7 @@ func TestMain(m *testing.M) {
 
 func cleanTables(t *testing.T) {
 	t.Helper()
-	_, err := testPool.Exec(context.Background(), "DELETE FROM cash_balances; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;")
+	_, err := testPool.Exec(context.Background(), "DELETE FROM transfers; DELETE FROM cash_balances; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;")
 	if err != nil {
 		t.Fatalf("failed to clean tables: %v", err)
 	}
@@ -106,6 +111,82 @@ func newTestAccount(tenantID, legalEntityID string) *domain.BankAccount {
 		BankIdentifier:      "SWIFT-TEST",
 		CurrencyCode:        "USD",
 		AccountStatus:       "ACTIVE",
+	}
+}
+
+// TestPgStore_ExecuteTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney
+// proves the idempotency guarantee against a REAL Postgres unique index —
+// this is the exact scenario a network-timeout-triggered client retry
+// produces, and it must not debit the source or credit the target twice.
+func TestPgStore_ExecuteTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	src := newTestAccount(tenantID, uuid.New().String())
+	tgt := newTestAccount(tenantID, uuid.New().String())
+	if err := s.CreateBankAccount(ctx, src); err != nil {
+		t.Fatalf("failed to create source account: %v", err)
+	}
+	if err := s.CreateBankAccount(ctx, tgt); err != nil {
+		t.Fatalf("failed to create target account: %v", err)
+	}
+
+	if err := s.CreateCashBalance(ctx, &domain.CashBalance{
+		BalanceID: uuid.New().String(), TenantID: tenantID, BankAccountID: src.BankAccountID,
+		LedgerBalance: 1000.0, AvailableBalance: 1000.0, AsOfTimestamp: time.Now().UTC(), CorrelationID: "corr-init-src",
+	}); err != nil {
+		t.Fatalf("failed to seed source balance: %v", err)
+	}
+	if err := s.CreateCashBalance(ctx, &domain.CashBalance{
+		BalanceID: uuid.New().String(), TenantID: tenantID, BankAccountID: tgt.BankAccountID,
+		LedgerBalance: 500.0, AvailableBalance: 500.0, AsOfTimestamp: time.Now().UTC(), CorrelationID: "corr-init-tgt",
+	}); err != nil {
+		t.Fatalf("failed to seed target balance: %v", err)
+	}
+
+	created1, err := s.ExecuteTransfer(ctx, src.BankAccountID, tgt.BankAccountID, 200.0, "USD", "corr-retry-1")
+	if err != nil {
+		t.Fatalf("first ExecuteTransfer failed: %v", err)
+	}
+	if !created1 {
+		t.Fatal("expected created=true on the first call")
+	}
+
+	// Simulate a client retry: identical call, same correlation_id.
+	created2, err := s.ExecuteTransfer(ctx, src.BankAccountID, tgt.BankAccountID, 200.0, "USD", "corr-retry-1")
+	if err != nil {
+		t.Fatalf("retried ExecuteTransfer failed: %v", err)
+	}
+	if created2 {
+		t.Fatal("expected created=false on the retried call — this is a double-money-movement bug if it's true")
+	}
+
+	resSrc, err := s.GetLatestCashBalance(ctx, src.BankAccountID)
+	if err != nil || resSrc == nil {
+		t.Fatalf("failed to get final source balance: %v", err)
+	}
+	if resSrc.AvailableBalance != 800.0 {
+		t.Fatalf("DOUBLE DEBIT: expected source available balance to be 800 (debited once), got %f", resSrc.AvailableBalance)
+	}
+
+	resTgt, err := s.GetLatestCashBalance(ctx, tgt.BankAccountID)
+	if err != nil || resTgt == nil {
+		t.Fatalf("failed to get final target balance: %v", err)
+	}
+	if resTgt.AvailableBalance != 700.0 {
+		t.Fatalf("DOUBLE CREDIT: expected target available balance to be 700 (credited once), got %f", resTgt.AvailableBalance)
+	}
+
+	var transferCount int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM transfers WHERE tenant_id = $1 AND correlation_id = $2`,
+		tenantID, "corr-retry-1").Scan(&transferCount); err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if transferCount != 1 {
+		t.Fatalf("expected exactly 1 transfers row for this correlation_id, got %d", transferCount)
 	}
 }
 
@@ -209,15 +290,18 @@ func TestPgStore_ExecuteTransfer_And_Isolation(t *testing.T) {
 	}
 
 	// Attempt transfer scoped to Tenant B's context — must fail
-	err := s.ExecuteTransfer(ctxB, acctA1.BankAccountID, acctA2.BankAccountID, 100.0, "USD", "attacker-corr")
+	_, err := s.ExecuteTransfer(ctxB, acctA1.BankAccountID, acctA2.BankAccountID, 100.0, "USD", "attacker-corr")
 	if err == nil {
 		t.Fatal("tenant isolation failure: Tenant B was allowed to execute transfer on Tenant A's accounts")
 	}
 
 	// Correct transfer scoped to Tenant A
-	err = s.ExecuteTransfer(ctxA, acctA1.BankAccountID, acctA2.BankAccountID, 200.0, "USD", "valid-transfer")
+	created, err := s.ExecuteTransfer(ctxA, acctA1.BankAccountID, acctA2.BankAccountID, 200.0, "USD", "valid-transfer")
 	if err != nil {
 		t.Fatalf("transfer failed: %v", err)
+	}
+	if !created {
+		t.Fatal("expected created=true on the first transfer")
 	}
 
 	// Check final balances for Tenant A

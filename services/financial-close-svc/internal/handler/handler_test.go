@@ -30,12 +30,18 @@ func newStubStore() *stubStore {
 	return &stubStore{periods: make(map[string]*domain.FiscalPeriod)}
 }
 
-func (s *stubStore) CreateFiscalPeriod(_ context.Context, fp *domain.FiscalPeriod) error {
+func (s *stubStore) CreateFiscalPeriod(_ context.Context, fp *domain.FiscalPeriod) (bool, error) {
 	if s.createErr != nil {
-		return s.createErr
+		return false, s.createErr
+	}
+	for _, existing := range s.periods {
+		if existing.LegalEntityID == fp.LegalEntityID && existing.PeriodName == fp.PeriodName {
+			*fp = *existing
+			return false, nil
+		}
 	}
 	s.periods[fp.FiscalPeriodID] = fp
-	return nil
+	return true, nil
 }
 
 func (s *stubStore) GetFiscalPeriod(_ context.Context, id string) (*domain.FiscalPeriod, error) {
@@ -239,6 +245,37 @@ func TestCreateFiscalPeriod_HappyPath(t *testing.T) {
 	}
 	if fp.TenantID != "tenant-abc" {
 		t.Errorf("tenant isolation: expected tenant-abc got %q", fp.TenantID)
+	}
+}
+
+func TestCreateFiscalPeriod_Retried_ReturnsOriginalNotDuplicate(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	body := map[string]any{
+		"legal_entity_id": "le-1",
+		"period_name":     "2024-Q1",
+		"period_start":    "2024-01-01T00:00:00Z",
+		"period_end":      "2024-03-31T23:59:59Z",
+	}
+
+	first := doReq(r, http.MethodPost, "/v1/close/periods/", body, "principal-1")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstFP domain.FiscalPeriod
+	_ = json.NewDecoder(first.Body).Decode(&firstFP)
+
+	retry := doReq(r, http.MethodPost, "/v1/close/periods/", body, "principal-1")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("expected 200 on retried call for the same (legal_entity_id, period_name), got %d: %s", retry.Code, retry.Body.String())
+	}
+	var retryFP domain.FiscalPeriod
+	_ = json.NewDecoder(retry.Body).Decode(&retryFP)
+	if retryFP.FiscalPeriodID != firstFP.FiscalPeriodID {
+		t.Fatalf("retried call resolved to a different fiscal_period_id (%s) than the original (%s)", retryFP.FiscalPeriodID, firstFP.FiscalPeriodID)
+	}
+	if len(s.periods) != 1 {
+		t.Fatalf("expected exactly 1 fiscal period to exist, got %d — a retry must not create a duplicate", len(s.periods))
 	}
 }
 

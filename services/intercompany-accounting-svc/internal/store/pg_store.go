@@ -43,24 +43,52 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry) error {
+// CreateEntry inserts an intercompany entry in UNMATCHED status.
+//
+// Idempotent on (tenant_id, source_journal_id): a retried call (e.g. a
+// client timeout on a POST that actually succeeded server-side) hits the
+// unique index added in 000002 and resolves to the ORIGINAL entry —
+// mutating *entry in place to reflect it — rather than creating a
+// duplicate. Returns created=false when the row already existed.
+func (s *PgStore) CreateEntry(ctx context.Context, entry *domain.IntercompanyEntry) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO intercompany_entries (
 				intercompany_entry_id, tenant_id, source_legal_entity_id, target_legal_entity_id,
 				source_journal_id, target_journal_id, amount, currency_code, match_status,
 				mismatch_reason, created_at, updated_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (tenant_id, source_journal_id) DO NOTHING
 		`, entry.IntercompanyEntryID, tenantID, entry.SourceLegalEntityID, entry.TargetLegalEntityID,
 			entry.SourceJournalID, entry.TargetJournalID, entry.Amount, entry.CurrencyCode,
 			entry.MatchStatus, entry.MismatchReason, entry.CreatedAt, entry.UpdatedAt)
-		return err
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT intercompany_entry_id, source_legal_entity_id, target_legal_entity_id, target_journal_id,
+				       amount, currency_code, match_status, mismatch_reason, created_at, updated_at
+				FROM intercompany_entries WHERE tenant_id = $1 AND source_journal_id = $2
+			`, tenantID, entry.SourceJournalID)
+			if err := row.Scan(
+				&entry.IntercompanyEntryID, &entry.SourceLegalEntityID, &entry.TargetLegalEntityID, &entry.TargetJournalID,
+				&entry.Amount, &entry.CurrencyCode, &entry.MatchStatus, &entry.MismatchReason, &entry.CreatedAt, &entry.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error) {
