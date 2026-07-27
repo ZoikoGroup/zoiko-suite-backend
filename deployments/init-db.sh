@@ -167,6 +167,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contrac
 # Apply migrations for payroll-run-svc
 echo "Applying migrations for payroll_run..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000002_add_idempotency_index.up.sql
 
 # Apply migrations for compensation-svc
 echo "Applying migrations for compensation..."
@@ -195,10 +196,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f 
 # Apply migrations for offboarding-severance-svc
 echo "Applying migrations for offboarding_severance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severance" -f /migrations/offboarding-severance/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severance" -f /migrations/offboarding-severance/000002_fix_tenant_isolation_and_idempotency.up.sql
 
 # Apply migrations for workforce-compliance-svc
 echo "Applying migrations for workforce_compliance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000002_fix_tenant_isolation_and_idempotency.up.sql
 
 # ── Phase 5 ─────────────────────────────────────────────────────────────────
 

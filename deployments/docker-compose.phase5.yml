@@ -116,7 +116,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -145,7 +145,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -174,7 +174,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -203,7 +203,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -232,7 +232,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -261,7 +261,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -290,7 +290,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -320,7 +320,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
       tax-rules-svc:
         condition: service_healthy
     healthcheck:
@@ -352,7 +352,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
       tax-rules-svc:
         condition: service_healthy
     healthcheck:
@@ -385,7 +385,7 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
-        condition: service_healthy
+        condition: service_started
       tax-rules-svc:
         condition: service_healthy
     healthcheck:
