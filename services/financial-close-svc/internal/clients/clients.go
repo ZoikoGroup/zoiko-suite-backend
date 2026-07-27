@@ -32,7 +32,7 @@ func New(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger) *C
 		apURL:        apURL,
 		arURL:        arURL,
 		vaultURL:     vaultURL,
-		http:         &http.Client{Timeout: 5 * time.Second},
+		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
 		log:          log,
 	}
 }

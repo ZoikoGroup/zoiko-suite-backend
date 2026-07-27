@@ -18,7 +18,7 @@ import (
 
 // Store is the persistence contract the handler depends on.
 type Store interface {
-	CreateStatementLine(ctx context.Context, l *domain.StatementLine) error
+	CreateStatementLine(ctx context.Context, l *domain.StatementLine) (created bool, err error)
 	GetStatementLine(ctx context.Context, statementLineID string) (*domain.StatementLine, error)
 	ListStatementLines(ctx context.Context, filter domain.ListStatementLinesFilter) ([]domain.StatementLine, error)
 	MatchStatementLine(ctx context.Context, tenantID, statementLineID, journalID, actorPrincipalID string) error
@@ -113,9 +113,16 @@ func (h *Handler) CreateStatementLine(w http.ResponseWriter, r *http.Request) {
 		Status:          domain.StatementLineStatusUnmatched,
 		CorrelationID:   req.CorrelationID,
 	}
-	if err := h.store.CreateStatementLine(r.Context(), l); err != nil {
+	created, err := h.store.CreateStatementLine(r.Context(), l)
+	if err != nil {
 		h.log.Error("CreateStatementLine: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if !created {
+		// Replay of a prior request with the same correlation_id — return
+		// the original line, do not re-publish the ingested event.
+		writeJSON(w, http.StatusOK, l)
 		return
 	}
 
@@ -385,6 +392,8 @@ func requiredFieldMissing(req domain.CreateStatementLineRequest) string {
 		return "currency_code"
 	case req.BankReference == "":
 		return "bank_reference"
+	case req.CorrelationID == "":
+		return "correlation_id"
 	default:
 		return ""
 	}

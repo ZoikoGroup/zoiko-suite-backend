@@ -18,7 +18,8 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	requests map[string]*domain.PurchaseRequest
+	requests      map[string]*domain.PurchaseRequest
+	byCorrelation map[string]string
 
 	createErr     error
 	getErr        error
@@ -27,15 +28,23 @@ type stubStore struct {
 }
 
 func newStubStore() *stubStore {
-	return &stubStore{requests: map[string]*domain.PurchaseRequest{}}
+	return &stubStore{requests: map[string]*domain.PurchaseRequest{}, byCorrelation: map[string]string{}}
 }
 
-func (s *stubStore) CreateRequest(_ context.Context, r *domain.PurchaseRequest) error {
+func (s *stubStore) CreateRequest(_ context.Context, r *domain.PurchaseRequest) (bool, error) {
 	if s.createErr != nil {
-		return s.createErr
+		return false, s.createErr
+	}
+	key := r.TenantID + "|" + r.CorrelationID
+	if r.CorrelationID != "" {
+		if existingID, ok := s.byCorrelation[key]; ok {
+			*r = *s.requests[existingID]
+			return false, nil
+		}
+		s.byCorrelation[key] = r.RequestID
 	}
 	s.requests[r.RequestID] = r
-	return nil
+	return true, nil
 }
 
 func (s *stubStore) GetRequest(_ context.Context, requestID string) (*domain.PurchaseRequest, error) {
@@ -118,6 +127,7 @@ func validCreateReq() domain.CreateRequestRequest {
 		Description:   "50 laptops",
 		Amount:        50000,
 		CurrencyCode:  "USD",
+		CorrelationID: "corr-1",
 	}
 }
 
@@ -126,6 +136,42 @@ func TestCreateRequest_Success(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/", validCreateReq(), "principal-1")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateRequest_MissingCorrelationID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.CorrelationID = ""
+	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no correlation_id, got %d", rec.Code)
+	}
+}
+
+func TestCreateRequest_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	req := validCreateReq()
+
+	first := doRequest(r, http.MethodPost, "/v1/purchase-requests/", req, "principal-1")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstPR domain.PurchaseRequest
+	_ = json.NewDecoder(first.Body).Decode(&firstPR)
+
+	retry := doRequest(r, http.MethodPost, "/v1/purchase-requests/", req, "principal-1")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("expected 200 on retried call with the same correlation_id, got %d: %s", retry.Code, retry.Body.String())
+	}
+	var retryPR domain.PurchaseRequest
+	_ = json.NewDecoder(retry.Body).Decode(&retryPR)
+	if retryPR.RequestID != firstPR.RequestID {
+		t.Fatalf("retried call resolved to a different request_id (%s) than the original (%s)", retryPR.RequestID, firstPR.RequestID)
+	}
+	if pub.created != 1 {
+		t.Fatalf("expected exactly 1 PublishRequestCreated call, got %d — replay must not re-publish", pub.created)
 	}
 }
 

@@ -1,0 +1,10 @@
+# .dockerignore for exception-escalation-svc
+**/*_test.go
+**/testdata/
+.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db
+deployments/
+docs/
+.git/

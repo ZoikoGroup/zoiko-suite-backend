@@ -70,22 +70,63 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 // credits) happens at ValidateJournal, not here — PENDING is deliberately
 // allowed to be unbalanced, matching the Tri-Phase Commit spec's intent that
 // Pending is a draft state.
-func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, lines []domain.JournalLine) error {
+//
+// Idempotent on (tenant_id, correlation_id): a retried call with the same
+// correlation_id resolves h to the original journal and returns its actual
+// lines (created=false) instead of inserting a duplicate — a client retry
+// after a network timeout must not double-post a journal. The returned
+// lines slice reflects whichever journal (new or pre-existing) the call
+// resolved to; it is not necessarily the same length as the input lines.
+func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, lines []domain.JournalLine) (resultLines []domain.JournalLine, created bool, err error) {
 	tenantID := tenantFromCtxOrFallback(ctx, h.TenantID)
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO journal_headers (
 				journal_id, tenant_id, legal_entity_id, fiscal_period, status,
 				description, created_by_principal_id, correlation_id, created_at
 			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, h.JournalID, h.TenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 			h.Description, h.CreatedByPrincipalID, h.CorrelationID, now)
 		if err != nil {
 			return err
 		}
+
+		if tag.RowsAffected() == 0 {
+			// Conflict: an earlier call with this correlation_id already
+			// created a journal. Resolve h and resultLines to that existing
+			// journal rather than inserting a duplicate.
+			if err := tx.QueryRow(ctx, `
+				SELECT journal_id, created_at FROM journal_headers
+				WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, h.CorrelationID).Scan(&h.JournalID, &h.CreatedAt); err != nil {
+				return err
+			}
+			rows, err := tx.Query(ctx, `
+				SELECT journal_line_id, journal_id, line_number, account_code,
+				       debit_amount, credit_amount, COALESCE(description, '')
+				FROM journal_lines WHERE journal_id = $1 AND tenant_id = $2
+				ORDER BY line_number
+			`, h.JournalID, tenantID)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var l domain.JournalLine
+				if err := rows.Scan(&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
+					&l.DebitAmount, &l.CreditAmount, &l.Description); err != nil {
+					return err
+				}
+				resultLines = append(resultLines, l)
+			}
+			return rows.Err()
+		}
+
 		h.CreatedAt = now
+		created = true
 
 		for i := range lines {
 			lines[i].JournalLineID = uuid.NewString()
@@ -102,8 +143,10 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 				return err
 			}
 		}
+		resultLines = lines
 		return nil
 	})
+	return resultLines, created, err
 }
 
 // GetJournal returns a journal header plus its lines. Returns (nil, nil, nil)
