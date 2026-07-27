@@ -19,7 +19,7 @@ import (
 
 // Store is the persistence contract.
 type Store interface {
-	CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice) error
+	CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice) (created bool, err error)
 	GetInvoice(ctx context.Context, invoiceID string) (*domain.CustomerInvoice, error)
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.CustomerInvoice, error)
 	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) error
@@ -115,9 +115,16 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:        req.CorrelationID,
 	}
 
-	if err := h.store.CreateInvoice(r.Context(), inv); err != nil {
+	created, err := h.store.CreateInvoice(r.Context(), inv)
+	if err != nil {
 		h.log.Error("CreateInvoice: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if !created {
+		// Replay of a prior request with the same correlation_id — return
+		// the original invoice, do not re-publish the issued event.
+		writeJSON(w, http.StatusOK, inv)
 		return
 	}
 
@@ -361,6 +368,8 @@ func requiredInvoiceFieldMissing(req domain.CreateCustomerInvoiceRequest) string
 		return "currency_code"
 	case req.DueDate.IsZero():
 		return "due_date"
+	case req.CorrelationID == "":
+		return "correlation_id"
 	default:
 		return ""
 	}
