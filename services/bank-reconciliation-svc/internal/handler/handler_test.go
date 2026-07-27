@@ -20,7 +20,8 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	lines map[string]*domain.StatementLine
+	lines         map[string]*domain.StatementLine
+	byCorrelation map[string]string
 
 	createErr      error
 	getErr         error
@@ -31,15 +32,23 @@ type stubStore struct {
 }
 
 func newStubStore() *stubStore {
-	return &stubStore{lines: map[string]*domain.StatementLine{}}
+	return &stubStore{lines: map[string]*domain.StatementLine{}, byCorrelation: map[string]string{}}
 }
 
-func (s *stubStore) CreateStatementLine(_ context.Context, l *domain.StatementLine) error {
+func (s *stubStore) CreateStatementLine(_ context.Context, l *domain.StatementLine) (bool, error) {
 	if s.createErr != nil {
-		return s.createErr
+		return false, s.createErr
+	}
+	key := l.TenantID + "|" + l.CorrelationID
+	if l.CorrelationID != "" {
+		if existingID, ok := s.byCorrelation[key]; ok {
+			*l = *s.lines[existingID]
+			return false, nil
+		}
+		s.byCorrelation[key] = l.StatementLineID
 	}
 	s.lines[l.StatementLineID] = l
-	return nil
+	return true, nil
 }
 
 func (s *stubStore) GetStatementLine(_ context.Context, statementLineID string) (*domain.StatementLine, error) {
@@ -173,6 +182,7 @@ func validCreateReq() domain.CreateStatementLineRequest {
 		Amount:        1000,
 		CurrencyCode:  "USD",
 		BankReference: "ACH-1234",
+		CorrelationID: "corr-1",
 	}
 }
 
@@ -181,6 +191,42 @@ func TestCreateStatementLine_Success(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/", validCreateReq(), "principal-1")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateStatementLine_MissingCorrelationID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	req := validCreateReq()
+	req.CorrelationID = ""
+	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no correlation_id, got %d", rec.Code)
+	}
+}
+
+func TestCreateStatementLine_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubLedger{})
+	req := validCreateReq()
+
+	first := doRequest(r, http.MethodPost, "/v1/statement-lines/", req, "principal-1")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstLine domain.StatementLine
+	_ = json.NewDecoder(first.Body).Decode(&firstLine)
+
+	retry := doRequest(r, http.MethodPost, "/v1/statement-lines/", req, "principal-1")
+	if retry.Code != http.StatusOK {
+		t.Fatalf("expected 200 on retried call with the same correlation_id, got %d: %s", retry.Code, retry.Body.String())
+	}
+	var retryLine domain.StatementLine
+	_ = json.NewDecoder(retry.Body).Decode(&retryLine)
+	if retryLine.StatementLineID != firstLine.StatementLineID {
+		t.Fatalf("retried call resolved to a different statement_line_id (%s) than the original (%s)", retryLine.StatementLineID, firstLine.StatementLineID)
+	}
+	if pub.ingested != 1 {
+		t.Fatalf("expected exactly 1 PublishStatementIngested call, got %d — replay must not re-publish", pub.ingested)
 	}
 }
 

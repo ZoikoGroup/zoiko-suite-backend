@@ -24,7 +24,7 @@ func New(apURL, arURL, obligationsURL string, log *zap.Logger) *Clients {
 		apURL:        apURL,
 		arURL:        arURL,
 		obligationsURL: obligationsURL,
-		http:         &http.Client{Timeout: 3 * time.Second},
+		http:         &http.Client{Timeout: 3 * time.Second, Transport: newRetryTransport()},
 		log:          log,
 	}
 }

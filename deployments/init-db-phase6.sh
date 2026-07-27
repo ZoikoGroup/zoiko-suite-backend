@@ -20,7 +20,6 @@ apply_migration() {
 
 # ── Authorization Service ───────────────────────────────────────────────────
 create_db authorization_svc
-
 # ── Anomaly Detection ─────────────────────────────────────────────────────────
 create_db anomaly_detection
 apply_migration anomaly_detection /migrations/anomaly-detection/000001_initial_schema.up.sql
