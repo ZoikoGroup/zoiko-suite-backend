@@ -119,7 +119,7 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) periodFixture {
 	}
 	tctx := svcmiddleware.WithTenant(ctx, f.tenantID)
 
-	require.NoError(t, testStore.CreateFiscalPeriod(tctx, &domain.FiscalPeriod{
+	_, err := testStore.CreateFiscalPeriod(tctx, &domain.FiscalPeriod{
 		FiscalPeriodID: f.fiscalPeriodID,
 		TenantID:       f.tenantID,
 		LegalEntityID:  f.legalEntityID,
@@ -127,7 +127,8 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) periodFixture {
 		PeriodStart:    time.Now().UTC(),
 		PeriodEnd:      time.Now().UTC().AddDate(0, 1, 0),
 		CloseStatus:    "OPEN",
-	}))
+	})
+	require.NoError(t, err)
 
 	return f
 }
