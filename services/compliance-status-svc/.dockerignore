@@ -1,0 +1,10 @@
+# .dockerignore for compliance-status-svc
+**/*_test.go
+**/testdata/
+.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db
+deployments/
+docs/
+.git/
