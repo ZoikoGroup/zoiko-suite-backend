@@ -51,6 +51,8 @@ services:
       - ../services/org-structure-svc/deployments/migrations:/migrations/org-structure:ro
       - ../services/offboarding-severance-svc/deployments/migrations:/migrations/offboarding-severance:ro
       - ../services/workforce-compliance-svc/deployments/migrations:/migrations/workforce-compliance:ro
+      - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
+      - ../services/performance-review-svc/deployments/migrations:/migrations/performance-review:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -1786,6 +1788,91 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8118/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── Identity Cell: Access Control Service (Port: 8119) ───────────────────────
+  # Owns Role catalogue, PermissionBundle definitions, and Role-Bundle links
+  # (docs/architecture/03-microservices.md §9.4). Publishes role.created,
+  # role.updated, permission.bundle.updated events consumed by authorization-svc
+  # to keep the RBAC evaluation layer in sync. This service is the explicit
+  # write-owner of Role and PermissionBundle — authorization-svc reads them
+  # for evaluation but does not write them here. Unblocks policy-svc event
+  # consumption of role.updated (see known-gaps.md).
+  access-control-svc:
+    build:
+      context: ../services/access-control-svc
+      dockerfile: Dockerfile
+    container_name: access-control-svc
+    ports:
+      - "8119:8119"
+    environment:
+      PORT: "8119"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: access_control_svc
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.access-control.events"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8119/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── Workforce Cell: Performance Review Service (Port: 8103) ──────────────────
+  # Authoritative owner of review cycles and individual employee performance
+  # reviews (docs/architecture/03-microservices.md §8.5, Phase 4).
+  # State machine: INITIATED → SELF_ASSESSMENT_PENDING → MANAGER_REVIEW_PENDING
+  #   → SUBMITTED → APPROVED → COMPLETED. Every mutation gated through
+  # authorization-svc (fail-closed). Completed reviews write governance_decision_id.
+  # Publishes: review.cycle.created, review.created, review.completed
+  # Consumes:  employee.terminated (cancels open reviews on termination)
+  performance-review-svc:
+    build:
+      context: ../services/performance-review-svc
+      dockerfile: Dockerfile
+    container_name: performance-review-svc
+    ports:
+      - "8103:8103"
+    environment:
+      PORT: "8103"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: performance_reviews
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.workforce.events"
+      KAFKA_GROUP_ID: "performance-review-svc"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ENV: local
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8103/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

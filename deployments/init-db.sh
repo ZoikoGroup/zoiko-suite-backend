@@ -43,6 +43,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE org_structure;
     CREATE DATABASE offboarding_severance;
     CREATE DATABASE workforce_compliance;
+    CREATE DATABASE access_control_svc;
+    CREATE DATABASE performance_reviews;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -192,6 +194,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f 
 # Apply migrations for org-structure-svc
 echo "Applying migrations for org_structure..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f /migrations/org-structure/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f /migrations/org-structure/000002_add_idempotency.up.sql
 
 # Apply migrations for offboarding-severance-svc
 echo "Applying migrations for offboarding_severance..."
@@ -202,5 +205,13 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severa
 echo "Applying migrations for workforce_compliance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000002_fix_tenant_isolation_and_idempotency.up.sql
+
+# Apply migrations for access-control-svc
+echo "Applying migrations for access_control_svc..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "access_control_svc" -f /migrations/access-control/000001_initial_schema.up.sql
+
+# Apply migrations for performance-review-svc
+echo "Applying migrations for performance_reviews..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "performance_reviews" -f /migrations/performance-review/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."

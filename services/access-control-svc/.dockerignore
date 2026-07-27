@@ -1,0 +1,6 @@
+# .dockerignore for access-control-svc
+# Exclude files that should not be in the Docker build context.
+.git
+.gitignore
+*.md
+deployments/migrations
