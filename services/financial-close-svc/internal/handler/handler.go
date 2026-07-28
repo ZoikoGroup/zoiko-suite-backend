@@ -22,7 +22,7 @@ import (
 )
 
 type Store interface {
-	CreateFiscalPeriod(ctx context.Context, fp *domain.FiscalPeriod) error
+	CreateFiscalPeriod(ctx context.Context, fp *domain.FiscalPeriod) (created bool, err error)
 	GetFiscalPeriod(ctx context.Context, id string) (*domain.FiscalPeriod, error)
 	GetFiscalPeriodByName(ctx context.Context, legalEntityID, name string) (*domain.FiscalPeriod, error)
 	ListFiscalPeriods(ctx context.Context, legalEntityID string) ([]domain.FiscalPeriod, error)
@@ -117,9 +117,16 @@ func (h *Handler) CreateFiscalPeriod(w http.ResponseWriter, r *http.Request) {
 		CloseStatus:    "OPEN",
 	}
 
-	if err := h.store.CreateFiscalPeriod(r.Context(), fp); err != nil {
+	created, err := h.store.CreateFiscalPeriod(r.Context(), fp)
+	if err != nil {
 		h.log.Error("failed to create fiscal period", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		// Replay of a prior request for the same (legal_entity_id, period_name)
+		// — return the original period rather than erroring.
+		writeJSON(w, http.StatusOK, fp)
 		return
 	}
 
@@ -316,6 +323,26 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 
 	// Update DB record lock state
 	if err := h.store.LockFiscalPeriod(r.Context(), id, now, docID); err != nil {
+		if errors.Is(err, domain.ErrPeriodAlreadyLocked) {
+			// Replay of a prior request that already succeeded (e.g. a client
+			// timeout on a lock call that actually completed server-side) —
+			// return the current locked state rather than misreporting this
+			// as a store outage.
+			current, getErr := h.store.GetFiscalPeriod(r.Context(), id)
+			if getErr != nil {
+				h.log.Error("failed to fetch already-locked period", zap.Error(getErr))
+				writeError(w, http.StatusServiceUnavailable, "store_unavailable", getErr.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
+				FiscalPeriodID:     current.FiscalPeriodID,
+				PeriodName:         current.PeriodName,
+				CloseStatus:        current.CloseStatus,
+				CloseLockedAt:      derefTime(current.CloseLockedAt),
+				EvidenceDocumentID: derefString(current.EvidenceDocumentID),
+			})
+			return
+		}
 		h.log.Error("failed to lock fiscal period", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
@@ -379,4 +406,18 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func derefTime(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

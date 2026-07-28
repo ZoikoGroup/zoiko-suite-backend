@@ -25,7 +25,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 	return &HTTPClient{
 		baseURL: baseURL,
 		log:     log,
-		http:    &http.Client{Timeout: 2 * time.Second},
+		http:    &http.Client{Timeout: 2 * time.Second, Transport: newRetryTransport()},
 	}
 }
 
