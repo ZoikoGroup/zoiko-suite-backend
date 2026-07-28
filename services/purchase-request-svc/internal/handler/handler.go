@@ -16,7 +16,7 @@ import (
 
 // Store is the persistence contract the handler depends on.
 type Store interface {
-	CreateRequest(ctx context.Context, r *domain.PurchaseRequest) error
+	CreateRequest(ctx context.Context, r *domain.PurchaseRequest) (created bool, err error)
 	GetRequest(ctx context.Context, requestID string) (*domain.PurchaseRequest, error)
 	ListRequests(ctx context.Context, filter domain.ListRequestsFilter) ([]domain.PurchaseRequest, error)
 	TransitionRequest(ctx context.Context, tenantID, requestID string, toStatus domain.RequestStatus, actorPrincipalID string, rejectionReason *string) error
@@ -101,9 +101,16 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 		Status:                 domain.RequestStatusPending,
 		CorrelationID:          req.CorrelationID,
 	}
-	if err := h.store.CreateRequest(r.Context(), pr); err != nil {
+	created, err := h.store.CreateRequest(r.Context(), pr)
+	if err != nil {
 		h.log.Error("CreateRequest: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if !created {
+		// Replay of a prior request with the same correlation_id — return
+		// the original request, do not re-publish the created event.
+		writeJSON(w, http.StatusOK, pr)
 		return
 	}
 
@@ -264,6 +271,8 @@ func requiredFieldMissing(req domain.CreateRequestRequest) string {
 		return "description"
 	case req.CurrencyCode == "":
 		return "currency_code"
+	case req.CorrelationID == "":
+		return "correlation_id"
 	default:
 		return ""
 	}

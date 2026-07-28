@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_intercompany_entries_tenant_source_journal;

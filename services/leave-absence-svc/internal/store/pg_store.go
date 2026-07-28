@@ -214,6 +214,11 @@ func (s *PgStore) AccrueLeaveBalance(ctx context.Context, employeeID, leaveTypeI
 	return &b, nil
 }
 
+// SubmitLeaveRequest locks pending hours and creates a leave request.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL request instead of creating a duplicate request and double
+// locking pending hours against the balance.
 func (s *PgStore) SubmitLeaveRequest(ctx context.Context, req *domain.SubmitLeaveRequest) (*domain.LeaveRequest, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -225,6 +230,27 @@ func (s *PgStore) SubmitLeaveRequest(ctx context.Context, req *domain.SubmitLeav
 	var lr domain.LeaveRequest
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if req.CorrelationID != "" {
+			err := tx.QueryRow(ctx, `
+				SELECT r.request_id, r.tenant_id, r.employee_id, r.leave_type_id, t.name,
+				       r.start_date::text, r.end_date::text, r.total_hours, r.reason, r.status,
+				       r.reviewer_id, r.reviewer_notes, r.reviewed_at, r.correlation_id, r.created_at, r.updated_at
+				FROM leave_requests r
+				JOIN leave_types t ON r.leave_type_id = t.leave_type_id
+				WHERE r.tenant_id = $1 AND r.correlation_id = $2
+			`, tenantID, req.CorrelationID).Scan(
+				&lr.RequestID, &lr.TenantID, &lr.EmployeeID, &lr.LeaveTypeID, &lr.LeaveTypeName,
+				&lr.StartDate, &lr.EndDate, &lr.TotalHours, &lr.Reason, &lr.Status,
+				&lr.ReviewerID, &lr.ReviewerNotes, &lr.ReviewedAt, &lr.CorrelationID, &lr.CreatedAt, &lr.UpdatedAt,
+			)
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+
 		// 1. Fetch balance
 		var allocated, used, pending float64
 		err := tx.QueryRow(ctx, `
@@ -258,25 +284,25 @@ func (s *PgStore) SubmitLeaveRequest(ctx context.Context, req *domain.SubmitLeav
 		_, err = tx.Exec(ctx, `
 			INSERT INTO leave_requests (
 				request_id, tenant_id, employee_id, leave_type_id, start_date,
-				end_date, total_hours, reason, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'SUBMITTED', $9, $9)
+				end_date, total_hours, reason, status, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'SUBMITTED', $9, $10, $10)
 		`, requestID, tenantID, req.EmployeeID, req.LeaveTypeID, req.StartDate,
-			req.EndDate, req.TotalHours, req.Reason, now)
+			req.EndDate, req.TotalHours, req.Reason, req.CorrelationID, now)
 		if err != nil {
 			return err
 		}
 
 		return tx.QueryRow(ctx, `
 			SELECT r.request_id, r.tenant_id, r.employee_id, r.leave_type_id, t.name,
-			       r.start_date, r.end_date, r.total_hours, r.reason, r.status,
-			       r.reviewer_id, r.reviewer_notes, r.reviewed_at, r.created_at, r.updated_at
+			       r.start_date::text, r.end_date::text, r.total_hours, r.reason, r.status,
+			       r.reviewer_id, r.reviewer_notes, r.reviewed_at, r.correlation_id, r.created_at, r.updated_at
 			FROM leave_requests r
 			JOIN leave_types t ON r.leave_type_id = t.leave_type_id
 			WHERE r.tenant_id = $1 AND r.request_id = $2
 		`, tenantID, requestID).Scan(
 			&lr.RequestID, &lr.TenantID, &lr.EmployeeID, &lr.LeaveTypeID, &lr.LeaveTypeName,
 			&lr.StartDate, &lr.EndDate, &lr.TotalHours, &lr.Reason, &lr.Status,
-			&lr.ReviewerID, &lr.ReviewerNotes, &lr.ReviewedAt, &lr.CreatedAt, &lr.UpdatedAt,
+			&lr.ReviewerID, &lr.ReviewerNotes, &lr.ReviewedAt, &lr.CorrelationID, &lr.CreatedAt, &lr.UpdatedAt,
 		)
 	})
 	if err != nil {
@@ -295,15 +321,15 @@ func (s *PgStore) GetLeaveRequest(ctx context.Context, requestID string) (*domai
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT r.request_id, r.tenant_id, r.employee_id, r.leave_type_id, t.name,
-			       r.start_date, r.end_date, r.total_hours, r.reason, r.status,
-			       r.reviewer_id, r.reviewer_notes, r.reviewed_at, r.created_at, r.updated_at
+			       r.start_date::text, r.end_date::text, r.total_hours, r.reason, r.status,
+			       r.reviewer_id, r.reviewer_notes, r.reviewed_at, r.correlation_id, r.created_at, r.updated_at
 			FROM leave_requests r
 			JOIN leave_types t ON r.leave_type_id = t.leave_type_id
 			WHERE r.tenant_id = $1 AND r.request_id = $2
 		`, tenantID, requestID).Scan(
 			&lr.RequestID, &lr.TenantID, &lr.EmployeeID, &lr.LeaveTypeID, &lr.LeaveTypeName,
 			&lr.StartDate, &lr.EndDate, &lr.TotalHours, &lr.Reason, &lr.Status,
-			&lr.ReviewerID, &lr.ReviewerNotes, &lr.ReviewedAt, &lr.CreatedAt, &lr.UpdatedAt,
+			&lr.ReviewerID, &lr.ReviewerNotes, &lr.ReviewedAt, &lr.CorrelationID, &lr.CreatedAt, &lr.UpdatedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -325,8 +351,8 @@ func (s *PgStore) ListLeaveRequests(ctx context.Context, employeeID, status stri
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := `
 			SELECT r.request_id, r.tenant_id, r.employee_id, r.leave_type_id, t.name,
-			       r.start_date, r.end_date, r.total_hours, r.reason, r.status,
-			       r.reviewer_id, r.reviewer_notes, r.reviewed_at, r.created_at, r.updated_at
+			       r.start_date::text, r.end_date::text, r.total_hours, r.reason, r.status,
+			       r.reviewer_id, r.reviewer_notes, r.reviewed_at, r.correlation_id, r.created_at, r.updated_at
 			FROM leave_requests r
 			JOIN leave_types t ON r.leave_type_id = t.leave_type_id
 			WHERE r.tenant_id = $1
@@ -354,7 +380,7 @@ func (s *PgStore) ListLeaveRequests(ctx context.Context, employeeID, status stri
 			if err := rows.Scan(
 				&lr.RequestID, &lr.TenantID, &lr.EmployeeID, &lr.LeaveTypeID, &lr.LeaveTypeName,
 				&lr.StartDate, &lr.EndDate, &lr.TotalHours, &lr.Reason, &lr.Status,
-				&lr.ReviewerID, &lr.ReviewerNotes, &lr.ReviewedAt, &lr.CreatedAt, &lr.UpdatedAt,
+				&lr.ReviewerID, &lr.ReviewerNotes, &lr.ReviewedAt, &lr.CorrelationID, &lr.CreatedAt, &lr.UpdatedAt,
 			); err != nil {
 				return err
 			}
@@ -368,6 +394,18 @@ func (s *PgStore) ListLeaveRequests(ctx context.Context, employeeID, status stri
 	return out, nil
 }
 
+// ApproveLeaveRequest transitions a leave request from SUBMITTED to
+// APPROVED and moves its locked hours from pending to used.
+//
+// The status transition is an atomic conditional UPDATE (WHERE
+// status = 'SUBMITTED' ... RETURNING), not a read-then-write: two
+// concurrent approve/reject calls (a retry, a double-click) race on the
+// same row's UPDATE, which Postgres serializes via the row lock the UPDATE
+// itself takes. Only the call that actually flips SUBMITTED -> APPROVED
+// touches the balance; the loser sees zero rows affected and returns
+// ErrInvalidStatusTransition without ever double-mutating pending/used
+// hours. A prior version read the status in a separate un-locked SELECT,
+// letting two concurrent calls both observe SUBMITTED and both move hours.
 func (s *PgStore) ApproveLeaveRequest(ctx context.Context, requestID, reviewerID, notes string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -379,10 +417,11 @@ func (s *PgStore) ApproveLeaveRequest(ctx context.Context, requestID, reviewerID
 		var empID, leaveTypeID string
 		var totalHours float64
 		err := tx.QueryRow(ctx, `
-			SELECT employee_id, leave_type_id, total_hours
-			FROM leave_requests
-			WHERE tenant_id = $1 AND request_id = $2 AND status = 'SUBMITTED'
-		`, tenantID, requestID).Scan(&empID, &leaveTypeID, &totalHours)
+			UPDATE leave_requests
+			SET status = 'APPROVED', reviewer_id = $1, reviewer_notes = $2, reviewed_at = $3, updated_at = $3
+			WHERE tenant_id = $4 AND request_id = $5 AND status = 'SUBMITTED'
+			RETURNING employee_id, leave_type_id, total_hours
+		`, reviewerID, notes, now, tenantID, requestID).Scan(&empID, &leaveTypeID, &totalHours)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrInvalidStatusTransition
 		}
@@ -390,26 +429,18 @@ func (s *PgStore) ApproveLeaveRequest(ctx context.Context, requestID, reviewerID
 			return err
 		}
 
-		// 1. Move pending hours to used hours
 		_, err = tx.Exec(ctx, `
 			UPDATE leave_balances
 			SET pending_hours = pending_hours - $1, used_hours = used_hours + $1, updated_at = $2
 			WHERE tenant_id = $3 AND employee_id = $4 AND leave_type_id = $5
 		`, totalHours, now, tenantID, empID, leaveTypeID)
-		if err != nil {
-			return err
-		}
-
-		// 2. Update request status
-		_, err = tx.Exec(ctx, `
-			UPDATE leave_requests
-			SET status = 'APPROVED', reviewer_id = $1, reviewer_notes = $2, reviewed_at = $3, updated_at = $3
-			WHERE tenant_id = $4 AND request_id = $5
-		`, reviewerID, notes, now, tenantID, requestID)
 		return err
 	})
 }
 
+// RejectLeaveRequest transitions a leave request from SUBMITTED to
+// REJECTED and releases its locked pending hours. See ApproveLeaveRequest
+// for why the status transition must be an atomic conditional UPDATE.
 func (s *PgStore) RejectLeaveRequest(ctx context.Context, requestID, reviewerID, notes string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -421,10 +452,11 @@ func (s *PgStore) RejectLeaveRequest(ctx context.Context, requestID, reviewerID,
 		var empID, leaveTypeID string
 		var totalHours float64
 		err := tx.QueryRow(ctx, `
-			SELECT employee_id, leave_type_id, total_hours
-			FROM leave_requests
-			WHERE tenant_id = $1 AND request_id = $2 AND status = 'SUBMITTED'
-		`, tenantID, requestID).Scan(&empID, &leaveTypeID, &totalHours)
+			UPDATE leave_requests
+			SET status = 'REJECTED', reviewer_id = $1, reviewer_notes = $2, reviewed_at = $3, updated_at = $3
+			WHERE tenant_id = $4 AND request_id = $5 AND status = 'SUBMITTED'
+			RETURNING employee_id, leave_type_id, total_hours
+		`, reviewerID, notes, now, tenantID, requestID).Scan(&empID, &leaveTypeID, &totalHours)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrInvalidStatusTransition
 		}
@@ -432,22 +464,11 @@ func (s *PgStore) RejectLeaveRequest(ctx context.Context, requestID, reviewerID,
 			return err
 		}
 
-		// 1. Release pending hours
 		_, err = tx.Exec(ctx, `
 			UPDATE leave_balances
 			SET pending_hours = pending_hours - $1, updated_at = $2
 			WHERE tenant_id = $3 AND employee_id = $4 AND leave_type_id = $5
 		`, totalHours, now, tenantID, empID, leaveTypeID)
-		if err != nil {
-			return err
-		}
-
-		// 2. Update request status
-		_, err = tx.Exec(ctx, `
-			UPDATE leave_requests
-			SET status = 'REJECTED', reviewer_id = $1, reviewer_notes = $2, reviewed_at = $3, updated_at = $3
-			WHERE tenant_id = $4 AND request_id = $5
-		`, reviewerID, notes, now, tenantID, requestID)
 		return err
 	})
 }

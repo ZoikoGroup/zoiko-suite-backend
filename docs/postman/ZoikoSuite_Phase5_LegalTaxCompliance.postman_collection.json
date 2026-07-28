@@ -1083,6 +1083,469 @@
                                                 ]
                                   }
                               ]
-                 }
+                 },
+                 {
+                     "name": "11. Withholding Tax Service",
+                     "item": [
+                         {
+                             "name": "Calculate Withholding Tax",
+                             "request": {
+                                 "method": "POST",
+                                 "header": [
+                                     { "key": "Content-Type", "value": "application/json" },
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "body": {
+                                     "mode": "raw",
+                                     "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"counterparty_id\":\"vendor-crossborder-01\",\"payment_reference\":\"INV-2026-901\",\"payment_type\":\"ROYALTIES\",\"gross_payment_amount\":50000.00,\"taxable_base_amount\":50000.00,\"withholding_rate_percent\":15.00,\"currency\":\"USD\"}"
+                                 },
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax/calculate"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                             "pm.test('withheld amount calculated', ()=>{const b=pm.response.json();pm.expect(b.withheld_amount).to.eql(7500);});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "Create Withholding Tax Obligation",
+                             "request": {
+                                 "method": "POST",
+                                 "header": [
+                                     { "key": "Content-Type", "value": "application/json" },
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "body": {
+                                     "mode": "raw",
+                                     "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"counterparty_id\":\"vendor-crossborder-01\",\"payment_reference\":\"INV-2026-901\",\"payment_type\":\"ROYALTIES\",\"gross_payment_amount\":50000.00,\"taxable_base_amount\":50000.00,\"withholding_rate_percent\":15.00,\"currency\":\"USD\",\"notes\":\"Cross border royalty payment WHT\",\"effective_from\":\"2026-07-22\",\"created_by\":\"tax_mgr\"}"
+                                 },
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                             "const b=pm.response.json();",
+                                             "pm.environment.set('whtObligationId', b.obligation_id);"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "List Withholding Tax Obligations",
+                             "request": {
+                                 "method": "GET",
+                                 "header": [
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax?legal_entity_id={{legalEntityId}}"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "Get Withholding Tax Obligation by ID",
+                             "request": {
+                                 "method": "GET",
+                                 "header": [
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax/{{whtObligationId}}"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         },
+                         {
+                             "name": "Remit Withholding Tax Obligation",
+                             "request": {
+                                 "method": "POST",
+                                 "header": [
+                                     { "key": "Content-Type", "value": "application/json" },
+                                     { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                 ],
+                                 "body": {
+                                     "mode": "raw",
+                                     "raw": "{\"remittance_reference\":\"HMRC-WHT-REMIT-2026-0099\",\"remitted_by\":\"treasury_officer\",\"notes\":\"Remitted to HMRC bank account\"}"
+                                 },
+                                 "url": "{{baseUrl}}:8129/v1/withholding-tax/{{whtObligationId}}/remit"
+                             },
+                             "event": [
+                                 {
+                                     "listen": "test",
+                                     "script": {
+                                         "exec": [
+                                             "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                             "pm.test('Status REMITTED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('REMITTED');});"
+                                         ]
+                                     }
+                                 }
+                             ]
+                         }
+                     ]
+                 },
+                  {
+                      "name": "12. Filing Preparation Service",
+                      "item": [
+                          {
+                              "name": "Create Filing Draft",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"filing_type\":\"VAT\",\"period_key\":\"2026-Q2\",\"due_date\":\"2026-08-07\",\"payload_data\":\"{\\\"total_vat_due\\\":15400.00}\",\"evidence_manifest_ref\":\"manifest-2026-q2-vat\",\"notes\":\"Q2 statutory VAT return draft\",\"created_by\":\"compliance_mgr\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8130/v1/filing-preparation/drafts"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('filingDraftId', b.draft_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Validate Filing Draft",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"required_document_types\":[\"INVOICE_SUMMARY\",\"RECONCILIATION\"],\"validated_by\":\"auditor\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8130/v1/filing-preparation/drafts/{{filingDraftId}}/validate"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status PREPARED', ()=>{const b=pm.response.json();pm.expect(b.validation_status).to.eql('PREPARED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Finalize Filing Draft",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"finalized_by\":\"tax_head\",\"notes\":\"Approved for submission to HMRC\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8130/v1/filing-preparation/drafts/{{filingDraftId}}/finalize"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status READY_FOR_SUBMISSION', ()=>{const b=pm.response.json();pm.expect(b.validation_status).to.eql('READY_FOR_SUBMISSION');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
+                  },
+                  {
+                      "name": "13. Filing Tracker Service",
+                      "item": [
+                          {
+                              "name": "Schedule Filing Requirement",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"filing_authority\":\"HMRC\",\"filing_type\":\"VAT\",\"period_key\":\"2026-Q2\",\"due_date\":\"2026-08-07\",\"notes\":\"Q2 VAT statutory deadline\",\"created_by\":\"system\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8131/v1/filing-tracker/requirements"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('filingReqId', b.filing_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Submit Filing Requirement",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"submission_reference\":\"HMRC-SUB-2026-88001\",\"submitted_by\":\"tax_specialist\",\"notes\":\"Submitted via HMRC portal\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8131/v1/filing-tracker/requirements/{{filingReqId}}/submit"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status SUBMITTED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('SUBMITTED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Confirm Filing Requirement",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"confirmation_reference\":\"HMRC-CONFIRM-88001-SUCCESS\",\"notes\":\"Receipt confirmed by HMRC\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8131/v1/filing-tracker/requirements/{{filingReqId}}/confirm"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status CONFIRMED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('CONFIRMED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
+                  },
+                  {
+                      "name": "14. Compliance Status Service",
+                      "item": [
+                          {
+                              "name": "Evaluate Compliance Health",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"domain_name\":\"TAX\",\"total_obligations\":10,\"fulfilled_obligations\":9,\"pending_obligations\":1,\"overdue_obligations\":0,\"open_exceptions\":0,\"effective_from\":\"2026-01-01\",\"created_by\":\"risk_officer\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8132/v1/compliance-status/evaluate"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "const b=pm.response.json();",
+                                              "pm.expect(b.health_score).to.eql(90);",
+                                              "pm.environment.set('compStatusId', b.status_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Create Compliance Gap",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"domain_name\":\"TAX\",\"gap_type\":\"MISSING_EVIDENCE\",\"severity\":\"HIGH\",\"source_reference\":\"whto-2026-001\",\"description\":\"Missing exemption certificate for cross-border WHT\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8132/v1/compliance-status/gaps"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('complianceGapId', b.gap_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Resolve Compliance Gap",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"remediation_notes\":\"Exemption certificate provided by counterparty\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8132/v1/compliance-status/gaps/{{complianceGapId}}/resolve"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status RESOLVED', ()=>{const b=pm.response.json();pm.expect(b.status).to.eql('RESOLVED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
+                  },
+                  {
+                      "name": "15. Exception & Escalation Service",
+                      "item": [
+                          {
+                              "name": "Create Exception Case",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"legal_entity_id\":\"{{legalEntityId}}\",\"jurisdiction_id\":\"GB-UK\",\"exception_type\":\"OVERDUE_FILING\",\"severity_level\":\"HIGH\",\"linked_object_type\":\"FILING\",\"linked_object_id\":\"ftrk-2026-9901\",\"description\":\"VAT return not submitted before due date\",\"assigned_to_role\":\"TAX_MANAGER\",\"created_by\":\"filing_tracker_svc\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8133/v1/exception-escalation/exceptions"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 201 Created', ()=>{pm.response.to.have.status(201);});",
+                                              "const b=pm.response.json();",
+                                              "pm.environment.set('exceptionCaseId', b.exception_case_id);"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Escalate Exception Case",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"escalated_to_role\":\"COMPLIANCE_HEAD\",\"escalation_reason\":\"High severity overdue filing exceeding 7 days\",\"escalated_by\":\"tax_manager\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8133/v1/exception-escalation/exceptions/{{exceptionCaseId}}/escalate"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "const b=pm.response.json();",
+                                              "pm.expect(b.exception_case.case_status).to.eql('ESCALATED');"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          },
+                          {
+                              "name": "Resolve Exception Case",
+                              "request": {
+                                  "method": "POST",
+                                  "header": [
+                                      { "key": "Content-Type", "value": "application/json" },
+                                      { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+                                  ],
+                                  "body": {
+                                      "mode": "raw",
+                                      "raw": "{\"closed_by\":\"compliance_head\",\"closure_reason\":\"Late filing approved and submitted with penalty waiver\"}"
+                                  },
+                                  "url": "{{baseUrl}}:8133/v1/exception-escalation/exceptions/{{exceptionCaseId}}/resolve"
+                              },
+                              "event": [
+                                  {
+                                      "listen": "test",
+                                      "script": {
+                                          "exec": [
+                                              "pm.test('Status 200', ()=>{pm.response.to.have.status(200);});",
+                                              "pm.test('Status CLOSED', ()=>{const b=pm.response.json();pm.expect(b.case_status).to.eql('CLOSED');});"
+                                          ]
+                                      }
+                                  }
+                              ]
+                          }
+                      ]
+                  }
              ]
 }

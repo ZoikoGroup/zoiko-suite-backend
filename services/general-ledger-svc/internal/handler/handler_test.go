@@ -19,29 +19,42 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	journals map[string]*domain.JournalHeader
-	lines    map[string][]domain.JournalLine
+	journals      map[string]*domain.JournalHeader
+	lines         map[string][]domain.JournalLine
+	byCorrelation map[string]string // correlation_id -> journal_id, mirrors the real partial unique index
 
-	createErr      error
-	getErr         error
-	listErr        error
-	transitionErr  error
-	sumErr         error
-	debitTotal     float64
-	creditTotal    float64
+	createErr     error
+	getErr        error
+	listErr       error
+	transitionErr error
+	sumErr        error
+	debitTotal    float64
+	creditTotal   float64
 }
 
 func newStubStore() *stubStore {
-	return &stubStore{journals: map[string]*domain.JournalHeader{}, lines: map[string][]domain.JournalLine{}}
+	return &stubStore{
+		journals:      map[string]*domain.JournalHeader{},
+		lines:         map[string][]domain.JournalLine{},
+		byCorrelation: map[string]string{},
+	}
 }
 
-func (s *stubStore) CreateJournal(_ context.Context, h *domain.JournalHeader, lines []domain.JournalLine) error {
+func (s *stubStore) CreateJournal(_ context.Context, h *domain.JournalHeader, lines []domain.JournalLine) ([]domain.JournalLine, bool, error) {
 	if s.createErr != nil {
-		return s.createErr
+		return nil, false, s.createErr
+	}
+	if h.CorrelationID != "" {
+		if existingID, ok := s.byCorrelation[h.CorrelationID]; ok {
+			existing := s.journals[existingID]
+			*h = *existing
+			return s.lines[existingID], false, nil
+		}
+		s.byCorrelation[h.CorrelationID] = h.JournalID
 	}
 	s.journals[h.JournalID] = h
 	s.lines[h.JournalID] = lines
-	return nil
+	return lines, true, nil
 }
 
 func (s *stubStore) GetJournal(_ context.Context, journalID string) (*domain.JournalHeader, []domain.JournalLine, error) {
@@ -86,9 +99,11 @@ type stubPublisher struct {
 	created, validated, posted, reversed int
 }
 
-func (p *stubPublisher) PublishJournalCreated(_ context.Context, _ domain.JournalHeader)     { p.created++ }
-func (p *stubPublisher) PublishJournalValidated(_ context.Context, _ domain.JournalHeader)   { p.validated++ }
-func (p *stubPublisher) PublishJournalPosted(_ context.Context, _ domain.JournalHeader)      { p.posted++ }
+func (p *stubPublisher) PublishJournalCreated(_ context.Context, _ domain.JournalHeader) { p.created++ }
+func (p *stubPublisher) PublishJournalValidated(_ context.Context, _ domain.JournalHeader) {
+	p.validated++
+}
+func (p *stubPublisher) PublishJournalPosted(_ context.Context, _ domain.JournalHeader) { p.posted++ }
 func (p *stubPublisher) PublishJournalReversed(_ context.Context, _ domain.JournalHeader, _ string) {
 	p.reversed++
 }
@@ -142,6 +157,7 @@ func validCreateReq() domain.CreateJournalRequest {
 		LegalEntityID: "e1",
 		FiscalPeriod:  "2026-07",
 		Description:   "test journal",
+		CorrelationID: "corr-1",
 		Lines: []domain.CreateJournalLineInput{
 			{AccountCode: "1000", DebitAmount: 100},
 			{AccountCode: "4000", CreditAmount: 100},
@@ -198,6 +214,54 @@ func TestCreateJournal_LineWithBothDebitAndCredit_Rejected(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a line with both debit and credit set, got %d", rec.Code)
+	}
+}
+
+func TestCreateJournal_MissingCorrelationID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.CorrelationID = ""
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no correlation_id (required as the idempotency key), got %d", rec.Code)
+	}
+}
+
+func TestCreateJournal_RetriedCorrelationID_ReturnsOriginalNotDuplicate(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
+
+	req := validCreateReq()
+	rec1 := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	var first domain.JournalWithLines
+	if err := json.Unmarshal(rec1.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+
+	// Simulate a client retry after a network timeout: identical request,
+	// same correlation_id.
+	rec2 := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on retried correlation_id (idempotent replay, not a new journal), got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var second domain.JournalWithLines
+	if err := json.Unmarshal(rec2.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second response: %v", err)
+	}
+
+	if second.JournalID != first.JournalID {
+		t.Fatalf("retried call returned a different journal_id (%s) than the original (%s) — this is the exact duplicate-posting bug idempotency keys exist to prevent",
+			second.JournalID, first.JournalID)
+	}
+	if len(s.journals) != 1 {
+		t.Fatalf("expected exactly 1 journal to exist in the store after a retry, got %d", len(s.journals))
+	}
+	if pub.created != 1 {
+		t.Fatalf("expected journal.created to publish exactly once (not on the replay), got %d", pub.created)
 	}
 }
 
@@ -278,7 +342,7 @@ func TestReverseJournal_OnlyFinalizedIsReversible(t *testing.T) {
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/journals/j1/reverse",
-		domain.ReverseJournalRequest{Reason: "correction"}, "principal-1")
+		domain.ReverseJournalRequest{Reason: "correction", CorrelationID: "corr-reverse-1"}, "principal-1")
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 reversing a non-FINALIZED journal, got %d", rec.Code)
 	}
@@ -295,7 +359,7 @@ func TestReverseJournal_Finalized_CreatesInvertedReversingJournal(t *testing.T) 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/journals/j1/reverse",
-		domain.ReverseJournalRequest{Reason: "correction"}, "principal-1")
+		domain.ReverseJournalRequest{Reason: "correction", CorrelationID: "corr-reverse-1"}, "principal-1")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
 	}

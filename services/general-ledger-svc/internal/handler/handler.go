@@ -17,7 +17,7 @@ import (
 
 // Store is the persistence contract the handler depends on.
 type Store interface {
-	CreateJournal(ctx context.Context, h *domain.JournalHeader, lines []domain.JournalLine) error
+	CreateJournal(ctx context.Context, h *domain.JournalHeader, lines []domain.JournalLine) (resultLines []domain.JournalLine, created bool, err error)
 	GetJournal(ctx context.Context, journalID string) (*domain.JournalHeader, []domain.JournalLine, error)
 	ListJournals(ctx context.Context, filter domain.ListJournalsFilter) ([]domain.JournalHeader, error)
 	TransitionJournal(ctx context.Context, tenantID, journalID string, fromStatus, toStatus domain.JournalStatus, actorPrincipalID string) error
@@ -132,14 +132,23 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.CreateJournal(r.Context(), header, lines); err != nil {
+	resultLines, created, err := h.store.CreateJournal(r.Context(), header, lines)
+	if err != nil {
 		h.log.Error("CreateJournal: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
+	// created=false means this correlation_id was already used — a client
+	// retry after a network timeout, not a genuinely new journal. Return
+	// the original journal with 200, not a duplicate with 201.
+	if !created {
+		writeJSON(w, http.StatusOK, domain.JournalWithLines{JournalHeader: *header, Lines: resultLines})
+		return
+	}
+
 	h.publisher.PublishJournalCreated(r.Context(), *header)
-	writeJSON(w, http.StatusCreated, domain.JournalWithLines{JournalHeader: *header, Lines: lines})
+	writeJSON(w, http.StatusCreated, domain.JournalWithLines{JournalHeader: *header, Lines: resultLines})
 }
 
 // ── GET /v1/journals/{journal_id} ────────────────────────────────────────────
@@ -298,6 +307,10 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_field", "reason")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
+		return
+	}
 
 	header, lines, err := h.store.GetJournal(r.Context(), journalID)
 	if err != nil {
@@ -356,11 +369,23 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.CreateJournal(r.Context(), reversingHeader, reversingLines); err != nil {
+	resultLines, created, err := h.store.CreateJournal(r.Context(), reversingHeader, reversingLines)
+	if err != nil {
 		h.log.Error("ReverseJournal: failed to create reversing journal", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
+
+	// created=false means this correlation_id already reversed this journal
+	// on an earlier call — a retry, not a new reversal. The original
+	// journal is already REVERSED; re-running TransitionJournal would
+	// correctly fail with ErrInvalidTransition (it's not FINALIZED anymore)
+	// and wrongly report a retry as an error. Return the original result.
+	if !created {
+		writeJSON(w, http.StatusOK, domain.JournalWithLines{JournalHeader: *reversingHeader, Lines: resultLines})
+		return
+	}
+
 	if err := h.store.TransitionJournal(r.Context(), header.TenantID, journalID,
 		domain.JournalStatusFinalized, domain.JournalStatusReversed, principalID); err != nil {
 		h.handleTransitionErr(w, err)
@@ -368,7 +393,7 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.publisher.PublishJournalReversed(r.Context(), *header, reversingHeader.JournalID)
-	writeJSON(w, http.StatusCreated, domain.JournalWithLines{JournalHeader: *reversingHeader, Lines: reversingLines})
+	writeJSON(w, http.StatusCreated, domain.JournalWithLines{JournalHeader: *reversingHeader, Lines: resultLines})
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -401,6 +426,12 @@ func requiredJournalFieldMissing(req domain.CreateJournalRequest) string {
 		return "legal_entity_id"
 	case req.FiscalPeriod == "":
 		return "fiscal_period"
+	case req.CorrelationID == "":
+		// Required, not optional: correlation_id is the idempotency key
+		// that lets a client retry safely after a network timeout without
+		// double-posting a journal. An idempotency key nobody's required
+		// to send protects nobody.
+		return "correlation_id"
 	default:
 		return ""
 	}

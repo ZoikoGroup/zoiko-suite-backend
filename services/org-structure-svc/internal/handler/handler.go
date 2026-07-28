@@ -17,11 +17,11 @@ import (
 )
 
 type Store interface {
-	CreateDepartment(ctx context.Context, d *domain.Department) error
+	CreateDepartment(ctx context.Context, d *domain.Department) (created bool, err error)
 	ListDepartments(ctx context.Context, legalEntityID string) ([]domain.Department, error)
 	GetDepartment(ctx context.Context, departmentID string) (*domain.Department, error)
 
-	CreatePosition(ctx context.Context, p *domain.Position) error
+	CreatePosition(ctx context.Context, p *domain.Position) (created bool, err error)
 	ListPositions(ctx context.Context, departmentID string) ([]domain.Position, error)
 	GetPosition(ctx context.Context, positionID string) (*domain.Position, error)
 
@@ -44,12 +44,12 @@ type EmployeeValidator interface {
 }
 
 const (
-	actionOrgDeptCreate      = "ORG_DEPT_CREATE"
-	actionOrgDeptView        = "ORG_DEPT_VIEW"
-	actionOrgPositionCreate  = "ORG_POSITION_CREATE"
-	actionOrgPositionView    = "ORG_POSITION_VIEW"
-	actionOrgAssignmentCreate= "ORG_ASSIGNMENT_CREATE"
-	actionOrgAssignmentView  = "ORG_ASSIGNMENT_VIEW"
+	actionOrgDeptCreate       = "ORG_DEPT_CREATE"
+	actionOrgDeptView         = "ORG_DEPT_VIEW"
+	actionOrgPositionCreate   = "ORG_POSITION_CREATE"
+	actionOrgPositionView     = "ORG_POSITION_VIEW"
+	actionOrgAssignmentCreate = "ORG_ASSIGNMENT_CREATE"
+	actionOrgAssignmentView   = "ORG_ASSIGNMENT_VIEW"
 )
 
 type Handler struct {
@@ -98,6 +98,10 @@ func (h *Handler) CreateDepartment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, name, code, cost_center_code are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -120,13 +124,19 @@ func (h *Handler) CreateDepartment(w http.ResponseWriter, r *http.Request) {
 		CostCenterCode:     req.CostCenterCode,
 		ParentDepartmentID: req.ParentDepartmentID,
 		Status:             "ACTIVE",
+		CorrelationID:      req.CorrelationID,
 		CreatedAt:          now,
 		UpdatedAt:          now,
 	}
 
-	if err := h.store.CreateDepartment(r.Context(), dept); err != nil {
+	created, err := h.store.CreateDepartment(r.Context(), dept)
+	if err != nil {
 		h.log.Error("failed to create department", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, dept)
 		return
 	}
 
@@ -144,11 +154,14 @@ func (h *Handler) ListDepartments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if legalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionOrgDeptView); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionOrgDeptView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListDepartments(r.Context(), legalEntityID)
@@ -167,7 +180,7 @@ func (h *Handler) ListDepartments(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetDepartment(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	_, ok := h.requirePrincipal(w, r)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
@@ -180,6 +193,11 @@ func (h *Handler) GetDepartment(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.log.Error("failed to get department", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, dept.LegalEntityID, actionOrgDeptView); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -197,6 +215,10 @@ func (h *Handler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 
 	if req.LegalEntityID == "" || req.DepartmentID == "" || req.Title == "" || req.Code == "" || req.JobLevel == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, department_id, title, code, job_level are required")
+		return
+	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
 		return
 	}
 
@@ -227,13 +249,19 @@ func (h *Handler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 		MaxHeadcount:     req.MaxHeadcount,
 		CurrentHeadcount: 0,
 		Status:           "ACTIVE",
+		CorrelationID:    req.CorrelationID,
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
 
-	if err := h.store.CreatePosition(r.Context(), pos); err != nil {
+	created, err := h.store.CreatePosition(r.Context(), pos)
+	if err != nil {
 		h.log.Error("failed to create position", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, pos)
 		return
 	}
 
@@ -246,8 +274,29 @@ func (h *Handler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListPositions(w http.ResponseWriter, r *http.Request) {
 	departmentID := r.URL.Query().Get("department_id")
 
-	_, ok := h.requirePrincipal(w, r)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+
+	if departmentID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "department_id is required")
+		return
+	}
+
+	dept, err := h.store.GetDepartment(r.Context(), departmentID)
+	if errors.Is(err, domain.ErrDepartmentNotFound) {
+		writeError(w, http.StatusBadRequest, "department_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch department for position listing", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, dept.LegalEntityID, actionOrgPositionView); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -267,7 +316,7 @@ func (h *Handler) ListPositions(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetPosition(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 
-	_, ok := h.requirePrincipal(w, r)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
@@ -280,6 +329,11 @@ func (h *Handler) GetPosition(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.log.Error("failed to get position", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, pos.LegalEntityID, actionOrgPositionView); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -299,6 +353,10 @@ func (h *Handler) AssignEmployee(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "employee_id, department_id, position_id, effective_from are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -306,32 +364,23 @@ func (h *Handler) AssignEmployee(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, req.EmployeeID)
+	if !ok {
+		return
+	}
 
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
+	if req.ManagerEmployeeID != nil && *req.ManagerEmployeeID != "" && h.employee != nil {
+		mgr, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, *req.ManagerEmployeeID)
 		if err != nil {
 			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
+				writeError(w, http.StatusBadRequest, "manager_invalid", string(domain.ErrManagerNotFound))
 				return
 			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
+			h.log.Error("manager validation failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+			return
 		}
-
-		if req.ManagerEmployeeID != nil && *req.ManagerEmployeeID != "" {
-			mgr, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, *req.ManagerEmployeeID)
-			if err != nil {
-				if errors.Is(err, domain.ErrEmployeeNotFound) {
-					writeError(w, http.StatusBadRequest, "manager_invalid", string(domain.ErrManagerNotFound))
-					return
-				}
-				h.log.Warn("manager validation call failed, proceeding", zap.Error(err))
-			} else if mgr != nil {
-				_ = mgr
-			}
-		}
+		_ = mgr
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionOrgAssignmentCreate); err != nil {
@@ -355,7 +404,7 @@ func (h *Handler) AssignEmployee(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetEmployeeAssignment(w http.ResponseWriter, r *http.Request) {
 	empID := chi.URLParam(r, "employee_id")
 
-	_, ok := h.requirePrincipal(w, r)
+	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
@@ -371,6 +420,11 @@ func (h *Handler) GetEmployeeAssignment(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if err := h.authz.CheckAllowed(r.Context(), principalID, oa.LegalEntityID, actionOrgAssignmentView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	writeJSON(w, http.StatusOK, oa)
 }
 
@@ -383,6 +437,33 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// resolveEmployeeEntity confirms an employee exists and returns their real
+// legal entity, to be used as the authorization scope for the action being
+// performed. Fails closed: if employee-master-svc is unreachable or returns
+// anything other than a clean "not found," the request is rejected (503)
+// rather than proceeding under a placeholder entity that authorization
+// would evaluate meaninglessly — a prior version logged a warning and
+// proceeded under "GLOBAL" on any non-not-found error.
+func (h *Handler) resolveEmployeeEntity(w http.ResponseWriter, r *http.Request, tenantID, principalID, employeeID string) (string, bool) {
+	if h.employee == nil {
+		return "GLOBAL", true
+	}
+	emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, employeeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrEmployeeNotFound) {
+			writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
+			return "", false
+		}
+		h.log.Error("employee validation failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+		return "", false
+	}
+	if emp == nil || emp.LegalEntityID == "" {
+		return "GLOBAL", true
+	}
+	return emp.LegalEntityID, true
 }
 
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {

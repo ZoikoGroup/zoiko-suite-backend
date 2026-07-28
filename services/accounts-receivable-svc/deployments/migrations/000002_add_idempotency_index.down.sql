@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_customer_invoices_tenant_correlation;

@@ -38,12 +38,17 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS journal_lines, journal_headers CASCADE;`)
 
-	sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations/000001_initial_schema.up.sql"))
-	if err != nil {
-		t.Fatalf("failed to read migration: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(sql)); err != nil {
-		t.Fatalf("failed to apply migration: %v", err)
+	for _, migration := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_idempotency_index.up.sql",
+	} {
+		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
+		if err != nil {
+			t.Fatalf("failed to read migration %s: %v", migration, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to apply migration %s: %v", migration, err)
+		}
 	}
 
 	return pool
@@ -71,7 +76,7 @@ func TestPgStore_CreateJournal_And_GetJournal(t *testing.T) {
 		{AccountCode: "4000", CreditAmount: 100},
 	}
 
-	if err := s.CreateJournal(ctx, h, lines); err != nil {
+	if _, _, err := s.CreateJournal(ctx, h, lines); err != nil {
 		t.Fatalf("CreateJournal failed: %v", err)
 	}
 
@@ -90,6 +95,76 @@ func TestPgStore_CreateJournal_And_GetJournal(t *testing.T) {
 	}
 	if gotLines[0].LineNumber != 1 || gotLines[1].LineNumber != 2 {
 		t.Fatalf("expected line numbers assigned in order, got %d, %d", gotLines[0].LineNumber, gotLines[1].LineNumber)
+	}
+}
+
+// TestPgStore_CreateJournal_RetriedCorrelationID_IsIdempotent proves the
+// idempotency guarantee against a REAL Postgres unique index, not a stub —
+// this is exactly the scenario a network-timeout-triggered client retry
+// produces, and it must resolve to the original journal, never a duplicate.
+func TestPgStore_CreateJournal_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	legalEntityID := uuid.New().String()
+
+	newHeader := func() *domain.JournalHeader {
+		return &domain.JournalHeader{
+			JournalID:            uuid.New().String(),
+			TenantID:             tenantID,
+			LegalEntityID:        legalEntityID,
+			FiscalPeriod:         "2026-07",
+			Status:               domain.JournalStatusPending,
+			Description:          "retried journal",
+			CreatedByPrincipalID: "test-admin",
+			CorrelationID:        "corr-retry-1",
+		}
+	}
+	lines := []domain.JournalLine{
+		{AccountCode: "1000", DebitAmount: 100},
+		{AccountCode: "4000", CreditAmount: 100},
+	}
+
+	h1 := newHeader()
+	resultLines1, created1, err := s.CreateJournal(ctx, h1, lines)
+	if err != nil {
+		t.Fatalf("first CreateJournal failed: %v", err)
+	}
+	if !created1 {
+		t.Fatal("expected created=true on the first call")
+	}
+	if len(resultLines1) != 2 {
+		t.Fatalf("expected 2 lines on first call, got %d", len(resultLines1))
+	}
+
+	// Simulate a client retry: a fresh header (new JournalID, as a real
+	// client would generate) but the SAME correlation_id.
+	h2 := newHeader()
+	resultLines2, created2, err := s.CreateJournal(ctx, h2, lines)
+	if err != nil {
+		t.Fatalf("retried CreateJournal failed: %v", err)
+	}
+	if created2 {
+		t.Fatal("expected created=false on the retried call — this is a duplicate-posting bug if it's true")
+	}
+	if h2.JournalID != h1.JournalID {
+		t.Fatalf("retried call resolved to a different journal_id (%s) than the original (%s)", h2.JournalID, h1.JournalID)
+	}
+	if len(resultLines2) != 2 {
+		t.Fatalf("expected the original journal's 2 lines to be returned on replay, got %d", len(resultLines2))
+	}
+
+	// Confirm only ONE journal actually exists in the database for this
+	// correlation_id — the real assertion this test exists to make.
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM journal_headers WHERE tenant_id = $1 AND correlation_id = $2`,
+		tenantID, "corr-retry-1").Scan(&count); err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("DUPLICATE POSTING: expected exactly 1 journal_headers row for this correlation_id, got %d", count)
 	}
 }
 
@@ -115,7 +190,7 @@ func TestPgStore_SumLines(t *testing.T) {
 		{AccountCode: "1001", DebitAmount: 40},
 		{AccountCode: "4000", CreditAmount: 100},
 	}
-	if err := s.CreateJournal(ctx, h, lines); err != nil {
+	if _, _, err := s.CreateJournal(ctx, h, lines); err != nil {
 		t.Fatalf("CreateJournal failed: %v", err)
 	}
 
@@ -145,7 +220,7 @@ func TestPgStore_TransitionJournal_WrongFromStatus_Rejected(t *testing.T) {
 		CreatedByPrincipalID: "test-admin",
 		CorrelationID:        "corr-3",
 	}
-	if err := s.CreateJournal(ctx, h, []domain.JournalLine{{AccountCode: "1000", DebitAmount: 1}}); err != nil {
+	if _, _, err := s.CreateJournal(ctx, h, []domain.JournalLine{{AccountCode: "1000", DebitAmount: 1}}); err != nil {
 		t.Fatalf("CreateJournal failed: %v", err)
 	}
 
@@ -176,7 +251,7 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 		FiscalPeriod: "2026-07", Status: domain.JournalStatusPending,
 		Description: "tenant A journal", CreatedByPrincipalID: "admin-a", CorrelationID: "corr-a",
 	}
-	if err := s.CreateJournal(ctxA, hA, []domain.JournalLine{{AccountCode: "1000", DebitAmount: 1}}); err != nil {
+	if _, _, err := s.CreateJournal(ctxA, hA, []domain.JournalLine{{AccountCode: "1000", DebitAmount: 1}}); err != nil {
 		t.Fatalf("CreateJournal (tenant A) failed: %v", err)
 	}
 

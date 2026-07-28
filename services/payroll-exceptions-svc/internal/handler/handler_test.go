@@ -20,18 +20,29 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	exceptions map[string]*domain.PayrollException
+	exceptions       map[string]*domain.PayrollException
+	exceptionsByCorr map[string]string
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		exceptions: make(map[string]*domain.PayrollException),
+		exceptions:       make(map[string]*domain.PayrollException),
+		exceptionsByCorr: make(map[string]string),
 	}
 }
 
-func (s *stubStore) CreateException(_ context.Context, e *domain.PayrollException) error {
+func (s *stubStore) CreateException(_ context.Context, e *domain.PayrollException) (bool, error) {
+	if e.CorrelationID != "" {
+		if existingID, ok := s.exceptionsByCorr[e.CorrelationID]; ok {
+			*e = *s.exceptions[existingID]
+			return false, nil
+		}
+	}
 	s.exceptions[e.ExceptionID] = e
-	return nil
+	if e.CorrelationID != "" {
+		s.exceptionsByCorr[e.CorrelationID] = e.ExceptionID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetException(_ context.Context, id string) (*domain.PayrollException, error) {
@@ -159,6 +170,7 @@ func TestRaiseException_MissingPrincipal(t *testing.T) {
 		"exception_code": "NEGATIVE_NET_PAY",
 		"severity":       "BLOCKER",
 		"description":    "Net pay calculated as -$150.00",
+		"correlation_id": "corr-exc-missing-principal",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -176,6 +188,7 @@ func TestRaiseException_BlockerFlow(t *testing.T) {
 		"exception_code": "NEGATIVE_NET_PAY",
 		"severity":       "BLOCKER",
 		"description":    "Net pay calculated as -$150.00",
+		"correlation_id": "corr-exc-blocker-flow",
 	}, "payroll-admin")
 
 	if rrRaise.Code != http.StatusCreated {
@@ -223,5 +236,70 @@ func TestRaiseException_BlockerFlow(t *testing.T) {
 	_ = json.NewDecoder(rrBlockers2.Body).Decode(&sum2)
 	if !sum2.CanRelease || sum2.BlockerCount != 0 {
 		t.Errorf("expected can_release=true, blocker_count=0 got %+v", sum2)
+	}
+}
+
+func TestRaiseException_MissingCorrelationID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodPost, "/v1/payroll-exceptions", map[string]any{
+		"payroll_run_id": "prun-402",
+		"exception_code": "NEGATIVE_NET_PAY",
+		"severity":       "WARNING",
+		"description":    "test",
+	}, "payroll-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRaiseException_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	downValidator := &stubEmployeeValidator{err: domain.ErrStoreUnavailable}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, downValidator)
+	empID := "emp-401"
+	rr := doReq(r, http.MethodPost, "/v1/payroll-exceptions", map[string]any{
+		"payroll_run_id": "prun-403",
+		"employee_id":    empID,
+		"exception_code": "MISSING_TAX_PROFILE",
+		"severity":       "WARNING",
+		"description":    "test",
+		"correlation_id": "corr-exc-down",
+	}, "payroll-admin")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (fail closed) got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRaiseException_RetriedCorrelationID_ReturnsOriginal(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	body := map[string]any{
+		"payroll_run_id": "prun-404",
+		"exception_code": "NEGATIVE_NET_PAY",
+		"severity":       "BLOCKER",
+		"description":    "test",
+		"correlation_id": "corr-exc-retry",
+	}
+
+	rr1 := doReq(r, http.MethodPost, "/v1/payroll-exceptions", body, "payroll-admin")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var exc1 domain.PayrollException
+	_ = json.NewDecoder(rr1.Body).Decode(&exc1)
+
+	rr2 := doReq(r, http.MethodPost, "/v1/payroll-exceptions", body, "payroll-admin")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on replay got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var exc2 domain.PayrollException
+	_ = json.NewDecoder(rr2.Body).Decode(&exc2)
+
+	if exc2.ExceptionID != exc1.ExceptionID {
+		t.Errorf("expected replay to resolve to the original exception %q, got %q", exc1.ExceptionID, exc2.ExceptionID)
+	}
+	if pub.raised != 1 || pub.blockerFlagged != 1 {
+		t.Errorf("expected exactly 1 raised & 1 blockerFlagged event (no re-publish on replay) got raised=%d, blocker=%d", pub.raised, pub.blockerFlagged)
 	}
 }

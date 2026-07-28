@@ -1,10 +1,23 @@
 name: CI
 
+# push on "main" catches direct pushes (rare, but not every change goes
+# through a PR — e.g. an emergency hotfix). Feature branches are covered by
+# pull_request instead of push: once a PR exists, push+pull_request on the
+# same branch would run this entire ~25-service matrix twice for the
+# identical commit, doubling compute cost and doubling exposure to any
+# transient flake (this already caused a false-negative on PR #58's
+# embedded-postgres download step). The concurrency group below is a second
+# layer of protection — if anything still fires twice for the same ref, the
+# older run is cancelled rather than both racing to completion.
 on:
   push:
-    branches: ["main", "feat/**", "fix/**", "chore/**"]
+    branches: ["main"]
   pull_request:
     branches: ["main"]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 defaults:
   run:

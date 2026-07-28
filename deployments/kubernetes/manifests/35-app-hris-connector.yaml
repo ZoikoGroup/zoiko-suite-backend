@@ -1,0 +1,82 @@
+###############################################################################
+# 35-app-hris-connector.yaml
+# Phase 7 — HRIS Connector Service  (port 8146)
+###############################################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hris-connector-svc
+  namespace: zoiko-extensions
+  labels:
+    app: hris-connector-svc
+    phase: "7"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hris-connector-svc
+  template:
+    metadata:
+      labels:
+        app: hris-connector-svc
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: hris-connector-svc
+          image: zoiko/hris-connector-svc:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8146
+          env:
+            - name: PORT
+              value: "8146"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hris-connector-db-secret
+                  key: url
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: KAFKA_EVENTS_TOPIC
+              value: "zoiko.hris.connector.events"
+            - name: AUTHZ_SERVICE_URL
+              value: "http://authorization-svc.zoiko-governance:8081"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8146
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8146
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hris-connector-svc
+  namespace: zoiko-extensions
+spec:
+  selector:
+    app: hris-connector-svc
+  ports:
+    - protocol: TCP
+      port: 8146
+      targetPort: 8146

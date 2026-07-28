@@ -4,12 +4,12 @@ package store_test
 
 import (
 	"context"
-	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
-	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -19,81 +19,42 @@ import (
 	"zoiko.io/accounts-receivable-svc/internal/store"
 )
 
-var (
-	testPool  *pgxpool.Pool
-	testStore *store.PgStore
-)
-
-func TestMain(m *testing.M) {
-	dbPort := uint32(15901 + uint32(os.Getpid()%499))
-	pg := embeddedpostgres.NewDatabase(
-		embeddedpostgres.DefaultConfig().
-			Port(dbPort).
-			Database("ar_isolation_test").
-			Username("postgres").
-			Password("postgres"),
-	)
-	if err := pg.Start(); err != nil {
-		fmt.Printf("failed to start embedded postgres: %v\n", err)
-		os.Exit(1)
+// openTestPool connects to a real Postgres and reapplies the migration from
+// a clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set — same
+// convention as every other service in this platform.
+func openTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
-
-	dsn := fmt.Sprintf(
-		"host=localhost port=%d dbname=ar_isolation_test user=postgres password=postgres sslmode=disable",
-		dbPort,
-	)
 
 	ctx := context.Background()
-	var err error
-	testPool, err = pgxpool.New(ctx, dsn)
+	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
-		fmt.Printf("failed to connect to postgres: %v\n", err)
-		_ = pg.Stop()
-		os.Exit(1)
+		t.Fatalf("failed to connect to postgres: %v", err)
 	}
+	t.Cleanup(pool.Close)
 
-	for i := 0; i < 75; i++ {
-		if err = testPool.Ping(ctx); err == nil {
-			break
+	_, filename, _, _ := runtime.Caller(0)
+	base := filepath.Dir(filename)
+
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS customer_invoices CASCADE;`)
+
+	for _, migration := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_idempotency_index.up.sql",
+	} {
+		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
+		if err != nil {
+			t.Fatalf("failed to read migration %s: %v", migration, err)
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if err != nil {
-		fmt.Printf("postgres did not become ready: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to apply migration %s: %v", migration, err)
+		}
 	}
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		fmt.Printf("failed to read migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
-	}
-	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-		fmt.Printf("failed to apply migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
-	}
-
-	testStore = store.New(testPool, zap.NewNop())
-
-	code := m.Run()
-
-	testPool.Close()
-	_ = pg.Stop()
-	os.Exit(code)
-}
-
-func cleanTable(t *testing.T) {
-	t.Helper()
-	_, err := testPool.Exec(context.Background(), "DELETE FROM customer_invoices;")
-	if err != nil {
-		t.Fatalf("failed to clean customer_invoices: %v", err)
-	}
+	return pool
 }
 
 func newTestInvoice(tenantID string) *domain.CustomerInvoice {
@@ -108,19 +69,19 @@ func newTestInvoice(tenantID string) *domain.CustomerInvoice {
 		DueDate:              time.Now().Add(15 * 24 * time.Hour),
 		Status:               domain.InvoiceStatusIssued,
 		CreatedByPrincipalID: "test-admin",
-		CorrelationID:        "corr-1",
+		CorrelationID:        "corr-" + uuid.New().String(),
 	}
 }
 
 func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
-	cleanTable(t)
-	s := testStore
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
@@ -136,15 +97,59 @@ func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
 	}
 }
 
+// TestPgStore_CreateInvoice_RetriedCorrelationID_IsIdempotent proves the
+// idempotency guarantee against a REAL Postgres unique index — this is the
+// exact scenario a network-timeout-triggered client retry produces, and it
+// must resolve to the original invoice, never a duplicate receivable.
+func TestPgStore_CreateInvoice_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv1 := newTestInvoice(tenantID)
+	inv1.CorrelationID = "corr-retry-1"
+	created1, err := s.CreateInvoice(ctx, inv1)
+	if err != nil {
+		t.Fatalf("first CreateInvoice failed: %v", err)
+	}
+	if !created1 {
+		t.Fatal("expected created=true on the first call")
+	}
+
+	inv2 := newTestInvoice(tenantID)
+	inv2.CorrelationID = "corr-retry-1"
+	created2, err := s.CreateInvoice(ctx, inv2)
+	if err != nil {
+		t.Fatalf("retried CreateInvoice failed: %v", err)
+	}
+	if created2 {
+		t.Fatal("expected created=false on the retried call — this is a duplicate-receivable bug if it's true")
+	}
+	if inv2.InvoiceID != inv1.InvoiceID {
+		t.Fatalf("retried call resolved to a different invoice_id (%s) than the original (%s)", inv2.InvoiceID, inv1.InvoiceID)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM customer_invoices WHERE tenant_id = $1 AND correlation_id = $2`,
+		tenantID, "corr-retry-1").Scan(&count); err != nil {
+		t.Fatalf("count query failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("DUPLICATE RECEIVABLE: expected exactly 1 customer_invoices row for this correlation_id, got %d", count)
+	}
+}
+
 func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
-	cleanTable(t)
-	s := testStore
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
 
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	inv := newTestInvoice(tenantID)
-	if err := s.CreateInvoice(ctx, inv); err != nil {
+	if _, err := s.CreateInvoice(ctx, inv); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 
@@ -161,8 +166,8 @@ func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
 }
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
-	cleanTable(t)
-	s := testStore
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
@@ -170,7 +175,7 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 
 	invA := newTestInvoice(tenantA)
-	if err := s.CreateInvoice(ctxA, invA); err != nil {
+	if _, err := s.CreateInvoice(ctxA, invA); err != nil {
 		t.Fatalf("CreateInvoice (tenant A) failed: %v", err)
 	}
 
@@ -200,15 +205,15 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 }
 
 func TestPgStore_ListInvoices_TenantScoped(t *testing.T) {
-	cleanTable(t)
-	s := testStore
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)
 
 	invA := newTestInvoice(tenantA)
-	if err := s.CreateInvoice(ctxA, invA); err != nil {
+	if _, err := s.CreateInvoice(ctxA, invA); err != nil {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 

@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_statement_lines_tenant_correlation;

@@ -164,11 +164,14 @@ func (h *Handler) ListEmployees(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if legalEntityID != "" {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionEmployeeView); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionEmployeeView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	list, err := h.store.ListEmployees(r.Context(), legalEntityID, status, workerType, departmentID, managerEmployeeID)
@@ -298,6 +301,11 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 
 	if req.Status != "ONBOARDING" && req.Status != "ACTIVE" && req.Status != "SUSPENDED" && req.Status != "TERMINATED" {
 		writeError(w, http.StatusBadRequest, "invalid_status", "status must be ONBOARDING, ACTIVE, SUSPENDED, or TERMINATED")
+		return
+	}
+
+	if req.Status == "TERMINATED" && (req.TerminationDate == nil || *req.TerminationDate == "") {
+		writeError(w, http.StatusBadRequest, "missing_fields", "termination_date is required when status is TERMINATED")
 		return
 	}
 

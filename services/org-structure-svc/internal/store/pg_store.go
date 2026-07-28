@@ -45,22 +45,48 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreateDepartment(ctx context.Context, d *domain.Department) error {
+// CreateDepartment inserts a department.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL department — mutating *d in place — rather than creating a
+// duplicate.
+func (s *PgStore) CreateDepartment(ctx context.Context, d *domain.Department) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO departments (
 				department_id, tenant_id, legal_entity_id, name, code,
-				cost_center_code, parent_department_id, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				cost_center_code, parent_department_id, status, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, d.DepartmentID, tenantID, d.LegalEntityID, d.Name, d.Code,
-			d.CostCenterCode, d.ParentDepartmentID, d.Status, d.CreatedAt, d.UpdatedAt)
-		return err
+			d.CostCenterCode, d.ParentDepartmentID, d.Status, d.CorrelationID, d.CreatedAt, d.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT department_id, legal_entity_id, name, code, cost_center_code,
+				       parent_department_id, status, created_at, updated_at
+				FROM departments WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, d.CorrelationID)
+			if err := row.Scan(
+				&d.DepartmentID, &d.LegalEntityID, &d.Name, &d.Code, &d.CostCenterCode,
+				&d.ParentDepartmentID, &d.Status, &d.CreatedAt, &d.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) ListDepartments(ctx context.Context, legalEntityID string) ([]domain.Department, error) {
@@ -136,22 +162,50 @@ func (s *PgStore) GetDepartment(ctx context.Context, departmentID string) (*doma
 	return &d, nil
 }
 
-func (s *PgStore) CreatePosition(ctx context.Context, p *domain.Position) error {
+// CreatePosition inserts a position.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL position — mutating *p in place — rather than creating a
+// duplicate.
+func (s *PgStore) CreatePosition(ctx context.Context, p *domain.Position) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO positions (
 				position_id, tenant_id, legal_entity_id, department_id, title,
-				code, job_level, max_headcount, current_headcount, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				code, job_level, max_headcount, current_headcount, status, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, p.PositionID, tenantID, p.LegalEntityID, p.DepartmentID, p.Title,
-			p.Code, p.JobLevel, p.MaxHeadcount, p.CurrentHeadcount, p.Status, p.CreatedAt, p.UpdatedAt)
-		return err
+			p.Code, p.JobLevel, p.MaxHeadcount, p.CurrentHeadcount, p.Status, p.CorrelationID, p.CreatedAt, p.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT p.position_id, p.legal_entity_id, p.department_id, d.name, p.title, p.code,
+				       p.job_level, p.max_headcount, p.current_headcount, p.status, p.created_at, p.updated_at
+				FROM positions p
+				JOIN departments d ON p.department_id = d.department_id
+				WHERE p.tenant_id = $1 AND p.correlation_id = $2
+			`, tenantID, p.CorrelationID)
+			if err := row.Scan(
+				&p.PositionID, &p.LegalEntityID, &p.DepartmentID, &p.DepartmentName, &p.Title, &p.Code,
+				&p.JobLevel, &p.MaxHeadcount, &p.CurrentHeadcount, &p.Status, &p.CreatedAt, &p.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) ListPositions(ctx context.Context, departmentID string) ([]domain.Position, error) {
@@ -229,6 +283,12 @@ func (s *PgStore) GetPosition(ctx context.Context, positionID string) (*domain.P
 	return &p, nil
 }
 
+// AssignEmployee supersedes any existing active assignment and creates a
+// new one.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL assignment instead of superseding it again and double-incrementing
+// the position's headcount.
 func (s *PgStore) AssignEmployee(ctx context.Context, req *domain.AssignEmployeeRequest) (*domain.OrgAssignment, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
@@ -240,6 +300,28 @@ func (s *PgStore) AssignEmployee(ctx context.Context, req *domain.AssignEmployee
 	var oa domain.OrgAssignment
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if req.CorrelationID != "" {
+			err := tx.QueryRow(ctx, `
+				SELECT a.assignment_id, a.tenant_id, a.employee_id, a.department_id, d.name, d.legal_entity_id,
+				       a.position_id, p.title, a.manager_employee_id, a.effective_from::text, a.effective_to::text,
+				       a.status, a.correlation_id, a.created_at, a.updated_at
+				FROM org_assignments a
+				JOIN departments d ON a.department_id = d.department_id
+				JOIN positions p ON a.position_id = p.position_id
+				WHERE a.tenant_id = $1 AND a.correlation_id = $2
+			`, tenantID, req.CorrelationID).Scan(
+				&oa.AssignmentID, &oa.TenantID, &oa.EmployeeID, &oa.DepartmentID, &oa.DepartmentName, &oa.LegalEntityID,
+				&oa.PositionID, &oa.PositionTitle, &oa.ManagerEmployeeID, &oa.EffectiveFrom, &oa.EffectiveTo,
+				&oa.Status, &oa.CorrelationID, &oa.CreatedAt, &oa.UpdatedAt,
+			)
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+
 		// 1. End-date existing active assignment
 		_, err := tx.Exec(ctx, `
 			UPDATE org_assignments
@@ -254,10 +336,10 @@ func (s *PgStore) AssignEmployee(ctx context.Context, req *domain.AssignEmployee
 		_, err = tx.Exec(ctx, `
 			INSERT INTO org_assignments (
 				assignment_id, tenant_id, employee_id, department_id, position_id,
-				manager_employee_id, effective_from, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, $8)
+				manager_employee_id, effective_from, status, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'ACTIVE', $8, $9, $9)
 		`, assignmentID, tenantID, req.EmployeeID, req.DepartmentID, req.PositionID,
-			req.ManagerEmployeeID, req.EffectiveFrom, now)
+			req.ManagerEmployeeID, req.EffectiveFrom, req.CorrelationID, now)
 		if err != nil {
 			return err
 		}
@@ -273,17 +355,17 @@ func (s *PgStore) AssignEmployee(ctx context.Context, req *domain.AssignEmployee
 		}
 
 		return tx.QueryRow(ctx, `
-			SELECT a.assignment_id, a.tenant_id, a.employee_id, a.department_id, d.name,
-			       a.position_id, p.title, a.manager_employee_id, a.effective_from, a.effective_to,
-			       a.status, a.created_at, a.updated_at
+			SELECT a.assignment_id, a.tenant_id, a.employee_id, a.department_id, d.name, d.legal_entity_id,
+			       a.position_id, p.title, a.manager_employee_id, a.effective_from::text, a.effective_to::text,
+			       a.status, a.correlation_id, a.created_at, a.updated_at
 			FROM org_assignments a
 			JOIN departments d ON a.department_id = d.department_id
 			JOIN positions p ON a.position_id = p.position_id
 			WHERE a.tenant_id = $1 AND a.assignment_id = $2
 		`, tenantID, assignmentID).Scan(
-			&oa.AssignmentID, &oa.TenantID, &oa.EmployeeID, &oa.DepartmentID, &oa.DepartmentName,
+			&oa.AssignmentID, &oa.TenantID, &oa.EmployeeID, &oa.DepartmentID, &oa.DepartmentName, &oa.LegalEntityID,
 			&oa.PositionID, &oa.PositionTitle, &oa.ManagerEmployeeID, &oa.EffectiveFrom, &oa.EffectiveTo,
-			&oa.Status, &oa.CreatedAt, &oa.UpdatedAt,
+			&oa.Status, &oa.CorrelationID, &oa.CreatedAt, &oa.UpdatedAt,
 		)
 	})
 	if err != nil {
@@ -301,18 +383,18 @@ func (s *PgStore) GetEmployeeAssignment(ctx context.Context, employeeID string) 
 	var oa domain.OrgAssignment
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
-			SELECT a.assignment_id, a.tenant_id, a.employee_id, a.department_id, d.name,
-			       a.position_id, p.title, a.manager_employee_id, a.effective_from, a.effective_to,
-			       a.status, a.created_at, a.updated_at
+			SELECT a.assignment_id, a.tenant_id, a.employee_id, a.department_id, d.name, d.legal_entity_id,
+			       a.position_id, p.title, a.manager_employee_id, a.effective_from::text, a.effective_to::text,
+			       a.status, a.correlation_id, a.created_at, a.updated_at
 			FROM org_assignments a
 			JOIN departments d ON a.department_id = d.department_id
 			JOIN positions p ON a.position_id = p.position_id
 			WHERE a.tenant_id = $1 AND a.employee_id = $2 AND a.status = 'ACTIVE'
 			ORDER BY a.effective_from DESC LIMIT 1
 		`, tenantID, employeeID).Scan(
-			&oa.AssignmentID, &oa.TenantID, &oa.EmployeeID, &oa.DepartmentID, &oa.DepartmentName,
+			&oa.AssignmentID, &oa.TenantID, &oa.EmployeeID, &oa.DepartmentID, &oa.DepartmentName, &oa.LegalEntityID,
 			&oa.PositionID, &oa.PositionTitle, &oa.ManagerEmployeeID, &oa.EffectiveFrom, &oa.EffectiveTo,
-			&oa.Status, &oa.CreatedAt, &oa.UpdatedAt,
+			&oa.Status, &oa.CorrelationID, &oa.CreatedAt, &oa.UpdatedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

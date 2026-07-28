@@ -318,3 +318,44 @@ func TestUpdateStatus_Termination(t *testing.T) {
 		t.Errorf("expected 1 terminated event got %d", pub.terminated)
 	}
 }
+
+func TestUpdateStatus_Terminated_MissingTerminationDate_Rejected(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+
+	rrCreate := doReq(r, http.MethodPost, "/v1/employees/", map[string]any{
+		"legal_entity_id": "le-us",
+		"first_name":      "Jane",
+		"last_name":       "Smith",
+		"email":           "jane.smith2@example.com",
+		"worker_type":     "FULL_TIME",
+		"hire_date":       "2023-05-01",
+	}, "hr-manager")
+	var emp domain.Employee
+	_ = json.NewDecoder(rrCreate.Body).Decode(&emp)
+
+	rrTerm := doReq(r, http.MethodPut, "/v1/employees/"+emp.EmployeeID+"/status", map[string]any{
+		"status": "TERMINATED",
+	}, "hr-manager")
+
+	if rrTerm.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rrTerm.Code, rrTerm.Body.String())
+	}
+}
+
+func TestListEmployees_MissingLegalEntityID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/employees/", nil, "hr-manager")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListEmployees_AuthzDenied_Returns403(t *testing.T) {
+	deniedAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	r := newRouter(newStubStore(), &stubPublisher{}, deniedAuthz)
+	rr := doReq(r, http.MethodGet, "/v1/employees/?legal_entity_id=le-us", nil, "hr-manager")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}

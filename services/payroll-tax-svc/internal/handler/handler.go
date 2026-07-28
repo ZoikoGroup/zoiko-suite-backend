@@ -20,7 +20,7 @@ import (
 type Store interface {
 	CreateProfile(ctx context.Context, p *domain.TaxJurisdictionProfile) error
 	ListProfiles(ctx context.Context, legalEntityID, jurisdictionCode string) ([]domain.TaxJurisdictionProfile, error)
-	CreateCalculationWithAudit(ctx context.Context, calc *domain.TaxCalculationRecord, audit *domain.TaxBasisAudit) error
+	CreateCalculationWithAudit(ctx context.Context, calc *domain.TaxCalculationRecord, audit *domain.TaxBasisAudit) (created bool, err error)
 	GetCalculation(ctx context.Context, calculationID string) (*domain.TaxCalculationRecord, error)
 	ListCalculations(ctx context.Context, payrollRunID, employeeID string) ([]domain.TaxCalculationRecord, error)
 	GetTaxBasisAudit(ctx context.Context, calculationID string) (*domain.TaxBasisAudit, error)
@@ -171,6 +171,10 @@ func (h *Handler) CalculateTax(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "payroll_run_id, employee_id, jurisdiction_code, gross_taxable_amount are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -178,19 +182,9 @@ func (h *Handler) CalculateTax(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
-
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, req.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionTaxCalculate); err != nil {
@@ -236,6 +230,7 @@ func (h *Handler) CalculateTax(w http.ResponseWriter, r *http.Request) {
 		EngineType:            engineType,
 		RuleVersionUsed:       "2026.1",
 		Status:                "CALCULATED",
+		CorrelationID:         req.CorrelationID,
 		CreatedAt:             now,
 	}
 
@@ -248,7 +243,7 @@ func (h *Handler) CalculateTax(w http.ResponseWriter, r *http.Request) {
 
 	providerMetaRaw, _ := json.Marshal(map[string]any{
 		"engine_type":    engineType,
-		"executed_by":   principalID,
+		"executed_by":    principalID,
 		"calculation_id": calcID,
 		"timestamp":      now,
 	})
@@ -263,9 +258,14 @@ func (h *Handler) CalculateTax(w http.ResponseWriter, r *http.Request) {
 		AuditedAt:            now,
 	}
 
-	if err := h.store.CreateCalculationWithAudit(r.Context(), calc, audit); err != nil {
+	created, err := h.store.CreateCalculationWithAudit(r.Context(), calc, audit)
+	if err != nil {
 		h.log.Error("failed to store tax calculation and audit", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, calc)
 		return
 	}
 
@@ -379,13 +379,10 @@ func (h *Handler) AdjustCalculation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	legalEntityID := "GLOBAL"
-	if h.employee != nil {
-		tenantID := svcmiddleware.TenantFromContext(r.Context())
-		emp, _ := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, calc.EmployeeID)
-		if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, calc.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionTaxAdjust); err != nil {
@@ -418,6 +415,33 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// resolveEmployeeEntity confirms an employee exists and returns their real
+// legal entity, to be used as the authorization scope for the action being
+// performed. Fails closed: if employee-master-svc is unreachable or returns
+// anything other than a clean "not found," the request is rejected (503)
+// rather than proceeding under a placeholder entity that authorization
+// would evaluate meaninglessly — prior versions of these call sites either
+// logged a warning and proceeded, or discarded the error entirely.
+func (h *Handler) resolveEmployeeEntity(w http.ResponseWriter, r *http.Request, tenantID, principalID, employeeID string) (string, bool) {
+	if h.employee == nil {
+		return "GLOBAL", true
+	}
+	emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, employeeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrEmployeeNotFound) {
+			writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
+			return "", false
+		}
+		h.log.Error("employee validation failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+		return "", false
+	}
+	if emp == nil || emp.LegalEntityID == "" {
+		return "GLOBAL", true
+	}
+	return emp.LegalEntityID, true
 }
 
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {

@@ -43,24 +43,50 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreatePlan(ctx context.Context, p *domain.BenefitPlan) error {
+// CreatePlan inserts a benefit plan.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to
+// the ORIGINAL plan — mutating *p in place — rather than creating a
+// duplicate.
+func (s *PgStore) CreatePlan(ctx context.Context, p *domain.BenefitPlan) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO benefit_plans (
 				plan_id, tenant_id, legal_entity_id, name, plan_type,
 				provider_name, deduction_tax_treatment, employer_contribution_pct,
-				employee_contribution_amount, currency, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				employee_contribution_amount, currency, status, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, p.PlanID, tenantID, p.LegalEntityID, p.Name, p.PlanType,
 			p.ProviderName, p.DeductionTaxTreatment, p.EmployerContributionPct,
-			p.EmployeeContributionAmount, p.Currency, p.Status, p.CreatedAt, p.UpdatedAt)
-		return err
+			p.EmployeeContributionAmount, p.Currency, p.Status, p.CorrelationID, p.CreatedAt, p.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT plan_id, legal_entity_id, name, plan_type, provider_name, deduction_tax_treatment,
+				       employer_contribution_pct, employee_contribution_amount, currency, status, created_at, updated_at
+				FROM benefit_plans WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, p.CorrelationID)
+			if err := row.Scan(
+				&p.PlanID, &p.LegalEntityID, &p.Name, &p.PlanType, &p.ProviderName, &p.DeductionTaxTreatment,
+				&p.EmployerContributionPct, &p.EmployeeContributionAmount, &p.Currency, &p.Status, &p.CreatedAt, &p.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) ListPlans(ctx context.Context, legalEntityID, status string) ([]domain.BenefitPlan, error) {
@@ -144,24 +170,84 @@ func (s *PgStore) GetPlan(ctx context.Context, planID string) (*domain.BenefitPl
 	return &p, nil
 }
 
-func (s *PgStore) CreateElection(ctx context.Context, e *domain.BenefitElection) error {
+// CreateElection inserts a benefit election in ACTIVE status.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to
+// the ORIGINAL election — mutating *e in place — rather than creating a
+// duplicate enrollment (and duplicate payroll deduction).
+func (s *PgStore) CreateElection(ctx context.Context, e *domain.BenefitElection) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO benefit_elections (
 				election_id, tenant_id, employee_id, plan_id, coverage_level,
 				employee_contribution_amount, employer_contribution_amount,
-				effective_from, effective_to, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				effective_from, effective_to, status, correlation_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, e.ElectionID, tenantID, e.EmployeeID, e.PlanID, e.CoverageLevel,
 			e.EmployeeContributionAmount, e.EmployerContributionAmount,
-			e.EffectiveFrom, e.EffectiveTo, e.Status, e.CreatedAt, e.UpdatedAt)
-		return err
+			e.EffectiveFrom, e.EffectiveTo, e.Status, e.CorrelationID, e.CreatedAt, e.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT election_id, employee_id, plan_id, coverage_level, employee_contribution_amount,
+				       employer_contribution_amount, effective_from::text, effective_to::text, status, created_at, updated_at
+				FROM benefit_elections WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, e.CorrelationID)
+			if err := row.Scan(
+				&e.ElectionID, &e.EmployeeID, &e.PlanID, &e.CoverageLevel, &e.EmployeeContributionAmount,
+				&e.EmployerContributionAmount, &e.EffectiveFrom, &e.EffectiveTo, &e.Status, &e.CreatedAt, &e.UpdatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
+}
+
+// GetElection resolves a benefit election by its primary key — used by
+// the handler to authorize an update/cancel against the election's real
+// employee (and thus legal entity) instead of listing every ACTIVE
+// election in the tenant and scanning for a match in Go, which also
+// crashed outright: the old code passed an empty employeeID into a query
+// that binds it to a UUID NOT NULL column.
+func (s *PgStore) GetElection(ctx context.Context, electionID string) (*domain.BenefitElection, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var e domain.BenefitElection
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT election_id, tenant_id, employee_id, plan_id, coverage_level,
+			       employee_contribution_amount, employer_contribution_amount,
+			       effective_from::text, effective_to::text, status, correlation_id, created_at, updated_at
+			FROM benefit_elections WHERE election_id = $1 AND tenant_id = $2
+		`, electionID, tenantID).Scan(
+			&e.ElectionID, &e.TenantID, &e.EmployeeID, &e.PlanID, &e.CoverageLevel,
+			&e.EmployeeContributionAmount, &e.EmployerContributionAmount,
+			&e.EffectiveFrom, &e.EffectiveTo, &e.Status, &e.CorrelationID, &e.CreatedAt, &e.UpdatedAt,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrElectionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
 }
 
 func (s *PgStore) UpdateElection(ctx context.Context, e *domain.BenefitElection) error {
@@ -227,7 +313,7 @@ func (s *PgStore) ListElectionsByEmployee(ctx context.Context, employeeID, statu
 		query := `
 			SELECT election_id, tenant_id, employee_id, plan_id, coverage_level,
 			       employee_contribution_amount, employer_contribution_amount,
-			       effective_from, effective_to, status, created_at, updated_at
+			       effective_from::text, effective_to::text, status, created_at, updated_at
 			FROM benefit_elections
 			WHERE tenant_id = $1 AND employee_id = $2
 		`

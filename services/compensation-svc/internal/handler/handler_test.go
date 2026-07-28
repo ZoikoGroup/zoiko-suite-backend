@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -20,22 +21,37 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	structures map[string]*domain.CompensationStructure
-	revisions  map[string]*domain.WageRevision
-	bonuses    map[string]*domain.BonusGrant
+	structures      map[string]*domain.CompensationStructure
+	structsByCorr   map[string]string
+	revisions       map[string]*domain.WageRevision
+	revisionsByCorr map[string]string
+	bonuses         map[string]*domain.BonusGrant
+	bonusesByCorr   map[string]string
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		structures: make(map[string]*domain.CompensationStructure),
-		revisions:  make(map[string]*domain.WageRevision),
-		bonuses:    make(map[string]*domain.BonusGrant),
+		structures:      make(map[string]*domain.CompensationStructure),
+		structsByCorr:   make(map[string]string),
+		revisions:       make(map[string]*domain.WageRevision),
+		revisionsByCorr: make(map[string]string),
+		bonuses:         make(map[string]*domain.BonusGrant),
+		bonusesByCorr:   make(map[string]string),
 	}
 }
 
-func (s *stubStore) CreateStructure(_ context.Context, str *domain.CompensationStructure) error {
+func (s *stubStore) CreateStructure(_ context.Context, str *domain.CompensationStructure) (bool, error) {
+	if str.CorrelationID != "" {
+		if existingID, ok := s.structsByCorr[str.CorrelationID]; ok {
+			*str = *s.structures[existingID]
+			return false, nil
+		}
+	}
 	s.structures[str.StructureID] = str
-	return nil
+	if str.CorrelationID != "" {
+		s.structsByCorr[str.CorrelationID] = str.StructureID
+	}
+	return true, nil
 }
 
 func (s *stubStore) ListStructures(_ context.Context, legalEntityID string) ([]domain.CompensationStructure, error) {
@@ -49,7 +65,13 @@ func (s *stubStore) ListStructures(_ context.Context, legalEntityID string) ([]d
 	return out, nil
 }
 
-func (s *stubStore) CreateWageRevision(_ context.Context, rev *domain.WageRevision) error {
+func (s *stubStore) CreateWageRevision(_ context.Context, rev *domain.WageRevision) (bool, error) {
+	if rev.CorrelationID != "" {
+		if existingID, ok := s.revisionsByCorr[rev.CorrelationID]; ok {
+			*rev = *s.revisions[existingID]
+			return false, nil
+		}
+	}
 	for _, r := range s.revisions {
 		if r.EmployeeID == rev.EmployeeID && r.Status == "ACTIVE" {
 			r.Status = "SUPERSEDED"
@@ -57,7 +79,10 @@ func (s *stubStore) CreateWageRevision(_ context.Context, rev *domain.WageRevisi
 		}
 	}
 	s.revisions[rev.RevisionID] = rev
-	return nil
+	if rev.CorrelationID != "" {
+		s.revisionsByCorr[rev.CorrelationID] = rev.RevisionID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetActiveWageRevision(_ context.Context, employeeID string) (*domain.WageRevision, error) {
@@ -79,9 +104,26 @@ func (s *stubStore) GetWageRevisionHistory(_ context.Context, employeeID string)
 	return out, nil
 }
 
-func (s *stubStore) CreateBonusGrant(_ context.Context, b *domain.BonusGrant) error {
+func (s *stubStore) CreateBonusGrant(_ context.Context, b *domain.BonusGrant) (bool, error) {
+	if b.CorrelationID != "" {
+		if existingID, ok := s.bonusesByCorr[b.CorrelationID]; ok {
+			*b = *s.bonuses[existingID]
+			return false, nil
+		}
+	}
 	s.bonuses[b.GrantID] = b
-	return nil
+	if b.CorrelationID != "" {
+		s.bonusesByCorr[b.CorrelationID] = b.GrantID
+	}
+	return true, nil
+}
+
+func (s *stubStore) GetBonusGrant(_ context.Context, grantID string) (*domain.BonusGrant, error) {
+	b, ok := s.bonuses[grantID]
+	if !ok {
+		return nil, domain.ErrBonusNotFound
+	}
+	return b, nil
 }
 
 func (s *stubStore) ApproveBonusGrant(_ context.Context, grantID, approvedBy string) error {
@@ -179,6 +221,7 @@ func TestCreateStructure_MissingPrincipal(t *testing.T) {
 		"min_amount":      80000.0,
 		"max_amount":      130000.0,
 		"currency":        "USD",
+		"correlation_id":  "corr-struct-1",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -196,6 +239,7 @@ func TestCreateStructure_HappyPath(t *testing.T) {
 		"min_amount":      80000.0,
 		"max_amount":      130000.0,
 		"currency":        "USD",
+		"correlation_id":  "corr-struct-2",
 	}, "hr-admin")
 
 	if rr.Code != http.StatusCreated {
@@ -224,6 +268,7 @@ func TestReviseWage_EffectiveDatedLineage(t *testing.T) {
 		"currency":       "USD",
 		"effective_from": "2024-01-01",
 		"reason":         "Initial Hire Rate",
+		"correlation_id": "corr-rev-1",
 	}, "hr-admin")
 
 	if rrRev1.Code != http.StatusCreated {
@@ -241,6 +286,7 @@ func TestReviseWage_EffectiveDatedLineage(t *testing.T) {
 		"currency":       "USD",
 		"effective_from": "2024-07-01",
 		"reason":         "Merit Promotion",
+		"correlation_id": "corr-rev-2",
 	}, "hr-admin")
 
 	if rrRev2.Code != http.StatusCreated {
@@ -277,11 +323,12 @@ func TestGrantAndApproveBonus_Success(t *testing.T) {
 
 	// 1. Grant bonus
 	rrGrant := doReq(r, http.MethodPost, "/v1/compensation/bonuses", map[string]any{
-		"employee_id": "emp-102",
-		"bonus_type":  "PERFORMANCE",
-		"amount":      15000.0,
-		"currency":    "USD",
-		"grant_date":  "2024-12-15",
+		"employee_id":    "emp-102",
+		"bonus_type":     "PERFORMANCE",
+		"amount":         15000.0,
+		"currency":       "USD",
+		"grant_date":     "2024-12-15",
+		"correlation_id": "corr-bonus-1",
 	}, "manager-1")
 
 	if rrGrant.Code != http.StatusCreated {
@@ -311,5 +358,77 @@ func TestGrantAndApproveBonus_Success(t *testing.T) {
 
 	if pub.bonusApproved != 1 {
 		t.Errorf("expected 1 bonusApproved event got %d", pub.bonusApproved)
+	}
+}
+
+// ── Previously-missing authz coverage ──────────────────────────────────────────
+
+// TestGetWageHistory_AuthzDenied_Returns403 proves GetWageHistory now
+// actually calls authz — a prior version returned any authenticated
+// principal's request without ever consulting authorization-svc.
+func TestGetWageHistory_AuthzDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubEmployeeValidator{})
+
+	rr := doReq(r, http.MethodGet, "/v1/compensation/revisions/employee/emp-101", nil, "snoop")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when authz denies, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestGetActiveWage_AuthzDenied_Returns403 — same gap, different endpoint.
+func TestGetActiveWage_AuthzDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubEmployeeValidator{})
+
+	rr := doReq(r, http.MethodGet, "/v1/compensation/revisions/employee/emp-101/active", nil, "snoop")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when authz denies, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestListBonuses_MissingEmployeeID_Rejected proves an unscoped, unauthorized
+// tenant-wide bonus listing is no longer possible — a prior version let any
+// authenticated principal list every bonus grant in the tenant with no
+// authz check at all.
+func TestListBonuses_MissingEmployeeID_Rejected(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	rr := doReq(r, http.MethodGet, "/v1/compensation/bonuses", nil, "snoop")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when employee_id is omitted, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListBonuses_AuthzDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubEmployeeValidator{})
+
+	rr := doReq(r, http.MethodGet, "/v1/compensation/bonuses?employee_id=emp-101", nil, "snoop")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when authz denies, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestReviseWage_EmployeeValidationServiceDown_FailsClosed proves a
+// non-"not found" employee-master-svc error blocks the request (503)
+// instead of proceeding under a placeholder "GLOBAL" entity.
+func TestReviseWage_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{err: fmt.Errorf("employee-master-svc unreachable")})
+
+	rr := doReq(r, http.MethodPost, "/v1/compensation/revisions", map[string]any{
+		"employee_id":    "emp-101",
+		"pay_type":       "SALARY",
+		"amount":         90000.0,
+		"currency":       "USD",
+		"effective_from": "2024-01-01",
+		"reason":         "Initial Hire Rate",
+		"correlation_id": "corr-rev-down-1",
+	}, "hr-admin")
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when employee-master-svc is unreachable, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
