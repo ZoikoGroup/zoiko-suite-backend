@@ -17,10 +17,11 @@ import (
 )
 
 type Store interface {
-	CreatePlan(ctx context.Context, p *domain.BenefitPlan) error
+	CreatePlan(ctx context.Context, p *domain.BenefitPlan) (created bool, err error)
 	ListPlans(ctx context.Context, legalEntityID, status string) ([]domain.BenefitPlan, error)
 	GetPlan(ctx context.Context, planID string) (*domain.BenefitPlan, error)
-	CreateElection(ctx context.Context, e *domain.BenefitElection) error
+	CreateElection(ctx context.Context, e *domain.BenefitElection) (created bool, err error)
+	GetElection(ctx context.Context, electionID string) (*domain.BenefitElection, error)
 	UpdateElection(ctx context.Context, e *domain.BenefitElection) error
 	CancelElection(ctx context.Context, electionID, cancelDate string) error
 	ListElectionsByEmployee(ctx context.Context, employeeID, status string) ([]domain.BenefitElection, error)
@@ -98,6 +99,10 @@ func (h *Handler) CreatePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_tax_treatment", "deduction_tax_treatment must be PRE_TAX or POST_TAX")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -121,24 +126,30 @@ func (h *Handler) CreatePlan(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	now := time.Now().UTC()
 	p := &domain.BenefitPlan{
-		PlanID:                      uuid.NewString(),
-		TenantID:                    tenantID,
-		LegalEntityID:               req.LegalEntityID,
-		Name:                        req.Name,
-		PlanType:                    req.PlanType,
-		ProviderName:                req.ProviderName,
+		PlanID:                     uuid.NewString(),
+		TenantID:                   tenantID,
+		LegalEntityID:              req.LegalEntityID,
+		Name:                       req.Name,
+		PlanType:                   req.PlanType,
+		ProviderName:               req.ProviderName,
 		DeductionTaxTreatment:      req.DeductionTaxTreatment,
 		EmployerContributionPct:    empPct,
 		EmployeeContributionAmount: eeAmt,
-		Currency:                    req.Currency,
-		Status:                      "ACTIVE",
-		CreatedAt:                   now,
-		UpdatedAt:                   now,
+		Currency:                   req.Currency,
+		Status:                     "ACTIVE",
+		CorrelationID:              req.CorrelationID,
+		CreatedAt:                  now,
+		UpdatedAt:                  now,
 	}
 
-	if err := h.store.CreatePlan(r.Context(), p); err != nil {
+	created, err := h.store.CreatePlan(r.Context(), p)
+	if err != nil {
 		h.log.Error("failed to create benefit plan", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, p)
 		return
 	}
 
@@ -189,6 +200,10 @@ func (h *Handler) EnrollBenefit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "employee_id, plan_id, coverage_level, effective_from are required")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -196,19 +211,9 @@ func (h *Handler) EnrollBenefit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
-	legalEntityID := "GLOBAL"
-
-	if h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, req.EmployeeID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, req.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionBenefitsEnroll); err != nil {
@@ -244,17 +249,23 @@ func (h *Handler) EnrollBenefit(w http.ResponseWriter, r *http.Request) {
 		EmployerContributionAmount: erContribution,
 		EffectiveFrom:              req.EffectiveFrom,
 		Status:                     "ACTIVE",
+		CorrelationID:              req.CorrelationID,
 		CreatedAt:                  now,
 		UpdatedAt:                  now,
 	}
 
-	if err := h.store.CreateElection(r.Context(), election); err != nil {
+	created, err := h.store.CreateElection(r.Context(), election)
+	if err != nil {
 		h.log.Error("failed to create benefit election", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
 	correlationID := getCorrelationID(r)
+	if !created {
+		writeJSON(w, http.StatusOK, election)
+		return
+	}
 	h.publisher.PublishBenefitEnrolled(r.Context(), correlationID, *election)
 
 	writeJSON(w, http.StatusCreated, election)
@@ -276,33 +287,25 @@ func (h *Handler) UpdateElection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	elections, err := h.store.ListElectionsByEmployee(r.Context(), "", "ACTIVE")
-	if err != nil {
-		h.log.Error("failed to fetch active election for update", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
-
-	var target *domain.BenefitElection
-	for _, e := range elections {
-		if e.ElectionID == id {
-			target = &e
-			break
-		}
-	}
-
-	if target == nil {
+	target, err := h.store.GetElection(r.Context(), id)
+	if errors.Is(err, domain.ErrElectionNotFound) {
 		writeError(w, http.StatusNotFound, "election_not_found", "")
 		return
 	}
+	if err != nil {
+		h.log.Error("failed to fetch election for update", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if target.Status != "ACTIVE" {
+		writeError(w, http.StatusConflict, "election_not_active", "only an ACTIVE election can be updated")
+		return
+	}
 
-	legalEntityID := "GLOBAL"
-	if h.employee != nil {
-		tenantID := svcmiddleware.TenantFromContext(r.Context())
-		emp, _ := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, target.EmployeeID)
-		if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, target.EmployeeID)
+	if !ok {
+		return
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionBenefitsUpdate); err != nil {
@@ -345,33 +348,21 @@ func (h *Handler) CancelElection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	elections, err := h.store.ListElectionsByEmployee(r.Context(), "", "")
+	target, err := h.store.GetElection(r.Context(), id)
+	if errors.Is(err, domain.ErrElectionNotFound) {
+		writeError(w, http.StatusNotFound, "election_not_found", "")
+		return
+	}
 	if err != nil {
 		h.log.Error("failed to fetch election for cancel", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
 
-	var target *domain.BenefitElection
-	for _, e := range elections {
-		if e.ElectionID == id {
-			target = &e
-			break
-		}
-	}
-
-	if target == nil {
-		writeError(w, http.StatusNotFound, "election_not_found", "")
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	legalEntityID, ok := h.resolveEmployeeEntity(w, r, tenantID, principalID, target.EmployeeID)
+	if !ok {
 		return
-	}
-
-	legalEntityID := "GLOBAL"
-	if h.employee != nil {
-		tenantID := svcmiddleware.TenantFromContext(r.Context())
-		emp, _ := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, target.EmployeeID)
-		if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
-		}
 	}
 
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionBenefitsCancel); err != nil {
@@ -472,6 +463,33 @@ func (h *Handler) GetDeductionSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
+
+// resolveEmployeeEntity confirms an employee exists and returns their real
+// legal entity, to be used as the authorization scope for the action
+// being performed. Fails closed: if employee-master-svc is unreachable or
+// returns anything other than a clean "not found," the request is
+// rejected (503) rather than proceeding under a placeholder entity that
+// authorization would evaluate meaninglessly — a prior version discarded
+// the error entirely on the update/cancel paths.
+func (h *Handler) resolveEmployeeEntity(w http.ResponseWriter, r *http.Request, tenantID, principalID, employeeID string) (string, bool) {
+	if h.employee == nil {
+		return "GLOBAL", true
+	}
+	emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, employeeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrEmployeeNotFound) {
+			writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
+			return "", false
+		}
+		h.log.Error("employee validation failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+		return "", false
+	}
+	if emp == nil || emp.LegalEntityID == "" {
+		return "GLOBAL", true
+	}
+	return emp.LegalEntityID, true
+}
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")

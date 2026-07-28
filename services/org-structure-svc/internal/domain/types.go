@@ -11,6 +11,7 @@ type Department struct {
 	CostCenterCode     string    `json:"cost_center_code"`
 	ParentDepartmentID *string   `json:"parent_department_id,omitempty"`
 	Status             string    `json:"status"` // ACTIVE, INACTIVE
+	CorrelationID      string    `json:"correlation_id"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
@@ -27,24 +28,27 @@ type Position struct {
 	MaxHeadcount     int       `json:"max_headcount"`
 	CurrentHeadcount int       `json:"current_headcount"`
 	Status           string    `json:"status"` // ACTIVE, INACTIVE
+	CorrelationID    string    `json:"correlation_id"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type OrgAssignment struct {
-	AssignmentID      string     `json:"assignment_id"`
-	TenantID          string     `json:"tenant_id"`
-	EmployeeID        string     `json:"employee_id"`
-	DepartmentID      string     `json:"department_id"`
-	DepartmentName    string     `json:"department_name,omitempty"`
-	PositionID        string     `json:"position_id"`
-	PositionTitle     string     `json:"position_title,omitempty"`
-	ManagerEmployeeID *string    `json:"manager_employee_id,omitempty"`
-	EffectiveFrom     string     `json:"effective_from"`
-	EffectiveTo       *string    `json:"effective_to,omitempty"`
-	Status            string     `json:"status"` // ACTIVE, SUPERSEDED
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	AssignmentID      string    `json:"assignment_id"`
+	TenantID          string    `json:"tenant_id"`
+	EmployeeID        string    `json:"employee_id"`
+	DepartmentID      string    `json:"department_id"`
+	DepartmentName    string    `json:"department_name,omitempty"`
+	LegalEntityID     string    `json:"legal_entity_id"`
+	PositionID        string    `json:"position_id"`
+	PositionTitle     string    `json:"position_title,omitempty"`
+	ManagerEmployeeID *string   `json:"manager_employee_id,omitempty"`
+	EffectiveFrom     string    `json:"effective_from"`
+	EffectiveTo       *string   `json:"effective_to,omitempty"`
+	Status            string    `json:"status"` // ACTIVE, SUPERSEDED
+	CorrelationID     string    `json:"correlation_id"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type CreateDepartmentRequest struct {
@@ -53,6 +57,7 @@ type CreateDepartmentRequest struct {
 	Code               string  `json:"code"`
 	CostCenterCode     string  `json:"cost_center_code"`
 	ParentDepartmentID *string `json:"parent_department_id,omitempty"`
+	CorrelationID      string  `json:"correlation_id"`
 }
 
 type CreatePositionRequest struct {
@@ -62,6 +67,7 @@ type CreatePositionRequest struct {
 	Code          string `json:"code"`
 	JobLevel      string `json:"job_level"`
 	MaxHeadcount  int    `json:"max_headcount"`
+	CorrelationID string `json:"correlation_id"`
 }
 
 type AssignEmployeeRequest struct {
@@ -70,6 +76,7 @@ type AssignEmployeeRequest struct {
 	PositionID        string  `json:"position_id"`
 	ManagerEmployeeID *string `json:"manager_employee_id,omitempty"`
 	EffectiveFrom     string  `json:"effective_from"`
+	CorrelationID     string  `json:"correlation_id"`
 }
 
 type errorString string
@@ -80,10 +87,16 @@ var (
 	ErrDepartmentNotFound      = errorString("department not found")
 	ErrPositionNotFound        = errorString("position not found")
 	ErrAssignmentNotFound      = errorString("org assignment not found")
-	ErrEmployeeNotFound       = errorString("employee not found or inactive")
-	ErrManagerNotFound        = errorString("manager employee not found or inactive")
-	ErrAuthorizationDenied    = errorString("authorization denied for org action")
-	ErrAuthzServiceUnavailable= errorString("authorization-svc unavailable")
-	ErrIdentityMissing        = errorString("caller identity missing")
-	ErrStoreUnavailable       = errorString("org structure store unavailable")
+	ErrEmployeeNotFound        = errorString("employee not found or inactive")
+	ErrManagerNotFound         = errorString("manager employee not found or inactive")
+	ErrAuthorizationDenied     = errorString("authorization denied for org action")
+	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
+	ErrIdentityMissing         = errorString("caller identity missing")
+	ErrStoreUnavailable        = errorString("org structure store unavailable")
+
+	// ErrEmployeeValidationFailed means employee-master-svc could not be
+	// reached to confirm the employee's real legal entity — fail closed
+	// rather than proceeding with a placeholder entity that authorization
+	// would evaluate meaninglessly.
+	ErrEmployeeValidationFailed = errorString("failed to verify employee's legal entity: employee-master-svc unavailable")
 )

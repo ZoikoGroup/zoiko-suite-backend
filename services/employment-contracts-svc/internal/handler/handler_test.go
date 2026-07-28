@@ -21,20 +21,31 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	contracts  map[string]*domain.EmploymentContract
-	amendments map[string]*domain.ContractAmendment
+	contracts       map[string]*domain.EmploymentContract
+	contractsByCorr map[string]string
+	amendments      map[string]*domain.ContractAmendment
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		contracts:  make(map[string]*domain.EmploymentContract),
-		amendments: make(map[string]*domain.ContractAmendment),
+		contracts:       make(map[string]*domain.EmploymentContract),
+		contractsByCorr: make(map[string]string),
+		amendments:      make(map[string]*domain.ContractAmendment),
 	}
 }
 
-func (s *stubStore) IssueContract(_ context.Context, c *domain.EmploymentContract) error {
+func (s *stubStore) IssueContract(_ context.Context, c *domain.EmploymentContract) (bool, error) {
+	if c.CorrelationID != "" {
+		if existingID, ok := s.contractsByCorr[c.CorrelationID]; ok {
+			*c = *s.contracts[existingID]
+			return false, nil
+		}
+	}
 	s.contracts[c.ContractID] = c
-	return nil
+	if c.CorrelationID != "" {
+		s.contractsByCorr[c.CorrelationID] = c.ContractID
+	}
+	return true, nil
 }
 
 func (s *stubStore) GetContract(_ context.Context, id string) (*domain.EmploymentContract, error) {
@@ -135,7 +146,7 @@ func (v *stubEmployeeValidator) ValidateEmployee(_ context.Context, _, _, _ stri
 
 // ── router factory ─────────────────────────────────────────────────────────────
 
-func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, empValidator *stubEmployeeValidator) chi.Router {
+func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, empValidator handler.EmployeeValidator) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -176,6 +187,7 @@ func TestIssueContract_MissingPrincipal(t *testing.T) {
 		"currency":           "USD",
 		"pay_frequency":      "MONTHLY",
 		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-missing-principal",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -193,6 +205,7 @@ func TestIssueContract_AuthzDenied(t *testing.T) {
 		"currency":           "USD",
 		"pay_frequency":      "MONTHLY",
 		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-authz-denied",
 	}, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d", rr.Code)
@@ -214,6 +227,7 @@ func TestIssueContract_HappyPath(t *testing.T) {
 		"currency":           "USD",
 		"pay_frequency":      "MONTHLY",
 		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-happy",
 	}, "principal-1")
 
 	if rr.Code != http.StatusCreated {
@@ -257,6 +271,7 @@ func TestAmendContract_AppendOnlyVersionLineage(t *testing.T) {
 		"currency":           "USD",
 		"pay_frequency":      "MONTHLY",
 		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-amend-v1",
 	}, "hr-admin")
 
 	var v1Contract domain.EmploymentContract
@@ -326,6 +341,7 @@ func TestTerminateContract_Success(t *testing.T) {
 		"currency":           "USD",
 		"pay_frequency":      "MONTHLY",
 		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-terminate",
 	}, "hr-admin")
 
 	var c domain.EmploymentContract
@@ -348,5 +364,128 @@ func TestTerminateContract_Success(t *testing.T) {
 	}
 	if pub.terminated != 1 {
 		t.Errorf("expected 1 terminated event got %d", pub.terminated)
+	}
+}
+
+// ── ListContracts Tests ────────────────────────────────────────────────────────
+
+func TestListContracts_MissingLegalEntityID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/contracts/", nil, "hr-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListContracts_AuthzDenied_Returns403(t *testing.T) {
+	deniedAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	r := newRouter(newStubStore(), &stubPublisher{}, deniedAuthz, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/contracts/?legal_entity_id=le-us", nil, "hr-admin")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── IssueContract: fail-closed employee validation & idempotency ──────────────
+
+func TestIssueContract_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	downValidator := &stubEmployeeValidator{err: domain.ErrStoreUnavailable}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, downValidator)
+	rr := doReq(r, http.MethodPost, "/v1/contracts/", map[string]any{
+		"legal_entity_id":    "le-us",
+		"employee_id":        "emp-999",
+		"contract_type":      "FULL_TIME",
+		"title":              "Engineer",
+		"base_salary_amount": 100000.0,
+		"currency":           "USD",
+		"pay_frequency":      "MONTHLY",
+		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-down",
+	}, "hr-admin")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (fail closed) got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+type stubEmployeeValidatorWithEntity struct {
+	legalEntityID string
+}
+
+func (v *stubEmployeeValidatorWithEntity) ValidateEmployee(_ context.Context, _, _, _ string) (*employee.EmployeeResponse, error) {
+	return &employee.EmployeeResponse{Status: "ACTIVE", LegalEntityID: v.legalEntityID}, nil
+}
+
+func TestIssueContract_EmployeeLegalEntityMismatch_Rejected(t *testing.T) {
+	mismatchValidator := &stubEmployeeValidatorWithEntity{legalEntityID: "le-uk"}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, mismatchValidator)
+	rr := doReq(r, http.MethodPost, "/v1/contracts/", map[string]any{
+		"legal_entity_id":    "le-us",
+		"employee_id":        "emp-999",
+		"contract_type":      "FULL_TIME",
+		"title":              "Engineer",
+		"base_salary_amount": 100000.0,
+		"currency":           "USD",
+		"pay_frequency":      "MONTHLY",
+		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-mismatch",
+	}, "hr-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestIssueContract_MissingCorrelationID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodPost, "/v1/contracts/", map[string]any{
+		"legal_entity_id":    "le-us",
+		"employee_id":        "emp-999",
+		"contract_type":      "FULL_TIME",
+		"title":              "Engineer",
+		"base_salary_amount": 100000.0,
+		"currency":           "USD",
+		"pay_frequency":      "MONTHLY",
+		"effective_from":     "2024-01-01",
+	}, "hr-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestIssueContract_RetriedCorrelationID_ReturnsOriginal(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	body := map[string]any{
+		"legal_entity_id":    "le-us",
+		"employee_id":        "emp-999",
+		"contract_type":      "FULL_TIME",
+		"title":              "Engineer",
+		"base_salary_amount": 100000.0,
+		"currency":           "USD",
+		"pay_frequency":      "MONTHLY",
+		"effective_from":     "2024-01-01",
+		"correlation_id":     "corr-contract-retry",
+	}
+
+	rr1 := doReq(r, http.MethodPost, "/v1/contracts/", body, "hr-admin")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var c1 domain.EmploymentContract
+	_ = json.NewDecoder(rr1.Body).Decode(&c1)
+
+	rr2 := doReq(r, http.MethodPost, "/v1/contracts/", body, "hr-admin")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on replay got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var c2 domain.EmploymentContract
+	_ = json.NewDecoder(rr2.Body).Decode(&c2)
+
+	if c2.ContractID != c1.ContractID {
+		t.Errorf("expected replay to resolve to the original contract %q, got %q", c1.ContractID, c2.ContractID)
+	}
+	if pub.issued != 1 {
+		t.Errorf("expected exactly 1 issued event (no re-publish on replay) got %d", pub.issued)
 	}
 }

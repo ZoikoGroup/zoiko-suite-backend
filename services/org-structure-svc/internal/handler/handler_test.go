@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -20,22 +21,37 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	departments map[string]*domain.Department
-	positions   map[string]*domain.Position
-	assignments map[string]*domain.OrgAssignment
+	departments       map[string]*domain.Department
+	departmentsByCorr map[string]string
+	positions         map[string]*domain.Position
+	positionsByCorr   map[string]string
+	assignments       map[string]*domain.OrgAssignment
+	assignmentsByCorr map[string]string
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		departments: make(map[string]*domain.Department),
-		positions:   make(map[string]*domain.Position),
-		assignments: make(map[string]*domain.OrgAssignment),
+		departments:       make(map[string]*domain.Department),
+		departmentsByCorr: make(map[string]string),
+		positions:         make(map[string]*domain.Position),
+		positionsByCorr:   make(map[string]string),
+		assignments:       make(map[string]*domain.OrgAssignment),
+		assignmentsByCorr: make(map[string]string),
 	}
 }
 
-func (s *stubStore) CreateDepartment(_ context.Context, d *domain.Department) error {
+func (s *stubStore) CreateDepartment(_ context.Context, d *domain.Department) (bool, error) {
+	if d.CorrelationID != "" {
+		if existingID, ok := s.departmentsByCorr[d.CorrelationID]; ok {
+			*d = *s.departments[existingID]
+			return false, nil
+		}
+	}
 	s.departments[d.DepartmentID] = d
-	return nil
+	if d.CorrelationID != "" {
+		s.departmentsByCorr[d.CorrelationID] = d.DepartmentID
+	}
+	return true, nil
 }
 
 func (s *stubStore) ListDepartments(_ context.Context, legalEntityID string) ([]domain.Department, error) {
@@ -57,9 +73,18 @@ func (s *stubStore) GetDepartment(_ context.Context, id string) (*domain.Departm
 	return d, nil
 }
 
-func (s *stubStore) CreatePosition(_ context.Context, p *domain.Position) error {
+func (s *stubStore) CreatePosition(_ context.Context, p *domain.Position) (bool, error) {
+	if p.CorrelationID != "" {
+		if existingID, ok := s.positionsByCorr[p.CorrelationID]; ok {
+			*p = *s.positions[existingID]
+			return false, nil
+		}
+	}
 	s.positions[p.PositionID] = p
-	return nil
+	if p.CorrelationID != "" {
+		s.positionsByCorr[p.CorrelationID] = p.PositionID
+	}
+	return true, nil
 }
 
 func (s *stubStore) ListPositions(_ context.Context, departmentID string) ([]domain.Position, error) {
@@ -82,17 +107,37 @@ func (s *stubStore) GetPosition(_ context.Context, id string) (*domain.Position,
 }
 
 func (s *stubStore) AssignEmployee(_ context.Context, req *domain.AssignEmployeeRequest) (*domain.OrgAssignment, error) {
+	if req.CorrelationID != "" {
+		if existingID, ok := s.assignmentsByCorr[req.CorrelationID]; ok {
+			for _, oa := range s.assignments {
+				if oa.AssignmentID == existingID {
+					return oa, nil
+				}
+			}
+		}
+	}
+
+	legalEntityID := ""
+	if dept, ok := s.departments[req.DepartmentID]; ok {
+		legalEntityID = dept.LegalEntityID
+	}
+
 	oa := &domain.OrgAssignment{
-		AssignmentID:      "assign-1",
+		AssignmentID:      fmt.Sprintf("assign-%d", len(s.assignments)+1),
 		TenantID:          "tenant-abc",
 		EmployeeID:        req.EmployeeID,
 		DepartmentID:      req.DepartmentID,
+		LegalEntityID:     legalEntityID,
 		PositionID:        req.PositionID,
 		ManagerEmployeeID: req.ManagerEmployeeID,
 		EffectiveFrom:     req.EffectiveFrom,
 		Status:            "ACTIVE",
+		CorrelationID:     req.CorrelationID,
 	}
 	s.assignments[req.EmployeeID] = oa
+	if req.CorrelationID != "" {
+		s.assignmentsByCorr[req.CorrelationID] = oa.AssignmentID
+	}
 	return oa, nil
 }
 
@@ -170,6 +215,7 @@ func TestCreateDepartment_MissingPrincipal(t *testing.T) {
 		"name":             "Engineering",
 		"code":             "ENG",
 		"cost_center_code": "CC-101",
+		"correlation_id":   "corr-dept-missing-principal",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -187,6 +233,7 @@ func TestOrgStructureLifecycle(t *testing.T) {
 		"name":             "Engineering",
 		"code":             "ENG",
 		"cost_center_code": "CC-101",
+		"correlation_id":   "corr-dept-lifecycle",
 	}, "hr-admin")
 
 	if rrDept.Code != http.StatusCreated {
@@ -207,6 +254,7 @@ func TestOrgStructureLifecycle(t *testing.T) {
 		"code":            "ENG-SR-BE",
 		"job_level":       "L5",
 		"max_headcount":   5,
+		"correlation_id":  "corr-pos-lifecycle",
 	}, "hr-admin")
 
 	if rrPos.Code != http.StatusCreated {
@@ -227,6 +275,7 @@ func TestOrgStructureLifecycle(t *testing.T) {
 		"position_id":         pos.PositionID,
 		"manager_employee_id": &mgrID,
 		"effective_from":      "2024-01-01",
+		"correlation_id":      "corr-assign-lifecycle",
 	}, "hr-admin")
 
 	if rrAssign.Code != http.StatusCreated {
@@ -234,5 +283,137 @@ func TestOrgStructureLifecycle(t *testing.T) {
 	}
 	if pub.empAssigned != 1 {
 		t.Errorf("expected 1 empAssigned event got %d", pub.empAssigned)
+	}
+}
+
+// ── Authz coverage on view endpoints ────────────────────────────────────────────
+
+func TestListDepartments_MissingLegalEntityID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/org/departments", nil, "hr-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListDepartments_AuthzDenied_Returns403(t *testing.T) {
+	deniedAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	r := newRouter(newStubStore(), &stubPublisher{}, deniedAuthz, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/org/departments?legal_entity_id=le-us", nil, "hr-admin")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListPositions_MissingDepartmentID_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/org/positions", nil, "hr-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListPositions_AuthzDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	s.departments["dept-1"] = &domain.Department{DepartmentID: "dept-1", LegalEntityID: "le-us", Name: "Eng"}
+	deniedAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	r := newRouter(s, &stubPublisher{}, deniedAuthz, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/org/positions?department_id=dept-1", nil, "hr-admin")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetPosition_AuthzDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	s.positions["pos-1"] = &domain.Position{PositionID: "pos-1", LegalEntityID: "le-us", DepartmentID: "dept-1", Title: "Engineer"}
+	deniedAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	r := newRouter(s, &stubPublisher{}, deniedAuthz, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/org/positions/pos-1", nil, "hr-admin")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetEmployeeAssignment_AuthzDenied_Returns403(t *testing.T) {
+	s := newStubStore()
+	s.departments["dept-1"] = &domain.Department{DepartmentID: "dept-1", LegalEntityID: "le-us", Name: "Eng"}
+	s.assignments["emp-501"] = &domain.OrgAssignment{
+		AssignmentID: "assign-1", EmployeeID: "emp-501", DepartmentID: "dept-1", LegalEntityID: "le-us", Status: "ACTIVE",
+	}
+	deniedAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	r := newRouter(s, &stubPublisher{}, deniedAuthz, &stubEmployeeValidator{})
+	rr := doReq(r, http.MethodGet, "/v1/org/assignments/employee/emp-501", nil, "hr-admin")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── AssignEmployee: fail-closed validation & idempotency ───────────────────────
+
+func TestAssignEmployee_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	downValidator := &stubEmployeeValidator{err: domain.ErrStoreUnavailable}
+	s := newStubStore()
+	s.departments["dept-1"] = &domain.Department{DepartmentID: "dept-1", LegalEntityID: "le-us", Name: "Eng"}
+	s.positions["pos-1"] = &domain.Position{PositionID: "pos-1", LegalEntityID: "le-us", DepartmentID: "dept-1", Title: "Engineer"}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, downValidator)
+
+	rr := doReq(r, http.MethodPost, "/v1/org/assignments", map[string]any{
+		"employee_id":    "emp-999",
+		"department_id":  "dept-1",
+		"position_id":    "pos-1",
+		"effective_from": "2024-01-01",
+		"correlation_id": "corr-assign-down",
+	}, "hr-admin")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (fail closed) got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestAssignEmployee_MissingCorrelationID_Rejected(t *testing.T) {
+	s := newStubStore()
+	s.departments["dept-1"] = &domain.Department{DepartmentID: "dept-1", LegalEntityID: "le-us", Name: "Eng"}
+	s.positions["pos-1"] = &domain.Position{PositionID: "pos-1", LegalEntityID: "le-us", DepartmentID: "dept-1", Title: "Engineer"}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	rr := doReq(r, http.MethodPost, "/v1/org/assignments", map[string]any{
+		"employee_id":    "emp-999",
+		"department_id":  "dept-1",
+		"position_id":    "pos-1",
+		"effective_from": "2024-01-01",
+	}, "hr-admin")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCreateDepartment_Idempotent_ReplayReturns200(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	body := map[string]any{
+		"legal_entity_id":  "le-us",
+		"name":             "Engineering",
+		"code":             "ENG",
+		"cost_center_code": "CC-101",
+		"correlation_id":   "corr-dept-replay",
+	}
+
+	rr1 := doReq(r, http.MethodPost, "/v1/org/departments", body, "hr-admin")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var d1 domain.Department
+	_ = json.NewDecoder(rr1.Body).Decode(&d1)
+
+	rr2 := doReq(r, http.MethodPost, "/v1/org/departments", body, "hr-admin")
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on replay got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var d2 domain.Department
+	_ = json.NewDecoder(rr2.Body).Decode(&d2)
+
+	if d2.DepartmentID != d1.DepartmentID {
+		t.Errorf("expected replay to resolve to the original department %q, got %q", d1.DepartmentID, d2.DepartmentID)
 	}
 }

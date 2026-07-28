@@ -15,8 +15,8 @@ type TaxJurisdictionProfile struct {
 }
 
 type TaxComponent struct {
-	TaxName   string  `json:"tax_name"`   // e.g. Income Tax, Social Insurance, Medicare
-	TaxType   string  `json:"tax_type"`   // STATE, FEDERAL, LOCAL, SOCIAL
+	TaxName   string  `json:"tax_name"` // e.g. Income Tax, Social Insurance, Medicare
+	TaxType   string  `json:"tax_type"` // STATE, FEDERAL, LOCAL, SOCIAL
 	RatePct   float64 `json:"rate_pct"`
 	TaxAmount float64 `json:"tax_amount"`
 }
@@ -35,6 +35,7 @@ type TaxCalculationRecord struct {
 	EngineType            string         `json:"engine_type"`
 	RuleVersionUsed       string         `json:"rule_version_used"`
 	Status                string         `json:"status"` // CALCULATED, AUDITED, ADJUSTED
+	CorrelationID         string         `json:"correlation_id"`
 	CreatedAt             time.Time      `json:"created_at"`
 }
 
@@ -62,12 +63,13 @@ type CalculateTaxRequest struct {
 	GrossTaxableAmount    float64 `json:"gross_taxable_amount"`
 	PreTaxDeductionAmount float64 `json:"pre_tax_deduction_amount"`
 	Currency              string  `json:"currency"`
+	CorrelationID         string  `json:"correlation_id"`
 }
 
 type AdjustTaxRequest struct {
-	NewTaxBreakdown  []TaxComponent `json:"new_tax_breakdown"`
-	NewTotalTaxAmount float64       `json:"new_total_tax_amount"`
-	Reason           string         `json:"reason"`
+	NewTaxBreakdown   []TaxComponent `json:"new_tax_breakdown"`
+	NewTotalTaxAmount float64        `json:"new_total_tax_amount"`
+	Reason            string         `json:"reason"`
 }
 
 type errorString string
@@ -83,4 +85,10 @@ var (
 	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
 	ErrIdentityMissing         = errorString("caller identity missing")
 	ErrStoreUnavailable        = errorString("payroll tax store unavailable")
+
+	// ErrEmployeeValidationFailed means employee-master-svc could not be
+	// reached to confirm the employee's real legal entity — fail closed
+	// rather than proceeding with a placeholder entity that authorization
+	// would evaluate meaninglessly.
+	ErrEmployeeValidationFailed = errorString("failed to verify employee's legal entity: employee-master-svc unavailable")
 )

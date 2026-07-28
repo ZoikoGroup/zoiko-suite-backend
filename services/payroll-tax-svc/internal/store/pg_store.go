@@ -112,28 +112,59 @@ func (s *PgStore) ListProfiles(ctx context.Context, legalEntityID, jurisdictionC
 	return out, nil
 }
 
-func (s *PgStore) CreateCalculationWithAudit(ctx context.Context, calc *domain.TaxCalculationRecord, audit *domain.TaxBasisAudit) error {
+// CreateCalculationWithAudit inserts a tax calculation record and its audit
+// log.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL calculation — mutating *calc in place — rather than creating a
+// duplicate calculation and a duplicate audit entry.
+func (s *PgStore) CreateCalculationWithAudit(ctx context.Context, calc *domain.TaxCalculationRecord, audit *domain.TaxBasisAudit) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
 	breakdownRaw, err := json.Marshal(calc.TaxBreakdown)
 	if err != nil {
-		return fmt.Errorf("marshal tax breakdown: %w", err)
+		return false, fmt.Errorf("marshal tax breakdown: %w", err)
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if calc.CorrelationID != "" {
+			var existingRaw []byte
+			row := tx.QueryRow(ctx, `
+				SELECT calculation_id, payroll_run_id, employee_id, jurisdiction_code,
+				       gross_taxable_amount, pre_tax_deduction_amount, taxable_basis, total_tax_amount,
+				       tax_breakdown, engine_type, rule_version_used, status, created_at
+				FROM tax_calculation_records WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, calc.CorrelationID)
+			err := row.Scan(
+				&calc.CalculationID, &calc.PayrollRunID, &calc.EmployeeID, &calc.JurisdictionCode,
+				&calc.GrossTaxableAmount, &calc.PreTaxDeductionAmount, &calc.TaxableBasis, &calc.TotalTaxAmount,
+				&existingRaw, &calc.EngineType, &calc.RuleVersionUsed, &calc.Status, &calc.CreatedAt,
+			)
+			if err == nil {
+				if err := json.Unmarshal(existingRaw, &calc.TaxBreakdown); err != nil {
+					return fmt.Errorf("unmarshal tax breakdown: %w", err)
+				}
+				created = false
+				return nil
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+
 		// 1. Insert calculation record
 		_, err := tx.Exec(ctx, `
 			INSERT INTO tax_calculation_records (
 				calculation_id, tenant_id, payroll_run_id, employee_id, jurisdiction_code,
 				gross_taxable_amount, pre_tax_deduction_amount, taxable_basis, total_tax_amount,
-				tax_breakdown, engine_type, rule_version_used, status, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+				tax_breakdown, engine_type, rule_version_used, status, correlation_id, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		`, calc.CalculationID, tenantID, calc.PayrollRunID, calc.EmployeeID, calc.JurisdictionCode,
 			calc.GrossTaxableAmount, calc.PreTaxDeductionAmount, calc.TaxableBasis, calc.TotalTaxAmount,
-			breakdownRaw, calc.EngineType, calc.RuleVersionUsed, calc.Status, calc.CreatedAt)
+			breakdownRaw, calc.EngineType, calc.RuleVersionUsed, calc.Status, calc.CorrelationID, calc.CreatedAt)
 		if err != nil {
 			return err
 		}
@@ -146,8 +177,13 @@ func (s *PgStore) CreateCalculationWithAudit(ctx context.Context, calc *domain.T
 			) VALUES ($1, $2, $3, $4, $5, $6, $7)
 		`, audit.AuditID, tenantID, audit.CalculationID, audit.EmployeeID,
 			audit.RuleBasisJSON, audit.ProviderMetadataJSON, audit.AuditedAt)
-		return err
+		if err != nil {
+			return err
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) GetCalculation(ctx context.Context, calculationID string) (*domain.TaxCalculationRecord, error) {

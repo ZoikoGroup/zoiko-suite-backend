@@ -164,6 +164,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employee_master" -
 # Apply migrations for employment-contracts-svc
 echo "Applying migrations for employment_contracts..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contracts" -f /migrations/employment-contracts/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contracts" -f /migrations/employment-contracts/000002_add_idempotency.up.sql
 
 # Apply migrations for payroll-run-svc
 echo "Applying migrations for payroll_run..."
@@ -173,26 +174,32 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /m
 # Apply migrations for compensation-svc
 echo "Applying migrations for compensation..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "compensation" -f /migrations/compensation/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "compensation" -f /migrations/compensation/000002_fix_race_and_idempotency.up.sql
 
 # Apply migrations for benefits-svc
 echo "Applying migrations for benefits..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "benefits" -f /migrations/benefits/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "benefits" -f /migrations/benefits/000002_fix_lookup_and_idempotency.up.sql
 
 # Apply migrations for payroll-tax-svc
 echo "Applying migrations for payroll_tax..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_tax" -f /migrations/payroll-tax/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_tax" -f /migrations/payroll-tax/000002_add_idempotency.up.sql
 
 # Apply migrations for payroll-exceptions-svc
 echo "Applying migrations for payroll_exceptions..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_exceptions" -f /migrations/payroll-exceptions/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_exceptions" -f /migrations/payroll-exceptions/000002_add_idempotency.up.sql
 
 # Apply migrations for leave-absence-svc
 echo "Applying migrations for leave_absence..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f /migrations/leave-absence/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f /migrations/leave-absence/000002_fix_race_and_idempotency.up.sql
 
 # Apply migrations for org-structure-svc
 echo "Applying migrations for org_structure..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f /migrations/org-structure/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f /migrations/org-structure/000002_add_idempotency.up.sql
 
 # Apply migrations for offboarding-severance-svc
 echo "Applying migrations for offboarding_severance..."
@@ -203,6 +210,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severa
 echo "Applying migrations for workforce_compliance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000002_fix_tenant_isolation_and_idempotency.up.sql
+fix/workforce-engine-critical-bugs
+
 
 # ── Phase 5 ─────────────────────────────────────────────────────────────────
 
@@ -305,5 +314,6 @@ EOSQL
 # Apply migrations for corporate-tax-svc
 echo "Applying migrations for corporate_tax..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_tax" -f /migrations/corporate-tax/000001_initial_schema.up.sql
+ main
 
 echo "All migrations applied successfully."

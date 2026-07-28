@@ -44,10 +44,15 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreateException(ctx context.Context, e *domain.PayrollException) error {
+// CreateException inserts a payroll exception.
+//
+// Idempotent on (tenant_id, correlation_id): a retried call resolves to the
+// ORIGINAL exception — mutating *e in place — rather than creating a
+// duplicate exception and re-flagging a blocker that's already open.
+func (s *PgStore) CreateException(ctx context.Context, e *domain.PayrollException) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return false, domain.ErrIdentityMissing
 	}
 
 	details := e.DetailsJSON
@@ -55,16 +60,37 @@ func (s *PgStore) CreateException(ctx context.Context, e *domain.PayrollExceptio
 		details = "{}"
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 			INSERT INTO payroll_exceptions (
 				exception_id, tenant_id, payroll_run_id, employee_id, exception_code,
-				severity, description, details_json, status, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				severity, description, details_json, status, correlation_id, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, e.ExceptionID, tenantID, e.PayrollRunID, e.EmployeeID, e.ExceptionCode,
-			e.Severity, e.Description, details, e.Status, e.CreatedAt)
-		return err
+			e.Severity, e.Description, details, e.Status, e.CorrelationID, e.CreatedAt)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			row := tx.QueryRow(ctx, `
+				SELECT exception_id, payroll_run_id, employee_id, exception_code, severity,
+				       description, details_json, status, resolution_notes, resolved_by, resolved_at, created_at
+				FROM payroll_exceptions WHERE tenant_id = $1 AND correlation_id = $2
+			`, tenantID, e.CorrelationID)
+			if err := row.Scan(
+				&e.ExceptionID, &e.PayrollRunID, &e.EmployeeID, &e.ExceptionCode, &e.Severity,
+				&e.Description, &e.DetailsJSON, &e.Status, &e.ResolutionNotes, &e.ResolvedBy, &e.ResolvedAt, &e.CreatedAt,
+			); err != nil {
+				return err
+			}
+			created = false
+			return nil
+		}
+		created = true
+		return nil
 	})
+	return created, err
 }
 
 func (s *PgStore) GetException(ctx context.Context, exceptionID string) (*domain.PayrollException, error) {

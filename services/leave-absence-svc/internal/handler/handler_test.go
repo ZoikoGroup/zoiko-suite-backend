@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -86,6 +87,14 @@ func (s *stubStore) AccrueLeaveBalance(_ context.Context, employeeID, leaveTypeI
 }
 
 func (s *stubStore) SubmitLeaveRequest(_ context.Context, req *domain.SubmitLeaveRequest) (*domain.LeaveRequest, error) {
+	if req.CorrelationID != "" {
+		for _, existing := range s.requests {
+			if existing.CorrelationID == req.CorrelationID {
+				return existing, nil
+			}
+		}
+	}
+
 	key := req.EmployeeID + ":" + req.LeaveTypeID
 	b, ok := s.balances[key]
 	if !ok || (b.AllocatedHours-b.UsedHours-b.PendingHours) < req.TotalHours {
@@ -96,7 +105,7 @@ func (s *stubStore) SubmitLeaveRequest(_ context.Context, req *domain.SubmitLeav
 	b.AvailableHours = b.AllocatedHours - b.UsedHours - b.PendingHours
 
 	lr := &domain.LeaveRequest{
-		RequestID:     "req-101",
+		RequestID:     fmt.Sprintf("req-%d", len(s.requests)+1),
 		TenantID:      "tenant-abc",
 		EmployeeID:    req.EmployeeID,
 		LeaveTypeID:   req.LeaveTypeID,
@@ -105,6 +114,7 @@ func (s *stubStore) SubmitLeaveRequest(_ context.Context, req *domain.SubmitLeav
 		TotalHours:    req.TotalHours,
 		Reason:        req.Reason,
 		Status:        "SUBMITTED",
+		CorrelationID: req.CorrelationID,
 	}
 	s.requests[lr.RequestID] = lr
 	return lr, nil
@@ -276,12 +286,13 @@ func TestLeaveAccrualAndRequestLifecycle(t *testing.T) {
 
 	// 3. Submit leave request for 40 hours
 	rrSub := doReq(r, http.MethodPost, "/v1/leave/requests", map[string]any{
-		"employee_id":   "emp-501",
-		"leave_type_id": lt.LeaveTypeID,
-		"start_date":    "2024-08-01",
-		"end_date":      "2024-08-05",
-		"total_hours":   40.0,
-		"reason":        "Summer Vacation",
+		"employee_id":    "emp-501",
+		"leave_type_id":  lt.LeaveTypeID,
+		"start_date":     "2024-08-01",
+		"end_date":       "2024-08-05",
+		"total_hours":    40.0,
+		"reason":         "Summer Vacation",
+		"correlation_id": "corr-leave-request-1",
 	}, "emp-501")
 
 	if rrSub.Code != http.StatusCreated {
@@ -304,5 +315,106 @@ func TestLeaveAccrualAndRequestLifecycle(t *testing.T) {
 	}
 	if pub.approved != 1 {
 		t.Errorf("expected 1 approved event got %d", pub.approved)
+	}
+}
+
+func TestSubmitLeaveRequest_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	downValidator := &stubEmployeeValidator{err: domain.ErrStoreUnavailable}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, downValidator)
+
+	rr := doReq(r, http.MethodPost, "/v1/leave/requests", map[string]any{
+		"employee_id":    "emp-501",
+		"leave_type_id":  "lt-1",
+		"start_date":     "2024-08-01",
+		"end_date":       "2024-08-05",
+		"total_hours":    40.0,
+		"correlation_id": "corr-leave-request-down",
+	}, "emp-501")
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (fail closed) got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSubmitLeaveRequest_MissingCorrelationID_Rejected(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	rr := doReq(r, http.MethodPost, "/v1/leave/requests", map[string]any{
+		"employee_id":   "emp-501",
+		"leave_type_id": "lt-1",
+		"start_date":    "2024-08-01",
+		"end_date":      "2024-08-05",
+		"total_hours":   40.0,
+	}, "emp-501")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestApproveLeaveRequest_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
+	s := newStubStore()
+
+	s.balances["emp-501:lt-1"] = &domain.LeaveBalance{
+		BalanceID: "bal-1", TenantID: "tenant-abc", EmployeeID: "emp-501", LeaveTypeID: "lt-1", AllocatedHours: 80,
+	}
+	s.requests["req-existing"] = &domain.LeaveRequest{
+		RequestID: "req-existing", TenantID: "tenant-abc", EmployeeID: "emp-501", LeaveTypeID: "lt-1",
+		StartDate: "2024-08-01", EndDate: "2024-08-05", TotalHours: 40, Status: "SUBMITTED",
+	}
+
+	downValidator := &stubEmployeeValidator{err: domain.ErrStoreUnavailable}
+	rDown := newRouter(s, &stubPublisher{}, &stubAuthZ{}, downValidator)
+
+	rr := doReq(rDown, http.MethodPost, "/v1/leave/requests/req-existing/approve", map[string]any{
+		"reviewer_notes": "Approved",
+	}, "manager-1")
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 (fail closed) got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSubmitLeaveRequest_RetriedCorrelationID_ReturnsOriginal(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeValidator{})
+
+	s.balances["emp-501:lt-1"] = &domain.LeaveBalance{
+		BalanceID: "bal-1", TenantID: "tenant-abc", EmployeeID: "emp-501", LeaveTypeID: "lt-1", AllocatedHours: 80,
+	}
+
+	body := map[string]any{
+		"employee_id":    "emp-501",
+		"leave_type_id":  "lt-1",
+		"start_date":     "2024-08-01",
+		"end_date":       "2024-08-05",
+		"total_hours":    40.0,
+		"correlation_id": "corr-leave-retry",
+	}
+
+	rr1 := doReq(r, http.MethodPost, "/v1/leave/requests", body, "emp-501")
+	if rr1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr1.Code, rr1.Body.String())
+	}
+	var lr1 domain.LeaveRequest
+	_ = json.NewDecoder(rr1.Body).Decode(&lr1)
+
+	rr2 := doReq(r, http.MethodPost, "/v1/leave/requests", body, "emp-501")
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on replay got %d: %s", rr2.Code, rr2.Body.String())
+	}
+	var lr2 domain.LeaveRequest
+	_ = json.NewDecoder(rr2.Body).Decode(&lr2)
+
+	if lr2.RequestID != lr1.RequestID {
+		t.Errorf("expected replay to resolve to the original request %q, got %q", lr1.RequestID, lr2.RequestID)
+	}
+
+	bal := s.balances["emp-501:lt-1"]
+	if bal.PendingHours != 40.0 {
+		t.Errorf("expected pending_hours to be locked exactly once (40.0), got %f — replay must not double-lock", bal.PendingHours)
 	}
 }

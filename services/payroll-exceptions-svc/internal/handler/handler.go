@@ -17,7 +17,7 @@ import (
 )
 
 type Store interface {
-	CreateException(ctx context.Context, e *domain.PayrollException) error
+	CreateException(ctx context.Context, e *domain.PayrollException) (created bool, err error)
 	GetException(ctx context.Context, exceptionID string) (*domain.PayrollException, error)
 	ListExceptions(ctx context.Context, payrollRunID, employeeID, status, severity string) ([]domain.PayrollException, error)
 	ResolveException(ctx context.Context, exceptionID, notes, resolvedBy, newStatus string) error
@@ -92,6 +92,10 @@ func (h *Handler) RaiseException(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_severity", "severity must be BLOCKER, CRITICAL, or WARNING")
 		return
 	}
+	if req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "correlation_id is required")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -101,16 +105,11 @@ func (h *Handler) RaiseException(w http.ResponseWriter, r *http.Request) {
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	legalEntityID := "GLOBAL"
 
-	if req.EmployeeID != nil && *req.EmployeeID != "" && h.employee != nil {
-		emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, *req.EmployeeID)
-		if err != nil {
-			if errors.Is(err, domain.ErrEmployeeNotFound) {
-				writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
-				return
-			}
-			h.log.Warn("employee validation call failed, proceeding", zap.Error(err))
-		} else if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
+	if req.EmployeeID != nil && *req.EmployeeID != "" {
+		var resolveOK bool
+		legalEntityID, resolveOK = h.resolveEmployeeEntity(w, r, tenantID, principalID, *req.EmployeeID)
+		if !resolveOK {
+			return
 		}
 	}
 
@@ -134,12 +133,18 @@ func (h *Handler) RaiseException(w http.ResponseWriter, r *http.Request) {
 		Description:   req.Description,
 		DetailsJSON:   details,
 		Status:        "OPEN",
+		CorrelationID: req.CorrelationID,
 		CreatedAt:     time.Now().UTC(),
 	}
 
-	if err := h.store.CreateException(r.Context(), exc); err != nil {
+	created, err := h.store.CreateException(r.Context(), exc)
+	if err != nil {
 		h.log.Error("failed to create exception", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if !created {
+		writeJSON(w, http.StatusOK, exc)
 		return
 	}
 
@@ -246,11 +251,12 @@ func (h *Handler) handleExceptionResolution(w http.ResponseWriter, r *http.Reque
 	}
 
 	legalEntityID := "GLOBAL"
-	if exc.EmployeeID != nil && *exc.EmployeeID != "" && h.employee != nil {
+	if exc.EmployeeID != nil && *exc.EmployeeID != "" {
 		tenantID := svcmiddleware.TenantFromContext(r.Context())
-		emp, _ := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, *exc.EmployeeID)
-		if emp != nil && emp.LegalEntityID != "" {
-			legalEntityID = emp.LegalEntityID
+		var resolveOK bool
+		legalEntityID, resolveOK = h.resolveEmployeeEntity(w, r, tenantID, principalID, *exc.EmployeeID)
+		if !resolveOK {
+			return
 		}
 	}
 
@@ -310,6 +316,33 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// resolveEmployeeEntity confirms an employee exists and returns their real
+// legal entity, to be used as the authorization scope for the action being
+// performed. Fails closed: if employee-master-svc is unreachable or returns
+// anything other than a clean "not found," the request is rejected (503)
+// rather than proceeding under a placeholder entity that authorization
+// would evaluate meaninglessly — prior versions of these call sites either
+// logged a warning and proceeded, or discarded the error entirely.
+func (h *Handler) resolveEmployeeEntity(w http.ResponseWriter, r *http.Request, tenantID, principalID, employeeID string) (string, bool) {
+	if h.employee == nil {
+		return "GLOBAL", true
+	}
+	emp, err := h.employee.ValidateEmployee(r.Context(), tenantID, principalID, employeeID)
+	if err != nil {
+		if errors.Is(err, domain.ErrEmployeeNotFound) {
+			writeError(w, http.StatusBadRequest, "employee_invalid", err.Error())
+			return "", false
+		}
+		h.log.Error("employee validation failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "employee_validation_failed", domain.ErrEmployeeValidationFailed.Error())
+		return "", false
+	}
+	if emp == nil || emp.LegalEntityID == "" {
+		return "GLOBAL", true
+	}
+	return emp.LegalEntityID, true
 }
 
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {

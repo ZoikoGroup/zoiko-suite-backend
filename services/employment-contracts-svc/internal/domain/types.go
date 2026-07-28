@@ -3,23 +3,24 @@ package domain
 import "time"
 
 type EmploymentContract struct {
-	ContractID       string     `json:"contract_id"`
-	TenantID         string     `json:"tenant_id"`
-	LegalEntityID    string     `json:"legal_entity_id"`
-	EmployeeID       string     `json:"employee_id"`
-	ContractNumber   string     `json:"contract_number"`
-	Version          int        `json:"version"`
-	ContractType     string     `json:"contract_type"` // FULL_TIME, PART_TIME, FIXED_TERM, EXECUTIVE
-	Status           string     `json:"status"`        // DRAFT, ACTIVE, SUPERSEDED, TERMINATED, EXPIRED
-	Title            string     `json:"title"`
-	BaseSalaryAmount float64    `json:"base_salary_amount"`
-	Currency         string     `json:"currency"`
-	PayFrequency     string     `json:"pay_frequency"` // MONTHLY, BIWEEKLY, WEEKLY
-	EffectiveFrom    string     `json:"effective_from"` // YYYY-MM-DD
-	EffectiveTo      *string    `json:"effective_to,omitempty"` // YYYY-MM-DD
-	DocumentVaultRef *string    `json:"document_vault_ref,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	ContractID       string    `json:"contract_id"`
+	TenantID         string    `json:"tenant_id"`
+	LegalEntityID    string    `json:"legal_entity_id"`
+	EmployeeID       string    `json:"employee_id"`
+	ContractNumber   string    `json:"contract_number"`
+	Version          int       `json:"version"`
+	ContractType     string    `json:"contract_type"` // FULL_TIME, PART_TIME, FIXED_TERM, EXECUTIVE
+	Status           string    `json:"status"`        // DRAFT, ACTIVE, SUPERSEDED, TERMINATED, EXPIRED
+	Title            string    `json:"title"`
+	BaseSalaryAmount float64   `json:"base_salary_amount"`
+	Currency         string    `json:"currency"`
+	PayFrequency     string    `json:"pay_frequency"`          // MONTHLY, BIWEEKLY, WEEKLY
+	EffectiveFrom    string    `json:"effective_from"`         // YYYY-MM-DD
+	EffectiveTo      *string   `json:"effective_to,omitempty"` // YYYY-MM-DD
+	DocumentVaultRef *string   `json:"document_vault_ref,omitempty"`
+	CorrelationID    string    `json:"correlation_id"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type ContractAmendment struct {
@@ -46,6 +47,7 @@ type IssueContractRequest struct {
 	EffectiveFrom    string  `json:"effective_from"`
 	EffectiveTo      *string `json:"effective_to,omitempty"`
 	DocumentVaultRef *string `json:"document_vault_ref,omitempty"`
+	CorrelationID    string  `json:"correlation_id"`
 }
 
 type AmendContractRequest struct {
@@ -74,4 +76,16 @@ var (
 	ErrAuthzServiceUnavailable   = errorString("authorization-svc unavailable")
 	ErrIdentityMissing           = errorString("caller identity missing")
 	ErrStoreUnavailable          = errorString("employment contract store unavailable")
+
+	// ErrEmployeeValidationFailed means employee-master-svc could not be
+	// reached to confirm the employee's real legal entity — fail closed
+	// rather than proceeding with a placeholder entity that authorization
+	// would evaluate meaninglessly.
+	ErrEmployeeValidationFailed = errorString("failed to verify employee's legal entity: employee-master-svc unavailable")
+
+	// ErrEmployeeLegalEntityMismatch means the employee's real legal entity
+	// (per employee-master-svc) does not match the legal_entity_id on the
+	// contract request — issuing the contract anyway would let a caller
+	// scope a contract to the wrong legal entity's authorization boundary.
+	ErrEmployeeLegalEntityMismatch = errorString("employee's legal entity does not match the contract's legal_entity_id")
 )

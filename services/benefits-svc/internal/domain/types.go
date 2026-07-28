@@ -3,19 +3,20 @@ package domain
 import "time"
 
 type BenefitPlan struct {
-	PlanID                      string    `json:"plan_id"`
-	TenantID                    string    `json:"tenant_id"`
-	LegalEntityID               string    `json:"legal_entity_id"`
-	Name                        string    `json:"name"`
-	PlanType                    string    `json:"plan_type"` // HEALTH_INSURANCE, DENTAL, VISION, RETIREMENT_401K, HSA, LIFE_INSURANCE
-	ProviderName                string    `json:"provider_name"`
+	PlanID                     string    `json:"plan_id"`
+	TenantID                   string    `json:"tenant_id"`
+	LegalEntityID              string    `json:"legal_entity_id"`
+	Name                       string    `json:"name"`
+	PlanType                   string    `json:"plan_type"` // HEALTH_INSURANCE, DENTAL, VISION, RETIREMENT_401K, HSA, LIFE_INSURANCE
+	ProviderName               string    `json:"provider_name"`
 	DeductionTaxTreatment      string    `json:"deduction_tax_treatment"` // PRE_TAX, POST_TAX
 	EmployerContributionPct    float64   `json:"employer_contribution_pct"`
 	EmployeeContributionAmount float64   `json:"employee_contribution_amount"`
-	Currency                    string    `json:"currency"`
-	Status                      string    `json:"status"` // ACTIVE, INACTIVE
-	CreatedAt                   time.Time `json:"created_at"`
-	UpdatedAt                   time.Time `json:"updated_at"`
+	Currency                   string    `json:"currency"`
+	Status                     string    `json:"status"` // ACTIVE, INACTIVE
+	CorrelationID              string    `json:"correlation_id"`
+	CreatedAt                  time.Time `json:"created_at"`
+	UpdatedAt                  time.Time `json:"updated_at"`
 }
 
 type BenefitElection struct {
@@ -26,9 +27,10 @@ type BenefitElection struct {
 	CoverageLevel              string    `json:"coverage_level"` // EMPLOYEE_ONLY, EMPLOYEE_PLUS_SPOUSE, EMPLOYEE_PLUS_FAMILY
 	EmployeeContributionAmount float64   `json:"employee_contribution_amount"`
 	EmployerContributionAmount float64   `json:"employer_contribution_amount"`
-	EffectiveFrom              string    `json:"effective_from"` // YYYY-MM-DD
+	EffectiveFrom              string    `json:"effective_from"`         // YYYY-MM-DD
 	EffectiveTo                *string   `json:"effective_to,omitempty"` // YYYY-MM-DD
-	Status                     string    `json:"status"` // ACTIVE, CANCELLED
+	Status                     string    `json:"status"`                 // ACTIVE, CANCELLED
+	CorrelationID              string    `json:"correlation_id"`
 	CreatedAt                  time.Time `json:"created_at"`
 	UpdatedAt                  time.Time `json:"updated_at"`
 }
@@ -42,6 +44,7 @@ type CreatePlanRequest struct {
 	EmployerContributionPct    *float64 `json:"employer_contribution_pct,omitempty"`
 	EmployeeContributionAmount *float64 `json:"employee_contribution_amount,omitempty"`
 	Currency                   string   `json:"currency"`
+	CorrelationID              string   `json:"correlation_id"`
 }
 
 type EnrollBenefitRequest struct {
@@ -50,6 +53,7 @@ type EnrollBenefitRequest struct {
 	CoverageLevel              string   `json:"coverage_level"`
 	EmployeeContributionAmount *float64 `json:"employee_contribution_amount,omitempty"`
 	EffectiveFrom              string   `json:"effective_from"`
+	CorrelationID              string   `json:"correlation_id"`
 }
 
 type UpdateElectionRequest struct {
@@ -71,12 +75,18 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrPlanNotFound            = errorString("benefit plan not found")
-	ErrElectionNotFound        = errorString("benefit election not found")
-	ErrElectionAlreadyCancelled= errorString("benefit election already cancelled")
-	ErrEmployeeNotFound        = errorString("employee not found or inactive")
-	ErrAuthorizationDenied     = errorString("authorization denied for benefits action")
-	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
-	ErrIdentityMissing         = errorString("caller identity missing")
-	ErrStoreUnavailable        = errorString("benefits store unavailable")
+	ErrPlanNotFound             = errorString("benefit plan not found")
+	ErrElectionNotFound         = errorString("benefit election not found")
+	ErrElectionAlreadyCancelled = errorString("benefit election already cancelled")
+	ErrEmployeeNotFound         = errorString("employee not found or inactive")
+	ErrAuthorizationDenied      = errorString("authorization denied for benefits action")
+	ErrAuthzServiceUnavailable  = errorString("authorization-svc unavailable")
+	ErrIdentityMissing          = errorString("caller identity missing")
+	ErrStoreUnavailable         = errorString("benefits store unavailable")
+
+	// ErrEmployeeValidationFailed means employee-master-svc could not be
+	// reached to confirm the employee's real legal entity — fail closed
+	// rather than proceeding with a placeholder entity that authorization
+	// would evaluate meaninglessly.
+	ErrEmployeeValidationFailed = errorString("failed to verify employee's legal entity: employee-master-svc unavailable")
 )

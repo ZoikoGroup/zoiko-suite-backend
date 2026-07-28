@@ -15,6 +15,7 @@ type PayrollException struct {
 	ResolutionNotes *string    `json:"resolution_notes,omitempty"`
 	ResolvedBy      *string    `json:"resolved_by,omitempty"`
 	ResolvedAt      *time.Time `json:"resolved_at,omitempty"`
+	CorrelationID   string     `json:"correlation_id"`
 	CreatedAt       time.Time  `json:"created_at"`
 }
 
@@ -25,6 +26,7 @@ type RaiseExceptionRequest struct {
 	Severity      string  `json:"severity"`
 	Description   string  `json:"description"`
 	DetailsJSON   string  `json:"details_json,omitempty"`
+	CorrelationID string  `json:"correlation_id"`
 }
 
 type ResolveExceptionRequest struct {
@@ -52,4 +54,10 @@ var (
 	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
 	ErrIdentityMissing         = errorString("caller identity missing")
 	ErrStoreUnavailable        = errorString("payroll exceptions store unavailable")
+
+	// ErrEmployeeValidationFailed means employee-master-svc could not be
+	// reached to confirm the employee's real legal entity — fail closed
+	// rather than proceeding with a placeholder entity that authorization
+	// would evaluate meaninglessly.
+	ErrEmployeeValidationFailed = errorString("failed to verify employee's legal entity: employee-master-svc unavailable")
 )
