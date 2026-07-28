@@ -1,4 +1,4 @@
-﻿package handler_test
+package handler_test
 
 import (
 	"bytes"
@@ -326,6 +326,121 @@ func TestGetPeriodStatus_LockedPeriod(t *testing.T) {
 }
 
 // ── LockPeriod tests ──────────────────────────────────────────────────────────
+
+func TestLockPeriod_UnsettledAPBlocksClose(t *testing.T) {
+	s := newStubStore()
+	s.periods["fp-open"] = &domain.FiscalPeriod{
+		FiscalPeriodID: "fp-open",
+		TenantID:       "tenant-abc",
+		LegalEntityID:  "le-1",
+		PeriodName:     "2024-Q1",
+		CloseStatus:    "OPEN",
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{unsettledAP: 1})
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 with unsettled AP invoices outstanding, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLockPeriod_UnsettledARBlocksClose(t *testing.T) {
+	s := newStubStore()
+	s.periods["fp-open"] = &domain.FiscalPeriod{
+		FiscalPeriodID: "fp-open",
+		TenantID:       "tenant-abc",
+		LegalEntityID:  "le-1",
+		PeriodName:     "2024-Q1",
+		CloseStatus:    "OPEN",
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{unsettledAR: 1})
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 with unsettled AR invoices outstanding, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestLockPeriod_GLQueryFails_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	s.periods["fp-open"] = &domain.FiscalPeriod{
+		FiscalPeriodID: "fp-open",
+		TenantID:       "tenant-abc",
+		LegalEntityID:  "le-1",
+		PeriodName:     "2024-Q1",
+		CloseStatus:    "OPEN",
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{unpostedErr: domain.ErrGLServiceUnavailable})
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when general-ledger-svc is unreachable (fail closed), got %d: %s", rr.Code, rr.Body.String())
+	}
+	if s.periods["fp-open"].CloseStatus != "OPEN" {
+		t.Fatalf("period must remain OPEN when a readiness check couldn't be performed, got %s", s.periods["fp-open"].CloseStatus)
+	}
+}
+
+func TestLockPeriod_TrialBalanceCompileFails_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	s.periods["fp-open"] = &domain.FiscalPeriod{
+		FiscalPeriodID: "fp-open",
+		TenantID:       "tenant-abc",
+		LegalEntityID:  "le-1",
+		PeriodName:     "2024-Q1",
+		CloseStatus:    "OPEN",
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{trialBalErr: domain.ErrGLServiceUnavailable})
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when trial balance compilation fails, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if s.periods["fp-open"].CloseStatus != "OPEN" {
+		t.Fatalf("period must remain OPEN when evidence generation failed, got %s", s.periods["fp-open"].CloseStatus)
+	}
+}
+
+func TestLockPeriod_EvidenceUploadFails_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	s.periods["fp-open"] = &domain.FiscalPeriod{
+		FiscalPeriodID: "fp-open",
+		TenantID:       "tenant-abc",
+		LegalEntityID:  "le-1",
+		PeriodName:     "2024-Q1",
+		CloseStatus:    "OPEN",
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubClients{uploadErr: domain.ErrVaultServiceUnavailable})
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when document-vault-svc upload fails, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if s.periods["fp-open"].CloseStatus != "OPEN" {
+		t.Fatalf("period must remain OPEN when close evidence couldn't be recorded, got %s", s.periods["fp-open"].CloseStatus)
+	}
+}
+
+func TestLockPeriod_AuthorizationDenied_Returns(t *testing.T) {
+	s := newStubStore()
+	s.periods["fp-open"] = &domain.FiscalPeriod{
+		FiscalPeriodID: "fp-open",
+		TenantID:       "tenant-abc",
+		LegalEntityID:  "le-1",
+		PeriodName:     "2024-Q1",
+		CloseStatus:    "OPEN",
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubClients{})
+	rr := doReq(r, http.MethodPost, "/v1/close/periods/fp-open/lock", nil, "principal-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d", rr.Code)
+	}
+}
+
+// ── ListFiscalPeriods tests ───────────────────────────────────────────────────
+
+func TestListFiscalPeriods_RequiresLegalEntityID(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	rr := doReq(r, http.MethodGet, "/v1/close/periods/", nil, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without legal_entity_id, got %d", rr.Code)
+	}
+}
 
 func TestLockPeriod_NotFound(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
