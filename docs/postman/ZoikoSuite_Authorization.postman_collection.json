@@ -1,0 +1,1225 @@
+{
+  "info": {
+    "name": "ZoikoSuite - Authorization Service (8089)",
+    "description": "Every endpoint on authorization-svc (:8089), ordered as a runnable flow.\n\nRun the folders top to bottom with the Collection Runner. Ids are captured by\ntest scripts, so nothing needs pasting by hand.\n\nKEY FACTS\n- /v1/authorize returns HTTP 200 for BOTH grant and deny. The verdict is in\n  decision_outcome, not the status code. 200 means the evaluation succeeded.\n- Evaluation order: RBAC, then delegated authority, then SoD as a veto.\n- Every evaluation is written to access_decision_log before responding.\n- legal_entity_id, tenant_id and every *_id path param MUST be a UUID.\n  principal_id is free text. A non-UUID legal_entity_id returns 503\n  store_unavailable, not 400 - that is a service defect, not your mistake.\n- Purchase actions consumed by purchase-order-svc: PO_ISSUE, PO_AMEND, PO_CLOSE.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "authzUrl",
+      "value": "http://localhost:8089"
+    },
+    {
+      "key": "tenantId",
+      "value": "11110000-0000-4000-8000-000000000001"
+    },
+    {
+      "key": "entityId",
+      "value": "22220000-0000-4000-8000-000000000001"
+    },
+    {
+      "key": "buyerPrincipal",
+      "value": "buyer-alice"
+    },
+    {
+      "key": "holderPrincipal",
+      "value": "approver-bob"
+    },
+    {
+      "key": "delegatePrincipal",
+      "value": "delegate-carol"
+    },
+    {
+      "key": "roleId",
+      "value": ""
+    },
+    {
+      "key": "approverRoleId",
+      "value": ""
+    },
+    {
+      "key": "assignmentId",
+      "value": ""
+    },
+    {
+      "key": "delegationId",
+      "value": ""
+    },
+    {
+      "key": "decisionId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "00 - Probes",
+      "item": [
+        {
+          "name": "Liveness /healthz",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-1"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/healthz",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Readiness /readyz",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-2"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/readyz",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "readyz"
+              ]
+            },
+            "description": "readyz includes the database; healthz does not."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// readyz includes the database; healthz does not.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Metrics /metrics",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-3"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/metrics",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "metrics"
+              ]
+            },
+            "description": "Prometheus exposition format, scraped directly (pull model)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Prometheus exposition format, scraped directly (pull model).",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "01 - Grant PO actions via RBAC",
+      "item": [
+        {
+          "name": "Create role - PO_BUYER",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-4"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"role_code\": \"PO_BUYER\",\n  \"role_name\": \"PO Buyer\",\n  \"role_scope_type\": \"LEGAL_ENTITY\",\n  \"created_by_principal_id\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles"
+              ]
+            },
+            "description": "role_code must be unique per tenant - a repeat returns 409 role_conflict. Optional role_id lets you supply your own UUID."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// role_code must be unique per tenant - a repeat returns 409 role_conflict. Optional role_id lets you supply your own UUID.",
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"roleId\", pm.response.json().role_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attach permission bundle - PO_ISSUE + PO_AMEND",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-5"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"bundle_code\": \"PO_ISSUE_ONLY\",\n  \"permitted_actions\": [\n    \"PO_ISSUE\",\n    \"PO_AMEND\"\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles/{{roleId}}/permission-bundles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles",
+                "{{roleId}}",
+                "permission-bundles"
+              ]
+            },
+            "description": "permitted_actions is the list authorize() checks against. Re-posting the same bundle_code updates it in place, still 201."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// permitted_actions is the list authorize() checks against. Re-posting the same bundle_code updates it in place, still 201.",
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assign role to buyer-alice",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-6"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"role_id\": \"{{roleId}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"assigned_by\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/role-assignments",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "role-assignments"
+              ]
+            },
+            "description": "effective_from is required and must parse as RFC3339 - a zero value returns 400 missing_field."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// effective_from is required and must parse as RFC3339 - a zero value returns 400 missing_field.",
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"assignmentId\", pm.response.json().principal_role_assignment_id);"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "02 - Evaluate (the endpoint purchase-order-svc calls)",
+      "item": [
+        {
+          "name": "Authorize PO_ISSUE -> GRANTED (rbac)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-7"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "Expect decision_outcome GRANTED, decision_basis rbac:role=PO_BUYER. This is byte-for-byte the call purchase-order-svc makes before issuing a PO."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Expect decision_outcome GRANTED, decision_basis rbac:role=PO_BUYER. This is byte-for-byte the call purchase-order-svc makes before issuing a PO.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set(\"decisionId\", pm.response.json().access_decision_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Authorize PO_CLOSE -> DENIED (no_grant)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-8"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_CLOSE\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "PO_CLOSE is not in the bundle. Still HTTP 200 - read decision_outcome."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// PO_CLOSE is not in the bundle. Still HTTP 200 - read decision_outcome.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get access decision by id",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-9"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions/{{decisionId}}",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions",
+                "{{decisionId}}"
+              ]
+            },
+            "description": "The decision artifact. Proves no material action happened without a logged decision."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// The decision artifact. Proves no material action happened without a logged decision.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "03 - Segregation of duties",
+      "item": [
+        {
+          "name": "Create SoD rule - PO_ISSUE vs PO_APPROVE",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-10"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain_code\": \"PROCUREMENT\",\n  \"action_a\": \"PO_ISSUE\",\n  \"action_b\": \"PO_APPROVE\",\n  \"conflict_type\": \"HARD\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/sod-rules",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "sod-rules"
+              ]
+            },
+            "description": "jurisdiction_id is optional; if supplied it must exist in jurisdiction-rules-svc or you get 404 jurisdiction_not_found."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// jurisdiction_id is optional; if supplied it must exist in jurisdiction-rules-svc or you get 404 jurisdiction_not_found.",
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create role - PO_APPROVER",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-11"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"role_code\": \"PO_APPROVER\",\n  \"role_name\": \"PO Approver\",\n  \"role_scope_type\": \"LEGAL_ENTITY\",\n  \"created_by_principal_id\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"approverRoleId\", pm.response.json().role_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attach bundle - PO_APPROVE",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-12"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"bundle_code\": \"PO_APPROVE_ONLY\",\n  \"permitted_actions\": [\n    \"PO_APPROVE\"\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles/{{approverRoleId}}/permission-bundles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles",
+                "{{approverRoleId}}",
+                "permission-bundles"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Also assign PO_APPROVER to buyer-alice (creates conflict)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-13"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"role_id\": \"{{approverRoleId}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"assigned_by\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/role-assignments",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "role-assignments"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Re-authorize PO_ISSUE -> DENIED by SoD",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-14"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "Identical request to folder 02, but decision_basis is now sod:conflict_with=PO_APPROVE. SoD vetoes an otherwise valid RBAC grant."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Identical request to folder 02, but decision_basis is now sod:conflict_with=PO_APPROVE. SoD vetoes an otherwise valid RBAC grant.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "04 - Delegated authority",
+      "item": [
+        {
+          "name": "Assign PO_BUYER to approver-bob (clean holder)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-15"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{holderPrincipal}}\",\n  \"role_id\": \"{{roleId}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"assigned_by\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/role-assignments",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "role-assignments"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Delegate bob -> carol",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-16"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"delegator_principal_id\": \"{{holderPrincipal}}\",\n  \"delegate_principal_id\": \"{{delegatePrincipal}}\",\n  \"scope_type\": \"LEGAL_ENTITY\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/delegated-authorities",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "delegated-authorities"
+              ]
+            },
+            "description": "authority_limit_type, authority_limit_value and effective_to are optional."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// authority_limit_type, authority_limit_value and effective_to are optional.",
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"delegationId\", pm.response.json().delegated_authority_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Authorize carol PO_ISSUE -> GRANTED (delegated)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-17"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{delegatePrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "carol holds no role of her own. decision_basis is delegated:from=approver-bob."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// carol holds no role of her own. decision_basis is delegated:from=approver-bob.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Revoke delegation",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-18"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/delegated-authorities/{{delegationId}}/revoke",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "delegated-authorities",
+                "{{delegationId}}",
+                "revoke"
+              ]
+            },
+            "description": "Empty JSON body. Sets revocation_status to REVOKED."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Empty JSON body. Sets revocation_status to REVOKED.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Authorize carol again -> DENIED",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-19"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{delegatePrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Revoke role assignment",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-20"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/role-assignments/{{assignmentId}}/revoke",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "role-assignments",
+                "{{assignmentId}}",
+                "revoke"
+              ]
+            },
+            "description": "Sets effective_to = now rather than deleting the row."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Sets effective_to = now rather than deleting the row.",
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "05 - Error cases",
+      "item": [
+        {
+          "name": "Duplicate role_code -> 409",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-21"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"role_code\": \"PO_BUYER\",\n  \"role_name\": \"dup\",\n  \"role_scope_type\": \"LEGAL_ENTITY\",\n  \"created_by_principal_id\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 409\", () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Revoke delegation twice -> 409 already_revoked",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-22"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/delegated-authorities/{{delegationId}}/revoke",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "delegated-authorities",
+                "{{delegationId}}",
+                "revoke"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 409\", () => pm.response.to.have.status(409));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Authorize missing principal_id -> 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-23"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Bundle without permitted_actions -> 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-24"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"bundle_code\": \"MISSING_ACTIONS\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles/{{roleId}}/permission-bundles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles",
+                "{{roleId}}",
+                "permission-bundles"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assignment for unknown role -> 404",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-25"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"nobody\",\n  \"role_id\": \"99999999-0000-4000-8000-000000000000\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"effective_from\": \"2026-01-01T00:00:00Z\",\n  \"assigned_by\": \"admin\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/role-assignments",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "role-assignments"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unknown decision id -> 404",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-26"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions/99999999-0000-4000-8000-000000000000",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions",
+                "99999999-0000-4000-8000-000000000000"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 404\", () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Non-UUID legal_entity_id -> 503 (service defect)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Correlation-ID",
+                "value": "pm-27"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"anyone\",\n  \"legal_entity_id\": \"not-a-uuid\",\n  \"action_type\": \"PO_ISSUE\"\n}"
+            },
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "Documents a real defect: a malformed UUID surfaces as store_unavailable instead of 400. Callers that fail closed on 503 - purchase-order-svc does - will read bad input as a platform outage."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Documents a real defect: a malformed UUID surfaces as store_unavailable instead of 400. Callers that fail closed on 503 - purchase-order-svc does - will read bad input as a platform outage.",
+                  "pm.test(\"status 503\", () => pm.response.to.have.status(503));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

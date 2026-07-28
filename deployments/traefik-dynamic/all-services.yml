@@ -1,0 +1,825 @@
+# GENERATED — do not hand-edit.
+# Regenerate: node deployments/scripts/gen-gateway-routes.mjs
+#
+# One port fronts every service, one path prefix each:
+#
+#     http://localhost:${GATEWAY_PORT}/<service-name>/<the service's own path>
+#
+# e.g.  /purchase-order-svc/v1/purchase-orders  -> purchase-order-svc:8129/v1/purchase-orders
+#       /authorization-svc/v1/authorize         -> authorization-svc:8089/v1/authorize
+#       /policy-svc/healthz                     -> policy-svc:8085/healthz
+#
+# LOCAL DEVELOPMENT ONLY. These routes carry NO gateway-auth middleware, so
+# every service is reachable unauthenticated through this port. That is
+# deliberate — the purpose is manual status checking — and must never be
+# deployed. Production routing is GTRM's compiled config: Host()-based and
+# ForwardAuth-enforced.
+#
+# priority 50 beats GTRM's HostRegexp catchall (priority 1) and stays below
+# its Host() routers (priority 100), so GTRM behaviour is unchanged.
+
+
+http:
+    routers:
+        svc-accounts-payable-svc:
+            rule: PathPrefix(`/accounts-payable-svc`)
+            entryPoints:
+                - web
+            service: svc-accounts-payable-svc
+            middlewares:
+                - strip-accounts-payable-svc
+            priority: 50
+        svc-accounts-receivable-svc:
+            rule: PathPrefix(`/accounts-receivable-svc`)
+            entryPoints:
+                - web
+            service: svc-accounts-receivable-svc
+            middlewares:
+                - strip-accounts-receivable-svc
+            priority: 50
+        svc-audit-event-store-svc:
+            rule: PathPrefix(`/audit-event-store-svc`)
+            entryPoints:
+                - web
+            service: svc-audit-event-store-svc
+            middlewares:
+                - strip-audit-event-store-svc
+            priority: 50
+        svc-authorization-svc:
+            rule: PathPrefix(`/authorization-svc`)
+            entryPoints:
+                - web
+            service: svc-authorization-svc
+            middlewares:
+                - strip-authorization-svc
+            priority: 50
+        svc-bank-reconciliation-svc:
+            rule: PathPrefix(`/bank-reconciliation-svc`)
+            entryPoints:
+                - web
+            service: svc-bank-reconciliation-svc
+            middlewares:
+                - strip-bank-reconciliation-svc
+            priority: 50
+        svc-benefits-svc:
+            rule: PathPrefix(`/benefits-svc`)
+            entryPoints:
+                - web
+            service: svc-benefits-svc
+            middlewares:
+                - strip-benefits-svc
+            priority: 50
+        svc-board-resolutions-svc:
+            rule: PathPrefix(`/board-resolutions-svc`)
+            entryPoints:
+                - web
+            service: svc-board-resolutions-svc
+            middlewares:
+                - strip-board-resolutions-svc
+            priority: 50
+        svc-clause-template-svc:
+            rule: PathPrefix(`/clause-template-svc`)
+            entryPoints:
+                - web
+            service: svc-clause-template-svc
+            middlewares:
+                - strip-clause-template-svc
+            priority: 50
+        svc-compensation-svc:
+            rule: PathPrefix(`/compensation-svc`)
+            entryPoints:
+                - web
+            service: svc-compensation-svc
+            middlewares:
+                - strip-compensation-svc
+            priority: 50
+        svc-configuration-feature-flag-svc:
+            rule: PathPrefix(`/configuration-feature-flag-svc`)
+            entryPoints:
+                - web
+            service: svc-configuration-feature-flag-svc
+            middlewares:
+                - strip-configuration-feature-flag-svc
+            priority: 50
+        svc-consolidation-svc:
+            rule: PathPrefix(`/consolidation-svc`)
+            entryPoints:
+                - web
+            service: svc-consolidation-svc
+            middlewares:
+                - strip-consolidation-svc
+            priority: 50
+        svc-contract-lifecycle-svc:
+            rule: PathPrefix(`/contract-lifecycle-svc`)
+            entryPoints:
+                - web
+            service: svc-contract-lifecycle-svc
+            middlewares:
+                - strip-contract-lifecycle-svc
+            priority: 50
+        svc-corporate-actions-svc:
+            rule: PathPrefix(`/corporate-actions-svc`)
+            entryPoints:
+                - web
+            service: svc-corporate-actions-svc
+            middlewares:
+                - strip-corporate-actions-svc
+            priority: 50
+        svc-corporate-tax-svc:
+            rule: PathPrefix(`/corporate-tax-svc`)
+            entryPoints:
+                - web
+            service: svc-corporate-tax-svc
+            middlewares:
+                - strip-corporate-tax-svc
+            priority: 50
+        svc-counterparty-management-svc:
+            rule: PathPrefix(`/counterparty-management-svc`)
+            entryPoints:
+                - web
+            service: svc-counterparty-management-svc
+            middlewares:
+                - strip-counterparty-management-svc
+            priority: 50
+        svc-document-vault-svc:
+            rule: PathPrefix(`/document-vault-svc`)
+            entryPoints:
+                - web
+            service: svc-document-vault-svc
+            middlewares:
+                - strip-document-vault-svc
+            priority: 50
+        svc-employee-master-svc:
+            rule: PathPrefix(`/employee-master-svc`)
+            entryPoints:
+                - web
+            service: svc-employee-master-svc
+            middlewares:
+                - strip-employee-master-svc
+            priority: 50
+        svc-employment-contracts-svc:
+            rule: PathPrefix(`/employment-contracts-svc`)
+            entryPoints:
+                - web
+            service: svc-employment-contracts-svc
+            middlewares:
+                - strip-employment-contracts-svc
+            priority: 50
+        svc-evidence-manifest-svc:
+            rule: PathPrefix(`/evidence-manifest-svc`)
+            entryPoints:
+                - web
+            service: svc-evidence-manifest-svc
+            middlewares:
+                - strip-evidence-manifest-svc
+            priority: 50
+        svc-evidence-requirements-svc:
+            rule: PathPrefix(`/evidence-requirements-svc`)
+            entryPoints:
+                - web
+            service: svc-evidence-requirements-svc
+            middlewares:
+                - strip-evidence-requirements-svc
+            priority: 50
+        svc-financial-close-svc:
+            rule: PathPrefix(`/financial-close-svc`)
+            entryPoints:
+                - web
+            service: svc-financial-close-svc
+            middlewares:
+                - strip-financial-close-svc
+            priority: 50
+        svc-gateway-auth-svc:
+            rule: PathPrefix(`/gateway-auth-svc`)
+            entryPoints:
+                - web
+            service: svc-gateway-auth-svc
+            middlewares:
+                - strip-gateway-auth-svc
+            priority: 50
+        svc-general-ledger-svc:
+            rule: PathPrefix(`/general-ledger-svc`)
+            entryPoints:
+                - web
+            service: svc-general-ledger-svc
+            middlewares:
+                - strip-general-ledger-svc
+            priority: 50
+        svc-governance-decision-log-svc:
+            rule: PathPrefix(`/governance-decision-log-svc`)
+            entryPoints:
+                - web
+            service: svc-governance-decision-log-svc
+            middlewares:
+                - strip-governance-decision-log-svc
+            priority: 50
+        svc-identity-context-svc:
+            rule: PathPrefix(`/identity-context-svc`)
+            entryPoints:
+                - web
+            service: svc-identity-context-svc
+            middlewares:
+                - strip-identity-context-svc
+            priority: 50
+        svc-intercompany-accounting-svc:
+            rule: PathPrefix(`/intercompany-accounting-svc`)
+            entryPoints:
+                - web
+            service: svc-intercompany-accounting-svc
+            middlewares:
+                - strip-intercompany-accounting-svc
+            priority: 50
+        svc-invoice-approval-svc:
+            rule: PathPrefix(`/invoice-approval-svc`)
+            entryPoints:
+                - web
+            service: svc-invoice-approval-svc
+            middlewares:
+                - strip-invoice-approval-svc
+            priority: 50
+        svc-jurisdiction-rules-svc:
+            rule: PathPrefix(`/jurisdiction-rules-svc`)
+            entryPoints:
+                - web
+            service: svc-jurisdiction-rules-svc
+            middlewares:
+                - strip-jurisdiction-rules-svc
+            priority: 50
+        svc-leave-absence-svc:
+            rule: PathPrefix(`/leave-absence-svc`)
+            entryPoints:
+                - web
+            service: svc-leave-absence-svc
+            middlewares:
+                - strip-leave-absence-svc
+            priority: 50
+        svc-obligation-tracking-svc:
+            rule: PathPrefix(`/obligation-tracking-svc`)
+            entryPoints:
+                - web
+            service: svc-obligation-tracking-svc
+            middlewares:
+                - strip-obligation-tracking-svc
+            priority: 50
+        svc-obligations-svc:
+            rule: PathPrefix(`/obligations-svc`)
+            entryPoints:
+                - web
+            service: svc-obligations-svc
+            middlewares:
+                - strip-obligations-svc
+            priority: 50
+        svc-offboarding-severance-svc:
+            rule: PathPrefix(`/offboarding-severance-svc`)
+            entryPoints:
+                - web
+            service: svc-offboarding-severance-svc
+            middlewares:
+                - strip-offboarding-severance-svc
+            priority: 50
+        svc-org-structure-svc:
+            rule: PathPrefix(`/org-structure-svc`)
+            entryPoints:
+                - web
+            service: svc-org-structure-svc
+            middlewares:
+                - strip-org-structure-svc
+            priority: 50
+        svc-payroll-exceptions-svc:
+            rule: PathPrefix(`/payroll-exceptions-svc`)
+            entryPoints:
+                - web
+            service: svc-payroll-exceptions-svc
+            middlewares:
+                - strip-payroll-exceptions-svc
+            priority: 50
+        svc-payroll-run-svc:
+            rule: PathPrefix(`/payroll-run-svc`)
+            entryPoints:
+                - web
+            service: svc-payroll-run-svc
+            middlewares:
+                - strip-payroll-run-svc
+            priority: 50
+        svc-payroll-tax-svc:
+            rule: PathPrefix(`/payroll-tax-svc`)
+            entryPoints:
+                - web
+            service: svc-payroll-tax-svc
+            middlewares:
+                - strip-payroll-tax-svc
+            priority: 50
+        svc-policy-svc:
+            rule: PathPrefix(`/policy-svc`)
+            entryPoints:
+                - web
+            service: svc-policy-svc
+            middlewares:
+                - strip-policy-svc
+            priority: 50
+        svc-purchase-order-svc:
+            rule: PathPrefix(`/purchase-order-svc`)
+            entryPoints:
+                - web
+            service: svc-purchase-order-svc
+            middlewares:
+                - strip-purchase-order-svc
+            priority: 50
+        svc-purchase-request-svc:
+            rule: PathPrefix(`/purchase-request-svc`)
+            entryPoints:
+                - web
+            service: svc-purchase-request-svc
+            middlewares:
+                - strip-purchase-request-svc
+            priority: 50
+        svc-schema-registry-svc:
+            rule: PathPrefix(`/schema-registry-svc`)
+            entryPoints:
+                - web
+            service: svc-schema-registry-svc
+            middlewares:
+                - strip-schema-registry-svc
+            priority: 50
+        svc-search-indexer-svc:
+            rule: PathPrefix(`/search-indexer-svc`)
+            entryPoints:
+                - web
+            service: svc-search-indexer-svc
+            middlewares:
+                - strip-search-indexer-svc
+            priority: 50
+        svc-secret-vault-integration-svc:
+            rule: PathPrefix(`/secret-vault-integration-svc`)
+            entryPoints:
+                - web
+            service: svc-secret-vault-integration-svc
+            middlewares:
+                - strip-secret-vault-integration-svc
+            priority: 50
+        svc-tax-determination-svc:
+            rule: PathPrefix(`/tax-determination-svc`)
+            entryPoints:
+                - web
+            service: svc-tax-determination-svc
+            middlewares:
+                - strip-tax-determination-svc
+            priority: 50
+        svc-tax-rules-svc:
+            rule: PathPrefix(`/tax-rules-svc`)
+            entryPoints:
+                - web
+            service: svc-tax-rules-svc
+            middlewares:
+                - strip-tax-rules-svc
+            priority: 50
+        svc-tenant-entity-registry-svc:
+            rule: PathPrefix(`/tenant-entity-registry-svc`)
+            entryPoints:
+                - web
+            service: svc-tenant-entity-registry-svc
+            middlewares:
+                - strip-tenant-entity-registry-svc
+            priority: 50
+        svc-treasury-svc:
+            rule: PathPrefix(`/treasury-svc`)
+            entryPoints:
+                - web
+            service: svc-treasury-svc
+            middlewares:
+                - strip-treasury-svc
+            priority: 50
+        svc-vat-gst-svc:
+            rule: PathPrefix(`/vat-gst-svc`)
+            entryPoints:
+                - web
+            service: svc-vat-gst-svc
+            middlewares:
+                - strip-vat-gst-svc
+            priority: 50
+        svc-workflow-history-svc:
+            rule: PathPrefix(`/workflow-history-svc`)
+            entryPoints:
+                - web
+            service: svc-workflow-history-svc
+            middlewares:
+                - strip-workflow-history-svc
+            priority: 50
+        svc-workflow-svc:
+            rule: PathPrefix(`/workflow-svc`)
+            entryPoints:
+                - web
+            service: svc-workflow-svc
+            middlewares:
+                - strip-workflow-svc
+            priority: 50
+        svc-workforce-compliance-svc:
+            rule: PathPrefix(`/workforce-compliance-svc`)
+            entryPoints:
+                - web
+            service: svc-workforce-compliance-svc
+            middlewares:
+                - strip-workforce-compliance-svc
+            priority: 50
+    middlewares:
+        strip-accounts-payable-svc:
+            stripPrefix:
+                prefixes:
+                    - /accounts-payable-svc
+        strip-accounts-receivable-svc:
+            stripPrefix:
+                prefixes:
+                    - /accounts-receivable-svc
+        strip-audit-event-store-svc:
+            stripPrefix:
+                prefixes:
+                    - /audit-event-store-svc
+        strip-authorization-svc:
+            stripPrefix:
+                prefixes:
+                    - /authorization-svc
+        strip-bank-reconciliation-svc:
+            stripPrefix:
+                prefixes:
+                    - /bank-reconciliation-svc
+        strip-benefits-svc:
+            stripPrefix:
+                prefixes:
+                    - /benefits-svc
+        strip-board-resolutions-svc:
+            stripPrefix:
+                prefixes:
+                    - /board-resolutions-svc
+        strip-clause-template-svc:
+            stripPrefix:
+                prefixes:
+                    - /clause-template-svc
+        strip-compensation-svc:
+            stripPrefix:
+                prefixes:
+                    - /compensation-svc
+        strip-configuration-feature-flag-svc:
+            stripPrefix:
+                prefixes:
+                    - /configuration-feature-flag-svc
+        strip-consolidation-svc:
+            stripPrefix:
+                prefixes:
+                    - /consolidation-svc
+        strip-contract-lifecycle-svc:
+            stripPrefix:
+                prefixes:
+                    - /contract-lifecycle-svc
+        strip-corporate-actions-svc:
+            stripPrefix:
+                prefixes:
+                    - /corporate-actions-svc
+        strip-corporate-tax-svc:
+            stripPrefix:
+                prefixes:
+                    - /corporate-tax-svc
+        strip-counterparty-management-svc:
+            stripPrefix:
+                prefixes:
+                    - /counterparty-management-svc
+        strip-document-vault-svc:
+            stripPrefix:
+                prefixes:
+                    - /document-vault-svc
+        strip-employee-master-svc:
+            stripPrefix:
+                prefixes:
+                    - /employee-master-svc
+        strip-employment-contracts-svc:
+            stripPrefix:
+                prefixes:
+                    - /employment-contracts-svc
+        strip-evidence-manifest-svc:
+            stripPrefix:
+                prefixes:
+                    - /evidence-manifest-svc
+        strip-evidence-requirements-svc:
+            stripPrefix:
+                prefixes:
+                    - /evidence-requirements-svc
+        strip-financial-close-svc:
+            stripPrefix:
+                prefixes:
+                    - /financial-close-svc
+        strip-gateway-auth-svc:
+            stripPrefix:
+                prefixes:
+                    - /gateway-auth-svc
+        strip-general-ledger-svc:
+            stripPrefix:
+                prefixes:
+                    - /general-ledger-svc
+        strip-governance-decision-log-svc:
+            stripPrefix:
+                prefixes:
+                    - /governance-decision-log-svc
+        strip-identity-context-svc:
+            stripPrefix:
+                prefixes:
+                    - /identity-context-svc
+        strip-intercompany-accounting-svc:
+            stripPrefix:
+                prefixes:
+                    - /intercompany-accounting-svc
+        strip-invoice-approval-svc:
+            stripPrefix:
+                prefixes:
+                    - /invoice-approval-svc
+        strip-jurisdiction-rules-svc:
+            stripPrefix:
+                prefixes:
+                    - /jurisdiction-rules-svc
+        strip-leave-absence-svc:
+            stripPrefix:
+                prefixes:
+                    - /leave-absence-svc
+        strip-obligation-tracking-svc:
+            stripPrefix:
+                prefixes:
+                    - /obligation-tracking-svc
+        strip-obligations-svc:
+            stripPrefix:
+                prefixes:
+                    - /obligations-svc
+        strip-offboarding-severance-svc:
+            stripPrefix:
+                prefixes:
+                    - /offboarding-severance-svc
+        strip-org-structure-svc:
+            stripPrefix:
+                prefixes:
+                    - /org-structure-svc
+        strip-payroll-exceptions-svc:
+            stripPrefix:
+                prefixes:
+                    - /payroll-exceptions-svc
+        strip-payroll-run-svc:
+            stripPrefix:
+                prefixes:
+                    - /payroll-run-svc
+        strip-payroll-tax-svc:
+            stripPrefix:
+                prefixes:
+                    - /payroll-tax-svc
+        strip-policy-svc:
+            stripPrefix:
+                prefixes:
+                    - /policy-svc
+        strip-purchase-order-svc:
+            stripPrefix:
+                prefixes:
+                    - /purchase-order-svc
+        strip-purchase-request-svc:
+            stripPrefix:
+                prefixes:
+                    - /purchase-request-svc
+        strip-schema-registry-svc:
+            stripPrefix:
+                prefixes:
+                    - /schema-registry-svc
+        strip-search-indexer-svc:
+            stripPrefix:
+                prefixes:
+                    - /search-indexer-svc
+        strip-secret-vault-integration-svc:
+            stripPrefix:
+                prefixes:
+                    - /secret-vault-integration-svc
+        strip-tax-determination-svc:
+            stripPrefix:
+                prefixes:
+                    - /tax-determination-svc
+        strip-tax-rules-svc:
+            stripPrefix:
+                prefixes:
+                    - /tax-rules-svc
+        strip-tenant-entity-registry-svc:
+            stripPrefix:
+                prefixes:
+                    - /tenant-entity-registry-svc
+        strip-treasury-svc:
+            stripPrefix:
+                prefixes:
+                    - /treasury-svc
+        strip-vat-gst-svc:
+            stripPrefix:
+                prefixes:
+                    - /vat-gst-svc
+        strip-workflow-history-svc:
+            stripPrefix:
+                prefixes:
+                    - /workflow-history-svc
+        strip-workflow-svc:
+            stripPrefix:
+                prefixes:
+                    - /workflow-svc
+        strip-workforce-compliance-svc:
+            stripPrefix:
+                prefixes:
+                    - /workforce-compliance-svc
+    services:
+        svc-accounts-payable-svc:
+            loadBalancer:
+                servers:
+                    - url: http://accounts-payable-svc:8099
+        svc-accounts-receivable-svc:
+            loadBalancer:
+                servers:
+                    - url: http://accounts-receivable-svc:8101
+        svc-audit-event-store-svc:
+            loadBalancer:
+                servers:
+                    - url: http://audit-event-store-svc:8084
+        svc-authorization-svc:
+            loadBalancer:
+                servers:
+                    - url: http://authorization-svc:8089
+        svc-bank-reconciliation-svc:
+            loadBalancer:
+                servers:
+                    - url: http://bank-reconciliation-svc:8102
+        svc-benefits-svc:
+            loadBalancer:
+                servers:
+                    - url: http://benefits-svc:8112
+        svc-board-resolutions-svc:
+            loadBalancer:
+                servers:
+                    - url: http://board-resolutions-svc:8122
+        svc-clause-template-svc:
+            loadBalancer:
+                servers:
+                    - url: http://clause-template-svc:8120
+        svc-compensation-svc:
+            loadBalancer:
+                servers:
+                    - url: http://compensation-svc:8111
+        svc-configuration-feature-flag-svc:
+            loadBalancer:
+                servers:
+                    - url: http://configuration-feature-flag-svc:8086
+        svc-consolidation-svc:
+            loadBalancer:
+                servers:
+                    - url: http://consolidation-svc:8106
+        svc-contract-lifecycle-svc:
+            loadBalancer:
+                servers:
+                    - url: http://contract-lifecycle-svc:8119
+        svc-corporate-actions-svc:
+            loadBalancer:
+                servers:
+                    - url: http://corporate-actions-svc:8123
+        svc-corporate-tax-svc:
+            loadBalancer:
+                servers:
+                    - url: http://corporate-tax-svc:8128
+        svc-counterparty-management-svc:
+            loadBalancer:
+                servers:
+                    - url: http://counterparty-management-svc:8124
+        svc-document-vault-svc:
+            loadBalancer:
+                servers:
+                    - url: http://document-vault-svc:8094
+        svc-employee-master-svc:
+            loadBalancer:
+                servers:
+                    - url: http://employee-master-svc:8108
+        svc-employment-contracts-svc:
+            loadBalancer:
+                servers:
+                    - url: http://employment-contracts-svc:8109
+        svc-evidence-manifest-svc:
+            loadBalancer:
+                servers:
+                    - url: http://evidence-manifest-svc:8095
+        svc-evidence-requirements-svc:
+            loadBalancer:
+                servers:
+                    - url: http://evidence-requirements-svc:8130
+        svc-financial-close-svc:
+            loadBalancer:
+                servers:
+                    - url: http://financial-close-svc:8104
+        svc-gateway-auth-svc:
+            loadBalancer:
+                servers:
+                    - url: http://gateway-auth-svc:8092
+        svc-general-ledger-svc:
+            loadBalancer:
+                servers:
+                    - url: http://general-ledger-svc:8098
+        svc-governance-decision-log-svc:
+            loadBalancer:
+                servers:
+                    - url: http://governance-decision-log-svc:8083
+        svc-identity-context-svc:
+            loadBalancer:
+                servers:
+                    - url: http://identity-context-svc:8080
+        svc-intercompany-accounting-svc:
+            loadBalancer:
+                servers:
+                    - url: http://intercompany-accounting-svc:8105
+        svc-invoice-approval-svc:
+            loadBalancer:
+                servers:
+                    - url: http://invoice-approval-svc:8107
+        svc-jurisdiction-rules-svc:
+            loadBalancer:
+                servers:
+                    - url: http://jurisdiction-rules-svc:8082
+        svc-leave-absence-svc:
+            loadBalancer:
+                servers:
+                    - url: http://leave-absence-svc:8115
+        svc-obligation-tracking-svc:
+            loadBalancer:
+                servers:
+                    - url: http://obligation-tracking-svc:8121
+        svc-obligations-svc:
+            loadBalancer:
+                servers:
+                    - url: http://obligations-svc:8088
+        svc-offboarding-severance-svc:
+            loadBalancer:
+                servers:
+                    - url: http://offboarding-severance-svc:8117
+        svc-org-structure-svc:
+            loadBalancer:
+                servers:
+                    - url: http://org-structure-svc:8116
+        svc-payroll-exceptions-svc:
+            loadBalancer:
+                servers:
+                    - url: http://payroll-exceptions-svc:8114
+        svc-payroll-run-svc:
+            loadBalancer:
+                servers:
+                    - url: http://payroll-run-svc:8110
+        svc-payroll-tax-svc:
+            loadBalancer:
+                servers:
+                    - url: http://payroll-tax-svc:8113
+        svc-policy-svc:
+            loadBalancer:
+                servers:
+                    - url: http://policy-svc:8085
+        svc-purchase-order-svc:
+            loadBalancer:
+                servers:
+                    - url: http://purchase-order-svc:8129
+        svc-purchase-request-svc:
+            loadBalancer:
+                servers:
+                    - url: http://purchase-request-svc:8100
+        svc-schema-registry-svc:
+            loadBalancer:
+                servers:
+                    - url: http://schema-registry-svc:8093
+        svc-search-indexer-svc:
+            loadBalancer:
+                servers:
+                    - url: http://search-indexer-svc:8096
+        svc-secret-vault-integration-svc:
+            loadBalancer:
+                servers:
+                    - url: http://secret-vault-integration-svc:8087
+        svc-tax-determination-svc:
+            loadBalancer:
+                servers:
+                    - url: http://tax-determination-svc:8126
+        svc-tax-rules-svc:
+            loadBalancer:
+                servers:
+                    - url: http://tax-rules-svc:8125
+        svc-tenant-entity-registry-svc:
+            loadBalancer:
+                servers:
+                    - url: http://tenant-entity-registry-svc:8081
+        svc-treasury-svc:
+            loadBalancer:
+                servers:
+                    - url: http://treasury-svc:8103
+        svc-vat-gst-svc:
+            loadBalancer:
+                servers:
+                    - url: http://vat-gst-svc:8127
+        svc-workflow-history-svc:
+            loadBalancer:
+                servers:
+                    - url: http://workflow-history-svc:8097
+        svc-workflow-svc:
+            loadBalancer:
+                servers:
+                    - url: http://workflow-svc:8090
+        svc-workforce-compliance-svc:
+            loadBalancer:
+                servers:
+                    - url: http://workforce-compliance-svc:8118
