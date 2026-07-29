@@ -34,6 +34,7 @@ services:
       - ../services/accounts-payable-svc/deployments/migrations:/migrations/accounts-payable:ro
       - ../services/accounts-receivable-svc/deployments/migrations:/migrations/accounts-receivable:ro
       - ../services/purchase-request-svc/deployments/migrations:/migrations/purchase-request:ro
+      - ../services/purchase-order-svc/deployments/migrations:/migrations/purchase-order:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
       - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
@@ -61,6 +62,7 @@ services:
       - ../services/tax-determination-svc/deployments/migrations:/migrations/tax-determination:ro
       - ../services/vat-gst-svc/deployments/migrations:/migrations/vat-gst:ro
       - ../services/corporate-tax-svc/deployments/migrations:/migrations/corporate-tax:ro
+      - ../services/evidence-requirements-svc/deployments/migrations:/migrations/evidence-requirements:ro
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
@@ -272,8 +274,17 @@ services:
       # routing-map change: cd gtrm/compiler && go run . --map ../routing-map.yaml
       # --regions ../regions.yaml --out ../compiled-traefik.yml
       - ./gtrm/compiled-traefik.yml:/etc/traefik/dynamic/gtrm.yml:ro
+      # Single-port access to every service, one path prefix each. Generated —
+      # regenerate with scripts/gen-gateway-routes.mjs after adding a service.
+      # Traefik merges every file in this directory, so this sits alongside
+      # gtrm.yml without touching it.
+      - ./traefik-dynamic/all-services.yml:/etc/traefik/dynamic/all-services.yml:ro
     ports:
-      - "80:80"
+      # GATEWAY_PORT is the one port that fronts all 50 services. Defaults to
+      # 8000 because port 80 is commonly already taken on a dev machine (IIS,
+      # Skype, another proxy) — set GATEWAY_PORT=80 in .env to use the standard
+      # port when it is free.
+      - "${GATEWAY_PORT:-8000}:80"
       - "8091:8080" # Traefik's own dashboard, separate from every service's own port
     depends_on:
       docker-proxy:
@@ -1118,6 +1129,86 @@ services:
       start_period: 10s
     restart: on-failure
 
+  purchase-order-svc:
+    build:
+      context: ../services/purchase-order-svc
+      dockerfile: Dockerfile
+    container_name: purchase-order-svc
+    ports:
+      - "8129:8129"
+    environment:
+      PORT: "8129"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: purchase_order
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.purchase-order.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PURCHASE_REQUEST_SERVICE_URL: "http://purchase-request-svc:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      purchase-request-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8129/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Evidence Requirements Service — 03-microservices.md §8.6. The seventh and
+  # final Governance Platform service (§5.1), closing that group at 7/7.
+  #
+  # depends_on keys below are compose SERVICE keys, not container_name values.
+  # Getting that wrong is a hard schema error that blocks `docker compose up`
+  # for the entire file regardless of which service is targeted — it happened
+  # here before with `jurisdiction-rules-svc` (a container_name) used where
+  # `jurisdiction-svc` (the service key) was required.
+  evidence-requirements-svc:
+    build:
+      context: ../services/evidence-requirements-svc
+      dockerfile: Dockerfile
+    container_name: evidence-requirements-svc
+    ports:
+      - "8130:8130"
+    environment:
+      PORT: "8130"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: evidence_requirements
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8130/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   accounts-receivable-svc:
     build:
       context: ../services/accounts-receivable-svc
@@ -1753,7 +1844,7 @@ services:
         condition: service_healthy
       employee-master-svc:
         condition: service_healthy
-      jurisdiction-rules-svc:
+      jurisdiction-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8117/healthz"]
@@ -1792,7 +1883,7 @@ services:
         condition: service_healthy
       employee-master-svc:
         condition: service_healthy
-      jurisdiction-rules-svc:
+      jurisdiction-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8118/healthz"]

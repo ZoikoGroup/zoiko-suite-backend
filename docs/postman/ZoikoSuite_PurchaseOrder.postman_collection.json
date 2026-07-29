@@ -1,0 +1,324 @@
+{
+  "info": {
+    "_postman_id": "zoiko-purchase-order-svc",
+    "name": "ZoikoSuite - Purchase Order Service (+ setup helpers)",
+    "description": "purchase-order-svc (8129) plus the authorization-svc (8089) grants and purchase-request-svc (8100) requests needed to exercise it end-to-end. Run folder 00 first (one-time setup), then 01, then 02 top-to-bottom. All three services must be running: `docker compose -f deployments/docker-compose.yml up -d postgres kafka authorization-svc purchase-request-svc purchase-order-svc`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "type": "string", "value": "http://localhost" },
+    { "key": "tenantId", "type": "string", "value": "aa5c2c9f-1201-43f4-a8fe-41d5684954e8" },
+    { "key": "entityId", "type": "string", "value": "b660fffe-1729-4d42-8ddd-f19db1619225" },
+    { "key": "principalId", "type": "string", "value": "test-principal-1" },
+    { "key": "roleId", "type": "string", "value": "" },
+    { "key": "purchaseRequestId", "type": "string", "value": "" },
+    { "key": "purchaseRequestIdPending", "type": "string", "value": "" },
+    { "key": "purchaseOrderId", "type": "string", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "00 - Setup: Authorization Grants (8089)",
+      "item": [
+        {
+          "name": "Create Role",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8089/v1/admin/roles",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"role_code\":\"PO_ADMIN\",\"role_name\":\"Purchase Order Admin\",\"role_scope_type\":\"LEGAL_ENTITY\",\"created_by_principal_id\":\"seed-script\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if(pm.response.code===201||pm.response.code===200){const b=pm.response.json();pm.collectionVariables.set('roleId', b.role_id||'');}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Permission Bundle (grants PO_ISSUE/AMEND/CLOSE + PR_REQUEST_*)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8089/v1/admin/roles/{{roleId}}/permission-bundles",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"bundle_code\":\"PO_PR_ACTIONS\",\"permitted_actions\":[\"PO_ISSUE\",\"PO_AMEND\",\"PO_CLOSE\",\"PR_REQUEST_CREATE\",\"PR_REQUEST_APPROVE\",\"PR_REQUEST_REJECT\"]}"
+            }
+          }
+        },
+        {
+          "name": "Create Role Assignment (grants principalId the role in entityId)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8089/v1/admin/role-assignments",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"principal_id\":\"{{principalId}}\",\"role_id\":\"{{roleId}}\",\"legal_entity_id\":\"{{entityId}}\",\"effective_from\":\"2026-01-01T00:00:00Z\",\"assigned_by\":\"seed-script\"}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "01 - Purchase Request Service (8100)",
+      "item": [
+        {
+          "name": "Health /healthz",
+          "request": { "method": "GET", "url": "{{baseUrl}}:8100/healthz", "header": [] }
+        },
+        {
+          "name": "Readiness /readyz",
+          "request": { "method": "GET", "url": "{{baseUrl}}:8100/readyz", "header": [] }
+        },
+        {
+          "name": "Create Purchase Request (will be Approved next)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8100/v1/purchase-requests/",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"description\":\"50 laptops\",\"amount\":50000,\"currency_code\":\"USD\",\"correlation_id\":\"corr-pr-approved-01\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set('purchaseRequestId', b.request_id||'');}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get Purchase Request by ID",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8100/v1/purchase-requests/{{purchaseRequestId}}",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{tenantId}}" } ]
+          }
+        },
+        {
+          "name": "List Purchase Requests",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8100/v1/purchase-requests/?tenant_id={{tenantId}}",
+            "header": []
+          }
+        },
+        {
+          "name": "Approve Purchase Request",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8100/v1/purchase-requests/{{purchaseRequestId}}/approve",
+            "header": [
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ]
+          }
+        },
+        {
+          "name": "Create Purchase Request (left PENDING - for the not-approved demo below)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8100/v1/purchase-requests/",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"description\":\"still pending\",\"amount\":999,\"currency_code\":\"USD\",\"correlation_id\":\"corr-pr-pending-01\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set('purchaseRequestIdPending', b.request_id||'');}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "02 - Purchase Order Service (8129)",
+      "item": [
+        {
+          "name": "Health /healthz",
+          "request": { "method": "GET", "url": "{{baseUrl}}:8129/healthz", "header": [] }
+        },
+        {
+          "name": "Readiness /readyz",
+          "request": { "method": "GET", "url": "{{baseUrl}}:8129/readyz", "header": [] }
+        },
+        {
+          "name": "Issue Purchase Order (standalone, no purchase_request_id)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"total_amount\":1500.50,\"currency_code\":\"USD\",\"correlation_id\":\"corr-po-standalone-01\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if(pm.response.code===201){const b=pm.response.json();pm.collectionVariables.set('purchaseOrderId', b.purchase_order_id||'');}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Issue Purchase Order AGAIN, same correlation_id (idempotent replay - expect 200, same po_id, no duplicate)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"total_amount\":1500.50,\"currency_code\":\"USD\",\"correlation_id\":\"corr-po-standalone-01\"}"
+            }
+          }
+        },
+        {
+          "name": "Issue Purchase Order without X-Principal-Id (expect 401)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"total_amount\":100,\"currency_code\":\"USD\",\"correlation_id\":\"corr-po-no-principal-01\"}"
+            }
+          }
+        },
+        {
+          "name": "Get Purchase Order by ID",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/{{purchaseOrderId}}",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{tenantId}}" } ]
+          }
+        },
+        {
+          "name": "List Purchase Orders",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/?tenant_id={{tenantId}}",
+            "header": []
+          }
+        },
+        {
+          "name": "Amend Purchase Order (bumps version, updates total_amount)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/{{purchaseOrderId}}/amend",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"new_total_amount\":1800.00,\"reason\":\"vendor price adjustment\"}"
+            }
+          }
+        },
+        {
+          "name": "Issue Purchase Order Referencing an APPROVED Purchase Request (expect 201)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"purchase_request_id\":\"{{purchaseRequestId}}\",\"total_amount\":50000,\"currency_code\":\"USD\",\"correlation_id\":\"corr-po-with-pr-01\"}"
+            }
+          }
+        },
+        {
+          "name": "Issue Purchase Order Referencing a PENDING (not approved) Purchase Request (expect 422)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"purchase_request_id\":\"{{purchaseRequestIdPending}}\",\"total_amount\":999,\"currency_code\":\"USD\",\"correlation_id\":\"corr-po-with-pending-pr-01\"}"
+            }
+          }
+        },
+        {
+          "name": "Close Purchase Order",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/{{purchaseOrderId}}/close",
+            "header": [
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ]
+          }
+        },
+        {
+          "name": "Amend Purchase Order AFTER Close (expect 422 invalid_transition)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8129/v1/purchase-orders/{{purchaseOrderId}}/amend",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"new_total_amount\":2000.00,\"reason\":\"too late\"}"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

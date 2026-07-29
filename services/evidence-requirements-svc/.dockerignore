@@ -1,0 +1,28 @@
+# .dockerignore for evidence-requirements-svc
+# Keep the build context lean — only source files go to the builder stage.
+# Mirrors audit-event-store-svc's .dockerignore.
+
+# Test artifacts
+**/*_test.go
+**/testdata/
+
+# Local dev / embedded-postgres binary cache (downloaded during go test -tags=integration)
+**/.embedded-postgres-go/
+
+# IDE / OS noise
+.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db
+
+# Deployment files that are not needed inside the image
+deployments/
+
+# Documentation
+docs/
+context.md
+progress.md
+
+# Git metadata
+.git/
+.gitignore

@@ -26,6 +26,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE accounts_payable;
     CREATE DATABASE accounts_receivable;
     CREATE DATABASE purchase_request;
+    CREATE DATABASE purchase_order;
     CREATE DATABASE treasury;
     CREATE DATABASE financial_close;
     CREATE DATABASE bank_reconciliation;
@@ -129,6 +130,10 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_receivabl
 echo "Applying migrations for purchase_request..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_request" -f /migrations/purchase-request/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_request" -f /migrations/purchase-request/000002_add_idempotency_index.up.sql
+
+# Apply migrations for purchase-order-svc
+echo "Applying migrations for purchase_order..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_order" -f /migrations/purchase-order/000001_initial_schema.up.sql
 
 # Apply migrations for treasury-svc
 echo "Applying migrations for treasury..."
@@ -315,5 +320,16 @@ EOSQL
 echo "Applying migrations for corporate_tax..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_tax" -f /migrations/corporate-tax/000001_initial_schema.up.sql
  main
+
+# Create database for evidence-requirements-svc — the seventh and final
+# Governance Platform service (03-microservices.md §5.1, §8.6).
+echo "Creating database: evidence_requirements..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE DATABASE evidence_requirements;
+EOSQL
+
+# Apply migrations for evidence-requirements-svc
+echo "Applying migrations for evidence_requirements..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_requirements" -f /migrations/evidence-requirements/000001_initial_schema.up.sql
 
 echo "All migrations applied successfully."

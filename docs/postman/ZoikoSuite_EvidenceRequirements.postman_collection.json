@@ -1,0 +1,567 @@
+{
+  "info": {
+    "_postman_id": "zoiko-evidence-requirements-svc",
+    "name": "ZoikoSuite - Evidence Requirements Service (+ setup helpers)",
+    "description": "evidence-requirements-svc (8130) plus the authorization-svc (8089) grants needed to exercise it end-to-end.\n\nSpec: docs/architecture/03-microservices.md §8.6 — \"Determines what supporting evidence must exist before an action may be completed.\" Critical constraint: \"No finalization path may skip required evidence states.\"\n\nRun folders in order: 00 (one-time authz setup), then 01, 02, 03.\n\nStart the stack with:\n  docker compose -f deployments/docker-compose.yml up -d postgres kafka authorization-svc document-vault-svc evidence-requirements-svc\n\nNotes:\n- Folder 02's 'NO_REQUIREMENTS_DEFINED' case deliberately uses an action_type nothing is configured for, so it does not depend on folder ordering.\n- Folder 02's SUPPORTING_DOCUMENT case uses a document_id that does not exist in document-vault-svc. It is expected to come back MISSING — that proves asserted artifacts are actually verified rather than trusted, and is not a setup error.\n- Correlation IDs are generated per run with {{$guid}} and captured where a replay needs the same value, so the collection is re-runnable without a database reset.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "type": "string", "value": "http://localhost" },
+    { "key": "tenantId", "type": "string", "value": "aa5c2c9f-1201-43f4-a8fe-41d5684954e8" },
+    { "key": "entityId", "type": "string", "value": "b660fffe-1729-4d42-8ddd-f19db1619225" },
+    { "key": "otherTenantId", "type": "string", "value": "cc111111-2222-3333-4444-555555555555" },
+    { "key": "principalId", "type": "string", "value": "test-principal-1" },
+    { "key": "roleId", "type": "string", "value": "" },
+    { "key": "requirementIdSignature", "type": "string", "value": "" },
+    { "key": "requirementIdTenantWide", "type": "string", "value": "" },
+    { "key": "requirementIdToRetire", "type": "string", "value": "" },
+    { "key": "createCorrId", "type": "string", "value": "" },
+    { "key": "evalCorrId", "type": "string", "value": "" },
+    { "key": "evaluationId", "type": "string", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "00 - Setup: Authorization Grants (8089)",
+      "description": "Catalog mutation is authz-gated. Without these grants folder 01 correctly returns 403 — that is the fail-closed default working, not a bug.",
+      "item": [
+        {
+          "name": "Create Role",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8089/v1/admin/roles",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"role_code\":\"EVIDENCE_ADMIN\",\"role_name\":\"Evidence Requirements Admin\",\"role_scope_type\":\"LEGAL_ENTITY\",\"created_by_principal_id\":\"seed-script\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if(pm.response.code===201||pm.response.code===200){const b=pm.response.json();pm.collectionVariables.set('roleId', b.role_id||'');}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create Permission Bundle (EVIDENCE_REQUIREMENT_CREATE / _RETIRE)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8089/v1/admin/roles/{{roleId}}/permission-bundles",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"bundle_code\":\"EVIDENCE_REQUIREMENT_ACTIONS\",\"permitted_actions\":[\"EVIDENCE_REQUIREMENT_CREATE\",\"EVIDENCE_REQUIREMENT_RETIRE\"]}"
+            }
+          }
+        },
+        {
+          "name": "Create Role Assignment (entity scope)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8089/v1/admin/role-assignments",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"principal_id\":\"{{principalId}}\",\"role_id\":\"{{roleId}}\",\"legal_entity_id\":\"{{entityId}}\",\"effective_from\":\"2026-01-01T00:00:00Z\",\"assigned_by\":\"seed-script\"}"
+            }
+          }
+        },
+        {
+          "name": "Create Role Assignment (tenant scope — for tenant-wide requirements)",
+          "description": "A tenant-wide requirement (no legal_entity_id) authorizes against the tenant itself, which is the broadest scope the rule will apply to. Without this grant, the tenant-wide create in folder 01 returns 403.",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8089/v1/admin/role-assignments",
+            "header": [ { "key": "Content-Type", "value": "application/json" } ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"principal_id\":\"{{principalId}}\",\"role_id\":\"{{roleId}}\",\"legal_entity_id\":\"{{tenantId}}\",\"effective_from\":\"2026-01-01T00:00:00Z\",\"assigned_by\":\"seed-script\"}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "01 - Catalog (8130)",
+      "item": [
+        {
+          "name": "Health — /healthz",
+          "request": { "method": "GET", "url": "{{baseUrl}}:8130/healthz" },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('200', ()=>pm.response.to.have.status(200));" ] } } ]
+        },
+        {
+          "name": "Readiness — /readyz",
+          "request": { "method": "GET", "url": "{{baseUrl}}:8130/readyz" },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('200', ()=>pm.response.to.have.status(200));" ] } } ]
+        },
+        {
+          "name": "Create requirement — SIGNATURE for FINANCE/JOURNAL_POST (entity-scoped)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"evidence_type\":\"SIGNATURE\",\"requirement_payload\":{\"minimum_count\":1,\"description\":\"an authorised signature is required before a journal may be posted\"},\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 created', ()=>pm.expect([200,201]).to.include(pm.response.code));",
+                  "if(pm.response.code<300){const b=pm.response.json();pm.collectionVariables.set('requirementIdSignature', b.evidence_requirement_id||'');}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create requirement — APPROVAL_RECORD, tenant-wide (no legal_entity_id)",
+          "description": "legal_entity_id omitted means the requirement applies to every entity in the tenant. This is the D1 decision (context.md §11.1) in practice: the data model omits legal_entity_id, doctrine requires it, so it is nullable and NULL is meaningful.",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"evidence_type\":\"APPROVAL_RECORD\",\"requirement_payload\":{\"minimum_count\":1},\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('created', ()=>pm.expect([200,201]).to.include(pm.response.code));",
+                  "if(pm.response.code<300){const b=pm.response.json();pm.collectionVariables.set('requirementIdTenantWide', b.evidence_requirement_id||'');pm.test('legal_entity_id is null (tenant-wide)', ()=>pm.expect(b.legal_entity_id).to.be.undefined);}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create requirement — idempotency probe (captures correlation_id)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"PERIOD_LOCK\",\"evidence_type\":\"SUPPORTING_DOCUMENT\",\"requirement_payload\":{\"minimum_count\":1,\"artifact_subtype\":\"RECONCILIATION\"},\"correlation_id\":\"{{createCorrId}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": { "exec": [ "pm.collectionVariables.set('createCorrId', pm.variables.replaceIn('{{$guid}}'));" ] }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('201 on first create', ()=>pm.response.to.have.status(201));",
+                  "if(pm.response.code<300){const b=pm.response.json();pm.collectionVariables.set('requirementIdToRetire', b.evidence_requirement_id||'');}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create requirement — REPLAY same correlation_id → 200, no duplicate",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{tenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"PERIOD_LOCK\",\"evidence_type\":\"SUPPORTING_DOCUMENT\",\"requirement_payload\":{\"minimum_count\":1,\"artifact_subtype\":\"RECONCILIATION\"},\"correlation_id\":\"{{createCorrId}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200 on replay, not 201', ()=>pm.response.to.have.status(200));",
+                  "pm.test('returns the ORIGINAL requirement', ()=>pm.expect(pm.response.json().evidence_requirement_id).to.eql(pm.collectionVariables.get('requirementIdToRetire')));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List requirements in force now (as_of=now)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8130/v1/evidence-requirements?tenant_id={{tenantId}}&as_of=now",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{tenantId}}" } ]
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('200', ()=>pm.response.to.have.status(200));" ] } } ]
+        },
+        {
+          "name": "List full history (omit as_of — includes retired)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8130/v1/evidence-requirements?tenant_id={{tenantId}}",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{tenantId}}" } ]
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('200', ()=>pm.response.to.have.status(200));" ] } } ]
+        },
+        {
+          "name": "Get one requirement",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8130/v1/evidence-requirements/{{requirementIdSignature}}",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{tenantId}}" } ]
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('200', ()=>pm.response.to.have.status(200));" ] } } ]
+        },
+        {
+          "name": "Retire (end-date) a requirement",
+          "description": "Retirement is effective end-dating. There is no DELETE route and no is_deleted flag anywhere in this service.",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements/{{requirementIdToRetire}}/end-date",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\"reason\":\"superseded by a stricter reconciliation requirement\"}" }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200', ()=>pm.response.to.have.status(200));",
+                  "if(pm.response.code===200){pm.test('effective_to is set', ()=>pm.expect(pm.response.json().effective_to).to.be.a('string'));}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Retire AGAIN → 422 already_retired (never a silent no-op)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements/{{requirementIdToRetire}}/end-date",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\"reason\":\"second attempt\"}" }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('422', ()=>pm.response.to.have.status(422));",
+                  "pm.test('already_retired', ()=>pm.expect(pm.response.text()).to.include('already_retired'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "02 - Evaluate (8130)",
+      "item": [
+        {
+          "name": "Evaluate → NO_REQUIREMENTS_DEFINED (unconfigured action)",
+          "description": "An empty catalog for this (domain_code, action_type) is a legitimate data state and is reported as its own outcome. It must NOT come back SATISFIED — that would make 'nobody configured this yet' indistinguishable from 'verified complete', which is the defect shape tax-determination-svc ships with its synthetic ZERO-TAX fallback.",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"NOTHING_CONFIGURED_FOR_THIS\",\"present_artifacts\":[],\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200', ()=>pm.response.to.have.status(200));",
+                  "const b=pm.response.json();",
+                  "pm.test('outcome is NO_REQUIREMENTS_DEFINED', ()=>pm.expect(b.outcome).to.eql('NO_REQUIREMENTS_DEFINED'));",
+                  "pm.test('outcome is NOT SATISFIED', ()=>pm.expect(b.outcome).to.not.eql('SATISFIED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Evaluate → MISSING (no artifacts supplied)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"present_artifacts\":[],\"correlation_id\":\"{{evalCorrId}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": { "exec": [ "pm.collectionVariables.set('evalCorrId', pm.variables.replaceIn('{{$guid}}'));" ] }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200', ()=>pm.response.to.have.status(200));",
+                  "const b=pm.response.json();",
+                  "pm.collectionVariables.set('evaluationId', b.evaluation_id||'');",
+                  "pm.test('outcome is MISSING', ()=>pm.expect(b.outcome).to.eql('MISSING'));",
+                  "pm.test('each unmet requirement is named individually', ()=>pm.expect(b.unmet.length).to.be.above(0));",
+                  "pm.test('unmet entries carry an explainable reason', ()=>pm.expect(b.unmet[0].reason).to.be.a('string').and.not.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Evaluate → REPLAY same correlation_id → original determination, no republish",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"present_artifacts\":[{\"evidence_type\":\"SIGNATURE\",\"reference_id\":\"sig-1\"},{\"evidence_type\":\"APPROVAL_RECORD\",\"reference_id\":\"wf-1\"}],\"correlation_id\":\"{{evalCorrId}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200', ()=>pm.response.to.have.status(200));",
+                  "const b=pm.response.json();",
+                  "pm.test('returns the ORIGINAL evaluation_id', ()=>pm.expect(b.evaluation_id).to.eql(pm.collectionVariables.get('evaluationId')));",
+                  "pm.test('recorded determination wins over a fresh re-evaluation', ()=>pm.expect(b.outcome).to.eql('MISSING'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Evaluate → SATISFIED (both requirements supplied, fresh correlation_id)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"present_artifacts\":[{\"evidence_type\":\"SIGNATURE\",\"reference_id\":\"sig-1\"},{\"evidence_type\":\"APPROVAL_RECORD\",\"reference_id\":\"wf-1\"}],\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200', ()=>pm.response.to.have.status(200));",
+                  "const b=pm.response.json();",
+                  "pm.test('outcome is SATISFIED', ()=>pm.expect(b.outcome).to.eql('SATISFIED'));",
+                  "pm.test('nothing unmet', ()=>pm.expect(b.unmet).to.be.an('array').that.is.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Evaluate → asserted document does not exist → MISSING (verification, not trust)",
+          "description": "PERIOD_LOCK requires a SUPPORTING_DOCUMENT with artifact_subtype RECONCILIATION. The reference_id below is a well-formed UUID that is not in document-vault-svc. Expected: MISSING, with a reason saying the document does not exist. This is the check that stops a caller walking through the gate by claiming evidence it does not have.\n\nNOTE: folder 01 retires the PERIOD_LOCK requirement, so run this BEFORE 01's retire step, or re-create the requirement first. If the requirement is retired this correctly returns NO_REQUIREMENTS_DEFINED instead.",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"PERIOD_LOCK\",\"present_artifacts\":[{\"evidence_type\":\"SUPPORTING_DOCUMENT\",\"reference_id\":\"99999999-9999-9999-9999-999999999999\",\"artifact_subtype\":\"RECONCILIATION\"}],\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('200', ()=>pm.response.to.have.status(200));",
+                  "const b=pm.response.json();",
+                  "pm.test('a nonexistent document does not satisfy the requirement', ()=>pm.expect(['MISSING','NO_REQUIREMENTS_DEFINED']).to.include(b.outcome));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get a past evaluation (the determination is itself evidence)",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluations/{{evaluationId}}",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{tenantId}}" } ]
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('200', ()=>pm.response.to.have.status(200));" ] } } ]
+        }
+      ]
+    },
+    {
+      "name": "03 - Negative / fail-closed cases",
+      "item": [
+        {
+          "name": "Evaluate without X-Tenant-Id → 400 (never a default tenant)",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"present_artifacts\":[],\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('400', ()=>pm.response.to.have.status(400));",
+                  "pm.test('missing_tenant', ()=>pm.expect(pm.response.text()).to.include('missing_tenant'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Evaluate without X-Principal-Id → 401",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/evidence/evaluate",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"present_artifacts\":[],\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('401', ()=>pm.response.to.have.status(401));" ] } } ]
+        },
+        {
+          "name": "Create with a body tenant_id that differs from the header → 403",
+          "description": "Otherwise a caller could write into another tenant's catalog by putting a different tenant_id in the body. The mismatch is rejected before authorization-svc is even consulted.",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"tenant_id\":\"{{otherTenantId}}\",\"legal_entity_id\":\"{{entityId}}\",\"domain_code\":\"FINANCE\",\"action_type\":\"JOURNAL_POST\",\"evidence_type\":\"SIGNATURE\",\"correlation_id\":\"{{$guid}}\"}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('403', ()=>pm.response.to.have.status(403));",
+                  "pm.test('tenant_scope_mismatch', ()=>pm.expect(pm.response.text()).to.include('tenant_scope_mismatch'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Retire without a reason → 400",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}:8130/v1/admin/evidence-requirements/{{requirementIdSignature}}/end-date",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{tenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{principalId}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{}" }
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('400', ()=>pm.response.to.have.status(400));" ] } } ]
+        },
+        {
+          "name": "List without tenant_id → 400",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8130/v1/evidence-requirements",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{tenantId}}" } ]
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('400', ()=>pm.response.to.have.status(400));" ] } } ]
+        },
+        {
+          "name": "Cross-tenant read of a requirement → 404",
+          "description": "Tenant scope is enforced by an explicit tenant_id filter in every store query, not by RLS alone — this platform connects as a Postgres superuser, which unconditionally bypasses RLS.",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}:8130/v1/evidence-requirements/{{requirementIdSignature}}",
+            "header": [ { "key": "X-Tenant-Id", "value": "{{otherTenantId}}" } ]
+          },
+          "event": [ { "listen": "test", "script": { "exec": [ "pm.test('404 — another tenant cannot read this requirement', ()=>pm.response.to.have.status(404));" ] } } ]
+        }
+      ]
+    }
+  ]
+}
