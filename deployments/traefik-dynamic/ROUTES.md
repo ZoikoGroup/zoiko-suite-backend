@@ -47,6 +47,7 @@
 | `/schema-registry-svc` | schema-registry-svc | 8093 |
 | `/search-indexer-svc` | search-indexer-svc | 8096 |
 | `/secret-vault-integration-svc` | secret-vault-integration-svc | 8087 |
+| `/spend-controls-svc` | spend-controls-svc | 8131 |
 | `/tax-determination-svc` | tax-determination-svc | 8126 |
 | `/tax-rules-svc` | tax-rules-svc | 8125 |
 | `/tenant-entity-registry-svc` | tenant-entity-registry-svc | 8081 |
