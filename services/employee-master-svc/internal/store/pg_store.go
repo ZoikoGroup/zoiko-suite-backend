@@ -84,7 +84,7 @@ func (s *PgStore) GetEmployee(ctx context.Context, id string) (*domain.Employee,
 		return tx.QueryRow(ctx, `
 			SELECT employee_id, tenant_id, legal_entity_id, employee_number, first_name, last_name,
 			       email, phone, job_title, department_id, manager_employee_id, worker_type,
-			       status, hire_date, termination_date, effective_from, effective_to, created_at, updated_at
+			       status, hire_date::text, termination_date::text, effective_from, effective_to, created_at, updated_at
 			FROM employees
 			WHERE employee_id = $1 AND tenant_id = $2
 		`, id, tenantID).Scan(
@@ -113,7 +113,7 @@ func (s *PgStore) ListEmployees(ctx context.Context, legalEntityID, status, work
 		query := `
 			SELECT employee_id, tenant_id, legal_entity_id, employee_number, first_name, last_name,
 			       email, phone, job_title, department_id, manager_employee_id, worker_type,
-			       status, hire_date, termination_date, effective_from, effective_to, created_at, updated_at
+			       status, hire_date::text, termination_date::text, effective_from, effective_to, created_at, updated_at
 			FROM employees
 			WHERE tenant_id = $1
 		`

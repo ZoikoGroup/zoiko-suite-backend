@@ -35,6 +35,7 @@ services:
       - ../services/accounts-receivable-svc/deployments/migrations:/migrations/accounts-receivable:ro
       - ../services/purchase-request-svc/deployments/migrations:/migrations/purchase-request:ro
       - ../services/purchase-order-svc/deployments/migrations:/migrations/purchase-order:ro
+      - ../services/spend-controls-svc/deployments/migrations:/migrations/spend-controls:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
       - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
@@ -1159,6 +1160,43 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8129/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Spend Controls Service — 03-microservices.md §12.12. Owns spend-control
+  # enforcement logic and consumption tracking against policy; previously
+  # unbuilt (docs/architecture/known-gaps.md never listed it, and the
+  # service had no directory under services/ at all).
+  spend-controls-svc:
+    build:
+      context: ../services/spend-controls-svc
+      dockerfile: Dockerfile
+    container_name: spend-controls-svc
+    ports:
+      - "8131:8131"
+    environment:
+      PORT: "8131"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: spend_controls
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.spend-controls.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8131/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

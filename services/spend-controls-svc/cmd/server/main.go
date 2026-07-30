@@ -21,15 +21,14 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
-	"zoiko.io/intercompany-accounting-svc/internal/config"
-	"zoiko.io/intercompany-accounting-svc/internal/domain"
-	"zoiko.io/intercompany-accounting-svc/internal/events"
-	"zoiko.io/intercompany-accounting-svc/internal/handler"
-	"zoiko.io/intercompany-accounting-svc/internal/health"
-	"zoiko.io/intercompany-accounting-svc/internal/ledger"
-	svcmiddleware "zoiko.io/intercompany-accounting-svc/internal/middleware"
-	"zoiko.io/intercompany-accounting-svc/internal/store"
-	"zoiko.io/intercompany-accounting-svc/internal/telemetry"
+	"zoiko.io/spend-controls-svc/internal/config"
+	"zoiko.io/spend-controls-svc/internal/domain"
+	"zoiko.io/spend-controls-svc/internal/events"
+	"zoiko.io/spend-controls-svc/internal/handler"
+	"zoiko.io/spend-controls-svc/internal/health"
+	svcmiddleware "zoiko.io/spend-controls-svc/internal/middleware"
+	"zoiko.io/spend-controls-svc/internal/store"
+	"zoiko.io/spend-controls-svc/internal/telemetry"
 )
 
 type httpAuthzClient struct {
@@ -38,6 +37,9 @@ type httpAuthzClient struct {
 	log     *zap.Logger
 }
 
+// authorization-svc's /v1/authorize always responds 200, and signals the
+// actual decision via decision_outcome: "GRANTED" | "DENIED" — there is no
+// "allowed" boolean field in its response.
 func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	reqBody, _ := json.Marshal(map[string]string{
 		"principal_id":    principalID,
@@ -63,12 +65,12 @@ func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEn
 	}
 
 	var res struct {
-		Allowed bool `json:"allowed"`
+		DecisionOutcome string `json:"decision_outcome"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return err
 	}
-	if !res.Allowed {
+	if res.DecisionOutcome != "GRANTED" {
 		return domain.ErrAuthorizationDenied
 	}
 	return nil
@@ -90,15 +92,14 @@ func main() {
 	}
 	defer func() { _ = log.Sync() }()
 
-	log.Info("intercompany-accounting-svc starting",
+	log.Info("spend-controls-svc starting",
 		zap.Int("port", cfg.Port),
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("authz_url", cfg.AuthZServiceURL),
-		zap.String("ledger_url", cfg.LedgerServiceURL),
 	)
 
 	// ── 2b. Tracing ──────────────────────────────────────────────────────────
-	shutdownTracing, err := telemetry.InitTracing(context.Background(), "intercompany-accounting-svc", cfg.OTELExporterEndpoint)
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "spend-controls-svc", cfg.OTELExporterEndpoint)
 	if err != nil {
 		log.Fatal("otel tracing init failed", zap.Error(err))
 	}
@@ -110,7 +111,7 @@ func main() {
 		}
 	}()
 
-	metrics := telemetry.NewMetrics("intercompany-accounting-svc")
+	metrics := telemetry.NewMetrics("spend-controls-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
@@ -140,36 +141,34 @@ func main() {
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
 
-	// AllowAutoTopicCreation is required even though the broker itself has
-	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
-	// this to false and never asks the broker to auto-create in its
-	// metadata request, so every write to a not-yet-existing topic fails
-	// with "Unknown Topic Or Partition" regardless of the broker-side
-	// setting.
 	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+		// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
+		// Writer refuses to produce to a topic it doesn't already know about
+		// unless this is also set client-side — without it, every publish to
+		// a not-yet-existing topic fails with "Unknown Topic Or Partition"
+		// even though the broker would have created it.
 		AllowAutoTopicCreation: true,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log}
-	ledgerClient := ledger.NewClient(cfg.LedgerServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
-	r.Use(otelchi.Middleware("intercompany-accounting-svc", otelchi.WithChiRoutes(r)))
+	r.Use(otelchi.Middleware("spend-controls-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, authzClient, ledgerClient, log)
+	h := handler.New(pgStore, publisher, authzClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
