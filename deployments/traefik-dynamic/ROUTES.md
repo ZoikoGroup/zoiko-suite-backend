@@ -53,6 +53,7 @@
 | `/tenant-entity-registry-svc` | tenant-entity-registry-svc | 8081 |
 | `/treasury-svc` | treasury-svc | 8103 |
 | `/vat-gst-svc` | vat-gst-svc | 8127 |
+| `/vendor-due-diligence-svc` | vendor-due-diligence-svc | 8132 |
 | `/workflow-history-svc` | workflow-history-svc | 8097 |
 | `/workflow-svc` | workflow-svc | 8090 |
 | `/workforce-compliance-svc` | workforce-compliance-svc | 8118 |
