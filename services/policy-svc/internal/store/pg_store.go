@@ -483,10 +483,16 @@ func (s *PgStore) ActivateVersion(ctx context.Context, policyVersionID, actorID 
 // (see PROGRESS.md); v1 assumes at most one Policy per policy_type is
 // the realistic case.
 func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error) {
+	// Column list is policyVersionColumns qualified with the pv. alias, plus
+	// p.policy_code last. Keep it in that order and complete: this query cannot
+	// use the shared const because of the join, and omitting
+	// activated_by_principal_id/activated_at here once made GET /v1/policies
+	// report every ACTIVE version as never activated.
 	const query = `
 		SELECT
 			pv.policy_version_id, pv.policy_id, pv.tenant_id, pv.legal_entity_id,
 			pv.rule_payload, pv.effective_from, pv.effective_to, pv.version_status,
+			pv.activated_by_principal_id, pv.activated_at,
 			pv.created_at, pv.created_by_principal_id, p.policy_code
 		FROM policy_versions pv
 		JOIN policies p ON p.policy_id = pv.policy_id
@@ -512,6 +518,7 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 		if scanErr := rows.Scan(
 			&v.PolicyVersionID, &v.PolicyID, &v.TenantID, &v.LegalEntityID,
 			&v.RulePayload, &v.EffectiveFrom, &v.EffectiveTo, &v.VersionStatus,
+			&v.ActivatedByPrincipalID, &v.ActivatedAt,
 			&v.CreatedAt, &v.CreatedByPrincipalID, &v.PolicyCode,
 		); scanErr != nil {
 			s.log.Error("pg FindApplicableVersions scan failed", zap.Error(scanErr))

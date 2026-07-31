@@ -556,8 +556,13 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	if decisionLog.last.ActorID != "admin-1" {
 		t.Errorf("expected ActorID admin-1, got %s", decisionLog.last.ActorID)
 	}
-	if decisionLog.last.Outcome != "APPROVAL_REQUIRED" {
-		t.Errorf("expected Outcome APPROVAL_REQUIRED, got %s", decisionLog.last.Outcome)
+	// Recorded outcome must be in the decision log's vocabulary
+	// (GRANTED/DENIED/ESCALATED), not this service's own result vocabulary.
+	// ESCALATED, not DENIED: over-threshold routes to an approver rather than
+	// refusing the action. The response above keeps APPROVAL_REQUIRED — the two
+	// vocabularies are deliberately different, so both are asserted here.
+	if decisionLog.last.Outcome != "ESCALATED" {
+		t.Errorf("expected recorded Outcome ESCALATED, got %s", decisionLog.last.Outcome)
 	}
 	if decisionLog.last.RuleBasis != "APPROVAL_5K:pv-1" {
 		t.Errorf("expected RuleBasis APPROVAL_5K:pv-1, got %s", decisionLog.last.RuleBasis)
@@ -687,6 +692,55 @@ func TestEvaluate_AmountEqualsThreshold_IsWithinThreshold(t *testing.T) {
 	}
 	if got.Result != "WITHIN_THRESHOLD" {
 		t.Errorf("expected WITHIN_THRESHOLD when amount == threshold, got %s", got.Result)
+	}
+}
+
+// The GRANTED half of the outcome mapping. Paired with the ESCALATED assertion in
+// TestEvaluate_ApprovalRequired_RecordsDecision: an under-threshold evaluation is
+// a real authorization and must be recorded as one, or the audit trail cannot
+// show that the spend was approved.
+func TestEvaluate_WithinThreshold_RecordsGrantedOutcome(t *testing.T) {
+	store := &stubStore{
+		applicable: []*domain.ApplicablePolicyVersion{
+			{
+				PolicyVersion: domain.PolicyVersion{
+					PolicyVersionID: "pv-1",
+					VersionStatus:   "ACTIVE",
+					RulePayload:     []byte(`{"threshold_amount":5000}`),
+				},
+				PolicyCode: "APPROVAL_5K",
+			},
+		},
+	}
+	decisionLog := &stubDecisionLog{}
+	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
+
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if decisionLog.calls != 1 {
+		t.Fatalf("expected RecordDecision called once, got %d", decisionLog.calls)
+	}
+	if decisionLog.last.Outcome != "GRANTED" {
+		t.Errorf("expected recorded Outcome GRANTED, got %s", decisionLog.last.Outcome)
+	}
+
+	// The API response keeps this service's own result vocabulary — callers switch
+	// on it, so normalising the evidence write must not leak into the contract.
+	var got struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if got.Result != "WITHIN_THRESHOLD" {
+		t.Errorf("expected response result WITHIN_THRESHOLD, got %s", got.Result)
 	}
 }
 

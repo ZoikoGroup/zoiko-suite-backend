@@ -428,6 +428,22 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 		t.Errorf("expected policy_code APPROVAL_5K to be joined in, got %s", resultsA[0].PolicyCode)
 	}
 
+	// Activation attribution must survive the join. This query filters on
+	// version_status = 'ACTIVE', so every row it returns has been activated by
+	// definition — a nil ActivatedAt here means the column was dropped from the
+	// SELECT, not that the version was never activated. The console renders that
+	// as "not recorded" against an ACTIVE policy, which reads as lost audit trail.
+	for i, v := range resultsA {
+		if v.ActivatedAt == nil {
+			t.Errorf("resultsA[%d] (%s): ACTIVE version came back with nil activated_at", i, v.PolicyVersionID)
+		}
+		if v.ActivatedByPrincipalID == nil {
+			t.Errorf("resultsA[%d] (%s): ACTIVE version came back with nil activated_by_principal_id", i, v.PolicyVersionID)
+		} else if *v.ActivatedByPrincipalID != "actor-1" {
+			t.Errorf("resultsA[%d]: expected activated_by_principal_id actor-1, got %s", i, *v.ActivatedByPrincipalID)
+		}
+	}
+
 	// Tenant B: must NOT see tenant A's override — only the global fallback.
 	resultsB, err := s.FindApplicableVersions(ctx, "APPROVAL_THRESHOLD", tenantB, nil)
 	if err != nil {

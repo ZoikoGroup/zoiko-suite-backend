@@ -705,7 +705,7 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 		LegalEntityID:     req.LegalEntityID,
 		ActorID:           req.EvaluatedByPrincipalID,
 		ActionType:        req.PolicyType,
-		Outcome:           result,
+		Outcome:           canonicalOutcome(result),
 		RuleBasis:         ruleBasis,
 		EvaluationContext: req.ActionContext,
 		CorrelationID:     correlationID,
@@ -726,6 +726,39 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 		PolicyVersionID: applicable.PolicyVersionID,
 		RuleBasis:       ruleBasis,
 	})
+}
+
+// canonicalOutcome maps this service's evaluation result onto the governance
+// decision log's outcome vocabulary — GRANTED / DENIED / ESCALATED, per
+// governance-decision-log-svc/internal/domain.GovernanceDecision.Outcome.
+//
+// Necessary because that column is VARCHAR with no CHECK constraint, so writing
+// "WITHIN_THRESHOLD" into it succeeds and then reads back as an outcome no
+// consumer recognises. The admin console buckets unknown outcomes into "needs
+// review" and labels them "not treated as an authorization" — correctly, since it
+// must never render an unknown value as an approval — which meant every decision
+// this service recorded appeared in the audit trail as unreadable rather than as
+// the authorization it was.
+//
+// APPROVAL_REQUIRED maps to ESCALATED, not DENIED: exceeding a threshold routes
+// the action to an approver, it does not refuse it. DENIED would overstate the
+// decision, and the evidence log is append-only, so a wrong outcome cannot be
+// corrected later.
+//
+// The HTTP response deliberately keeps the domain-specific result — that is this
+// service's own API contract and callers switch on it. Only the evidence write is
+// normalised. An unrecognised result passes through unmapped rather than being
+// guessed into an authorization; the console's review bucket is the right place
+// for it.
+func canonicalOutcome(result string) string {
+	switch result {
+	case "WITHIN_THRESHOLD":
+		return "GRANTED"
+	case "APPROVAL_REQUIRED":
+		return "ESCALATED"
+	default:
+		return result
+	}
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
