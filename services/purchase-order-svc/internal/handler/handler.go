@@ -20,6 +20,7 @@ type Store interface {
 	CreateOrder(ctx context.Context, o *domain.PurchaseOrder) (created bool, err error)
 	GetOrder(ctx context.Context, orderID string) (*domain.PurchaseOrder, error)
 	ListOrders(ctx context.Context, filter domain.ListOrdersFilter) ([]domain.PurchaseOrder, error)
+	ListAmendments(ctx context.Context, orderID string) ([]domain.PurchaseOrderAmendment, error)
 	AmendOrder(ctx context.Context, tenantID, orderID string, newTotalAmount float64, reason, actorPrincipalID string) (*domain.PurchaseOrder, error)
 	CloseOrder(ctx context.Context, tenantID, orderID, actorPrincipalID string) (*domain.PurchaseOrder, error)
 }
@@ -69,6 +70,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.IssueOrder)
 		r.Get("/", h.ListOrders)
 		r.Get("/{purchase_order_id}", h.GetOrder)
+		r.Get("/{purchase_order_id}/amendments", h.ListAmendments)
 		r.Post("/{purchase_order_id}/amend", h.AmendOrder)
 		r.Post("/{purchase_order_id}/close", h.CloseOrder)
 	})
@@ -168,6 +170,42 @@ func (h *Handler) ListOrders(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("ListOrders: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// ── GET /v1/purchase-orders/{purchase_order_id}/amendments ───────────────────
+//
+// The append-only amendment ledger for one order, oldest first. AmendOrder has
+// always written these rows — with the before/after totals and the operator's
+// stated reason — and nothing could read them back, so the order's `version`
+// counter was the only evidence an amendment ever happened.
+//
+// The order is resolved first so an unknown id is a 404 rather than an empty
+// list: "this order has no amendments" and "there is no such order" are
+// different facts, and an empty array would report the second as the first.
+func (h *Handler) ListAmendments(w http.ResponseWriter, r *http.Request) {
+	orderID := chi.URLParam(r, "purchase_order_id")
+
+	po, err := h.store.GetOrder(r.Context(), orderID)
+	if err != nil {
+		h.log.Error("ListAmendments: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if po == nil {
+		writeError(w, http.StatusNotFound, "order_not_found", "")
+		return
+	}
+
+	list, err := h.store.ListAmendments(r.Context(), orderID)
+	if err != nil {
+		h.log.Error("ListAmendments: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if list == nil {
+		list = []domain.PurchaseOrderAmendment{}
 	}
 	writeJSON(w, http.StatusOK, list)
 }

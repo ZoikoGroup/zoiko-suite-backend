@@ -259,6 +259,23 @@ type activateVersionRequest struct {
 	ActivatedByPrincipalID string `json:"activated_by_principal_id"`
 }
 
+// activateVersionResponse is the activated version plus whether this call is
+// what activated it.
+//
+// The store already distinguishes the two cases — it short-circuits when the
+// target is already ACTIVE and returns transitioned=false — but that flag used
+// to be dropped here, so a real DRAFT->ACTIVE transition and a no-op repeat
+// were byte-identical 200s. A caller could not tell whether its own request
+// changed anything, which is the same "a replay must not read as a write"
+// distinction CreateSecretPolicy makes with 201-vs-200.
+//
+// The version is embedded by pointer so every field it already returned stays
+// exactly where it was: this only adds a key.
+type activateVersionResponse struct {
+	*domain.SecretPolicyVersion
+	Transitioned bool `json:"transitioned"`
+}
+
 // ActivateVersion handles
 // POST /v1/secret-policies/{secret_policy_id}/versions/{version_id}/activate.
 func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
@@ -292,7 +309,7 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activated, _, _, err := h.store.ActivateVersion(r.Context(), versionID, req.ActivatedByPrincipalID)
+	activated, _, transitioned, err := h.store.ActivateVersion(r.Context(), versionID, req.ActivatedByPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrInvalidTransition):
@@ -303,7 +320,10 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, activated)
+	writeJSON(w, http.StatusOK, activateVersionResponse{
+		SecretPolicyVersion: activated,
+		Transitioned:        transitioned,
+	})
 }
 
 // ── POST /v1/secret-policies/{id}/material ──────────────────────────────────
@@ -727,7 +747,24 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("RevokeLease: failed to record REVOKED audit entry", zap.Error(err))
 		}
 	}
-	writeJSON(w, http.StatusOK, lease)
+	writeJSON(w, http.StatusOK, revokeLeaseResponse{
+		SecretLease:  lease,
+		Transitioned: transitioned,
+	})
+}
+
+// revokeLeaseResponse is the lease plus whether this call is what revoked it.
+//
+// Revoking an already-REVOKED lease is a 200 returning the record untouched
+// (the store short-circuits on that status) and writes no second audit entry.
+// Without this flag a first revoke and a repeat were indistinguishable, so a
+// caller had to guess whether the REVOKED audit entry came from its own
+// request. `revoked_at` cannot answer that — it is already set either way.
+//
+// Embedded by pointer so the existing lease fields are unchanged.
+type revokeLeaseResponse struct {
+	*domain.SecretLease
+	Transitioned bool `json:"transitioned"`
 }
 
 // ── POST /v1/secret-policies/{id}/rotate ────────────────────────────────────
