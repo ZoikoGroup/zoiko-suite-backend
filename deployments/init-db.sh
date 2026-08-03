@@ -46,6 +46,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE workforce_compliance;
     CREATE DATABASE spend_controls;
     CREATE DATABASE vendor_due_diligence;
+    CREATE DATABASE notification;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -144,6 +145,10 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "spend_controls" -f
 # Apply migrations for vendor-due-diligence-svc
 echo "Applying migrations for vendor_due_diligence..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligence" -f /migrations/vendor-due-diligence/000001_initial_schema.up.sql
+
+# Apply migrations for notification-svc
+echo "Applying migrations for notification..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "notification" -f /migrations/notification/000001_initial_schema.up.sql
 
 # Apply migrations for treasury-svc
 echo "Applying migrations for treasury..."

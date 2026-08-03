@@ -34,6 +34,7 @@
 | `/invoice-approval-svc` | invoice-approval-svc | 8107 |
 | `/jurisdiction-rules-svc` | jurisdiction-rules-svc | 8082 |
 | `/leave-absence-svc` | leave-absence-svc | 8115 |
+| `/notification-svc` | notification-svc | 8133 |
 | `/obligation-tracking-svc` | obligation-tracking-svc | 8121 |
 | `/obligations-svc` | obligations-svc | 8088 |
 | `/offboarding-severance-svc` | offboarding-severance-svc | 8117 |

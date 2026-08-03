@@ -253,6 +253,14 @@ http:
             middlewares:
                 - strip-leave-absence-svc
             priority: 50
+        svc-notification-svc:
+            rule: PathPrefix(`/notification-svc`)
+            entryPoints:
+                - web
+            service: svc-notification-svc
+            middlewares:
+                - strip-notification-svc
+            priority: 50
         svc-obligation-tracking-svc:
             rule: PathPrefix(`/obligation-tracking-svc`)
             entryPoints:
@@ -554,6 +562,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /leave-absence-svc
+        strip-notification-svc:
+            stripPrefix:
+                prefixes:
+                    - /notification-svc
         strip-obligation-tracking-svc:
             stripPrefix:
                 prefixes:
@@ -763,6 +775,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://leave-absence-svc:8115
+        svc-notification-svc:
+            loadBalancer:
+                servers:
+                    - url: http://notification-svc:8133
         svc-obligation-tracking-svc:
             loadBalancer:
                 servers:

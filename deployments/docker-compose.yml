@@ -37,6 +37,7 @@ services:
       - ../services/purchase-order-svc/deployments/migrations:/migrations/purchase-order:ro
       - ../services/spend-controls-svc/deployments/migrations:/migrations/spend-controls:ro
       - ../services/vendor-due-diligence-svc/deployments/migrations:/migrations/vendor-due-diligence:ro
+      - ../services/notification-svc/deployments/migrations:/migrations/notification:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
       - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
@@ -1241,6 +1242,46 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8132/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Notification Service — 03-microservices.md §9.7. Handles governed
+  # notifications for workflows, deadlines, escalations, approvals, and status
+  # changes; previously unbuilt. Delivery is a documented stub (see
+  # internal/handler/handler.go) — no real email/SMS/webhook provider is
+  # wired up on the platform yet. Delivery failure is deliberately never a
+  # 5xx to the caller, per the service's own critical constraint: "notification
+  # failure must not collapse source operational workflows."
+  notification-svc:
+    build:
+      context: ../services/notification-svc
+      dockerfile: Dockerfile
+    container_name: notification-svc
+    ports:
+      - "8133:8133"
+    environment:
+      PORT: "8133"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: notification
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.notification.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8133/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
