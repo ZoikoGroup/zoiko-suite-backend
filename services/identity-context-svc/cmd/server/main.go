@@ -108,10 +108,17 @@ func main() {
 	// Connects lazily on first write — unlike Postgres/Redis this is not a
 	// fail-fast startup dependency. Publish failures are handled per-call by
 	// the resolver's existing error-return/log path (Gap 1 fix).
+	// AllowAutoTopicCreation is required even though the broker itself has
+	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
+	// this to false and never asks the broker to auto-create in its
+	// metadata request, so every write to a not-yet-existing topic fails
+	// with "Unknown Topic Or Partition" regardless of the broker-side
+	// setting.
 	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
+		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:                  cfg.Kafka.Topic,
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
@@ -145,9 +152,9 @@ func main() {
 	r := chi.NewRouter()
 
 	// Platform middleware
-	r.Use(middleware.RequestID)    // injects X-Request-Id
+	r.Use(middleware.RequestID) // injects X-Request-Id
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)    // never let a panic crash the Tier 0 service
+	r.Use(middleware.Recoverer) // never let a panic crash the Tier 0 service
 	r.Use(otelchi.Middleware("identity-context-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 

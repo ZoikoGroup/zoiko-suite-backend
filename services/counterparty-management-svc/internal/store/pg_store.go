@@ -94,7 +94,7 @@ func (s *PgStore) GetCounterparty(ctx context.Context, id string) (*domain.Count
 	err = tx.QueryRow(ctx, `
 		SELECT counterparty_id, tenant_id, legal_entity_id, name, counterparty_type, COALESCE(registration_number,''),
 		       COALESCE(tax_id,''), jurisdiction_id, risk_category, status, COALESCE(contact_email,''),
-		       COALESCE(phone,''), COALESCE(address,''), compliance_status, effective_from, effective_to,
+		       COALESCE(phone,''), COALESCE(address,''), compliance_status, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM counterparties WHERE counterparty_id = $1`, id,
 	).Scan(
@@ -129,7 +129,7 @@ func (s *PgStore) ListCounterparties(ctx context.Context, legalEntityID, counter
 	rows, err := tx.Query(ctx, `
 		SELECT counterparty_id, tenant_id, legal_entity_id, name, counterparty_type, COALESCE(registration_number,''),
 		       COALESCE(tax_id,''), jurisdiction_id, risk_category, status, COALESCE(contact_email,''),
-		       COALESCE(phone,''), COALESCE(address,''), compliance_status, effective_from, effective_to,
+		       COALESCE(phone,''), COALESCE(address,''), compliance_status, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM counterparties
 		WHERE ($1 = '' OR legal_entity_id = $1)

@@ -357,6 +357,14 @@ http:
             middlewares:
                 - strip-secret-vault-integration-svc
             priority: 50
+        svc-spend-controls-svc:
+            rule: PathPrefix(`/spend-controls-svc`)
+            entryPoints:
+                - web
+            service: svc-spend-controls-svc
+            middlewares:
+                - strip-spend-controls-svc
+            priority: 50
         svc-tax-determination-svc:
             rule: PathPrefix(`/tax-determination-svc`)
             entryPoints:
@@ -396,6 +404,14 @@ http:
             service: svc-vat-gst-svc
             middlewares:
                 - strip-vat-gst-svc
+            priority: 50
+        svc-vendor-due-diligence-svc:
+            rule: PathPrefix(`/vendor-due-diligence-svc`)
+            entryPoints:
+                - web
+            service: svc-vendor-due-diligence-svc
+            middlewares:
+                - strip-vendor-due-diligence-svc
             priority: 50
         svc-workflow-history-svc:
             rule: PathPrefix(`/workflow-history-svc`)
@@ -590,6 +606,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /secret-vault-integration-svc
+        strip-spend-controls-svc:
+            stripPrefix:
+                prefixes:
+                    - /spend-controls-svc
         strip-tax-determination-svc:
             stripPrefix:
                 prefixes:
@@ -610,6 +630,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /vat-gst-svc
+        strip-vendor-due-diligence-svc:
+            stripPrefix:
+                prefixes:
+                    - /vendor-due-diligence-svc
         strip-workflow-history-svc:
             stripPrefix:
                 prefixes:
@@ -791,6 +815,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://secret-vault-integration-svc:8087
+        svc-spend-controls-svc:
+            loadBalancer:
+                servers:
+                    - url: http://spend-controls-svc:8131
         svc-tax-determination-svc:
             loadBalancer:
                 servers:
@@ -811,6 +839,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://vat-gst-svc:8127
+        svc-vendor-due-diligence-svc:
+            loadBalancer:
+                servers:
+                    - url: http://vendor-due-diligence-svc:8132
         svc-workflow-history-svc:
             loadBalancer:
                 servers:
