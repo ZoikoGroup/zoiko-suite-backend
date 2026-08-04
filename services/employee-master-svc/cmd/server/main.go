@@ -61,13 +61,19 @@ func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEn
 		return domain.ErrAuthzServiceUnavailable
 	}
 
+	// authorization-svc's /v1/authorize always responds 200, and signals the
+	// actual decision via decision_outcome: "GRANTED" | "DENIED" — there is
+	// no "allowed" boolean field. A prior version of this client decoded a
+	// non-existent "allowed" field, which silently stayed false (Go's zero
+	// value) on every response, denying every request regardless of the
+	// real decision.
 	var res struct {
-		Allowed bool `json:"allowed"`
+		DecisionOutcome string `json:"decision_outcome"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return err
 	}
-	if !res.Allowed {
+	if res.DecisionOutcome != "GRANTED" {
 		return domain.ErrAuthorizationDenied
 	}
 	return nil
@@ -138,10 +144,17 @@ func main() {
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
 
+	// AllowAutoTopicCreation is required even though the broker itself has
+	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
+	// this to false and never asks the broker to auto-create in its
+	// metadata request, so every write to a not-yet-existing topic fails
+	// with "Unknown Topic Or Partition" regardless of the broker-side
+	// setting.
 	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
+		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:                  cfg.Kafka.Topic,
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 

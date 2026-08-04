@@ -100,10 +100,17 @@ func main() {
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool, log)
 
+	// AllowAutoTopicCreation is required even though the broker itself has
+	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
+	// this to false and never asks the broker to auto-create in its
+	// metadata request, so every write to a not-yet-existing topic fails
+	// with "Unknown Topic Or Partition" regardless of the broker-side
+	// setting.
 	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
+		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:                  cfg.Kafka.Topic,
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
