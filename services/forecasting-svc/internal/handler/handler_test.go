@@ -15,18 +15,31 @@ import (
 	"zoiko.io/forecasting-svc/internal/store"
 )
 
-func setupTestRouter() http.Handler {
+// newGrantingAuthzServer stands in for authorization-svc in tests: it
+// always grants, matching the real service's contract of always returning
+// HTTP 200 with a decision in the body.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) http.Handler {
 	logger := zap.NewNop()
 	memStore := store.NewMemoryStore()
 	publisher := events.NewPublisher([]string{"localhost:9092"}, "zoiko.forecasting.events", logger)
-	authzClient := authz.NewClient("http://localhost:8089", logger)
+	authzSrv := newGrantingAuthzServer(t)
+	authzClient := authz.NewClient(authzSrv.URL, logger)
 	h := handler.NewHandler(memStore, publisher, authzClient, logger)
 
 	return handler.NewRouter(h)
 }
 
 func TestHealthCheck(t *testing.T) {
-	router := setupTestRouter()
+	router := setupTestRouter(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -48,7 +61,7 @@ func TestHealthCheck(t *testing.T) {
 }
 
 func TestGenerateAndLifecycleForecast(t *testing.T) {
-	router := setupTestRouter()
+	router := setupTestRouter(t)
 
 	// 1. Generate Forecast
 	genReq := domain.GenerateForecastRequest{
@@ -67,6 +80,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/forecasts/generate", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "tenant-test-123")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-01")
 	rec := httptest.NewRecorder()
 
 	router.ServeHTTP(rec, req)
@@ -129,6 +143,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 	recalcReq := httptest.NewRequest(http.MethodPost, "/v1/forecasts/"+createdModel.ID+"/recalculate", bytes.NewBuffer(recalcReqBody))
 	recalcReq.Header.Set("X-Tenant-ID", "tenant-test-123")
 	recalcReq.Header.Set("Content-Type", "application/json")
+	recalcReq.Header.Set("X-Principal-Id", "principal-01")
 	recalcRec := httptest.NewRecorder()
 
 	router.ServeHTTP(recalcRec, recalcReq)
@@ -140,6 +155,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 	// 5. Archive Forecast
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/forecasts/"+createdModel.ID, nil)
 	delReq.Header.Set("X-Tenant-ID", "tenant-test-123")
+	delReq.Header.Set("X-Principal-Id", "principal-01")
 	delRec := httptest.NewRecorder()
 
 	router.ServeHTTP(delRec, delReq)
@@ -150,7 +166,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 }
 
 func TestValidationErrors(t *testing.T) {
-	router := setupTestRouter()
+	router := setupTestRouter(t)
 
 	invalidReq := domain.GenerateForecastRequest{
 		LegalEntityID: "", // Missing

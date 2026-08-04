@@ -15,17 +15,30 @@ import (
 	"zoiko.io/migration-integrity-svc/internal/store"
 )
 
-func newRouter() http.Handler {
+// newMockAuthzServer stands in for authorization-svc during tests, always
+// granting the requested action.
+func newMockAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newRouter(t *testing.T) http.Handler {
 	logger := zap.NewNop()
 	s := store.NewMemoryStore()
 	p := events.NewPublisher([]string{"localhost:9092"}, "zoiko.migration-integrity.events", logger)
-	a := authz.NewClient("http://localhost:8089", logger)
+	authzSrv := newMockAuthzServer(t)
+	a := authz.NewClient(authzSrv.URL, logger)
 	h := handler.NewHandler(s, p, a, logger)
 	return handler.NewRouter(h)
 }
 
 func TestHealthCheck(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -41,7 +54,7 @@ func TestHealthCheck(t *testing.T) {
 }
 
 func TestValidateMigrationAndLifecycle(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 
 	// 1. Validate a mixed dataset — some valid, some violating
 	validateReq := domain.ValidateMigrationRequest{
@@ -65,6 +78,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 	body, _ := json.Marshal(validateReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
+	req.Header.Set("X-Principal-Id", "user-1")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -126,6 +140,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		remBody, _ := json.Marshal(domain.RemediateRequest{Notes: "Corrected in source system"})
 		remReq := httptest.NewRequest(http.MethodPost, "/v1/migrations/"+job.ID+"/audit/"+entryID+"/remediate", bytes.NewBuffer(remBody))
 		remReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
+		remReq.Header.Set("X-Principal-Id", "user-1")
 		remReq.Header.Set("Content-Type", "application/json")
 		remRec := httptest.NewRecorder()
 		router.ServeHTTP(remRec, remReq)
@@ -142,6 +157,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 	// 5. Archive Job
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/migrations/"+job.ID, nil)
 	delReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
+	delReq.Header.Set("X-Principal-Id", "user-1")
 	delRec := httptest.NewRecorder()
 	router.ServeHTTP(delRec, delReq)
 	if delRec.Code != http.StatusOK {
@@ -150,7 +166,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 }
 
 func TestValidateMigrationCleanData(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 
 	cleanReq := domain.ValidateMigrationRequest{
 		LegalEntityID:  "LE-5006",
@@ -168,6 +184,7 @@ func TestValidateMigrationCleanData(t *testing.T) {
 	body, _ := json.Marshal(cleanReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
+	req.Header.Set("X-Principal-Id", "user-1")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -190,12 +207,13 @@ func TestValidateMigrationCleanData(t *testing.T) {
 }
 
 func TestValidationErrors(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 
 	// Missing legal_entity_id
 	body, _ := json.Marshal(domain.ValidateMigrationRequest{MigrationName: "test"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
+	req.Header.Set("X-Principal-Id", "user-1")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 

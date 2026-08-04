@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,15 +16,48 @@ import (
 	"zoiko.io/counterparty-management-svc/internal/store"
 )
 
+// AuthZClient is the authorization-svc contract required by the handler. It
+// fails closed: any non-nil error means the write must be refused.
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+const (
+	actionCounterpartyCreate         = "COUNTERPARTY_CREATE"
+	actionCounterpartyUpdate         = "COUNTERPARTY_UPDATE"
+	actionCounterpartyComplianceEdit = "COUNTERPARTY_COMPLIANCE_UPDATE"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthZClient
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+// requirePrincipal extracts the calling principal from the X-Principal-Id
+// header. If missing, it writes a 401 and returns ok=false.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "missing X-Principal-Id header")
+		return "", false
+	}
+	return principalID, true
+}
+
+// writeAuthzErr fails closed: an explicit denial is a 403, anything else
+// (including authz-svc being unreachable) is a 503.
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -46,6 +80,15 @@ func (h *Handler) CreateCounterparty(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Name == "" || req.CounterpartyType == "" || req.JurisdictionID == "" {
 		writeError(w, http.StatusBadRequest, "name, counterparty_type, and jurisdiction_id are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCounterpartyCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -124,6 +167,15 @@ func (h *Handler) UpdateCounterparty(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionCounterpartyUpdate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	if req.Name != "" {
 		existing.Name = req.Name
 	}
@@ -178,6 +230,25 @@ func (h *Handler) UpdateComplianceStatus(w http.ResponseWriter, r *http.Request)
 	}
 	if req.ComplianceStatus == "" {
 		writeError(w, http.StatusBadRequest, "compliance_status is required")
+		return
+	}
+
+	existing, err := h.store.GetCounterparty(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrCounterpartyNotFound) {
+			writeError(w, http.StatusNotFound, "counterparty not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch counterparty")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionCounterpartyComplianceEdit); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 

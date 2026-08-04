@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -13,6 +14,12 @@ import (
 	"zoiko.io/reporting-orchestration-svc/internal/health"
 	"zoiko.io/reporting-orchestration-svc/internal/middleware"
 	"zoiko.io/reporting-orchestration-svc/internal/store"
+)
+
+const (
+	REPORT_DEFINITION_CREATE = "REPORT_DEFINITION_CREATE"
+	REPORT_DEFINITION_STATUS_UPDATE = "REPORT_DEFINITION_STATUS_UPDATE"
+	REPORT_RUN_TRIGGER       = "REPORT_RUN_TRIGGER"
 )
 
 type Handler struct {
@@ -64,6 +71,15 @@ func (h *Handler) CreateDefinition(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := req.Validate(); err != nil {
 		h.errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, REPORT_DEFINITION_CREATE); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -128,6 +144,21 @@ func (h *Handler) UpdateDefinitionStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	existing, err := h.store.GetDefinitionByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.errJSON(w, http.StatusNotFound, "report definition not found")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, REPORT_DEFINITION_STATUS_UPDATE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	if err := h.store.UpdateDefinitionStatus(r.Context(), tenantID, id, body.Status); err != nil {
 		h.errJSON(w, http.StatusNotFound, "report definition not found")
 		return
@@ -147,6 +178,15 @@ func (h *Handler) TriggerRun(w http.ResponseWriter, r *http.Request) {
 	def, err := h.store.GetDefinitionByID(r.Context(), tenantID, defID)
 	if err != nil {
 		h.errJSON(w, http.StatusNotFound, "report definition not found")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, def.LegalEntityID, REPORT_RUN_TRIGGER); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -219,4 +259,28 @@ func (h *Handler) okJSON(w http.ResponseWriter, code int, payload interface{}) {
 
 func (h *Handler) errJSON(w http.ResponseWriter, code int, msg string) {
 	h.okJSON(w, code, map[string]string{"error": msg})
+}
+
+// requirePrincipal reads the caller's identity from X-Principal-Id, set by
+// the gateway after identity verification. A request with no resolved
+// principal never passed identity verification — fail closed with 401.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		h.errJSON(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// writeAuthzErr maps an authz.CheckAllowed error to the appropriate HTTP
+// response. Denial is 403; any other error (including authorization-svc
+// being unreachable) is 503 — fail closed, never allow silently.
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		h.errJSON(w, http.StatusForbidden, "authorization denied")
+		return
+	}
+	h.logger.Error("authorization check failed", zap.Error(err))
+	h.errJSON(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }

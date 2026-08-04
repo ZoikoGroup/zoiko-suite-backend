@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,15 +16,45 @@ import (
 	"zoiko.io/board-resolutions-svc/internal/store"
 )
 
+// AuthZClient is the subset of authz.Client the handler depends on. Defined as an
+// interface here so tests can supply a stub.
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+const (
+	actionMeetingCreate    = "MEETING_CREATE"
+	actionResolutionCreate = "RESOLUTION_CREATE"
+	actionResolutionVote   = "RESOLUTION_VOTE"
+	actionResolutionPass   = "RESOLUTION_PASS"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthZClient
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "principal identity missing")
+		return "", false
+	}
+	return principalID, true
+}
+
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "forbidden")
+	} else {
+		writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+	}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -47,6 +78,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) CreateMeeting(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.CreateMeetingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -54,6 +90,11 @@ func (h *Handler) CreateMeeting(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Title == "" || req.ScheduledAt.IsZero() {
 		writeError(w, http.StatusBadRequest, "title and scheduled_at are required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionMeetingCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -109,6 +150,11 @@ func (h *Handler) ListMeetings(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateResolution(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.CreateResolutionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -116,6 +162,11 @@ func (h *Handler) CreateResolution(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Title == "" || req.Content == "" || req.Category == "" {
 		writeError(w, http.StatusBadRequest, "title, content, and category are required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionResolutionCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -175,9 +226,29 @@ func (h *Handler) RecordVotes(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.RecordVotesRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	existing, err := h.store.GetResolution(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrResolutionNotFound) {
+			writeError(w, http.StatusNotFound, "resolution not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get resolution")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionResolutionVote); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -202,6 +273,11 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.PassResolutionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -209,6 +285,21 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.PassedBy == "" {
 		writeError(w, http.StatusBadRequest, "passed_by is required")
+		return
+	}
+
+	existing, err := h.store.GetResolution(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrResolutionNotFound) {
+			writeError(w, http.StatusNotFound, "resolution not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get resolution")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionResolutionPass); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 

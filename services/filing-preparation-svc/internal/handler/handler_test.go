@@ -103,10 +103,23 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, draftID, tenantI
 	return nil
 }
 
-func setupTestRouter() (*chi.Mux, *mockStore) {
+// newGrantingAuthzServer starts a stub authorization-svc that grants every
+// request, mirroring the real service's always-200 contract.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) (*chi.Mux, *mockStore) {
 	st := newMockStore()
 	pub := &mockPublisher{}
-	az := authz.NewClient("http://localhost:8089")
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
 	logger, _ := zap.NewDevelopment()
 	h := New(st, pub, az, logger)
 
@@ -116,7 +129,7 @@ func setupTestRouter() (*chi.Mux, *mockStore) {
 }
 
 func TestCreateAndValidateFilingDraft(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	reqPayload := domain.CreateDraftRequest{
 		LegalEntityID:       "entity-001",
@@ -132,6 +145,7 @@ func TestCreateAndValidateFilingDraft(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/filing-preparation/drafts", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "user-001")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -154,6 +168,7 @@ func TestCreateAndValidateFilingDraft(t *testing.T) {
 
 	valReq := httptest.NewRequest("POST", "/v1/filing-preparation/drafts/"+created.DraftID+"/validate", bytes.NewBuffer(valBody))
 	valReq.Header.Set("Content-Type", "application/json")
+	valReq.Header.Set("X-Principal-Id", "user-001")
 	valW := httptest.NewRecorder()
 
 	r.ServeHTTP(valW, valReq)
@@ -176,6 +191,7 @@ func TestCreateAndValidateFilingDraft(t *testing.T) {
 
 	finReq := httptest.NewRequest("POST", "/v1/filing-preparation/drafts/"+created.DraftID+"/finalize", bytes.NewBuffer(finBody))
 	finReq.Header.Set("Content-Type", "application/json")
+	finReq.Header.Set("X-Principal-Id", "user-001")
 	finW := httptest.NewRecorder()
 
 	r.ServeHTTP(finW, finReq)

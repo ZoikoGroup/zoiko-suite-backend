@@ -12,9 +12,16 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"zoiko.io/filing-tracker-svc/internal/authz"
 	"zoiko.io/filing-tracker-svc/internal/domain"
 )
+
+// mockAuthz always grants, so handler tests exercise the store/publish flow
+// without depending on a live authorization-svc.
+type mockAuthz struct{}
+
+func (m *mockAuthz) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	return nil
+}
 
 type mockStore struct {
 	items map[string]*domain.FilingRequirement
@@ -126,7 +133,7 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, filingID, tenant
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
 	pub := &mockPublisher{}
-	az := authz.NewClient("http://localhost:8089")
+	az := &mockAuthz{}
 	logger, _ := zap.NewDevelopment()
 	h := New(st, pub, az, logger)
 
@@ -152,6 +159,7 @@ func TestScheduleSubmitAndConfirmFilingRequirement(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/filing-tracker/requirements", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-tax-manager")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -174,6 +182,7 @@ func TestScheduleSubmitAndConfirmFilingRequirement(t *testing.T) {
 
 	subReq := httptest.NewRequest("POST", "/v1/filing-tracker/requirements/"+created.FilingID+"/submit", bytes.NewBuffer(subBody))
 	subReq.Header.Set("Content-Type", "application/json")
+	subReq.Header.Set("X-Principal-Id", "principal-tax-specialist")
 	subW := httptest.NewRecorder()
 
 	r.ServeHTTP(subW, subReq)
@@ -198,6 +207,7 @@ func TestScheduleSubmitAndConfirmFilingRequirement(t *testing.T) {
 
 	confReq := httptest.NewRequest("POST", "/v1/filing-tracker/requirements/"+created.FilingID+"/confirm", bytes.NewBuffer(confBody))
 	confReq.Header.Set("Content-Type", "application/json")
+	confReq.Header.Set("X-Principal-Id", "principal-tax-specialist")
 	confW := httptest.NewRecorder()
 
 	r.ServeHTTP(confW, confReq)

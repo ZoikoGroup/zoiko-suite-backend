@@ -15,6 +15,11 @@ import (
 	"zoiko.io/esignature-integration-svc/internal/store"
 )
 
+const (
+	ENVELOPE_CREATE = "ENVELOPE_CREATE"
+	ENVELOPE_STATUS_UPDATE = "ENVELOPE_STATUS_UPDATE"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
@@ -46,6 +51,15 @@ func (h *Handler) CreateEnvelope(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LegalEntityID == "" || req.DocumentTitle == "" || req.SignerEmail == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, document_title, and signer_email are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, ENVELOPE_CREATE); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -107,6 +121,25 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	existing, err := h.store.GetEnvelopeByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrEnvelopeNotFound) {
+			writeError(w, http.StatusNotFound, "envelope not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get envelope")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, ENVELOPE_STATUS_UPDATE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	env, err := h.store.UpdateEnvelopeStatus(r.Context(), id, &req)
 	if err != nil {
 		if errors.Is(err, domain.ErrEnvelopeNotFound) {
@@ -129,4 +162,28 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// requirePrincipal reads the caller's identity from X-Principal-Id, set by
+// the gateway after identity verification. A request with no resolved
+// principal never passed identity verification — fail closed with 401.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// writeAuthzErr maps an authz.CheckAllowed error to the appropriate HTTP
+// response. Denial is 403; any other error (including authorization-svc
+// being unreachable) is 503 — fail closed, never allow silently.
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "authorization denied")
+		return
+	}
+	h.logger.Error("authorization check failed", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }

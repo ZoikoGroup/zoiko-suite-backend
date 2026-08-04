@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/corporate-tax-svc/internal/authz"
 	"zoiko.io/corporate-tax-svc/internal/domain"
 	"zoiko.io/corporate-tax-svc/internal/events"
 )
@@ -98,9 +99,20 @@ var _ events.Publisher = (*stubPublisher)(nil)
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-func newTestHandler() *Handler {
+// newStubAuthzServer stands in for authorization-svc and always grants,
+// matching its real contract: HTTP 200 with decision_outcome in the body.
+func newStubAuthzServer(t *testing.T) *authz.Client {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(ts.Close)
+	return authz.NewClient(ts.URL)
+}
+
+func newTestHandler(t *testing.T) *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, nil, logger)
+	return New(newStubStore(), &stubPublisher{}, newStubAuthzServer(t), logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -111,13 +123,14 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "principal-test-01")
 	return r
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 func TestCreateCorporateTaxReturn(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	body := domain.CreateTaxReturnRequest{
 		LegalEntityID:         "le-uk-001",
 		JurisdictionID:        "uk-england",
@@ -162,7 +175,7 @@ func TestCreateCorporateTaxReturn(t *testing.T) {
 }
 
 func TestSubmitCorporateTaxReturn(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 
@@ -197,7 +210,7 @@ func TestSubmitCorporateTaxReturn(t *testing.T) {
 }
 
 func TestAssessCorporateTaxReturn(t *testing.T) {
-	h := newTestHandler()
+	h := newTestHandler(t)
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
 

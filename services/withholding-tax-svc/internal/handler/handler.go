@@ -15,6 +15,14 @@ import (
 	"zoiko.io/withholding-tax-svc/internal/store"
 )
 
+const (
+	ActionWithholdingCalculate        = "WITHHOLDING_TAX_CALCULATE"
+	ActionWithholdingObligationCreate = "WITHHOLDING_OBLIGATION_CREATE"
+	ActionWithholdingObligationUpdate = "WITHHOLDING_OBLIGATION_UPDATE"
+	ActionWithholdingObligationRemit  = "WITHHOLDING_OBLIGATION_REMIT"
+	ActionWithholdingObligationCancel = "WITHHOLDING_OBLIGATION_CANCEL"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
@@ -41,11 +49,21 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) Calculate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.CalculateWithholdingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	if !h.authorize(w, r, principalID, req.LegalEntityID, ActionWithholdingCalculate) {
+		return
+	}
+
 	if req.GrossPaymentAmount <= 0 {
 		writeError(w, http.StatusBadRequest, "gross_payment_amount must be greater than 0")
 		return
@@ -81,6 +99,11 @@ func (h *Handler) Calculate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.CreateObligationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -92,6 +115,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.GrossPaymentAmount <= 0 {
 		writeError(w, http.StatusBadRequest, "gross_payment_amount must be greater than zero")
+		return
+	}
+
+	if !h.authorize(w, r, principalID, req.LegalEntityID, ActionWithholdingObligationCreate) {
 		return
 	}
 
@@ -161,6 +188,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	existing, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrObligationNotFound) {
@@ -168,6 +200,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch withholding tax obligation")
+		return
+	}
+
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, ActionWithholdingObligationUpdate) {
 		return
 	}
 
@@ -197,6 +233,25 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Remit(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
+
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrObligationNotFound) {
+			writeError(w, http.StatusNotFound, "withholding tax obligation not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch withholding tax obligation")
+		return
+	}
+
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, ActionWithholdingObligationRemit) {
+		return
+	}
 
 	var req domain.RemitObligationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -230,6 +285,25 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrObligationNotFound) {
+			writeError(w, http.StatusNotFound, "withholding tax obligation not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch withholding tax obligation")
+		return
+	}
+
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, ActionWithholdingObligationCancel) {
+		return
+	}
+
 	var req domain.CancelObligationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -252,6 +326,33 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = h.publisher.Publish(r.Context(), "withholding_tax.cancelled", id, tenantID, o)
 	writeJSON(w, http.StatusOK, o)
+}
+
+// requirePrincipal extracts the caller's principal ID from the X-Principal-Id header.
+// If missing, it writes a 401 response and returns ok=false.
+func requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// authorize checks with authorization-svc whether principalID may perform actionType
+// on legalEntityID. It writes the appropriate error response and returns ok=false if
+// the action is not authorized (fail closed on any error, including unavailability).
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		return false
+	}
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

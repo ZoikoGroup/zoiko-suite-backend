@@ -19,6 +19,7 @@ type Store interface {
 	List(ctx context.Context, legalEntityID, jurisdictionID, domainName, status string) ([]domain.ComplianceHealth, error)
 	CreateGap(ctx context.Context, g *domain.ComplianceGap) error
 	ListGaps(ctx context.Context, legalEntityID, domainName, severity, status string) ([]domain.ComplianceGap, error)
+	GetGapByID(ctx context.Context, id string) (*domain.ComplianceGap, error)
 	ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest) (*domain.ComplianceGap, error)
 }
 
@@ -259,6 +260,40 @@ func (s *PgStore) ListGaps(ctx context.Context, legalEntityID, domainName, sever
 	}
 	_ = tx.Commit(ctx)
 	return out, nil
+}
+
+func (s *PgStore) GetGapByID(ctx context.Context, id string) (*domain.ComplianceGap, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.setRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+
+	var g domain.ComplianceGap
+	var sevStr, statStr string
+	err = tx.QueryRow(ctx, `
+		SELECT gap_id, tenant_id, legal_entity_id, jurisdiction_id, domain_name,
+		       gap_type, severity, source_reference, description, remediation_plan,
+		       status, detected_at, resolved_at, created_at, updated_at
+		FROM compliance_gaps WHERE gap_id = $1`, id,
+	).Scan(
+		&g.GapID, &g.TenantID, &g.LegalEntityID, &g.JurisdictionID, &g.DomainName,
+		&g.GapType, &sevStr, &g.SourceReference, &g.Description, &g.RemediationPlan,
+		&statStr, &g.DetectedAt, &g.ResolvedAt, &g.CreatedAt, &g.UpdatedAt,
+	)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, domain.ErrGapNotFound
+		}
+		return nil, err
+	}
+	g.Severity = domain.GapSeverity(sevStr)
+	g.Status = domain.GapStatus(statStr)
+	_ = tx.Commit(ctx)
+	return &g, nil
 }
 
 func (s *PgStore) ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest) (*domain.ComplianceGap, error) {

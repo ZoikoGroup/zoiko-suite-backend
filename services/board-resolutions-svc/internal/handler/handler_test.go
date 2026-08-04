@@ -112,9 +112,17 @@ func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
+type stubAuthz struct{}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return nil
+}
+
+var _ AuthZClient = (*stubAuthz)(nil)
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, nil, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -125,6 +133,7 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "principal-test-01")
 	return r
 }
 

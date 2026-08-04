@@ -12,9 +12,18 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"zoiko.io/exception-escalation-svc/internal/authz"
 	"zoiko.io/exception-escalation-svc/internal/domain"
 )
+
+// mockAuthzClient grants every request; used to exercise the happy path in
+// tests that are not specifically testing authz denial/unavailability.
+type mockAuthzClient struct {
+	err error
+}
+
+func (a *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	return a.err
+}
 
 type mockStore struct {
 	cases       map[string]*domain.ExceptionCase
@@ -142,7 +151,7 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, caseID, tenantID
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
 	pub := &mockPublisher{}
-	az := authz.NewClient("http://localhost:8089")
+	az := &mockAuthzClient{}
 	logger, _ := zap.NewDevelopment()
 	h := New(st, pub, az, logger)
 
@@ -169,6 +178,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -192,6 +202,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	escReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/escalate", bytes.NewBuffer(escBody))
 	escReq.Header.Set("Content-Type", "application/json")
+	escReq.Header.Set("X-Principal-Id", "principal-test-01")
 	escW := httptest.NewRecorder()
 
 	r.ServeHTTP(escW, escReq)
@@ -209,6 +220,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	resReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/resolve", bytes.NewBuffer(resBody))
 	resReq.Header.Set("Content-Type", "application/json")
+	resReq.Header.Set("X-Principal-Id", "principal-test-01")
 	resW := httptest.NewRecorder()
 
 	r.ServeHTTP(resW, resReq)
