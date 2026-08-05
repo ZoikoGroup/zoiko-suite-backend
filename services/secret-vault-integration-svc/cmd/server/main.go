@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,6 +32,9 @@ import (
 	"github.com/riandyrn/otelchi"
 	"go.uber.org/zap"
 
+	"github.com/segmentio/kafka-go"
+
+	"zoiko.io/secret-vault-integration-svc/internal/authz"
 	"zoiko.io/secret-vault-integration-svc/internal/config"
 	"zoiko.io/secret-vault-integration-svc/internal/events"
 	"zoiko.io/secret-vault-integration-svc/internal/handler"
@@ -111,7 +115,18 @@ func main() {
 	}
 
 	// ── 6. Event publisher (stub — logs until kafka.Writer is injected) ─────────
-	publisher := events.NewPublisher(log, "secret-vault-events")
+	kafkaWriter := newKafkaWriter(cfg, log)
+	if kafkaWriter != nil {
+		defer func() { _ = kafkaWriter.Close() }()
+	}
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
+	// AuthZ client. Refuses to start in production/staging against a
+	// placeholder URL — no service may silently fall back to permit-all.
+	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+	if err != nil {
+		log.Fatal("authz client construction failed", zap.Error(err))
+	}
 
 	// ── 7. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -123,7 +138,7 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, vaultBackend, publisher, log)
+	h := handler.New(pgStore, vaultBackend, publisher, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 8. Health probes + metrics ────────────────────────────────────────────
@@ -176,4 +191,32 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// newKafkaWriter builds the event-backbone producer, or nil when no brokers
+// are configured.
+//
+// Kafka connects lazily on first write, so it is not a fail-fast startup
+// dependency like Postgres — the same posture as obligations-svc and
+// jurisdiction-rules-svc. A nil writer makes every publish a logged no-op,
+// which keeps a single-service local run to two containers; that fallback is
+// refused outside local development, because a production deployment
+// silently publishing nothing is exactly the failure events exist to prevent.
+func newKafkaWriter(cfg *config.Config, log *zap.Logger) *kafka.Writer {
+	if len(cfg.Kafka.Brokers) == 0 {
+		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging") {
+			log.Fatal("KAFKA_BROKERS must be set in " + cfg.Env + " environment")
+		}
+		log.Warn("no Kafka brokers configured — domain events will be dropped")
+		return nil
+	}
+	return &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+		// Bounded so an unreachable broker delays a response rather than
+		// holding the request open — the write is already committed by the
+		// time an event is emitted.
+		WriteTimeout: 5 * time.Second,
+	}
 }

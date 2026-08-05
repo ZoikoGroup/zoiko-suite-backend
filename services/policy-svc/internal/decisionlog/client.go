@@ -135,6 +135,13 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionPa
 		return fmt.Errorf("build decision request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// governance-decision-log-svc now authenticates writers to its ledger:
+	// an append with no identified caller is a forged governance decision.
+	// The acting principal that produced this evaluation is forwarded as the
+	// writer, in the header the gateway would otherwise set.
+	if params.ActorID != "" {
+		req.Header.Set("X-Principal-Id", params.ActorID)
+	}
 	if params.CorrelationID != "" {
 		req.Header.Set("X-Correlation-ID", params.CorrelationID)
 	}

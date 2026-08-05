@@ -6,11 +6,13 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/domain"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 )
@@ -30,16 +32,68 @@ type EventPublisher interface {
 	PublishDecisionRecorded(ctx context.Context, d domain.GovernanceDecision) error
 }
 
+// ActionRecordDecision is the authorization-svc action_type a caller must
+// hold to append to the governance ledger.
+const ActionRecordDecision = "GOVERNANCE_DECISION_RECORD"
+
 // Handler holds all HTTP handler methods.
 type Handler struct {
 	store     DecisionStore
 	publisher EventPublisher
+	authz     authz.Client
 	log       *zap.Logger
+
+	// authzPlatformScopeID is the legal_entity_id used when a decision is
+	// not scoped to one. authorization-svc rejects an empty legal_entity_id.
+	authzPlatformScopeID string
 }
 
 // New constructs a Handler.
-func New(store DecisionStore, publisher EventPublisher, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, log: log}
+func New(store DecisionStore, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+	return &Handler{
+		store:                store,
+		publisher:            publisher,
+		authz:                authzClient,
+		authzPlatformScopeID: authzPlatformScopeID,
+		log:                  log,
+	}
+}
+
+// requirePrincipal resolves the calling principal from X-Principal-Id.
+//
+// This ledger is append-only evidence. Without an authenticated caller,
+// anything able to reach the port could forge a governance decision — which
+// defeats the point of keeping the ledger. Service callers (policy-svc)
+// forward the acting principal in the same header.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
+		return id, true
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{
+		"error":   "missing_principal",
+		"message": "X-Principal-Id is required to append to the governance ledger",
+	})
+	return "", false
+}
+
+// authorize fails closed on both a denial and an unobtainable decision.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID string) bool {
+	scope := h.authzPlatformScopeID
+	if legalEntityID != "" {
+		scope = legalEntityID
+	}
+	err := h.authz.CheckAllowed(r.Context(), principalID, scope, ActionRecordDecision)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, authz.ErrDenied):
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+	default:
+		h.log.Error("authorization check failed — refusing the write",
+			zap.String("principal_id", principalID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+	}
+	return false
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -121,6 +175,11 @@ func (req createDecisionRequest) missingField() string {
 func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req createDecisionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -135,6 +194,10 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 			"error": "missing_field",
 			"field": missing,
 		})
+		return
+	}
+
+	if !h.authorize(w, r, principalID, req.LegalEntityID) {
 		return
 	}
 

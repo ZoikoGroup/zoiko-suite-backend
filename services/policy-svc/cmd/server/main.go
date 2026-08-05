@@ -29,6 +29,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/config"
 	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/events"
@@ -119,6 +120,13 @@ func main() {
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	decisionLogClient := decisionlog.NewHTTPClient(cfg.GovernanceDecisionLogServiceURL)
 
+	// AuthZ client. Refuses to start in production/staging against a
+	// placeholder URL — no service may silently fall back to permit-all.
+	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+	if err != nil {
+		log.Fatal("authz client construction failed", zap.Error(err))
+	}
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -129,7 +137,7 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, decisionLogClient, log)
+	h := handler.New(pgStore, publisher, decisionLogClient, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

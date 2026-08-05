@@ -66,6 +66,8 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_regi
 echo "Applying migrations for jurisdiction_rules..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000002_add_audit_columns.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000003_add_data_classification.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000004_add_rule_code_index.up.sql
 
 # Apply migrations for governance-decision-log-svc
 echo "Applying migrations for governance_decision_log..."

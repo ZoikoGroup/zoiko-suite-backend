@@ -507,10 +507,26 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
-      AUTHZ_SERVICE_URL: "http://jurisdiction-svc:8082" # mock stub authz points back
+      # Points at the real Authorization Service. This used to point back at
+      # jurisdiction-svc itself ("mock stub authz points back"), which was
+      # only harmless while HTTPAuthZClient.Authorize was a no-op that
+      # returned nil — i.e. while every admin mutation was permitted without
+      # a decision. authz.NewClient now rejects that URL as a placeholder.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Jurisdiction data is platform-wide reference data with no tenant or
+      # legal entity of its own, but authorization-svc rejects an empty
+      # legal_entity_id — so decisions are evaluated against one synthetic
+      # platform-scope entity. Role assignments granting JURISDICTION_* /
+      # JURISDICTION_RULE_* actions must use this same id.
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "jurisdiction-rules-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.jurisdiction.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
       otel-collector:
         condition: service_started
@@ -562,8 +578,19 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Authorization gate. These services previously had none at all, so
+      # anything able to reach the port could write to them. Role
+      # assignments granting the actions below must use AUTHZ_PLATFORM_SCOPE_ID
+      # as legal_entity_id — authorization-svc rejects an empty one.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "governance-decision-log-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8083/healthz"]
@@ -623,6 +650,13 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
+      # Authorization gate. policy-svc had none: anyone able to reach the
+      # port could define a policy, publish a version and activate it.
+      # Role assignments granting POLICY_CREATE / POLICY_VERSION_CREATE /
+      # POLICY_VERSION_ACTIVATE must use AUTHZ_PLATFORM_SCOPE_ID as
+      # legal_entity_id for policies that are not entity-scoped.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "policy-svc"
@@ -660,8 +694,19 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Authorization gate. These services previously had none at all, so
+      # anything able to reach the port could write to them. Role
+      # assignments granting the actions below must use AUTHZ_PLATFORM_SCOPE_ID
+      # as legal_entity_id — authorization-svc rejects an empty one.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "configuration-feature-flag-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.configuration.events"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     # No healthcheck: this service's Dockerfile, unlike every other service's,
     # never built a cmd/healthcheck binary or declared a HEALTHCHECK
@@ -692,8 +737,19 @@ services:
       VAULT_MASTER_KEY_HEX: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       VAULT_LOCAL_STORE_PATH: "/tmp/secret_store.local"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Authorization gate. These services previously had none at all, so
+      # anything able to reach the port could write to them. Role
+      # assignments granting the actions below must use AUTHZ_PLATFORM_SCOPE_ID
+      # as legal_entity_id — authorization-svc rejects an empty one.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "secret-vault-integration-svc"
+      KAFKA_EVENTS_TOPIC: "zoiko.secretvault.events"
     depends_on:
       postgres:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8087/healthz"]
