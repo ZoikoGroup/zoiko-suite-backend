@@ -15,6 +15,13 @@ import (
 	"zoiko.io/tax-authority-interface-svc/internal/store"
 )
 
+const (
+	principalIDHeader = "X-Principal-Id"
+
+	ActionInterfaceCreate = "TAX_INTERFACE_CREATE"
+	ActionFilingSubmit    = "TAX_FILING_SUBMIT"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
@@ -39,6 +46,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) CreateInterface(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID := r.Header.Get(principalIDHeader)
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "missing X-Principal-Id header")
+		return
+	}
+
 	var req domain.CreateInterfaceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -46,6 +59,15 @@ func (h *Handler) CreateInterface(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LegalEntityID == "" || req.Jurisdiction == "" || req.AuthorityName == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, jurisdiction, and authority_name are required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, ActionInterfaceCreate); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to create tax interface")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "authorization check failed")
 		return
 	}
 
@@ -98,6 +120,12 @@ func (h *Handler) ListInterfaces(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) SubmitTaxFiling(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID := r.Header.Get(principalIDHeader)
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "missing X-Principal-Id header")
+		return
+	}
+
 	var req domain.SubmitTaxFilingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -108,12 +136,22 @@ func (h *Handler) SubmitTaxFiling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.store.GetInterfaceByID(r.Context(), req.InterfaceID); err != nil {
+	iface, err := h.store.GetInterfaceByID(r.Context(), req.InterfaceID)
+	if err != nil {
 		if errors.Is(err, domain.ErrInterfaceNotFound) {
 			writeError(w, http.StatusNotFound, "tax interface not found")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to verify tax interface")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, iface.LegalEntityID, ActionFilingSubmit); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to submit tax filing")
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "authorization check failed")
 		return
 	}
 

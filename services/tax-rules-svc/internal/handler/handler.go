@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,14 +16,25 @@ import (
 	"zoiko.io/tax-rules-svc/internal/store"
 )
 
+// AuthZClient is the interface handler depends on for write-path
+// authorization checks. authz.Client satisfies this.
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+const (
+	actionTaxRuleCreate = "TAX_RULE_CREATE"
+	actionTaxRuleUpdate = "TAX_RULE_UPDATE"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthZClient
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
 }
 
@@ -45,6 +57,16 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.JurisdictionID == "" || req.RuleCode == "" || req.Name == "" || req.Category == "" {
 		writeError(w, http.StatusBadRequest, "jurisdiction_id, rule_code, name, and category are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tenantID, actionTaxRuleCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -121,6 +143,16 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.TenantID, actionTaxRuleUpdate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	if req.Name != "" {
 		existing.Name = req.Name
 	}
@@ -150,6 +182,23 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 
 	_ = h.publisher.Publish(r.Context(), "tax_rule.updated", id, tenantID, existing)
 	writeJSON(w, http.StatusOK, existing)
+}
+
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

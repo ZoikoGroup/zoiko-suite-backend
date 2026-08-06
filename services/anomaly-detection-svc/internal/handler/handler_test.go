@@ -109,10 +109,23 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, subjectID, tenan
 	return nil
 }
 
-func setupTestRouter() (*chi.Mux, *mockStore) {
+// newGrantingAuthzServer stands in for authorization-svc in tests: it always
+// grants, matching the real service's contract of always returning HTTP 200
+// with a decision in the body.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) (*chi.Mux, *mockStore) {
 	st := newMockStore()
 	pub := &mockPublisher{}
-	az := authz.NewClient("http://localhost:8089")
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
 	logger, _ := zap.NewDevelopment()
 	h := New(st, pub, az, logger)
 
@@ -122,7 +135,7 @@ func setupTestRouter() (*chi.Mux, *mockStore) {
 }
 
 func TestDetectAndUpdateAnomalyStatus(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	// 1. Detect Anomaly
 	reqPayload := domain.DetectAnomalyRequest{
@@ -139,6 +152,7 @@ func TestDetectAndUpdateAnomalyStatus(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/anomalies/detect", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-01")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -168,6 +182,7 @@ func TestDetectAndUpdateAnomalyStatus(t *testing.T) {
 
 	upReq := httptest.NewRequest("POST", "/v1/anomalies/"+createdRec.AnomalyID+"/status", bytes.NewBuffer(upBody))
 	upReq.Header.Set("Content-Type", "application/json")
+	upReq.Header.Set("X-Principal-Id", "principal-01")
 	upW := httptest.NewRecorder()
 
 	r.ServeHTTP(upW, upReq)
@@ -202,7 +217,7 @@ func TestDetectAndUpdateAnomalyStatus(t *testing.T) {
 }
 
 func TestCreateAndListAnomalyRules(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	rulePayload := domain.CreateRuleRequest{
 		RuleName:       "High Payroll Variance Limit",
@@ -215,6 +230,7 @@ func TestCreateAndListAnomalyRules(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/anomalies/rules", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-01")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)

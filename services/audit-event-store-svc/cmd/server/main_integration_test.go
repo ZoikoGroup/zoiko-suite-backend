@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/audit-event-store-svc/internal/health"
+	"zoiko.io/audit-event-store-svc/internal/store"
 )
 
 // freePort returns an OS-assigned free TCP port on localhost.
@@ -49,20 +51,27 @@ func freePort(t *testing.T) int {
 }
 
 // schema is the minimal DDL needed to satisfy the service's DB expectations.
-// Mirrors deployments/migrations/000001_initial_schema.up.sql.
+// Mirrors deployments/migrations/000001_initial_schema.up.sql and
+// 000002_add_hash_chain_fields.up.sql.
 const schema = `
 CREATE TABLE IF NOT EXISTS audit_events (
-    event_id        TEXT        NOT NULL,
-    event_type      TEXT        NOT NULL,
-    tenant_id       TEXT        NOT NULL,
-    legal_entity_id TEXT        NOT NULL,
-    principal_id    TEXT,
-    source_service  TEXT        NOT NULL,
-    schema_version  TEXT        NOT NULL,
-    payload         JSONB       NOT NULL,
-    stored_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    event_id             TEXT        NOT NULL,
+    event_type           TEXT        NOT NULL,
+    tenant_id            TEXT        NOT NULL,
+    legal_entity_id      TEXT        NOT NULL,
+    principal_id         TEXT,
+    source_service       TEXT        NOT NULL,
+    schema_version       TEXT        NOT NULL,
+    payload              JSONB       NOT NULL,
+    stored_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    correlation_id       TEXT,
+    causation_id         TEXT,
+    sequence_number      BIGINT,
+    payload_hash         TEXT,
+    previous_event_hash  TEXT,
     CONSTRAINT audit_events_pkey PRIMARY KEY (event_id)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS audit_events_sequence_number_idx ON audit_events (sequence_number);
 `
 
 // TestServerHealthProbes is the integration smoke test.
@@ -189,4 +198,142 @@ func TestServerHealthProbes(t *testing.T) {
 	// ── Explicit log of both probe responses for the PR record ────────────
 	t.Log("Both /healthz and /readyz returned 200 ok with correct JSON bodies.")
 	_ = os.Stdout.Sync()
+}
+
+// TestPgStore_HashChain_RealPostgres proves the hash-chain locking logic in
+// internal/store/store.go (pg_advisory_xact_lock + chain-tip read + insert)
+// actually works against a real PostgreSQL server, not just the in-memory
+// FakeStore mirror in internal/store/store_test.go. The advisory lock is
+// the one piece of this feature that's fundamentally untestable without a
+// real Postgres — FakeStore's mutex can't prove the SQL-level locking
+// behaves correctly.
+func TestPgStore_HashChain_RealPostgres(t *testing.T) {
+	dbPort := freePort(t)
+
+	pg := embeddedpostgres.NewDatabase(
+		embeddedpostgres.DefaultConfig().
+			Username("testuser").
+			Password("testpass").
+			Database("audit_event_store").
+			Port(uint32(dbPort)).
+			Logger(io.Discard),
+	)
+	require.NoError(t, pg.Start(), "embedded postgres must start")
+	t.Cleanup(func() { _ = pg.Stop() })
+
+	dsn := fmt.Sprintf(
+		"host=localhost port=%d dbname=audit_event_store user=testuser password=testpass sslmode=disable",
+		dbPort,
+	)
+
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	require.Eventually(t, func() bool {
+		return pool.Ping(ctx) == nil
+	}, 10*time.Second, 200*time.Millisecond, "embedded postgres did not become ready in time")
+
+	_, err = pool.Exec(ctx, schema)
+	require.NoError(t, err, "schema migration must succeed")
+
+	log, _ := zap.NewDevelopment()
+	defer func() { _ = log.Sync() }()
+
+	pgStore := store.NewPgStore(pool, log)
+
+	// Sequential inserts: verify the chain links correctly under real SQL.
+	first := &store.AuditEvent{
+		EventID: "evt-real-1", EventType: "test.event", TenantID: "t1",
+		LegalEntityID: "e1", SourceService: "test-svc", SchemaVersion: "1.0",
+		Payload: json.RawMessage(`{"n":1}`),
+	}
+	require.NoError(t, pgStore.Store(ctx, first))
+	assert.Equal(t, int64(1), first.SequenceNumber)
+	assert.NotEmpty(t, first.PayloadHash)
+	assert.Empty(t, first.PreviousEventHash, "first real row must have no predecessor")
+
+	second := &store.AuditEvent{
+		EventID: "evt-real-2", EventType: "test.event", TenantID: "t1",
+		LegalEntityID: "e1", SourceService: "test-svc", SchemaVersion: "1.0",
+		Payload: json.RawMessage(`{"n":2}`),
+	}
+	require.NoError(t, pgStore.Store(ctx, second))
+	assert.Equal(t, int64(2), second.SequenceNumber)
+	assert.Equal(t, first.PayloadHash, second.PreviousEventHash,
+		"second row must chain to the first row's real, database-computed payload_hash")
+
+	// Duplicate delivery: must not consume a sequence number or break the chain.
+	dup := &store.AuditEvent{
+		EventID: "evt-real-1", EventType: "test.event", TenantID: "t1",
+		LegalEntityID: "e1", SourceService: "test-svc", SchemaVersion: "1.0",
+		Payload: json.RawMessage(`{"n":1}`),
+	}
+	require.NoError(t, pgStore.Store(ctx, dup))
+	assert.Zero(t, dup.SequenceNumber, "duplicate event_id must not advance the real chain")
+
+	third := &store.AuditEvent{
+		EventID: "evt-real-3", EventType: "test.event", TenantID: "t1",
+		LegalEntityID: "e1", SourceService: "test-svc", SchemaVersion: "1.0",
+		Payload: json.RawMessage(`{"n":3}`),
+	}
+	require.NoError(t, pgStore.Store(ctx, third))
+	assert.Equal(t, int64(3), third.SequenceNumber, "no gap: the duplicate above must not have consumed sequence 3")
+	assert.Equal(t, second.PayloadHash, third.PreviousEventHash)
+
+	// Concurrent inserts against the REAL database: this is the actual
+	// property the advisory lock exists to guarantee — no fork, no gap,
+	// no lost update, under real concurrent SQL transactions.
+	const n = 15
+	var wg sync.WaitGroup
+	ready := make(chan struct{})
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-ready
+			e := &store.AuditEvent{
+				EventID: fmt.Sprintf("evt-real-concurrent-%02d", i), EventType: "test.event",
+				TenantID: "t1", LegalEntityID: "e1", SourceService: "test-svc", SchemaVersion: "1.0",
+				Payload: json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+			}
+			assert.NoError(t, pgStore.Store(ctx, e))
+		}()
+	}
+	close(ready)
+	wg.Wait()
+
+	rows, err := pool.Query(ctx, "SELECT sequence_number, payload_hash, previous_event_hash FROM audit_events ORDER BY sequence_number ASC")
+	require.NoError(t, err)
+	defer rows.Close()
+
+	var (
+		seqs       []int64
+		hashes     []string
+		prevHashes []*string
+	)
+	for rows.Next() {
+		var seq int64
+		var hash string
+		var prev *string
+		require.NoError(t, rows.Scan(&seq, &hash, &prev))
+		seqs = append(seqs, seq)
+		hashes = append(hashes, hash)
+		prevHashes = append(prevHashes, prev)
+	}
+	require.NoError(t, rows.Err())
+
+	require.Len(t, seqs, 3+n, "3 sequential + n concurrent rows, minus the one deduped duplicate")
+	for i, seq := range seqs {
+		assert.Equal(t, int64(i+1), seq, "sequence_number must be gap-free and strictly increasing under real concurrent load")
+		if i > 0 {
+			require.NotNil(t, prevHashes[i], "every row after the first must have a previous_event_hash")
+			assert.Equal(t, hashes[i-1], *prevHashes[i],
+				"row at position %d must chain to the immediately preceding row — a mismatch means the advisory lock failed to prevent a fork", i)
+		}
+	}
+
+	t.Logf("Verified a %d-row hash chain (3 sequential + %d concurrent) against real Postgres with no gaps and no forks.", len(seqs), n)
 }

@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/domain"
 	"zoiko.io/contract-lifecycle-svc/internal/events"
 )
@@ -107,11 +108,31 @@ func (p *stubPublisher) Publish(_ context.Context, _ string, _ string, _ string,
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
+// --- Stub authz client ---
+
+// stubAuthzClient grants every request by default, matching the
+// authorization-svc contract's decision_outcome field but skipping the
+// network call. Tests can flip deny/err to exercise failure paths.
+type stubAuthzClient struct {
+	deny bool
+	err  error
+}
+
+func (s *stubAuthzClient) CheckAllowed(_ context.Context, _, _, _ string) error {
+	if s.err != nil {
+		return s.err
+	}
+	if s.deny {
+		return authz.ErrAuthorizationDenied
+	}
+	return nil
+}
+
 // --- Test helpers ---
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, nil, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -122,6 +143,7 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "user-test-01")
 	return r
 }
 

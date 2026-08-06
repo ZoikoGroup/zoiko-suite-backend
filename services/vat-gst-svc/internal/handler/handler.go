@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -8,22 +9,58 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"zoiko.io/vat-gst-svc/internal/authz"
+	authzpkg "zoiko.io/vat-gst-svc/internal/authz"
 	"zoiko.io/vat-gst-svc/internal/domain"
 	"zoiko.io/vat-gst-svc/internal/events"
 	"zoiko.io/vat-gst-svc/internal/middleware"
 	"zoiko.io/vat-gst-svc/internal/store"
 )
 
+// Action constants passed to authorization-svc as action_type. Every write
+// endpoint in this service must be checked against authorization-svc before
+// its mutation runs, and must fail CLOSED (see authz.Client.CheckAllowed).
+const (
+	VATReturnCreate = "VAT_RETURN_CREATE"
+	VATReturnUpdate = "VAT_RETURN_UPDATE"
+	VATReturnFile   = "VAT_RETURN_FILE"
+)
+
+// AuthzChecker is the authorization-svc contract this handler depends on.
+// authz.Client satisfies it; tests can substitute a stub.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthzChecker
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthzChecker, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+// authorize extracts the calling principal from X-Principal-Id and checks
+// it against authorization-svc for the given action on the given legal
+// entity. It writes the appropriate error response and returns false if the
+// caller must not proceed.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, legalEntityID, actionType string) bool {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		}
+		return false
+	}
+	return true
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -46,6 +83,10 @@ func (h *Handler) CreateVATReturn(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LegalEntityID == "" || req.JurisdictionID == "" || req.TaxPeriod == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, jurisdiction_id, and tax_period are required")
+		return
+	}
+
+	if !h.authorize(w, r, req.LegalEntityID, VATReturnCreate) {
 		return
 	}
 
@@ -123,6 +164,10 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.authorize(w, r, existing.LegalEntityID, VATReturnUpdate) {
+		return
+	}
+
 	existing.TotalSalesAmount = req.TotalSalesAmount
 	existing.TotalPurchaseAmount = req.TotalPurchaseAmount
 	existing.OutputTaxAmount = req.OutputTaxAmount
@@ -148,6 +193,20 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.FiledBy == "" {
 		writeError(w, http.StatusBadRequest, "filed_by is required")
+		return
+	}
+
+	existing, err := h.store.GetVATReturn(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrVATReturnNotFound) {
+			writeError(w, http.StatusNotFound, "vat return not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch vat return")
+		return
+	}
+
+	if !h.authorize(w, r, existing.LegalEntityID, VATReturnFile) {
 		return
 	}
 

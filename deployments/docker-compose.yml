@@ -37,6 +37,12 @@ services:
       - ../services/purchase-order-svc/deployments/migrations:/migrations/purchase-order:ro
       - ../services/spend-controls-svc/deployments/migrations:/migrations/spend-controls:ro
       - ../services/vendor-due-diligence-svc/deployments/migrations:/migrations/vendor-due-diligence:ro
+      - ../services/notification-svc/deployments/migrations:/migrations/notification:ro
+      - ../services/procurement-workflow-svc/deployments/migrations:/migrations/procurement-workflow:ro
+      - ../services/performance-review-svc/deployments/migrations:/migrations/performance-review:ro
+      - ../services/delegated-authority-svc/deployments/migrations:/migrations/delegated-authority:ro
+      - ../services/access-control-svc/deployments/migrations:/migrations/access-control:ro
+      - ../services/decision-support-svc/deployments/migrations:/migrations/decision-support:ro
       - ../services/treasury-svc/deployments/migrations:/migrations/treasury:ro
       - ../services/financial-close-svc/deployments/migrations:/migrations/financial-close:ro
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
@@ -1247,6 +1253,285 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # Notification Service — 03-microservices.md §9.7. Handles governed
+  # notifications for workflows, deadlines, escalations, approvals, and status
+  # changes; previously unbuilt. Delivery is a documented stub (see
+  # internal/handler/handler.go) — no real email/SMS/webhook provider is
+  # wired up on the platform yet. Delivery failure is deliberately never a
+  # 5xx to the caller, per the service's own critical constraint: "notification
+  # failure must not collapse source operational workflows."
+  notification-svc:
+    build:
+      context: ../services/notification-svc
+      dockerfile: Dockerfile
+    container_name: notification-svc
+    ports:
+      - "8133:8133"
+    environment:
+      PORT: "8133"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: notification
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.notification.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8133/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Procurement Workflow Service — 03-microservices.md §12.7. Owns
+  # procurement orchestration and governed spend routing; previously
+  # unbuilt. Orchestrates the Procure-to-Pay saga: calls spend-controls-svc
+  # synchronously to check a proposed spend before a case may enter
+  # approval, then — once approved — calls purchase-order-svc synchronously
+  # to issue the real order, matching the doctrine's saga-discipline note
+  # in §17.8.
+  procurement-workflow-svc:
+    build:
+      context: ../services/procurement-workflow-svc
+      dockerfile: Dockerfile
+    container_name: procurement-workflow-svc
+    ports:
+      - "8134:8134"
+    environment:
+      PORT: "8134"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: procurement_workflow
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.procurement-workflow.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      SPEND_CONTROLS_URL: "http://spend-controls-svc:8131"
+      PURCHASE_ORDER_URL: "http://purchase-order-svc:8129"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      spend-controls-svc:
+        condition: service_healthy
+      purchase-order-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8134/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Performance & Review Service — 03-microservices.md §11.10. Owns review
+  # cycles and review records; previously unbuilt. Every review record is
+  # created against a real, synchronously-validated employee_id from
+  # employee-master-svc — a review is never created against an employee_id
+  # that hasn't been confirmed to exist.
+  performance-review-svc:
+    build:
+      context: ../services/performance-review-svc
+      dockerfile: Dockerfile
+    container_name: performance-review-svc
+    ports:
+      - "8135:8135"
+    environment:
+      PORT: "8135"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: performance_review
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.performance-review.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8135/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Delegated Authority Service — 03-microservices.md §9.3. Owns time-bound,
+  # scope-bound delegated authority chains; previously unbuilt. Enforces the
+  # spec's core constraint — "delegated authority must never exceed the
+  # delegator's own authority" — via a real synchronous authorization-svc
+  # call on the delegator (not the caller) for the exact action_type being
+  # delegated, at creation time.
+  delegated-authority-svc:
+    build:
+      context: ../services/delegated-authority-svc
+      dockerfile: Dockerfile
+    container_name: delegated-authority-svc
+    ports:
+      - "8136:8136"
+    environment:
+      PORT: "8136"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: delegated_authority
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.delegated-authority.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8136/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Access Control Service — 03-microservices.md §9.4. Owns role/permission-
+  # bundle DEFINITIONS (the catalogue); previously unbuilt. Scope decision:
+  # authorization-svc keeps owning live RBAC role/assignment data — this
+  # service is the governed authoring layer in front of it, provisioning
+  # each definition into authorization-svc's admin API via a real
+  # synchronous call rather than migrating that data out. See
+  # internal/domain/types.go for the full rationale.
+  access-control-svc:
+    build:
+      context: ../services/access-control-svc
+      dockerfile: Dockerfile
+    container_name: access-control-svc
+    ports:
+      - "8137:8137"
+    environment:
+      PORT: "8137"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: access_control
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.access-control.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8137/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # Decision Support Service — 03-microservices.md §15.5. Provides governed
+  # recommendations at approval/oversight points; previously unbuilt, and
+  # the spec lists no owned objects or events for it at all. Scope chosen:
+  # recommendations are grounded in real historical precedent, computed
+  # from a synchronous call to governance-decision-log-svc's real decision
+  # history rather than an invented heuristic. Per doctrine §15,
+  # intelligence/reporting services fail degraded, not destructive — an
+  # unreachable history source yields a NO_HISTORY recommendation, not an
+  # error, since a recommendation is advisory only.
+  decision-support-svc:
+    build:
+      context: ../services/decision-support-svc
+      dockerfile: Dockerfile
+    container_name: decision-support-svc
+    ports:
+      - "8138:8138"
+    environment:
+      PORT: "8138"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: decision_support
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.decision-support.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      GOVERNANCE_DECISION_LOG_URL: "http://governance-decision-log-svc:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      governance-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8138/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # mTLS Management Service — 05-security.md §5.2/§10.7/§12.4/§18. Owns
+  # service-to-service certificate lifecycle and communication policy;
+  # previously built but never wired into this compose file at all (one of
+  # 6 "Phase 6" services with no compose entry). No Postgres — this service
+  # uses an in-memory store for certs/policies, but its internal CA private
+  # key is persisted to a real volume (mtls_ca_data) so the CA survives
+  # container restarts — losing the CA would invalidate every previously
+  # issued certificate's trust chain.
+  mtls-management-svc:
+    build:
+      context: ../services/mtls-management-svc
+      dockerfile: Dockerfile
+    container_name: mtls-management-svc
+    ports:
+      - "8140:8140"
+    environment:
+      PORT: "8140"
+      CA_DATA_DIR: "/data/ca"
+    volumes:
+      - mtls_ca_data:/data/ca
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # Evidence Requirements Service — 03-microservices.md §8.6. The seventh and
   # final Governance Platform service (§5.1), closing that group at 7/7.
   #
@@ -2282,3 +2567,4 @@ volumes:
   minio_data:
   opensearch_data:
   document_vault_storage:
+  mtls_ca_data:

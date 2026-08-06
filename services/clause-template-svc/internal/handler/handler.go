@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,16 +16,33 @@ import (
 	"zoiko.io/clause-template-svc/internal/store"
 )
 
+// Action types passed to authorization-svc for each write operation.
+const (
+	actionClauseCreate   = "CLAUSE_CREATE"
+	actionClauseUpdate   = "CLAUSE_UPDATE"
+	actionTemplateCreate = "TEMPLATE_CREATE"
+	actionTemplateUpdate = "TEMPLATE_UPDATE"
+)
+
+// AuthZClient checks whether a principal is allowed to perform an action
+// against a legal entity. Implementations must fail closed: any error
+// returned here must be treated as "not authorized".
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthZClient
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
 }
+
+var _ AuthZClient = (*authz.Client)(nil)
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/clauses", func(r chi.Router) {
@@ -54,6 +72,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) CreateClause(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.CreateClauseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -61,6 +84,11 @@ func (h *Handler) CreateClause(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Title == "" || req.Body == "" || req.Category == "" {
 		writeError(w, http.StatusBadRequest, "title, body, and category are required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionClauseCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -118,6 +146,11 @@ func (h *Handler) UpdateClause(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	existing, err := h.store.GetClause(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrClauseNotFound) {
@@ -125,6 +158,11 @@ func (h *Handler) UpdateClause(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch clause")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionClauseUpdate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -164,6 +202,11 @@ func (h *Handler) UpdateClause(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.CreateTemplateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -171,6 +214,11 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Title == "" || req.ContractType == "" {
 		writeError(w, http.StatusBadRequest, "title and contract_type are required")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionTemplateCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -229,6 +277,11 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	existing, err := h.store.GetTemplate(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrTemplateNotFound) {
@@ -236,6 +289,11 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch template")
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateUpdate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -274,6 +332,23 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Helpers ---
+
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "action not authorized")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")

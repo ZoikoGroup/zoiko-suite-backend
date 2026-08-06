@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -13,6 +14,12 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/health"
 	customMiddleware "zoiko.io/reconciliation-intelligence-svc/internal/middleware"
 	"zoiko.io/reconciliation-intelligence-svc/internal/store"
+)
+
+const (
+	RECONCILIATION_ANALYZE      = "RECONCILIATION_ANALYZE"
+	RECONCILIATION_APPLY_RESOLUTION = "RECONCILIATION_APPLY_RESOLUTION"
+	RECONCILIATION_ARCHIVE      = "RECONCILIATION_ARCHIVE"
 )
 
 type Handler struct {
@@ -64,6 +71,15 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 
 	if err := req.Validate(); err != nil {
 		h.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, RECONCILIATION_ANALYZE); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -151,6 +167,21 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		req.ResolutionStatus = domain.StatusApproved
 	}
 
+	job, err := h.store.GetJobByID(r.Context(), tenantID, jobID)
+	if err != nil {
+		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, job.LegalEntityID, RECONCILIATION_APPLY_RESOLUTION); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	item, err := h.store.ApplyResolution(r.Context(), tenantID, jobID, itemID, req.ResolutionStatus, req.ResolutionNotes)
 	if err != nil {
 		h.respondError(w, http.StatusNotFound, err.Error())
@@ -165,6 +196,21 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 	id := chi.URLParam(r, "id")
+
+	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, job.LegalEntityID, RECONCILIATION_ARCHIVE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
 
 	if err := h.store.ArchiveJob(r.Context(), tenantID, id); err != nil {
 		h.respondError(w, http.StatusNotFound, "reconciliation job not found")
@@ -185,4 +231,28 @@ func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface
 
 func (h *Handler) respondError(w http.ResponseWriter, code int, message string) {
 	h.respondJSON(w, code, map[string]string{"error": message})
+}
+
+// requirePrincipal reads the caller's identity from X-Principal-Id, set by
+// the gateway after identity verification. A request with no resolved
+// principal never passed identity verification — fail closed with 401.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		h.respondError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// writeAuthzErr maps an authz.CheckAllowed error to the appropriate HTTP
+// response. Denial is 403; any other error (including authorization-svc
+// being unreachable) is 503 — fail closed, never allow silently.
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		h.respondError(w, http.StatusForbidden, "authorization denied")
+		return
+	}
+	h.logger.Error("authorization check failed", zap.Error(err))
+	h.respondError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }

@@ -119,6 +119,16 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the initiator of a workflow may not be listed as an approver in any
+	// of its own stages. This is a validation error on the caller-supplied
+	// workflow definition, not an authz decision.
+	for _, st := range req.Stages {
+		if st.ApproverPrincipalID == req.InitiatedBy {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].approver_principal_id"})
+			return
+		}
+	}
 
 	instance, stages, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, WorkflowType: req.WorkflowType,
@@ -235,6 +245,17 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	instanceForAuthzCheck, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "SubmitAction")
+		return
+	}
+
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3),
+	// defense-in-depth: the principal who initiated the workflow may never
+	// submit an approve/reject action on it, regardless of whether they are
+	// (incorrectly) recorded as an assigned approver for the current stage.
+	// This covers instances created before CreateWorkflow's validation
+	// existed, or via any path that bypasses it.
+	if req.ActorPrincipalID == instanceForAuthzCheck.InitiatedBy {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
 		return
 	}
 

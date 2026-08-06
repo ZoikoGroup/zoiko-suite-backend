@@ -15,6 +15,11 @@ import (
 	"zoiko.io/external-data-feed-svc/internal/store"
 )
 
+const (
+	FEED_SUBSCRIPTION_CREATE = "FEED_SUBSCRIPTION_CREATE"
+	FEED_EVENT_INGEST        = "FEED_EVENT_INGEST"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
@@ -46,6 +51,15 @@ func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LegalEntityID == "" || req.Provider == "" || req.FeedType == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, provider, and feed_type are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, FEED_SUBSCRIPTION_CREATE); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -106,12 +120,22 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify subscription exists
-	if _, err := h.store.GetSubscriptionByID(r.Context(), req.FeedID); err != nil {
+	sub, err := h.store.GetSubscriptionByID(r.Context(), req.FeedID)
+	if err != nil {
 		if errors.Is(err, domain.ErrFeedNotFound) {
 			writeError(w, http.StatusNotFound, "feed subscription not found")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to verify feed subscription")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sub.LegalEntityID, FEED_EVENT_INGEST); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -150,4 +174,28 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// requirePrincipal reads the caller's identity from X-Principal-Id, set by
+// the gateway after identity verification. A request with no resolved
+// principal never passed identity verification — fail closed with 401.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// writeAuthzErr maps an authz.CheckAllowed error to the appropriate HTTP
+// response. Denial is 403; any other error (including authorization-svc
+// being unreachable) is 503 — fail closed, never allow silently.
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "authorization denied")
+		return
+	}
+	h.logger.Error("authorization check failed", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }

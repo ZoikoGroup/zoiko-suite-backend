@@ -104,6 +104,19 @@ var ErrStoreUnavailable = errorString("workflow store unavailable")
 var ErrAuthorizationDenied = errorString("authorization denied for this approval action")
 var ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
 
+// ErrInitiatorCannotBeApprover is a creation-time validation error:
+// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)
+// forbids a workflow's initiator from being listed as an approver in any
+// of its own stages.
+var ErrInitiatorCannotBeApprover = errorString("initiated_by may not appear as an approver in any stage")
+
+// ErrSelfApprovalNotAllowed is the decision-time, defense-in-depth
+// enforcement of the same Segregation of Duties doctrine: the principal who
+// initiated a workflow may not submit an approve/reject action on it, even
+// if they were (incorrectly) recorded as an assigned approver for the
+// current stage.
+var ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }

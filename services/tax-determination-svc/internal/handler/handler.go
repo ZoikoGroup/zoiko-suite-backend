@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -16,16 +17,52 @@ import (
 	"zoiko.io/tax-determination-svc/internal/store"
 )
 
+// Action constants for authorization-svc calls, shaped <RESOURCE>_<VERB>.
+const (
+	ActionTaxDeterminationCreate   = "TAX_DETERMINATION_CREATE"
+	ActionTaxDeterminationOverride = "TAX_DETERMINATION_OVERRIDE"
+)
+
+// AuthzChecker is the subset of authz.Client's contract the handler depends
+// on. It is an interface (rather than *authz.Client directly) so tests can
+// substitute a stub without exercising real HTTP calls.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+var _ AuthzChecker = (*authz.Client)(nil)
+
 type Handler struct {
 	store       store.Store
 	publisher   events.Publisher
-	authz       *authz.Client
+	authz       AuthzChecker
 	rulesClient *rules.Client
 	logger      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, rc *rules.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthzChecker, rc *rules.Client, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, rulesClient: rc, logger: logger}
+}
+
+// authorize extracts the caller's principal from the X-Principal-Id header
+// and checks the action against authorization-svc before any mutation is
+// performed. It writes the appropriate error response itself when the
+// caller should not proceed.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, legalEntityID, actionType string) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		}
+		return "", false
+	}
+	return principalID, true
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -47,6 +84,10 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TransactionID == "" || req.JurisdictionID == "" || req.TaxCategory == "" || req.GrossAmount <= 0 {
 		writeError(w, http.StatusBadRequest, "transaction_id, jurisdiction_id, tax_category, and positive gross_amount are required")
+		return
+	}
+
+	if _, ok := h.authorize(w, r, req.LegalEntityID, ActionTaxDeterminationCreate); !ok {
 		return
 	}
 
@@ -135,6 +176,20 @@ func (h *Handler) OverrideDetermination(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.Reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required for tax override")
+		return
+	}
+
+	existing, err := h.store.GetDetermination(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrTaxDeterminationNotFound) {
+			writeError(w, http.StatusNotFound, "tax determination not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get tax determination")
+		return
+	}
+
+	if _, ok := h.authorize(w, r, existing.LegalEntityID, ActionTaxDeterminationOverride); !ok {
 		return
 	}
 

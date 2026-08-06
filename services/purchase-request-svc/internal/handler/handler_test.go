@@ -272,6 +272,42 @@ func TestRejectRequest_FromPending_Succeeds(t *testing.T) {
 	}
 }
 
+// TestApproveRequest_SelfApproval_Rejected enforces the platform's
+// Segregation of Duties doctrine (docs/original_doc/zoiko_suite_doc1.txt
+// §12.3): a purchase request's creator may not also be the one who approves
+// it.
+func TestApproveRequest_SelfApproval_Rejected(t *testing.T) {
+	s := newStubStore()
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", RequestedByPrincipalID: "principal-1", Status: domain.RequestStatusPending}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/r1/approve", nil, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for self-approval, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.requests["r1"].Status != domain.RequestStatusPending {
+		t.Fatalf("expected status to remain PENDING after rejected self-approval, got %s", s.requests["r1"].Status)
+	}
+}
+
+// TestRejectRequest_SelfApproval_Rejected mirrors the approve-side check:
+// the requester may not reject their own request either — SoD applies to
+// both decision outcomes.
+func TestRejectRequest_SelfApproval_Rejected(t *testing.T) {
+	s := newStubStore()
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", RequestedByPrincipalID: "principal-1", Status: domain.RequestStatusPending}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/r1/reject",
+		domain.RejectRequestRequest{Reason: "trying to self-reject"}, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for self-rejection, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.requests["r1"].Status != domain.RequestStatusPending {
+		t.Fatalf("expected status to remain PENDING after rejected self-rejection, got %s", s.requests["r1"].Status)
+	}
+}
+
 func TestRejectRequest_AlreadyRejected_Rejected(t *testing.T) {
 	s := newStubStore()
 	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", Status: domain.RequestStatusRejected}

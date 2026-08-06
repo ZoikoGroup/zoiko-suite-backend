@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,15 +16,48 @@ import (
 	"zoiko.io/corporate-actions-svc/internal/store"
 )
 
+// AuthZClient checks whether a principal is authorized to perform an action
+// against authorization-svc. Implementations must fail closed.
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+const (
+	actionCorporateActionCreate  = "CORPORATE_ACTION_CREATE"
+	actionCorporateActionUpdate  = "CORPORATE_ACTION_UPDATE"
+	actionCorporateActionExecute = "CORPORATE_ACTION_EXECUTE"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthZClient
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+// requirePrincipal extracts the calling principal from the X-Principal-Id
+// header. If missing, it writes a 401 response and returns ok=false.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// writeAuthzErr maps an authz error to the appropriate HTTP response,
+// failing closed on anything that isn't an explicit grant.
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -46,6 +80,15 @@ func (h *Handler) CreateAction(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Title == "" || req.ActionType == "" || req.EffectiveDate == "" {
 		writeError(w, http.StatusBadRequest, "title, action_type, and effective_date are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCorporateActionCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -122,6 +165,15 @@ func (h *Handler) UpdateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionCorporateActionUpdate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	if req.Title != "" {
 		existing.Title = req.Title
 	}
@@ -170,6 +222,33 @@ func (h *Handler) ExecuteAction(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ExecutedBy == "" {
 		writeError(w, http.StatusBadRequest, "executed_by is required")
+		return
+	}
+
+	existing, err := h.store.GetAction(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrCorporateActionNotFound) {
+			writeError(w, http.StatusNotFound, "corporate action not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch corporate action")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionCorporateActionExecute); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// a payment batch/corporate action creator may not approve or execute
+	// their own submission.
+	if existing.CreatedBy == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
 		return
 	}
 

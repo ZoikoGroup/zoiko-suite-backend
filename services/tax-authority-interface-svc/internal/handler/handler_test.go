@@ -20,7 +20,17 @@ import (
 func setupTestRouter() (chi.Router, *events.MockPublisher) {
 	st := store.NewMemoryStore()
 	pub := events.NewMockPublisher()
-	az := authz.NewClient("http://localhost:8081")
+
+	// Stub authorization-svc that always grants, so tests exercise the
+	// real fail-closed CheckAllowed path against a live HTTP contract
+	// rather than bypassing it.
+	authzSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+
+	az := authz.NewClient(authzSrv.URL)
 	logger := zap.NewNop()
 
 	h := New(st, pub, az, logger)
@@ -45,6 +55,7 @@ func TestTaxAuthorityFlow(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/tax-authority/interfaces", bytes.NewReader(tfBytes))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-test")
+	req.Header.Set("X-Principal-Id", "user-1")
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -70,6 +81,7 @@ func TestTaxAuthorityFlow(t *testing.T) {
 	subHTTP := httptest.NewRequest("POST", "/v1/tax-authority/filings", bytes.NewReader(subBytes))
 	subHTTP.Header.Set("Content-Type", "application/json")
 	subHTTP.Header.Set("X-Tenant-ID", "tenant-test")
+	subHTTP.Header.Set("X-Principal-Id", "user-1")
 
 	subW := httptest.NewRecorder()
 	r.ServeHTTP(subW, subHTTP)

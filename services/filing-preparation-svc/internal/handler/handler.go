@@ -15,6 +15,13 @@ import (
 	"zoiko.io/filing-preparation-svc/internal/store"
 )
 
+const (
+	ActionFilingDraftCreate   = "FILING_DRAFT_CREATE"
+	ActionFilingDraftUpdate   = "FILING_DRAFT_UPDATE"
+	ActionFilingDraftValidate = "FILING_DRAFT_VALIDATE"
+	ActionFilingDraftFinalize = "FILING_DRAFT_FINALIZE"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
@@ -37,8 +44,39 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 }
 
+// principalID extracts the caller's principal from the X-Principal-Id
+// header. If missing, it writes a 401 response and returns ok=false.
+func principalID(w http.ResponseWriter, r *http.Request) (string, bool) {
+	id := r.Header.Get("X-Principal-Id")
+	if id == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return id, true
+}
+
+// checkAuthorized calls authorization-svc and writes the appropriate error
+// response if the action is denied or the check could not be completed.
+// It fails closed: any error is treated as "not authorized".
+func (h *Handler) checkAuthorized(w http.ResponseWriter, r *http.Request, principal, legalEntityID, action string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principal, legalEntityID, action); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "authorization check unavailable")
+		}
+		return false
+	}
+	return true
+}
+
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
+
+	principal, ok := principalID(w, r)
+	if !ok {
+		return
+	}
 
 	var req domain.CreateDraftRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -47,6 +85,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LegalEntityID == "" || req.JurisdictionID == "" || req.PeriodKey == "" || req.DueDate == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, jurisdiction_id, period_key, and due_date are required")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principal, req.LegalEntityID, ActionFilingDraftCreate) {
 		return
 	}
 
@@ -110,6 +152,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principal, ok := principalID(w, r)
+	if !ok {
+		return
+	}
+
 	existing, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrDraftNotFound) {
@@ -117,6 +164,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch filing draft")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principal, existing.LegalEntityID, ActionFilingDraftUpdate) {
 		return
 	}
 
@@ -148,6 +199,25 @@ func (h *Handler) Validate(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principal, ok := principalID(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrDraftNotFound) {
+			writeError(w, http.StatusNotFound, "filing draft not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch filing draft")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principal, existing.LegalEntityID, ActionFilingDraftValidate) {
+		return
+	}
+
 	var req domain.ValidateDraftRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -178,6 +248,25 @@ func (h *Handler) Validate(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Finalize(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
+
+	principal, ok := principalID(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrDraftNotFound) {
+			writeError(w, http.StatusNotFound, "filing draft not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch filing draft")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principal, existing.LegalEntityID, ActionFilingDraftFinalize) {
+		return
+	}
 
 	var req domain.FinalizeDraftRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

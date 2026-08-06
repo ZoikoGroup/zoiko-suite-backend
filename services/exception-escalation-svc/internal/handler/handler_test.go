@@ -12,9 +12,18 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"zoiko.io/exception-escalation-svc/internal/authz"
 	"zoiko.io/exception-escalation-svc/internal/domain"
 )
+
+// mockAuthzClient grants every request; used to exercise the happy path in
+// tests that are not specifically testing authz denial/unavailability.
+type mockAuthzClient struct {
+	err error
+}
+
+func (a *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	return a.err
+}
 
 type mockStore struct {
 	cases       map[string]*domain.ExceptionCase
@@ -142,7 +151,7 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, caseID, tenantID
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
 	pub := &mockPublisher{}
-	az := authz.NewClient("http://localhost:8089")
+	az := &mockAuthzClient{}
 	logger, _ := zap.NewDevelopment()
 	h := New(st, pub, az, logger)
 
@@ -169,6 +178,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -192,6 +202,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	escReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/escalate", bytes.NewBuffer(escBody))
 	escReq.Header.Set("Content-Type", "application/json")
+	escReq.Header.Set("X-Principal-Id", "principal-test-01")
 	escW := httptest.NewRecorder()
 
 	r.ServeHTTP(escW, escReq)
@@ -209,6 +220,7 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 
 	resReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/resolve", bytes.NewBuffer(resBody))
 	resReq.Header.Set("Content-Type", "application/json")
+	resReq.Header.Set("X-Principal-Id", "principal-test-01")
 	resW := httptest.NewRecorder()
 
 	r.ServeHTTP(resW, resReq)
@@ -223,5 +235,59 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 	}
 	if resolved.CaseStatus != domain.CaseClosed {
 		t.Errorf("expected status CLOSED, got %s", resolved.CaseStatus)
+	}
+}
+
+// TestResolveException_SelfApprovalForbidden enforces Segregation of Duties
+// (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal who created
+// an exception case may not be the same principal who resolves/closes it.
+func TestResolveException_SelfApprovalForbidden(t *testing.T) {
+	r, _ := setupTestRouter()
+
+	const creator = "filing_tracker_svc"
+
+	createReqPayload := domain.CreateExceptionRequest{
+		LegalEntityID:    "entity-001",
+		JurisdictionID:   "GB-UK",
+		ExceptionType:    "OVERDUE_FILING",
+		SeverityLevel:    domain.SeverityHigh,
+		LinkedObjectType: "FILING",
+		LinkedObjectID:   "ftrk-2026-9902",
+		Description:      "VAT return not submitted before due date",
+		AssignedToRole:   "TAX_MANAGER",
+		CreatedBy:        creator,
+	}
+	body, _ := json.Marshal(createReqPayload)
+
+	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", creator)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", w.Code)
+	}
+
+	var created domain.ExceptionCase
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Attempt to resolve as the same principal that created the case.
+	resReqPayload := domain.ResolveCaseRequest{
+		ClosedBy:      creator,
+		ClosureReason: "Late filing approved and submitted with penalty waiver",
+	}
+	resBody, _ := json.Marshal(resReqPayload)
+
+	resReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/resolve", bytes.NewBuffer(resBody))
+	resReq.Header.Set("Content-Type", "application/json")
+	resReq.Header.Set("X-Principal-Id", creator)
+	resW := httptest.NewRecorder()
+	r.ServeHTTP(resW, resReq)
+
+	if resW.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 self-approval rejection, got %d — %s", resW.Code, resW.Body.String())
 	}
 }

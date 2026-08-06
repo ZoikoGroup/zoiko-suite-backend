@@ -12,7 +12,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"zoiko.io/compliance-status-svc/internal/authz"
 	"zoiko.io/compliance-status-svc/internal/domain"
 )
 
@@ -102,6 +101,14 @@ func (m *mockStore) ListGaps(ctx context.Context, legalEntityID, domainName, sev
 	return out, nil
 }
 
+func (m *mockStore) GetGapByID(ctx context.Context, id string) (*domain.ComplianceGap, error) {
+	g, ok := m.gaps[id]
+	if !ok {
+		return nil, domain.ErrGapNotFound
+	}
+	return g, nil
+}
+
 func (m *mockStore) ResolveGap(ctx context.Context, id string, req *domain.ResolveGapRequest) (*domain.ComplianceGap, error) {
 	g, ok := m.gaps[id]
 	if !ok {
@@ -123,10 +130,21 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, subjectID, tenan
 	return nil
 }
 
+// mockAuthzClient grants every request by default, so existing handler
+// behavior tests aren't coupled to a live authorization-svc. Tests that need
+// to exercise denial/unavailability can set decision/err explicitly.
+type mockAuthzClient struct {
+	err error
+}
+
+func (m *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	return m.err
+}
+
 func setupTestRouter() (*chi.Mux, *mockStore) {
 	st := newMockStore()
 	pub := &mockPublisher{}
-	az := authz.NewClient("http://localhost:8089")
+	az := &mockAuthzClient{}
 	logger, _ := zap.NewDevelopment()
 	h := New(st, pub, az, logger)
 
@@ -154,6 +172,7 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/compliance-status/evaluate", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -187,6 +206,7 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 
 	gapReq := httptest.NewRequest("POST", "/v1/compliance-status/gaps", bytes.NewBuffer(gapBody))
 	gapReq.Header.Set("Content-Type", "application/json")
+	gapReq.Header.Set("X-Principal-Id", "principal-test-01")
 	gapW := httptest.NewRecorder()
 
 	r.ServeHTTP(gapW, gapReq)
@@ -206,6 +226,7 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 
 	resReq := httptest.NewRequest("POST", "/v1/compliance-status/gaps/"+createdGap.GapID+"/resolve", bytes.NewBuffer(resBody))
 	resReq.Header.Set("Content-Type", "application/json")
+	resReq.Header.Set("X-Principal-Id", "principal-test-01")
 	resW := httptest.NewRecorder()
 
 	r.ServeHTTP(resW, resReq)
@@ -225,6 +246,7 @@ func TestEvaluateAndResolveComplianceGap(t *testing.T) {
 	// Resolve Gap Second Time -> 409 Conflict
 	resReq2 := httptest.NewRequest("POST", "/v1/compliance-status/gaps/"+createdGap.GapID+"/resolve", bytes.NewBuffer(resBody))
 	resReq2.Header.Set("Content-Type", "application/json")
+	resReq2.Header.Set("X-Principal-Id", "principal-test-01")
 	resW2 := httptest.NewRecorder()
 	r.ServeHTTP(resW2, resReq2)
 	if resW2.Code != http.StatusConflict {
@@ -248,6 +270,7 @@ func TestGetAndListComplianceStatusRecords(t *testing.T) {
 	body1, _ := json.Marshal(req1)
 	r1 := httptest.NewRequest("POST", "/v1/compliance-status/evaluate", bytes.NewBuffer(body1))
 	r1.Header.Set("Content-Type", "application/json")
+	r1.Header.Set("X-Principal-Id", "principal-test-01")
 	w1 := httptest.NewRecorder()
 	r.ServeHTTP(w1, r1)
 

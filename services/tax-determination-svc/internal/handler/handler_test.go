@@ -78,10 +78,20 @@ func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
+// stubAuthz is a stand-in for authz.Client in tests: it never makes a real
+// HTTP call, and lets tests control the grant/deny/error outcome.
+type stubAuthz struct {
+	err error
+}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return s.err
+}
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
 	rulesClient := rules.NewClient("http://localhost:8125")
-	return New(newStubStore(), &stubPublisher{}, nil, rulesClient, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, rulesClient, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -92,6 +102,7 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "user-test-01")
 	return r
 }
 

@@ -112,9 +112,17 @@ func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
+type stubAuthz struct{}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return nil
+}
+
+var _ AuthZClient = (*stubAuthz)(nil)
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, nil, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -125,6 +133,7 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "principal-test-01")
 	return r
 }
 
@@ -189,5 +198,46 @@ func TestPassResolution(t *testing.T) {
 	_ = json.NewDecoder(wPass.Body).Decode(&passed)
 	if passed.Status != domain.ResolutionStatusPassed {
 		t.Errorf("expected PASSED, got %s", passed.Status)
+	}
+}
+
+func TestPassResolution_BySameCreator_Returns403(t *testing.T) {
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the resolution's drafter/creator (identified by the deciding
+	// principal, X-Principal-Id) may not be the one who passes it.
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	// Create a resolution as the same principal that will later attempt
+	// to pass it. CreatedBy is set from X-Principal-Id server-side via
+	// buildRequest's fixed "principal-test-01" header, not from the
+	// request body's CreatedBy field, so the store's CreatedBy must match
+	// that header for this test to exercise the self-approval path.
+	body := domain.CreateResolutionRequest{
+		MeetingID:        "mtg-002",
+		LegalEntityID:    "le-001",
+		ResolutionNumber: "RES-2026-002",
+		Title:            "Approve Executive Compensation",
+		Content:          "Resolved that executive compensation package be approved...",
+		Category:         domain.ResolutionCategoryExecutive,
+		EffectiveFrom:    "2026-01-01",
+		CreatedBy:        "principal-test-01",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/resolutions", body))
+	var created domain.BoardResolution
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+	if created.CreatedBy != "principal-test-01" {
+		t.Fatalf("expected created resolution's CreatedBy to be principal-test-01, got %s", created.CreatedBy)
+	}
+
+	passBody := domain.PassResolutionRequest{
+		PassedBy: "principal-test-01",
+	}
+	wPass := httptest.NewRecorder()
+	r.ServeHTTP(wPass, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass", passBody))
+	if wPass.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 passing a resolution created by the same principal, got %d — %s", wPass.Code, wPass.Body.String())
 	}
 }
