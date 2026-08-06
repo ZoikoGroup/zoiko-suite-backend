@@ -47,6 +47,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE spend_controls;
     CREATE DATABASE vendor_due_diligence;
     CREATE DATABASE notification;
+    CREATE DATABASE procurement_workflow;
+    CREATE DATABASE performance_review;
+    CREATE DATABASE delegated_authority;
+    CREATE DATABASE access_control;
+    CREATE DATABASE decision_support;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -149,6 +154,26 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligen
 # Apply migrations for notification-svc
 echo "Applying migrations for notification..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "notification" -f /migrations/notification/000001_initial_schema.up.sql
+
+# Apply migrations for procurement-workflow-svc
+echo "Applying migrations for procurement_workflow..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "procurement_workflow" -f /migrations/procurement-workflow/000001_initial_schema.up.sql
+
+# Apply migrations for performance-review-svc
+echo "Applying migrations for performance_review..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "performance_review" -f /migrations/performance-review/000001_initial_schema.up.sql
+
+# Apply migrations for delegated-authority-svc
+echo "Applying migrations for delegated_authority..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "delegated_authority" -f /migrations/delegated-authority/000001_initial_schema.up.sql
+
+# Apply migrations for access-control-svc
+echo "Applying migrations for access_control..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "access_control" -f /migrations/access-control/000001_initial_schema.up.sql
+
+# Apply migrations for decision-support-svc
+echo "Applying migrations for decision_support..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "decision_support" -f /migrations/decision-support/000001_initial_schema.up.sql
 
 # Apply migrations for treasury-svc
 echo "Applying migrations for treasury..."

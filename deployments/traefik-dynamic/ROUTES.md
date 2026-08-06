@@ -5,6 +5,7 @@
 
 | Path prefix | Service | Direct port |
 | --- | --- | --- |
+| `/access-control-svc` | access-control-svc | 8137 |
 | `/accounts-payable-svc` | accounts-payable-svc | 8099 |
 | `/accounts-receivable-svc` | accounts-receivable-svc | 8101 |
 | `/audit-event-store-svc` | audit-event-store-svc | 8084 |
@@ -20,6 +21,8 @@
 | `/corporate-actions-svc` | corporate-actions-svc | 8123 |
 | `/corporate-tax-svc` | corporate-tax-svc | 8128 |
 | `/counterparty-management-svc` | counterparty-management-svc | 8124 |
+| `/decision-support-svc` | decision-support-svc | 8138 |
+| `/delegated-authority-svc` | delegated-authority-svc | 8136 |
 | `/document-vault-svc` | document-vault-svc | 8094 |
 | `/employee-master-svc` | employee-master-svc | 8108 |
 | `/employment-contracts-svc` | employment-contracts-svc | 8109 |
@@ -42,7 +45,9 @@
 | `/payroll-exceptions-svc` | payroll-exceptions-svc | 8114 |
 | `/payroll-run-svc` | payroll-run-svc | 8110 |
 | `/payroll-tax-svc` | payroll-tax-svc | 8113 |
+| `/performance-review-svc` | performance-review-svc | 8135 |
 | `/policy-svc` | policy-svc | 8085 |
+| `/procurement-workflow-svc` | procurement-workflow-svc | 8134 |
 | `/purchase-order-svc` | purchase-order-svc | 8129 |
 | `/purchase-request-svc` | purchase-request-svc | 8100 |
 | `/schema-registry-svc` | schema-registry-svc | 8093 |

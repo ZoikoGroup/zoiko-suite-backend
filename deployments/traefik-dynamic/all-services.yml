@@ -21,6 +21,14 @@
 
 http:
     routers:
+        svc-access-control-svc:
+            rule: PathPrefix(`/access-control-svc`)
+            entryPoints:
+                - web
+            service: svc-access-control-svc
+            middlewares:
+                - strip-access-control-svc
+            priority: 50
         svc-accounts-payable-svc:
             rule: PathPrefix(`/accounts-payable-svc`)
             entryPoints:
@@ -140,6 +148,22 @@ http:
             service: svc-counterparty-management-svc
             middlewares:
                 - strip-counterparty-management-svc
+            priority: 50
+        svc-decision-support-svc:
+            rule: PathPrefix(`/decision-support-svc`)
+            entryPoints:
+                - web
+            service: svc-decision-support-svc
+            middlewares:
+                - strip-decision-support-svc
+            priority: 50
+        svc-delegated-authority-svc:
+            rule: PathPrefix(`/delegated-authority-svc`)
+            entryPoints:
+                - web
+            service: svc-delegated-authority-svc
+            middlewares:
+                - strip-delegated-authority-svc
             priority: 50
         svc-document-vault-svc:
             rule: PathPrefix(`/document-vault-svc`)
@@ -317,6 +341,14 @@ http:
             middlewares:
                 - strip-payroll-tax-svc
             priority: 50
+        svc-performance-review-svc:
+            rule: PathPrefix(`/performance-review-svc`)
+            entryPoints:
+                - web
+            service: svc-performance-review-svc
+            middlewares:
+                - strip-performance-review-svc
+            priority: 50
         svc-policy-svc:
             rule: PathPrefix(`/policy-svc`)
             entryPoints:
@@ -324,6 +356,14 @@ http:
             service: svc-policy-svc
             middlewares:
                 - strip-policy-svc
+            priority: 50
+        svc-procurement-workflow-svc:
+            rule: PathPrefix(`/procurement-workflow-svc`)
+            entryPoints:
+                - web
+            service: svc-procurement-workflow-svc
+            middlewares:
+                - strip-procurement-workflow-svc
             priority: 50
         svc-purchase-order-svc:
             rule: PathPrefix(`/purchase-order-svc`)
@@ -446,6 +486,10 @@ http:
                 - strip-workforce-compliance-svc
             priority: 50
     middlewares:
+        strip-access-control-svc:
+            stripPrefix:
+                prefixes:
+                    - /access-control-svc
         strip-accounts-payable-svc:
             stripPrefix:
                 prefixes:
@@ -506,6 +550,14 @@ http:
             stripPrefix:
                 prefixes:
                     - /counterparty-management-svc
+        strip-decision-support-svc:
+            stripPrefix:
+                prefixes:
+                    - /decision-support-svc
+        strip-delegated-authority-svc:
+            stripPrefix:
+                prefixes:
+                    - /delegated-authority-svc
         strip-document-vault-svc:
             stripPrefix:
                 prefixes:
@@ -594,10 +646,18 @@ http:
             stripPrefix:
                 prefixes:
                     - /payroll-tax-svc
+        strip-performance-review-svc:
+            stripPrefix:
+                prefixes:
+                    - /performance-review-svc
         strip-policy-svc:
             stripPrefix:
                 prefixes:
                     - /policy-svc
+        strip-procurement-workflow-svc:
+            stripPrefix:
+                prefixes:
+                    - /procurement-workflow-svc
         strip-purchase-order-svc:
             stripPrefix:
                 prefixes:
@@ -659,6 +719,10 @@ http:
                 prefixes:
                     - /workforce-compliance-svc
     services:
+        svc-access-control-svc:
+            loadBalancer:
+                servers:
+                    - url: http://access-control-svc:8137
         svc-accounts-payable-svc:
             loadBalancer:
                 servers:
@@ -719,6 +783,14 @@ http:
             loadBalancer:
                 servers:
                     - url: http://counterparty-management-svc:8124
+        svc-decision-support-svc:
+            loadBalancer:
+                servers:
+                    - url: http://decision-support-svc:8138
+        svc-delegated-authority-svc:
+            loadBalancer:
+                servers:
+                    - url: http://delegated-authority-svc:8136
         svc-document-vault-svc:
             loadBalancer:
                 servers:
@@ -807,10 +879,18 @@ http:
             loadBalancer:
                 servers:
                     - url: http://payroll-tax-svc:8113
+        svc-performance-review-svc:
+            loadBalancer:
+                servers:
+                    - url: http://performance-review-svc:8135
         svc-policy-svc:
             loadBalancer:
                 servers:
                     - url: http://policy-svc:8085
+        svc-procurement-workflow-svc:
+            loadBalancer:
+                servers:
+                    - url: http://procurement-workflow-svc:8134
         svc-purchase-order-svc:
             loadBalancer:
                 servers:
