@@ -1,66 +1,25 @@
 package store_test
 
 import (
-	"context"
-	"os"
-	"path/filepath"
-	"runtime"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-	"go.uber.org/zap"
-
+	"zoiko.io/jurisdiction-rules-svc/internal/domain"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
 // TestPgStore_FindRules_Integration verifies the real PostgreSQL SQL query for
 // point-in-time rule fetching, specifically proving that:
-// 1. Half-open interval filtering [effective_from, effective_to) works in Postgres.
-// 2. Rules with status 'SUPERSEDED' ARE returned for historical effective_at queries.
-// 3. Rules with status 'DRAFT' are excluded.
+//  1. Half-open interval filtering [effective_from, effective_to) works in Postgres.
+//  2. Rules with status 'SUPERSEDED' ARE returned for historical effective_at queries.
+//  3. Rules with status 'DRAFT' are excluded.
 func TestPgStore_FindRules_Integration(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
-	}
-
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-	defer pool.Close()
-
-	// Locate and apply migration schema
-	_, filename, _, _ := runtime.Caller(0)
-	migPath := filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000001_initial_schema.up.sql")
-	migSQL, err := os.ReadFile(migPath)
-	if err != nil {
-		t.Fatalf("failed to read migration file %s: %v", migPath, err)
-	}
-
-	// Drop tables if existing for clean state
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS jurisdiction_rule_drift_events, jurisdiction_rules, jurisdictions CASCADE;")
-	if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
-		t.Fatalf("failed to execute migration 1: %v", err)
-	}
-
-	migPath2 := filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000002_add_audit_columns.up.sql")
-	migSQL2, err := os.ReadFile(migPath2)
-	if err != nil {
-		t.Fatalf("failed to read migration file %s: %v", migPath2, err)
-	}
-	if _, err := pool.Exec(ctx, string(migSQL2)); err != nil {
-		t.Fatalf("failed to execute migration 2: %v", err)
-	}
-
-	logger := zap.NewNop()
-	s := store.New(pool, logger)
+	s, pool, ctx := newTestStore(t)
 
 	// Insert test jurisdiction
 	const jurID = "a0000000-0000-0000-0000-000000000001"
-	_, err = pool.Exec(ctx, `
+	_, err := pool.Exec(ctx, `
 		INSERT INTO jurisdictions (jurisdiction_id, jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, effective_from, active_flag, created_by_principal_id)
 		VALUES ($1, 'TEST-US', 'Test US', 'COUNTRY', 'FEDERAL', '2020-01-01T00:00:00Z', true, 'admin');
 	`, jurID)
@@ -138,5 +97,92 @@ func TestPgStore_FindRules_Integration(t *testing.T) {
 	}
 	if rulesCurr[0].RuleStatus != "ACTIVE" {
 		t.Errorf("expected status ACTIVE, got %s", rulesCurr[0].RuleStatus)
+	}
+}
+
+// TestPgStore_FindRules_SurvivesDeactivation covers the §8.2 constraint that
+// "historical actions must always be explainable against the rule set active
+// at time of execution".
+//
+// FindRules resolved the jurisdiction with the active-only FindByID, so the
+// moment a jurisdiction was deactivated every historical rule query against
+// it started returning 404 — taking the audit trail with it.
+func TestPgStore_FindRules_SurvivesDeactivation(t *testing.T) {
+	s, _, ctx := newTestStore(t)
+	j := mustCreateJurisdiction(t, s, ctx, "GB", nil)
+
+	from := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if _, _, err := s.CreateRule(ctx, domain.CreateRuleParams{
+		JurisdictionID:       j.JurisdictionID,
+		RuleDomain:           "TAX",
+		RuleCode:             "GB_VAT",
+		RuleName:             "VAT",
+		EffectiveFrom:        from,
+		RulePayload:          []byte(`{}`),
+		RuleStatus:           "ACTIVE",
+		CreatedByPrincipalID: "admin-1",
+	}); err != nil {
+		t.Fatalf("failed to create rule: %v", err)
+	}
+
+	if _, err := s.DeactivateJurisdiction(ctx, j.JurisdictionID, "admin-1"); err != nil {
+		t.Fatalf("failed to deactivate: %v", err)
+	}
+
+	rules, err := s.FindRules(ctx, store.FindRulesParams{
+		JurisdictionID: j.JurisdictionID,
+		EffectiveAt:    time.Date(2024, time.June, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("historical rule query must survive deactivation, got: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Errorf("expected the historical rule to still be explainable, got %d rules", len(rules))
+	}
+
+	// A genuinely unknown jurisdiction is still 404.
+	if _, err := s.FindRules(ctx, store.FindRulesParams{JurisdictionID: "00000000-0000-0000-0000-0000000000ff"}); !errors.Is(err, domain.ErrJurisdictionNotFound) {
+		t.Errorf("expected ErrJurisdictionNotFound for an unknown jurisdiction, got %v", err)
+	}
+}
+
+// TestPgStore_List_Pagination verifies limit/offset actually page, and that
+// the ordering is total — jurisdiction_code alone is not unique, so without
+// the id tiebreaker two pages could repeat or skip a row.
+func TestPgStore_List_Pagination(t *testing.T) {
+	s, _, ctx := newTestStore(t)
+
+	for _, code := range []string{"AA", "BB", "CC", "DD", "EE"} {
+		mustCreateJurisdiction(t, s, ctx, code, nil)
+	}
+
+	page1, err := s.List(ctx, store.ListParams{Limit: 2, Offset: 0})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	page2, err := s.List(ctx, store.ListParams{Limit: 2, Offset: 2})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(page1) != 2 || len(page2) != 2 {
+		t.Fatalf("expected 2 rows per page, got %d and %d", len(page1), len(page2))
+	}
+	if page1[0].JurisdictionCode != "AA" || page1[1].JurisdictionCode != "BB" {
+		t.Errorf("page 1 = %s,%s — want AA,BB", page1[0].JurisdictionCode, page1[1].JurisdictionCode)
+	}
+	if page2[0].JurisdictionCode != "CC" || page2[1].JurisdictionCode != "DD" {
+		t.Errorf("page 2 = %s,%s — want CC,DD", page2[0].JurisdictionCode, page2[1].JurisdictionCode)
+	}
+
+	// active=true must exclude a deactivated jurisdiction.
+	if _, err := s.DeactivateJurisdiction(ctx, page1[0].JurisdictionID, "admin-1"); err != nil {
+		t.Fatalf("failed to deactivate: %v", err)
+	}
+	activeOnly, err := s.List(ctx, store.ListParams{ActiveOnly: true})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(activeOnly) != 4 {
+		t.Errorf("expected 4 active jurisdictions after deactivating one, got %d", len(activeOnly))
 	}
 }

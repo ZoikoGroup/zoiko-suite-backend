@@ -20,17 +20,29 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	orders map[string]*domain.PurchaseOrder
+	orders     map[string]*domain.PurchaseOrder
+	amendments map[string][]domain.PurchaseOrderAmendment
 
-	createErr error
-	getErr    error
-	listErr   error
-	amendErr  error
-	closeErr  error
+	createErr     error
+	getErr        error
+	listErr       error
+	amendErr      error
+	closeErr      error
+	amendmentsErr error
 }
 
 func newStubStore() *stubStore {
-	return &stubStore{orders: map[string]*domain.PurchaseOrder{}}
+	return &stubStore{
+		orders:     map[string]*domain.PurchaseOrder{},
+		amendments: map[string][]domain.PurchaseOrderAmendment{},
+	}
+}
+
+func (s *stubStore) ListAmendments(_ context.Context, orderID string) ([]domain.PurchaseOrderAmendment, error) {
+	if s.amendmentsErr != nil {
+		return nil, s.amendmentsErr
+	}
+	return s.amendments[orderID], nil
 }
 
 func (s *stubStore) CreateOrder(_ context.Context, o *domain.PurchaseOrder) (bool, error) {
@@ -72,7 +84,7 @@ func (s *stubStore) ListOrders(_ context.Context, _ domain.ListOrdersFilter) ([]
 	return out, nil
 }
 
-func (s *stubStore) AmendOrder(_ context.Context, _, orderID string, newTotalAmount float64, _ string, _ string) (*domain.PurchaseOrder, error) {
+func (s *stubStore) AmendOrder(_ context.Context, _, orderID string, newTotalAmount float64, reason string, actorPrincipalID string) (*domain.PurchaseOrder, error) {
 	if s.amendErr != nil {
 		return nil, s.amendErr
 	}
@@ -80,8 +92,22 @@ func (s *stubStore) AmendOrder(_ context.Context, _, orderID string, newTotalAmo
 	if !ok || o.Status != domain.OrderStatusIssued {
 		return nil, domain.ErrInvalidTransition
 	}
+	previous := o.TotalAmount
+	fromVersion := o.Version
 	o.TotalAmount = newTotalAmount
 	o.Version++
+	// Mirror the real store: an amend always appends to the ledger, which is
+	// what ListAmendments reads back.
+	s.amendments[orderID] = append(s.amendments[orderID], domain.PurchaseOrderAmendment{
+		AmendmentID:          fmt.Sprintf("amend-%d", len(s.amendments[orderID])+1),
+		PurchaseOrderID:      orderID,
+		FromVersion:          fromVersion,
+		ToVersion:            o.Version,
+		PreviousTotalAmount:  previous,
+		NewTotalAmount:       newTotalAmount,
+		Reason:               reason,
+		AmendedByPrincipalID: actorPrincipalID,
+	})
 	return o, nil
 }
 

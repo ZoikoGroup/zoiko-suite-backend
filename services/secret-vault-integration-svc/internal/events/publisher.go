@@ -4,8 +4,10 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/secret-vault-integration-svc/internal/domain"
@@ -28,12 +30,16 @@ type envelope struct {
 type Publisher struct {
 	log   *zap.Logger
 	topic string
-	// producer *kafka.Writer  — TODO: inject kafka.Writer before Phase 1 exit criteria
+
+	// producer is nil only in local development with no broker configured,
+	// in which case emit drops the event and says so. main.go refuses to
+	// start with a nil producer in production or staging.
+	producer *kafka.Writer
 }
 
 // NewPublisher constructs a Publisher bound to the given topic.
-func NewPublisher(log *zap.Logger, topic string) *Publisher {
-	return &Publisher{log: log, topic: topic}
+func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publisher {
+	return &Publisher{log: log, topic: topic, producer: producer}
 }
 
 // PublishAccessRequested publishes secret.access.requested — fires on
@@ -90,14 +96,25 @@ func (p *Publisher) emit(eventType, correlationID string, payload map[string]any
 		return err
 	}
 
-	// TODO: publish to Kafka topic
-	// msg := kafka.Message{Topic: p.topic, Value: data}
-	// if err := p.producer.WriteMessages(ctx, msg); err != nil { ... outbox retry ... }
+	if p.producer == nil {
+		p.log.Debug("event dropped — no Kafka brokers configured",
+			zap.String("event_type", eventType),
+			zap.String("correlation_id", correlationID),
+		)
+		return nil
+	}
 
-	p.log.Info("event emitted (stub — wire Kafka writer)",
+	// Topic is set on the Writer, not the Message — kafka-go rejects a
+	// Message carrying a Topic when the Writer already has one.
+	msg := kafka.Message{Key: []byte(correlationID), Value: data}
+	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
+		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
+	}
+
+	p.log.Info("event published",
 		zap.String("event_type", eventType),
+		zap.String("topic", p.topic),
 		zap.String("correlation_id", correlationID),
-		zap.ByteString("payload", data),
 	)
 	return nil
 }

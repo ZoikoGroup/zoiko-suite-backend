@@ -202,6 +202,50 @@ func (s *PgStore) ListOrders(ctx context.Context, filter domain.ListOrdersFilter
 	return out, err
 }
 
+// ListAmendments returns the append-only amendment ledger for one order,
+// oldest first so the version chain reads forwards (v1->v2, v2->v3, …).
+//
+// Until this existed the ledger was write-only: every amend recorded the
+// before/after totals and the operator's reason, and nothing could read them
+// back — the order's `version` counter was the only visible trace that an
+// amendment had happened at all. Tenant scope comes from the request context
+// and is applied as an explicit filter as well as via RLS, matching GetOrder.
+func (s *PgStore) ListAmendments(ctx context.Context, orderID string) ([]domain.PurchaseOrderAmendment, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, nil
+	}
+
+	var out []domain.PurchaseOrderAmendment
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT amendment_id, purchase_order_id, from_version, to_version,
+			       previous_total_amount, new_total_amount, reason,
+			       amended_by_principal_id, amended_at
+			FROM purchase_order_amendments
+			WHERE purchase_order_id = $1 AND tenant_id = $2
+			ORDER BY from_version ASC, amended_at ASC
+		`, orderID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a domain.PurchaseOrderAmendment
+			if err := rows.Scan(
+				&a.AmendmentID, &a.PurchaseOrderID, &a.FromVersion, &a.ToVersion,
+				&a.PreviousTotalAmount, &a.NewTotalAmount, &a.Reason,
+				&a.AmendedByPrincipalID, &a.AmendedAt,
+			); err != nil {
+				return err
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
 // AmendOrder atomically reads the current version/total_amount and updates
 // them in a single statement (CTE + FOR UPDATE lock), so the read and the
 // write can never race with a concurrent amend/close. Returns

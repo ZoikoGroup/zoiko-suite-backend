@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -34,6 +35,10 @@ type stubStore struct {
 
 	insertErr   error
 	insertedArg *domain.EventSchema
+	// insertedExpectedVersion records the optimistic-concurrency token the
+	// handler passed down, so tests can prove the compatibility baseline and
+	// the write guard are the same version.
+	insertedExpectedVersion int
 }
 
 func (s *stubStore) LatestVersion(_ context.Context, _ string) (*domain.EventSchema, error) {
@@ -48,9 +53,17 @@ func (s *stubStore) Versions(_ context.Context, _ string) ([]*domain.EventSchema
 func (s *stubStore) EventNames(_ context.Context) ([]string, error) {
 	return s.names, s.namesErr
 }
-func (s *stubStore) Insert(_ context.Context, sch *domain.EventSchema) error {
+func (s *stubStore) Insert(_ context.Context, sch *domain.EventSchema, expectedVersion int) (*domain.EventSchema, error) {
 	s.insertedArg = sch
-	return s.insertErr
+	s.insertedExpectedVersion = expectedVersion
+	if s.insertErr != nil {
+		return nil, s.insertErr
+	}
+	// The real store assigns the version inside the INSERT and returns the
+	// stored row; mirror that so the handler's response body is exercised.
+	stored := *sch
+	stored.Version = expectedVersion + 1
+	return &stored, nil
 }
 
 // ── stub authz client ──────────────────────────────────────────────────────
@@ -104,8 +117,16 @@ func TestRegisterVersion_FirstVersion_Returns201WithVersion1(t *testing.T) {
 	assert.Equal(t, 1, got.Version)
 	assert.Equal(t, "identity.context.resolved", got.EventName)
 	require.NotNil(t, s.insertedArg)
-	assert.Equal(t, 1, s.insertedArg.Version)
 	assert.Equal(t, "principal-admin-001", s.insertedArg.RegisteredBy)
+	// The handler no longer computes the version — the store assigns it inside
+	// the INSERT so concurrent registrations cannot collide. What the handler
+	// is responsible for is the baseline it checked against, which doubles as
+	// the optimistic-concurrency guard. 0 means "no version registered yet".
+	assert.Equal(t, 0, s.insertedExpectedVersion,
+		"a first registration must be guarded against a baseline of 0")
+	// An omitted mode is stored as BACKWARD, not left blank — §17.2 requires
+	// the mode to be declared, and a blank column would record nothing.
+	assert.Equal(t, domain.CompatibilityBackward, s.insertedArg.CompatibilityMode)
 }
 
 func TestRegisterVersion_CompatibleEvolution_Returns201WithNextVersion(t *testing.T) {
@@ -288,3 +309,136 @@ var assertErr = &testError{"store unavailable"}
 type testError struct{ msg string }
 
 func (e *testError) Error() string { return e.msg }
+
+// ── compatibility_mode (04-data-model.md §17.2) ─────────────────────────────
+
+// TestRegisterVersion_DeclaredNoneSkipsCompatibilityCheck covers the
+// controlled-rollout case §17.2 allows for. Before the mode was declarable
+// every schema was checked for backward compatibility whatever its author
+// intended, so a contract that was legitimately allowed a breaking change
+// could not be evolved at all except by registering it under a new name.
+func TestRegisterVersion_DeclaredNoneSkipsCompatibilityCheck(t *testing.T) {
+	s := &stubStore{latest: &domain.EventSchema{
+		EventName:  "internal.probe",
+		Version:    1,
+		JSONSchema: json.RawMessage(`{"properties":{"old_field":{"type":"string"}},"required":["old_field"]}`),
+	}}
+	r := newRouter(s)
+
+	// Removes a required field — unambiguously breaking under BACKWARD.
+	body := `{"json_schema":{"properties":{"new_field":{"type":"string"}},"required":["new_field"]},"compatibility_mode":"NONE"}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/internal.probe/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code,
+		"a breaking change must be accepted when NONE is declared")
+	assert.Equal(t, domain.CompatibilityNone, s.insertedArg.CompatibilityMode,
+		"the declared mode must be recorded on the row, so the exemption is visible in the register")
+}
+
+// TestRegisterVersion_BreakingChangeStillRefusedUnderBackward is the other
+// half: NONE must be an explicit opt-out, not a weakening of the default.
+func TestRegisterVersion_BreakingChangeStillRefusedUnderBackward(t *testing.T) {
+	s := &stubStore{latest: &domain.EventSchema{
+		EventName:  "public.probe",
+		Version:    1,
+		JSONSchema: json.RawMessage(`{"properties":{"old_field":{"type":"string"}},"required":["old_field"]}`),
+	}}
+	r := newRouter(s)
+
+	// Same breaking body, mode omitted — must default to BACKWARD and refuse.
+	body := `{"json_schema":{"properties":{"new_field":{"type":"string"}},"required":["new_field"]}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/public.probe/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	assert.Nil(t, s.insertedArg, "a refused schema must never reach the store")
+}
+
+// TestRegisterVersion_UnknownCompatibilityModeRefused — an unrecognised mode
+// is rejected rather than quietly treated as BACKWARD. Defaulting it would
+// record a discipline the service is not applying, which is worse than a 400.
+func TestRegisterVersion_UnknownCompatibilityModeRefused(t *testing.T) {
+	for _, mode := range []string{"FORWARD", "FULL", "backward", "ANYTHING"} {
+		t.Run(mode, func(t *testing.T) {
+			s := &stubStore{latest: nil}
+			r := newRouter(s)
+
+			body := `{"json_schema":{"properties":{}},"compatibility_mode":"` + mode + `"}`
+			req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/x.probe/versions", bytes.NewBufferString(body)))
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusBadRequest, rec.Code,
+				"mode %q is not enforceable by this service and must be refused", mode)
+			assert.Nil(t, s.insertedArg, "nothing may be written for an unenforceable mode")
+		})
+	}
+}
+
+// TestRegisterVersion_OwningServiceRecorded — §17.1 lists owning_service on
+// SchemaRegistryArtifact. Without it the registry can say a contract changed
+// but not who is responsible for it.
+func TestRegisterVersion_OwningServiceRecorded(t *testing.T) {
+	s := &stubStore{latest: nil}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{}},"owning_service":"identity-context-svc"}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/y.probe/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	assert.Equal(t, "identity-context-svc", s.insertedArg.OwningService)
+}
+
+// ── version race (was reported as a 503) ────────────────────────────────────
+
+// TestRegisterVersion_LostRaceIs409Not503 is the regression test for a
+// concurrent registration being reported as a database outage.
+//
+// The handler used to compute the next version itself, so a race ended in a
+// primary-key collision that surfaced as ErrStoreUnavailable — a 503, which
+// sends the reader to look for a broken database when nothing is broken. It
+// is a 409, and the message tells the caller to re-read and retry rather than
+// simply retry: its schema was checked against a version that is no longer
+// latest.
+func TestRegisterVersion_LostRaceIs409Not503(t *testing.T) {
+	s := &stubStore{
+		latest: &domain.EventSchema{
+			EventName:  "raced.probe",
+			Version:    3,
+			JSONSchema: json.RawMessage(`{"properties":{},"required":[]}`),
+		},
+		insertErr: domain.ErrVersionRaced,
+	}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{"extra":{"type":"string"}},"required":[]}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/raced.probe/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code,
+		"a lost version race is a conflict, not a store outage")
+	assert.NotEqual(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Contains(t, rec.Body.String(), "retry")
+	assert.Equal(t, 3, s.insertedExpectedVersion,
+		"the guard passed to the store must be the version the compatibility check ran against")
+}
+
+// TestRegisterVersion_GenuineStoreFailureIsStill503 — the 409 above must not
+// have swallowed real database failures.
+func TestRegisterVersion_GenuineStoreFailureIsStill503(t *testing.T) {
+	s := &stubStore{latest: nil, insertErr: errors.New("connection refused")}
+	r := newRouter(s)
+
+	body := `{"json_schema":{"properties":{}}}`
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/z.probe/versions", bytes.NewBufferString(body)))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
