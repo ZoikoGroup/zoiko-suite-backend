@@ -214,6 +214,12 @@ func newKafkaWriter(cfg *config.Config, log *zap.Logger) *kafka.Writer {
 		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:    cfg.Kafka.Topic,
 		Balancer: &kafka.LeastBytes{},
+		// Required even though the broker sets auto.create.topics.enable:
+		// kafka-go defaults this to false and never asks the broker to
+		// auto-create in its metadata request, so a write to a topic that does
+		// not exist yet fails with "Unknown Topic Or Partition" regardless of
+		// the broker-side setting. Matches the platform-wide fix in 7589bc3.
+		AllowAutoTopicCreation: true,
 		// Bounded so an unreachable broker delays a response rather than
 		// holding the request open — the write is already committed by the
 		// time an event is emitted.
