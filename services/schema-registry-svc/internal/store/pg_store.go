@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -28,10 +29,22 @@ type Store interface {
 	// EventNames returns every distinct event name with at least one
 	// registered version.
 	EventNames(ctx context.Context) ([]string, error)
-	// Insert appends a new version row. Callers are responsible for
-	// computing the next version number and running the compatibility
-	// check — this method only persists.
-	Insert(ctx context.Context, s *domain.EventSchema) error
+	// Insert appends a new version row, assigning the version number
+	// atomically from the current maximum and returning the stored row.
+	//
+	// The version is computed inside the INSERT rather than by the caller.
+	// Previously the handler read the latest version, added one, and inserted
+	// — so two concurrent registrations both computed the same number and the
+	// loser hit the (event_name, version) primary key. That collision was
+	// reported as a store failure, i.e. a 503, making an ordinary race look
+	// like a database outage.
+	//
+	// expectedVersion is the version the caller ran its compatibility check
+	// against. If another registration has landed since, Insert returns
+	// domain.ErrVersionRaced rather than writing: the proposed schema was
+	// validated against a baseline that is no longer latest, so retrying
+	// server-side would skip the check against the version that actually won.
+	Insert(ctx context.Context, s *domain.EventSchema, expectedVersion int) (*domain.EventSchema, error)
 }
 
 type PgStore struct {
@@ -43,18 +56,21 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
-const schemaColumns = `event_name, version, json_schema, registered_by, registered_at`
+const schemaColumns = `event_name, version, json_schema, compatibility_mode, owning_service, registered_by, registered_at`
 
 func scanEventSchema(row pgx.Row) (*domain.EventSchema, error) {
 	var s domain.EventSchema
-	var registeredBy *string
+	var registeredBy, owningService *string
 	var rawSchema []byte
-	if err := row.Scan(&s.EventName, &s.Version, &rawSchema, &registeredBy, &s.RegisteredAt); err != nil {
+	if err := row.Scan(&s.EventName, &s.Version, &rawSchema, &s.CompatibilityMode, &owningService, &registeredBy, &s.RegisteredAt); err != nil {
 		return nil, err
 	}
 	s.JSONSchema = json.RawMessage(rawSchema)
 	if registeredBy != nil {
 		s.RegisteredBy = *registeredBy
+	}
+	if owningService != nil {
+		s.OwningService = *owningService
 	}
 	return &s, nil
 }
@@ -133,17 +149,59 @@ func (s *PgStore) EventNames(ctx context.Context) ([]string, error) {
 	return names, rows.Err()
 }
 
-func (s *PgStore) Insert(ctx context.Context, sch *domain.EventSchema) error {
-	var registeredBy *string
+func (s *PgStore) Insert(ctx context.Context, sch *domain.EventSchema, expectedVersion int) (*domain.EventSchema, error) {
+	var registeredBy, owningService *string
 	if sch.RegisteredBy != "" {
 		registeredBy = &sch.RegisteredBy
 	}
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO event_schemas (event_name, version, json_schema, registered_by)
-		VALUES ($1, $2, $3, $4)`,
-		sch.EventName, sch.Version, []byte(sch.JSONSchema), registeredBy)
-	if err != nil {
-		return fmt.Errorf("insert schema version: %w", err)
+	if sch.OwningService != "" {
+		owningService = &sch.OwningService
 	}
-	return nil
+
+	// The version is derived inside the statement from the current maximum,
+	// so two concurrent registrations cannot both compute the same number.
+	// The WHERE clause is the optimistic-concurrency guard: it only inserts
+	// if the latest version is still the one the caller checked against, so a
+	// race is refused rather than silently accepted against a stale baseline.
+	// COALESCE handles the first version of a new event name, where MAX is NULL.
+	// Every parameter is cast explicitly. $1 appears both as an inserted value
+	// and in the WHERE clause, and without a cast Postgres cannot deduce one
+	// type for both uses — it fails with "inconsistent types deduced for
+	// parameter $1" (42P08) rather than anything that names the real problem.
+	const query = `
+		INSERT INTO event_schemas (event_name, version, json_schema, compatibility_mode, owning_service, registered_by)
+		SELECT $1::varchar, COALESCE(MAX(version), 0) + 1, $2::jsonb, $3::varchar, $4::varchar, $5::varchar
+		FROM   event_schemas
+		WHERE  event_name = $1::varchar
+		HAVING COALESCE(MAX(version), 0) = $6::int
+		RETURNING ` + schemaColumns + `;`
+
+	row := s.pool.QueryRow(ctx, query,
+		sch.EventName, []byte(sch.JSONSchema), sch.CompatibilityMode, owningService, registeredBy, expectedVersion)
+
+	stored, err := scanEventSchema(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// HAVING excluded the row: the latest version moved between the
+			// caller's read and this write.
+			return nil, domain.ErrVersionRaced
+		}
+		if isUniqueViolation(err) {
+			// Belt and braces — the primary key would also catch a collision
+			// the HAVING guard somehow missed. Same meaning, same answer, and
+			// specifically not reported as a store outage.
+			return nil, domain.ErrVersionRaced
+		}
+		return nil, fmt.Errorf("insert schema version: %w", err)
+	}
+	return stored, nil
+}
+
+// isUniqueViolation reports whether err is a Postgres unique/PK violation
+// (SQLSTATE 23505). Without this a concurrent registration surfaced as a
+// generic store error and therefore a 503 — an ordinary race reported as an
+// outage, which sends the reader to look for a broken database.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }

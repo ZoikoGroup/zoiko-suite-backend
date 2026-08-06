@@ -7,11 +7,13 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/secret-vault-integration-svc/internal/authz"
 	"zoiko.io/secret-vault-integration-svc/internal/classification"
 	"zoiko.io/secret-vault-integration-svc/internal/domain"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
@@ -69,12 +71,25 @@ type Handler struct {
 	store     SecretVaultStore
 	vault     VaultBackend
 	publisher EventPublisher
+	authz     authz.Client
 	log       *zap.Logger
+
+	// authzPlatformScopeID is the legal_entity_id used for secret policy
+	// administration, which is platform-scoped rather than entity-scoped.
+	// authorization-svc rejects an empty legal_entity_id.
+	authzPlatformScopeID string
 }
 
 // New constructs a Handler.
-func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, log *zap.Logger) *Handler {
-	return &Handler{store: store, vault: vault, publisher: publisher, log: log}
+func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+	return &Handler{
+		store:                store,
+		vault:                vault,
+		publisher:            publisher,
+		authz:                authzClient,
+		authzPlatformScopeID: authzPlatformScopeID,
+		log:                  log,
+	}
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -133,6 +148,14 @@ func (req createSecretPolicyRequest) missingField() string {
 func (h *Handler) CreateSecretPolicy(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretPolicyCreate) {
+		return
+	}
+
 	var req createSecretPolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -178,14 +201,14 @@ func (h *Handler) CreateSecretPolicy(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/secret-policies/{id}/versions ──────────────────────────────────
 
 type createSecretPolicyVersionRequest struct {
-	SecretPolicyVersionID  string          `json:"secret_policy_version_id,omitempty"`
-	TenantID               *string         `json:"tenant_id,omitempty"`
-	LegalEntityID          *string         `json:"legal_entity_id,omitempty"`
-	AllowedWorkloadIDs     json.RawMessage `json:"allowed_workload_ids,omitempty"`
-	MaxLeaseDurationSeconds int            `json:"max_lease_duration_seconds"`
-	EffectiveFrom          time.Time       `json:"effective_from"`
-	EffectiveTo            *time.Time      `json:"effective_to,omitempty"`
-	CreatedByPrincipalID   string          `json:"created_by_principal_id"`
+	SecretPolicyVersionID   string          `json:"secret_policy_version_id,omitempty"`
+	TenantID                *string         `json:"tenant_id,omitempty"`
+	LegalEntityID           *string         `json:"legal_entity_id,omitempty"`
+	AllowedWorkloadIDs      json.RawMessage `json:"allowed_workload_ids,omitempty"`
+	MaxLeaseDurationSeconds int             `json:"max_lease_duration_seconds"`
+	EffectiveFrom           time.Time       `json:"effective_from"`
+	EffectiveTo             *time.Time      `json:"effective_to,omitempty"`
+	CreatedByPrincipalID    string          `json:"created_by_principal_id"`
 }
 
 func (req createSecretPolicyVersionRequest) missingField() string {
@@ -205,6 +228,14 @@ func (req createSecretPolicyVersionRequest) missingField() string {
 func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Request) {
 	secretPolicyID := chi.URLParam(r, "secret_policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretPolicyVersionCreate) {
+		return
+	}
 
 	var req createSecretPolicyVersionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -259,12 +290,37 @@ type activateVersionRequest struct {
 	ActivatedByPrincipalID string `json:"activated_by_principal_id"`
 }
 
+// activateVersionResponse is the activated version plus whether this call is
+// what activated it.
+//
+// The store already distinguishes the two cases — it short-circuits when the
+// target is already ACTIVE and returns transitioned=false — but that flag used
+// to be dropped here, so a real DRAFT->ACTIVE transition and a no-op repeat
+// were byte-identical 200s. A caller could not tell whether its own request
+// changed anything, which is the same "a replay must not read as a write"
+// distinction CreateSecretPolicy makes with 201-vs-200.
+//
+// The version is embedded by pointer so every field it already returned stays
+// exactly where it was: this only adds a key.
+type activateVersionResponse struct {
+	*domain.SecretPolicyVersion
+	Transitioned bool `json:"transitioned"`
+}
+
 // ActivateVersion handles
 // POST /v1/secret-policies/{secret_policy_id}/versions/{version_id}/activate.
 func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	secretPolicyID := chi.URLParam(r, "secret_policy_id")
 	versionID := chi.URLParam(r, "version_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretPolicyVersionActivate) {
+		return
+	}
 
 	var req activateVersionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -292,7 +348,7 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activated, _, _, err := h.store.ActivateVersion(r.Context(), versionID, req.ActivatedByPrincipalID)
+	activated, _, transitioned, err := h.store.ActivateVersion(r.Context(), versionID, req.ActivatedByPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrInvalidTransition):
@@ -303,7 +359,10 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, activated)
+	writeJSON(w, http.StatusOK, activateVersionResponse{
+		SecretPolicyVersion: activated,
+		Transitioned:        transitioned,
+	})
 }
 
 // ── POST /v1/secret-policies/{id}/material ──────────────────────────────────
@@ -327,6 +386,14 @@ type putSecretMaterialRequest struct {
 func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 	secretPolicyID := chi.URLParam(r, "secret_policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretMaterialWrite) {
+		return
+	}
 
 	var req putSecretMaterialRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -696,6 +763,14 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 	leaseID := chi.URLParam(r, "lease_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretLeaseRevoke) {
+		return
+	}
+
 	lease, transitioned, err := h.store.RevokeLease(r.Context(), leaseID)
 	if err != nil {
 		switch {
@@ -727,7 +802,24 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("RevokeLease: failed to record REVOKED audit entry", zap.Error(err))
 		}
 	}
-	writeJSON(w, http.StatusOK, lease)
+	writeJSON(w, http.StatusOK, revokeLeaseResponse{
+		SecretLease:  lease,
+		Transitioned: transitioned,
+	})
+}
+
+// revokeLeaseResponse is the lease plus whether this call is what revoked it.
+//
+// Revoking an already-REVOKED lease is a 200 returning the record untouched
+// (the store short-circuits on that status) and writes no second audit entry.
+// Without this flag a first revoke and a repeat were indistinguishable, so a
+// caller had to guess whether the REVOKED audit entry came from its own
+// request. `revoked_at` cannot answer that — it is already set either way.
+//
+// Embedded by pointer so the existing lease fields are unchanged.
+type revokeLeaseResponse struct {
+	*domain.SecretLease
+	Transitioned bool `json:"transitioned"`
 }
 
 // ── POST /v1/secret-policies/{id}/rotate ────────────────────────────────────
@@ -760,6 +852,14 @@ type rotateResponse struct {
 func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 	secretPolicyID := chi.URLParam(r, "secret_policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionSecretRotate) {
+		return
+	}
 
 	var req rotateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -918,4 +1018,58 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		_ = err
 	}
+}
+
+// ── authorization ────────────────────────────────────────────────────────────
+
+// Action types this service asks authorization-svc about.
+//
+// These cover secret POLICY administration. POST /v1/secrets/broker is
+// deliberately not in this list: brokering is this service's own gate — it
+// evaluates the active secret policy for the requested path and issues a
+// scoped, expiring lease — and putting a second, coarser RBAC check in front
+// of it would obscure which decision actually refused an access.
+const (
+	ActionSecretPolicyCreate          = "SECRET_POLICY_CREATE"
+	ActionSecretPolicyVersionCreate   = "SECRET_POLICY_VERSION_CREATE"
+	ActionSecretPolicyVersionActivate = "SECRET_POLICY_VERSION_ACTIVATE"
+	ActionSecretMaterialWrite         = "SECRET_MATERIAL_WRITE"
+	ActionSecretLeaseRevoke           = "SECRET_LEASE_REVOKE"
+	ActionSecretRotate                = "SECRET_ROTATE"
+)
+
+// requirePrincipal resolves the acting principal from the gateway-verified
+// X-Principal-Id header, writing 401 and returning false when absent.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
+		return id, true
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{
+		"error":   "missing_principal",
+		"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
+	})
+	return "", false
+}
+
+// authorize fails closed on both a denial and an unobtainable decision.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	scope := h.authzPlatformScopeID
+	if legalEntityID != "" {
+		scope = legalEntityID
+	}
+	err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, authz.ErrDenied):
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+	default:
+		h.log.Error("authorization check failed — refusing the mutation",
+			zap.String("principal_id", principalID),
+			zap.String("action_type", actionType),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+	}
+	return false
 }

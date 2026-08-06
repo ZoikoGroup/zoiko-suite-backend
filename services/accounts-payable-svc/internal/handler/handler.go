@@ -229,6 +229,13 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// a payment batch/invoice creator may not approve their own submission.
+	if inv.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
+
 	if err := h.store.TransitionInvoice(r.Context(), inv.TenantID, invoiceID,
 		domain.InvoiceStatusValidated, domain.InvoiceStatusApproved, principalID); err != nil {
 		h.handleTransitionErr(w, err)

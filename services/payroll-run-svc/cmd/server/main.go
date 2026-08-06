@@ -63,13 +63,16 @@ func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEn
 		return domain.ErrAuthzServiceUnavailable
 	}
 
+	// authorization-svc's /v1/authorize always responds 200, and signals the
+	// actual decision via decision_outcome: "GRANTED" | "DENIED" — there is
+	// no "allowed" boolean field in its response.
 	var res struct {
-		Allowed bool `json:"allowed"`
+		DecisionOutcome string `json:"decision_outcome"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return err
 	}
-	if !res.Allowed {
+	if res.DecisionOutcome != "GRANTED" {
 		return domain.ErrAuthorizationDenied
 	}
 	return nil

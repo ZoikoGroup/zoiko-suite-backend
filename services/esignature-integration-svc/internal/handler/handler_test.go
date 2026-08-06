@@ -17,10 +17,23 @@ import (
 	"zoiko.io/esignature-integration-svc/internal/store"
 )
 
-func setupTestRouter() (chi.Router, *events.MockPublisher) {
+// newGrantingAuthzServer stands in for authorization-svc in tests: it
+// always grants, matching the real service's contract of always returning
+// HTTP 200 with a decision in the body.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
 	st := store.NewMemoryStore()
 	pub := events.NewMockPublisher()
-	az := authz.NewClient("http://localhost:8081")
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
 	h := New(st, pub, az, zap.NewNop())
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext)
@@ -29,7 +42,7 @@ func setupTestRouter() (chi.Router, *events.MockPublisher) {
 }
 
 func TestEsignatureFlow(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	// Create envelope
 	reqBody := domain.CreateEnvelopeRequest{
@@ -44,6 +57,7 @@ func TestEsignatureFlow(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/esignature/envelopes", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-test")
+	req.Header.Set("X-Principal-Id", "principal-01")
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -70,6 +84,7 @@ func TestEsignatureFlow(t *testing.T) {
 	updateReq := httptest.NewRequest("POST", "/v1/esignature/envelopes/"+env.EnvelopeID+"/status", bytes.NewReader(updateBytes))
 	updateReq.Header.Set("Content-Type", "application/json")
 	updateReq.Header.Set("X-Tenant-ID", "tenant-test")
+	updateReq.Header.Set("X-Principal-Id", "principal-01")
 
 	updateW := httptest.NewRecorder()
 	r.ServeHTTP(updateW, updateReq)

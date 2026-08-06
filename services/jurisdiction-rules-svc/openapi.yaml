@@ -1,0 +1,921 @@
+openapi: "3.1.0"
+
+info:
+  title: Jurisdiction Rules Service
+  version: "1.1.0"
+  description: |
+    Authoritative registry of jurisdiction identities and their effective-dated
+    applicability rules (03-microservices.md §8.2).
+
+    **Governance invariants:**
+    - `rule_payload` holds APPLICABILITY METADATA ONLY — never computation values.
+      Thresholds, rates and bands belong to the Tax and Payroll services (OQ-1, Model B).
+    - Every type/status/domain field is a VARCHAR tag stored as data. New jurisdiction
+      types, rule domains and status values are added by data migration, never by a
+      code change (OQ-3).
+    - Nothing is deleted. Jurisdictions are deactivated with `active_flag` + `effective_to`;
+      rules are end-dated and moved to SUPERSEDED or RETIRED.
+    - Historical actions must always be explainable against the rule set active at the
+      time of execution, so point-in-time reads keep working after a jurisdiction is
+      deactivated and after a rule is superseded.
+    - `legal_drift_state` transitions are append-only. The column carries the current
+      value; `/v1/rules/{id}/drift-events` carries the history (OQ-4).
+    - Jurisdiction and rule data are platform-wide reference data. There is no
+      `tenant_id` and no row-level security on these tables.
+
+    **Read vs runtime resolution.** `/rules` is the raw per-jurisdiction, effective-dated
+    view — the audit and replay surface, one jurisdiction only. `/rule-pack` is the
+    runtime view: it walks the ancestor chain and resolves exactly one winning rule per
+    (`rule_domain`, `rule_code`).
+
+    **Authentication.** Read endpoints are unauthenticated — this is public reference
+    data, and `GET /v1/jurisdictions/{id}` is the synchronous fail-closed validation
+    call other services make before persisting a `jurisdiction_id`. Every `/v1/admin/*`
+    endpoint requires a caller identity in `X-Principal-Id` (set by the gateway's
+    ForwardAuth middleware from a verified identity envelope) and a positive decision
+    from the Authorization Service. Both a denial and an unreachable Authorization
+    Service block the mutation.
+
+    **Fail-closed status codes.** `503` means "cannot answer", never "no". A caller
+    that treats `503` as `404` breaks the validation contract.
+
+servers:
+  - url: http://localhost:8082
+    description: Local development
+  - url: https://api.zoiko.internal/jurisdiction
+    description: Internal cluster ingress (gateway strips the /jurisdiction prefix)
+
+tags:
+  - name: Jurisdictions
+    description: Jurisdiction registry reads, including the fail-closed validation probe
+  - name: Rules
+    description: Effective-dated rule reads and runtime rule-pack resolution
+  - name: Drift
+    description: Legal Drift Detection — divergence between stored rules and legal reality
+  - name: Admin
+    description: Mutations. Authenticated and authorized on every route.
+  - name: Health
+    description: Liveness and readiness probes
+
+paths:
+
+  # ── Jurisdictions (public read) ────────────────────────────────────────────
+
+  /v1/jurisdictions:
+    get:
+      tags: [Jurisdictions]
+      summary: List jurisdictions
+      operationId: listJurisdictions
+      parameters:
+        - name: type
+          in: query
+          description: Filter by jurisdiction_type, e.g. COUNTRY, STATE_PROVINCE, TAX_AUTHORITY.
+          schema: { type: string }
+        - name: active
+          in: query
+          description: When "true", limit to active_flag=true and non-expired rows.
+          schema: { type: string, enum: ["true"] }
+        - $ref: '#/components/parameters/Limit200'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Matching jurisdictions. Always an array, never null.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Jurisdiction' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdictions/{jurisdiction_id}:
+    get:
+      tags: [Jurisdictions]
+      summary: Validate and fetch a jurisdiction
+      description: |
+        The synchronous validation endpoint other services call fail-closed before
+        persisting anything that references a `jurisdiction_id`.
+
+        Unknown, malformed, inactive and expired ids all answer `404` — they are the
+        same fact to a caller. A `503` is categorically different and must cause the
+        caller to reject the write rather than treat it as "not found".
+      operationId: getJurisdiction
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Jurisdiction is known and active.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Jurisdiction' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdictions/{jurisdiction_id}/ancestors:
+    get:
+      tags: [Jurisdictions]
+      summary: Resolve the ancestor chain
+      description: |
+        Ancestors from the immediate parent outward to the root, nearest first. The
+        jurisdiction itself is not included, so a root jurisdiction answers `200 []` —
+        which is a different fact from `404`.
+      operationId: getAncestors
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Ancestor chain, nearest first. Empty for a root jurisdiction.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Jurisdiction' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  # ── Rules (public read) ────────────────────────────────────────────────────
+
+  /v1/jurisdictions/{jurisdiction_id}/rules:
+    get:
+      tags: [Rules]
+      summary: Rules effective at a point in time, for one jurisdiction
+      description: |
+        The raw, per-jurisdiction, effective-dated view. Inheritance is NOT resolved —
+        use `/rule-pack` for the runtime view.
+
+        DRAFT rules are excluded. SUPERSEDED and RETIRED rules ARE returned when the
+        requested `effective_at` falls inside their effective period, because a
+        historical action has to remain explainable against the rules that governed it.
+
+        This endpoint keeps answering after the jurisdiction is deactivated, for the
+        same reason.
+      operationId: getRules
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - name: domain
+          in: query
+          description: Filter by rule_domain, e.g. PAYROLL, TAX, EMPLOYMENT, FILING, RETENTION, BENEFITS.
+          schema: { type: string }
+        - $ref: '#/components/parameters/EffectiveAt'
+        - $ref: '#/components/parameters/Limit100'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Matching rules. Always an array, never null.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/JurisdictionRule' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/jurisdictions/{jurisdiction_id}/rule-pack:
+    get:
+      tags: [Rules]
+      summary: Resolve the runtime rule pack
+      description: |
+        The "resolve jurisdiction set" and "fetch runtime rule pack" capabilities of
+        §8.2, in one call.
+
+        Walks the jurisdiction and its whole ancestor chain and returns exactly one
+        winning rule per (`rule_domain`, `rule_code`): the nearest jurisdiction wins,
+        ties broken by the later `effective_from`. DRAFT and RETIRED rules never enter
+        a pack.
+
+        `resolved_from` names the jurisdictions the pack was assembled from, self first,
+        so the caller can record the rule basis of a governed action — §8.2's evidence
+        obligation.
+
+        A pack is a runtime artifact, so an inactive or expired jurisdiction answers
+        `404` rather than a stale pack.
+      operationId: getRulePack
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - name: domain
+          in: query
+          description: Restrict the pack to one rule_domain.
+          schema: { type: string }
+        - $ref: '#/components/parameters/EffectiveAt'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Resolved rule pack.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RulePack' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/rules/{jurisdiction_rule_id}:
+    get:
+      tags: [Rules]
+      summary: Fetch one rule by id
+      description: |
+        The rule id appears in every published event and in the rule basis recorded
+        against governed actions, so it has to be resolvable directly.
+      operationId: getRule
+      parameters:
+        - $ref: '#/components/parameters/RuleID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: The rule, in whatever status it currently holds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionRule' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  /v1/rules/{jurisdiction_rule_id}/drift-events:
+    get:
+      tags: [Drift]
+      summary: Legal drift history for a rule
+      description: |
+        The append-only `legal_drift_state` transition history, newest first (OQ-4).
+        The current state on the rule says *that* a rule has drifted; this says when,
+        from what, on whose authority, and why.
+
+        A rule that has never drifted answers `200 []`, which is a different fact from
+        `404`.
+      operationId: getDriftEvents
+      parameters:
+        - $ref: '#/components/parameters/RuleID'
+        - $ref: '#/components/parameters/Limit200'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Drift history, newest first. Always an array, never null.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DriftEvent' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/StoreUnavailable' }
+
+  # ── Admin mutations ────────────────────────────────────────────────────────
+
+  /v1/admin/jurisdictions:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Create a jurisdiction
+      description: |
+        Idempotent on the dedup key (`jurisdiction_code`, `jurisdiction_type`,
+        `parent_jurisdiction_id`): a replay with identical attributes answers `200`
+        with the existing record and publishes nothing. A replay with differing
+        attributes is a `409`.
+
+        `jurisdiction_id`, `active_flag`, `data_classification` and
+        `created_by_principal_id` are server-assigned and cannot be set by the caller.
+      operationId: createJurisdiction
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateJurisdictionRequest' }
+      responses:
+        "201":
+          description: Created. Publishes `jurisdiction.created`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Jurisdiction' }
+        "200":
+          description: Idempotent replay of an existing jurisdiction. Publishes nothing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Jurisdiction' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404":
+          description: |
+            `parent_jurisdiction_not_found` — the supplied parent does not exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "409":
+          description: |
+            `conflict` — the dedup key matches an existing jurisdiction with different
+            attributes. `cyclic_hierarchy` — the parent assignment would make the
+            jurisdiction its own ancestor.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "413": { $ref: '#/components/responses/BodyTooLarge' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdictions/{jurisdiction_id}/deactivate:
+    post:
+      tags: [Admin, Jurisdictions]
+      summary: Deactivate a jurisdiction
+      description: |
+        Sets `active_flag=false` and end-dates the record with `effective_to`. This is
+        not a delete: the row is preserved and stays readable for historical replay.
+        Publishes `jurisdiction.deactivated`.
+      operationId: deactivateJurisdiction
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      responses:
+        "200":
+          description: Deactivated and end-dated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Jurisdiction' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/jurisdictions/{jurisdiction_id}/rules:
+    post:
+      tags: [Admin, Rules]
+      summary: Create a rule
+      description: |
+        Idempotent on the dedup key (`jurisdiction_id`, `rule_code`, `effective_from`).
+
+        A rule may only be created in DRAFT (the default) or ACTIVE. SUPERSEDED and
+        RETIRED are reached through the transition endpoint, never directly.
+
+        Two live rules with the same `rule_code` and overlapping effective periods are
+        rejected with `409 overlapping_rule`, because both would satisfy the same
+        point-in-time query. DRAFT rules are exempt so a replacement can be prepared
+        while the incumbent is still in force — the same check runs again on activation.
+      operationId: createRule
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/JurisdictionID'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRuleRequest' }
+      responses:
+        "201":
+          description: |
+            Created. Publishes `jurisdiction.rule.updated`, plus
+            `jurisdiction.rule.activated` when created directly in ACTIVE.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionRule' }
+        "200":
+          description: Idempotent replay of an existing rule. Publishes nothing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionRule' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404":
+          description: |
+            `jurisdiction_not_found` — the jurisdiction is unknown or has been deactivated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "409":
+          description: |
+            `conflict` — dedup key matches an existing rule with a different payload or
+            name. `overlapping_rule` — the effective period overlaps another live rule
+            with the same `rule_code`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "413": { $ref: '#/components/responses/BodyTooLarge' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/rules/{jurisdiction_rule_id}/transition:
+    post:
+      tags: [Admin, Rules]
+      summary: Transition a rule's lifecycle status
+      description: |
+        The only legal transitions are DRAFT→ACTIVE, ACTIVE→SUPERSEDED, and
+        ACTIVE|SUPERSEDED→RETIRED. Nothing returns to DRAFT.
+
+        A retried transition into the status the rule already holds answers `200` and
+        publishes nothing, so a network retry cannot make a consumer act twice.
+
+        Transitions into SUPERSEDED or RETIRED close an open-ended rule. Supply
+        `effective_to` to say when it stopped applying; omitted, it closes at the
+        current time. Without this a superseded rule keeps matching every
+        point-in-time query alongside its own replacement.
+      operationId: transitionRuleStatus
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RuleID'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransitionRuleStatusRequest' }
+      responses:
+        "200":
+          description: |
+            Transitioned, or an idempotent no-op. A real transition publishes
+            `jurisdiction.rule.updated`, plus `jurisdiction.rule.activated` for ACTIVE.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JurisdictionRule' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "409":
+          description: |
+            `invalid_transition` — the current status is not a legal prior state.
+            `overlapping_rule` — activating this rule would overlap another live rule
+            with the same `rule_code`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  /v1/admin/rules/{jurisdiction_rule_id}/drift:
+    post:
+      tags: [Admin, Drift]
+      summary: Record a legal drift state change
+      description: |
+        The write side of Legal Drift Detection (§8.2's Critical Enhancement): an
+        external regulatory feed, or a human reviewer, declares that a stored rule has
+        diverged from applicable legal reality.
+
+        The state change and its justification are written together, append-only. A
+        move away from CURRENT publishes `legal.drift.detected`; a return to CURRENT is
+        a resolution and publishes nothing — announcing it as "drift detected" would
+        have consumers react to the opposite of what happened. Setting the state the
+        rule already holds is a no-op: it appends no history and publishes nothing.
+      operationId: recordDrift
+      security: [{ principalHeader: [] }]
+      parameters:
+        - $ref: '#/components/parameters/RuleID'
+        - $ref: '#/components/parameters/PrincipalID'
+        - $ref: '#/components/parameters/CorrelationID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordDriftRequest' }
+      responses:
+        "200":
+          description: Drift state recorded, or an unchanged no-op.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RecordDriftResponse' }
+        "400": { $ref: '#/components/responses/BadRequest' }
+        "401": { $ref: '#/components/responses/MissingPrincipal' }
+        "403": { $ref: '#/components/responses/Forbidden' }
+        "404": { $ref: '#/components/responses/NotFound' }
+        "503": { $ref: '#/components/responses/AuthzOrStoreUnavailable' }
+
+  # ── Health ─────────────────────────────────────────────────────────────────
+
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness probe
+      operationId: liveness
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: "ok" }
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness probe
+      description: Answers 200 only when the database pool can be pinged within 2 seconds.
+      operationId: readiness
+      responses:
+        "200":
+          description: Ready to serve traffic.
+        "503":
+          description: Not ready — the database is unreachable.
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus metrics
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content:
+            text/plain: {}
+
+components:
+
+  securitySchemes:
+    principalHeader:
+      type: apiKey
+      in: header
+      name: X-Principal-Id
+      description: |
+        The acting principal, set by the gateway's ForwardAuth middleware after it
+        verifies the caller's identity envelope against identity-svc's JWKS. Callers
+        do not set this themselves — a request that reaches the service without it is
+        rejected with `401 missing_principal` rather than attributed to the platform.
+
+  parameters:
+    JurisdictionID:
+      name: jurisdiction_id
+      in: path
+      required: true
+      description: Jurisdiction UUID. A malformed value answers 404, not 503.
+      schema: { type: string }
+
+    RuleID:
+      name: jurisdiction_rule_id
+      in: path
+      required: true
+      description: Rule UUID. A malformed value answers 404, not 503.
+      schema: { type: string }
+
+    CorrelationID:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: |
+        Evidence propagation id, echoed on every response. Generated by the service
+        when absent.
+      schema: { type: string }
+
+    PrincipalID:
+      name: X-Principal-Id
+      in: header
+      required: true
+      description: See the `principalHeader` security scheme.
+      schema: { type: string }
+
+    EffectiveAt:
+      name: effective_at
+      in: query
+      required: false
+      description: RFC3339 point-in-time. Defaults to now. A malformed value is a 400, never silently "now".
+      schema: { type: string, format: date-time }
+
+    Limit100:
+      name: limit
+      in: query
+      required: false
+      description: Page size, max 100, default 50. Must be a non-negative integer.
+      schema: { type: integer, minimum: 0, maximum: 100, default: 50 }
+
+    Limit200:
+      name: limit
+      in: query
+      required: false
+      description: Page size, max 200, default 50. Must be a non-negative integer.
+      schema: { type: integer, minimum: 0, maximum: 200, default: 50 }
+
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Zero-based page offset. Must be a non-negative integer.
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  responses:
+    BadRequest:
+      description: |
+        Malformed or incomplete request. Codes include `missing_field`,
+        `invalid_request_body`, `invalid_effective_at`, `invalid_effective_period`,
+        `invalid_limit`, `invalid_offset`, `invalid_rule_status`,
+        `invalid_rule_payload`, `invalid_status`, `invalid_drift_state`.
+        An unknown JSON field is rejected rather than ignored.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    MissingPrincipal:
+      description: '`missing_principal` — no caller identity on the request.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    Forbidden:
+      description: '`unauthorized` — the Authorization Service denied the action.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    NotFound:
+      description: |
+        `jurisdiction_not_found` / `rule_not_found`. Also returned for a malformed id,
+        which cannot name an existing row.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    BodyTooLarge:
+      description: '`request_body_too_large` — the body exceeds 256 KiB.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    StoreUnavailable:
+      description: |
+        `store_unavailable` — the service cannot answer. This is NOT "no". Callers
+        validating a `jurisdiction_id` must reject the write fail-closed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    AuthzOrStoreUnavailable:
+      description: |
+        `authz_unavailable` — no authorization decision could be obtained, so the
+        mutation was refused. `store_unavailable` — the database could not be reached.
+        Both fail closed: nothing was written.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code. Clients switch on this, not on the message.
+        message:
+          type: string
+          description: Human-readable detail. May change without notice.
+        field:
+          type: string
+          description: The offending field, when error is `missing_field`.
+        jurisdiction_id:
+          type: string
+
+    Jurisdiction:
+      type: object
+      description: |
+        A jurisdiction identity. PUBLIC data
+        (data_classification_audit.md §2.11) — names, region codes, country codes.
+      required:
+        - jurisdiction_id
+        - jurisdiction_code
+        - jurisdiction_name
+        - jurisdiction_type
+        - authority_type
+        - effective_from
+        - active_flag
+        - data_classification
+        - created_at
+        - created_by_principal_id
+        - schema_version
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        jurisdiction_code:
+          type: string
+          description: |
+            Human-readable short code, e.g. "GB", "US-CA". DATA ONLY — never used as a
+            code branch anywhere in the platform.
+        jurisdiction_name: { type: string }
+        jurisdiction_type:
+          type: string
+          description: |
+            VARCHAR tag stored as data, e.g. COUNTRY, STATE_PROVINCE, TAX_AUTHORITY,
+            LABOR_LAW_BOUNDARY, FILING_AUTHORITY, DATA_RESIDENCY_BOUNDARY. New values
+            arrive by data migration; this list is illustrative, not exhaustive.
+        parent_jurisdiction_id:
+          type: [string, "null"]
+          format: uuid
+          description: Null for a root jurisdiction. Nests country → state → tax authority.
+        authority_type:
+          type: string
+          description: e.g. FEDERAL, STATE, MUNICIPAL, SUPRANATIONAL. Data driven.
+        effective_from: { type: string, format: date-time }
+        effective_to:
+          type: [string, "null"]
+          format: date-time
+          description: Null while current. Set on deactivation — end-dating, not deletion.
+        active_flag: { type: boolean }
+        data_classification: { type: string, const: "PUBLIC" }
+        created_at: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+        schema_version: { type: string }
+        updated_at: { type: [string, "null"], format: date-time }
+        updated_by_principal_id: { type: [string, "null"] }
+
+    JurisdictionRule:
+      type: object
+      description: |
+        An effective-dated applicability rule. INTERNAL data
+        (data_classification_audit.md §2.11).
+      required:
+        - jurisdiction_rule_id
+        - jurisdiction_id
+        - rule_domain
+        - rule_code
+        - rule_name
+        - effective_from
+        - rule_payload
+        - rule_status
+        - legal_drift_state
+        - data_classification
+        - created_at
+        - created_by_principal_id
+        - schema_version
+      properties:
+        jurisdiction_rule_id: { type: string, format: uuid }
+        jurisdiction_id: { type: string, format: uuid }
+        rule_domain:
+          type: string
+          description: e.g. PAYROLL, TAX, EMPLOYMENT, FILING, RETENTION, BENEFITS. Data driven.
+        rule_code:
+          type: string
+          description: Stable machine-readable identifier for this rule type within a domain.
+        rule_name: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            Exclusive end of the half-open effective period. Set automatically when the
+            rule is superseded or retired.
+        rule_payload:
+          type: object
+          description: |
+            APPLICABILITY METADATA ONLY — never computation values. Thresholds, rates
+            and bands belong to the Tax and Payroll services (OQ-1, Model B). Structure
+            is domain-specific and governed by `rule_domain` + `schema_version`.
+            Example: `{"applies_to_entity_types":["COMPANY","BRANCH"],
+            "filing_frequency":"MONTHLY","authority_code":"HMRC"}`.
+        source_reference:
+          type: [string, "null"]
+          description: Citation — legislative act, regulation, statutory instrument.
+        external_feed_reference:
+          type: [string, "null"]
+          description: The external regulatory data feed that produced this rule.
+        rule_status:
+          type: string
+          description: DRAFT, ACTIVE, SUPERSEDED or RETIRED. VARCHAR, not an enum.
+        legal_drift_state:
+          type: string
+          description: |
+            CURRENT, DRIFTED or UNDER_REVIEW. Current value only — the transition
+            history is at /v1/rules/{id}/drift-events.
+        data_classification: { type: string, const: "INTERNAL" }
+        created_at: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+        schema_version: { type: string }
+        updated_at: { type: [string, "null"], format: date-time }
+        updated_by_principal_id: { type: [string, "null"] }
+
+    RulePack:
+      type: object
+      description: The resolved, runtime-ready rule set for a jurisdiction at a point in time.
+      required: [jurisdiction_id, effective_at, resolved_from, rules]
+      properties:
+        jurisdiction_id: { type: string, format: uuid }
+        effective_at: { type: string, format: date-time }
+        resolved_from:
+          type: array
+          description: |
+            The jurisdiction chain the pack was assembled from, self first then
+            ancestors outward to the root. Record this as the rule basis of a governed
+            action.
+          items: { type: string, format: uuid }
+        rules:
+          type: array
+          description: One winning rule per (rule_domain, rule_code). Never null.
+          items: { $ref: '#/components/schemas/JurisdictionRule' }
+
+    DriftEvent:
+      type: object
+      description: One append-only entry in a rule's legal_drift_state history (OQ-4).
+      required:
+        - drift_event_id
+        - jurisdiction_rule_id
+        - from_state
+        - to_state
+        - effective_at
+        - recorded_by_principal_id
+        - schema_version
+      properties:
+        drift_event_id: { type: string, format: uuid }
+        jurisdiction_rule_id: { type: string, format: uuid }
+        from_state: { type: string }
+        to_state: { type: string }
+        reason:
+          type: [string, "null"]
+          description: |
+            The evidence — the regulatory update that diverged from the stored rule, or
+            the review conclusion that closed it.
+        effective_at: { type: string, format: date-time }
+        recorded_by_principal_id: { type: string }
+        correlation_id: { type: [string, "null"] }
+        schema_version: { type: string }
+
+    CreateJurisdictionRequest:
+      type: object
+      required: [jurisdiction_code, jurisdiction_name, jurisdiction_type, authority_type, effective_from]
+      additionalProperties: false
+      properties:
+        jurisdiction_code: { type: string, minLength: 1, maxLength: 32 }
+        jurisdiction_name: { type: string, minLength: 1 }
+        jurisdiction_type: { type: string, minLength: 1, maxLength: 64 }
+        parent_jurisdiction_id: { type: [string, "null"], format: uuid }
+        authority_type: { type: string, minLength: 1, maxLength: 64 }
+        effective_from: { type: string, format: date-time }
+        effective_to:
+          type: [string, "null"]
+          format: date-time
+          description: Must be strictly after effective_from.
+
+    CreateRuleRequest:
+      type: object
+      required: [rule_domain, rule_code, rule_name, effective_from]
+      additionalProperties: false
+      properties:
+        rule_domain: { type: string, minLength: 1, maxLength: 64 }
+        rule_code: { type: string, minLength: 1, maxLength: 128 }
+        rule_name: { type: string, minLength: 1 }
+        effective_from: { type: string, format: date-time }
+        effective_to:
+          type: [string, "null"]
+          format: date-time
+          description: Must be strictly after effective_from.
+        rule_payload:
+          type: object
+          description: |
+            Applicability metadata. Must be a JSON object — a scalar or array is
+            rejected. Omitted defaults to `{}`.
+          default: {}
+        source_reference: { type: [string, "null"] }
+        external_feed_reference: { type: [string, "null"] }
+        rule_status:
+          type: string
+          enum: [DRAFT, ACTIVE]
+          default: DRAFT
+          description: |
+            SUPERSEDED and RETIRED are not accepted here — they are reached only
+            through the transition endpoint.
+
+    TransitionRuleStatusRequest:
+      type: object
+      required: [new_status]
+      additionalProperties: false
+      properties:
+        new_status:
+          type: string
+          enum: [ACTIVE, SUPERSEDED, RETIRED]
+        effective_to:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            When the rule stopped applying. Used only for SUPERSEDED and RETIRED, and
+            only when the rule does not already carry an end date. Omitted means now.
+            Must be strictly after the rule's effective_from.
+
+    RecordDriftRequest:
+      type: object
+      required: [drift_state]
+      additionalProperties: false
+      properties:
+        drift_state:
+          type: string
+          enum: [CURRENT, DRIFTED, UNDER_REVIEW]
+        reason:
+          type: [string, "null"]
+          description: The evidence for the change. Preserved verbatim in the history.
+
+    RecordDriftResponse:
+      type: object
+      required: [rule, changed]
+      properties:
+        rule: { $ref: '#/components/schemas/JurisdictionRule' }
+        drift_event:
+          oneOf:
+            - $ref: '#/components/schemas/DriftEvent'
+            - type: "null"
+          description: The history entry written. Null when the state was already set.
+        changed:
+          type: boolean
+          description: |
+            False for a replay. Consumers use this to tell a real divergence from a
+            retried call.

@@ -2,10 +2,7 @@
 package middleware
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"net/http"
-	"strings"
 
 	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
@@ -13,70 +10,64 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
 )
 
-// TenantContext extracts the tenant_id claim from the IdentityContextEnvelope
-// JWT in the Authorization header and injects it into the request context via
-// domain.WithTenant. Every DB transaction in PgStore calls withRLS which reads
-// this value to set app.tenant_id on the Postgres session, enforcing RLS.
+// Gateway-set identity headers. Traefik's ForwardAuth middleware verifies the
+// caller's IdentityContextEnvelope against identity-svc's JWKS and copies the
+// resolved identity into these headers; a request with a bad token never
+// reaches this process at all. See the gateway-auth middleware definition in
+// deployments/docker-compose.yml.
+const (
+	HeaderPrincipalID   = "X-Principal-Id"
+	HeaderTenantID      = "X-Tenant-Id"
+	HeaderLegalEntityID = "X-Legal-Entity-Id"
+)
+
+// Identity extracts the caller's verified identity into the request context.
 //
-// Requests that carry no tenant_id (e.g. the ProvisionTenant bootstrap call)
-// are permitted through — CreateTenant sets the context from the new ID itself.
-// All other mutating store calls require this middleware to have set it first.
-func TenantContext(log *zap.Logger) func(http.Handler) http.Handler {
+// Until 2026-08-05 this middleware read tenant_id by base64-decoding the JWT
+// payload from the Authorization header, with no signature check, on the
+// stated assumption that "the Authorization Service has already validated the
+// token upstream". Two things made that assumption false:
+//
+//   - The authorization client was a TODO that returned nil, so nothing
+//     validated anything.
+//   - docker-compose publishes 8081 on the host, so the gateway that does the
+//     verifying can be bypassed by connecting to the service directly.
+//
+// tenant_id is what PgStore.withRLS sets as app.tenant_id on every Postgres
+// session, so an unsigned, caller-supplied claim was steering row-level
+// security — this service's central architectural guarantee. Forging
+// {"tenant_id":"<victim>"} needs no key, just base64.
+//
+// Reading the gateway-set headers instead means the value is only ever one a
+// verified envelope produced. A caller who sets the header directly is not
+// trusted either: in production the gateway strips inbound copies of these
+// headers before ForwardAuth, and the service is not published outside the
+// cluster.
+func Identity(log *zap.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tenantID := extractTenantIDFromBearer(r.Header.Get("Authorization"))
-			if tenantID != "" {
-				r = r.WithContext(domain.WithTenant(r.Context(), tenantID))
+			ctx := r.Context()
+
+			if tenantID := r.Header.Get(HeaderTenantID); tenantID != "" {
+				ctx = domain.WithTenant(ctx, tenantID)
 			} else {
-				log.Debug("tenant_id not present in JWT; RLS will rely on store-level fallback",
+				// Not an error: ProvisionTenant is the bootstrap call and has
+				// no tenant yet — it sets the context from the new ID itself.
+				log.Debug("no verified tenant on request; RLS relies on the store-level fallback",
 					zap.String("path", r.URL.Path),
-					zap.String("request_id", chimiddleware.GetReqID(r.Context())),
+					zap.String("request_id", chimiddleware.GetReqID(ctx)),
 				)
 			}
-			next.ServeHTTP(w, r)
+
+			if principalID := r.Header.Get(HeaderPrincipalID); principalID != "" {
+				ctx = domain.WithPrincipal(ctx, principalID)
+			}
+
+			if legalEntityID := r.Header.Get(HeaderLegalEntityID); legalEntityID != "" {
+				ctx = domain.WithLegalEntity(ctx, legalEntityID)
+			}
+
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
-}
-
-// extractTenantIDFromBearer parses the Bearer JWT and extracts the tenant_id
-// claim from the payload. Signature verification is not performed here — the
-// Authorization Service has already validated the token upstream.
-// The IdentityContextEnvelope carries tenant_id as a top-level JWT claim.
-func extractTenantIDFromBearer(authHeader string) string {
-	token := strings.TrimPrefix(authHeader, "Bearer ")
-	if token == "" || token == authHeader {
-		return ""
-	}
-	return jwtClaimString(token, "tenant_id")
-}
-
-// jwtClaimString decodes the JWT payload and returns the string value of the
-// named claim. Returns "" if the token is malformed or the claim is absent.
-func jwtClaimString(token, claim string) string {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return ""
-	}
-
-	// JWT uses base64url (RFC 4648 §5) without padding.
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
-	}
-
-	// Unmarshal only into a map to avoid coupling to a specific claims struct.
-	var claims map[string]any
-	if err := json.Unmarshal(raw, &claims); err != nil {
-		return ""
-	}
-
-	v, ok := claims[claim]
-	if !ok {
-		return ""
-	}
-	s, ok := v.(string)
-	if !ok {
-		return ""
-	}
-	return s
 }

@@ -260,6 +260,11 @@ func (h *Handler) SubmitDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if appReq.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", string(domain.ErrSelfApprovalNotAllowed))
+		return
+	}
+
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	correlationID := getCorrelationID(r)
 

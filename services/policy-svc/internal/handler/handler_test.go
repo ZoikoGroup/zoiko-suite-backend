@@ -39,13 +39,23 @@ type stubStore struct {
 	historyErr     error
 	applicable     []*domain.ApplicablePolicyVersion
 	applicableErr  error
+
+	// call counters + captured actor, so the authorization tests can prove a
+	// refused request never reached the store and that the recorded actor is
+	// the header principal rather than anything in the body.
+	createPolicyCalls  int
+	createVersionCalls int
+	activateCalls      int
+	activateActor      string
 }
 
 func (s *stubStore) CreatePolicy(_ context.Context, _ domain.CreatePolicyParams) (*domain.Policy, bool, error) {
+	s.createPolicyCalls++
 	return s.policy, s.policyCreated, s.policyErr
 }
 
 func (s *stubStore) CreatePolicyVersion(_ context.Context, _ domain.CreatePolicyVersionParams) (*domain.PolicyVersion, bool, error) {
+	s.createVersionCalls++
 	return s.version, s.versionCreated, s.versionErr
 }
 
@@ -53,7 +63,9 @@ func (s *stubStore) FindPolicyVersionByID(_ context.Context, _ string) (*domain.
 	return s.findVersion, s.findVersionErr
 }
 
-func (s *stubStore) ActivateVersion(_ context.Context, _ string, _ string) (*domain.PolicyVersion, []*domain.PolicyVersion, bool, error) {
+func (s *stubStore) ActivateVersion(_ context.Context, _ string, actorID string) (*domain.PolicyVersion, []*domain.PolicyVersion, bool, error) {
+	s.activateCalls++
+	s.activateActor = actorID
 	return s.activated, s.superseded, s.transitioned, s.activateErr
 }
 
@@ -123,10 +135,47 @@ func newTestRouterWithPublisher(s *stubStore, p *stubPublisher) chi.Router {
 }
 
 func newTestRouterFull(s *stubStore, p *stubPublisher, d *stubDecisionLog) chi.Router {
+	return newTestRouterWithAuthz(s, p, d, &stubAuthz{})
+}
+
+// newTestRouterWithAuthz is the same wiring with an explicit authz client —
+// used by the tests that exercise the 403 and fail-closed 503 paths.
+func newTestRouterWithAuthz(s *stubStore, p *stubPublisher, d *stubDecisionLog, az *stubAuthz) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, d, zap.NewNop())
+	h := handler.New(s, p, d, az, testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
+}
+
+// testAuthzScopeID stands in for config.AuthZPlatformScopeID — the synthetic
+// legal entity a policy that is not entity-scoped is authorized against.
+const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f2"
+
+// testPrincipal is what the gateway ForwardAuth middleware would set in
+// X-Principal-Id after verifying the caller identity envelope.
+const testPrincipal = "principal-policy-admin"
+
+// stubAuthz records what it was asked and answers with err.
+type stubAuthz struct {
+	err error
+
+	calls      int
+	principal  string
+	scope      string
+	actionType string
+}
+
+func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType string) error {
+	a.calls++
+	a.principal, a.scope, a.actionType = principalID, legalEntityID, actionType
+	return a.err
+}
+
+// authed stamps the gateway-verified principal header onto a request. Every
+// mutating route now requires it.
+func authed(req *http.Request) *http.Request {
+	req.Header.Set("X-Principal-Id", testPrincipal)
+	return req
 }
 
 // ── CreatePolicy ─────────────────────────────────────────────────────────────
@@ -146,7 +195,7 @@ func TestCreatePolicy_Created(t *testing.T) {
 	r := newTestRouterWithPublisher(store, pub)
 
 	body := `{"policy_code":"APPROVAL_5K","policy_name":"5K Approval Threshold","policy_type":"APPROVAL_THRESHOLD","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -174,7 +223,7 @@ func TestCreatePolicy_IdempotentReplay(t *testing.T) {
 	r := newTestRouterWithPublisher(store, pub)
 
 	body := `{"policy_code":"APPROVAL_5K","policy_name":"5K Approval Threshold","policy_type":"APPROVAL_THRESHOLD","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -190,7 +239,7 @@ func TestCreatePolicy_MissingField(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"policy_code":"APPROVAL_5K"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -204,7 +253,7 @@ func TestCreatePolicy_Conflict(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"policy_code":"APPROVAL_5K","policy_name":"5K Approval Threshold","policy_type":"APPROVAL_THRESHOLD","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -218,7 +267,7 @@ func TestCreatePolicy_StoreUnavailable(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"policy_code":"APPROVAL_5K","policy_name":"5K Approval Threshold","policy_type":"APPROVAL_THRESHOLD","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -242,7 +291,7 @@ func TestCreatePolicyVersion_Created(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"rule_payload":{"threshold_amount":5000},"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -255,7 +304,7 @@ func TestCreatePolicyVersion_MissingEffectiveFrom(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -269,7 +318,7 @@ func TestCreatePolicyVersion_PolicyNotFound(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/missing/versions", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/missing/versions", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -291,7 +340,7 @@ func TestActivateVersion_Success(t *testing.T) {
 	r := newTestRouterWithPublisher(store, pub)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -323,7 +372,7 @@ func TestActivateVersion_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	r := newTestRouterWithPublisher(store, pub)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -336,15 +385,193 @@ func TestActivateVersion_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	}
 }
 
-func TestActivateVersion_MissingActor(t *testing.T) {
-	r := newTestRouter(&stubStore{})
+// TestActivateVersion_ActorComesFromHeaderNotBody replaces an earlier test
+// that asserted a 400 when activated_by_principal_id was missing from the
+// body. That field is now ignored: a caller must not be able to choose what
+// the audit trail records about them, so the actor is read from the
+// gateway-verified header and an empty body is perfectly valid.
+func TestActivateVersion_ActorComesFromHeaderNotBody(t *testing.T) {
+	store := &stubStore{
+		findVersion:  &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT"},
+		activated:    &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},
+		transitioned: true,
+	}
+	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(`{}`))
+	// Body names someone else entirely; the header is what must be recorded.
+	body := `{"activated_by_principal_id":"someone-else"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.activateActor != testPrincipal {
+		t.Errorf("store recorded actor %q, want the header principal %q", store.activateActor, testPrincipal)
+	}
+}
+
+// ── authentication and authorization ─────────────────────────────────────────
+
+// mutatingRoutes is every route that changes policy state, so a route added
+// later cannot quietly skip the gate.
+var mutatingRoutes = []struct {
+	name string
+	path string
+	body string
+}{
+	{"create policy", "/v1/policies", `{"policy_code":"C","policy_name":"N","policy_type":"APPROVAL_THRESHOLD"}`},
+	{"create version", "/v1/policies/p-1/versions", `{"effective_from":"2025-01-01T00:00:00Z","rule_payload":{"threshold_amount":100}}`},
+	{"activate version", "/v1/policies/p-1/versions/pv-1/activate", `{}`},
+}
+
+func okStore() *stubStore {
+	return &stubStore{
+		policy:         &domain.Policy{PolicyID: "p-1", PolicyCode: "C"},
+		policyCreated:  true,
+		version:        &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT"},
+		versionCreated: true,
+		findVersion:    &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT"},
+		activated:      &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},
+		transitioned:   true,
+	}
+}
+
+// TestMutatingRoutes_401_WithoutPrincipal — policy-svc took the acting
+// principal from the request body, so the audit columns recorded whatever the
+// caller typed and an unauthenticated caller could write as anyone.
+func TestMutatingRoutes_401_WithoutPrincipal(t *testing.T) {
+	for _, route := range mutatingRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			r := newTestRouter(okStore())
+			// Deliberately NOT wrapped in authed().
+			req := httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 without a principal, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestMutatingRoutes_403_Denied — a denial must stop the write.
+func TestMutatingRoutes_403_Denied(t *testing.T) {
+	for _, route := range mutatingRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := okStore()
+			az := &stubAuthz{err: domain.ErrAuthorizationDenied}
+			r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+			}
+			if az.calls != 1 {
+				t.Errorf("expected exactly 1 authorization check, got %d", az.calls)
+			}
+			if az.principal != testPrincipal {
+				t.Errorf("authz saw principal %q, want %q", az.principal, testPrincipal)
+			}
+			if store.createPolicyCalls > 0 || store.createVersionCalls > 0 || store.activateCalls > 0 {
+				t.Error("FAIL: a denied request still reached the store")
+			}
+		})
+	}
+}
+
+// TestMutatingRoutes_503_AuthzUnavailableFailsClosed — an unreachable
+// authorization service must block the mutation, not wave it through.
+func TestMutatingRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
+	for _, route := range mutatingRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := okStore()
+			az := &stubAuthz{err: domain.ErrAuthorizationServiceUnavailable}
+			r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+			if store.createPolicyCalls > 0 || store.createVersionCalls > 0 || store.activateCalls > 0 {
+				t.Error("FAIL: a request reached the store without an authorization decision")
+			}
+		})
+	}
+}
+
+// TestActivateVersion_AuthorizedAgainstStoredScope — activation must be
+// checked against the entity the version actually binds, read from the stored
+// record, not from anything the caller supplied.
+func TestActivateVersion_AuthorizedAgainstStoredScope(t *testing.T) {
+	entity := "legal-entity-77"
+	store := okStore()
+	store.findVersion = &domain.PolicyVersion{
+		PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT", LegalEntityID: &entity,
+	}
+	az := &stubAuthz{}
+	r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(`{}`)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if az.scope != entity {
+		t.Errorf("authz scope = %q, want the version's legal entity %q", az.scope, entity)
+	}
+	if az.actionType != "POLICY_VERSION_ACTIVATE" {
+		t.Errorf("action_type = %q, want POLICY_VERSION_ACTIVATE", az.actionType)
+	}
+}
+
+// TestCreatePolicy_UsesPlatformScopeWhenUnscoped — a Policy header row has no
+// legal entity, and authorization-svc rejects an empty legal_entity_id.
+func TestCreatePolicy_UsesPlatformScopeWhenUnscoped(t *testing.T) {
+	az := &stubAuthz{}
+	r := newTestRouterWithAuthz(okStore(), &stubPublisher{}, &stubDecisionLog{}, az)
+
+	body := `{"policy_code":"C","policy_name":"N","policy_type":"APPROVAL_THRESHOLD"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if az.scope != testAuthzScopeID {
+		t.Errorf("authz scope = %q, want the platform scope %q", az.scope, testAuthzScopeID)
+	}
+	if az.scope == "" {
+		t.Error("an empty legal_entity_id would be rejected by authorization-svc with 400")
+	}
+}
+
+// TestEvaluate_NotGated — Evaluate is a query other services call on the hot
+// path; it changes no policy state, so requiring a POLICY_* grant on every
+// caller would be wrong. It stays open deliberately.
+func TestEvaluate_NotGated(t *testing.T) {
+	az := &stubAuthz{err: domain.ErrAuthorizationDenied}
+	store := &stubStore{applicable: []*domain.ApplicablePolicyVersion{}}
+	r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
+
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_amount":100,"evaluated_by_principal_id":"caller-1"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden || w.Code == http.StatusUnauthorized {
+		t.Fatalf("Evaluate must not be gated, got %d", w.Code)
+	}
+	if az.calls != 0 {
+		t.Errorf("Evaluate should not call authorization-svc, got %d calls", az.calls)
 	}
 }
 
@@ -356,7 +583,7 @@ func TestActivateVersion_PolicyIDMismatch(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -373,7 +600,7 @@ func TestActivateVersion_InvalidTransition(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions/pv-1/activate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -556,8 +783,13 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	if decisionLog.last.ActorID != "admin-1" {
 		t.Errorf("expected ActorID admin-1, got %s", decisionLog.last.ActorID)
 	}
-	if decisionLog.last.Outcome != "APPROVAL_REQUIRED" {
-		t.Errorf("expected Outcome APPROVAL_REQUIRED, got %s", decisionLog.last.Outcome)
+	// Recorded outcome must be in the decision log's vocabulary
+	// (GRANTED/DENIED/ESCALATED), not this service's own result vocabulary.
+	// ESCALATED, not DENIED: over-threshold routes to an approver rather than
+	// refusing the action. The response above keeps APPROVAL_REQUIRED — the two
+	// vocabularies are deliberately different, so both are asserted here.
+	if decisionLog.last.Outcome != "ESCALATED" {
+		t.Errorf("expected recorded Outcome ESCALATED, got %s", decisionLog.last.Outcome)
 	}
 	if decisionLog.last.RuleBasis != "APPROVAL_5K:pv-1" {
 		t.Errorf("expected RuleBasis APPROVAL_5K:pv-1, got %s", decisionLog.last.RuleBasis)
@@ -687,6 +919,55 @@ func TestEvaluate_AmountEqualsThreshold_IsWithinThreshold(t *testing.T) {
 	}
 	if got.Result != "WITHIN_THRESHOLD" {
 		t.Errorf("expected WITHIN_THRESHOLD when amount == threshold, got %s", got.Result)
+	}
+}
+
+// The GRANTED half of the outcome mapping. Paired with the ESCALATED assertion in
+// TestEvaluate_ApprovalRequired_RecordsDecision: an under-threshold evaluation is
+// a real authorization and must be recorded as one, or the audit trail cannot
+// show that the spend was approved.
+func TestEvaluate_WithinThreshold_RecordsGrantedOutcome(t *testing.T) {
+	store := &stubStore{
+		applicable: []*domain.ApplicablePolicyVersion{
+			{
+				PolicyVersion: domain.PolicyVersion{
+					PolicyVersionID: "pv-1",
+					VersionStatus:   "ACTIVE",
+					RulePayload:     []byte(`{"threshold_amount":5000}`),
+				},
+				PolicyCode: "APPROVAL_5K",
+			},
+		},
+	}
+	decisionLog := &stubDecisionLog{}
+	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
+
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if decisionLog.calls != 1 {
+		t.Fatalf("expected RecordDecision called once, got %d", decisionLog.calls)
+	}
+	if decisionLog.last.Outcome != "GRANTED" {
+		t.Errorf("expected recorded Outcome GRANTED, got %s", decisionLog.last.Outcome)
+	}
+
+	// The API response keeps this service's own result vocabulary — callers switch
+	// on it, so normalising the evidence write must not leak into the contract.
+	var got struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if got.Result != "WITHIN_THRESHOLD" {
+		t.Errorf("expected response result WITHIN_THRESHOLD, got %s", got.Result)
 	}
 }
 

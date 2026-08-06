@@ -3,10 +3,12 @@ package handler
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
@@ -25,10 +27,13 @@ func getTenant(r *http.Request) string {
 
 type Handler struct {
 	store  store.Store
+	ca     *ca.CA
 	logger *zap.Logger
 }
 
-func New(s store.Store, l *zap.Logger) *Handler { return &Handler{store: s, logger: l} }
+func New(s store.Store, c *ca.CA, l *zap.Logger) *Handler {
+	return &Handler{store: s, ca: c, logger: l}
+}
 
 func NewRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
@@ -60,12 +65,42 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 		h.errJSON(w, 400, err.Error())
 		return
 	}
-	cert := domain.GenerateCertificate(&req, tenantID)
+
+	issued, err := h.ca.IssueLeaf(req.CommonName, []string{req.ServiceName}, time.Duration(req.RotationDays)*24*time.Hour)
+	if err != nil {
+		h.logger.Error("failed to issue leaf certificate", zap.String("common_name", req.CommonName), zap.Error(err))
+		h.errJSON(w, 500, "failed to issue certificate")
+		return
+	}
+
+	now := time.Now()
+	cert := &domain.MtlsCertificate{
+		TenantID:       tenantID,
+		LegalEntityID:  req.LegalEntityID,
+		ServiceName:    req.ServiceName,
+		CommonName:     req.CommonName,
+		Issuer:         "ZoikoSuite Internal CA",
+		SerialNumber:   issued.SerialNumber,
+		Fingerprint:    issued.Fingerprint,
+		CertificatePEM: string(issued.CertificatePEM),
+		ValidFrom:      issued.NotBefore,
+		ValidTo:        issued.NotAfter,
+		RotationDays:   req.RotationDays,
+		AutoRotate:     req.AutoRotate,
+		Status:         domain.CertStatusActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
 	if err := h.store.CreateCert(r.Context(), tenantID, cert); err != nil {
 		h.errJSON(w, 500, "failed to provision certificate")
 		return
 	}
-	h.okJSON(w, 201, cert)
+
+	h.okJSON(w, 201, domain.ProvisionCertResult{
+		Certificate:   *cert,
+		PrivateKeyPEM: string(issued.PrivateKeyPEM),
+		CACertPEM:     string(h.ca.CertificatePEM()),
+	})
 }
 
 func (h *Handler) GetCert(w http.ResponseWriter, r *http.Request) {
@@ -89,12 +124,37 @@ func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenant(r)
-	cert, err := h.store.RotateCert(r.Context(), tenantID, chi.URLParam(r, "id"))
+	id := chi.URLParam(r, "id")
+
+	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
 	if err != nil {
 		h.errJSON(w, 404, "certificate not found")
 		return
 	}
-	h.okJSON(w, 200, cert)
+
+	// Rotation issues a genuinely new key pair and certificate signed by
+	// the same CA — it is not a metadata refresh. The old private key
+	// (which this service never retained anyway) becomes unusable the
+	// moment the requesting service adopts the new one.
+	issued, err := h.ca.IssueLeaf(existing.CommonName, []string{existing.ServiceName}, time.Duration(existing.RotationDays)*24*time.Hour)
+	if err != nil {
+		h.logger.Error("failed to issue rotated certificate", zap.String("id", id), zap.Error(err))
+		h.errJSON(w, 500, "failed to rotate certificate")
+		return
+	}
+
+	updated, err := h.store.ReplaceCertMaterial(r.Context(), tenantID, id,
+		issued.SerialNumber, issued.Fingerprint, string(issued.CertificatePEM), issued.NotBefore, issued.NotAfter)
+	if err != nil {
+		h.errJSON(w, 404, "certificate not found")
+		return
+	}
+
+	h.okJSON(w, 200, domain.ProvisionCertResult{
+		Certificate:   *updated,
+		PrivateKeyPEM: string(issued.PrivateKeyPEM),
+		CACertPEM:     string(h.ca.CertificatePEM()),
+	})
 }
 
 func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {

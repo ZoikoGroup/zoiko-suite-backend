@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/configuration-feature-flag-svc/internal/authz"
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
 	"zoiko.io/configuration-feature-flag-svc/internal/store"
 )
@@ -38,12 +40,24 @@ type EventPublisher interface {
 type Handler struct {
 	store     ConfigStore
 	publisher EventPublisher
+	authz     authz.Client
 	log       *zap.Logger
+
+	// authzPlatformScopeID is the legal_entity_id used for configuration and
+	// flags, which are platform-scoped rather than entity-scoped.
+	// authorization-svc rejects an empty legal_entity_id.
+	authzPlatformScopeID string
 }
 
 // New constructs a Handler.
-func New(store ConfigStore, publisher EventPublisher, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, log: log}
+func New(store ConfigStore, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+	return &Handler{
+		store:                store,
+		publisher:            publisher,
+		authz:                authzClient,
+		authzPlatformScopeID: authzPlatformScopeID,
+		log:                  log,
+	}
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -113,6 +127,14 @@ func (req upsertConfigEntryRequest) missingField() string {
 //	503 → store unavailable
 func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionConfigWrite) {
+		return
+	}
 
 	var req upsertConfigEntryRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -301,6 +323,14 @@ func (req upsertFeatureFlagRequest) missingField() string {
 func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, "", ActionFeatureFlagWrite) {
+		return
+	}
+
 	var req upsertFeatureFlagRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -461,4 +491,50 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		// At this point headers are already sent — log only.
 		_ = err
 	}
+}
+
+// ── authorization ────────────────────────────────────────────────────────────
+
+// Action types this service asks authorization-svc about. Changing a config
+// value or flipping a feature flag alters platform behaviour at runtime, so
+// both are material actions under 03-microservices.md §17.1.
+const (
+	ActionConfigWrite      = "CONFIGURATION_WRITE"
+	ActionFeatureFlagWrite = "FEATURE_FLAG_WRITE"
+)
+
+// requirePrincipal resolves the acting principal from the gateway-verified
+// X-Principal-Id header, writing 401 and returning false when absent.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
+		return id, true
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{
+		"error":   "missing_principal",
+		"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
+	})
+	return "", false
+}
+
+// authorize fails closed on both a denial and an unobtainable decision.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	scope := h.authzPlatformScopeID
+	if legalEntityID != "" {
+		scope = legalEntityID
+	}
+	err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, authz.ErrDenied):
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+	default:
+		h.log.Error("authorization check failed — refusing the mutation",
+			zap.String("principal_id", principalID),
+			zap.String("action_type", actionType),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+	}
+	return false
 }

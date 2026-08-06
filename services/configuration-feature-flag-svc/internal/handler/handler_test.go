@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/configuration-feature-flag-svc/internal/authz"
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
 	"zoiko.io/configuration-feature-flag-svc/internal/handler"
 	"zoiko.io/configuration-feature-flag-svc/internal/store"
@@ -33,10 +35,10 @@ type stubStore struct {
 	listConfigErr       error
 	gotListConfigFilter store.ListFilter
 
-	flag             *domain.FeatureFlag
-	flagCreated      bool
-	flagErr          error
-	gotUpsertFlag    domain.UpsertFeatureFlagParams
+	flag          *domain.FeatureFlag
+	flagCreated   bool
+	flagErr       error
+	gotUpsertFlag domain.UpsertFeatureFlagParams
 
 	findFlagResult *domain.FeatureFlag
 	findFlagErr    error
@@ -95,7 +97,7 @@ func (p *stubPublisher) PublishFeatureFlagUpdated(_ context.Context, _ domain.Fe
 
 func newTestRouter(s *stubStore, p *stubPublisher) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, zap.NewNop())
+	h := handler.New(s, p, testAuthz(), testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -116,7 +118,7 @@ func TestUpsertConfigEntry_Created(t *testing.T) {
 	r := newTestRouter(store, pub)
 
 	body := `{"key":"payroll.batch_size","value":100,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -144,7 +146,7 @@ func TestUpsertConfigEntry_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	r := newTestRouter(store, pub)
 
 	body := `{"key":"k","value":100,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -160,7 +162,7 @@ func TestUpsertConfigEntry_MissingField(t *testing.T) {
 	r := newTestRouter(&stubStore{}, &stubPublisher{})
 
 	body := `{"key":"k"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -172,7 +174,7 @@ func TestUpsertConfigEntry_MissingField(t *testing.T) {
 func TestUpsertConfigEntry_InvalidJSON(t *testing.T) {
 	r := newTestRouter(&stubStore{}, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(`{not json`))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(`{not json`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -186,7 +188,7 @@ func TestUpsertConfigEntry_StoreUnavailable(t *testing.T) {
 	r := newTestRouter(store, &stubPublisher{})
 
 	body := `{"key":"k","value":100,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -201,7 +203,7 @@ func TestUpsertConfigEntry_PublishFailureDoesNotFailRequest(t *testing.T) {
 	r := newTestRouter(store, pub)
 
 	body := `{"key":"k","value":100,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -322,7 +324,7 @@ func TestUpsertFeatureFlag_Created(t *testing.T) {
 	r := newTestRouter(store, pub)
 
 	body := `{"key":"new_ui","enabled":true,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -343,7 +345,7 @@ func TestUpsertFeatureFlag_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	r := newTestRouter(store, pub)
 
 	body := `{"key":"new_ui","enabled":true,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -359,7 +361,7 @@ func TestUpsertFeatureFlag_MissingEnabled(t *testing.T) {
 	r := newTestRouter(&stubStore{}, &stubPublisher{})
 
 	body := `{"key":"new_ui","environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -373,7 +375,7 @@ func TestUpsertFeatureFlag_ExplicitFalseIsNotMissing(t *testing.T) {
 	r := newTestRouter(store, &stubPublisher{})
 
 	body := `{"key":"new_ui","enabled":false,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -389,7 +391,7 @@ func TestUpsertFeatureFlag_RolloutPercentageOutOfRange(t *testing.T) {
 	r := newTestRouter(&stubStore{}, &stubPublisher{})
 
 	body := `{"key":"new_ui","enabled":true,"environment":"staging","rollout_percentage":150,"created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -402,7 +404,7 @@ func TestUpsertFeatureFlag_NegativeRolloutPercentageRejected(t *testing.T) {
 	r := newTestRouter(&stubStore{}, &stubPublisher{})
 
 	body := `{"key":"new_ui","enabled":true,"environment":"staging","rollout_percentage":-1,"created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -416,7 +418,7 @@ func TestUpsertFeatureFlag_StoreUnavailable(t *testing.T) {
 	r := newTestRouter(store, &stubPublisher{})
 
 	body := `{"key":"new_ui","enabled":true,"environment":"staging","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -491,5 +493,128 @@ func TestListFeatureFlags_StoreUnavailable(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d", w.Code)
+	}
+}
+
+// ── authorization test scaffolding ───────────────────────────────────────────
+
+// testAuthzScopeID stands in for config.AuthZPlatformScopeID.
+const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
+
+// testPrincipal is what the gateway ForwardAuth middleware sets in
+// X-Principal-Id after verifying the caller identity envelope.
+const testPrincipal = "principal-test-admin"
+
+// stubAuthz records what it was asked and answers with err.
+type stubAuthz struct {
+	err error
+
+	calls      int
+	principal  string
+	scope      string
+	actionType string
+}
+
+func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType string) error {
+	a.calls++
+	a.principal, a.scope, a.actionType = principalID, legalEntityID, actionType
+	return a.err
+}
+
+// testAuthz is the permit-all default used by every pre-existing test.
+func testAuthz() *stubAuthz { return &stubAuthz{} }
+
+// authed stamps the gateway-verified principal header onto a request.
+// Every mutating route now requires it.
+func authed(req *http.Request) *http.Request {
+	req.Header.Set("X-Principal-Id", testPrincipal)
+	return req
+}
+
+// ── authorization contract ───────────────────────────────────────────────────
+
+// gatedRoutes is every route that mutates state, so a route added later
+// cannot quietly skip the gate.
+var gatedRoutes = []struct {
+	name string
+	path string
+	body string
+}{
+	{name: "upsert config", path: "/v1/config", body: `{"config_key":"k","config_value":"v","environment":"production","updated_by_principal_id":"a"}`},
+	{name: "upsert flag", path: "/v1/flags", body: `{"flag_key":"f","environment":"production","enabled":true,"updated_by_principal_id":"a"}`},
+}
+
+// TestGatedRoutes_401_WithoutPrincipal — this service shipped with no gate of
+// any kind, so anything able to reach the port could write to it.
+func TestGatedRoutes_401_WithoutPrincipal(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := &stubStore{}
+			pub := &stubPublisher{}
+			az := &stubAuthz{}
+			r := chi.NewRouter()
+			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+
+			// Deliberately NOT wrapped in authed().
+			req := httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 without a principal, got %d: %s", w.Code, w.Body.String())
+			}
+			if az.calls != 0 {
+				t.Error("authorization was consulted before the caller was even identified")
+			}
+		})
+	}
+}
+
+// TestGatedRoutes_403_Denied — a denial must stop the write.
+func TestGatedRoutes_403_Denied(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := &stubStore{}
+			pub := &stubPublisher{}
+			az := &stubAuthz{err: authz.ErrDenied}
+			r := chi.NewRouter()
+			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+			}
+			if az.principal != testPrincipal {
+				t.Errorf("authz saw principal %q, want %q", az.principal, testPrincipal)
+			}
+			if az.scope == "" {
+				t.Error("an empty legal_entity_id would be rejected by authorization-svc with 400")
+			}
+		})
+	}
+}
+
+// TestGatedRoutes_503_AuthzUnavailableFailsClosed — an unreachable
+// authorization service must block the mutation, not wave it through.
+func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := &stubStore{}
+			pub := &stubPublisher{}
+			az := &stubAuthz{err: authz.ErrUnavailable}
+			r := chi.NewRouter()
+			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }

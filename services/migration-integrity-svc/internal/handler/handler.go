@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -15,6 +16,14 @@ import (
 	"zoiko.io/migration-integrity-svc/internal/health"
 	"zoiko.io/migration-integrity-svc/internal/middleware"
 	"zoiko.io/migration-integrity-svc/internal/store"
+)
+
+const (
+	principalIDHeader = "X-Principal-Id"
+
+	ActionMigrationJobValidate = "MIGRATION_JOB_VALIDATE"
+	ActionMigrationJobArchive  = "MIGRATION_JOB_ARCHIVE"
+	ActionAuditEntryRemediate  = "AUDIT_ENTRY_REMEDIATE"
 )
 
 type Handler struct {
@@ -54,6 +63,11 @@ func NewRouter(h *Handler) http.Handler {
 func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.ValidateMigrationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, http.StatusBadRequest, "invalid request body")
@@ -61,6 +75,10 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := req.Validate(); err != nil {
 		h.errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, req.LegalEntityID, ActionMigrationJobValidate) {
 		return
 	}
 
@@ -145,6 +163,21 @@ func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "id")
 	entryID := chi.URLParam(r, "entryId")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	job, err := h.store.GetJobByID(r.Context(), tenantID, jobID)
+	if err != nil {
+		h.errJSON(w, http.StatusNotFound, "migration job not found")
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, job.LegalEntityID, ActionAuditEntryRemediate) {
+		return
+	}
+
 	var req domain.RemediateRequest
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
@@ -161,6 +194,21 @@ func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	job, err := h.store.GetJobByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.errJSON(w, http.StatusNotFound, "migration job not found")
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, job.LegalEntityID, ActionMigrationJobArchive) {
+		return
+	}
 
 	if err := h.store.ArchiveJob(r.Context(), tenantID, id); err != nil {
 		h.errJSON(w, http.StatusNotFound, "migration job not found")
@@ -181,4 +229,32 @@ func (h *Handler) okJSON(w http.ResponseWriter, code int, payload interface{}) {
 
 func (h *Handler) errJSON(w http.ResponseWriter, code int, msg string) {
 	h.okJSON(w, code, map[string]string{"error": msg})
+}
+
+// requirePrincipal extracts the caller's principal ID from the
+// X-Principal-Id request header. If missing, it writes a 401 response and
+// returns ok=false so the caller can abort the request.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get(principalIDHeader)
+	if principalID == "" {
+		h.errJSON(w, http.StatusUnauthorized, "missing "+principalIDHeader+" header")
+		return "", false
+	}
+	return principalID, true
+}
+
+// checkAllowed enforces a fail-closed authorization check against
+// authorization-svc before any write mutation. It writes the appropriate
+// error response and returns false when the action must not proceed.
+func (h *Handler) checkAllowed(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			h.errJSON(w, http.StatusForbidden, "not authorized to perform this action")
+			return false
+		}
+		h.logger.Error("authorization check failed", zap.Error(err))
+		h.errJSON(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		return false
+	}
+	return true
 }

@@ -1,3 +1,23 @@
+// Package store provides the PostgreSQL implementation of
+// contract-lifecycle-svc's persistence layer.
+//
+// Every method wraps its work in setRLS, which sets app.tenant_id on the
+// transaction, and the Row-Level Security policies in
+// 000001_initial_schema.up.sql are correctly written. That is NOT sufficient on
+// its own: this pool connects as a Postgres superuser (the DATABASE_URL in
+// deployments/docker-compose.yml is postgres:postgres, same as every other
+// service on this platform), and Postgres superusers unconditionally bypass Row
+// Level Security no matter what policies exist — ENABLE ROW LEVEL SECURITY is
+// also skipped for a table's owner unless FORCE ROW LEVEL SECURITY is set, and
+// here the owner is postgres too.
+//
+// So every method ALSO filters explicitly by tenant_id in its own SQL. This is
+// the same belt-and-braces already documented in purchase-order-svc's store,
+// where it was adopted after genuine CI failures in general-ledger-svc and
+// tenant-entity-registry-svc. This service was written relying on RLS alone,
+// which meant any caller could read and mutate another tenant's contracts
+// simply by sending a different X-Tenant-Id — verified live before this was
+// added, with a second tenant reading all four of the first tenant's rows.
 package store
 
 import (
@@ -25,6 +45,27 @@ type Store interface {
 	ListContractVersions(ctx context.Context, contractID string) ([]domain.ContractVersion, error)
 }
 
+// effectiveDateColumns is the SELECT fragment for the two effective-date
+// columns, which MUST be read as text.
+//
+// effective_from/effective_to are DATE columns, but domain.Contract and
+// domain.ContractVersion declare them as string / *string because the API
+// contract is a plain "YYYY-MM-DD" — not an RFC3339 timestamp. pgx will happily
+// ENCODE a Go string into a DATE parameter (it parses the literal), so every
+// write path worked; it cannot DECODE a DATE into a *string, so every read that
+// actually scanned a row failed. That asymmetry is why the service looked
+// healthy: POST returned 201, and only GET/PUT/submit/activate/terminate — all
+// of which load the row first — returned 500. A read matching zero rows also
+// looked fine, because there was nothing to scan.
+//
+// Casting in SQL rather than changing the Go type keeps the wire shape
+// identical: switching EffectiveFrom to time.Time would serialise as
+// "2026-08-01T00:00:00Z" and silently break every consumer.
+//
+// TO_CHAR rather than ::TEXT so the format does not depend on the session's
+// DateStyle. NULL effective_to passes through as NULL.
+const effectiveDateColumns = `TO_CHAR(effective_from, 'YYYY-MM-DD'), TO_CHAR(effective_to, 'YYYY-MM-DD')`
+
 // PgStore implements Store using a PostgreSQL connection pool with RLS.
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -36,6 +77,11 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 }
 
 // setRLS sets the RLS tenant context variable for the current transaction.
+//
+// Kept even though the superuser connection bypasses the policies (see the
+// package comment): it costs one statement, and it is what makes the policies
+// work the moment this service is given a non-superuser role. It is defence in
+// depth, never the only defence — the explicit tenant_id predicate is.
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
 	_, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID))
@@ -129,10 +175,11 @@ func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.Contract,
 	err = tx.QueryRow(ctx, `
 		SELECT contract_id, tenant_id, legal_entity_id, contract_type, title,
 		       COALESCE(description,''), counterparty_id, counterparty_name, status, version,
-		       effective_from, effective_to, signed_at, signed_by,
+		       `+effectiveDateColumns+`, signed_at, signed_by,
 		       terminated_at, terminated_by, termination_note,
 		       currency, total_value, document_vault_id, created_by, created_at, updated_at
-		FROM contracts WHERE contract_id = $1`, id,
+		FROM contracts WHERE contract_id = $1 AND tenant_id = $2`,
+		id, middleware.GetTenantID(ctx),
 	).Scan(
 		&c.ContractID, &c.TenantID, &c.LegalEntityID, &ctype, &c.Title,
 		&c.Description, &c.CounterpartyID, &c.CounterpartyName, &status, &c.Version,
@@ -166,12 +213,13 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID string) ([]do
 	rows, err := tx.Query(ctx, `
 		SELECT contract_id, tenant_id, legal_entity_id, contract_type, title,
 		       COALESCE(description,''), counterparty_id, counterparty_name, status, version,
-		       effective_from, effective_to, signed_at, signed_by,
+		       `+effectiveDateColumns+`, signed_at, signed_by,
 		       terminated_at, terminated_by, termination_note,
 		       currency, total_value, document_vault_id, created_by, created_at, updated_at
 		FROM contracts
-		WHERE ($1 = '' OR legal_entity_id = $1)
-		ORDER BY created_at DESC`, legalEntityID,
+		WHERE tenant_id = $2 AND ($1 = '' OR legal_entity_id = $1)
+		ORDER BY created_at DESC`,
+		legalEntityID, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, err
@@ -217,9 +265,10 @@ func (s *PgStore) UpdateContract(ctx context.Context, c *domain.Contract, change
 		UPDATE contracts
 		SET title=$1, description=$2, counterparty_name=$3, effective_to=$4,
 		    currency=$5, total_value=$6, version=$7, updated_at=$8
-		WHERE contract_id=$9`,
+		WHERE contract_id=$9 AND tenant_id=$10`,
 		c.Title, c.Description, c.CounterpartyName, c.EffectiveTo,
 		c.Currency, c.TotalValue, c.Version, c.UpdatedAt, c.ContractID,
+		middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return fmt.Errorf("update contract: %w", err)
@@ -245,8 +294,9 @@ func (s *PgStore) UpdateContractStatus(ctx context.Context, id string, status do
 
 	now := time.Now().UTC()
 	_, err = tx.Exec(ctx, `
-		UPDATE contracts SET status=$1, updated_at=$2 WHERE contract_id=$3`,
-		string(status), now, id,
+		UPDATE contracts SET status=$1, updated_at=$2
+		WHERE contract_id=$3 AND tenant_id=$4`,
+		string(status), now, id, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return err
@@ -287,8 +337,9 @@ func (s *PgStore) ActivateContract(ctx context.Context, id string, req *domain.A
 	_, err = tx.Exec(ctx, `
 		UPDATE contracts
 		SET status=$1, signed_by=$2, signed_at=$3, document_vault_id=$4, version=$5, updated_at=$6
-		WHERE contract_id=$7`,
+		WHERE contract_id=$7 AND tenant_id=$8`,
 		string(c.Status), c.SignedBy, c.SignedAt, c.DocumentVaultID, c.Version, c.UpdatedAt, id,
+		middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, err
@@ -337,9 +388,9 @@ func (s *PgStore) TerminateContract(ctx context.Context, id string, req *domain.
 		UPDATE contracts
 		SET status=$1, terminated_by=$2, terminated_at=$3, termination_note=$4,
 		    effective_to=$5, version=$6, updated_at=$7
-		WHERE contract_id=$8`,
+		WHERE contract_id=$8 AND tenant_id=$9`,
 		string(c.Status), c.TerminatedBy, c.TerminatedAt, c.TerminationNote,
-		c.EffectiveTo, c.Version, c.UpdatedAt, id,
+		c.EffectiveTo, c.Version, c.UpdatedAt, id, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, err
@@ -368,8 +419,11 @@ func (s *PgStore) ListContractVersions(ctx context.Context, contractID string) (
 
 	rows, err := tx.Query(ctx, `
 		SELECT version_id, contract_id, tenant_id, version_number, status, title,
-		       COALESCE(description,''), effective_from, effective_to, change_summary, created_by, created_at
-		FROM contract_versions WHERE contract_id=$1 ORDER BY version_number ASC`, contractID,
+		       COALESCE(description,''), `+effectiveDateColumns+`, change_summary, created_by, created_at
+		FROM contract_versions
+		WHERE contract_id=$1 AND tenant_id=$2
+		ORDER BY version_number ASC`,
+		contractID, middleware.GetTenantID(ctx),
 	)
 	if err != nil {
 		return nil, err

@@ -17,10 +17,23 @@ import (
 	"zoiko.io/external-data-feed-svc/internal/store"
 )
 
-func setupTestRouter() (chi.Router, *events.MockPublisher) {
+// newGrantingAuthzServer stands in for authorization-svc in tests: it
+// always grants, matching the real service's contract of always returning
+// HTTP 200 with a decision in the body.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
 	st := store.NewMemoryStore()
 	pub := events.NewMockPublisher()
-	az := authz.NewClient("http://localhost:8081")
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
 	h := New(st, pub, az, zap.NewNop())
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext)
@@ -29,7 +42,7 @@ func setupTestRouter() (chi.Router, *events.MockPublisher) {
 }
 
 func TestExternalDataFeedFlow(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	// Create subscription
 	subReq := domain.CreateSubscriptionRequest{
@@ -43,6 +56,7 @@ func TestExternalDataFeedFlow(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/external-data-feeds/subscriptions", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-test")
+	req.Header.Set("X-Principal-Id", "principal-01")
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -70,6 +84,7 @@ func TestExternalDataFeedFlow(t *testing.T) {
 	ingestHTTP := httptest.NewRequest("POST", "/v1/external-data-feeds/events/ingest", bytes.NewReader(ingestBody))
 	ingestHTTP.Header.Set("Content-Type", "application/json")
 	ingestHTTP.Header.Set("X-Tenant-ID", "tenant-test")
+	ingestHTTP.Header.Set("X-Principal-Id", "principal-01")
 
 	ingestW := httptest.NewRecorder()
 	r.ServeHTTP(ingestW, ingestHTTP)

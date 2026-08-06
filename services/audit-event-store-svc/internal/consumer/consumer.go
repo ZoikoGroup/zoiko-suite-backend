@@ -25,11 +25,21 @@ import (
 // envelope is the canonical event wrapper shared by all ZoikoSuite services
 // (see identity-context-svc/internal/events/publisher.go).
 // Every event arriving on the Kafka topic is expected to conform to this shape.
+//
+// CorrelationID/CausationID are read from the envelope first (the shape most
+// producers built this session actually emit — see e.g.
+// procurement-workflow-svc/internal/events/publisher.go), falling back to a
+// same-named field inside the payload for older producers (e.g.
+// identity-context-svc's identity.context.resolved, which carries
+// correlation_id inside its payload, not the envelope). Both are optional:
+// not every producer sets causation_id today.
 type envelope struct {
 	EventType     string          `json:"event_type"`
 	EmittedAt     string          `json:"emitted_at"` // RFC3339 string from producer
 	SchemaVersion string          `json:"schema_version"`
 	SourceService string          `json:"source_service"`
+	CorrelationID string          `json:"correlation_id,omitempty"`
+	CausationID   string          `json:"causation_id,omitempty"`
 	Payload       json.RawMessage `json:"payload"`
 }
 
@@ -172,7 +182,15 @@ func (c *Consumer) handleContextResolved(ctx context.Context, eventID string, en
 		return nil
 	}
 
-	evt := store.AuditEvent{
+	// Envelope-level correlation_id wins if a producer sets it; otherwise
+	// fall back to the payload's own correlation_id (identity-context-svc's
+	// current shape).
+	correlationID := env.CorrelationID
+	if correlationID == "" {
+		correlationID = p.CorrelationID
+	}
+
+	evt := &store.AuditEvent{
 		EventID:       eventID,
 		EventType:     env.EventType,
 		TenantID:      p.TenantID,
@@ -181,6 +199,8 @@ func (c *Consumer) handleContextResolved(ctx context.Context, eventID string, en
 		SourceService: env.SourceService,
 		SchemaVersion: env.SchemaVersion,
 		Payload:       env.Payload,
+		CorrelationID: correlationID,
+		CausationID:   env.CausationID,
 	}
 
 	if err := c.store.Store(ctx, evt); err != nil {
@@ -223,7 +243,7 @@ func (c *Consumer) handleEntityStatusChanged(ctx context.Context, eventID string
 		return nil
 	}
 
-	evt := store.AuditEvent{
+	evt := &store.AuditEvent{
 		EventID:       eventID,
 		EventType:     env.EventType,
 		TenantID:      p.TenantID,
@@ -231,6 +251,8 @@ func (c *Consumer) handleEntityStatusChanged(ctx context.Context, eventID string
 		SourceService: env.SourceService,
 		SchemaVersion: env.SchemaVersion,
 		Payload:       env.Payload,
+		CorrelationID: env.CorrelationID,
+		CausationID:   env.CausationID,
 	}
 
 	if err := c.store.Store(ctx, evt); err != nil {

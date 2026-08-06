@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -15,14 +17,26 @@ import (
 	"zoiko.io/compliance-risk-scoring-svc/internal/store"
 )
 
+// AuthZClient is the subset of the authz client used by write handlers to
+// enforce fail-closed authorization checks against authorization-svc.
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+const (
+	actionRiskScoreCreate         = "RISK_SCORE_CREATE"
+	actionRiskThresholdRuleCreate = "RISK_THRESHOLD_RULE_CREATE"
+	actionRiskAssessmentArchive   = "RISK_ASSESSMENT_ARCHIVE"
+)
+
 type Handler struct {
 	store     store.Store
 	publisher *events.Publisher
-	authz     *authz.Client
+	authz     AuthZClient
 	logger    *zap.Logger
 }
 
-func NewHandler(s store.Store, p *events.Publisher, a *authz.Client, l *zap.Logger) *Handler {
+func NewHandler(s store.Store, p *events.Publisher, a AuthZClient, l *zap.Logger) *Handler {
 	return &Handler{
 		store:     s,
 		publisher: p,
@@ -65,6 +79,15 @@ func (h *Handler) CalculateRiskScore(w http.ResponseWriter, r *http.Request) {
 
 	if err := req.Validate(); err != nil {
 		h.respondError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionRiskScoreCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -140,14 +163,31 @@ func (h *Handler) GetAssessmentByID(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) CreateThresholdRule(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 
-	var rule domain.RiskThresholdRule
-	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+	var body struct {
+		domain.RiskThresholdRule
+		LegalEntityID string `json:"legal_entity_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		h.respondError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	rule := body.RiskThresholdRule
 
 	if rule.RuleName == "" || rule.RiskCategory == "" {
 		h.respondError(w, http.StatusBadRequest, "rule_name and risk_category are required")
+		return
+	}
+	if body.LegalEntityID == "" {
+		h.respondError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, body.LegalEntityID, actionRiskThresholdRuleCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -195,6 +235,21 @@ func (h *Handler) ArchiveAssessment(w http.ResponseWriter, r *http.Request) {
 	tenantID := customMiddleware.GetTenantID(r.Context())
 	id := chi.URLParam(r, "id")
 
+	assessment, err := h.store.GetAssessmentByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.respondError(w, http.StatusNotFound, "assessment not found")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, assessment.LegalEntityID, actionRiskAssessmentArchive); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	if err := h.store.ArchiveAssessment(r.Context(), tenantID, id); err != nil {
 		h.respondError(w, http.StatusNotFound, "assessment not found")
 		return
@@ -216,4 +271,21 @@ func (h *Handler) respondJSON(w http.ResponseWriter, code int, payload interface
 
 func (h *Handler) respondError(w http.ResponseWriter, code int, message string) {
 	h.respondJSON(w, code, map[string]string{"error": message})
+}
+
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		h.respondError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		h.respondError(w, http.StatusForbidden, "not authorized to perform this action")
+		return
+	}
+	h.respondError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }

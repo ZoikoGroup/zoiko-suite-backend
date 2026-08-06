@@ -17,10 +17,23 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 )
 
-func setupTestRouter() (chi.Router, *events.MockPublisher) {
+// newGrantingAuthzServer stands in for authorization-svc in tests: it
+// always grants, matching the real service's contract of always returning
+// HTTP 200 with a decision in the body.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
 	st := store.NewMemoryStore()
 	pub := events.NewMockPublisher()
-	az := authz.NewClient("http://localhost:8081")
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
 	logger := zap.NewNop()
 
 	h := New(st, pub, az, logger)
@@ -32,7 +45,7 @@ func setupTestRouter() (chi.Router, *events.MockPublisher) {
 }
 
 func TestCreateAndIngestBridge(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	reqBody := domain.CreateBridgeRequest{
 		LegalEntityID: "le-101",
@@ -46,6 +59,7 @@ func TestCreateAndIngestBridge(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/bridges", bytes.NewReader(bodyBytes))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-test")
+	req.Header.Set("X-Principal-Id", "principal-01")
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -73,6 +87,7 @@ func TestCreateAndIngestBridge(t *testing.T) {
 	ingestReq := httptest.NewRequest("POST", "/v1/bridges/"+created.BridgeID+"/ingest", bytes.NewReader(ingestBytes))
 	ingestReq.Header.Set("Content-Type", "application/json")
 	ingestReq.Header.Set("X-Tenant-ID", "tenant-test")
+	ingestReq.Header.Set("X-Principal-Id", "principal-01")
 
 	ingestW := httptest.NewRecorder()
 	r.ServeHTTP(ingestW, ingestReq)
@@ -83,7 +98,7 @@ func TestCreateAndIngestBridge(t *testing.T) {
 }
 
 func TestListBridges(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	req := httptest.NewRequest("GET", "/v1/bridges?legal_entity_id=le-101", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-test")

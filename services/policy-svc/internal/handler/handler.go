@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/domain"
 )
@@ -41,12 +43,72 @@ type Handler struct {
 	store       PolicyStore
 	publisher   EventPublisher
 	decisionLog decisionlog.Client
+	authz       authz.Client
 	log         *zap.Logger
+
+	// authzPlatformScopeID is the legal_entity_id used when a policy is not
+	// scoped to one. A global or tenant-wide policy has no owning legal
+	// entity, but authorization-svc rejects an empty legal_entity_id — so
+	// those decisions are evaluated against one synthetic platform-scope
+	// entity, and the role assignment granting POLICY_* must use that id.
+	authzPlatformScopeID string
 }
 
 // New constructs a Handler.
-func New(store PolicyStore, publisher EventPublisher, decisionLog decisionlog.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, decisionLog: decisionLog, log: log}
+func New(store PolicyStore, publisher EventPublisher, decisionLog decisionlog.Client, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+	return &Handler{
+		store:                store,
+		publisher:            publisher,
+		decisionLog:          decisionLog,
+		authz:                authzClient,
+		authzPlatformScopeID: authzPlatformScopeID,
+		log:                  log,
+	}
+}
+
+// requirePrincipal resolves the acting principal from the gateway-verified
+// X-Principal-Id header, writing 401 and returning false when absent.
+//
+// The three mutating endpoints previously took created_by_principal_id /
+// activated_by_principal_id from the request BODY, so the audit columns
+// recorded whatever the caller typed. The header is set by the gateway's
+// ForwardAuth middleware from a verified identity envelope and cannot be
+// chosen by the caller.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
+		return id, true
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{
+		"error":   "missing_principal",
+		"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
+	})
+	return "", false
+}
+
+// authorize asks authorization-svc whether principalID may perform
+// actionType in the given scope, and writes the fail-closed response itself
+// when the answer is anything other than GRANTED.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, actionType string, legalEntityID *string) bool {
+	scope := h.authzPlatformScopeID
+	if legalEntityID != nil && *legalEntityID != "" {
+		scope = *legalEntityID
+	}
+
+	err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, domain.ErrAuthorizationDenied):
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+	default:
+		h.log.Error("authorization check failed — refusing the mutation",
+			zap.String("principal_id", principalID),
+			zap.String("action_type", actionType),
+			zap.Error(err),
+		)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
+	}
+	return false
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -83,11 +145,16 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 // PolicyID is optional — callers may supply their own idempotency key,
 // mirroring CreateJurisdictionParams in jurisdiction-rules-svc.
 type createPolicyRequest struct {
-	PolicyID             string `json:"policy_id,omitempty"`
-	PolicyCode           string `json:"policy_code"`
-	PolicyName           string `json:"policy_name"`
-	PolicyType           string `json:"policy_type"`
-	CreatedByPrincipalID string `json:"created_by_principal_id"`
+	PolicyID   string `json:"policy_id,omitempty"`
+	PolicyCode string `json:"policy_code"`
+	PolicyName string `json:"policy_name"`
+	PolicyType string `json:"policy_type"`
+
+	// CreatedByPrincipalID is accepted for backward compatibility with
+	// existing callers and then IGNORED — the acting principal comes from
+	// the gateway-verified X-Principal-Id header. A caller must not be able
+	// to choose what the audit trail records about them.
+	CreatedByPrincipalID string `json:"created_by_principal_id,omitempty"`
 }
 
 func (req createPolicyRequest) missingField() string {
@@ -98,8 +165,6 @@ func (req createPolicyRequest) missingField() string {
 		return "policy_name"
 	case req.PolicyType == "":
 		return "policy_type"
-	case req.CreatedByPrincipalID == "":
-		return "created_by_principal_id"
 	default:
 		return ""
 	}
@@ -119,10 +184,22 @@ func (req createPolicyRequest) missingField() string {
 //	201 → policy created for the first time
 //	200 → policy_code already existed with identical attributes; no-op
 //	400 → missing required field
+//	401 → no caller identity on the request
+//	403 → authorization denied
 //	409 → policy_code already exists with differing attributes
-//	503 → store unavailable
+//	503 → authz or store unavailable
 func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// A Policy header row is not scoped to a legal entity — scoping lives on
+	// its versions — so this is evaluated against the platform scope.
+	if !h.authorize(w, r, principalID, authz.ActionPolicyCreate, nil) {
+		return
+	}
 
 	var req createPolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -145,7 +222,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 		PolicyCode:           req.PolicyCode,
 		PolicyName:           req.PolicyName,
 		PolicyType:           req.PolicyType,
-		CreatedByPrincipalID: req.CreatedByPrincipalID,
+		CreatedByPrincipalID: principalID,
 	}
 
 	p, created, err := h.store.CreatePolicy(r.Context(), params)
@@ -197,21 +274,21 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 // POST /v1/policies/{policy_id}/versions. PolicyVersionID is optional —
 // callers may supply their own idempotency key.
 type createPolicyVersionRequest struct {
-	PolicyVersionID      string          `json:"policy_version_id,omitempty"`
-	TenantID             *string         `json:"tenant_id,omitempty"`
-	LegalEntityID        *string         `json:"legal_entity_id,omitempty"`
-	RulePayload          json.RawMessage `json:"rule_payload,omitempty"`
-	EffectiveFrom        time.Time       `json:"effective_from"`
-	EffectiveTo          *time.Time      `json:"effective_to,omitempty"`
-	CreatedByPrincipalID string          `json:"created_by_principal_id"`
+	PolicyVersionID string          `json:"policy_version_id,omitempty"`
+	TenantID        *string         `json:"tenant_id,omitempty"`
+	LegalEntityID   *string         `json:"legal_entity_id,omitempty"`
+	RulePayload     json.RawMessage `json:"rule_payload,omitempty"`
+	EffectiveFrom   time.Time       `json:"effective_from"`
+	EffectiveTo     *time.Time      `json:"effective_to,omitempty"`
+
+	// Accepted then IGNORED — see createPolicyRequest.
+	CreatedByPrincipalID string `json:"created_by_principal_id,omitempty"`
 }
 
 func (req createPolicyVersionRequest) missingField() string {
 	switch {
 	case req.EffectiveFrom.IsZero():
 		return "effective_from"
-	case req.CreatedByPrincipalID == "":
-		return "created_by_principal_id"
 	default:
 		return ""
 	}
@@ -232,6 +309,11 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	policyID := chi.URLParam(r, "policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req createPolicyVersionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
@@ -248,6 +330,13 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Authorized in the scope the version will apply to, so a principal
+	// granted POLICY_VERSION_CREATE for one legal entity cannot publish a
+	// version binding another.
+	if !h.authorize(w, r, principalID, authz.ActionPolicyVersionCreate, req.LegalEntityID) {
+		return
+	}
+
 	params := domain.CreatePolicyVersionParams{
 		PolicyVersionID:      req.PolicyVersionID,
 		PolicyID:             policyID,
@@ -256,7 +345,7 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		RulePayload:          []byte(req.RulePayload),
 		EffectiveFrom:        req.EffectiveFrom,
 		EffectiveTo:          req.EffectiveTo,
-		CreatedByPrincipalID: req.CreatedByPrincipalID,
+		CreatedByPrincipalID: principalID,
 	}
 
 	v, created, err := h.store.CreatePolicyVersion(r.Context(), params)
@@ -306,8 +395,12 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/policies/{policy_id}/versions/{version_id}/activate ───────────
 
 // activateVersionRequest is the wire shape for the activate endpoint.
+//
+// The body is now optional: the acting principal comes from X-Principal-Id.
+// activated_by_principal_id is still accepted so existing callers do not
+// break, and ignored.
 type activateVersionRequest struct {
-	ActivatedByPrincipalID string `json:"activated_by_principal_id"`
+	ActivatedByPrincipalID string `json:"activated_by_principal_id,omitempty"`
 }
 
 // ActivateVersion handles
@@ -330,18 +423,16 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "version_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req activateVersionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_json",
 			"message": err.Error(),
-		})
-		return
-	}
-	if req.ActivatedByPrincipalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error": "missing_field",
-			"field": "activated_by_principal_id",
 		})
 		return
 	}
@@ -376,7 +467,15 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	activated, superseded, transitioned, err := h.store.ActivateVersion(r.Context(), versionID, req.ActivatedByPrincipalID)
+	// Authorized against the scope the version actually binds, read from the
+	// stored record rather than the request — activation is the moment a
+	// policy starts governing real spend, so it is checked after the version
+	// is resolved and before anything is written.
+	if !h.authorize(w, r, principalID, authz.ActionPolicyVersionActivate, existing.LegalEntityID) {
+		return
+	}
+
+	activated, superseded, transitioned, err := h.store.ActivateVersion(r.Context(), versionID, principalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrPolicyVersionNotFound):
@@ -705,7 +804,7 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 		LegalEntityID:     req.LegalEntityID,
 		ActorID:           req.EvaluatedByPrincipalID,
 		ActionType:        req.PolicyType,
-		Outcome:           result,
+		Outcome:           canonicalOutcome(result),
 		RuleBasis:         ruleBasis,
 		EvaluationContext: req.ActionContext,
 		CorrelationID:     correlationID,
@@ -726,6 +825,39 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 		PolicyVersionID: applicable.PolicyVersionID,
 		RuleBasis:       ruleBasis,
 	})
+}
+
+// canonicalOutcome maps this service's evaluation result onto the governance
+// decision log's outcome vocabulary — GRANTED / DENIED / ESCALATED, per
+// governance-decision-log-svc/internal/domain.GovernanceDecision.Outcome.
+//
+// Necessary because that column is VARCHAR with no CHECK constraint, so writing
+// "WITHIN_THRESHOLD" into it succeeds and then reads back as an outcome no
+// consumer recognises. The admin console buckets unknown outcomes into "needs
+// review" and labels them "not treated as an authorization" — correctly, since it
+// must never render an unknown value as an approval — which meant every decision
+// this service recorded appeared in the audit trail as unreadable rather than as
+// the authorization it was.
+//
+// APPROVAL_REQUIRED maps to ESCALATED, not DENIED: exceeding a threshold routes
+// the action to an approver, it does not refuse it. DENIED would overstate the
+// decision, and the evidence log is append-only, so a wrong outcome cannot be
+// corrected later.
+//
+// The HTTP response deliberately keeps the domain-specific result — that is this
+// service's own API contract and callers switch on it. Only the evidence write is
+// normalised. An unrecognised result passes through unmapped rather than being
+// guessed into an authorization; the console's review bucket is the right place
+// for it.
+func canonicalOutcome(result string) string {
+	switch result {
+	case "WITHIN_THRESHOLD":
+		return "GRANTED"
+	case "APPROVAL_REQUIRED":
+		return "ESCALATED"
+	default:
+		return result
+	}
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.

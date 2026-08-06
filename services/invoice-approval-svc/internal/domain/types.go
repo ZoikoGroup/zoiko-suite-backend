@@ -60,4 +60,10 @@ var (
 	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
 	ErrIdentityMissing         = errorString("caller identity missing")
 	ErrStoreUnavailable        = errorString("invoice approval store unavailable")
+
+	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties
+	// doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal
+	// who created a record may not be the same principal who approves or
+	// rejects it.
+	ErrSelfApprovalNotAllowed = errorString("principal may not approve or reject their own submission")
 )

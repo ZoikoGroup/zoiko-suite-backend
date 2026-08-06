@@ -1,13 +1,14 @@
 // Package main is the entry point for jurisdiction-rules-svc.
 //
 // Wiring order:
-//  1. Load config from environment
+//  1. Load config from environment (fails fast on unsafe combinations)
 //  2. Initialise structured logger (zap)
-//  3. Connect to PostgreSQL pool (pgxpool) — Tier 0 pool sizing
-//  4. Construct PgStore
-//  5. Construct HTTP handler + mount routes on chi router
-//  6. Mount health probes (/healthz, /readyz)
-//  7. Start HTTP server with graceful shutdown
+//  3. Tracing + metrics
+//  4. Connect to PostgreSQL pool (pgxpool) — Tier 0 pool sizing
+//  5. Construct PgStore, AuthZ client, event publisher
+//  6. Construct HTTP handler + mount routes on chi router
+//  7. Mount health probes (/healthz, /readyz, /metrics)
+//  8. Start HTTP server with graceful shutdown
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,10 +28,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
@@ -53,12 +57,14 @@ func main() {
 	defer func() { _ = log.Sync() }()
 
 	log.Info("jurisdiction-rules-svc starting",
+		zap.String("env", cfg.Env),
 		zap.Int("port", cfg.Port),
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("authz_url", cfg.AuthZServiceURL),
+		zap.Strings("kafka_brokers", cfg.Kafka.Brokers),
 	)
 
-	// ── 2b. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
+	// ── 3. Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
 	shutdownTracing, err := telemetry.InitTracing(context.Background(), "jurisdiction-rules-svc", cfg.OTELExporterEndpoint)
 	if err != nil {
 		log.Fatal("otel tracing init failed", zap.Error(err))
@@ -73,7 +79,7 @@ func main() {
 
 	metrics := telemetry.NewMetrics("jurisdiction-rules-svc")
 
-	// ── 3. Database pool ──────────────────────────────────────────────────────
+	// ── 4. Database pool ──────────────────────────────────────────────────────
 	// Tier 0 pool sizing — same values as tenant-entity-registry-svc.
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
 	if err != nil {
@@ -100,18 +106,21 @@ func main() {
 	}
 	log.Info("db pool connected")
 
-	// ── 4. Store ──────────────────────────────────────────────────────────────
+	// ── 5. Store, AuthZ client, event publisher ───────────────────────────────
 	pgStore := store.New(pool, log)
 
 	// AuthZ client. Fails fast at startup if ENV is production/staging and
-	// AuthZServiceURL is still empty or the dev placeholder — no domain
+	// AuthZServiceURL is still empty or a dev placeholder — no domain
 	// service may silently fall back to a permit-all stub in production.
 	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
 	if err != nil {
 		log.Fatal("authz client construction failed", zap.Error(err))
 	}
 
-	// ── 5. Router + handler ───────────────────────────────────────────────────
+	publisher, closeProducer := newPublisher(cfg, log)
+	defer closeProducer()
+
+	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -121,23 +130,24 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, authzClient, log)
+	h := handler.New(pgStore, authzClient, publisher, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 
-	// ── 6. Health probes + metrics ────────────────────────────────────────────
+	// ── 7. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
 	r.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
 
-	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
+	// ── 8. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)
@@ -163,6 +173,44 @@ func main() {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
 	log.Info("server stopped")
+}
+
+// newPublisher builds the event publisher and its cleanup function.
+//
+// Kafka connects lazily on first write, so it is not a fail-fast startup
+// dependency like Postgres — same posture as identity-context-svc,
+// tenant-entity-registry-svc, policy-svc and obligations-svc. With no
+// brokers configured the service still runs, dropping events, which keeps
+// single-service local development to two containers; that fallback is
+// refused outside local development, because a production deployment
+// silently publishing nothing is exactly the failure the events exist to
+// prevent.
+func newPublisher(cfg *config.Config, log *zap.Logger) (events.Publisher, func()) {
+	if len(cfg.Kafka.Brokers) == 0 {
+		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "staging") {
+			log.Fatal("KAFKA_BROKERS must be set in " + cfg.Env + " environment")
+		}
+		log.Warn("no Kafka brokers configured — domain events will be dropped")
+		return events.NewNoopPublisher(log), func() {}
+	}
+
+	writer := &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+		// Required even though the broker sets auto.create.topics.enable:
+		// kafka-go defaults this to false and never asks the broker to
+		// auto-create in its metadata request, so a write to a topic that does
+		// not exist yet fails with "Unknown Topic Or Partition" regardless of
+		// the broker-side setting. Matches the platform-wide fix in 7589bc3.
+		AllowAutoTopicCreation: true,
+		// Bounded so an unreachable broker delays a mutation's response
+		// rather than holding the request open. The write has already been
+		// committed by the time an event is emitted; the caller should not
+		// wait on the event backbone to hear about it.
+		WriteTimeout: 5 * time.Second,
+	}
+	return events.NewPublisher(log, cfg.Kafka.Topic, writer), func() { _ = writer.Close() }
 }
 
 // correlationIDMiddleware propagates X-Correlation-ID through every request.

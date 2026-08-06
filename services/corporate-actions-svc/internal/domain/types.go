@@ -8,6 +8,12 @@ import (
 var (
 	ErrCorporateActionNotFound = errors.New("corporate action not found")
 	ErrActionAlreadyExecuted   = errors.New("corporate action is already executed")
+
+	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties
+	// doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal
+	// who created a record may not be the same principal who approves,
+	// executes, or resolves it.
+	ErrSelfApprovalNotAllowed = errors.New("principal may not approve or decide on their own submission")
 )
 
 type ActionType string
