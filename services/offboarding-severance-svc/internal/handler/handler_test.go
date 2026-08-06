@@ -276,8 +276,9 @@ func TestOffboardingSeveranceLifecycle(t *testing.T) {
 		t.Errorf("expected 1 initiated event got %d", pub.initiated)
 	}
 
-	// 2. Approve Termination
-	rrApprove := doReq(r, http.MethodPost, "/v1/terminations/"+req.TerminationID+"/approve", nil, "hr-admin")
+	// 2. Approve Termination — approver must differ from the initiator
+	// (Segregation of Duties: docs/original_doc/zoiko_suite_doc1.txt §12.3).
+	rrApprove := doReq(r, http.MethodPost, "/v1/terminations/"+req.TerminationID+"/approve", nil, "hr-approver")
 	if rrApprove.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d: %s", rrApprove.Code, rrApprove.Body.String())
 	}
@@ -308,5 +309,38 @@ func TestOffboardingSeveranceLifecycle(t *testing.T) {
 	}
 	if pub.terminated != 1 {
 		t.Errorf("expected 1 terminated event got %d", pub.terminated)
+	}
+}
+
+func TestApproveTermination_BySameInitiator_Returns403(t *testing.T) {
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the principal who initiated a termination request may not be the one
+	// who approves it.
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeValidator{}, &stubJurisdiction{})
+
+	rrInit := doReq(r, http.MethodPost, "/v1/terminations", map[string]any{
+		"legal_entity_id":    "le-us",
+		"employee_id":        "emp-202",
+		"termination_type":   "RESIGNATION",
+		"reason_code":        "PERSONAL",
+		"notice_period_days": 30,
+		"last_working_day":   "2024-12-31",
+		"effective_from":     "2024-12-31",
+		"correlation_id":     "corr-term-self",
+	}, "hr-admin")
+	if rrInit.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rrInit.Code, rrInit.Body.String())
+	}
+	var req domain.TerminationRequest
+	_ = json.NewDecoder(rrInit.Body).Decode(&req)
+
+	rrApprove := doReq(r, http.MethodPost, "/v1/terminations/"+req.TerminationID+"/approve", nil, "hr-admin")
+	if rrApprove.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 approving a termination request initiated by the same principal, got %d: %s", rrApprove.Code, rrApprove.Body.String())
+	}
+	if pub.approved != 0 {
+		t.Errorf("expected no approved event to be published for a rejected self-approval, got %d", pub.approved)
 	}
 }

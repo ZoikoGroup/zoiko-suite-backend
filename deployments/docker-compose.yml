@@ -1504,6 +1504,34 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # mTLS Management Service — 05-security.md §5.2/§10.7/§12.4/§18. Owns
+  # service-to-service certificate lifecycle and communication policy;
+  # previously built but never wired into this compose file at all (one of
+  # 6 "Phase 6" services with no compose entry). No Postgres — this service
+  # uses an in-memory store for certs/policies, but its internal CA private
+  # key is persisted to a real volume (mtls_ca_data) so the CA survives
+  # container restarts — losing the CA would invalidate every previously
+  # issued certificate's trust chain.
+  mtls-management-svc:
+    build:
+      context: ../services/mtls-management-svc
+      dockerfile: Dockerfile
+    container_name: mtls-management-svc
+    ports:
+      - "8140:8140"
+    environment:
+      PORT: "8140"
+      CA_DATA_DIR: "/data/ca"
+    volumes:
+      - mtls_ca_data:/data/ca
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # Evidence Requirements Service — 03-microservices.md §8.6. The seventh and
   # final Governance Platform service (§5.1), closing that group at 7/7.
   #
@@ -2539,3 +2567,4 @@ volumes:
   minio_data:
   opensearch_data:
   document_vault_storage:
+  mtls_ca_data:

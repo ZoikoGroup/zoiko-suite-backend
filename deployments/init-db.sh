@@ -59,6 +59,7 @@ echo "Databases created successfully. Running migration scripts..."
 # Apply migrations for audit-event-store-svc
 echo "Applying migrations for audit_event_store..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "audit_event_store" -f /migrations/audit-event-store/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "audit_event_store" -f /migrations/audit-event-store/000002_add_hash_chain_fields.up.sql
 
 # Apply migrations for identity-context-svc
 echo "Applying migrations for identity_context..."

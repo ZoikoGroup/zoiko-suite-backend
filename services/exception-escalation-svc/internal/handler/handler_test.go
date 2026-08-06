@@ -237,3 +237,57 @@ func TestCreateEscalateAndResolveException(t *testing.T) {
 		t.Errorf("expected status CLOSED, got %s", resolved.CaseStatus)
 	}
 }
+
+// TestResolveException_SelfApprovalForbidden enforces Segregation of Duties
+// (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal who created
+// an exception case may not be the same principal who resolves/closes it.
+func TestResolveException_SelfApprovalForbidden(t *testing.T) {
+	r, _ := setupTestRouter()
+
+	const creator = "filing_tracker_svc"
+
+	createReqPayload := domain.CreateExceptionRequest{
+		LegalEntityID:    "entity-001",
+		JurisdictionID:   "GB-UK",
+		ExceptionType:    "OVERDUE_FILING",
+		SeverityLevel:    domain.SeverityHigh,
+		LinkedObjectType: "FILING",
+		LinkedObjectID:   "ftrk-2026-9902",
+		Description:      "VAT return not submitted before due date",
+		AssignedToRole:   "TAX_MANAGER",
+		CreatedBy:        creator,
+	}
+	body, _ := json.Marshal(createReqPayload)
+
+	req := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", creator)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected status 201, got %d", w.Code)
+	}
+
+	var created domain.ExceptionCase
+	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	// Attempt to resolve as the same principal that created the case.
+	resReqPayload := domain.ResolveCaseRequest{
+		ClosedBy:      creator,
+		ClosureReason: "Late filing approved and submitted with penalty waiver",
+	}
+	resBody, _ := json.Marshal(resReqPayload)
+
+	resReq := httptest.NewRequest("POST", "/v1/exception-escalation/exceptions/"+created.ExceptionCaseID+"/resolve", bytes.NewBuffer(resBody))
+	resReq.Header.Set("Content-Type", "application/json")
+	resReq.Header.Set("X-Principal-Id", creator)
+	resW := httptest.NewRecorder()
+	r.ServeHTTP(resW, resReq)
+
+	if resW.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 self-approval rejection, got %d — %s", resW.Code, resW.Body.String())
+	}
+}

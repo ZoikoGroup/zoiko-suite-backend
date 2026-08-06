@@ -303,6 +303,17 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// PassResolution is the distinct closing action that finalizes a
+	// resolution as PASSED — the resolution's drafter/creator may not be
+	// the principal who closes it. (RecordVotes only tallies aggregate
+	// vote counts and does not finalize status, so the doctrine's
+	// self-approval check belongs here, not there.)
+	if existing.CreatedBy == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
+
 	res, err := h.store.PassResolution(r.Context(), id, &req)
 	if err != nil {
 		switch {

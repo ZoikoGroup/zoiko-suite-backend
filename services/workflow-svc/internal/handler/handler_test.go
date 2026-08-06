@@ -163,6 +163,22 @@ func TestCreateWorkflow_MissingField(t *testing.T) {
 	}
 }
 
+// TestCreateWorkflow_InitiatorAsApprover_Rejected enforces Segregation of
+// Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3) at creation time:
+// a workflow's initiator may not be listed as an approver in any stage.
+func TestCreateWorkflow_InitiatorAsApprover_Rejected(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"tenant_id":"t-1","legal_entity_id":"le-1","workflow_type":"PURCHASE_APPROVAL","initiated_by":"requester-1","stages":[{"approver_principal_id":"approver-1"},{"approver_principal_id":"requester-1"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ── SubmitAction ─────────────────────────────────────────────────────────────
 
 func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing.T) {
@@ -282,6 +298,30 @@ func TestSubmitAction_WrongApprover(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
+// TestSubmitAction_InitiatorSelfApproval_Forbidden enforces Segregation of
+// Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3) as defense-in-depth
+// at decision time: even if the workflow's initiator was (hypothetically,
+// via a path that bypasses CreateWorkflow's validation) recorded as the
+// assigned approver for the current stage, they must still be rejected.
+func TestSubmitAction_InitiatorSelfApproval_Forbidden(t *testing.T) {
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{WorkflowInstanceID: "w-1", LegalEntityID: "le-1", WorkflowStatus: "PENDING", InitiatedBy: "requester-1"},
+		submitErr:    domain.ErrWorkflowNotFound, // would only be hit if SubmitAction were called
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
+
+	// requester-1 is the workflow's initiator, submitting as though they
+	// were the assigned approver for the current stage.
+	body := `{"actor_principal_id":"requester-1","action":"APPROVE"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/actions", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

@@ -224,6 +224,14 @@ func (h *Handler) ApproveTermination(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the principal who initiated a termination request may not be the
+	// same principal who approves it.
+	if existing.InitiatedBy == principalID {
+		http.Error(w, domain.ErrSelfApprovalNotAllowed.Error(), http.StatusForbidden)
+		return
+	}
+
 	tReq, err := h.store.ApproveTerminationRequest(r.Context(), id, principalID)
 	if err != nil {
 		h.writeStoreErr(w, err)

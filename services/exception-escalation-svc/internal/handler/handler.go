@@ -216,6 +216,14 @@ func (h *Handler) ResolveException(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the principal who created the exception case may not be the same
+	// principal who resolves and closes it.
+	if existingCase.CreatedBy == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
+
 	updatedCase, err := h.store.ResolveException(r.Context(), id, &req)
 	if err != nil {
 		switch {

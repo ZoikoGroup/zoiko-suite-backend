@@ -163,3 +163,42 @@ func TestExecuteAction(t *testing.T) {
 		t.Errorf("expected EXECUTED, got %s", executed.Status)
 	}
 }
+
+// TestExecuteAction_SelfApprovalForbidden enforces Segregation of Duties
+// (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal who created
+// a corporate action may not be the same principal who executes it.
+func TestExecuteAction_SelfApprovalForbidden(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	const creator = "board-member-001"
+
+	// Create the action as `creator`.
+	createBody := domain.CreateCorporateActionRequest{
+		LegalEntityID: "le-001",
+		Title:         "Subsidiary Restructure",
+		ActionType:    domain.ActionTypeRestructure,
+		EffectiveDate: "2026-05-01",
+		CreatedBy:     creator,
+	}
+	createReq := buildRequest(http.MethodPost, "/v1/corporate-actions", createBody)
+	createReq.Header.Set("X-Principal-Id", creator)
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, createReq)
+	var created domain.CorporateAction
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	// Attempt to execute as the same principal that created it.
+	execBody := domain.ExecuteCorporateActionRequest{
+		ExecutedBy: creator,
+	}
+	execReq := buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody)
+	execReq.Header.Set("X-Principal-Id", creator)
+	wExec := httptest.NewRecorder()
+	r.ServeHTTP(wExec, execReq)
+
+	if wExec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 self-approval rejection, got %d — %s", wExec.Code, wExec.Body.String())
+	}
+}

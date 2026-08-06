@@ -37,6 +37,7 @@
 | `/invoice-approval-svc` | invoice-approval-svc | 8107 |
 | `/jurisdiction-rules-svc` | jurisdiction-rules-svc | 8082 |
 | `/leave-absence-svc` | leave-absence-svc | 8115 |
+| `/mtls-management-svc` | mtls-management-svc | 8140 |
 | `/notification-svc` | notification-svc | 8133 |
 | `/obligation-tracking-svc` | obligation-tracking-svc | 8121 |
 | `/obligations-svc` | obligations-svc | 8088 |

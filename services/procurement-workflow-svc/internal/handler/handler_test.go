@@ -302,6 +302,32 @@ func TestApproveCase_HappyPath(t *testing.T) {
 	}
 }
 
+// TestApproveCase_SelfApproval_Rejected enforces the platform's Segregation
+// of Duties doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the
+// principal who requested a procurement case may not also be the one who
+// approves it.
+func TestApproveCase_SelfApproval_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubSpendChecker{decision: "ALLOWED"}, &stubOrderIssuer{})
+	c := createApprovalPendingCase(t, r) // requested by "principal-1"
+
+	rr := doReq(r, http.MethodPost, "/v1/procurement-cases/"+c.CaseID+"/approve", nil, "principal-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for self-approval got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRejectCase_SelfApproval_Rejected mirrors the approve-side check for
+// rejection — SoD applies to both decision outcomes.
+func TestRejectCase_SelfApproval_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubSpendChecker{decision: "ALLOWED"}, &stubOrderIssuer{})
+	c := createApprovalPendingCase(t, r) // requested by "principal-1"
+
+	rr := doReq(r, http.MethodPost, "/v1/procurement-cases/"+c.CaseID+"/reject", map[string]any{"reason": "self-reject attempt"}, "principal-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for self-rejection got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestRejectCase_RequiresReason(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubSpendChecker{decision: "ALLOWED"}, &stubOrderIssuer{})
 	c := createApprovalPendingCase(t, r)

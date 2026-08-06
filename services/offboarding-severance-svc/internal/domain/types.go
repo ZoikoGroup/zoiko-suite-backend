@@ -21,6 +21,12 @@ var (
 	// resolved tenant (no X-Tenant-Id header) — fail closed rather than
 	// defaulting to a shared tenant bucket.
 	ErrIdentityMissing = errors.New("tenant identity missing")
+
+	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties
+	// doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal
+	// who created a record may not be the same principal who approves,
+	// executes, or passes it.
+	ErrSelfApprovalNotAllowed = errors.New("principal may not approve or decide on their own submission")
 )
 
 type TerminationType string

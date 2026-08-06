@@ -299,4 +299,68 @@ func TestContextResolvedStoredCorrectly(t *testing.T) {
 	assert.Equal(t, "identity-context-svc", stored.SourceService)
 	assert.Equal(t, "1.0", stored.SchemaVersion)
 	assert.NotEmpty(t, stored.Payload)
+	assert.Equal(t, "corr-xyz", stored.CorrelationID,
+		"correlation_id from the payload must be promoted onto the stored event")
+	assert.NotEmpty(t, stored.PayloadHash, "the store must compute a payload_hash for every stored event")
+}
+
+// ─── Test 6: correlation_id / causation_id propagation ───────────────────────
+
+// TestCorrelationAndCausationID_EnvelopeLevelWins verifies that when a
+// producer sets correlation_id/causation_id at the envelope level (the
+// shape most producers built this session actually emit), those values win
+// over anything in the payload.
+func TestCorrelationAndCausationID_EnvelopeLevelWins(t *testing.T) {
+	s := store.NewFakeStore()
+	c := newConsumer(t, s)
+	ctx := context.Background()
+
+	payload := map[string]string{
+		"tenant_id":       "tenant-abc",
+		"legal_entity_id": "entity-xyz",
+		"previous_status": "ACTIVE",
+		"new_status":      "SUSPENDED",
+	}
+	rawPayload, err := json.Marshal(payload)
+	require.NoError(t, err)
+
+	env := map[string]interface{}{
+		"event_type":     "entity.status.changed",
+		"emitted_at":     "2026-07-03T10:00:00Z",
+		"schema_version": "1.0",
+		"source_service": "tenant-entity-registry-svc",
+		"correlation_id": "envelope-corr-1",
+		"causation_id":   "envelope-cause-1",
+		"payload":        json.RawMessage(rawPayload),
+	}
+	msg, err := json.Marshal(env)
+	require.NoError(t, err)
+
+	const eventID = "evt-envelope-correlation-001"
+	require.NoError(t, c.Handle(ctx, eventID, msg))
+
+	stored, ok := s.Get(eventID)
+	require.True(t, ok)
+	assert.Equal(t, "envelope-corr-1", stored.CorrelationID)
+	assert.Equal(t, "envelope-cause-1", stored.CausationID)
+}
+
+// TestCorrelationID_FallsBackToPayload verifies that when a producer has no
+// envelope-level correlation_id (older shape), the consumer falls back to
+// the payload's own correlation_id field rather than storing an empty one.
+func TestCorrelationID_FallsBackToPayload(t *testing.T) {
+	s := store.NewFakeStore()
+	c := newConsumer(t, s)
+	ctx := context.Background()
+
+	const eventID = "evt-payload-correlation-001"
+	msg := buildContextResolvedMsg(t, eventID, map[string]string{
+		"correlation_id": "payload-corr-only",
+	})
+
+	require.NoError(t, c.Handle(ctx, eventID, msg))
+
+	stored, ok := s.Get(eventID)
+	require.True(t, ok)
+	assert.Equal(t, "payload-corr-only", stored.CorrelationID)
 }

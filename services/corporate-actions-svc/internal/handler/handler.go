@@ -244,6 +244,14 @@ func (h *Handler) ExecuteAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// a payment batch/corporate action creator may not approve or execute
+	// their own submission.
+	if existing.CreatedBy == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
+
 	a, err := h.store.ExecuteAction(r.Context(), id, &req)
 	if err != nil {
 		switch {

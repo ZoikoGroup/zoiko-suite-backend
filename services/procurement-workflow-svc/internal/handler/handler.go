@@ -239,6 +239,11 @@ func (h *Handler) ApproveCase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if pc.RequestedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", string(domain.ErrSelfApprovalNotAllowed))
+		return
+	}
+
 	updated, err := h.store.UpdateApproved(r.Context(), caseID, principalID)
 	if err != nil {
 		h.writeCaseErr(w, err)
@@ -274,6 +279,11 @@ func (h *Handler) RejectCase(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, pc.LegalEntityID, actionCaseReject); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if pc.RequestedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", string(domain.ErrSelfApprovalNotAllowed))
 		return
 	}
 

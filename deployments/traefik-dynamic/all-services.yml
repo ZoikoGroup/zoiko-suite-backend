@@ -277,6 +277,14 @@ http:
             middlewares:
                 - strip-leave-absence-svc
             priority: 50
+        svc-mtls-management-svc:
+            rule: PathPrefix(`/mtls-management-svc`)
+            entryPoints:
+                - web
+            service: svc-mtls-management-svc
+            middlewares:
+                - strip-mtls-management-svc
+            priority: 50
         svc-notification-svc:
             rule: PathPrefix(`/notification-svc`)
             entryPoints:
@@ -614,6 +622,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /leave-absence-svc
+        strip-mtls-management-svc:
+            stripPrefix:
+                prefixes:
+                    - /mtls-management-svc
         strip-notification-svc:
             stripPrefix:
                 prefixes:
@@ -847,6 +859,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://leave-absence-svc:8115
+        svc-mtls-management-svc:
+            loadBalancer:
+                servers:
+                    - url: http://mtls-management-svc:8140
         svc-notification-svc:
             loadBalancer:
                 servers:
