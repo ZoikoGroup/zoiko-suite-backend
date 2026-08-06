@@ -47,11 +47,13 @@
 | `/schema-registry-svc` | schema-registry-svc | 8093 |
 | `/search-indexer-svc` | search-indexer-svc | 8096 |
 | `/secret-vault-integration-svc` | secret-vault-integration-svc | 8087 |
+| `/spend-controls-svc` | spend-controls-svc | 8131 |
 | `/tax-determination-svc` | tax-determination-svc | 8126 |
 | `/tax-rules-svc` | tax-rules-svc | 8125 |
 | `/tenant-entity-registry-svc` | tenant-entity-registry-svc | 8081 |
 | `/treasury-svc` | treasury-svc | 8103 |
 | `/vat-gst-svc` | vat-gst-svc | 8127 |
+| `/vendor-due-diligence-svc` | vendor-due-diligence-svc | 8132 |
 | `/workflow-history-svc` | workflow-history-svc | 8097 |
 | `/workflow-svc` | workflow-svc | 8090 |
 | `/workforce-compliance-svc` | workforce-compliance-svc | 8118 |
