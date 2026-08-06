@@ -1,10 +1,10 @@
 // Package handler exposes the REST API for tenant-entity-registry-svc via chi.
 //
 // All mutating endpoints:
-//   1. Extract the IdentityContextEnvelope JWT from Authorization header.
-//   2. Extract X-Correlation-ID for propagation and evidence.
-//   3. Delegate to the registry.Service — which calls AuthorizationClient first.
-//   4. Map service errors to HTTP status codes.
+//  1. Extract the IdentityContextEnvelope JWT from Authorization header.
+//  2. Extract X-Correlation-ID for propagation and evidence.
+//  3. Delegate to the registry.Service — which calls AuthorizationClient first.
+//  4. Map service errors to HTTP status codes.
 //
 // Read-only endpoints do not require the Authorization header (the service
 // itself still validates entity existence but does not call AuthZ for reads).
@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -30,30 +29,30 @@ import (
 // can be extracted later if multiple service implementations are needed.
 type svc interface {
 	// Tenant
-	ProvisionTenant(ctx context.Context, envelopeJWT string, req domain.ProvisionTenantRequest, correlationID string) (*domain.Tenant, error)
+	ProvisionTenant(ctx context.Context, req domain.ProvisionTenantRequest, correlationID string) (*domain.Tenant, error)
 	GetTenant(ctx context.Context, tenantID string) (*domain.Tenant, error)
-	TransitionTenantLifecycle(ctx context.Context, envelopeJWT, tenantID string, req domain.TransitionTenantLifecycleRequest) error
+	TransitionTenantLifecycle(ctx context.Context, tenantID string, req domain.TransitionTenantLifecycleRequest) error
 
 	// Entity
-	CreateEntity(ctx context.Context, envelopeJWT string, req domain.CreateEntityRequest) (*domain.LegalEntity, error)
+	CreateEntity(ctx context.Context, req domain.CreateEntityRequest) (*domain.LegalEntity, error)
 	GetEntity(ctx context.Context, legalEntityID string) (*domain.LegalEntity, error)
 	ListEntities(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error)
-	UpdateEntity(ctx context.Context, envelopeJWT, legalEntityID string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error)
+	UpdateEntity(ctx context.Context, legalEntityID string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error)
 	GetEntityStatus(ctx context.Context, legalEntityID string) (*domain.EntityStatusResponse, error)
-	TransitionEntityStatus(ctx context.Context, envelopeJWT, legalEntityID string, req domain.TransitionEntityStatusRequest) error
+	TransitionEntityStatus(ctx context.Context, legalEntityID string, req domain.TransitionEntityStatusRequest) error
 
 	// Hierarchy
-	CreateHierarchy(ctx context.Context, envelopeJWT string, req domain.CreateHierarchyRequest) (*domain.EntityHierarchy, error)
-	EndDateHierarchy(ctx context.Context, envelopeJWT, hierarchyID string, endDate time.Time, correlationID string) error
+	CreateHierarchy(ctx context.Context, req domain.CreateHierarchyRequest) (*domain.EntityHierarchy, error)
+	EndDateHierarchy(ctx context.Context, hierarchyID string, endDate time.Time, correlationID string) error
 	ListHierarchies(ctx context.Context, legalEntityID string) ([]*domain.EntityHierarchy, error)
 
 	// Jurisdiction assignment
-	AssignJurisdiction(ctx context.Context, envelopeJWT, legalEntityID string, req domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error)
+	AssignJurisdiction(ctx context.Context, legalEntityID string, req domain.AssignJurisdictionRequest) (*domain.EntityJurisdictionAssignment, error)
 	ListJurisdictions(ctx context.Context, legalEntityID string) ([]*domain.EntityJurisdictionAssignment, error)
-	EndDateJurisdictionAssignment(ctx context.Context, envelopeJWT, assignmentID string, endDate time.Time, correlationID string) error
+	EndDateJurisdictionAssignment(ctx context.Context, assignmentID string, endDate time.Time, correlationID string) error
 
 	// Residency policy
-	CreateResidencyPolicy(ctx context.Context, envelopeJWT string, req domain.CreateResidencyPolicyRequest) (*domain.DataResidencyPolicy, error)
+	CreateResidencyPolicy(ctx context.Context, req domain.CreateResidencyPolicyRequest) (*domain.DataResidencyPolicy, error)
 	GetResidencyPolicy(ctx context.Context, policyID string) (*domain.DataResidencyPolicy, error)
 
 	// ResidencyRegion — read-only (IaC-managed)
@@ -65,10 +64,10 @@ type svc interface {
 	ResolveTenantRegion(ctx context.Context, tenantID string) (*domain.ResolvedTenantRegion, error)
 
 	// TaxIdentityBundle
-	CreateTaxIdentityBundle(ctx context.Context, envelopeJWT, legalEntityID string, req domain.CreateTaxIdentityBundleRequest) (*domain.TaxIdentityBundle, error)
+	CreateTaxIdentityBundle(ctx context.Context, legalEntityID string, req domain.CreateTaxIdentityBundleRequest) (*domain.TaxIdentityBundle, error)
 	GetTaxIdentityBundle(ctx context.Context, bundleID string) (*domain.TaxIdentityBundle, error)
 	ListTaxIdentityBundles(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error)
-	TransitionTaxIdentityBundleStatus(ctx context.Context, envelopeJWT, bundleID string, req domain.TransitionTaxIdentityBundleStatusRequest) error
+	TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, req domain.TransitionTaxIdentityBundleStatusRequest) error
 }
 
 // Handler holds all HTTP handler methods.
@@ -136,7 +135,7 @@ func (h *Handler) ProvisionTenant(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	t, err := h.svc.ProvisionTenant(r.Context(), bearerToken(r), req, correlationID(r))
+	t, err := h.svc.ProvisionTenant(r.Context(), req, correlationID(r))
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -172,7 +171,7 @@ func (h *Handler) TransitionTenantLifecycle(w http.ResponseWriter, r *http.Reque
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.svc.TransitionTenantLifecycle(r.Context(), bearerToken(r), chi.URLParam(r, "tenantID"), req); err != nil {
+	if err := h.svc.TransitionTenantLifecycle(r.Context(), chi.URLParam(r, "tenantID"), req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -186,7 +185,7 @@ func (h *Handler) CreateEntity(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	e, err := h.svc.CreateEntity(r.Context(), bearerToken(r), req)
+	e, err := h.svc.CreateEntity(r.Context(), req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -217,7 +216,7 @@ func (h *Handler) UpdateEntity(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	e, err := h.svc.UpdateEntity(r.Context(), bearerToken(r), chi.URLParam(r, "entityID"), req)
+	e, err := h.svc.UpdateEntity(r.Context(), chi.URLParam(r, "entityID"), req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -244,7 +243,7 @@ func (h *Handler) TransitionEntityStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.CorrelationID = correlationID(r)
-	if err := h.svc.TransitionEntityStatus(r.Context(), bearerToken(r), chi.URLParam(r, "entityID"), req); err != nil {
+	if err := h.svc.TransitionEntityStatus(r.Context(), chi.URLParam(r, "entityID"), req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -258,7 +257,7 @@ func (h *Handler) CreateHierarchy(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	hier, err := h.svc.CreateHierarchy(r.Context(), bearerToken(r), req)
+	hier, err := h.svc.CreateHierarchy(r.Context(), req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -282,7 +281,7 @@ func (h *Handler) EndDateHierarchy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := h.svc.EndDateHierarchy(r.Context(), bearerToken(r), chi.URLParam(r, "hierarchyID"), endDate, correlationID(r)); err != nil {
+	if err := h.svc.EndDateHierarchy(r.Context(), chi.URLParam(r, "hierarchyID"), endDate, correlationID(r)); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -296,7 +295,7 @@ func (h *Handler) AssignJurisdiction(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	a, err := h.svc.AssignJurisdiction(r.Context(), bearerToken(r), chi.URLParam(r, "entityID"), req)
+	a, err := h.svc.AssignJurisdiction(r.Context(), chi.URLParam(r, "entityID"), req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -318,7 +317,7 @@ func (h *Handler) EndDateJurisdictionAssignment(w http.ResponseWriter, r *http.R
 	if !ok {
 		return
 	}
-	if err := h.svc.EndDateJurisdictionAssignment(r.Context(), bearerToken(r), chi.URLParam(r, "assignmentID"), endDate, correlationID(r)); err != nil {
+	if err := h.svc.EndDateJurisdictionAssignment(r.Context(), chi.URLParam(r, "assignmentID"), endDate, correlationID(r)); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -332,7 +331,7 @@ func (h *Handler) CreateResidencyPolicy(w http.ResponseWriter, r *http.Request) 
 	if !decode(w, r, &req) {
 		return
 	}
-	p, err := h.svc.CreateResidencyPolicy(r.Context(), bearerToken(r), req)
+	p, err := h.svc.CreateResidencyPolicy(r.Context(), req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -376,7 +375,7 @@ func (h *Handler) CreateTaxIdentityBundle(w http.ResponseWriter, r *http.Request
 	if !decode(w, r, &req) {
 		return
 	}
-	b, err := h.svc.CreateTaxIdentityBundle(r.Context(), bearerToken(r), chi.URLParam(r, "entityID"), req)
+	b, err := h.svc.CreateTaxIdentityBundle(r.Context(), chi.URLParam(r, "entityID"), req)
 	if err != nil {
 		h.writeErr(w, r, err)
 		return
@@ -407,7 +406,7 @@ func (h *Handler) TransitionTaxIdentityBundleStatus(w http.ResponseWriter, r *ht
 	if !decode(w, r, &req) {
 		return
 	}
-	if err := h.svc.TransitionTaxIdentityBundleStatus(r.Context(), bearerToken(r), chi.URLParam(r, "bundleID"), req); err != nil {
+	if err := h.svc.TransitionTaxIdentityBundleStatus(r.Context(), chi.URLParam(r, "bundleID"), req); err != nil {
 		h.writeErr(w, r, err)
 		return
 	}
@@ -423,6 +422,12 @@ func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 		writeErrJSON(w, http.StatusNotFound, "not found", corrID)
 	case errors.Is(err, registry.ErrInvalidTransition):
 		writeErrJSON(w, http.StatusUnprocessableEntity, err.Error(), corrID)
+	case errors.Is(err, registry.ErrUnauthenticated):
+		// 401, not 403: the caller was never identified, so there is no
+		// principal to evaluate a grant against. Kept distinct so an operator
+		// can tell "the gateway did not forward an identity" apart from
+		// "this principal is not permitted".
+		writeErrJSON(w, http.StatusUnauthorized, "unauthenticated: no verified principal on request", corrID)
 	case errors.Is(err, registry.ErrUnauthorized):
 		writeErrJSON(w, http.StatusForbidden, "forbidden", corrID)
 	case errors.Is(err, registry.ErrServiceUnavailable):
@@ -464,11 +469,11 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
-func bearerToken(r *http.Request) string {
-	val := r.Header.Get("Authorization")
-	val = strings.TrimPrefix(val, "Bearer ")
-	return val
-}
+// bearerToken is deliberately gone. The Authorization header was passed
+// straight into the service layer, which decoded its payload without
+// verifying the signature to obtain both the audit identity and the tenant
+// used for row-level security. The verified identity now arrives as request
+// context, set by middleware.Identity from gateway-checked headers.
 
 func correlationID(r *http.Request) string {
 	if id := r.Header.Get("X-Correlation-ID"); id != "" {

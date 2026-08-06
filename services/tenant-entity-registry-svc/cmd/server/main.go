@@ -1,14 +1,14 @@
 // Package main is the entry point for tenant-entity-registry-svc.
 //
 // Wiring order:
-//   1. Load config from environment
-//   2. Initialise structured logger (zap)
-//   3. Connect to PostgreSQL pool (pgxpool)
-//   4. Construct dependency implementations: store, events publisher, authz client, jurisdiction validator
-//   5. Construct registry.Service
-//   6. Construct HTTP handler + mount routes on chi router
-//   7. Mount health probes on a separate internal router
-//   8. Start HTTP server with graceful shutdown
+//  1. Load config from environment
+//  2. Initialise structured logger (zap)
+//  3. Connect to PostgreSQL pool (pgxpool)
+//  4. Construct dependency implementations: store, events publisher, authz client, jurisdiction validator
+//  5. Construct registry.Service
+//  6. Construct HTTP handler + mount routes on chi router
+//  7. Mount health probes on a separate internal router
+//  8. Start HTTP server with graceful shutdown
 package main
 
 import (
@@ -130,15 +130,16 @@ func main() {
 
 	eventPublisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
-	// Authorization client.
-	// Switch to authz.NewHTTPAuthZClient(cfg.AuthZServiceURL, log) before
-	// Phase 1 production cutover per doctrine: no service self-authorizes.
-	var authzClient authz.AuthorizationClient = authz.NewStubAuthZClient(log)
-	if cfg.AuthZServiceURL != "" && cfg.AuthZServiceURL != "http://authorization-svc" {
-		authzClient = authz.NewHTTPAuthZClient(cfg.AuthZServiceURL, log)
-		log.Info("using HTTP authorization client", zap.String("url", cfg.AuthZServiceURL))
-	} else {
-		log.Warn("using STUB authorization client — wire real AuthZ before production")
+	// Authorization client. Refuses to start in production or staging against
+	// a placeholder URL, rather than silently falling back to a permit-all
+	// stub. The previous form treated any URL other than the literal
+	// "http://authorization-svc" as production wiring — and docker-compose
+	// set it to this service's own address, so it selected a client whose
+	// Authorize was a TODO returning nil and logged "using HTTP authorization
+	// client" while permitting every mutation without a decision.
+	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+	if err != nil {
+		log.Fatal("authz client construction failed", zap.Error(err))
 	}
 
 	// Jurisdiction validator.
@@ -152,7 +153,7 @@ func main() {
 	}
 
 	// ── 5. Service ───────────────────────────────────────────────────────────
-	svc := registry.NewService(pgStore, eventPublisher, authzClient, jurisdValidator, log)
+	svc := registry.NewService(pgStore, eventPublisher, authzClient, jurisdValidator, cfg.AuthZPlatformScopeID, log)
 
 	// ── 6. HTTP router ───────────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -162,9 +163,12 @@ func main() {
 	r.Use(otelchi.Middleware("tenant-entity-registry-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
-	// F1: extract tenant_id from JWT into context so every DB call can set
-	// app.tenant_id on the Postgres session and RLS is actually enforced.
-	r.Use(svcmiddleware.TenantContext(log))
+	// Extract the caller's gateway-verified identity into the request context:
+	// tenant_id so every DB call can set app.tenant_id on the Postgres session
+	// and RLS is actually enforced, and principal_id so mutations are
+	// authorized and audited against a real caller. Previously both were
+	// base64-decoded out of an unverified JWT.
+	r.Use(svcmiddleware.Identity(log))
 	r.Use(middleware.Logger)
 
 	h := handler.New(svc, log)

@@ -12,11 +12,8 @@ package registry
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,31 +28,44 @@ import (
 // Sentinel errors returned by the service layer.
 // Handlers map these to appropriate HTTP status codes.
 var (
-	ErrNotFound           = errors.New("not found")
-	ErrInvalidTransition  = errors.New("invalid status transition")
-	ErrUnauthorized       = errors.New("unauthorized")
+	ErrNotFound          = errors.New("not found")
+	ErrInvalidTransition = errors.New("invalid status transition")
+	ErrUnauthorized      = errors.New("unauthorized")
+	// ErrUnauthenticated is returned when a mutation arrives with no verified
+	// principal. Distinct from ErrUnauthorized: the caller has not been
+	// identified at all, so there is nothing to evaluate a grant against.
+	// Handlers map this to 401, not 403.
+	ErrUnauthenticated    = errors.New("unauthenticated: no verified principal")
 	ErrServiceUnavailable = errors.New("upstream service unavailable")
 	ErrInvalidInput       = errors.New("invalid input")
 	// ErrConflict is returned when a unique constraint is violated (e.g. duplicate
 	// tenant_code). Handlers should map this to HTTP 409 Conflict.
-	ErrConflict           = errors.New("conflict: resource already exists")
+	ErrConflict = errors.New("conflict: resource already exists")
 	// ErrRegionUnresolved is returned by ResolveTenantRegion when the
 	// tenant exists but its active residency policy has no
 	// ResidencyRegionID assigned yet — a real, expected state for
 	// policies created before that column existed (migration 000003),
 	// not a bug. Handlers should map this to HTTP 409 Conflict, distinct
 	// from ErrNotFound.
-	ErrRegionUnresolved   = errors.New("tenant's residency policy has no region assigned")
+	ErrRegionUnresolved = errors.New("tenant's residency policy has no region assigned")
 )
 
 // Service orchestrates all registry operations.
 // It owns no HTTP concerns — those belong to internal/handler.
 type Service struct {
-	store    Store
-	events   EventPublisher
-	authz    AuthorizationClient
-	jurisd   JurisdictionValidator
-	log      *zap.Logger
+	store  Store
+	events EventPublisher
+	authz  AuthorizationClient
+	jurisd JurisdictionValidator
+
+	// platformScopeID is the authorization scope used for operations that have
+	// no tenant yet — in practice only ProvisionTenant. authorization-svc
+	// rejects an empty legal_entity_id, so tenant creation is evaluated
+	// against one synthetic platform-scope entity. Role assignments granting
+	// TENANT_PROVISION must be made against this same ID.
+	platformScopeID string
+
+	log *zap.Logger
 }
 
 // NewService constructs a Service with all required dependencies.
@@ -64,14 +74,16 @@ func NewService(
 	events EventPublisher,
 	authz AuthorizationClient,
 	jurisd JurisdictionValidator,
+	platformScopeID string,
 	log *zap.Logger,
 ) *Service {
 	return &Service{
-		store:  store,
-		events: events,
-		authz:  authz,
-		jurisd: jurisd,
-		log:    log,
+		store:           store,
+		events:          events,
+		authz:           authz,
+		jurisd:          jurisd,
+		platformScopeID: platformScopeID,
+		log:             log,
 	}
 }
 
@@ -92,18 +104,17 @@ func NewService(
 // API.
 func (s *Service) ProvisionTenant(
 	ctx context.Context,
-	envelopeJWT string,
 	req domain.ProvisionTenantRequest,
 	correlationID string,
 ) (*domain.Tenant, error) {
-	if err := s.authorize(ctx, envelopeJWT, "tenant", "provision"); err != nil {
+	if err := s.authorize(ctx, "tenant", "provision"); err != nil {
 		return nil, err
 	}
 
 	tenantID := newID()
 	policyID := newID()
 	now := time.Now().UTC()
-	actor := actorFromJWT(envelopeJWT)
+	actor := domain.PrincipalFromContext(ctx)
 
 	t := &domain.Tenant{
 		TenantID:                     tenantID,
@@ -146,8 +157,54 @@ func (s *Service) ProvisionTenant(
 	return t, nil
 }
 
-// GetTenant retrieves a tenant by ID. Returns ErrNotFound if absent.
+// assertTenantScope refuses a request whose path tenant is not the caller's
+// own verified tenant.
+//
+// Row-level security was supposed to make this unnecessary, and it does not.
+// Verified live on 2026-08-05: GET /v1/tenants/{A}/entities with
+// X-Tenant-Id: B returned tenant A's entities in full. Two independent
+// reasons, both confirmed against the running database:
+//
+//   - The service connects as the Postgres superuser (pg_user.usesuper = t),
+//     and superusers bypass RLS unconditionally, whatever the policy says.
+//   - The tables are owned by that same user and were created with ENABLE ROW
+//     LEVEL SECURITY, not FORCE (pg_class.relforcerowsecurity = f), so the
+//     owner bypasses them too.
+//
+// The policies themselves are present and correctly written — they simply
+// never execute. internal/store/tenant_isolation_test.go documents the same
+// trap and covers the store methods that take a tenant filter; what it cannot
+// cover is this layer, where the tenant comes from the URL rather than from
+// the caller's identity. A query filtered by a caller-supplied path parameter
+// is not an isolation boundary, however correct its WHERE clause.
+//
+// ErrNotFound rather than ErrUnauthorized is deliberate: a cross-tenant probe
+// must not be able to tell "exists but forbidden" from "does not exist", or
+// the 403 itself confirms the tenant.
+func (s *Service) assertTenantScope(ctx context.Context, tenantID string) error {
+	callerTenant := domain.TenantFromContext(ctx)
+	if callerTenant == "" || tenantID == "" {
+		// No verified tenant on the request. ProvisionTenant is the only
+		// legitimate case and it does not route through here; anything else
+		// reaching this point cannot be scoped, so it is refused.
+		return ErrNotFound
+	}
+	if callerTenant != tenantID {
+		s.log.Warn("cross-tenant read refused",
+			zap.String("caller_tenant", callerTenant),
+			zap.String("requested_tenant", tenantID),
+		)
+		return ErrNotFound
+	}
+	return nil
+}
+
+// GetTenant retrieves a tenant by ID. Returns ErrNotFound if absent, or if the
+// caller's verified tenant is not this one.
 func (s *Service) GetTenant(ctx context.Context, tenantID string) (*domain.Tenant, error) {
+	if err := s.assertTenantScope(ctx, tenantID); err != nil {
+		return nil, err
+	}
 	t, err := s.store.GetTenantByID(ctx, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store.GetTenantByID: %w", err)
@@ -162,10 +219,10 @@ func (s *Service) GetTenant(ctx context.Context, tenantID string) (*domain.Tenan
 // Invalid transitions are rejected fail-closed.
 func (s *Service) TransitionTenantLifecycle(
 	ctx context.Context,
-	envelopeJWT, tenantID string,
+	tenantID string,
 	req domain.TransitionTenantLifecycleRequest,
 ) error {
-	if err := s.authorize(ctx, envelopeJWT, "tenant:"+tenantID, "lifecycle.transition"); err != nil {
+	if err := s.authorize(ctx, "tenant", "lifecycle.transition"); err != nil {
 		return err
 	}
 
@@ -178,7 +235,7 @@ func (s *Service) TransitionTenantLifecycle(
 		return fmt.Errorf("%w: %s → %s", ErrInvalidTransition, t.LifecycleState, req.TargetState)
 	}
 
-	return s.store.TransitionTenantLifecycle(ctx, tenantID, req.TargetState, actorFromJWT(envelopeJWT), req.CorrelationID)
+	return s.store.TransitionTenantLifecycle(ctx, tenantID, req.TargetState, domain.PrincipalFromContext(ctx), req.CorrelationID)
 }
 
 // ---------------------------------------------------------------------------
@@ -190,10 +247,9 @@ func (s *Service) TransitionTenantLifecycle(
 // Rules Service before persistence (Q2 resolution — fail-closed).
 func (s *Service) CreateEntity(
 	ctx context.Context,
-	envelopeJWT string,
 	req domain.CreateEntityRequest,
 ) (*domain.LegalEntity, error) {
-	if err := s.authorize(ctx, envelopeJWT, "entity", "create"); err != nil {
+	if err := s.authorize(ctx, "entity", "create"); err != nil {
 		return nil, err
 	}
 
@@ -215,7 +271,7 @@ func (s *Service) CreateEntity(
 		EntityStatus:          domain.EntityStatusActive,
 		DataResidencyPolicyID: req.DataResidencyPolicyID,
 		CreatedAt:             time.Now().UTC(),
-		CreatedByPrincipalID:  actorFromJWT(envelopeJWT),
+		CreatedByPrincipalID:  domain.PrincipalFromContext(ctx),
 	}
 
 	if err := s.store.CreateEntity(ctx, e); err != nil {
@@ -247,24 +303,37 @@ func (s *Service) GetEntity(ctx context.Context, legalEntityID string) (*domain.
 
 // ListEntities returns all legal entities for a tenant.
 func (s *Service) ListEntities(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error) {
-	return s.store.ListEntitiesByTenant(ctx, tenantID)
+	if err := s.assertTenantScope(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	entities, err := s.store.ListEntitiesByTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	// Never null — a caller iterating the JSON array must not get a null
+	// where an empty list is meant. Verified live: this endpoint returned
+	// `null` rather than `[]` for a tenant with no entities.
+	if entities == nil {
+		entities = []*domain.LegalEntity{}
+	}
+	return entities, nil
 }
 
 // UpdateEntity applies a partial update to a legal entity.
 // Only mutable non-governance fields may be patched (legal_name, trading_name, currency).
 func (s *Service) UpdateEntity(
 	ctx context.Context,
-	envelopeJWT, legalEntityID string,
+	legalEntityID string,
 	req domain.UpdateEntityRequest,
 ) (*domain.LegalEntity, error) {
-	if err := s.authorize(ctx, envelopeJWT, "entity:"+legalEntityID, "update"); err != nil {
+	if err := s.authorize(ctx, "entity", "update"); err != nil {
 		return nil, err
 	}
 
 	// Populate audit actor from the verified envelope JWT.
 	// actorFromJWT performs payload-only decoding — signature is already
 	// verified by the Authorization Service before this service is called.
-	req.ActorPrincipalID = actorFromJWT(envelopeJWT)
+	req.ActorPrincipalID = domain.PrincipalFromContext(ctx)
 
 	e, err := s.store.UpdateEntity(ctx, legalEntityID, req)
 	if err != nil {
@@ -305,10 +374,10 @@ func (s *Service) GetEntityStatus(ctx context.Context, legalEntityID string) (*d
 // 0 rows as a no-op when newStatus == target, see below).
 func (s *Service) TransitionEntityStatus(
 	ctx context.Context,
-	envelopeJWT, legalEntityID string,
+	legalEntityID string,
 	req domain.TransitionEntityStatusRequest,
 ) error {
-	if err := s.authorize(ctx, envelopeJWT, "entity:"+legalEntityID, "status.transition"); err != nil {
+	if err := s.authorize(ctx, "entity", "status.transition"); err != nil {
 		return err
 	}
 
@@ -330,7 +399,7 @@ func (s *Service) TransitionEntityStatus(
 
 	affected, tenantID, err := s.store.TransitionEntityStatus(
 		ctx, legalEntityID, req.NewStatus, allowedPriors,
-		actorFromJWT(envelopeJWT), req.CorrelationID,
+		domain.PrincipalFromContext(ctx), req.CorrelationID,
 	)
 	if err != nil {
 		return fmt.Errorf("store.TransitionEntityStatus: %w", err)
@@ -371,22 +440,21 @@ func (s *Service) TransitionEntityStatus(
 // CreateHierarchy establishes an effective-dated parent-child entity relationship.
 func (s *Service) CreateHierarchy(
 	ctx context.Context,
-	envelopeJWT string,
 	req domain.CreateHierarchyRequest,
 ) (*domain.EntityHierarchy, error) {
-	if err := s.authorize(ctx, envelopeJWT, "entity.hierarchy", "create"); err != nil {
+	if err := s.authorize(ctx, "entity.hierarchy", "create"); err != nil {
 		return nil, err
 	}
 
 	h := &domain.EntityHierarchy{
-		HierarchyID:         newID(),
-		TenantID:            req.TenantID,
-		ParentLegalEntityID: req.ParentLegalEntityID,
-		ChildLegalEntityID:  req.ChildLegalEntityID,
-		RelationshipType:    req.RelationshipType,
-		EffectiveFrom:       req.EffectiveFrom,
-		CreatedAt:           time.Now().UTC(),
-		CreatedByPrincipalID: actorFromJWT(envelopeJWT),
+		HierarchyID:          newID(),
+		TenantID:             req.TenantID,
+		ParentLegalEntityID:  req.ParentLegalEntityID,
+		ChildLegalEntityID:   req.ChildLegalEntityID,
+		RelationshipType:     req.RelationshipType,
+		EffectiveFrom:        req.EffectiveFrom,
+		CreatedAt:            time.Now().UTC(),
+		CreatedByPrincipalID: domain.PrincipalFromContext(ctx),
 	}
 
 	if err := s.store.CreateHierarchy(ctx, h); err != nil {
@@ -401,15 +469,15 @@ func (s *Service) CreateHierarchy(
 // No hard-delete per doctrine.
 func (s *Service) EndDateHierarchy(
 	ctx context.Context,
-	envelopeJWT, hierarchyID string,
+	hierarchyID string,
 	endDate time.Time,
 	correlationID string,
 ) error {
-	if err := s.authorize(ctx, envelopeJWT, "entity.hierarchy:"+hierarchyID, "end-date"); err != nil {
+	if err := s.authorize(ctx, "entity.hierarchy", "end-date"); err != nil {
 		return err
 	}
 
-	if err := s.store.EndDateHierarchy(ctx, hierarchyID, endDate, actorFromJWT(envelopeJWT), correlationID); err != nil {
+	if err := s.store.EndDateHierarchy(ctx, hierarchyID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateHierarchy: %w", err)
 	}
 
@@ -431,10 +499,10 @@ func (s *Service) ListHierarchies(ctx context.Context, legalEntityID string) ([]
 // jurisdiction_id is validated synchronously — fail-closed (Q2 resolution).
 func (s *Service) AssignJurisdiction(
 	ctx context.Context,
-	envelopeJWT, legalEntityID string,
+	legalEntityID string,
 	req domain.AssignJurisdictionRequest,
 ) (*domain.EntityJurisdictionAssignment, error) {
-	if err := s.authorize(ctx, envelopeJWT, "entity:"+legalEntityID+"/jurisdiction", "assign"); err != nil {
+	if err := s.authorize(ctx, "entity.jurisdiction", "assign"); err != nil {
 		return nil, err
 	}
 
@@ -452,7 +520,7 @@ func (s *Service) AssignJurisdiction(
 		EffectiveFrom:        req.EffectiveFrom,
 		SourceBasis:          req.SourceBasis,
 		CreatedAt:            time.Now().UTC(),
-		CreatedByPrincipalID: actorFromJWT(envelopeJWT),
+		CreatedByPrincipalID: domain.PrincipalFromContext(ctx),
 	}
 
 	if err := s.store.CreateJurisdictionAssignment(ctx, a); err != nil {
@@ -472,15 +540,15 @@ func (s *Service) ListJurisdictions(ctx context.Context, legalEntityID string) (
 // No hard-delete per doctrine.
 func (s *Service) EndDateJurisdictionAssignment(
 	ctx context.Context,
-	envelopeJWT, assignmentID string,
+	assignmentID string,
 	endDate time.Time,
 	correlationID string,
 ) error {
-	if err := s.authorize(ctx, envelopeJWT, "entity.jurisdiction:"+assignmentID, "end-date"); err != nil {
+	if err := s.authorize(ctx, "entity.jurisdiction", "end-date"); err != nil {
 		return err
 	}
 
-	if err := s.store.EndDateJurisdictionAssignment(ctx, assignmentID, endDate, actorFromJWT(envelopeJWT), correlationID); err != nil {
+	if err := s.store.EndDateJurisdictionAssignment(ctx, assignmentID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateJurisdictionAssignment: %w", err)
 	}
 
@@ -500,10 +568,9 @@ func (s *Service) EndDateJurisdictionAssignment(
 // CreateResidencyPolicy creates a data residency policy for a tenant.
 func (s *Service) CreateResidencyPolicy(
 	ctx context.Context,
-	envelopeJWT string,
 	req domain.CreateResidencyPolicyRequest,
 ) (*domain.DataResidencyPolicy, error) {
-	if err := s.authorize(ctx, envelopeJWT, "residency.policy", "create"); err != nil {
+	if err := s.authorize(ctx, "residency.policy", "create"); err != nil {
 		return nil, err
 	}
 
@@ -517,7 +584,7 @@ func (s *Service) CreateResidencyPolicy(
 		ResidencyRegionID:      req.ResidencyRegionID,
 		ActiveFlag:             true,
 		CreatedAt:              time.Now().UTC(),
-		CreatedByPrincipalID:   actorFromJWT(envelopeJWT),
+		CreatedByPrincipalID:   domain.PrincipalFromContext(ctx),
 	}
 
 	if err := s.store.CreateResidencyPolicy(ctx, p); err != nil {
@@ -572,6 +639,9 @@ func (s *Service) ListResidencyRegions(ctx context.Context) ([]*domain.Residency
 // assigned yet (migration 000003 added the column nullable, unbackfilled
 // — this is an expected, real state for existing policies, not a bug).
 func (s *Service) ResolveTenantRegion(ctx context.Context, tenantID string) (*domain.ResolvedTenantRegion, error) {
+	if err := s.assertTenantScope(ctx, tenantID); err != nil {
+		return nil, err
+	}
 	t, err := s.store.GetTenantByID(ctx, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("store.GetTenantByID: %w", err)
@@ -616,10 +686,10 @@ func (s *Service) ResolveTenantRegion(ctx context.Context, tenantID string) (*do
 // jurisdiction_id is validated synchronously — fail-closed.
 func (s *Service) CreateTaxIdentityBundle(
 	ctx context.Context,
-	envelopeJWT, legalEntityID string,
+	legalEntityID string,
 	req domain.CreateTaxIdentityBundleRequest,
 ) (*domain.TaxIdentityBundle, error) {
-	if err := s.authorize(ctx, envelopeJWT, "entity:"+legalEntityID+"/tax-identity-bundle", "create"); err != nil {
+	if err := s.authorize(ctx, "tax-identity-bundle", "create"); err != nil {
 		return nil, err
 	}
 
@@ -643,7 +713,7 @@ func (s *Service) CreateTaxIdentityBundle(
 		EffectiveFrom:        req.EffectiveFrom,
 		EffectiveTo:          req.EffectiveTo,
 		CreatedAt:            time.Now().UTC(),
-		CreatedByPrincipalID: actorFromJWT(envelopeJWT),
+		CreatedByPrincipalID: domain.PrincipalFromContext(ctx),
 		DataClassification:   req.DataClassification,
 	}
 
@@ -673,21 +743,50 @@ func (s *Service) ListTaxIdentityBundles(ctx context.Context, legalEntityID stri
 // TransitionTaxIdentityBundleStatus applies a status transition on a bundle header.
 func (s *Service) TransitionTaxIdentityBundleStatus(
 	ctx context.Context,
-	envelopeJWT, bundleID string,
+	bundleID string,
 	req domain.TransitionTaxIdentityBundleStatusRequest,
 ) error {
-	if err := s.authorize(ctx, envelopeJWT, "tax-identity-bundle:"+bundleID, "status.transition"); err != nil {
+	if err := s.authorize(ctx, "tax-identity-bundle", "status.transition"); err != nil {
 		return err
 	}
-	return s.store.TransitionTaxIdentityBundleStatus(ctx, bundleID, req.NewStatus, actorFromJWT(envelopeJWT), req.CorrelationID)
+	return s.store.TransitionTaxIdentityBundleStatus(ctx, bundleID, req.NewStatus, domain.PrincipalFromContext(ctx), req.CorrelationID)
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-func (s *Service) authorize(ctx context.Context, envelopeJWT, resource, action string) error {
-	if err := s.authz.Authorize(ctx, envelopeJWT, resource, action); err != nil {
+// authorize asks authorization-svc whether the calling principal may perform
+// resource/action, and fails closed on anything that is not a clear grant.
+//
+// Both the principal and the scope come from the request context, populated by
+// middleware.Identity from gateway-verified headers. They were previously
+// taken from the raw Authorization header, which this service base64-decoded
+// itself without checking the signature — so both the subject of the decision
+// and the audit identity were caller-chosen. See internal/middleware.
+//
+// Scope is the tenant the caller is acting within. ProvisionTenant is the one
+// operation with no tenant yet — it is evaluated against the configured
+// platform scope, since authorization-svc rejects an empty legal_entity_id.
+func (s *Service) authorize(ctx context.Context, resource, action string) error {
+	principalID := domain.PrincipalFromContext(ctx)
+	if principalID == "" {
+		// No verified identity reached this call. Refusing here rather than
+		// substituting a default keeps an unauthenticated request from being
+		// recorded as a legitimate one.
+		s.log.Warn("mutation attempted with no verified principal — rejecting",
+			zap.String("resource", resource),
+			zap.String("action", action),
+		)
+		return ErrUnauthenticated
+	}
+
+	scopeID := domain.TenantFromContext(ctx)
+	if scopeID == "" {
+		scopeID = s.platformScopeID
+	}
+
+	if err := s.authz.Authorize(ctx, principalID, scopeID, resource, action); err != nil {
 		switch {
 		case errors.Is(err, authz.ErrUnauthorized):
 			return ErrUnauthorized
@@ -759,29 +858,14 @@ func nullableString(s string) *string {
 // responsibility of the Authorization Service which the caller has already
 // consulted. Returns "system" only as a last resort if the claim is absent,
 // which will appear in audit logs as a signal that JWT wiring is incomplete.
-func actorFromJWT(token string) string {
-	token = strings.TrimPrefix(token, "Bearer ")
-	if token == "" {
-		return "system"
-	}
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return "system"
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return "system"
-	}
-	var claims map[string]any
-	if err := json.Unmarshal(raw, &claims); err != nil {
-		return "system"
-	}
-	if pid, ok := claims["principal_id"].(string); ok && pid != "" {
-		return pid
-	}
-	// Fallback: some issuers use "sub" as the principal identifier.
-	if sub, ok := claims["sub"].(string); ok && sub != "" {
-		return sub
-	}
-	return "system"
-}
+// actorFromJWT is deliberately gone.
+//
+// It base64-decoded the JWT payload from the Authorization header and read
+// principal_id out of it, with no signature verification, falling back to the
+// literal string "system". Every audit column on every mutation was therefore
+// stamped with an identity the caller chose — forging one needed no key, only
+// base64 — and an unattributed write was recorded as the platform's own.
+//
+// The acting principal now comes from domain.PrincipalFromContext, populated
+// by middleware.Identity from the gateway-verified X-Principal-Id header, and
+// a mutation with no verified principal is refused rather than defaulted.

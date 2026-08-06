@@ -1,5 +1,60 @@
 # Known Architecture & Test Coverage Gaps
 
+## Resolved: tenant-entity-registry-svc trusted an unsigned JWT for tenant isolation
+
+Three defects that compounded, all closed 2026-08-05 and verified against
+running containers (16/16 live assertions).
+
+1. `HTTPAuthZClient.Authorize` was a TODO that logged a warning and returned
+   nil, so no mutation was ever authorized. `docker-compose.yml` set
+   `AUTHZ_SERVICE_URL` to this service's own address ("mock stub authz points
+   back"), and `main.go` treated any URL other than the literal
+   `http://authorization-svc` as production wiring — so that value selected
+   the no-op client while logging "using HTTP authorization client".
+
+2. `middleware.TenantContext` and `registry.actorFromJWT` both base64-decoded
+   the JWT payload **without verifying the signature**, on the stated
+   assumption that the Authorization Service had already validated it. Defect
+   1 meant nothing had. `tenant_id` from that unsigned payload is what
+   `PgStore.withRLS` sets as `app.tenant_id`, so row-level security — this
+   service's central guarantee — was being steered by a value any caller could
+   forge with base64 and no key. `compose` publishes 8081 on the host, so the
+   gateway that does the verifying is bypassable.
+
+3. Row-level security does not run at all. Confirmed against the live
+   database: the service connects as the Postgres superuser
+   (`pg_user.usesuper = t`), which bypasses RLS unconditionally, and the
+   tables are owned by that same user with ENABLE rather than FORCE row level
+   security (`pg_class.relforcerowsecurity = f`), so the owner bypasses the
+   policies too. The policies are present and correctly written; they simply
+   never execute. Verified exploitable before the fix:
+   `GET /v1/tenants/{A}/entities` with `X-Tenant-Id: B` returned tenant A's
+   entities in full.
+
+Fixes: identity now comes from gateway-verified `X-Principal-Id` /
+`X-Tenant-Id` headers (`middleware.Identity`); `actorFromJWT` and
+`bearerToken` are deleted so the unsafe path cannot be reintroduced; a
+mutation with no verified principal is 401; the authz client is real and
+fails closed; and tenant-scoped reads assert the path tenant equals the
+caller's verified tenant, returning 404 rather than 403 so a probe cannot
+confirm a tenant's existence.
+
+Carried forward: the superuser RLS bypass itself is unchanged and affects
+every service in the estate that connects as `postgres`. The explicit scope
+check makes this service safe regardless, which is the same belt-and-braces
+posture purchase-order-svc and general-ledger-svc adopted after real CI
+failures. Running the services as a non-superuser role with FORCE ROW LEVEL
+SECURITY would make the policies load-bearing again and is a separate,
+estate-wide change.
+
+Also of note: `internal/store/tenant_isolation_test.go` already documented
+this exact superuser trap and covers the store methods that take a tenant
+filter. What it could not cover is the layer above, where the tenant comes
+from the URL rather than the caller's identity — a query filtered by a
+caller-supplied path parameter is not an isolation boundary however correct
+its WHERE clause.
+
+
 ## Open: jurisdiction-rules-svc owns no compliance calendar
 03-microservices.md §8.2 lists "compliance calendar logic" among this
 service's holdings and jurisdiction.calendar.changed among its published

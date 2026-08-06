@@ -478,12 +478,24 @@ services:
       KAFKA_GROUP_ID: "tenant-entity-registry-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.entity.events"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
-      AUTHZ_SERVICE_URL: "http://tenant-svc:8081" # mock stub authz points back
+      # Was "http://tenant-svc:8081" — this service's own address, commented
+      # "mock stub authz points back". main.go treated any URL other than the
+      # literal "http://authorization-svc" as production wiring, so that value
+      # selected a client whose Authorize was a TODO returning nil and logged
+      # "using HTTP authorization client" while permitting every mutation
+      # without a decision. authz.NewClient now rejects it as a placeholder.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # ProvisionTenant is the one mutation with no tenant to scope to, and
+      # authorization-svc rejects an empty legal_entity_id. Role assignments
+      # granting TENANT_PROVISION must target this same ID.
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8081/healthz"]
