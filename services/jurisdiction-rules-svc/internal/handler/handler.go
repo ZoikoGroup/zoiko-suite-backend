@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/domain"
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 )
 
@@ -28,6 +30,9 @@ type JurisdictionStore interface {
 
 	FindRules(ctx context.Context, params store.FindRulesParams) ([]*domain.JurisdictionRule, error)
 
+	// FindRulePack resolves the runtime rule pack across the ancestor chain.
+	FindRulePack(ctx context.Context, jurisdictionID, ruleDomain string, at time.Time) (*domain.RulePack, error)
+
 	// CreateJurisdiction inserts a new jurisdiction idempotently.
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
@@ -40,34 +45,46 @@ type JurisdictionStore interface {
 	// CreateRule inserts a new rule idempotently.
 	CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
 
-	// TransitionRuleStatus atomically updates rule_status if current status
-	// is in allowedPriors. The returned bool is true only for a genuine
-	// transition — false for an idempotent no-op replay (the rule was
-	// already at newStatus) — so callers can tell "this really just
-	// happened" from "this was already true" without a separate read.
-	TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, bool, error)
-}
+	// TransitionRuleStatus atomically updates rule_status if current status is
+	// in allowedPriors. The bool reports whether anything actually changed.
+	TransitionRuleStatus(ctx context.Context, params store.TransitionParams) (*domain.JurisdictionRule, bool, error)
 
-// EventPublisher is the narrow interface the handler depends on for
-// publishing domain events. Allows the handler to be tested without a real
-// Kafka producer.
-type EventPublisher interface {
-	PublishRuleUpdated(ctx context.Context, correlationID string, rule domain.JurisdictionRule) error
-	PublishRuleActivated(ctx context.Context, correlationID string, rule domain.JurisdictionRule) error
+	// RecordDrift moves legal_drift_state and appends to the drift history.
+	RecordDrift(ctx context.Context, params domain.RecordDriftParams) (*domain.JurisdictionRule, *domain.DriftEvent, bool, error)
+
+	// FindDriftEvents returns the append-only drift history for a rule.
+	FindDriftEvents(ctx context.Context, ruleID string, limit, offset int) ([]*domain.DriftEvent, error)
 }
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
 	store     JurisdictionStore
 	authz     authz.AuthorizationClient
-	publisher EventPublisher
+	publisher events.Publisher
 	log       *zap.Logger
+
+	// authzScopeID is the legal_entity_id presented to authorization-svc.
+	// See config.AuthZPlatformScopeID for why a platform-wide service needs one.
+	authzScopeID string
 }
 
 // New constructs a Handler.
-func New(store JurisdictionStore, authzClient authz.AuthorizationClient, publisher EventPublisher, log *zap.Logger) *Handler {
-	return &Handler{store: store, authz: authzClient, publisher: publisher, log: log}
+func New(store JurisdictionStore, authzClient authz.AuthorizationClient, publisher events.Publisher, authzScopeID string, log *zap.Logger) *Handler {
+	return &Handler{
+		store:        store,
+		authz:        authzClient,
+		publisher:    publisher,
+		authzScopeID: authzScopeID,
+		log:          log,
+	}
 }
+
+// maxRequestBody caps admin request bodies at 256 KiB.
+//
+// rule_payload is caller-supplied JSON with no size bound in the schema, so
+// without this an admin POST could stream an arbitrarily large body straight
+// into memory and into a JSONB column.
+const maxRequestBody = 256 << 10
 
 // ruleStatusAllowedPriors defines the only legal prior rule_status for each
 // target status. Nothing else in the codebase or docs/architecture defines
@@ -77,6 +94,34 @@ var ruleStatusAllowedPriors = map[string][]string{
 	"ACTIVE":     {"DRAFT"},
 	"SUPERSEDED": {"ACTIVE"},
 	"RETIRED":    {"ACTIVE", "SUPERSEDED"},
+}
+
+// endDatingStatuses are the target statuses that close an open-ended rule.
+// A rule left with effective_to = NULL after being superseded keeps matching
+// every point-in-time query alongside the rule that replaced it.
+var endDatingStatuses = map[string]bool{
+	"SUPERSEDED": true,
+	"RETIRED":    true,
+}
+
+// createableRuleStatuses are the statuses a rule may be created in.
+//
+// rule_status used to be taken verbatim from the request body, so a caller
+// could POST a rule straight into ACTIVE — or into "BANANAS" — and skip the
+// DRAFT→ACTIVE state machine entirely. Creation is limited to the two states
+// that are not the *result* of a transition.
+var createableRuleStatuses = map[string]bool{
+	"DRAFT":  true,
+	"ACTIVE": true,
+}
+
+// driftStates is the legal_drift_state value space (OQ-4). Same reasoning as
+// ruleStatusAllowedPriors: the transition target has to be checked somewhere,
+// and this is the boundary where it is first named.
+var driftStates = map[string]bool{
+	"CURRENT":      true,
+	"DRIFTED":      true,
+	"UNDER_REVIEW": true,
 }
 
 // CreateJurisdictionRequest is the caller-facing request body for
@@ -112,6 +157,22 @@ type CreateRuleRequest struct {
 // states are never client-supplied — see ruleStatusAllowedPriors.
 type TransitionRuleStatusRequest struct {
 	NewStatus string `json:"new_status"`
+
+	// EffectiveTo optionally states when the rule stopped applying, for the
+	// transitions that close a rule (SUPERSEDED, RETIRED). Omitted means now.
+	// Ignored when the rule already carries an end date.
+	EffectiveTo *time.Time `json:"effective_to"`
+}
+
+// RecordDriftRequest is the caller-facing request body for
+// POST /v1/admin/rules/{jurisdiction_rule_id}/drift.
+type RecordDriftRequest struct {
+	// DriftState is one of CURRENT, DRIFTED, UNDER_REVIEW.
+	DriftState string `json:"drift_state"`
+
+	// Reason is the evidence for the change — the regulatory update that
+	// diverged from the stored rule, or the review conclusion that closed it.
+	Reason *string `json:"reason"`
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -126,12 +187,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/jurisdictions/{jurisdiction_id}", h.GetJurisdiction)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/ancestors", h.GetAncestors)
 	r.Get("/v1/jurisdictions/{jurisdiction_id}/rules", h.GetRules)
+	r.Get("/v1/jurisdictions/{jurisdiction_id}/rule-pack", h.GetRulePack)
+	r.Get("/v1/rules/{jurisdiction_rule_id}", h.GetRule)
+	r.Get("/v1/rules/{jurisdiction_rule_id}/drift-events", h.GetDriftEvents)
 
 	// ── Admin mutations (AuthZ required on every route) ───────────────────────
 	r.Post("/v1/admin/jurisdictions", h.CreateJurisdiction)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/deactivate", h.DeactivateJurisdiction)
 	r.Post("/v1/admin/jurisdictions/{jurisdiction_id}/rules", h.CreateRule)
 	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/transition", h.TransitionRuleStatus)
+	r.Post("/v1/admin/rules/{jurisdiction_rule_id}/drift", h.RecordDrift)
 }
 
 // correlationIDMiddleware echoes X-Correlation-ID from the request into the
@@ -147,6 +212,8 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// ── Public reads ─────────────────────────────────────────────────────────────
+
 // GetJurisdiction handles GET /v1/jurisdictions/{jurisdiction_id}.
 //
 // This is the validation endpoint called synchronously (fail-closed) by
@@ -156,7 +223,7 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 // Response contract (must match HTTPJurisdictionValidator exactly):
 //
 //	200 → jurisdiction known and active
-//	404 → jurisdiction_id unknown, inactive, or expired
+//	404 → jurisdiction_id unknown, malformed, inactive, or expired
 //	503 → store unavailable — callers MUST reject the assignment fail-closed
 func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
@@ -209,24 +276,22 @@ func (h *Handler) GetJurisdiction(w http.ResponseWriter, r *http.Request) {
 // Response:
 //
 //	200 → JSON array of Jurisdiction objects (may be empty)
+//	400 → limit or offset is not a non-negative integer
 //	503 → store unavailable
 func (h *Handler) ListJurisdictions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
+	limit, offset, ok := h.parsePaging(w, q)
+	if !ok {
+		return
+	}
+
 	params := store.ListParams{
 		JurisdictionType: q.Get("type"),
 		ActiveOnly:       q.Get("active") == "true",
-	}
-	if v := q.Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			params.Limit = n
-		}
-	}
-	if v := q.Get("offset"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			params.Offset = n
-		}
+		Limit:            limit,
+		Offset:           offset,
 	}
 
 	results, err := h.store.List(r.Context(), params)
@@ -266,24 +331,7 @@ func (h *Handler) GetAncestors(w http.ResponseWriter, r *http.Request) {
 
 	ancestors, err := h.store.FindAncestors(r.Context(), jurisdictionID)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrJurisdictionNotFound):
-			h.log.Debug("GetAncestors: jurisdiction not found",
-				zap.String("jurisdiction_id", jurisdictionID),
-				zap.String("correlation_id", correlationID),
-			)
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":           "jurisdiction_not_found",
-				"jurisdiction_id": jurisdictionID,
-			})
-		default:
-			h.log.Error("GetAncestors: store unavailable",
-				zap.String("jurisdiction_id", jurisdictionID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(err),
-			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		}
+		h.writeStoreError(w, err, correlationID)
 		return
 	}
 
@@ -301,16 +349,21 @@ func (h *Handler) GetAncestors(w http.ResponseWriter, r *http.Request) {
 
 // GetRules handles GET /v1/jurisdictions/{jurisdiction_id}/rules.
 //
+// This is the raw, per-jurisdiction, effective-dated view — the audit and
+// replay surface. It does NOT resolve inheritance; for the runtime view see
+// GetRulePack.
+//
 // Query parameters (all optional):
 //
 //	domain=PAYROLL        filter by rule_domain (VARCHAR, data driven)
-//	effective_at=2024-01-01T00:00:00Z  point-in-time (ISO 8601). If omitted, now is used.
+//	effective_at=2024-01-01T00:00:00Z  point-in-time (RFC3339). Defaults to now.
 //	limit=50              page size (max 100, default 50)
 //	offset=0              zero-based page offset
 //
 // Response:
 //
 //	200 → JSON array of JurisdictionRule objects (may be empty)
+//	400 → malformed effective_at, limit, or offset
 //	404 → jurisdiction_id not found
 //	503 → store unavailable
 func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
@@ -318,53 +371,24 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
-	params := store.FindRulesParams{
-		JurisdictionID: jurisdictionID,
-		Domain:         q.Get("domain"), // empty string means all domains
+	effectiveAt, ok := h.parseEffectiveAt(w, q)
+	if !ok {
+		return
 	}
-	if v := q.Get("effective_at"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
-		if err != nil {
-			// Return 400 Bad Request for invalid effective_at format
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error":   "invalid_effective_at",
-				"message": "effective_at must be a valid RFC3339 timestamp",
-			})
-			return
-		}
-		params.EffectiveAt = t
-	}
-	if v := q.Get("limit"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			params.Limit = n
-		}
-	}
-	if v := q.Get("offset"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			params.Offset = n
-		}
+	limit, offset, ok := h.parsePaging(w, q)
+	if !ok {
+		return
 	}
 
-	results, err := h.store.FindRules(r.Context(), params)
+	results, err := h.store.FindRules(r.Context(), store.FindRulesParams{
+		JurisdictionID: jurisdictionID,
+		Domain:         q.Get("domain"), // empty string means all domains
+		EffectiveAt:    effectiveAt,
+		Limit:          limit,
+		Offset:         offset,
+	})
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrJurisdictionNotFound):
-			h.log.Debug("GetRules: jurisdiction not found",
-				zap.String("jurisdiction_id", jurisdictionID),
-				zap.String("correlation_id", correlationID),
-			)
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":           "jurisdiction_not_found",
-				"jurisdiction_id": jurisdictionID,
-			})
-		default:
-			h.log.Error("GetRules: store unavailable",
-				zap.String("jurisdiction_id", jurisdictionID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(err),
-			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		}
+		h.writeStoreError(w, err, correlationID)
 		return
 	}
 
@@ -380,6 +404,103 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, results)
 }
 
+// GetRulePack handles GET /v1/jurisdictions/{jurisdiction_id}/rule-pack —
+// the "resolve jurisdiction set" and "fetch runtime rule pack" inbound APIs
+// of 03-microservices.md §8.2.
+//
+// Unlike GetRules this walks the ancestor chain and returns exactly one
+// winning rule per (rule_domain, rule_code): nearest jurisdiction wins, ties
+// broken by the later effective_from. DRAFT and RETIRED rules never appear.
+// resolved_from names the jurisdictions the pack was assembled from, so a
+// caller can record the rule basis of a governed action.
+//
+// Query parameters (all optional):
+//
+//	domain=PAYROLL        restrict the pack to one rule_domain
+//	effective_at=...      point-in-time (RFC3339). Defaults to now.
+//
+// Response:
+//
+//	200 → RulePack
+//	400 → malformed effective_at
+//	404 → jurisdiction_id unknown, inactive, or expired
+//	503 → store unavailable
+func (h *Handler) GetRulePack(w http.ResponseWriter, r *http.Request) {
+	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+	q := r.URL.Query()
+
+	effectiveAt, ok := h.parseEffectiveAt(w, q)
+	if !ok {
+		return
+	}
+
+	pack, err := h.store.FindRulePack(r.Context(), jurisdictionID, q.Get("domain"), effectiveAt)
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+
+	h.log.Debug("GetRulePack",
+		zap.String("jurisdiction_id", jurisdictionID),
+		zap.Int("rule_count", len(pack.Rules)),
+		zap.Int("chain_length", len(pack.ResolvedFrom)),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, pack)
+}
+
+// GetRule handles GET /v1/rules/{jurisdiction_rule_id}.
+//
+// The rule id appears in every published event and in the rule basis
+// recorded against governed actions, but there was no way to read a rule
+// back by that id — only by listing a jurisdiction's rules and filtering.
+//
+// Response: 200 the rule / 404 unknown or malformed id / 503 unavailable.
+func (h *Handler) GetRule(w http.ResponseWriter, r *http.Request) {
+	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	rule, err := h.store.FindRuleByID(r.Context(), ruleID)
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+	writeJSON(w, http.StatusOK, rule)
+}
+
+// GetDriftEvents handles GET /v1/rules/{jurisdiction_rule_id}/drift-events.
+//
+// The append-only legal_drift_state history (OQ-4), newest first. The
+// current state on the rule says a rule has drifted; this says when, from
+// what, on whose authority, and why.
+//
+// Response:
+//
+//	200 → JSON array of DriftEvent objects (may be empty)
+//	400 → malformed limit or offset
+//	404 → jurisdiction_rule_id not found
+//	503 → store unavailable
+func (h *Handler) GetDriftEvents(w http.ResponseWriter, r *http.Request) {
+	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	limit, offset, ok := h.parsePaging(w, r.URL.Query())
+	if !ok {
+		return
+	}
+
+	history, err := h.store.FindDriftEvents(r.Context(), ruleID, limit, offset)
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+	if history == nil {
+		history = []*domain.DriftEvent{}
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
 // ── Admin mutations ──────────────────────────────────────────────────────────
 
 // CreateJurisdiction handles POST /v1/admin/jurisdictions.
@@ -388,21 +509,44 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 //
 //	201 → new jurisdiction created
 //	200 → idempotent replay of an existing jurisdiction (same dedup key, same attributes)
-//	400 → malformed request body
+//	400 → malformed or incomplete request body
+//	401 → no caller identity on the request
 //	403 → authorization denied
+//	404 → parent_jurisdiction_id does not exist
 //	409 → dedup key matches an existing jurisdiction with differing attributes
 //	503 → authz or store unavailable
 func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if err := h.checkAuthz(r, "jurisdiction", "create"); err != nil {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.checkAuthz(r, principalID, "jurisdiction", "create"); err != nil {
 		h.writeAuthzError(w, err)
 		return
 	}
 
 	var req CreateJurisdictionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request_body"})
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if field := firstBlank(
+		requiredField{"jurisdiction_code", req.JurisdictionCode},
+		requiredField{"jurisdiction_name", req.JurisdictionName},
+		requiredField{"jurisdiction_type", req.JurisdictionType},
+		requiredField{"authority_type", req.AuthorityType},
+	); field != "" {
+		writeMissingField(w, field)
+		return
+	}
+	if req.EffectiveFrom.IsZero() {
+		writeMissingField(w, "effective_from")
+		return
+	}
+	if !validEffectivePeriod(req.EffectiveFrom, req.EffectiveTo) {
+		writeError(w, http.StatusBadRequest, "invalid_effective_period", "effective_to must be after effective_from")
 		return
 	}
 
@@ -415,7 +559,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 		EffectiveFrom:        req.EffectiveFrom,
 		EffectiveTo:          req.EffectiveTo,
 		ActiveFlag:           true,
-		CreatedByPrincipalID: actorIDFromRequest(r),
+		CreatedByPrincipalID: principalID,
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -424,11 +568,17 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	if created {
+		// Only a real insert emits. An idempotent replay must not make
+		// consumers think a second jurisdiction appeared.
+		h.publish("jurisdiction.created", correlationID, func() error {
+			return h.publisher.PublishJurisdictionCreated(r.Context(), *j, correlationID)
+		})
 		status = http.StatusCreated
 	}
 	h.log.Info("CreateJurisdiction",
 		zap.String("jurisdiction_id", j.JurisdictionID),
 		zap.Bool("created", created),
+		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, status, j)
@@ -439,6 +589,7 @@ func (h *Handler) CreateJurisdiction(w http.ResponseWriter, r *http.Request) {
 // Response:
 //
 //	200 → deactivated
+//	401 → no caller identity on the request
 //	403 → authorization denied
 //	404 → jurisdiction_id not found
 //	503 → authz or store unavailable
@@ -446,19 +597,28 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if err := h.checkAuthz(r, "jurisdiction", "deactivate"); err != nil {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.checkAuthz(r, principalID, "jurisdiction", "deactivate"); err != nil {
 		h.writeAuthzError(w, err)
 		return
 	}
 
-	j, err := h.store.DeactivateJurisdiction(r.Context(), jurisdictionID, actorIDFromRequest(r))
+	j, err := h.store.DeactivateJurisdiction(r.Context(), jurisdictionID, principalID)
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
 	}
 
+	h.publish("jurisdiction.deactivated", correlationID, func() error {
+		return h.publisher.PublishJurisdictionDeactivated(r.Context(), *j, correlationID)
+	})
+
 	h.log.Info("DeactivateJurisdiction",
 		zap.String("jurisdiction_id", jurisdictionID),
+		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, http.StatusOK, j)
@@ -470,22 +630,63 @@ func (h *Handler) DeactivateJurisdiction(w http.ResponseWriter, r *http.Request)
 //
 //	201 → new rule created
 //	200 → idempotent replay of an existing rule (same dedup key, same payload/name)
-//	400 → malformed request body
+//	400 → malformed or incomplete request body, or a rule_status that cannot be created directly
+//	401 → no caller identity on the request
 //	403 → authorization denied
-//	409 → dedup key matches an existing rule with differing payload/name
+//	404 → jurisdiction_id unknown or inactive
+//	409 → dedup key matches an existing rule with differing payload/name, or the
+//	      effective period overlaps another live rule with the same rule_code
 //	503 → authz or store unavailable
 func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 	jurisdictionID := chi.URLParam(r, "jurisdiction_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if err := h.checkAuthz(r, "jurisdiction_rule", "create"); err != nil {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.checkAuthz(r, principalID, "jurisdiction_rule", "create"); err != nil {
 		h.writeAuthzError(w, err)
 		return
 	}
 
 	var req CreateRuleRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request_body"})
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	if field := firstBlank(
+		requiredField{"rule_domain", req.RuleDomain},
+		requiredField{"rule_code", req.RuleCode},
+		requiredField{"rule_name", req.RuleName},
+	); field != "" {
+		writeMissingField(w, field)
+		return
+	}
+	if req.EffectiveFrom.IsZero() {
+		writeMissingField(w, "effective_from")
+		return
+	}
+	if !validEffectivePeriod(req.EffectiveFrom, req.EffectiveTo) {
+		writeError(w, http.StatusBadRequest, "invalid_effective_period", "effective_to must be after effective_from")
+		return
+	}
+
+	// Default to DRAFT rather than to the empty string, which the NOT NULL
+	// column happily accepted and which no query ever matches.
+	ruleStatus := req.RuleStatus
+	if ruleStatus == "" {
+		ruleStatus = "DRAFT"
+	}
+	if !createableRuleStatuses[ruleStatus] {
+		writeError(w, http.StatusBadRequest, "invalid_rule_status",
+			"rule_status must be DRAFT or ACTIVE at creation; SUPERSEDED and RETIRED are reached only via transition")
+		return
+	}
+
+	payload, err := normaliseRulePayload(req.RulePayload)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_rule_payload", err.Error())
 		return
 	}
 
@@ -496,11 +697,11 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 		RuleName:              req.RuleName,
 		EffectiveFrom:         req.EffectiveFrom,
 		EffectiveTo:           req.EffectiveTo,
-		RulePayload:           req.RulePayload,
+		RulePayload:           payload,
 		SourceReference:       req.SourceReference,
 		ExternalFeedReference: req.ExternalFeedReference,
-		RuleStatus:            req.RuleStatus,
-		CreatedByPrincipalID:  actorIDFromRequest(r),
+		RuleStatus:            ruleStatus,
+		CreatedByPrincipalID:  principalID,
 	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
@@ -509,17 +710,23 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 
 	status := http.StatusOK
 	if created {
-		status = http.StatusCreated
-		// Only publish on a genuine first insert — an idempotent replay of
-		// an already-existing rule must not re-emit the event.
-		if err := h.publisher.PublishRuleUpdated(r.Context(), correlationID, *rule); err != nil {
-			h.log.Error("failed to publish jurisdiction.rule.updated", zap.Error(err))
+		h.publish("jurisdiction.rule.updated", correlationID, func() error {
+			return h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID)
+		})
+		// A rule created directly in ACTIVE never passes through the
+		// transition endpoint, so activation is announced here instead.
+		if rule.RuleStatus == "ACTIVE" {
+			h.publish("jurisdiction.rule.activated", correlationID, func() error {
+				return h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID)
+			})
 		}
+		status = http.StatusCreated
 	}
 	h.log.Info("CreateRule",
 		zap.String("jurisdiction_rule_id", rule.JurisdictionRuleID),
 		zap.String("jurisdiction_id", jurisdictionID),
 		zap.Bool("created", created),
+		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, status, rule)
@@ -531,74 +738,170 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 //
 //	200 → transitioned (or idempotent no-op if already in the target status)
 //	400 → malformed request body, or new_status is not a recognized target state
+//	401 → no caller identity on the request
 //	403 → authorization denied
 //	404 → jurisdiction_rule_id not found
-//	409 → current status is not a legal prior state for new_status
+//	409 → current status is not a legal prior state for new_status, or
+//	      activating this rule would overlap another live rule with the same code
 //	503 → authz or store unavailable
 func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if err := h.checkAuthz(r, "jurisdiction_rule", "transition"); err != nil {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.checkAuthz(r, principalID, "jurisdiction_rule", "transition"); err != nil {
 		h.writeAuthzError(w, err)
 		return
 	}
 
 	var req TransitionRuleStatusRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request_body"})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
-	allowedPriors, ok := ruleStatusAllowedPriors[req.NewStatus]
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_status"})
+	allowedPriors, known := ruleStatusAllowedPriors[req.NewStatus]
+	if !known {
+		writeError(w, http.StatusBadRequest, "invalid_status", "new_status must be one of ACTIVE, SUPERSEDED, RETIRED")
 		return
 	}
 
-	rule, changed, err := h.store.TransitionRuleStatus(r.Context(), ruleID, req.NewStatus, allowedPriors, actorIDFromRequest(r))
+	rule, transitioned, err := h.store.TransitionRuleStatus(r.Context(), store.TransitionParams{
+		RuleID:        ruleID,
+		NewStatus:     req.NewStatus,
+		AllowedPriors: allowedPriors,
+		EndDate:       endDatingStatuses[req.NewStatus],
+		EffectiveTo:   req.EffectiveTo,
+		ActorID:       principalID,
+	})
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
 	}
 
-	if changed {
-		if err := h.publisher.PublishRuleUpdated(r.Context(), correlationID, *rule); err != nil {
-			h.log.Error("failed to publish jurisdiction.rule.updated", zap.Error(err))
-		}
+	// A replayed transition must not re-emit — a consumer that saw
+	// rule.activated twice would double-apply whatever it does on activation.
+	if transitioned {
+		h.publish("jurisdiction.rule.updated", correlationID, func() error {
+			return h.publisher.PublishRuleUpdated(r.Context(), *rule, correlationID)
+		})
 		if req.NewStatus == "ACTIVE" {
-			if err := h.publisher.PublishRuleActivated(r.Context(), correlationID, *rule); err != nil {
-				h.log.Error("failed to publish jurisdiction.rule.activated", zap.Error(err))
-			}
+			h.publish("jurisdiction.rule.activated", correlationID, func() error {
+				return h.publisher.PublishRuleActivated(r.Context(), *rule, correlationID)
+			})
 		}
 	}
 
 	h.log.Info("TransitionRuleStatus",
 		zap.String("jurisdiction_rule_id", ruleID),
 		zap.String("new_status", req.NewStatus),
+		zap.Bool("transitioned", transitioned),
+		zap.String("principal_id", principalID),
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, http.StatusOK, rule)
 }
 
-// ── Shared admin helpers ─────────────────────────────────────────────────────
+// RecordDrift handles POST /v1/admin/rules/{jurisdiction_rule_id}/drift.
+//
+// This is the write side of Legal Drift Detection (03-microservices.md §8.2's
+// Critical Enhancement): an external regulatory feed, or a human reviewer,
+// declares that a stored rule has diverged from applicable legal reality.
+// The state change and its justification are recorded together, append-only,
+// and legal.drift.detected is published for anything moving away from CURRENT.
+//
+// Response:
+//
+//	200 → drift state recorded, or an idempotent no-op if already in that state
+//	400 → malformed body, or drift_state outside CURRENT|DRIFTED|UNDER_REVIEW
+//	401 → no caller identity on the request
+//	403 → authorization denied
+//	404 → jurisdiction_rule_id not found
+//	503 → authz or store unavailable
+func (h *Handler) RecordDrift(w http.ResponseWriter, r *http.Request) {
+	ruleID := chi.URLParam(r, "jurisdiction_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
 
-// actorIDFromRequest extracts the acting principal from the trusted
-// X-Actor-Principal-ID header, falling back to "system" if absent — the same
-// convention used in identity-context-svc and tenant-entity-registry-svc.
-func actorIDFromRequest(r *http.Request) string {
-	if id := r.Header.Get("X-Actor-Principal-ID"); id != "" {
-		return id
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
 	}
-	return "system"
+	if err := h.checkAuthz(r, principalID, "jurisdiction_rule", "record_drift"); err != nil {
+		h.writeAuthzError(w, err)
+		return
+	}
+
+	var req RecordDriftRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !driftStates[req.DriftState] {
+		writeError(w, http.StatusBadRequest, "invalid_drift_state", "drift_state must be one of CURRENT, DRIFTED, UNDER_REVIEW")
+		return
+	}
+
+	rule, event, changed, err := h.store.RecordDrift(r.Context(), domain.RecordDriftParams{
+		JurisdictionRuleID:    ruleID,
+		ToState:               req.DriftState,
+		Reason:                req.Reason,
+		RecordedByPrincipalID: principalID,
+		CorrelationID:         correlationID,
+	})
+	if err != nil {
+		h.writeStoreError(w, err, correlationID)
+		return
+	}
+
+	// Only a real divergence is news. Returning to CURRENT is a resolution,
+	// carried by the history rather than by a "drift detected" fact.
+	if changed && req.DriftState != "CURRENT" {
+		h.publish("legal.drift.detected", correlationID, func() error {
+			return h.publisher.PublishLegalDriftDetected(r.Context(), *rule, *event, correlationID)
+		})
+	}
+
+	h.log.Info("RecordDrift",
+		zap.String("jurisdiction_rule_id", ruleID),
+		zap.String("drift_state", req.DriftState),
+		zap.Bool("changed", changed),
+		zap.String("principal_id", principalID),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rule":        rule,
+		"drift_event": event,
+		"changed":     changed,
+	})
 }
 
-// checkAuthz extracts the caller's identity envelope from the Authorization
-// header and asks the AuthorizationClient for a decision. Doctrine: no domain
+// ── Shared helpers ───────────────────────────────────────────────────────────
+
+// requirePrincipal resolves the acting principal from the gateway-verified
+// identity headers, writing 401 and returning false when there is none.
+//
+// This used to fall back to the literal string "system" when no header was
+// present, so every unattributed mutation was written into the audit columns
+// as if the platform itself had made it. It also read X-Actor-Principal-ID,
+// a header nothing sets — the gateway's ForwardAuth middleware publishes
+// X-Principal-Id (see the authResponseHeaders label in docker-compose.yml),
+// so in practice the audit trail recorded "system" for every write.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	for _, header := range []string{"X-Principal-Id", "X-Actor-Principal-ID"} {
+		if id := strings.TrimSpace(r.Header.Get(header)); id != "" {
+			return id, true
+		}
+	}
+	writeError(w, http.StatusUnauthorized, "missing_principal",
+		"X-Principal-Id is required — this header is set by the gateway from a verified identity envelope")
+	return "", false
+}
+
+// checkAuthz asks the AuthorizationClient for a decision. Doctrine: no domain
 // service self-authorizes a material action.
-func (h *Handler) checkAuthz(r *http.Request, resource, action string) error {
-	envelopeJWT := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return h.authz.Authorize(r.Context(), envelopeJWT, resource, action)
+func (h *Handler) checkAuthz(r *http.Request, principalID, resource, action string) error {
+	return h.authz.Authorize(r.Context(), principalID, h.authzScopeID, resource, action)
 }
 
 // writeAuthzError maps an AuthorizationClient error to an HTTP response.
@@ -612,26 +915,181 @@ func (h *Handler) writeAuthzError(w http.ResponseWriter, err error) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
 }
 
-// writeStoreError maps a store error to an HTTP response, extending the same
-// pattern already used by the read handlers above with the two admin-only
-// error types.
+// writeStoreError maps a store error to an HTTP response.
 func (h *Handler) writeStoreError(w http.ResponseWriter, err error, correlationID string) {
 	switch {
 	case errors.Is(err, domain.ErrJurisdictionNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "jurisdiction_not_found"})
+	case errors.Is(err, domain.ErrParentNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "parent_jurisdiction_not_found"})
 	case errors.Is(err, domain.ErrRuleNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "rule_not_found"})
 	case errors.Is(err, domain.ErrConflict):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "conflict"})
+	case errors.Is(err, domain.ErrOverlappingRule):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "overlapping_rule"})
+	case errors.Is(err, domain.ErrCyclicHierarchy):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "cyclic_hierarchy"})
 	case errors.Is(err, domain.ErrInvalidTransition):
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+	case errors.Is(err, domain.ErrInvalidEffectivePeriod):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_effective_period"})
 	default:
-		h.log.Error("admin store operation failed",
+		h.log.Error("store operation failed",
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}
+}
+
+// publish runs an event emission, logging rather than failing the request if
+// the broker is unreachable. The write is already committed; refusing the
+// response would tell the caller nothing happened when something did.
+func (h *Handler) publish(eventType, correlationID string, emit func() error) {
+	if err := emit(); err != nil {
+		h.log.Error("failed to publish event",
+			zap.String("event_type", eventType),
+			zap.String("correlation_id", correlationID),
+			zap.Error(err),
+		)
+	}
+}
+
+// parsePaging reads limit and offset, rejecting anything that is not a
+// non-negative integer.
+//
+// Both used to be parsed with the error discarded, so "limit=abc" silently
+// fell back to the default and "offset=-1" reached Postgres, which rejects a
+// negative OFFSET — surfacing as 503 store_unavailable, i.e. a client typo
+// presenting as an outage.
+func (h *Handler) parsePaging(w http.ResponseWriter, q map[string][]string) (limit, offset int, ok bool) {
+	limit, ok = parseNonNegativeInt(w, q, "limit")
+	if !ok {
+		return 0, 0, false
+	}
+	offset, ok = parseNonNegativeInt(w, q, "offset")
+	if !ok {
+		return 0, 0, false
+	}
+	return limit, offset, true
+}
+
+func parseNonNegativeInt(w http.ResponseWriter, q map[string][]string, key string) (int, bool) {
+	vals, present := q[key]
+	if !present || len(vals) == 0 || vals[0] == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(vals[0])
+	if err != nil || n < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_"+key, key+" must be a non-negative integer")
+		return 0, false
+	}
+	return n, true
+}
+
+// parseEffectiveAt reads the point-in-time parameter. A zero value means
+// "now", resolved in the store.
+func (h *Handler) parseEffectiveAt(w http.ResponseWriter, q map[string][]string) (time.Time, bool) {
+	vals, present := q["effective_at"]
+	if !present || len(vals) == 0 || vals[0] == "" {
+		return time.Time{}, true
+	}
+	t, err := time.Parse(time.RFC3339, vals[0])
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_effective_at", "effective_at must be a valid RFC3339 timestamp")
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// decodeJSON reads a size-limited request body and rejects unknown fields.
+//
+// Unknown fields are an error rather than being ignored: a caller that
+// misspells "rule_payload" would otherwise get a 201 for a rule with an
+// empty payload, and only discover it much later.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
+				"request body exceeds "+strconv.Itoa(maxRequestBody)+" bytes")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request_body", err.Error())
+		return false
+	}
+	// Reject trailing content — two concatenated JSON objects would otherwise
+	// decode as just the first.
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid_request_body", "body must contain exactly one JSON object")
+		return false
+	}
+	return true
+}
+
+// normaliseRulePayload validates that the payload is a JSON object and
+// defaults an omitted one to {}.
+//
+// The column is JSONB NOT NULL DEFAULT '{}', but the insert always supplied a
+// value: an omitted payload sent empty bytes, which Postgres rejects as
+// invalid JSON and which surfaced as 503. A scalar payload ("x", 7, null)
+// was accepted outright, even though every documented payload — and every
+// consumer that reads applies_to_entity_types or filing_frequency out of it —
+// assumes an object.
+func normaliseRulePayload(raw json.RawMessage) ([]byte, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return []byte(`{}`), nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+		return nil, errors.New("rule_payload must be a JSON object")
+	}
+	return []byte(trimmed), nil
+}
+
+// requiredField pairs a JSON field name with its submitted value.
+type requiredField struct {
+	name  string
+	value string
+}
+
+// firstBlank returns the name of the first blank required field, in the order
+// given — so the error a caller gets is deterministic and matches the order
+// the fields appear in the request contract.
+func firstBlank(fields ...requiredField) string {
+	for _, f := range fields {
+		if strings.TrimSpace(f.value) == "" {
+			return f.name
+		}
+	}
+	return ""
+}
+
+// validEffectivePeriod reports whether effective_to, when present, is
+// strictly after effective_from.
+func validEffectivePeriod(from time.Time, to *time.Time) bool {
+	return to == nil || to.After(from)
+}
+
+func writeMissingField(w http.ResponseWriter, field string) {
+	writeJSON(w, http.StatusBadRequest, map[string]string{
+		"error": "missing_field",
+		"field": field,
+	})
+}
+
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	body := map[string]string{"error": code}
+	if message != "" {
+		body["message"] = message
+	}
+	writeJSON(w, status, body)
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.

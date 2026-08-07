@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/secret-vault-integration-svc/internal/authz"
 	"zoiko.io/secret-vault-integration-svc/internal/domain"
 	"zoiko.io/secret-vault-integration-svc/internal/handler"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
@@ -34,8 +36,8 @@ type stubStore struct {
 	findVersionResult *domain.SecretPolicyVersion
 	findVersionErr    error
 
-	activated    *domain.SecretPolicyVersion
-	activateErr  error
+	activated   *domain.SecretPolicyVersion
+	activateErr error
 
 	history    []*domain.SecretPolicyVersion
 	historyErr error
@@ -56,9 +58,9 @@ type stubStore struct {
 	listLeasesResult []*domain.SecretLease
 	listLeasesErr    error
 
-	revokeLeaseResult      *domain.SecretLease
+	revokeLeaseResult       *domain.SecretLease
 	revokeLeaseTransitioned bool
-	revokeLeaseErr         error
+	revokeLeaseErr          error
 
 	revokedByPath    []*domain.SecretLease
 	revokedByPathErr error
@@ -167,7 +169,7 @@ func (p *stubPublisher) PublishRotationCompleted(_ context.Context, _, _ string,
 
 func newTestRouter(s *stubStore, v *stubVault, p *stubPublisher) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, v, p, zap.NewNop())
+	h := handler.New(s, v, p, testAuthz(), testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -186,7 +188,7 @@ func TestCreateSecretPolicy_Created(t *testing.T) {
 	r := defaultRouter(s)
 
 	body := `{"secret_class":"DATABASE_CREDENTIAL","secret_path":"kv/db","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -197,7 +199,7 @@ func TestCreateSecretPolicy_Created(t *testing.T) {
 
 func TestCreateSecretPolicy_MissingField(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(`{"secret_class":"X"}`))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(`{"secret_class":"X"}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -209,7 +211,7 @@ func TestCreateSecretPolicy_Conflict(t *testing.T) {
 	s := &stubStore{policyErr: domain.ErrConflict}
 	r := defaultRouter(s)
 	body := `{"secret_class":"X","secret_path":"kv/x","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {
@@ -220,7 +222,7 @@ func TestCreateSecretPolicy_Conflict(t *testing.T) {
 func TestCreateSecretPolicy_InvalidDataClassification(t *testing.T) {
 	r := defaultRouter(&stubStore{})
 	body := `{"secret_class":"DATABASE_CREDENTIAL","secret_path":"kv/db","created_by_principal_id":"admin-1","data_classification":"INVALID_CLASSIFICATION"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -240,7 +242,7 @@ func TestCreateSecretPolicyVersion_Created(t *testing.T) {
 	}
 	r := defaultRouter(s)
 	body := `{"allowed_workload_ids":["svc-a"],"max_lease_duration_seconds":300,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -251,7 +253,7 @@ func TestCreateSecretPolicyVersion_Created(t *testing.T) {
 func TestCreateSecretPolicyVersion_InvalidMaxLeaseDuration(t *testing.T) {
 	r := defaultRouter(&stubStore{})
 	body := `{"max_lease_duration_seconds":0,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -263,7 +265,7 @@ func TestCreateSecretPolicyVersion_PolicyNotFound(t *testing.T) {
 	s := &stubStore{versionErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 	body := `{"max_lease_duration_seconds":300,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/versions", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/versions", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -280,7 +282,7 @@ func TestActivateVersion_Success(t *testing.T) {
 	}
 	r := defaultRouter(s)
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -290,7 +292,7 @@ func TestActivateVersion_Success(t *testing.T) {
 
 func TestActivateVersion_MissingActor(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(`{}`))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(`{}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -302,7 +304,7 @@ func TestActivateVersion_PolicyMismatch(t *testing.T) {
 	s := &stubStore{findVersionResult: &domain.SecretPolicyVersion{SecretPolicyVersionID: "spv-1", SecretPolicyID: "OTHER"}}
 	r := defaultRouter(s)
 	body := `{"activated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions/spv-1/activate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -318,7 +320,7 @@ func TestPutSecretMaterial_Success(t *testing.T) {
 	r := newTestRouter(s, v, &stubPublisher{})
 
 	body := `{"material_base64":"c2VjcmV0LXZhbHVl"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/material", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/material", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -332,7 +334,7 @@ func TestPutSecretMaterial_Success(t *testing.T) {
 
 func TestPutSecretMaterial_MissingField(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/material", strings.NewReader(`{}`))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/material", strings.NewReader(`{}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -344,7 +346,7 @@ func TestPutSecretMaterial_PolicyNotFound(t *testing.T) {
 	s := &stubStore{findPolicyErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 	body := `{"material_base64":"c2VjcmV0"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/material", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/material", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -400,7 +402,7 @@ func TestBroker_Granted(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouter(s, v, pub)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-a", "req-1")))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-a", "req-1"))))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -426,7 +428,7 @@ func TestBroker_NoApplicablePolicy(t *testing.T) {
 	s := &stubStore{applicableByPathErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/missing", "svc-a", "req-1")))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/missing", "svc-a", "req-1"))))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -454,7 +456,7 @@ func TestBroker_NotAuthorized(t *testing.T) {
 	}
 	r := defaultRouter(s)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-b", "req-1")))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-b", "req-1"))))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -494,7 +496,7 @@ func TestBroker_CorrelationIDFromBody_UsedWhenHeaderAbsent(t *testing.T) {
 	r := defaultRouter(s)
 
 	body := `{"secret_path":"kv/db","requested_by_principal_id":"svc-a","request_id":"req-1","correlation_id":"corr-from-body"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -510,7 +512,7 @@ func TestBroker_CorrelationIDFromBody_UsedWhenHeaderAbsent(t *testing.T) {
 
 func TestBroker_MissingField(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(`{"secret_path":"kv/db"}`))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(`{"secret_path":"kv/db"}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -531,7 +533,7 @@ func TestBroker_VaultUnavailable(t *testing.T) {
 	v := &stubVault{getErr: context.DeadlineExceeded}
 	r := newTestRouter(s, v, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-a", "req-1")))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", strings.NewReader(brokerBody("kv/db", "svc-a", "req-1"))))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusServiceUnavailable {
@@ -579,7 +581,7 @@ func TestRevokeLease_Success(t *testing.T) {
 		revokeLeaseTransitioned: true,
 	}
 	r := defaultRouter(s)
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -593,7 +595,7 @@ func TestRevokeLease_Success(t *testing.T) {
 func TestRevokeLease_InvalidTransition(t *testing.T) {
 	s := &stubStore{revokeLeaseErr: domain.ErrInvalidTransition}
 	r := defaultRouter(s)
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusConflict {
@@ -615,7 +617,7 @@ func TestRotate_Success(t *testing.T) {
 	r := newTestRouter(s, v, pub)
 
 	body := `{"request_id":"rot-1","rotated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -649,7 +651,7 @@ func TestRotate_IdempotentReplay_DoesNotRotateAgain(t *testing.T) {
 	r := newTestRouter(s, v, &stubPublisher{})
 
 	body := `{"request_id":"rot-1","rotated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -664,7 +666,7 @@ func TestRotate_IdempotentReplay_DoesNotRotateAgain(t *testing.T) {
 func TestRotate_MissingRequestID(t *testing.T) {
 	r := defaultRouter(&stubStore{})
 	body := `{"rotated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -676,7 +678,7 @@ func TestRotate_PolicyNotFound(t *testing.T) {
 	s := &stubStore{findPolicyErr: domain.ErrSecretPolicyNotFound}
 	r := defaultRouter(s)
 	body := `{"request_id":"rot-1","rotated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/rotate", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/missing/rotate", strings.NewReader(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -693,5 +695,145 @@ func TestListAuditLog_EmptyReturnsArray(t *testing.T) {
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
 		t.Fatalf("expected 200 empty array, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── authorization test scaffolding ───────────────────────────────────────────
+
+// testAuthzScopeID stands in for config.AuthZPlatformScopeID.
+const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
+
+// testPrincipal is what the gateway ForwardAuth middleware sets in
+// X-Principal-Id after verifying the caller identity envelope.
+const testPrincipal = "principal-test-admin"
+
+// stubAuthz records what it was asked and answers with err.
+type stubAuthz struct {
+	err error
+
+	calls      int
+	principal  string
+	scope      string
+	actionType string
+}
+
+func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType string) error {
+	a.calls++
+	a.principal, a.scope, a.actionType = principalID, legalEntityID, actionType
+	return a.err
+}
+
+// testAuthz is the permit-all default used by every pre-existing test.
+func testAuthz() *stubAuthz { return &stubAuthz{} }
+
+// authed stamps the gateway-verified principal header onto a request.
+// Every mutating route now requires it.
+func authed(req *http.Request) *http.Request {
+	req.Header.Set("X-Principal-Id", testPrincipal)
+	return req
+}
+
+// ── authorization contract ───────────────────────────────────────────────────
+
+// gatedRoutes is every secret-POLICY administration route. The broker
+// endpoint is deliberately absent — see the comment on the Action* constants
+// in handler.go: brokering is gated by the secret policy it evaluates, and a
+// second coarser RBAC check in front of it would obscure which decision
+// actually refused an access.
+var gatedRoutes = []struct {
+	name string
+	path string
+	body string
+}{
+	{name: "create secret policy", path: "/v1/secret-policies", body: `{}`},
+	{name: "create version", path: "/v1/secret-policies/sp-1/versions", body: `{}`},
+	{name: "activate version", path: "/v1/secret-policies/sp-1/versions/v-1/activate", body: `{}`},
+	{name: "put material", path: "/v1/secret-policies/sp-1/material", body: `{}`},
+	{name: "rotate", path: "/v1/secret-policies/sp-1/rotate", body: `{}`},
+	{name: "revoke lease", path: "/v1/secrets/leases/l-1/revoke", body: `{}`},
+}
+
+func gatedRouter(az *stubAuthz) http.Handler {
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, handler.New(&stubStore{}, &stubVault{}, &stubPublisher{}, az, testAuthzScopeID, zap.NewNop()))
+	return r
+}
+
+// TestGatedRoutes_401_WithoutPrincipal — this service brokers secret access
+// and shipped with no gate on its administration routes, so anything able to
+// reach the port could rewrite a secret policy or overwrite secret material.
+func TestGatedRoutes_401_WithoutPrincipal(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			az := &stubAuthz{}
+			// Deliberately NOT wrapped in authed().
+			req := httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body))
+			w := httptest.NewRecorder()
+			gatedRouter(az).ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 without a principal, got %d: %s", w.Code, w.Body.String())
+			}
+			if az.calls != 0 {
+				t.Error("authorization was consulted before the caller was even identified")
+			}
+		})
+	}
+}
+
+// TestGatedRoutes_403_Denied — a denial must stop the write, before the body
+// is even parsed.
+func TestGatedRoutes_403_Denied(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			az := &stubAuthz{err: authz.ErrDenied}
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			gatedRouter(az).ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+			}
+			if az.principal != testPrincipal {
+				t.Errorf("authz saw principal %q, want %q", az.principal, testPrincipal)
+			}
+			if az.scope == "" {
+				t.Error("an empty legal_entity_id would be rejected by authorization-svc with 400")
+			}
+		})
+	}
+}
+
+// TestGatedRoutes_503_AuthzUnavailableFailsClosed — an unreachable
+// authorization service must block the mutation, not wave it through.
+func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			az := &stubAuthz{err: authz.ErrUnavailable}
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			gatedRouter(az).ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestBroker_NotRBACGated — the broker is the runtime secret-access path. It
+// is gated by the secret policy it evaluates, not by a platform RBAC action,
+// so a denied RBAC client must not turn into a refused broker call.
+func TestBroker_NotRBACGated(t *testing.T) {
+	az := &stubAuthz{err: authz.ErrDenied}
+	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", bytes.NewBufferString(`{}`))
+	w := httptest.NewRecorder()
+	gatedRouter(az).ServeHTTP(w, req)
+
+	if w.Code == http.StatusForbidden || w.Code == http.StatusUnauthorized {
+		t.Fatalf("broker must not be RBAC-gated, got %d", w.Code)
+	}
+	if az.calls != 0 {
+		t.Errorf("broker should not call authorization-svc, got %d calls", az.calls)
 	}
 }

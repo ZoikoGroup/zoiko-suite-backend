@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/domain"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
 	"zoiko.io/governance-decision-log-svc/internal/store"
@@ -65,7 +67,7 @@ func (p *stubPublisher) PublishDecisionRecorded(_ context.Context, d domain.Gove
 
 func newTestRouter(store handler.DecisionStore, pub handler.EventPublisher) http.Handler {
 	r := chi.NewRouter()
-	h := handler.New(store, pub, zap.NewNop())
+	h := handler.New(store, pub, testAuthz(), testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -88,7 +90,7 @@ func validBody() string {
 func TestCreateDecision_201_FirstInsert(t *testing.T) {
 	store := &stubStore{created: true}
 	h := newTestRouter(store, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 	req.Header.Set("X-Correlation-ID", "corr-req-001")
 
 	rr := httptest.NewRecorder()
@@ -118,7 +120,7 @@ func TestCreateDecision_201_FirstInsert(t *testing.T) {
 func TestCreateDecision_201_PublishesDecisionRecorded(t *testing.T) {
 	pub := &stubPublisher{}
 	h := newTestRouter(&stubStore{created: true}, pub)
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -141,7 +143,7 @@ func TestCreateDecision_201_PublishesDecisionRecorded(t *testing.T) {
 func TestCreateDecision_200_IdempotentReplay(t *testing.T) {
 	store := &stubStore{created: false}
 	h := newTestRouter(store, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -157,7 +159,7 @@ func TestCreateDecision_200_IdempotentReplay(t *testing.T) {
 func TestCreateDecision_200_IdempotentReplay_DoesNotRePublish(t *testing.T) {
 	pub := &stubPublisher{}
 	h := newTestRouter(&stubStore{created: false}, pub)
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -177,7 +179,7 @@ func TestCreateDecision_200_IdempotentReplay_DoesNotRePublish(t *testing.T) {
 func TestCreateDecision_201_PublishFailureDoesNotFailRequest(t *testing.T) {
 	pub := &stubPublisher{err: errors.New("kafka unreachable")}
 	h := newTestRouter(&stubStore{created: true}, pub)
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -192,7 +194,7 @@ func TestCreateDecision_201_PublishFailureDoesNotFailRequest(t *testing.T) {
 func TestCreateDecision_400_MissingField(t *testing.T) {
 	body := `{"tenant_id": "tenant-1"}` // missing everything else
 	h := newTestRouter(&stubStore{created: true}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body)))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -213,7 +215,7 @@ func TestCreateDecision_400_MissingField(t *testing.T) {
 // with 400, not a 500 or panic.
 func TestCreateDecision_400_InvalidJSON(t *testing.T) {
 	h := newTestRouter(&stubStore{created: true}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{not json`))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(`{not json`)))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -227,7 +229,7 @@ func TestCreateDecision_400_InvalidJSON(t *testing.T) {
 // returns 503 — not a silently swallowed failure.
 func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 	h := newTestRouter(&stubStore{err: domain.ErrStoreUnavailable}, &stubPublisher{})
-	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -432,5 +434,127 @@ func TestListDecisions_503_StoreUnavailable(t *testing.T) {
 
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── authorization test scaffolding ───────────────────────────────────────────
+
+// testAuthzScopeID stands in for config.AuthZPlatformScopeID.
+const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
+
+// testPrincipal is what the gateway ForwardAuth middleware sets in
+// X-Principal-Id after verifying the caller identity envelope.
+const testPrincipal = "principal-test-admin"
+
+// stubAuthz records what it was asked and answers with err.
+type stubAuthz struct {
+	err error
+
+	calls      int
+	principal  string
+	scope      string
+	actionType string
+}
+
+func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType string) error {
+	a.calls++
+	a.principal, a.scope, a.actionType = principalID, legalEntityID, actionType
+	return a.err
+}
+
+// testAuthz is the permit-all default used by every pre-existing test.
+func testAuthz() *stubAuthz { return &stubAuthz{} }
+
+// authed stamps the gateway-verified principal header onto a request.
+// Every mutating route now requires it.
+func authed(req *http.Request) *http.Request {
+	req.Header.Set("X-Principal-Id", testPrincipal)
+	return req
+}
+
+// ── authorization contract ───────────────────────────────────────────────────
+
+// gatedRoutes is every route that mutates state, so a route added later
+// cannot quietly skip the gate.
+var gatedRoutes = []struct {
+	name string
+	path string
+	body string
+}{
+	{name: "record decision", path: "/v1/decisions", body: `{"decision_id":"d-1","tenant_id":"t-1","legal_entity_id":"le-1","actor_id":"a-1","action_type":"APPROVE","outcome":"GRANTED","rule_basis":"policy:APPROVAL_5K","correlation_id":"corr-1"}`},
+}
+
+// TestGatedRoutes_401_WithoutPrincipal — this service shipped with no gate of
+// any kind, so anything able to reach the port could write to it.
+func TestGatedRoutes_401_WithoutPrincipal(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := &stubStore{}
+			pub := &stubPublisher{}
+			az := &stubAuthz{}
+			r := chi.NewRouter()
+			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+
+			// Deliberately NOT wrapped in authed().
+			req := httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 without a principal, got %d: %s", w.Code, w.Body.String())
+			}
+			if az.calls != 0 {
+				t.Error("authorization was consulted before the caller was even identified")
+			}
+		})
+	}
+}
+
+// TestGatedRoutes_403_Denied — a denial must stop the write.
+func TestGatedRoutes_403_Denied(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := &stubStore{}
+			pub := &stubPublisher{}
+			az := &stubAuthz{err: authz.ErrDenied}
+			r := chi.NewRouter()
+			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+			}
+			if az.principal != testPrincipal {
+				t.Errorf("authz saw principal %q, want %q", az.principal, testPrincipal)
+			}
+			if az.scope == "" {
+				t.Error("an empty legal_entity_id would be rejected by authorization-svc with 400")
+			}
+		})
+	}
+}
+
+// TestGatedRoutes_503_AuthzUnavailableFailsClosed — an unreachable
+// authorization service must block the mutation, not wave it through.
+func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
+	for _, route := range gatedRoutes {
+		t.Run(route.name, func(t *testing.T) {
+			store := &stubStore{}
+			pub := &stubPublisher{}
+			az := &stubAuthz{err: authz.ErrUnavailable}
+			r := chi.NewRouter()
+			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+
+			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }

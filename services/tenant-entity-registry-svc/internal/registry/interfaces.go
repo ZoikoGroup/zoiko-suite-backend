@@ -113,7 +113,12 @@ type AuthorizationClient interface {
 	// Authorize returns nil if the action is permitted.
 	// Returns authz.ErrUnauthorized if denied.
 	// Returns authz.ErrAuthZUnavailable if service unreachable — callers fail-closed.
-	Authorize(ctx context.Context, envelopeJWT, resource, action string) error
+	//
+	// principalID is the gateway-verified acting principal and scopeID the
+	// tenant the decision is evaluated within. This used to take the raw
+	// envelope JWT, which the service then decoded itself without verifying
+	// the signature — so the subject of the decision was caller-chosen.
+	Authorize(ctx context.Context, principalID, scopeID, resource, action string) error
 }
 
 // ---------------------------------------------------------------------------

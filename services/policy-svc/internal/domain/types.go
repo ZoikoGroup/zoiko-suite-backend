@@ -129,6 +129,15 @@ var ErrConflict = errorString("conflict: record already exists with differing at
 // Callers must fail-closed — treat as unavailable, not as "not found".
 var ErrStoreUnavailable = errorString("policy store unavailable")
 
+// ErrAuthorizationDenied is returned when authorization-svc answers DENIED
+// for a policy mutation (403 Forbidden).
+var ErrAuthorizationDenied = errorString("authorization denied")
+
+// ErrAuthorizationServiceUnavailable is returned when no authorization
+// decision could be obtained (503). Callers must fail closed — a policy
+// mutation never proceeds without a positive decision.
+var ErrAuthorizationServiceUnavailable = errorString("authorization service unavailable")
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }

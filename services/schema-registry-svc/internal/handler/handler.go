@@ -87,6 +87,21 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 04-data-model.md §17.2: "compatibility mode must be declared". Omitted
+	// means BACKWARD — both the safe default and what every previously
+	// registered schema was held to, so existing callers are unaffected. An
+	// unrecognised mode is refused rather than defaulted: recording a
+	// discipline the service does not actually apply would be worse than
+	// rejecting the request.
+	mode := req.CompatibilityMode
+	if mode == "" {
+		mode = domain.CompatibilityBackward
+	}
+	if !domain.ValidCompatibilityMode(mode) {
+		writeError(w, http.StatusBadRequest, domain.ErrInvalidCompatibilityMode.Error())
+		return
+	}
+
 	ctx := r.Context()
 	current, err := h.store.LatestVersion(ctx, eventName)
 	if err != nil {
@@ -95,31 +110,62 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	nextVersion := 1
+	// currentVersion is both the compatibility baseline and the optimistic
+	// concurrency token handed to the store. 0 means "no version yet".
+	currentVersion := 0
 	if current != nil {
-		violations, err := compat.Check(current.JSONSchema, req.JSONSchema)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, "schema shape error: "+err.Error())
-			return
+		currentVersion = current.Version
+
+		// NONE is the §17.2 controlled-rollout escape hatch. It is logged at
+		// INFO because a contract evolving without a compatibility check is a
+		// governance event, not a routine one — the register shows the mode,
+		// and the log shows when it was exercised.
+		if mode == domain.CompatibilityNone {
+			h.log.Info("compatibility check skipped — NONE declared",
+				zap.String("event_name", eventName),
+				zap.Int("from_version", currentVersion),
+				zap.String("principal_id", principalID),
+			)
+		} else {
+			violations, err := compat.Check(current.JSONSchema, req.JSONSchema)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "schema shape error: "+err.Error())
+				return
+			}
+			if len(violations) > 0 {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error":      domain.ErrIncompatibleSchema.Error(),
+					"violations": violations,
+				})
+				return
+			}
 		}
-		if len(violations) > 0 {
-			writeJSON(w, http.StatusConflict, map[string]any{
-				"error":      domain.ErrIncompatibleSchema.Error(),
-				"violations": violations,
-			})
-			return
-		}
-		nextVersion = current.Version + 1
 	}
 
 	newSchema := &domain.EventSchema{
-		EventName:    eventName,
-		Version:      nextVersion,
-		JSONSchema:   req.JSONSchema,
-		RegisteredBy: principalID,
-		RegisteredAt: time.Now().UTC(),
+		EventName:         eventName,
+		JSONSchema:        req.JSONSchema,
+		CompatibilityMode: mode,
+		OwningService:     req.OwningService,
+		RegisteredBy:      principalID,
+		RegisteredAt:      time.Now().UTC(),
 	}
-	if err := h.store.Insert(ctx, newSchema); err != nil {
+
+	// The version is assigned inside the INSERT, guarded by currentVersion.
+	stored, err := h.store.Insert(ctx, newSchema, currentVersion)
+	if err != nil {
+		if errors.Is(err, domain.ErrVersionRaced) {
+			// A concurrent registration won. 409, not 503: nothing is broken,
+			// and the caller must re-read and re-check rather than blindly
+			// retry — its schema was validated against a version that is no
+			// longer latest.
+			h.log.Info("schema registration lost a version race",
+				zap.String("event_name", eventName),
+				zap.Int("checked_against_version", currentVersion),
+			)
+			writeError(w, http.StatusConflict, domain.ErrVersionRaced.Error())
+			return
+		}
 		h.log.Error("insert schema version failed", zap.Error(err), zap.String("event_name", eventName))
 		writeError(w, http.StatusServiceUnavailable, domain.ErrStoreUnavailable.Error())
 		return
@@ -127,9 +173,10 @@ func (h *Handler) RegisterVersion(w http.ResponseWriter, r *http.Request) {
 
 	h.log.Info("schema version registered",
 		zap.String("event_name", eventName),
-		zap.Int("version", nextVersion),
+		zap.Int("version", stored.Version),
+		zap.String("compatibility_mode", stored.CompatibilityMode),
 	)
-	writeJSON(w, http.StatusCreated, newSchema)
+	writeJSON(w, http.StatusCreated, stored)
 }
 
 // ── GET /v1/schemas/{eventName}/versions/latest ─────────────────────────────

@@ -182,7 +182,7 @@ func (m *memStore) TransitionTaxIdentityBundleStatus(_ context.Context, id strin
 
 type noopPublisher struct{}
 
-func (noopPublisher) PublishTenantCreated(_ context.Context, _ *domain.Tenant, _ string) {}
+func (noopPublisher) PublishTenantCreated(_ context.Context, _ *domain.Tenant, _ string)      {}
 func (noopPublisher) PublishEntityCreated(_ context.Context, _ *domain.LegalEntity, _ string) {}
 func (noopPublisher) PublishEntityUpdated(_ context.Context, _ *domain.LegalEntity, _ string) {}
 func (noopPublisher) PublishEntityStatusChanged(_ context.Context, _, _ string, _, _ domain.EntityStatus, _ string) {
@@ -198,17 +198,17 @@ func (noopPublisher) PublishEntityJurisdictionChanged(_ context.Context, _ *doma
 
 type permitAllAuthZ struct{}
 
-func (permitAllAuthZ) Authorize(_ context.Context, _, _, _ string) error { return nil }
+func (permitAllAuthZ) Authorize(_ context.Context, _, _, _, _ string) error { return nil }
 
 type denyAllAuthZ struct{}
 
-func (denyAllAuthZ) Authorize(_ context.Context, _, _, _ string) error {
+func (denyAllAuthZ) Authorize(_ context.Context, _, _, _, _ string) error {
 	return authz.ErrUnauthorized
 }
 
 type unavailableAuthZ struct{}
 
-func (unavailableAuthZ) Authorize(_ context.Context, _, _, _ string) error {
+func (unavailableAuthZ) Authorize(_ context.Context, _, _, _, _ string) error {
 	return authz.ErrAuthZUnavailable
 }
 
@@ -236,10 +236,33 @@ func (unavailableJurisd) ValidateExists(_ context.Context, _ string) error {
 // helpers
 // ---------------------------------------------------------------------------
 
+// testPlatformScope stands in for config.AuthZPlatformScopeID — the scope
+// ProvisionTenant is evaluated against, since no tenant exists yet.
+const testPlatformScope = "00000000-0000-0000-0000-0000000000aa"
+
+// testPrincipal is what the gateway would set in X-Principal-Id after
+// verifying the caller's envelope.
+const testPrincipal = "principal-test-1"
+
+// authCtx returns a context carrying a verified principal, as
+// middleware.Identity would have populated it. Mutations refuse a context
+// without one, so every write path in these tests must use this rather than
+// context.Background().
+func authCtx() context.Context {
+	return domain.WithPrincipal(context.Background(), testPrincipal)
+}
+
+// tenantCtx is authCtx plus a verified tenant, as middleware.Identity would
+// populate it from X-Tenant-Id. Reads and transitions scoped to a tenant are
+// refused unless the caller's own verified tenant matches the one in the path.
+func tenantCtx(tenantID string) context.Context {
+	return domain.WithTenant(authCtx(), tenantID)
+}
+
 func newSvc(t *testing.T, store registry.Store, authzC registry.AuthorizationClient, jv registry.JurisdictionValidator) *registry.Service {
 	t.Helper()
 	log := zap.NewNop()
-	return registry.NewService(store, noopPublisher{}, authzC, jv, log)
+	return registry.NewService(store, noopPublisher{}, authzC, jv, testPlatformScope, log)
 }
 
 func baseSvc(t *testing.T) (*registry.Service, *memStore) {
@@ -265,7 +288,7 @@ func TestProvisionTenant_Success(t *testing.T) {
 		DefaultDataResidencyPolicyID: "drp-001",
 	}
 
-	tenant, err := svc.ProvisionTenant(context.Background(), "jwt-stub", req, "corr-001")
+	tenant, err := svc.ProvisionTenant(authCtx(), req, "corr-001")
 	require.NoError(t, err)
 	assert.NotEmpty(t, tenant.TenantID)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState)
@@ -281,7 +304,7 @@ func TestProvisionTenant_Unauthorized(t *testing.T) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, denyAllAuthZ{}, acceptAllJurisd{})
 
-	_, err := svc.ProvisionTenant(context.Background(), "bad-jwt", domain.ProvisionTenantRequest{}, "corr")
+	_, err := svc.ProvisionTenant(authCtx(), domain.ProvisionTenantRequest{}, "corr")
 	assert.ErrorIs(t, err, registry.ErrUnauthorized)
 }
 
@@ -289,7 +312,7 @@ func TestProvisionTenant_AuthZUnavailable_FailsClosed(t *testing.T) {
 	ms := newMemStore()
 	svc := newSvc(t, ms, unavailableAuthZ{}, acceptAllJurisd{})
 
-	_, err := svc.ProvisionTenant(context.Background(), "jwt", domain.ProvisionTenantRequest{}, "corr")
+	_, err := svc.ProvisionTenant(authCtx(), domain.ProvisionTenantRequest{}, "corr")
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -305,12 +328,14 @@ func TestTransitionTenantLifecycle_ValidTransition(t *testing.T) {
 		PrimaryLocale:                "en-GB",
 		DefaultDataResidencyPolicyID: "drp-001",
 	}
-	tenant, err := svc.ProvisionTenant(context.Background(), "jwt", req, "corr")
+	tenant, err := svc.ProvisionTenant(authCtx(), req, "corr")
 	require.NoError(t, err)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState)
 
-	// Transition ONBOARDING → ACTIVE (valid)
-	err = svc.TransitionTenantLifecycle(context.Background(), "jwt", tenant.TenantID,
+	// Transition ONBOARDING → ACTIVE (valid). The caller's verified tenant must
+	// be the one being transitioned — reads and transitions are refused when
+	// the path tenant is not the caller's own.
+	err = svc.TransitionTenantLifecycle(tenantCtx(tenant.TenantID), tenant.TenantID,
 		domain.TransitionTenantLifecycleRequest{
 			TargetState:   domain.TenantLifecycleActive,
 			CorrelationID: "corr-002",
@@ -332,15 +357,78 @@ func TestTransitionTenantLifecycle_InvalidTransition(t *testing.T) {
 		PrimaryLocale:                "fr-FR",
 		DefaultDataResidencyPolicyID: "drp-001",
 	}
-	tenant, _ := svc.ProvisionTenant(context.Background(), "jwt", req, "corr")
+	tenant, _ := svc.ProvisionTenant(authCtx(), req, "corr")
 
 	// ONBOARDING → OFFBOARDING is not a valid transition
-	err := svc.TransitionTenantLifecycle(context.Background(), "jwt", tenant.TenantID,
+	err := svc.TransitionTenantLifecycle(tenantCtx(tenant.TenantID), tenant.TenantID,
 		domain.TransitionTenantLifecycleRequest{
 			TargetState:   domain.TenantLifecycleOffboarding,
 			CorrelationID: "corr-003",
 		})
 	assert.ErrorIs(t, err, registry.ErrInvalidTransition)
+}
+
+// TestCrossTenantReadsAreRefused is the regression test for a live-verified
+// cross-tenant read.
+//
+// Row-level security was meant to prevent this and does not: the service
+// connects as the Postgres superuser, which bypasses RLS unconditionally, and
+// the tables are owned by that same user with ENABLE (not FORCE) ROW LEVEL
+// SECURITY, so the owner bypasses the policies too. Both confirmed against a
+// running database via pg_user.usesuper and pg_class.relforcerowsecurity.
+//
+// The queries themselves filter correctly — on the tenant id taken from the
+// URL. That is not an isolation boundary: it is the caller choosing their own
+// scope. Verified live before the fix: GET /v1/tenants/{A}/entities with
+// X-Tenant-Id: B returned tenant A's entities in full.
+func TestCrossTenantReadsAreRefused(t *testing.T) {
+	svc, ms := baseSvc(t)
+
+	victim := &domain.Tenant{TenantID: "tenant-a", TenantCode: "A", LegalName: "Tenant A"}
+	ms.tenants[victim.TenantID] = victim
+
+	attacker := tenantCtx("tenant-b")
+
+	t.Run("GetTenant", func(t *testing.T) {
+		_, err := svc.GetTenant(attacker, victim.TenantID)
+		require.ErrorIs(t, err, registry.ErrNotFound,
+			"another tenant's record must not be readable, and must not be distinguishable from absent")
+	})
+
+	t.Run("ListEntities", func(t *testing.T) {
+		_, err := svc.ListEntities(attacker, victim.TenantID)
+		require.ErrorIs(t, err, registry.ErrNotFound)
+	})
+
+	t.Run("ResolveTenantRegion", func(t *testing.T) {
+		_, err := svc.ResolveTenantRegion(attacker, victim.TenantID)
+		require.ErrorIs(t, err, registry.ErrNotFound)
+	})
+
+	t.Run("no verified tenant at all", func(t *testing.T) {
+		_, err := svc.GetTenant(authCtx(), victim.TenantID)
+		require.ErrorIs(t, err, registry.ErrNotFound,
+			"a request with no verified tenant cannot be scoped and must be refused")
+	})
+
+	t.Run("own tenant still readable", func(t *testing.T) {
+		got, err := svc.GetTenant(tenantCtx(victim.TenantID), victim.TenantID)
+		require.NoError(t, err, "the fix must not over-restrict a caller reading its own tenant")
+		assert.Equal(t, victim.TenantID, got.TenantID)
+	})
+}
+
+// TestListEntitiesReturnsEmptyArrayNotNil — the handler serialises this
+// directly, and a nil slice becomes JSON `null`, which breaks a caller
+// iterating the array. Verified live returning `null`.
+func TestListEntitiesReturnsEmptyArrayNotNil(t *testing.T) {
+	svc, ms := baseSvc(t)
+	ms.tenants["tenant-a"] = &domain.Tenant{TenantID: "tenant-a"}
+
+	got, err := svc.ListEntities(tenantCtx("tenant-a"), "tenant-a")
+	require.NoError(t, err)
+	assert.NotNil(t, got, "an empty entity list must serialise as [], never null")
+	assert.Empty(t, got)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,7 +450,7 @@ func TestCreateEntity_Success(t *testing.T) {
 		CorrelationID:         "corr-004",
 	}
 
-	entity, err := svc.CreateEntity(context.Background(), "jwt", req)
+	entity, err := svc.CreateEntity(authCtx(), req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, entity.LegalEntityID)
 	assert.Equal(t, domain.EntityStatusActive, entity.EntityStatus)
@@ -388,7 +476,7 @@ func TestCreateEntity_JurisdictionNotFound_FailsClosed(t *testing.T) {
 		CorrelationID:         "corr-005",
 	}
 
-	_, err := svc.CreateEntity(context.Background(), "jwt", req)
+	_, err := svc.CreateEntity(authCtx(), req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -408,7 +496,7 @@ func TestCreateEntity_JurisdictionServiceUnavailable_FailsClosed(t *testing.T) {
 		CorrelationID:         "corr-006",
 	}
 
-	_, err := svc.CreateEntity(context.Background(), "jwt", req)
+	_, err := svc.CreateEntity(authCtx(), req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -452,7 +540,7 @@ func TestTransitionEntityStatus_ValidTransition(t *testing.T) {
 		EntityStatus:  domain.EntityStatusActive,
 	}
 
-	err := svc.TransitionEntityStatus(context.Background(), "jwt", "ent-001",
+	err := svc.TransitionEntityStatus(authCtx(), "ent-001",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-007",
@@ -471,7 +559,7 @@ func TestTransitionEntityStatus_Idempotent_SameStatus(t *testing.T) {
 	}
 
 	// Applying the same status must be a no-op (idempotent)
-	err := svc.TransitionEntityStatus(context.Background(), "jwt", "ent-002",
+	err := svc.TransitionEntityStatus(authCtx(), "ent-002",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-008",
@@ -490,7 +578,7 @@ func TestTransitionEntityStatus_InvalidTransition_Rejected(t *testing.T) {
 		EntityStatus:  domain.EntityStatusDissolved, // terminal state
 	}
 
-	err := svc.TransitionEntityStatus(context.Background(), "jwt", "ent-003",
+	err := svc.TransitionEntityStatus(authCtx(), "ent-003",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusActive,
 			CorrelationID: "corr-009",
@@ -517,7 +605,7 @@ func TestCreateTaxIdentityBundle_Success(t *testing.T) {
 		CorrelationID:  "corr-010",
 	}
 
-	bundle, err := svc.CreateTaxIdentityBundle(context.Background(), "jwt", "ent-100", req)
+	bundle, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, bundle.TaxIdentityBundleID)
 	assert.Equal(t, "ent-100", bundle.LegalEntityID)
@@ -547,7 +635,7 @@ func TestCreateTaxIdentityBundle_InvalidDataClassification_Fails(t *testing.T) {
 		DataClassification: "INVALID_CLASSIFICATION",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(context.Background(), "jwt", "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -561,7 +649,7 @@ func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 		CorrelationID:  "corr-011",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(context.Background(), "jwt", "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -575,7 +663,7 @@ func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.
 		CorrelationID:  "corr-012",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(context.Background(), "jwt", "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -583,75 +671,218 @@ func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.
 // UpdateEntity actor audit tests (R3 fix)
 // ---------------------------------------------------------------------------
 
-// TestUpdateEntity_WritesRealActorPrincipalID confirms that the service
-// extracts principal_id from the envelope JWT and passes it to the store
-// as updated_by_principal_id — not the "system" fallback.
-//
-// actorFromJWT performs payload-only base64 decoding; it does NOT verify the
-// signature. We craft a minimal unsigned JWT to exercise the extraction path
-// without needing a real key or signing library in this test package.
-func TestUpdateEntity_WritesRealActorPrincipalID(t *testing.T) {
-	svc, ms := baseSvc(t)
-	ctx := context.Background()
-
-	// Pre-seed an entity so UpdateEntity finds it.
-	entityID := "ent-actor-test"
+// seedEntity pre-seeds an entity so update/transition paths find one.
+func seedEntity(ms *memStore, entityID string) {
 	ms.entities[entityID] = &domain.LegalEntity{
 		LegalEntityID: entityID,
 		TenantID:      "ten-001",
 		LegalName:     "Original Name",
 		EntityStatus:  domain.EntityStatusActive,
 	}
-
-	wantPrincipalID := "usr_01J0000000000000000000001"
-
-	// Build a minimal unsigned JWT: header.payload.sig where:
-	//   header = {"alg":"none"}
-	//   payload = {"principal_id":"<id>"}
-	//   sig = empty (actorFromJWT ignores the signature entirely)
-	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
-	payload := base64.RawURLEncoding.EncodeToString(
-		[]byte(`{"principal_id":"` + wantPrincipalID + `"}`),
-	)
-	envelopeJWT := header + "." + payload + "."
-
-	newName := "Updated Name"
-	req := domain.UpdateEntityRequest{
-		LegalName:     &newName,
-		CorrelationID: "corr-actor-test",
-	}
-
-	_, err := svc.UpdateEntity(ctx, envelopeJWT, entityID, req)
-	require.NoError(t, err)
-
-	// The store must have received the real principal_id, not "system".
-	assert.Equal(t, wantPrincipalID, ms.lastUpdateActor,
-		"updated_by_principal_id must be the real actor from the JWT, not the 'system' fallback")
-	assert.NotEqual(t, "system", ms.lastUpdateActor,
-		"hardcoded 'system' must not appear when a valid JWT is provided")
 }
 
-// TestUpdateEntity_FallsBackToSystem_WhenJWTAbsent confirms the documented
-// fallback: when no JWT is provided, actor is "system" and the update still
-// succeeds. This is intentional; it will be visible in audit logs as a signal
-// that the caller did not supply a JWT.
-func TestUpdateEntity_FallsBackToSystem_WhenJWTAbsent(t *testing.T) {
+// TestUpdateEntity_WritesVerifiedActorPrincipalID confirms the audit column
+// records the principal the gateway verified.
+//
+// This test replaces one that asserted the opposite behaviour. The previous
+// version built an unsigned {"alg":"none"} token, put a principal_id of its
+// choosing in the payload, and asserted the service adopted it — encoding the
+// vulnerability as the expected contract. Anyone could mint that token; no key
+// was involved. The identity now comes from the request context, populated by
+// middleware.Identity from the gateway-verified X-Principal-Id header.
+func TestUpdateEntity_WritesVerifiedActorPrincipalID(t *testing.T) {
 	svc, ms := baseSvc(t)
-	ctx := context.Background()
+	entityID := "ent-actor-test"
+	seedEntity(ms, entityID)
 
-	entityID := "ent-no-jwt"
-	ms.entities[entityID] = &domain.LegalEntity{
-		LegalEntityID: entityID,
-		TenantID:      "ten-001",
-		LegalName:     "Name",
-		EntityStatus:  domain.EntityStatusActive,
+	newName := "Updated Name"
+	_, err := svc.UpdateEntity(authCtx(), entityID, domain.UpdateEntityRequest{
+		LegalName:     &newName,
+		CorrelationID: "corr-actor-test",
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, testPrincipal, ms.lastUpdateActor,
+		"updated_by_principal_id must be the gateway-verified principal")
+	assert.NotEqual(t, "system", ms.lastUpdateActor,
+		"the 'system' fallback must not appear for an attributed write")
+}
+
+// TestUpdateEntity_IgnoresForgedJWT is the regression test for the removed
+// actorFromJWT path. A caller-supplied Authorization header is no longer read
+// anywhere in this service, so a forged token cannot influence the audit
+// identity — the mutation is refused outright for lack of a verified
+// principal, rather than attributed to whoever the token claimed to be.
+func TestUpdateEntity_IgnoresForgedJWT(t *testing.T) {
+	svc, ms := baseSvc(t)
+	entityID := "ent-forge-test"
+	seedEntity(ms, entityID)
+
+	// The exact shape the old code trusted: unsigned, attacker-chosen subject.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"principal_id":"attacker","tenant_id":"victim-tenant"}`))
+	forged := header + "." + payload + "."
+
+	// A context carrying the forged token as a value, with no verified
+	// principal — i.e. exactly what an unauthenticated caller can produce.
+	ctx := context.WithValue(context.Background(), forgedTokenKey{}, forged)
+
+	newName := "Updated Name"
+	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{LegalName: &newName})
+
+	require.ErrorIs(t, err, registry.ErrUnauthenticated,
+		"a request with no verified principal must be refused, not attributed to the token's claim")
+	assert.Empty(t, ms.lastUpdateActor, "no write should have reached the store")
+}
+
+type forgedTokenKey struct{}
+
+// TestMutationsRequireVerifiedPrincipal walks every mutating entry point and
+// asserts each refuses a context with no verified identity. Without this, a
+// single method forgetting the check would silently accept unauthenticated
+// writes — which is how the previous "system" fallback behaved on every route.
+func TestMutationsRequireVerifiedPrincipal(t *testing.T) {
+	anon := context.Background()
+
+	cases := []struct {
+		name string
+		call func(*registry.Service) error
+	}{
+		{"ProvisionTenant", func(s *registry.Service) error {
+			_, err := s.ProvisionTenant(anon, domain.ProvisionTenantRequest{}, "corr")
+			return err
+		}},
+		{"TransitionTenantLifecycle", func(s *registry.Service) error {
+			return s.TransitionTenantLifecycle(anon, "ten-001", domain.TransitionTenantLifecycleRequest{})
+		}},
+		{"CreateEntity", func(s *registry.Service) error {
+			_, err := s.CreateEntity(anon, domain.CreateEntityRequest{})
+			return err
+		}},
+		{"UpdateEntity", func(s *registry.Service) error {
+			_, err := s.UpdateEntity(anon, "ent-001", domain.UpdateEntityRequest{})
+			return err
+		}},
+		{"TransitionEntityStatus", func(s *registry.Service) error {
+			return s.TransitionEntityStatus(anon, "ent-001", domain.TransitionEntityStatusRequest{})
+		}},
+		{"CreateHierarchy", func(s *registry.Service) error {
+			_, err := s.CreateHierarchy(anon, domain.CreateHierarchyRequest{})
+			return err
+		}},
+		{"EndDateHierarchy", func(s *registry.Service) error {
+			return s.EndDateHierarchy(anon, "h-001", time.Now(), "corr")
+		}},
+		{"AssignJurisdiction", func(s *registry.Service) error {
+			_, err := s.AssignJurisdiction(anon, "ent-001", domain.AssignJurisdictionRequest{})
+			return err
+		}},
+		{"EndDateJurisdictionAssignment", func(s *registry.Service) error {
+			return s.EndDateJurisdictionAssignment(anon, "a-001", time.Now(), "corr")
+		}},
+		{"CreateResidencyPolicy", func(s *registry.Service) error {
+			_, err := s.CreateResidencyPolicy(anon, domain.CreateResidencyPolicyRequest{})
+			return err
+		}},
+		{"CreateTaxIdentityBundle", func(s *registry.Service) error {
+			_, err := s.CreateTaxIdentityBundle(anon, "ent-001", domain.CreateTaxIdentityBundleRequest{})
+			return err
+		}},
+		{"TransitionTaxIdentityBundleStatus", func(s *registry.Service) error {
+			return s.TransitionTaxIdentityBundleStatus(anon, "b-001", domain.TransitionTaxIdentityBundleStatusRequest{})
+		}},
 	}
 
-	newName := "Changed"
-	req := domain.UpdateEntityRequest{LegalName: &newName, CorrelationID: "corr-nojwt"}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _ := baseSvc(t)
+			err := tc.call(svc)
+			require.ErrorIs(t, err, registry.ErrUnauthenticated,
+				"%s must refuse a request with no verified principal", tc.name)
+		})
+	}
+}
 
-	_, err := svc.UpdateEntity(ctx, "" /* no JWT */, entityID, req)
+// recordingAuthZ captures what the service asked authorization-svc, so the
+// tests can prove the decision subject is the real caller and the scope is
+// the caller's own tenant — not values taken from the request body.
+type recordingAuthZ struct {
+	principalID string
+	scopeID     string
+	resource    string
+	action      string
+	calls       int
+}
+
+func (a *recordingAuthZ) Authorize(_ context.Context, principalID, scopeID, resource, action string) error {
+	a.principalID, a.scopeID, a.resource, a.action = principalID, scopeID, resource, action
+	a.calls++
+	return nil
+}
+
+// TestAuthorizeReceivesVerifiedPrincipalAndTenantScope pins the two values
+// that decide who a mutation is evaluated for.
+func TestAuthorizeReceivesVerifiedPrincipalAndTenantScope(t *testing.T) {
+	ms := newMemStore()
+	rec := &recordingAuthZ{}
+	svc := newSvc(t, ms, rec, acceptAllJurisd{})
+
+	entityID := "ent-scope-test"
+	seedEntity(ms, entityID)
+
+	ctx := domain.WithTenant(authCtx(), "ten-verified")
+	newName := "Updated"
+	_, err := svc.UpdateEntity(ctx, entityID, domain.UpdateEntityRequest{LegalName: &newName})
 	require.NoError(t, err)
-	assert.Equal(t, "system", ms.lastUpdateActor,
-		"when JWT is absent, actor must be 'system' (visible in audit logs as a wiring signal)")
+
+	require.Equal(t, 1, rec.calls)
+	assert.Equal(t, testPrincipal, rec.principalID, "decision subject must be the verified principal")
+	assert.Equal(t, "ten-verified", rec.scopeID, "decision scope must be the caller's verified tenant")
+}
+
+// TestProvisionTenantUsesPlatformScope — tenant creation is the one mutation
+// with no tenant to scope to, so it falls back to the configured platform
+// scope. authorization-svc rejects an empty legal_entity_id outright, so
+// getting this wrong is a 503 on every provisioning call.
+func TestProvisionTenantUsesPlatformScope(t *testing.T) {
+	ms := newMemStore()
+	rec := &recordingAuthZ{}
+	svc := newSvc(t, ms, rec, acceptAllJurisd{})
+
+	_, err := svc.ProvisionTenant(authCtx(), domain.ProvisionTenantRequest{
+		TenantCode:          "ACME",
+		LegalName:           "Acme Ltd",
+		DefaultCurrencyCode: "GBP",
+		PrimaryTimezone:     "Europe/London",
+		PrimaryLocale:       "en-GB",
+	}, "corr")
+	require.NoError(t, err)
+
+	assert.Equal(t, testPlatformScope, rec.scopeID,
+		"ProvisionTenant has no tenant yet and must use the configured platform scope")
+	assert.Equal(t, testPrincipal, rec.principalID)
+}
+
+// TestUpdateEntity_RefusesWhenNoVerifiedPrincipal replaces a test that
+// asserted the opposite: that an unattributed update succeeds and is recorded
+// as "system". That was described as an intentional fallback, "visible in
+// audit logs as a wiring signal" — but a signal nobody blocks on is not a
+// control. Every unauthenticated write in this service's history was recorded
+// as the platform's own action, and the audit trail cannot distinguish those
+// from real system activity after the fact.
+//
+// An unattributed mutation is now refused.
+func TestUpdateEntity_RefusesWhenNoVerifiedPrincipal(t *testing.T) {
+	svc, ms := baseSvc(t)
+
+	entityID := "ent-no-principal"
+	seedEntity(ms, entityID)
+
+	newName := "Changed"
+	_, err := svc.UpdateEntity(context.Background(), entityID,
+		domain.UpdateEntityRequest{LegalName: &newName, CorrelationID: "corr-noprincipal"})
+
+	require.ErrorIs(t, err, registry.ErrUnauthenticated)
+	assert.Empty(t, ms.lastUpdateActor,
+		"no write should reach the store without a verified principal")
 }

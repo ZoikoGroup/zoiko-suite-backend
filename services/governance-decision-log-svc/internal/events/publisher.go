@@ -29,18 +29,20 @@ type envelope struct {
 //
 // Evidence obligation: after every successful (first-time) write, this
 // service publishes governance.decision.recorded as a fact, not a command.
-//
-// producer may be nil (dry-run mode, used by tests and any environment that
-// deliberately runs without Kafka) — emit() logs instead of writing in that
-// case, the same behavior this Publisher had before a real producer existed.
+// Publishing is stubbed (logged, not written to Kafka) until a kafka.Writer
+// is injected — see CONTEXT.md.
 type Publisher struct {
-	log      *zap.Logger
-	topic    string
+	log   *zap.Logger
+	topic string
+
+	// producer is nil only in local development with no broker configured,
+	// in which case emit drops the event and says so. main.go refuses to
+	// start with a nil producer in production or staging.
 	producer *kafka.Writer
 }
 
-// NewPublisher constructs a Publisher bound to the given topic and producer.
-// Pass a nil producer for dry-run/log-only mode.
+// NewPublisher constructs a Publisher bound to the given topic and writer.
+// A nil producer makes every publish a logged no-op — see the struct comment.
 func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publisher {
 	return &Publisher{log: log, topic: topic, producer: producer}
 }
@@ -55,7 +57,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 // a jurisdiction reference) per CONTEXT.md's finalized payload shape, plus
 // the remaining decision fields so consumers don't need a follow-up read.
 func (p *Publisher) PublishDecisionRecorded(ctx context.Context, d domain.GovernanceDecision) error {
-	return p.emit(ctx, "governance.decision.recorded", d.CorrelationID, map[string]any{
+	return p.emit("governance.decision.recorded", d.CorrelationID, map[string]any{
 		"decision_id":          d.DecisionID,
 		"tenant_id":            d.TenantID,
 		"legal_entity_id":      d.LegalEntityID,
@@ -69,10 +71,9 @@ func (p *Publisher) PublishDecisionRecorded(ctx context.Context, d domain.Govern
 	})
 }
 
-// emit serialises the payload into the canonical envelope and writes it to
-// Kafka. If no producer was configured (dry-run mode), it logs instead —
-// the same behavior this Publisher had before a real producer existed.
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) error {
+// emit serialises the payload into the canonical envelope and writes to
+// Kafka. Stub: logs structured JSON until kafka.Writer is injected.
+func (p *Publisher) emit(eventType, correlationID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -91,15 +92,24 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 	}
 
 	if p.producer == nil {
-		p.log.Info("simulating publish event in dry mode",
+		p.log.Debug("event dropped — no Kafka brokers configured",
 			zap.String("event_type", eventType),
 			zap.String("correlation_id", correlationID),
 		)
 		return nil
 	}
 
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: data}); err != nil {
-		return fmt.Errorf("publish %s: %w", eventType, err)
+	// Topic is set on the Writer, not the Message — kafka-go rejects a
+	// Message carrying a Topic when the Writer already has one.
+	msg := kafka.Message{Key: []byte(correlationID), Value: data}
+	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
+		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
 	}
+
+	p.log.Info("event published",
+		zap.String("event_type", eventType),
+		zap.String("topic", p.topic),
+		zap.String("correlation_id", correlationID),
+	)
 	return nil
 }
