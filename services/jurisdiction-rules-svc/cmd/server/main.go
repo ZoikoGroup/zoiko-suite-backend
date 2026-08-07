@@ -26,10 +26,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/jurisdiction-rules-svc/internal/authz"
 	"zoiko.io/jurisdiction-rules-svc/internal/config"
+	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
@@ -111,6 +113,21 @@ func main() {
 		log.Fatal("authz client construction failed", zap.Error(err))
 	}
 
+	// Event publisher — see internal/events/publisher.go for what's wired.
+	kafkaWriter := &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+		// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
+		// Writer refuses to produce to a topic it doesn't already know about
+		// unless this is also set client-side — without it, every publish to
+		// a not-yet-existing topic fails with "Unknown Topic Or Partition"
+		// even though the broker would have created it.
+		AllowAutoTopicCreation: true,
+	}
+	defer func() { _ = kafkaWriter.Close() }()
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -121,7 +138,7 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, authzClient, log)
+	h := handler.New(pgStore, authzClient, publisher, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

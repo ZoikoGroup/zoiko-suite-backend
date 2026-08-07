@@ -25,10 +25,13 @@
 //     the fallback path.
 //
 //   - Error handling:
-//       • Validation errors (Consumer.Handle returns nil)  → commit & continue.
-//       • Store errors (Consumer.Handle returns non-nil)   → log & do NOT commit;
-//         the broker will re-deliver after the consumer restarts.
-//       • Context cancelled (shutdown)                     → exit cleanly.
+//
+//   - Validation errors (Consumer.Handle returns nil)  → commit & continue.
+//
+//   - Store errors (Consumer.Handle returns non-nil)   → log & do NOT commit;
+//     the broker will re-deliver after the consumer restarts.
+//
+//   - Context cancelled (shutdown)                     → exit cleanly.
 //
 //   - TODO (production): TLS/SASL broker auth, StartOffset configuration,
 //     per-topic DLQ routing, consumer group lag Prometheus metrics, and

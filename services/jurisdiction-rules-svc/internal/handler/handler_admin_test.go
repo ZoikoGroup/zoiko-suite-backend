@@ -259,3 +259,120 @@ func TestTransitionRuleStatus_404_RuleNotFound(t *testing.T) {
 		t.Fatalf("expected error=rule_not_found, got %q", got)
 	}
 }
+
+// ── event publishing ─────────────────────────────────────────────────────────
+//
+// These tests exercise the two real jurisdiction.rule.* triggers wired in
+// this session — see internal/events/publisher.go for what's deliberately
+// NOT wired (jurisdiction.calendar.changed, legal.drift.detected).
+
+func TestCreateRule_PublishesRuleUpdated_OnGenuineCreate(t *testing.T) {
+	store := &stubStore{
+		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "DRAFT"},
+		ruleWasCreated: true,
+	}
+	h, pub := newTestRouterWithPublisher(store, authz.NewStubAuthZClient(nopLogger()))
+
+	rr := postJSON(t, h, "/v1/admin/jurisdictions/j-1/rules", map[string]any{
+		"rule_domain":    "PAYROLL",
+		"rule_code":      "MIN-WAGE",
+		"rule_name":      "Minimum Wage",
+		"effective_from": time.Now().UTC().Format(time.RFC3339),
+		"rule_payload":   json.RawMessage(`{"applies_to_entity_types":["COMPANY"]}`),
+		"rule_status":    "DRAFT",
+	})
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.ruleUpdated != 1 {
+		t.Errorf("expected 1 jurisdiction.rule.updated publish, got %d", pub.ruleUpdated)
+	}
+	if pub.ruleActivated != 0 {
+		t.Errorf("expected 0 jurisdiction.rule.activated publishes for a DRAFT create, got %d", pub.ruleActivated)
+	}
+}
+
+func TestCreateRule_DoesNotPublish_OnIdempotentReplay(t *testing.T) {
+	store := &stubStore{
+		createdRule:    &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "DRAFT"},
+		ruleWasCreated: false, // idempotent replay: rule already existed
+	}
+	h, pub := newTestRouterWithPublisher(store, authz.NewStubAuthZClient(nopLogger()))
+
+	rr := postJSON(t, h, "/v1/admin/jurisdictions/j-1/rules", map[string]any{
+		"rule_domain":    "PAYROLL",
+		"rule_code":      "MIN-WAGE",
+		"rule_name":      "Minimum Wage",
+		"effective_from": time.Now().UTC().Format(time.RFC3339),
+		"rule_payload":   json.RawMessage(`{"applies_to_entity_types":["COMPANY"]}`),
+		"rule_status":    "DRAFT",
+	})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 (idempotent replay), got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.ruleUpdated != 0 {
+		t.Errorf("expected 0 jurisdiction.rule.updated publishes on an idempotent replay, got %d", pub.ruleUpdated)
+	}
+}
+
+func TestTransitionRuleStatus_PublishesRuleActivated_OnGenuineTransition(t *testing.T) {
+	store := &stubStore{
+		transitionedRule:  &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "ACTIVE"},
+		transitionChanged: true,
+	}
+	h, pub := newTestRouterWithPublisher(store, authz.NewStubAuthZClient(nopLogger()))
+
+	rr := postJSON(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.ruleActivated != 1 {
+		t.Errorf("expected 1 jurisdiction.rule.activated publish, got %d", pub.ruleActivated)
+	}
+	if pub.ruleUpdated != 1 {
+		t.Errorf("expected 1 jurisdiction.rule.updated publish alongside it, got %d", pub.ruleUpdated)
+	}
+}
+
+func TestTransitionRuleStatus_DoesNotPublishActivated_ForNonActiveTarget(t *testing.T) {
+	store := &stubStore{
+		transitionedRule:  &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "SUPERSEDED"},
+		transitionChanged: true,
+	}
+	h, pub := newTestRouterWithPublisher(store, authz.NewStubAuthZClient(nopLogger()))
+
+	rr := postJSON(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "SUPERSEDED"})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.ruleActivated != 0 {
+		t.Errorf("expected 0 jurisdiction.rule.activated publishes for a transition to SUPERSEDED, got %d", pub.ruleActivated)
+	}
+	if pub.ruleUpdated != 1 {
+		t.Errorf("expected 1 jurisdiction.rule.updated publish for the genuine transition, got %d", pub.ruleUpdated)
+	}
+}
+
+func TestTransitionRuleStatus_DoesNotPublish_OnIdempotentNoOp(t *testing.T) {
+	store := &stubStore{
+		transitionedRule:  &domain.JurisdictionRule{JurisdictionRuleID: "r-1", RuleStatus: "ACTIVE"},
+		transitionChanged: false, // idempotent no-op: rule was already ACTIVE
+	}
+	h, pub := newTestRouterWithPublisher(store, authz.NewStubAuthZClient(nopLogger()))
+
+	rr := postJSON(t, h, "/v1/admin/rules/r-1/transition", map[string]any{"new_status": "ACTIVE"})
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.ruleActivated != 0 {
+		t.Errorf("expected 0 jurisdiction.rule.activated publishes on an idempotent no-op replay, got %d", pub.ruleActivated)
+	}
+	if pub.ruleUpdated != 0 {
+		t.Errorf("expected 0 jurisdiction.rule.updated publishes on an idempotent no-op replay, got %d", pub.ruleUpdated)
+	}
+}

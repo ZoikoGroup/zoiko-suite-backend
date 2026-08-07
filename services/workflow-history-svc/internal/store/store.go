@@ -3,7 +3,7 @@
 // Architectural constraints (doctrine.md):
 //   - No UPDATE or DELETE on any stored event — ever.
 //   - Idempotency is guaranteed by a single atomic database statement:
-//       INSERT INTO workflow_history_events … ON CONFLICT (event_id) DO NOTHING
+//     INSERT INTO workflow_history_events … ON CONFLICT (event_id) DO NOTHING
 //     A prior SELECT-EXISTS check is explicitly prohibited: two concurrent
 //     goroutines can both pass a SELECT EXISTS check before either inserts,
 //     producing a duplicate row. The ON CONFLICT clause makes the entire
@@ -79,10 +79,11 @@ type AppendStore interface {
 
 // ReadStore is the read interface for the workflow history store.
 type ReadStore interface {
-	// ListByInstance returns all events for the given workflow instance,
-	// ordered chronologically (recorded_at ASC).
-	// Returns an empty slice (not an error) if no events exist.
-	ListByInstance(ctx context.Context, workflowInstanceID string) ([]WorkflowHistoryEvent, error)
+	// ListByInstance returns all events for the given workflow instance
+	// scoped to tenantID, ordered chronologically (recorded_at ASC).
+	// Returns an empty slice (not an error) if no events exist, including
+	// when the instance exists but belongs to a different tenant.
+	ListByInstance(ctx context.Context, tenantID, workflowInstanceID string) ([]WorkflowHistoryEvent, error)
 
 	// ListByFilter returns events matching the given filter ordered by
 	// recorded_at ASC. All filter fields are required.
@@ -111,6 +112,31 @@ func NewPgStore(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// withRLS runs fn inside a transaction with app.tenant_id set via
+// set_config, so the tenant_isolation_policy RLS policy on
+// workflow_history_events (migration 000002) actually scopes every
+// statement fn issues. Mirrors the withRLS pattern used throughout the
+// platform (e.g. employee-master-svc).
+func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+
 // Append inserts e into workflow_history_events atomically.
 //
 // The critical dedup guarantee is expressed in a single SQL statement:
@@ -134,15 +160,18 @@ VALUES
     ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (event_id) DO NOTHING`
 
-	_, err := s.pool.Exec(ctx, q,
-		e.EventID,
-		e.WorkflowInstanceID,
-		e.EventType,
-		e.CorrelationID,
-		e.TenantID,
-		e.LegalEntityID,
-		e.Payload,
-	)
+	err := s.withRLS(ctx, e.TenantID, func(tx pgx.Tx) error {
+		_, execErr := tx.Exec(ctx, q,
+			e.EventID,
+			e.WorkflowInstanceID,
+			e.EventType,
+			e.CorrelationID,
+			e.TenantID,
+			e.LegalEntityID,
+			e.Payload,
+		)
+		return execErr
+	})
 	if err != nil {
 		return fmt.Errorf("append workflow history event %q: %w", e.EventID, err)
 	}
@@ -154,23 +183,31 @@ ON CONFLICT (event_id) DO NOTHING`
 	return nil
 }
 
-// ListByInstance returns all events for the given workflowInstanceID ordered
-// chronologically by recorded_at ASC.
-func (s *PgStore) ListByInstance(ctx context.Context, workflowInstanceID string) ([]WorkflowHistoryEvent, error) {
+// ListByInstance returns all events for the given workflowInstanceID scoped
+// to tenantID, ordered chronologically by recorded_at ASC.
+func (s *PgStore) ListByInstance(ctx context.Context, tenantID, workflowInstanceID string) ([]WorkflowHistoryEvent, error) {
 	const q = `
 SELECT event_id, workflow_instance_id, event_type, correlation_id,
        tenant_id, legal_entity_id, payload, recorded_at
 FROM workflow_history_events
-WHERE workflow_instance_id = $1
+WHERE workflow_instance_id = $1 AND tenant_id = $2
 ORDER BY recorded_at ASC`
 
-	rows, err := s.pool.Query(ctx, q, workflowInstanceID)
+	var events []WorkflowHistoryEvent
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, q, workflowInstanceID, tenantID)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+		var scanErr error
+		events, scanErr = scanRows(rows)
+		return scanErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list workflow history by instance %q: %w", workflowInstanceID, err)
 	}
-	defer rows.Close()
-
-	return scanRows(rows)
+	return events, nil
 }
 
 // ListByFilter returns events matching the given filter ordered by recorded_at ASC.
@@ -185,13 +222,21 @@ WHERE tenant_id = $1
   AND recorded_at <= $4
 ORDER BY recorded_at ASC`
 
-	rows, err := s.pool.Query(ctx, q, f.TenantID, f.LegalEntityID, f.From, f.To)
+	var events []WorkflowHistoryEvent
+	err := s.withRLS(ctx, f.TenantID, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, q, f.TenantID, f.LegalEntityID, f.From, f.To)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+		var scanErr error
+		events, scanErr = scanRows(rows)
+		return scanErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list workflow history by filter: %w", err)
 	}
-	defer rows.Close()
-
-	return scanRows(rows)
+	return events, nil
 }
 
 // GetTenantContext retrieves the tenant_id and legal_entity_id from the earliest
@@ -275,14 +320,15 @@ func (f *FakeStore) Append(_ context.Context, e WorkflowHistoryEvent) error {
 	return nil
 }
 
-// ListByInstance returns all events for the given workflowInstanceID ordered
-// by RecordedAt ASC (insertion order in the fake, since Append stamps RecordedAt).
-func (f *FakeStore) ListByInstance(_ context.Context, workflowInstanceID string) ([]WorkflowHistoryEvent, error) {
+// ListByInstance returns all events for the given workflowInstanceID scoped
+// to tenantID, ordered by RecordedAt ASC (insertion order in the fake, since
+// Append stamps RecordedAt).
+func (f *FakeStore) ListByInstance(_ context.Context, tenantID, workflowInstanceID string) ([]WorkflowHistoryEvent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []WorkflowHistoryEvent
 	for _, e := range f.events {
-		if e.WorkflowInstanceID == workflowInstanceID {
+		if e.WorkflowInstanceID == workflowInstanceID && e.TenantID == tenantID {
 			out = append(out, e)
 		}
 	}

@@ -27,7 +27,7 @@ type JurisdictionStore interface {
 	FindAncestors(ctx context.Context, jurisdictionID string) ([]*domain.Jurisdiction, error)
 
 	FindRules(ctx context.Context, params store.FindRulesParams) ([]*domain.JurisdictionRule, error)
-  
+
 	// CreateJurisdiction inserts a new jurisdiction idempotently.
 	CreateJurisdiction(ctx context.Context, params domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error)
 
@@ -40,20 +40,33 @@ type JurisdictionStore interface {
 	// CreateRule inserts a new rule idempotently.
 	CreateRule(ctx context.Context, params domain.CreateRuleParams) (*domain.JurisdictionRule, bool, error)
 
-	// TransitionRuleStatus atomically updates rule_status if current status is in allowedPriors.
-	TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, error)
+	// TransitionRuleStatus atomically updates rule_status if current status
+	// is in allowedPriors. The returned bool is true only for a genuine
+	// transition — false for an idempotent no-op replay (the rule was
+	// already at newStatus) — so callers can tell "this really just
+	// happened" from "this was already true" without a separate read.
+	TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, bool, error)
+}
+
+// EventPublisher is the narrow interface the handler depends on for
+// publishing domain events. Allows the handler to be tested without a real
+// Kafka producer.
+type EventPublisher interface {
+	PublishRuleUpdated(ctx context.Context, correlationID string, rule domain.JurisdictionRule) error
+	PublishRuleActivated(ctx context.Context, correlationID string, rule domain.JurisdictionRule) error
 }
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
-	store JurisdictionStore
-	authz authz.AuthorizationClient
-	log   *zap.Logger
+	store     JurisdictionStore
+	authz     authz.AuthorizationClient
+	publisher EventPublisher
+	log       *zap.Logger
 }
 
 // New constructs a Handler.
-func New(store JurisdictionStore, authzClient authz.AuthorizationClient, log *zap.Logger) *Handler {
-	return &Handler{store: store, authz: authzClient, log: log}
+func New(store JurisdictionStore, authzClient authz.AuthorizationClient, publisher EventPublisher, log *zap.Logger) *Handler {
+	return &Handler{store: store, authz: authzClient, publisher: publisher, log: log}
 }
 
 // ruleStatusAllowedPriors defines the only legal prior rule_status for each
@@ -314,7 +327,7 @@ func (h *Handler) GetRules(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			// Return 400 Bad Request for invalid effective_at format
 			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error": "invalid_effective_at",
+				"error":   "invalid_effective_at",
 				"message": "effective_at must be a valid RFC3339 timestamp",
 			})
 			return
@@ -497,6 +510,11 @@ func (h *Handler) CreateRule(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
+		// Only publish on a genuine first insert — an idempotent replay of
+		// an already-existing rule must not re-emit the event.
+		if err := h.publisher.PublishRuleUpdated(r.Context(), correlationID, *rule); err != nil {
+			h.log.Error("failed to publish jurisdiction.rule.updated", zap.Error(err))
+		}
 	}
 	h.log.Info("CreateRule",
 		zap.String("jurisdiction_rule_id", rule.JurisdictionRuleID),
@@ -538,10 +556,21 @@ func (h *Handler) TransitionRuleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rule, err := h.store.TransitionRuleStatus(r.Context(), ruleID, req.NewStatus, allowedPriors, actorIDFromRequest(r))
+	rule, changed, err := h.store.TransitionRuleStatus(r.Context(), ruleID, req.NewStatus, allowedPriors, actorIDFromRequest(r))
 	if err != nil {
 		h.writeStoreError(w, err, correlationID)
 		return
+	}
+
+	if changed {
+		if err := h.publisher.PublishRuleUpdated(r.Context(), correlationID, *rule); err != nil {
+			h.log.Error("failed to publish jurisdiction.rule.updated", zap.Error(err))
+		}
+		if req.NewStatus == "ACTIVE" {
+			if err := h.publisher.PublishRuleActivated(r.Context(), correlationID, *rule); err != nil {
+				h.log.Error("failed to publish jurisdiction.rule.activated", zap.Error(err))
+			}
+		}
 	}
 
 	h.log.Info("TransitionRuleStatus",

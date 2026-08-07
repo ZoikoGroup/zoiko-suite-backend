@@ -25,8 +25,9 @@ type stubStore struct {
 	err     error
 	got     *domain.GovernanceDecision
 
-	findByIDResult *domain.GovernanceDecision
-	findByIDErr    error
+	findByIDResult    *domain.GovernanceDecision
+	findByIDErr       error
+	findByIDGotTenant string
 
 	listResult    []*domain.GovernanceDecision
 	listErr       error
@@ -38,7 +39,8 @@ func (s *stubStore) Insert(_ context.Context, d domain.GovernanceDecision) (bool
 	return s.created, s.err
 }
 
-func (s *stubStore) FindByID(_ context.Context, decisionID string) (*domain.GovernanceDecision, error) {
+func (s *stubStore) FindByID(_ context.Context, tenantID, decisionID string) (*domain.GovernanceDecision, error) {
+	s.findByIDGotTenant = tenantID
 	return s.findByIDResult, s.findByIDErr
 }
 
@@ -50,8 +52,8 @@ func (s *stubStore) List(_ context.Context, params store.ListParams) ([]*domain.
 // stubPublisher implements handler.EventPublisher for unit testing.
 // No Kafka, no network — purely in-memory, records what it was asked to publish.
 type stubPublisher struct {
-	err        error
-	publishes  int
+	err         error
+	publishes   int
 	gotDecision *domain.GovernanceDecision
 }
 
@@ -246,8 +248,10 @@ func TestCreateDecision_503_StoreUnavailable(t *testing.T) {
 // the stored decision.
 func TestGetDecision_200_Found(t *testing.T) {
 	want := &domain.GovernanceDecision{DecisionID: "dec-001", TenantID: "tenant-1"}
-	h := newTestRouter(&stubStore{findByIDResult: want}, &stubPublisher{})
+	s := &stubStore{findByIDResult: want}
+	h := newTestRouter(s, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -262,6 +266,25 @@ func TestGetDecision_200_Found(t *testing.T) {
 	if got.DecisionID != "dec-001" {
 		t.Errorf("decision_id mismatch: got %q", got.DecisionID)
 	}
+	if s.findByIDGotTenant != "tenant-1" {
+		t.Errorf("expected tenant-1 forwarded to store, got %q", s.findByIDGotTenant)
+	}
+}
+
+// TestGetDecision_400_MissingTenantID verifies that GetDecision requires
+// X-Tenant-Id — closing the gap where decision-support-svc's
+// GovernanceLogClient sends this header but the handler used to ignore it
+// entirely, returning cross-tenant data unscoped.
+func TestGetDecision_400_MissingTenantID(t *testing.T) {
+	h := newTestRouter(&stubStore{}, &stubPublisher{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
+	}
 }
 
 // TestGetDecision_404_NotFound verifies an unknown decision_id returns 404,
@@ -269,6 +292,7 @@ func TestGetDecision_200_Found(t *testing.T) {
 func TestGetDecision_404_NotFound(t *testing.T) {
 	h := newTestRouter(&stubStore{findByIDErr: domain.ErrDecisionNotFound}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/does-not-exist", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -283,6 +307,7 @@ func TestGetDecision_404_NotFound(t *testing.T) {
 func TestGetDecision_503_StoreUnavailable(t *testing.T) {
 	h := newTestRouter(&stubStore{findByIDErr: domain.ErrStoreUnavailable}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions/dec-001", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -297,6 +322,7 @@ func TestGetDecision_503_StoreUnavailable(t *testing.T) {
 func TestListDecisions_200_Empty(t *testing.T) {
 	h := newTestRouter(&stubStore{listResult: nil}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -327,6 +353,7 @@ func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 		"offset":     {"5"},
 	}
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?"+q.Encode(), nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -335,6 +362,9 @@ func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 		t.Fatalf("expected 200, got %d — body: %s", rr.Code, rr.Body.String())
 	}
 	p := s.listGotParams
+	if p.TenantID != "tenant-1" {
+		t.Errorf("expected tenant_id forwarded to store, got %q", p.TenantID)
+	}
 	if p.ActorID != "actor-1" || p.LegalEntityID != "entity-1" || p.ActionType != "PAYROLL_RELEASE" || p.RuleBasis != "policy-v3-sod" {
 		t.Errorf("filters not forwarded correctly: %+v", p)
 	}
@@ -346,11 +376,26 @@ func TestListDecisions_FiltersComposeIntoListParams(t *testing.T) {
 	}
 }
 
+// TestListDecisions_400_MissingTenantID verifies ListDecisions requires
+// X-Tenant-Id, same as GetDecision.
+func TestListDecisions_400_MissingTenantID(t *testing.T) {
+	h := newTestRouter(&stubStore{}, &stubPublisher{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
 // TestListDecisions_400_InvalidFrom verifies a malformed from timestamp is
 // rejected with 400 rather than silently ignored or causing a 500.
 func TestListDecisions_400_InvalidFrom(t *testing.T) {
 	h := newTestRouter(&stubStore{}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?from=not-a-timestamp", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -365,6 +410,7 @@ func TestListDecisions_400_InvalidFrom(t *testing.T) {
 func TestListDecisions_400_InvalidTo(t *testing.T) {
 	h := newTestRouter(&stubStore{}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions?to=not-a-timestamp", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
@@ -379,6 +425,7 @@ func TestListDecisions_400_InvalidTo(t *testing.T) {
 func TestListDecisions_503_StoreUnavailable(t *testing.T) {
 	h := newTestRouter(&stubStore{listErr: domain.ErrStoreUnavailable}, &stubPublisher{})
 	req := httptest.NewRequest(http.MethodGet, "/v1/decisions", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)

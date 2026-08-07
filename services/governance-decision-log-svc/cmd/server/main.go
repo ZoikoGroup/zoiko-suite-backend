@@ -5,7 +5,7 @@
 //  2. Initialise structured logger (zap)
 //  3. Connect to PostgreSQL pool (pgxpool) — Tier 0 pool sizing
 //  4. Construct PgStore
-//  5. Construct event publisher (stub — logs until kafka.Writer is injected)
+//  5. Construct event publisher (real Kafka producer)
 //  6. Construct HTTP handler + mount routes on chi router
 //  7. Mount health probes (/healthz, /readyz)
 //  8. Start HTTP server with graceful shutdown
@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/governance-decision-log-svc/internal/config"
@@ -103,8 +104,21 @@ func main() {
 	// ── 4. Store ──────────────────────────────────────────────────────────────
 	pgStore := store.New(pool, log)
 
-	// ── 5. Event publisher (stub — logs until kafka.Writer is injected) ─────────
-	publisher := events.NewPublisher(log, "governance.decisions")
+	// ── 5. Event publisher ───────────────────────────────────────────────────
+	kafkaWriter := &kafka.Writer{
+		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+		Topic:    cfg.Kafka.Topic,
+		Balancer: &kafka.LeastBytes{},
+		// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
+		// Writer refuses to produce to a topic it doesn't already know about
+		// unless this is also set client-side — without it, every publish to
+		// a not-yet-existing topic fails with "Unknown Topic Or Partition"
+		// even though the broker would have created it.
+		AllowAutoTopicCreation: true,
+	}
+	defer func() { _ = kafkaWriter.Close() }()
+
+	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 
 	// ── 6. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()

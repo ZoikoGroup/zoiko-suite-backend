@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds all runtime configuration for jurisdiction-rules-svc.
@@ -12,6 +13,8 @@ type Config struct {
 
 	DB DBConfig
 
+	Kafka KafkaConfig
+
 	// AuthZServiceURL is the base URL of the Authorization Service.
 	// Every admin mutating API call must be authorized before proceeding.
 	// No service self-authorizes (doctrine).
@@ -20,6 +23,16 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+}
+
+// KafkaConfig holds event-backbone connection parameters. Per
+// docs/architecture/03-microservices.md §8.2, this service publishes
+// jurisdiction.rule.updated and jurisdiction.rule.activated — see
+// internal/events/publisher.go for what is and isn't wired.
+type KafkaConfig struct {
+	Brokers []string
+	GroupID string
+	Topic   string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -53,6 +66,11 @@ func Load() (*Config, error) {
 			User:     env("DB_USER", "postgres"),
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
+		},
+		Kafka: KafkaConfig{
+			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			GroupID: env("KAFKA_GROUP_ID", "jurisdiction-rules-svc"),
+			Topic:   env("KAFKA_EVENTS_TOPIC", "jurisdiction.rules"),
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),

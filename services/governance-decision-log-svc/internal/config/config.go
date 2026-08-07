@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 // Config holds all runtime configuration for governance-decision-log-svc.
@@ -12,9 +13,22 @@ type Config struct {
 
 	DB DBConfig
 
+	Kafka KafkaConfig
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+}
+
+// KafkaConfig holds event-backbone connection parameters. Every governance
+// decision this service records is a fact the rest of the platform depends
+// on (doctrine.md §3.4/§17.3: "events are preferred for business
+// propagation") — until this was wired, that fact never left this
+// service's own database.
+type KafkaConfig struct {
+	Brokers []string
+	GroupID string
+	Topic   string
 }
 
 // DBConfig holds PostgreSQL connection parameters.
@@ -39,8 +53,8 @@ func (d DBConfig) DSN() string {
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
 	return &Config{
-		Env:  env("ENV", "local"),
-		Port: envInt("PORT", 8083),
+		Env:                  env("ENV", "local"),
+		Port:                 envInt("PORT", 8083),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
@@ -49,6 +63,11 @@ func Load() (*Config, error) {
 			User:     env("DB_USER", "postgres"),
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
+		},
+		Kafka: KafkaConfig{
+			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			GroupID: env("KAFKA_GROUP_ID", "governance-decision-log-svc"),
+			Topic:   env("KAFKA_EVENTS_TOPIC", "governance.decisions"),
 		},
 	}, nil
 }

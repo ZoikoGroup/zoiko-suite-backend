@@ -94,7 +94,7 @@ func TestPgStore_CreateJurisdiction_IdempotencyAnd409(t *testing.T) {
 
 	// 3. Differing attribute on same dedup key (409 Conflict)
 	conflictParams := params
-	conflictParams.JurisdictionID = uuid.New().String() // different ID, but same (code, type, parent)
+	conflictParams.JurisdictionID = uuid.New().String()           // different ID, but same (code, type, parent)
 	conflictParams.JurisdictionName = "California Republic State" // differing attribute!
 
 	_, created, err = s.CreateJurisdiction(ctx, conflictParams)
@@ -270,7 +270,7 @@ func TestPgStore_TransitionRuleStatus_StateMachineAndNoOp(t *testing.T) {
 
 	// 1. Legal transition DRAFT -> ACTIVE
 	allowedPriors := []string{"DRAFT"}
-	updated, err := s.TransitionRuleStatus(ctx, r.JurisdictionRuleID, "ACTIVE", allowedPriors, "actor-1")
+	updated, changed, err := s.TransitionRuleStatus(ctx, r.JurisdictionRuleID, "ACTIVE", allowedPriors, "actor-1")
 	if err != nil {
 		t.Fatalf("unexpected error transitioning DRAFT -> ACTIVE: %v", err)
 	}
@@ -280,20 +280,26 @@ func TestPgStore_TransitionRuleStatus_StateMachineAndNoOp(t *testing.T) {
 	if updated.UpdatedAt == nil {
 		t.Fatal("expected UpdatedAt to be set after transition")
 	}
+	if !changed {
+		t.Error("expected changed=true for a genuine DRAFT -> ACTIVE transition")
+	}
 
 	// 2. Idempotent network retry: call ACTIVE again when current is already ACTIVE!
 	// Notice allowedPriors is still ["DRAFT"] — without our pre-read check, this would fail!
-	retryUpdated, err := s.TransitionRuleStatus(ctx, r.JurisdictionRuleID, "ACTIVE", allowedPriors, "actor-1")
+	retryUpdated, retryChanged, err := s.TransitionRuleStatus(ctx, r.JurisdictionRuleID, "ACTIVE", allowedPriors, "actor-1")
 	if err != nil {
 		t.Fatalf("unexpected error on idempotent retry: %v", err)
 	}
 	if retryUpdated.RuleStatus != "ACTIVE" {
 		t.Errorf("expected status ACTIVE on retry, got %s", retryUpdated.RuleStatus)
 	}
+	if retryChanged {
+		t.Error("expected changed=false on an idempotent no-op replay — the caller (handler) relies on this to avoid re-publishing jurisdiction.rule.activated")
+	}
 
 	// 3. Illegal transition: try ACTIVE -> DRAFT (DRAFT is not in allowed priors for moving backward)
 	illegalPriors := []string{} // cannot move back to DRAFT from anything
-	_, err = s.TransitionRuleStatus(ctx, r.JurisdictionRuleID, "DRAFT", illegalPriors, "actor-1")
+	_, _, err = s.TransitionRuleStatus(ctx, r.JurisdictionRuleID, "DRAFT", illegalPriors, "actor-1")
 	if !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("expected ErrInvalidTransition on illegal transition, got: %v", err)
 	}

@@ -481,14 +481,14 @@ func (s *PgStore) CreateRule(ctx context.Context, params domain.CreateRuleParams
 }
 
 // TransitionRuleStatus updates rule_status atomically with a state machine check and pre-read retry no-op check.
-func (s *PgStore) TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, error) {
+func (s *PgStore) TransitionRuleStatus(ctx context.Context, ruleID, newStatus string, allowedPriors []string, actorID string) (*domain.JurisdictionRule, bool, error) {
 	current, err := s.FindRuleByID(ctx, ruleID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if current.RuleStatus == newStatus {
 		s.log.Debug("rule status transition idempotent no-op", zap.String("rule_id", ruleID), zap.String("status", newStatus))
-		return current, nil
+		return current, false, nil
 	}
 
 	const query = `
@@ -501,12 +501,12 @@ func (s *PgStore) TransitionRuleStatus(ctx context.Context, ruleID, newStatus st
 	r, err := scanJurisdictionRule(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, domain.ErrInvalidTransition
+			return nil, false, domain.ErrInvalidTransition
 		}
 		s.log.Error("pg TransitionRuleStatus failed", zap.String("id", ruleID), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return r, nil
+	return r, true, nil
 }
 
 // FindRules returns rules for a jurisdiction active at a point in time.

@@ -45,8 +45,9 @@ type stubStore struct {
 	ruleWasCreated bool
 	createRuleErr  error
 
-	transitionedRule *domain.JurisdictionRule
-	transitionErr    error
+	transitionedRule  *domain.JurisdictionRule
+	transitionChanged bool
+	transitionErr     error
 }
 
 func (s *stubStore) CreateJurisdiction(_ context.Context, _ domain.CreateJurisdictionParams) (*domain.Jurisdiction, bool, error) {
@@ -65,8 +66,8 @@ func (s *stubStore) CreateRule(_ context.Context, _ domain.CreateRuleParams) (*d
 	return s.createdRule, s.ruleWasCreated, s.createRuleErr
 }
 
-func (s *stubStore) TransitionRuleStatus(_ context.Context, _, _ string, _ []string, _ string) (*domain.JurisdictionRule, error) {
-	return s.transitionedRule, s.transitionErr
+func (s *stubStore) TransitionRuleStatus(_ context.Context, _, _ string, _ []string, _ string) (*domain.JurisdictionRule, bool, error) {
+	return s.transitionedRule, s.transitionChanged, s.transitionErr
 }
 
 func (s *stubStore) FindByID(_ context.Context, _ string) (*domain.Jurisdiction, error) {
@@ -137,6 +138,26 @@ func (s *stubStore) FindRules(_ context.Context, params store.FindRulesParams) (
 	return filtered[offset:end], nil
 }
 
+// ── stub publisher ───────────────────────────────────────────────────────────
+
+// stubPublisher implements handler.EventPublisher for unit testing — counts
+// calls so tests can assert on publish-vs-no-publish behavior without a
+// real Kafka producer.
+type stubPublisher struct {
+	ruleUpdated, ruleActivated int
+	err                        error
+}
+
+func (p *stubPublisher) PublishRuleUpdated(_ context.Context, _ string, _ domain.JurisdictionRule) error {
+	p.ruleUpdated++
+	return p.err
+}
+
+func (p *stubPublisher) PublishRuleActivated(_ context.Context, _ string, _ domain.JurisdictionRule) error {
+	p.ruleActivated++
+	return p.err
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 // newTestRouter wires a Handler onto a chi router exactly as main.go does.
@@ -148,10 +169,19 @@ func newTestRouter(store handler.JurisdictionStore) http.Handler {
 // newTestRouterWithAuthz is the same wiring, with an explicit AuthorizationClient
 // — used by admin-mutation tests that need to exercise 403/503 authz paths.
 func newTestRouterWithAuthz(store handler.JurisdictionStore, authzClient authz.AuthorizationClient) http.Handler {
+	h, _ := newTestRouterWithPublisher(store, authzClient)
+	return h
+}
+
+// newTestRouterWithPublisher is the same wiring as newTestRouterWithAuthz,
+// but also returns the stubPublisher so tests can assert on which events
+// were (or weren't) published.
+func newTestRouterWithPublisher(store handler.JurisdictionStore, authzClient authz.AuthorizationClient) (http.Handler, *stubPublisher) {
+	pub := &stubPublisher{}
 	r := chi.NewRouter()
-	h := handler.New(store, authzClient, zap.NewNop())
+	h := handler.New(store, authzClient, pub, zap.NewNop())
 	handler.RegisterRoutes(r, h)
-	return r
+	return r, pub
 }
 
 // executeRequest fires req against the given handler and returns the recorder.
@@ -284,9 +314,9 @@ func TestGetJurisdiction_503_IsDistinctFrom_404(t *testing.T) {
 // back in the response headers on both success and error paths.
 func TestGetJurisdiction_CorrelationID(t *testing.T) {
 	tests := []struct {
-		name    string
-		store   handler.JurisdictionStore
-		corrID  string
+		name   string
+		store  handler.JurisdictionStore
+		corrID string
 	}{
 		{
 			name:   "echo on 200",
@@ -469,95 +499,98 @@ func TestGetAncestors_503_StoreUnavailable(t *testing.T) {
 	}
 }
 
-
 // TestFindRules_SupersededRuleReturnedForHistoricalQuery verifies that when querying
 // for a point-in-time where a SUPERSEDED rule is active, it is returned (and not the
 // later ACTIVE rule).
 func TestFindRules_SupersededRuleReturnedForHistoricalQuery(t *testing.T) {
-    // Arrange: two rules for the same jurisdiction and domain.
-    // Rule1: SUPERSEDED, active 2024-01-01 to 2025-01-01
-    // Rule2: ACTIVE, active 2025-01-01 onward (no end date)
-    // Query effective_at: 2024-06-01 (should return Rule1 only)
+	// Arrange: two rules for the same jurisdiction and domain.
+	// Rule1: SUPERSEDED, active 2024-01-01 to 2025-01-01
+	// Rule2: ACTIVE, active 2025-01-01 onward (no end date)
+	// Query effective_at: 2024-06-01 (should return Rule1 only)
 
-    // Helper to create a JurisdictionRule with given fields.
-    makeRule := func(id, status string, start, end time.Time, payload map[string]any) *domain.JurisdictionRule {
-        pBytes, _ := json.Marshal(payload)
-        return &domain.JurisdictionRule{
-            JurisdictionRuleID: id,
-            JurisdictionID:     "test-jurisdiction-id",
-            RuleDomain:         "TAX",
-            RuleCode:           "RATE",
-            RuleName:           "Tax Rate",
-            EffectiveFrom:      start,
-            EffectiveTo:        func(t time.Time) *time.Time { if t.IsZero() { return nil }; return &t }(end),
-            RulePayload:        json.RawMessage(pBytes),
-            RuleStatus:         status,
-            LegalDriftState:    "CURRENT",
-            CreatedAt:          time.Now().UTC(),
-            CreatedByPrincipalID: "principal-test",
-            SchemaVersion:      "1.0",
-        }
-    }
+	// Helper to create a JurisdictionRule with given fields.
+	makeRule := func(id, status string, start, end time.Time, payload map[string]any) *domain.JurisdictionRule {
+		pBytes, _ := json.Marshal(payload)
+		return &domain.JurisdictionRule{
+			JurisdictionRuleID: id,
+			JurisdictionID:     "test-jurisdiction-id",
+			RuleDomain:         "TAX",
+			RuleCode:           "RATE",
+			RuleName:           "Tax Rate",
+			EffectiveFrom:      start,
+			EffectiveTo: func(t time.Time) *time.Time {
+				if t.IsZero() {
+					return nil
+				}
+				return &t
+			}(end),
+			RulePayload:          json.RawMessage(pBytes),
+			RuleStatus:           status,
+			LegalDriftState:      "CURRENT",
+			CreatedAt:            time.Now().UTC(),
+			CreatedByPrincipalID: "principal-test",
+			SchemaVersion:        "1.0",
+		}
+	}
 
-    // Define times
-    start1 := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
-    end1   := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
-    start2 := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
-    // end2 is zero (meaning nil)
+	// Define times
+	start1 := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	end1 := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	start2 := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+	// end2 is zero (meaning nil)
 
-    ruleSuperseded := makeRule(
-        "rule-superseded",
-        "SUPERSEDED",
-        start1,
-        end1,
-        map[string]any{"rate": 0.20},
-    )
-    ruleActive := makeRule(
-        "rule-active",
-        "ACTIVE",
-        start2,
-        time.Time{}, // zero time indicates no end date
-        map[string]any{"rate": 0.25},
-    )
+	ruleSuperseded := makeRule(
+		"rule-superseded",
+		"SUPERSEDED",
+		start1,
+		end1,
+		map[string]any{"rate": 0.20},
+	)
+	ruleActive := makeRule(
+		"rule-active",
+		"ACTIVE",
+		start2,
+		time.Time{}, // zero time indicates no end date
+		map[string]any{"rate": 0.25},
+	)
 
-    store := &stubStore{
-        rules: []*domain.JurisdictionRule{ruleSuperseded, ruleActive},
-    }
+	store := &stubStore{
+		rules: []*domain.JurisdictionRule{ruleSuperseded, ruleActive},
+	}
 
-    h := newTestRouter(store)
-    // Build the request with query parameters
-    req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/test-jurisdiction-id/rules?domain=TAX&effective_at=2024-06-01T00:00:00Z", nil)
-    req.Header.Set("X-Correlation-ID", "corr-test")
+	h := newTestRouter(store)
+	// Build the request with query parameters
+	req := httptest.NewRequest(http.MethodGet, "/v1/jurisdictions/test-jurisdiction-id/rules?domain=TAX&effective_at=2024-06-01T00:00:00Z", nil)
+	req.Header.Set("X-Correlation-ID", "corr-test")
 
-    rr := executeRequest(h, req)
+	rr := executeRequest(h, req)
 
-    // Assert
-    if rr.Code != http.StatusOK {
-        t.Fatalf("expected 200 OK, got %d - body: %s", rr.Code, rr.Body.String())
-    }
+	// Assert
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d - body: %s", rr.Code, rr.Body.String())
+	}
 
-    var rules []domain.JurisdictionRule
-    if err := json.NewDecoder(rr.Body).Decode(&rules); err != nil {
-        t.Fatalf("failed to decode response body: %v", err)
-    }
+	var rules []domain.JurisdictionRule
+	if err := json.NewDecoder(rr.Body).Decode(&rules); err != nil {
+		t.Fatalf("failed to decode response body: %v", err)
+	}
 
-    if len(rules) != 1 {
-        t.Fatalf("expected 1 rule, got %d", len(rules))
-    }
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(rules))
+	}
 
-    got := rules[0]
-    if got.JurisdictionRuleID != "rule-superseded" {
-        t.Errorf("expected rule ID 'rule-superseded', got %s", got.JurisdictionRuleID)
-    }
-    if got.RuleStatus != "SUPERSEDED" {
-        t.Errorf("expected rule status 'SUPERSEDED', got %s", got.RuleStatus)
-    }
-    // Additionally, ensure the effective dates are as expected
-    if !got.EffectiveFrom.Equal(start1) {
-        t.Errorf("expected effective_from %v, got %v", start1, got.EffectiveFrom)
-    }
-    if !(*got.EffectiveTo).Equal(end1) {
-        t.Errorf("expected effective_to %v, got %v", end1, *got.EffectiveTo)
-    }
+	got := rules[0]
+	if got.JurisdictionRuleID != "rule-superseded" {
+		t.Errorf("expected rule ID 'rule-superseded', got %s", got.JurisdictionRuleID)
+	}
+	if got.RuleStatus != "SUPERSEDED" {
+		t.Errorf("expected rule status 'SUPERSEDED', got %s", got.RuleStatus)
+	}
+	// Additionally, ensure the effective dates are as expected
+	if !got.EffectiveFrom.Equal(start1) {
+		t.Errorf("expected effective_from %v, got %v", start1, got.EffectiveFrom)
+	}
+	if !(*got.EffectiveTo).Equal(end1) {
+		t.Errorf("expected effective_to %v, got %v", end1, *got.EffectiveTo)
+	}
 }
-
