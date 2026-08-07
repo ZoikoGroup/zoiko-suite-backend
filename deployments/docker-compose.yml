@@ -1205,9 +1205,9 @@ services:
       dockerfile: Dockerfile
     container_name: purchase-order-svc
     ports:
-      - "8129:8129"
+      - "8112:8112"
     environment:
-      PORT: "8129"
+      PORT: "8112"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_order
@@ -1228,7 +1228,7 @@ services:
       purchase-request-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8129/healthz"]
+      test: ["CMD", "/healthcheck", "http://localhost:8112/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1285,9 +1285,9 @@ services:
       dockerfile: Dockerfile
     container_name: vendor-due-diligence-svc
     ports:
-      - "8132:8132"
+      - "8135:8135"
     environment:
-      PORT: "8132"
+      PORT: "8135"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: vendor_due_diligence
@@ -1308,7 +1308,7 @@ services:
       counterparty-management-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8132/healthz"]
+      test: ["CMD", "/healthcheck", "http://localhost:8135/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
