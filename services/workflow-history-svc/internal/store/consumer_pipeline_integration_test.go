@@ -108,10 +108,12 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		return pool.Ping(ctx) == nil
 	}, 10*time.Second, 200*time.Millisecond, "embedded postgres did not become ready")
 
-	migrationSQL, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	require.NoError(t, err, "could not read migration file")
-	_, err = pool.Exec(ctx, string(migrationSQL))
-	require.NoError(t, err, "migration failed")
+	for _, name := range []string{"000001_initial_schema.up.sql", "000002_add_rls.up.sql"} {
+		migrationSQL, err := os.ReadFile("../../deployments/migrations/" + name)
+		require.NoError(t, err, "could not read migration file %s", name)
+		_, err = pool.Exec(ctx, string(migrationSQL))
+		require.NoError(t, err, "migration %s failed", name)
+	}
 
 	// ── Wire real PgStore + Consumer ─────────────────────────────────────────
 	log := zap.NewNop()
@@ -133,7 +135,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		err := c.Handle(ctx, "evt-pipeline-001", raw)
 		require.NoError(t, err)
 
-		events, err := pgStore.ListByInstance(ctx, "wf-pipeline-001")
+		events, err := pgStore.ListByInstance(ctx, "t-pipeline", "wf-pipeline-001")
 		require.NoError(t, err)
 		require.Len(t, events, 1)
 		assert.Equal(t, "workflow.started", events[0].EventType)
@@ -154,7 +156,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		err := c.Handle(ctx, "evt-pipeline-002", raw)
 		require.NoError(t, err)
 
-		events, err := pgStore.ListByInstance(ctx, "wf-pipeline-001")
+		events, err := pgStore.ListByInstance(ctx, "t-pipeline", "wf-pipeline-001")
 		require.NoError(t, err)
 		require.Len(t, events, 2)
 
@@ -175,7 +177,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		err := c.Handle(ctx, "evt-pipeline-003", raw)
 		require.NoError(t, err)
 
-		events, err := pgStore.ListByInstance(ctx, "wf-pipeline-001")
+		events, err := pgStore.ListByInstance(ctx, "t-pipeline", "wf-pipeline-001")
 		require.NoError(t, err)
 		require.Len(t, events, 3)
 		assert.Equal(t, "workflow.completed", events[2].EventType)
@@ -194,7 +196,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		// Broker redelivery — same event_id, must be silently ignored.
 		require.NoError(t, c.Handle(ctx, "evt-idem-001", raw))
 
-		events, err := pgStore.ListByInstance(ctx, "wf-idem-pipeline")
+		events, err := pgStore.ListByInstance(ctx, "t-idem", "wf-idem-pipeline")
 		require.NoError(t, err)
 		assert.Len(t, events, 1, "duplicate event_id must produce exactly one row")
 	})
@@ -212,7 +214,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		require.Error(t, err, "expected fail-closed error when no started row exists")
 
 		// No row should have been stored.
-		events, qErr := pgStore.ListByInstance(ctx, "wf-orphan-pipeline")
+		events, qErr := pgStore.ListByInstance(ctx, "t-orphan", "wf-orphan-pipeline")
 		require.NoError(t, qErr)
 		assert.Empty(t, events)
 	})
@@ -235,7 +237,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		err := c.Handle(ctx, "evt-nosvc-001", data)
 		require.NoError(t, err) // rejection is non-fatal
 
-		events, qErr := pgStore.ListByInstance(ctx, "wf-nosvc")
+		events, qErr := pgStore.ListByInstance(ctx, "t-nosvc", "wf-nosvc")
 		require.NoError(t, qErr)
 		assert.Empty(t, events, "malformed message must not produce a DB row")
 	})
@@ -270,7 +272,7 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 			require.NoError(t, c.Handle(ctx, s.id, raw), "failed on event type %q", s.evtType)
 		}
 
-		events, err := pgStore.ListByInstance(ctx, instanceID)
+		events, err := pgStore.ListByInstance(ctx, "t-all", instanceID)
 		require.NoError(t, err)
 		require.Len(t, events, 5, "all five event types must be persisted")
 

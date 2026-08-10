@@ -81,6 +81,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules
 # Apply migrations for governance-decision-log-svc
 echo "Applying migrations for governance_decision_log..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000002_add_rls.up.sql
 # Apply migrations for policy-svc
 echo "Applying migrations for policy..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000001_initial_schema.up.sql
@@ -121,6 +122,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_manifest"
 # Apply migrations for workflow-history-svc
 echo "Applying migrations for workflow_history..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000002_add_rls.up.sql
 
 # Apply migrations for general-ledger-svc
 echo "Applying migrations for general_ledger..."

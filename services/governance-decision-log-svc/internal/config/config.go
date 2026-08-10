@@ -30,7 +30,11 @@ type Config struct {
 	OTELExporterEndpoint string
 }
 
-// KafkaConfig holds event backbone connection parameters.
+// KafkaConfig holds event-backbone connection parameters. Every governance
+// decision this service records is a fact the rest of the platform depends
+// on (doctrine.md §3.4/§17.3: "events are preferred for business
+// propagation") — until this was wired, that fact never left this
+// service's own database.
 type KafkaConfig struct {
 	Brokers []string
 	GroupID string

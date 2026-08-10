@@ -71,11 +71,13 @@ func TestIntegration(t *testing.T) {
 	}, 10*time.Second, 200*time.Millisecond, "embedded postgres did not become ready in time")
 
 	// Apply the migration SQL from the service's own migrations directory.
-	migrationSQL, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	require.NoError(t, err, "could not read migration file")
+	for _, name := range []string{"000001_initial_schema.up.sql", "000002_add_rls.up.sql"} {
+		migrationSQL, err := os.ReadFile("../../deployments/migrations/" + name)
+		require.NoError(t, err, "could not read migration file %s", name)
 
-	_, err = pool.Exec(ctx, string(migrationSQL))
-	require.NoError(t, err, "migration failed")
+		_, err = pool.Exec(ctx, string(migrationSQL))
+		require.NoError(t, err, "migration %s failed", name)
+	}
 
 	// ── 2. Build test server once ────────────────────────────────────────────
 	log := zap.NewNop()
@@ -111,10 +113,17 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("GET /v1/workflows/{id}/history NotFound", func(t *testing.T) {
-		resp, err := http.Get(srv.URL + "/v1/workflows/wf-does-not-exist/history")
+		resp, err := http.Get(srv.URL + "/v1/workflows/wf-does-not-exist/history?tenant_id=t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	})
+
+	t.Run("GET /v1/workflows/{id}/history Missing tenant_id", func(t *testing.T) {
+		resp, err := http.Get(srv.URL + "/v1/workflows/wf-does-not-exist/history")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	})
 
 	t.Run("GET /v1/workflows/{id}/history Returns Stored Events", func(t *testing.T) {
@@ -152,7 +161,7 @@ func TestIntegration(t *testing.T) {
 			require.NoError(t, pgStore.Append(ctx, e))
 		}
 
-		resp, err := http.Get(srv.URL + "/v1/workflows/wf-001/history")
+		resp, err := http.Get(srv.URL + "/v1/workflows/wf-001/history?tenant_id=t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -169,6 +178,13 @@ func TestIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("GET /v1/workflows/{id}/history Scoped To Wrong Tenant Returns 404", func(t *testing.T) {
+		resp, err := http.Get(srv.URL + "/v1/workflows/wf-001/history?tenant_id=t-OTHER")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusNotFound, resp.StatusCode, "wf-001 belongs to t-001, not t-OTHER")
+	})
+
 	t.Run("GET /v1/workflows/{id}/history Idempotency", func(t *testing.T) {
 		e := store.WorkflowHistoryEvent{
 			EventID:            "evt-idem-01",
@@ -182,7 +198,7 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, pgStore.Append(ctx, e))
 		require.NoError(t, pgStore.Append(ctx, e)) // duplicate
 
-		resp, err := http.Get(srv.URL + "/v1/workflows/wf-idem/history")
+		resp, err := http.Get(srv.URL + "/v1/workflows/wf-idem/history?tenant_id=t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
