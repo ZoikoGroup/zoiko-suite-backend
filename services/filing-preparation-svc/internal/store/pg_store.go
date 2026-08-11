@@ -18,7 +18,11 @@ type Store interface {
 	GetByID(ctx context.Context, id string) (*domain.FilingDraft, error)
 	List(ctx context.Context, legalEntityID, jurisdictionID, filingType, status string) ([]domain.FilingDraft, error)
 	Update(ctx context.Context, d *domain.FilingDraft) error
-	Validate(ctx context.Context, id string, req *domain.ValidateDraftRequest) (*domain.FilingDraft, error)
+	// Validate transitions a draft to PREPARED or BLOCKED based on
+	// evidenceSufficient — the caller (handler.Validate) must compute this
+	// from a real evidence-requirements-svc evaluation, not accept it as a
+	// client-supplied claim. blockReason is recorded verbatim when blocked.
+	Validate(ctx context.Context, id string, req *domain.ValidateDraftRequest, evidenceSufficient bool, blockReason string) (*domain.FilingDraft, error)
 	Finalize(ctx context.Context, id string, req *domain.FinalizeDraftRequest) (*domain.FilingDraft, error)
 }
 
@@ -182,7 +186,7 @@ func (s *PgStore) Update(ctx context.Context, d *domain.FilingDraft) error {
 	return tx.Commit(ctx)
 }
 
-func (s *PgStore) Validate(ctx context.Context, id string, req *domain.ValidateDraftRequest) (*domain.FilingDraft, error) {
+func (s *PgStore) Validate(ctx context.Context, id string, req *domain.ValidateDraftRequest, evidenceSufficient bool, blockReason string) (*domain.FilingDraft, error) {
 	d, err := s.GetByID(ctx, id)
 	if err != nil {
 		return nil, err
@@ -191,7 +195,7 @@ func (s *PgStore) Validate(ctx context.Context, id string, req *domain.ValidateD
 		return nil, domain.ErrDraftAlreadyFinal
 	}
 
-	d.ValidateEvidence(req.RequiredDocumentTypes)
+	d.ApplyEvidenceOutcome(evidenceSufficient, blockReason)
 	d.UpdatedAt = time.Now().UTC()
 
 	tx, err := s.pool.Begin(ctx)

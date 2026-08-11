@@ -48,7 +48,7 @@ func NewPublisher(log *zap.Logger, topic string, writer *kafka.Writer) *Publishe
 }
 
 func (p *Publisher) PublishTenantCreated(ctx context.Context, tenant *domain.Tenant, correlationID string) {
-	p.emit("tenant.created", correlationID, map[string]any{
+	p.emit("tenant.created", correlationID, tenant.TenantID, map[string]any{
 		"tenant_id":       tenant.TenantID,
 		"tenant_code":     tenant.TenantCode,
 		"legal_name":      tenant.LegalName,
@@ -57,19 +57,19 @@ func (p *Publisher) PublishTenantCreated(ctx context.Context, tenant *domain.Ten
 }
 
 func (p *Publisher) PublishEntityCreated(ctx context.Context, entity *domain.LegalEntity, correlationID string) {
-	p.emit("entity.created", correlationID, map[string]any{
-		"tenant_id":               entity.TenantID,
-		"legal_entity_id":         entity.LegalEntityID,
-		"entity_code":             entity.EntityCode,
-		"entity_type":             entity.EntityType,
-		"entity_status":           entity.EntityStatus,
-		"primary_jurisdiction_id": entity.PrimaryJurisdictionID,
+	p.emit("entity.created", correlationID, entity.LegalEntityID, map[string]any{
+		"tenant_id":                entity.TenantID,
+		"legal_entity_id":          entity.LegalEntityID,
+		"entity_code":              entity.EntityCode,
+		"entity_type":              entity.EntityType,
+		"entity_status":            entity.EntityStatus,
+		"primary_jurisdiction_id":  entity.PrimaryJurisdictionID,
 		"data_residency_policy_id": entity.DataResidencyPolicyID,
 	})
 }
 
 func (p *Publisher) PublishEntityUpdated(ctx context.Context, entity *domain.LegalEntity, correlationID string) {
-	p.emit("entity.updated", correlationID, map[string]any{
+	p.emit("entity.updated", correlationID, entity.LegalEntityID, map[string]any{
 		"tenant_id":       entity.TenantID,
 		"legal_entity_id": entity.LegalEntityID,
 	})
@@ -88,7 +88,7 @@ func (p *Publisher) PublishEntityStatusChanged(
 	previousStatus, newStatus domain.EntityStatus,
 	correlationID string,
 ) {
-	p.emit("entity.status.changed", correlationID, map[string]any{
+	p.emit("entity.status.changed", correlationID, legalEntityID, map[string]any{
 		"tenant_id":       tenantID,
 		"legal_entity_id": legalEntityID,
 		"previous_status": previousStatus,
@@ -102,7 +102,7 @@ func (p *Publisher) PublishEntityHierarchyChanged(
 	changeType string,
 	correlationID string,
 ) {
-	p.emit("entity.hierarchy.changed", correlationID, map[string]any{
+	p.emit("entity.hierarchy.changed", correlationID, hierarchy.HierarchyID, map[string]any{
 		"tenant_id":              hierarchy.TenantID,
 		"hierarchy_id":           hierarchy.HierarchyID,
 		"parent_legal_entity_id": hierarchy.ParentLegalEntityID,
@@ -120,14 +120,14 @@ func (p *Publisher) PublishEntityJurisdictionChanged(
 	changeType string,
 	correlationID string,
 ) {
-	p.emit("entity.jurisdiction.changed", correlationID, map[string]any{
-		"legal_entity_id":  assignment.LegalEntityID,
-		"assignment_id":    assignment.AssignmentID,
-		"jurisdiction_id":  assignment.JurisdictionID,
-		"assignment_type":  assignment.AssignmentType,
-		"change_type":      changeType, // "ASSIGNED" | "END_DATED"
-		"effective_from":   assignment.EffectiveFrom,
-		"effective_to":     assignment.EffectiveTo,
+	p.emit("entity.jurisdiction.changed", correlationID, assignment.AssignmentID, map[string]any{
+		"legal_entity_id": assignment.LegalEntityID,
+		"assignment_id":   assignment.AssignmentID,
+		"jurisdiction_id": assignment.JurisdictionID,
+		"assignment_type": assignment.AssignmentType,
+		"change_type":     changeType, // "ASSIGNED" | "END_DATED"
+		"effective_from":  assignment.EffectiveFrom,
+		"effective_to":    assignment.EffectiveTo,
 	})
 }
 
@@ -138,7 +138,7 @@ func (p *Publisher) PublishEntityJurisdictionChanged(
 // propagated to callers. Widening this to return error would ripple into
 // registry.Service's call sites and tests; that's a separate, larger change
 // than "wire the producer," so it's left as-is.
-func (p *Publisher) emit(eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(eventType, correlationID, key string, payload map[string]any) {
 	raw, _ := json.Marshal(payload)
 	env := envelope{
 		EventType:     eventType,
@@ -152,7 +152,7 @@ func (p *Publisher) emit(eventType, correlationID string, payload map[string]any
 
 	// Topic is set on the Writer itself (main.go), not here — kafka-go
 	// rejects a Message that also specifies Topic when the Writer already has one.
-	msg := kafka.Message{Value: data}
+	msg := kafka.Message{Key: []byte(key), Value: data}
 	if err := p.writer.WriteMessages(context.Background(), msg); err != nil {
 		p.log.Error("event publish failed",
 			zap.String("event_type", eventType),

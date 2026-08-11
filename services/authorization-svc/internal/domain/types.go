@@ -42,15 +42,17 @@ type PermissionBundle struct {
 	CreatedAt          time.Time `json:"created_at"`
 }
 
-// PrincipalRoleAssignment grants a Role to a principal, scoped to one legal
-// entity and effective-dated. No hard-delete: ending an assignment sets
+// PrincipalRoleAssignment grants a Role to a principal, effective-dated,
+// scoped either to one legal entity or — when LegalEntityID is nil — to the
+// whole tenant (only legal for a role whose RoleScopeType is "TENANT"; see
+// Store.CreateRoleAssignment). No hard-delete: ending an assignment sets
 // EffectiveTo, never removes the row — see Store.RevokeRoleAssignment.
 type PrincipalRoleAssignment struct {
 	PrincipalRoleAssignmentID string `json:"principal_role_assignment_id"`
 
-	PrincipalID   string `json:"principal_id"`
-	RoleID        string `json:"role_id"`
-	LegalEntityID string `json:"legal_entity_id"`
+	PrincipalID   string  `json:"principal_id"`
+	RoleID        string  `json:"role_id"`
+	LegalEntityID *string `json:"legal_entity_id"`
 
 	EffectiveFrom time.Time  `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to"`
@@ -70,8 +72,10 @@ type DelegatedAuthority struct {
 	DelegatePrincipalID  string `json:"delegate_principal_id"`
 
 	// ScopeType is data only (e.g. "FULL", "ACTION_SUBSET").
-	ScopeType     string `json:"scope_type"`
-	LegalEntityID string `json:"legal_entity_id"`
+	ScopeType string `json:"scope_type"`
+	// LegalEntityID is nil when the delegation applies across the whole
+	// tenant rather than one entity.
+	LegalEntityID *string `json:"legal_entity_id"`
 
 	// AuthorityLimitType/AuthorityLimitValue are optional (e.g. "AMOUNT_CAP" / "5000").
 	AuthorityLimitType  *string `json:"authority_limit_type"`
@@ -101,6 +105,11 @@ type SoDRule struct {
 
 	// JurisdictionID is nil for a globally-applicable rule.
 	JurisdictionID *string `json:"jurisdiction_id"`
+
+	// TenantID is nil for a rule that applies across every tenant. A
+	// non-nil value scopes the rule to one tenant only — mirrors
+	// JurisdictionID's own NULL = global convention on this same table.
+	TenantID *string `json:"tenant_id"`
 
 	ActiveFlag bool      `json:"active_flag"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -151,9 +160,12 @@ type CreateRoleAssignmentParams struct {
 	PrincipalRoleAssignmentID string
 	PrincipalID               string
 	RoleID                    string
-	LegalEntityID             string
-	EffectiveFrom             time.Time
-	AssignedBy                string
+	// LegalEntityID is nil for a tenant-wide assignment — only accepted
+	// when the target role's RoleScopeType is "TENANT"; see
+	// Store.CreateRoleAssignment.
+	LegalEntityID *string
+	EffectiveFrom time.Time
+	AssignedBy    string
 }
 
 type CreateDelegatedAuthorityParams struct {
@@ -161,11 +173,12 @@ type CreateDelegatedAuthorityParams struct {
 	DelegatorPrincipalID string
 	DelegatePrincipalID  string
 	ScopeType            string
-	LegalEntityID        string
-	AuthorityLimitType   *string
-	AuthorityLimitValue  *string
-	EffectiveFrom        time.Time
-	EffectiveTo          *time.Time
+	// LegalEntityID is nil for a tenant-wide delegation.
+	LegalEntityID       *string
+	AuthorityLimitType  *string
+	AuthorityLimitValue *string
+	EffectiveFrom       time.Time
+	EffectiveTo         *time.Time
 }
 
 type CreateSoDRuleParams struct {
@@ -175,6 +188,7 @@ type CreateSoDRuleParams struct {
 	ActionB        string
 	ConflictType   string
 	JurisdictionID *string
+	TenantID       *string
 }
 
 // EvaluateParams holds input for the core authorization evaluation.
@@ -183,12 +197,17 @@ type EvaluateParams struct {
 	LegalEntityID string
 	ActionType    string
 	CorrelationID string
+	// TenantID is optional — omit it to preserve today's behavior (only
+	// globally-applicable SoD rules are considered). Callers that supply
+	// it also get tenant-scoped SoD rules evaluated.
+	TenantID string
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var ErrRoleNotFound = errorString("role not found")
 var ErrRoleAssignmentNotFound = errorString("role assignment not found")
+var ErrLegalEntityRequiredForRoleScope = errorString("legal_entity_id is required: this role's scope_type is not TENANT")
 var ErrDelegatedAuthorityNotFound = errorString("delegated authority not found")
 var ErrAccessDecisionNotFound = errorString("access decision not found")
 var ErrInvalidTransition = errorString("invalid revocation status transition")

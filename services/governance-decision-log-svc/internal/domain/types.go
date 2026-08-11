@@ -26,9 +26,12 @@ var ErrStoreUnavailable = errors.New("governance decision store unavailable")
 // This is the MVP schema (see CONTEXT.md "FINALIZED — MVP schema"): a
 // deliberate simplification of the full GovernanceDecision entity in
 // docs/architecture/04-data-model.md §7.1. Fields not promoted to columns
-// here (policy_version_id, action_subject_type, action_subject_id,
-// workflow_instance_id) belong inside EvaluationContext until there's a
-// concrete need to query on them directly.
+// here (policy_version_id, action_subject_type, action_subject_id) belong
+// inside EvaluationContext until there's a concrete need to query on them
+// directly. workflow_instance_id and causation_id WERE in that category but
+// were promoted to first-class columns (migration 000003): this is the
+// platform's canonical governance evidence log, and "every decision made
+// during workflow instance X" is a real query, not a hypothetical one.
 type GovernanceDecision struct {
 	// DecisionID is caller-supplied and is the idempotency/dedup key.
 	DecisionID string `json:"decision_id"`
@@ -54,6 +57,12 @@ type GovernanceDecision struct {
 	EvaluationContext json.RawMessage `json:"evaluation_context,omitempty"`
 
 	CorrelationID string `json:"correlation_id"`
+
+	// WorkflowInstanceID is nil when this decision was not made in the
+	// context of a workflow instance.
+	WorkflowInstanceID *string `json:"workflow_instance_id,omitempty"`
+	// CausationID is nil when the causing event/decision is not known.
+	CausationID *string `json:"causation_id,omitempty"`
 
 	// DecidedAt is when the governance decision was made upstream (by
 	// Policy/Authorization/Workflow), not when it was logged here. If the

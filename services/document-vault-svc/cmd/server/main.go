@@ -18,6 +18,7 @@ import (
 	"zoiko.io/document-vault-svc/internal/config"
 	"zoiko.io/document-vault-svc/internal/handler"
 	"zoiko.io/document-vault-svc/internal/health"
+	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/residency"
 	"zoiko.io/document-vault-svc/internal/storage"
 	"zoiko.io/document-vault-svc/internal/store"
@@ -40,6 +41,11 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to parse db pool config", zap.Error(err))
 	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
 	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
 		log.Fatal("failed to create db pool", zap.Error(err))
@@ -68,6 +74,7 @@ func main() {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
+	r.Use(svcmiddleware.TenantContext())
 
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", healthH.Readiness)

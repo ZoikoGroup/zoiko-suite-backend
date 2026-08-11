@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -77,13 +79,15 @@ func (s *PgStore) CreatePayrollRun(ctx context.Context, r *domain.PayrollRun) (c
 			row := tx.QueryRow(ctx, `
 				SELECT run_id, run_number, pay_period_start::text, pay_period_end::text, pay_date::text,
 				       status, is_shadow_run, total_gross_pay, total_net_pay, total_tax_deductions,
-				       total_other_deductions, employee_count, created_at, updated_at, finalized_at
+				       total_other_deductions, employee_count, created_at, updated_at, finalized_at,
+				       governance_decision_id, snapshot_hash
 				FROM payroll_runs WHERE tenant_id = $1 AND correlation_id = $2
 			`, tenantID, r.CorrelationID)
 			if err := row.Scan(
 				&r.RunID, &r.RunNumber, &r.PayPeriodStart, &r.PayPeriodEnd, &r.PayDate,
 				&r.Status, &r.IsShadowRun, &r.TotalGrossPay, &r.TotalNetPay, &r.TotalTaxDeductions,
 				&r.TotalOtherDeductions, &r.EmployeeCount, &r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt,
+				&r.GovernanceDecisionID, &r.SnapshotHash,
 			); err != nil {
 				return err
 			}
@@ -108,14 +112,14 @@ func (s *PgStore) GetPayrollRun(ctx context.Context, id string) (*domain.Payroll
 			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start::text,
 			       pay_period_end::text, pay_date::text, status, is_shadow_run, total_gross_pay,
 			       total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
-			       created_at, updated_at, finalized_at
+			       created_at, updated_at, finalized_at, governance_decision_id, snapshot_hash
 			FROM payroll_runs
 			WHERE run_id = $1 AND tenant_id = $2
 		`, id, tenantID).Scan(
 			&r.RunID, &r.TenantID, &r.LegalEntityID, &r.RunNumber, &r.PayPeriodStart,
 			&r.PayPeriodEnd, &r.PayDate, &r.Status, &r.IsShadowRun, &r.TotalGrossPay,
 			&r.TotalNetPay, &r.TotalTaxDeductions, &r.TotalOtherDeductions, &r.EmployeeCount,
-			&r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt,
+			&r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt, &r.GovernanceDecisionID, &r.SnapshotHash,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -139,7 +143,7 @@ func (s *PgStore) ListPayrollRuns(ctx context.Context, legalEntityID, status str
 			SELECT run_id, tenant_id, legal_entity_id, run_number, pay_period_start::text,
 			       pay_period_end::text, pay_date::text, status, is_shadow_run, total_gross_pay,
 			       total_net_pay, total_tax_deductions, total_other_deductions, employee_count,
-			       created_at, updated_at, finalized_at
+			       created_at, updated_at, finalized_at, governance_decision_id, snapshot_hash
 			FROM payroll_runs
 			WHERE tenant_id = $1
 		`
@@ -171,7 +175,7 @@ func (s *PgStore) ListPayrollRuns(ctx context.Context, legalEntityID, status str
 				&r.RunID, &r.TenantID, &r.LegalEntityID, &r.RunNumber, &r.PayPeriodStart,
 				&r.PayPeriodEnd, &r.PayDate, &r.Status, &r.IsShadowRun, &r.TotalGrossPay,
 				&r.TotalNetPay, &r.TotalTaxDeductions, &r.TotalOtherDeductions, &r.EmployeeCount,
-				&r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt,
+				&r.CreatedAt, &r.UpdatedAt, &r.FinalizedAt, &r.GovernanceDecisionID, &r.SnapshotHash,
 			); err != nil {
 				return err
 			}
@@ -345,7 +349,12 @@ func (s *PgStore) GetShadowComparisonsByRun(ctx context.Context, runID string) (
 	return out, nil
 }
 
-func (s *PgStore) FinalizePayrollRun(ctx context.Context, runID string) error {
+// FinalizePayrollRun transitions a run to COMPLETED and stamps two audit
+// facts: governanceDecisionID (nil unless the caller supplied one) and a
+// snapshot_hash this service computes itself, over the run's own
+// already-locked totals — a reproducibility hash an auditor can recompute
+// from the stored numbers, not a caller-supplied claim.
+func (s *PgStore) FinalizePayrollRun(ctx context.Context, runID string, governanceDecisionID *string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return domain.ErrIdentityMissing
@@ -353,7 +362,12 @@ func (s *PgStore) FinalizePayrollRun(ctx context.Context, runID string) error {
 
 	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var status string
-		err := tx.QueryRow(ctx, "SELECT status FROM payroll_runs WHERE run_id = $1 AND tenant_id = $2 FOR UPDATE", runID, tenantID).Scan(&status)
+		var grossPay, netPay, taxDeductions, otherDeductions float64
+		var employeeCount int
+		err := tx.QueryRow(ctx, `
+			SELECT status, total_gross_pay, total_net_pay, total_tax_deductions, total_other_deductions, employee_count
+			FROM payroll_runs WHERE run_id = $1 AND tenant_id = $2 FOR UPDATE
+		`, runID, tenantID).Scan(&status, &grossPay, &netPay, &taxDeductions, &otherDeductions, &employeeCount)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.ErrPayrollRunNotFound
 		}
@@ -369,13 +383,19 @@ func (s *PgStore) FinalizePayrollRun(ctx context.Context, runID string) error {
 		}
 
 		now := time.Now().UTC()
+		snapshotInput := fmt.Sprintf("%s|%.2f|%.2f|%.2f|%.2f|%d", runID, grossPay, netPay, taxDeductions, otherDeductions, employeeCount)
+		sum := sha256.Sum256([]byte(snapshotInput))
+		snapshotHash := hex.EncodeToString(sum[:])
+
 		_, err = tx.Exec(ctx, `
 			UPDATE payroll_runs
 			SET status = 'COMPLETED',
 			    updated_at = $1,
-			    finalized_at = $2
-			WHERE run_id = $3 AND tenant_id = $4
-		`, now, now, runID, tenantID)
+			    finalized_at = $2,
+			    governance_decision_id = $3,
+			    snapshot_hash = $4
+			WHERE run_id = $5 AND tenant_id = $6
+		`, now, now, governanceDecisionID, snapshotHash, runID, tenantID)
 		return err
 	})
 }

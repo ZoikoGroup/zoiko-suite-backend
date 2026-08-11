@@ -134,7 +134,11 @@ type createDecisionRequest struct {
 	RuleBasis         string          `json:"rule_basis"`
 	EvaluationContext json.RawMessage `json:"evaluation_context,omitempty"`
 	CorrelationID     string          `json:"correlation_id"`
-	DecidedAt         *time.Time      `json:"decided_at,omitempty"`
+	// WorkflowInstanceID and CausationID are optional Event Linkage Keys
+	// (doctrine §3.3) — omit either when not known.
+	WorkflowInstanceID *string    `json:"workflow_instance_id,omitempty"`
+	CausationID        *string    `json:"causation_id,omitempty"`
+	DecidedAt          *time.Time `json:"decided_at,omitempty"`
 }
 
 // requiredFields lists the fields that must be non-empty. evaluation_context
@@ -209,16 +213,18 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	d := domain.GovernanceDecision{
-		DecisionID:        req.DecisionID,
-		TenantID:          req.TenantID,
-		LegalEntityID:     req.LegalEntityID,
-		ActorID:           req.ActorID,
-		ActionType:        req.ActionType,
-		Outcome:           req.Outcome,
-		RuleBasis:         req.RuleBasis,
-		EvaluationContext: req.EvaluationContext,
-		CorrelationID:     req.CorrelationID,
-		DecidedAt:         decidedAt,
+		DecisionID:         req.DecisionID,
+		TenantID:           req.TenantID,
+		LegalEntityID:      req.LegalEntityID,
+		ActorID:            req.ActorID,
+		ActionType:         req.ActionType,
+		Outcome:            req.Outcome,
+		RuleBasis:          req.RuleBasis,
+		EvaluationContext:  req.EvaluationContext,
+		CorrelationID:      req.CorrelationID,
+		WorkflowInstanceID: req.WorkflowInstanceID,
+		CausationID:        req.CausationID,
+		DecidedAt:          decidedAt,
 	}
 
 	created, err := h.store.Insert(r.Context(), d)

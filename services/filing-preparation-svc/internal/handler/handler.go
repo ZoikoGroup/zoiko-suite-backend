@@ -1,19 +1,29 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/filing-preparation-svc/internal/authz"
 	"zoiko.io/filing-preparation-svc/internal/domain"
 	"zoiko.io/filing-preparation-svc/internal/events"
+	"zoiko.io/filing-preparation-svc/internal/evidencereq"
 	"zoiko.io/filing-preparation-svc/internal/middleware"
 	"zoiko.io/filing-preparation-svc/internal/store"
 )
+
+// EvidenceReqClient verifies evidence sufficiency before a filing draft may
+// be validated as PREPARED. Implementations must fail closed: a transport
+// or service error must never be treated as "sufficient".
+type EvidenceReqClient interface {
+	Evaluate(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, artifacts []evidencereq.Artifact) (evidencereq.EvaluateResult, error)
+}
 
 const (
 	ActionFilingDraftCreate   = "FILING_DRAFT_CREATE"
@@ -23,14 +33,15 @@ const (
 )
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     *authz.Client
-	logger    *zap.Logger
+	store       store.Store
+	publisher   events.Publisher
+	authz       *authz.Client
+	evidenceReq EvidenceReqClient
+	logger      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, pub events.Publisher, az *authz.Client, er EvidenceReqClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, publisher: pub, authz: az, evidenceReq: er, logger: logger}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -224,7 +235,41 @@ func (h *Handler) Validate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	d, err := h.store.Validate(r.Context(), id, &req)
+	// No finalization path may skip required evidence states
+	// (03-microservices.md §8.6). This replaces the previous gate, which
+	// only checked whether the CALLER's own RequiredDocumentTypes list was
+	// non-empty — a client could always pass by sending an empty list.
+	// domain_code is the draft's own filing_type (real data), and the
+	// artifact presented is the evidence manifest already attached to the
+	// draft, if any.
+	// correlationID must NOT default to the draft's own ID:
+	// evidence-requirements-svc's Evaluate is deliberately idempotent on
+	// correlation_id (a genuine retry must replay, not re-evaluate) — a
+	// fixed per-draft fallback would make every retry-after-attaching-
+	// evidence permanently replay the FIRST attempt's result (caught live
+	// on the sibling board-resolutions-svc fix). Each call without a
+	// caller-supplied X-Correlation-ID is a distinct real-world attempt,
+	// not a retry, and Validate itself is legitimately called more than
+	// once per draft as evidence is assembled.
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		correlationID = "filing-validate-" + uuid.New().String()
+	}
+	var artifacts []evidencereq.Artifact
+	if existing.EvidenceManifestRef != "" {
+		artifacts = append(artifacts, evidencereq.Artifact{
+			EvidenceType: "EVIDENCE_MANIFEST",
+			ReferenceID:  existing.EvidenceManifestRef,
+		})
+	}
+	result, err := h.evidenceReq.Evaluate(r.Context(), tenantID, existing.LegalEntityID,
+		existing.FilingType, ActionFilingDraftValidate, correlationID, principal, artifacts)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "evidence-requirements-svc unavailable")
+		return
+	}
+
+	d, err := h.store.Validate(r.Context(), id, &req, result.Sufficient, result.Reason)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrDraftNotFound):

@@ -38,7 +38,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 
 // PublishStatementIngested corresponds to §10.5's statement.ingested event.
 func (p *Publisher) PublishStatementIngested(ctx context.Context, l domain.StatementLine) {
-	p.emit(ctx, "statement.ingested", l.CorrelationID, map[string]any{
+	p.emit(ctx, "statement.ingested", l.CorrelationID, l.StatementLineID, map[string]any{
 		"statement_line_id": l.StatementLineID,
 		"tenant_id":         l.TenantID,
 		"legal_entity_id":   l.LegalEntityID,
@@ -49,7 +49,7 @@ func (p *Publisher) PublishStatementIngested(ctx context.Context, l domain.State
 
 // PublishReconciliationMatched corresponds to §10.5's reconciliation.matched event.
 func (p *Publisher) PublishReconciliationMatched(ctx context.Context, l domain.StatementLine) {
-	p.emit(ctx, "reconciliation.matched", l.CorrelationID, map[string]any{
+	p.emit(ctx, "reconciliation.matched", l.CorrelationID, l.StatementLineID, map[string]any{
 		"statement_line_id":  l.StatementLineID,
 		"matched_journal_id": l.MatchedJournalID,
 	})
@@ -58,7 +58,7 @@ func (p *Publisher) PublishReconciliationMatched(ctx context.Context, l domain.S
 // PublishReconciliationExceptionRaised corresponds to §10.5's
 // reconciliation.exception.raised event.
 func (p *Publisher) PublishReconciliationExceptionRaised(ctx context.Context, l domain.StatementLine) {
-	p.emit(ctx, "reconciliation.exception.raised", l.CorrelationID, map[string]any{
+	p.emit(ctx, "reconciliation.exception.raised", l.CorrelationID, l.StatementLineID, map[string]any{
 		"statement_line_id": l.StatementLineID,
 		"reason":            l.ExceptionReason,
 	})
@@ -68,14 +68,14 @@ func (p *Publisher) PublishReconciliationExceptionRaised(ctx context.Context, l 
 // reconciliation.completed event — emitted once every line for a given bank
 // account + statement date is no longer UNMATCHED.
 func (p *Publisher) PublishReconciliationCompleted(ctx context.Context, tenantID, bankAccountID, statementDate string) {
-	p.emit(ctx, "reconciliation.completed", "", map[string]any{
+	p.emit(ctx, "reconciliation.completed", "", bankAccountID, map[string]any{
 		"tenant_id":       tenantID,
 		"bank_account_id": bankAccountID,
 		"statement_date":  statementDate,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -94,7 +94,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

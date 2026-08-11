@@ -137,6 +137,53 @@ func TestDetermineTax(t *testing.T) {
 	}
 }
 
+// TestDetermineTax_FallbackRuleHasNoSnapshot proves the zero-tax fallback
+// (tax-rules-svc unreachable, exercised here since newTestHandler points at
+// a non-listening address) is never given a fabricated snapshot reference —
+// there is no real rule content behind it to snapshot.
+func TestDetermineTax_FallbackRuleHasNoSnapshot(t *testing.T) {
+	h := newTestHandler()
+	body := domain.DetermineTaxRequest{
+		TransactionID: "tx-inv-1002", SourceModule: "INVOICE", LegalEntityID: "le-001",
+		JurisdictionID: "uk-england", TaxCategory: "VAT", GrossAmount: 1000.0,
+		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "billing-engine",
+	}
+	w := httptest.NewRecorder()
+	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d — %s", w.Code, w.Body.String())
+	}
+	var resp domain.TaxDetermination
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.TaxLogicSnapshotID != nil {
+		t.Errorf("expected nil tax_logic_snapshot_id for the fallback rule, got %v", *resp.TaxLogicSnapshotID)
+	}
+}
+
+// TestSnapshotTaxRule proves the snapshot is a real, deterministic,
+// content-sensitive reference — not a fabricated or constant placeholder.
+func TestSnapshotTaxRule(t *testing.T) {
+	a := &rules.TaxRuleDTO{RuleID: "trule-1", RuleCode: "UK-VAT-STD", Category: "VAT", TaxRatePercentage: 20.0, Status: "ACTIVE"}
+	b := &rules.TaxRuleDTO{RuleID: "trule-1", RuleCode: "UK-VAT-STD", Category: "VAT", TaxRatePercentage: 20.0, Status: "ACTIVE"}
+	c := &rules.TaxRuleDTO{RuleID: "trule-1", RuleCode: "UK-VAT-STD", Category: "VAT", TaxRatePercentage: 5.0, Status: "ACTIVE"} // rate later edited
+
+	snapA, snapB, snapC := snapshotTaxRule(a), snapshotTaxRule(b), snapshotTaxRule(c)
+	if snapA == nil || snapB == nil || snapC == nil {
+		t.Fatal("expected non-nil snapshots for real rule content")
+	}
+	if *snapA != *snapB {
+		t.Errorf("expected identical rule content to produce identical snapshots, got %s vs %s", *snapA, *snapB)
+	}
+	if *snapA == *snapC {
+		t.Errorf("expected a changed tax rate to change the snapshot — it did not, defeating the whole point")
+	}
+	if snapshotTaxRule(&rules.TaxRuleDTO{RuleID: "trule-fallback"}) != nil {
+		t.Error("expected nil snapshot for the fallback sentinel rule")
+	}
+}
+
 func TestOverrideDetermination(t *testing.T) {
 	h := newTestHandler()
 	r := chi.NewRouter()

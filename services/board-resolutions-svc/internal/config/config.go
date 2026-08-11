@@ -12,6 +12,7 @@ type Config struct {
 	KafkaEventsTopic     string
 	AuthzServiceURL      string
 	JurisdictionRulesURL string
+	EvidenceReqURL       string
 }
 
 func Load() (*Config, error) {
@@ -30,6 +31,7 @@ func Load() (*Config, error) {
 		KafkaEventsTopic:     getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.board-resolutions.events"),
 		AuthzServiceURL:      getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		JurisdictionRulesURL: getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8081"),
+		EvidenceReqURL:       getEnvOrDefault("EVIDENCE_REQ_URL", "http://evidence-requirements-svc:8130"),
 	}, nil
 }
 

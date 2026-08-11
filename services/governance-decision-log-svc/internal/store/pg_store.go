@@ -109,9 +109,10 @@ func (s *PgStore) Insert(ctx context.Context, d domain.GovernanceDecision) (bool
 	const q = `
 INSERT INTO governance_decisions
     (decision_id, tenant_id, legal_entity_id, actor_id, action_type,
-     outcome, rule_basis, evaluation_context, correlation_id, decided_at)
+     outcome, rule_basis, evaluation_context, correlation_id,
+     workflow_instance_id, causation_id, decided_at)
 VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (decision_id) DO NOTHING`
 
 	var tag pgconn.CommandTag
@@ -127,6 +128,8 @@ ON CONFLICT (decision_id) DO NOTHING`
 			d.RuleBasis,
 			nullableJSON(d.EvaluationContext),
 			d.CorrelationID,
+			d.WorkflowInstanceID,
+			d.CausationID,
 			d.DecidedAt,
 		)
 		return execErr
@@ -149,7 +152,8 @@ ON CONFLICT (decision_id) DO NOTHING`
 // Order must match scanDecision exactly.
 const decisionColumns = `
 	decision_id, tenant_id, legal_entity_id, actor_id, action_type,
-	outcome, rule_basis, evaluation_context, correlation_id, decided_at`
+	outcome, rule_basis, evaluation_context, correlation_id,
+	workflow_instance_id, causation_id, decided_at`
 
 // scanDecision scans one row produced by a decisionColumns SELECT.
 func scanDecision(row pgx.Row) (*domain.GovernanceDecision, error) {
@@ -164,6 +168,8 @@ func scanDecision(row pgx.Row) (*domain.GovernanceDecision, error) {
 		&d.RuleBasis,
 		&d.EvaluationContext,
 		&d.CorrelationID,
+		&d.WorkflowInstanceID,
+		&d.CausationID,
 		&d.DecidedAt,
 	)
 	return &d, err

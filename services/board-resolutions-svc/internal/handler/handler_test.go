@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/board-resolutions-svc/internal/domain"
 	"zoiko.io/board-resolutions-svc/internal/events"
+	"zoiko.io/board-resolutions-svc/internal/evidencereq"
 )
 
 type stubStore struct {
@@ -120,9 +121,22 @@ func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 
 var _ AuthZClient = (*stubAuthz)(nil)
 
+// stubEvidenceReq grants sufficiency by default, matching a
+// SATISFIED/NO_REQUIREMENTS_DEFINED outcome but skipping the network call.
+// Tests can set err to exercise the fail-closed path.
+type stubEvidenceReq struct {
+	err error
+}
+
+func (s *stubEvidenceReq) EvaluateSufficient(_ context.Context, _, _, _, _, _, _ string, _ []evidencereq.Artifact) error {
+	return s.err
+}
+
+var _ EvidenceReqClient = (*stubEvidenceReq)(nil)
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubEvidenceReq{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -198,6 +212,54 @@ func TestPassResolution(t *testing.T) {
 	_ = json.NewDecoder(wPass.Body).Decode(&passed)
 	if passed.Status != domain.ResolutionStatusPassed {
 		t.Errorf("expected PASSED, got %s", passed.Status)
+	}
+}
+
+func TestPassResolution_EvidenceMissing_Returns422(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubEvidenceReq{err: evidencereq.ErrEvidenceMissing}, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	body := domain.CreateResolutionRequest{
+		MeetingID: "mtg-003", LegalEntityID: "le-001", ResolutionNumber: "RES-2026-003",
+		Title: "Approve Merger", Content: "Resolved...", Category: domain.ResolutionCategoryStatutory,
+		EffectiveFrom: "2026-01-01", CreatedBy: "chairperson-001",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/resolutions", body))
+	var created domain.BoardResolution
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	passBody := domain.PassResolutionRequest{PassedBy: "chairperson-001"}
+	wPass := httptest.NewRecorder()
+	r.ServeHTTP(wPass, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass", passBody))
+	if wPass.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when required evidence is missing, got %d — %s", wPass.Code, wPass.Body.String())
+	}
+}
+
+func TestPassResolution_EvidenceServiceUnavailable_Returns503(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubEvidenceReq{err: evidencereq.ErrServiceUnavailable}, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	body := domain.CreateResolutionRequest{
+		MeetingID: "mtg-004", LegalEntityID: "le-001", ResolutionNumber: "RES-2026-004",
+		Title: "Approve Merger", Content: "Resolved...", Category: domain.ResolutionCategoryStatutory,
+		EffectiveFrom: "2026-01-01", CreatedBy: "chairperson-001",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/resolutions", body))
+	var created domain.BoardResolution
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	passBody := domain.PassResolutionRequest{PassedBy: "chairperson-001"}
+	wPass := httptest.NewRecorder()
+	r.ServeHTTP(wPass, buildRequest(http.MethodPost, "/v1/resolutions/"+created.ResolutionID+"/pass", passBody))
+	if wPass.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when evidence-requirements-svc is unavailable, got %d — %s", wPass.Code, wPass.Body.String())
 	}
 }
 

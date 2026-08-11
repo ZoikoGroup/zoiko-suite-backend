@@ -25,7 +25,7 @@ type AuthorizationStore interface {
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 	FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
 	FindDelegatedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
-	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction string) (string, bool, error)
+	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
 	RecordAccessDecision(ctx context.Context, principalID, legalEntityID, actionType, outcome, basis, correlationID string) (*domain.AccessDecisionLog, error)
 	FindAccessDecisionByID(ctx context.Context, accessDecisionID string) (*domain.AccessDecisionLog, error)
 }
@@ -183,12 +183,15 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 // ── POST /v1/admin/role-assignments ──────────────────────────────────────────
 
 type createAssignmentRequest struct {
-	PrincipalRoleAssignmentID string    `json:"principal_role_assignment_id,omitempty"`
-	PrincipalID               string    `json:"principal_id"`
-	RoleID                    string    `json:"role_id"`
-	LegalEntityID             string    `json:"legal_entity_id"`
-	EffectiveFrom             time.Time `json:"effective_from"`
-	AssignedBy                string    `json:"assigned_by"`
+	PrincipalRoleAssignmentID string `json:"principal_role_assignment_id,omitempty"`
+	PrincipalID               string `json:"principal_id"`
+	RoleID                    string `json:"role_id"`
+	// LegalEntityID is optional: omit it for a tenant-wide assignment
+	// (only accepted if the role's scope_type is TENANT — see
+	// domain.ErrLegalEntityRequiredForRoleScope).
+	LegalEntityID string    `json:"legal_entity_id,omitempty"`
+	EffectiveFrom time.Time `json:"effective_from"`
+	AssignedBy    string    `json:"assigned_by"`
 }
 
 func (req createAssignmentRequest) missingField() string {
@@ -197,8 +200,6 @@ func (req createAssignmentRequest) missingField() string {
 		return "principal_id"
 	case req.RoleID == "":
 		return "role_id"
-	case req.LegalEntityID == "":
-		return "legal_entity_id"
 	case req.EffectiveFrom.IsZero():
 		return "effective_from"
 	case req.AssignedBy == "":
@@ -224,17 +225,25 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var legalEntityID *string
+	if req.LegalEntityID != "" {
+		legalEntityID = &req.LegalEntityID
+	}
+
 	assignment, err := h.store.CreateRoleAssignment(r.Context(), domain.CreateRoleAssignmentParams{
 		PrincipalRoleAssignmentID: req.PrincipalRoleAssignmentID, PrincipalID: req.PrincipalID, RoleID: req.RoleID,
-		LegalEntityID: req.LegalEntityID, EffectiveFrom: req.EffectiveFrom, AssignedBy: req.AssignedBy,
+		LegalEntityID: legalEntityID, EffectiveFrom: req.EffectiveFrom, AssignedBy: req.AssignedBy,
 	})
 	if err != nil {
-		if errors.Is(err, domain.ErrRoleNotFound) {
+		switch {
+		case errors.Is(err, domain.ErrRoleNotFound):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": req.RoleID})
-			return
+		case errors.Is(err, domain.ErrLegalEntityRequiredForRoleScope):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "legal_entity_id_required", "message": err.Error()})
+		default:
+			h.log.Error("CreateRoleAssignment: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		}
-		h.log.Error("CreateRoleAssignment: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
 	writeJSON(w, http.StatusCreated, assignment)
@@ -263,15 +272,17 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/admin/delegated-authorities ─────────────────────────────────────
 
 type createDelegationRequest struct {
-	DelegatedAuthorityID string     `json:"delegated_authority_id,omitempty"`
-	DelegatorPrincipalID string     `json:"delegator_principal_id"`
-	DelegatePrincipalID  string     `json:"delegate_principal_id"`
-	ScopeType            string     `json:"scope_type"`
-	LegalEntityID        string     `json:"legal_entity_id"`
-	AuthorityLimitType   *string    `json:"authority_limit_type,omitempty"`
-	AuthorityLimitValue  *string    `json:"authority_limit_value,omitempty"`
-	EffectiveFrom        time.Time  `json:"effective_from"`
-	EffectiveTo          *time.Time `json:"effective_to,omitempty"`
+	DelegatedAuthorityID string `json:"delegated_authority_id,omitempty"`
+	DelegatorPrincipalID string `json:"delegator_principal_id"`
+	DelegatePrincipalID  string `json:"delegate_principal_id"`
+	ScopeType            string `json:"scope_type"`
+	// LegalEntityID is optional: omit it for a delegation that applies
+	// across the whole tenant rather than one entity.
+	LegalEntityID       string     `json:"legal_entity_id,omitempty"`
+	AuthorityLimitType  *string    `json:"authority_limit_type,omitempty"`
+	AuthorityLimitValue *string    `json:"authority_limit_value,omitempty"`
+	EffectiveFrom       time.Time  `json:"effective_from"`
+	EffectiveTo         *time.Time `json:"effective_to,omitempty"`
 }
 
 func (req createDelegationRequest) missingField() string {
@@ -282,8 +293,6 @@ func (req createDelegationRequest) missingField() string {
 		return "delegate_principal_id"
 	case req.ScopeType == "":
 		return "scope_type"
-	case req.LegalEntityID == "":
-		return "legal_entity_id"
 	case req.EffectiveFrom.IsZero():
 		return "effective_from"
 	default:
@@ -307,9 +316,14 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	var legalEntityID *string
+	if req.LegalEntityID != "" {
+		legalEntityID = &req.LegalEntityID
+	}
+
 	d, err := h.store.CreateDelegatedAuthority(r.Context(), domain.CreateDelegatedAuthorityParams{
 		DelegatedAuthorityID: req.DelegatedAuthorityID, DelegatorPrincipalID: req.DelegatorPrincipalID,
-		DelegatePrincipalID: req.DelegatePrincipalID, ScopeType: req.ScopeType, LegalEntityID: req.LegalEntityID,
+		DelegatePrincipalID: req.DelegatePrincipalID, ScopeType: req.ScopeType, LegalEntityID: legalEntityID,
 		AuthorityLimitType: req.AuthorityLimitType, AuthorityLimitValue: req.AuthorityLimitValue,
 		EffectiveFrom: req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
 	})
@@ -352,6 +366,9 @@ type createSoDRuleRequest struct {
 	ActionB        string  `json:"action_b"`
 	ConflictType   string  `json:"conflict_type"`
 	JurisdictionID *string `json:"jurisdiction_id,omitempty"`
+	// TenantID is optional — omit for a rule that applies across every
+	// tenant, matching JurisdictionID's own global-when-nil convention.
+	TenantID *string `json:"tenant_id,omitempty"`
 }
 
 func (req createSoDRuleRequest) missingField() string {
@@ -403,6 +420,7 @@ func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	rule, err := h.store.CreateSoDRule(r.Context(), domain.CreateSoDRuleParams{
 		DomainCode: req.DomainCode, ActionA: req.ActionA, ActionB: req.ActionB,
 		ConflictType: req.ConflictType, JurisdictionID: req.JurisdictionID,
+		TenantID: req.TenantID,
 	})
 	if err != nil {
 		h.log.Error("CreateSoDRule: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
@@ -418,6 +436,10 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
+	// TenantID is optional. Omitting it preserves today's behavior — only
+	// globally-applicable SoD rules are considered. Supplying it also
+	// brings that tenant's own SoD rules into the check.
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 type authorizeResponse struct {
@@ -506,7 +528,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		// SoD check: does holding req.ActionType alongside anything else
 		// this principal already holds violate a Separation-of-Duties rule?
 		others := removeAll(allHeldActions, req.ActionType)
-		conflicting, hasConflict, err := h.store.CheckSoDConflict(r.Context(), others, req.ActionType)
+		conflicting, hasConflict, err := h.store.CheckSoDConflict(r.Context(), others, req.ActionType, req.TenantID)
 		if err != nil {
 			h.log.Error("Authorize: store unavailable (sod check)", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})

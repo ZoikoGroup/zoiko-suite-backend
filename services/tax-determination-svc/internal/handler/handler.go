@@ -2,8 +2,11 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -16,6 +19,29 @@ import (
 	"zoiko.io/tax-determination-svc/internal/rules"
 	"zoiko.io/tax-determination-svc/internal/store"
 )
+
+// snapshotTaxRule computes a content-addressed reference over the actual
+// rule fields tax-rules-svc returned, pinning a determination to the exact
+// rule content applied — independent of later edits to the mutable rule row
+// rule_id points at. Returns nil for the zero-tax fallback (tax-rules-svc
+// unreachable): there is no real rule content to snapshot, and fabricating
+// one would misrepresent a fallback as a governed rule application.
+func snapshotTaxRule(rule *rules.TaxRuleDTO) *string {
+	// "trule-fallback" is this handler's own (currently unreachable) local
+	// fallback; "trule-default-fallback"/"trule-default-zero" are
+	// rules.Client's actual fallback sentinels — a transport error or an
+	// empty rule set from tax-rules-svc, respectively. None represent a
+	// real, governed rule application.
+	if rule == nil || rule.RuleID == "trule-fallback" ||
+		rule.RuleID == "trule-default-fallback" || rule.RuleID == "trule-default-zero" {
+		return nil
+	}
+	canonical := fmt.Sprintf("%s|%s|%s|%.6f|%.6f|%s",
+		rule.RuleID, rule.RuleCode, rule.Category, rule.TaxRatePercentage, rule.StandardDeductions, rule.Status)
+	sum := sha256.Sum256([]byte(canonical))
+	hash := hex.EncodeToString(sum[:])
+	return &hash
+}
 
 // Action constants for authorization-svc calls, shaped <RESOURCE>_<VERB>.
 const (
@@ -114,6 +140,7 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID:       req.LegalEntityID,
 		JurisdictionID:      req.JurisdictionID,
 		RuleID:              rule.RuleID,
+		TaxLogicSnapshotID:  snapshotTaxRule(rule),
 		TaxCategory:         req.TaxCategory,
 		GrossAmount:         req.GrossAmount,
 		TaxableAmount:       taxableAmount,

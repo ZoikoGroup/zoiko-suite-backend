@@ -33,7 +33,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 // PublishReviewCreated fires when a review record is first created against
 // a validated employee, inside an open cycle.
 func (p *Publisher) PublishReviewCreated(ctx context.Context, r domain.ReviewRecord) {
-	p.emit(ctx, "review.created", r.CorrelationID, map[string]any{
+	p.emit(ctx, "review.created", r.CorrelationID, r.ReviewID, map[string]any{
 		"review_id":       r.ReviewID,
 		"legal_entity_id": r.LegalEntityID,
 		"cycle_id":        r.CycleID,
@@ -43,7 +43,7 @@ func (p *Publisher) PublishReviewCreated(ctx context.Context, r domain.ReviewRec
 
 // PublishReviewCompleted fires once a submitted review is finalized.
 func (p *Publisher) PublishReviewCompleted(ctx context.Context, r domain.ReviewRecord) {
-	p.emit(ctx, "review.completed", r.CorrelationID, map[string]any{
+	p.emit(ctx, "review.completed", r.CorrelationID, r.ReviewID, map[string]any{
 		"review_id":       r.ReviewID,
 		"legal_entity_id": r.LegalEntityID,
 		"cycle_id":        r.CycleID,
@@ -52,7 +52,7 @@ func (p *Publisher) PublishReviewCompleted(ctx context.Context, r domain.ReviewR
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -75,7 +75,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

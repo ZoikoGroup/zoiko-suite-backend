@@ -45,7 +45,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 // obligation. Callers must only invoke this on the first insert
 // (created=true) — a replayed idempotent POST must not re-emit the event.
 func (p *Publisher) PublishObligationCreated(ctx context.Context, o domain.Obligation, correlationID string) error {
-	return p.emit("obligation.created", correlationID, map[string]any{
+	return p.emit("obligation.created", correlationID, o.ObligationID, map[string]any{
 		"obligation_id":           o.ObligationID,
 		"legal_entity_id":         o.LegalEntityID,
 		"jurisdiction_id":         o.JurisdictionID,
@@ -63,7 +63,7 @@ func (p *Publisher) PublishObligationCreated(ctx context.Context, o domain.Oblig
 // transition. Callers must only invoke this when transitioned=true (see
 // Store.UpdateObligationStatus) — an idempotent no-op must not re-emit.
 func (p *Publisher) PublishObligationUpdated(ctx context.Context, o domain.Obligation, correlationID string) error {
-	return p.emit("obligation.updated", correlationID, map[string]any{
+	return p.emit("obligation.updated", correlationID, o.ObligationID, map[string]any{
 		"obligation_id":     o.ObligationID,
 		"obligation_status": o.ObligationStatus,
 		"updated_at":        o.UpdatedAt,
@@ -73,7 +73,7 @@ func (p *Publisher) PublishObligationUpdated(ctx context.Context, o domain.Oblig
 // PublishObligationOverdue publishes obligation.overdue. Callers must only
 // invoke this on an actual transition into OVERDUE.
 func (p *Publisher) PublishObligationOverdue(ctx context.Context, o domain.Obligation, correlationID string) error {
-	return p.emit("obligation.overdue", correlationID, map[string]any{
+	return p.emit("obligation.overdue", correlationID, o.ObligationID, map[string]any{
 		"obligation_id": o.ObligationID,
 		"due_date":      o.DueDate,
 	})
@@ -82,7 +82,7 @@ func (p *Publisher) PublishObligationOverdue(ctx context.Context, o domain.Oblig
 // PublishObligationClosed publishes obligation.closed. Callers must only
 // invoke this on an actual transition into CLOSED.
 func (p *Publisher) PublishObligationClosed(ctx context.Context, o domain.Obligation, correlationID string) error {
-	return p.emit("obligation.closed", correlationID, map[string]any{
+	return p.emit("obligation.closed", correlationID, o.ObligationID, map[string]any{
 		"obligation_id": o.ObligationID,
 		"closed_at":     o.ClosedAt,
 	})
@@ -91,7 +91,7 @@ func (p *Publisher) PublishObligationClosed(ctx context.Context, o domain.Obliga
 // emit serialises the payload into the canonical envelope and writes it to
 // the Kafka topic set on the Writer (main.go) — not set here, since kafka-go
 // rejects a Message that also specifies Topic when the Writer already has one.
-func (p *Publisher) emit(eventType, correlationID string, payload map[string]any) error {
+func (p *Publisher) emit(eventType, correlationID, key string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
@@ -109,7 +109,7 @@ func (p *Publisher) emit(eventType, correlationID string, payload map[string]any
 		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
 	}
 
-	msg := kafka.Message{Value: data}
+	msg := kafka.Message{Key: []byte(key), Value: data}
 	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
 		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
 	}

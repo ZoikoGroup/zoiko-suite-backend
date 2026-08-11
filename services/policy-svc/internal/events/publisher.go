@@ -44,7 +44,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 // policy. Callers must only invoke this on the first insert
 // (created=true) — a replayed idempotent POST must not re-emit the event.
 func (p *Publisher) PublishPolicyCreated(ctx context.Context, policy domain.Policy, correlationID string) error {
-	return p.emit("policy.created", correlationID, map[string]any{
+	return p.emit("policy.created", correlationID, policy.PolicyID, map[string]any{
 		"policy_id":               policy.PolicyID,
 		"policy_code":             policy.PolicyCode,
 		"policy_name":             policy.PolicyName,
@@ -59,7 +59,7 @@ func (p *Publisher) PublishPolicyCreated(ctx context.Context, policy domain.Poli
 // there is no UPDATE on policies or policy_versions. Callers must only
 // invoke this on the first insert (created=true).
 func (p *Publisher) PublishPolicyUpdated(ctx context.Context, version domain.PolicyVersion, correlationID string) error {
-	return p.emit("policy.updated", correlationID, map[string]any{
+	return p.emit("policy.updated", correlationID, version.PolicyID, map[string]any{
 		"policy_version_id":       version.PolicyVersionID,
 		"policy_id":               version.PolicyID,
 		"tenant_id":               version.TenantID,
@@ -74,7 +74,7 @@ func (p *Publisher) PublishPolicyUpdated(ctx context.Context, version domain.Pol
 // PublishVersionActivated publishes policy.version.activated for a
 // version that just transitioned to ACTIVE.
 func (p *Publisher) PublishVersionActivated(ctx context.Context, version domain.PolicyVersion, correlationID string) error {
-	return p.emit("policy.version.activated", correlationID, map[string]any{
+	return p.emit("policy.version.activated", correlationID, version.PolicyID, map[string]any{
 		"policy_version_id":         version.PolicyVersionID,
 		"policy_id":                 version.PolicyID,
 		"tenant_id":                 version.TenantID,
@@ -90,7 +90,7 @@ func (p *Publisher) PublishVersionActivated(ctx context.Context, version domain.
 // version in the same scope — see Store.ActivateVersion) or, in a future
 // batch, RETIRED via a dedicated retire endpoint.
 func (p *Publisher) PublishRuleRetired(ctx context.Context, version domain.PolicyVersion, correlationID string) error {
-	return p.emit("policy.rule.retired", correlationID, map[string]any{
+	return p.emit("policy.rule.retired", correlationID, version.PolicyID, map[string]any{
 		"policy_version_id": version.PolicyVersionID,
 		"policy_id":         version.PolicyID,
 		"version_status":    version.VersionStatus,
@@ -100,7 +100,7 @@ func (p *Publisher) PublishRuleRetired(ctx context.Context, version domain.Polic
 // emit serialises the payload into the canonical envelope and writes it to
 // the Kafka topic set on the Writer (main.go) — not set here, since kafka-go
 // rejects a Message that also specifies Topic when the Writer already has one.
-func (p *Publisher) emit(eventType, correlationID string, payload map[string]any) error {
+func (p *Publisher) emit(eventType, correlationID, key string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
@@ -118,7 +118,7 @@ func (p *Publisher) emit(eventType, correlationID string, payload map[string]any
 		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
 	}
 
-	msg := kafka.Message{Value: data}
+	msg := kafka.Message{Key: []byte(key), Value: data}
 	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
 		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
 	}

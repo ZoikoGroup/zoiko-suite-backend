@@ -21,6 +21,24 @@ type Store interface {
 	ExecuteAction(ctx context.Context, id string, req *domain.ExecuteCorporateActionRequest) (*domain.CorporateAction, error)
 }
 
+// dateColumns is the SELECT fragment for the three DATE columns, which MUST
+// be read as text.
+//
+// effective_date/effective_from/effective_to are DATE columns, but
+// domain.CorporateAction declares them as string / *string because the API
+// contract is a plain "YYYY-MM-DD", not an RFC3339 timestamp. pgx happily
+// ENCODEs a Go string into a DATE parameter on write (INSERT worked), but
+// cannot DECODE a DATE into a *string on a plain SELECT — every read here
+// failed with a scan error, surfaced generically as "failed to fetch
+// corporate action" with no logged detail (same asymmetric read/write bug
+// already fixed in contract-lifecycle-svc's and board-resolutions-svc's
+// stores).
+//
+// TO_CHAR rather than ::TEXT so the format does not depend on the session's
+// DateStyle. NULL effective_to passes through as NULL.
+const effectiveDateColumn = `TO_CHAR(effective_date, 'YYYY-MM-DD')`
+const effectiveDateColumns = `TO_CHAR(effective_from, 'YYYY-MM-DD'), TO_CHAR(effective_to, 'YYYY-MM-DD')`
+
 type PgStore struct {
 	pool *pgxpool.Pool
 }
@@ -90,8 +108,8 @@ func (s *PgStore) GetAction(ctx context.Context, id string) (*domain.CorporateAc
 	var atype, status string
 	err = tx.QueryRow(ctx, `
 		SELECT action_id, tenant_id, legal_entity_id, title, action_type, COALESCE(description,''), COALESCE(resolution_id,''),
-		       effective_date, status, valuation_amount, currency, executed_at, executed_by, document_vault_id,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       `+effectiveDateColumn+`, status, valuation_amount, currency, executed_at, executed_by, document_vault_id,
+		       `+effectiveDateColumns+`, created_by, created_at, updated_at
 		FROM corporate_actions WHERE action_id = $1`, id,
 	).Scan(
 		&a.ActionID, &a.TenantID, &a.LegalEntityID, &a.Title, &atype, &a.Description, &a.ResolutionID,
@@ -122,8 +140,8 @@ func (s *PgStore) ListActions(ctx context.Context, legalEntityID, actionType, st
 
 	rows, err := tx.Query(ctx, `
 		SELECT action_id, tenant_id, legal_entity_id, title, action_type, COALESCE(description,''), COALESCE(resolution_id,''),
-		       effective_date, status, valuation_amount, currency, executed_at, executed_by, document_vault_id,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       `+effectiveDateColumn+`, status, valuation_amount, currency, executed_at, executed_by, document_vault_id,
+		       `+effectiveDateColumns+`, created_by, created_at, updated_at
 		FROM corporate_actions
 		WHERE ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR action_type = $2)

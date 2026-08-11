@@ -1,0 +1,2033 @@
+ZOIKOSUITE                     Commercial Operations, Subscription & Governed Platform Standard
+
+              ZOIKOSUITE
+
+Commercial Operations, Subscription & Governed
+                              Platform
+
+                  Operating Standard
+
+Executive doctrine
+
+ZoikoSuite must preserve one governed chain of truth from commercial entitlement and organizational context through
+connected-system facts, obligations, controls, workflow decisions, evidence, approvals, AI-assisted recommendations,
+execution and audit -- without silently replacing the systems of record, qualified professional judgment, legal authority, or a
+tenant's own accountability. No action may become commercially billable, operationally authoritative, compliance-relevant or
+externally represented as complete because of stale configuration, unsupported jurisdiction, unverified source data, model
+confidence alone, an unapproved automation, failed integration, missing evidence, or cross-tenant/cross-product
+contamination.
+
+Field                          Value
+Document ID
+Version                        ZSU-COM-OPS-001
+Date
+                               1.0 -- Commercial Launch & Governed Operations Standard
+Status
+                               August 7, 2026
+Owner
+Prepared for                   Build-ready commercial/product/engineering baseline; final price
+Language                       book, plan limits, market availability, legal claims, integration
+Classification                 certification, AI execution scopes, security controls, numeric service
+Legal operator                 objectives and formal go-live approval remain mandatory.
+
+Product model                  ZoikoSuite Product / Commercial
+
+Product category               Engineering, Product, Finance, Commercial, Customer Success,
+Primary executive buyer paths  Security, Privacy, Legal/Compliance, Data Governance, AI/ML, QA,
+                               Support, Partnerships, Solutions Architecture
+
+                               American English
+
+                               Confidential -- Internal Use
+
+                               Zoiko Tech Inc -- contracting, merchant, tax, privacy and invoice
+                               details must match verified Finance, Legal, processor, bank and
+                               market records before live charging.
+
+                               Commercially independent standalone SaaS + optional integrated
+                               Zoiko One component; approved Zoiko products and external
+                               systems connect through governed interfaces rather than implicit
+                               commercial bundling.
+
+                               Governed Business Operations Intelligence Platform
+
+                               CFO / Finance; General Counsel / Legal & Compliance; CIO /
+                               Technology & Governance
+
+Confidential -- Internal Use   ZSU-COM-OPS-001 | v1.0  Page 1
+  ZOIKOSUITE                                Commercial Operations, Subscription & Governed Platform Standard
+
+  Field                         Value
+
+  Product stage                 Platform and public architecture are established; commercial
+                                catalog, market-specific release claims, integrated control definitions
+CONTENTS                        and production acceptance evidence must remain registry-governed.
+
+  No.                           Section
+  1                             Executive Commercial & Product Decisions
+  2                             Canonical ZoikoSuite Architecture
+  3                             Five-Plane Trust Doctrine -- Non-Negotiable Separation
+  4                             P0 Launch Blockers -- No-Go Until Closed
+  5                             A. Commercial Account, Organization, Workspace & Legal Entity
+  6                             Model
+  7                             B. Plans, Packaging, Contracts, Trials, Entitlements & Upgrades
+  8                             C. Capability, Module & Release Registry
+  9                             D. Connected Systems, Systems of Record & Data Authority
+  10                            E. Obligation, Policy, Control & Compliance Model
+  11                            F. Regional Intelligence, Jurisdiction & Effective-Date Governance
+  12                            G. AI, Agentic Automation & Human Authority
+  13                            H. Workflow, Cases, Approvals, Tasks & Escalation
+  14                            I. Evidence, Auditability, Attestations & Control Testing
+  15                            J. Documents, Records, Retention, Legal Hold & Exports
+  16                            K. Accounting, Tax, HR, Payroll & Billing Boundaries
+  17                            L. Integrations, API, Webhooks, Idempotency & Import Controls
+  18                            M. Reporting, Executive Intelligence & Analytics Boundaries
+  19                            N. ZoikoSuite Subscription Billing -- Zoiko Charges to Customers
+  20                            O. Failed Payments, Dunning, Restriction & Termination
+  21                            P. Zoiko One Bundling, Cross-Sell & Double-Charge Prevention
+  22                            Q. Global Market Availability, Data Residency & Localization
+  23                            R. Security, Privacy, AI Data Use & Provider Governance
+  24                            S. Communications, Notifications, Portals & Delivery Evidence
+  25                            T. Internal, Demo, Pilot, Sandbox & Existing Workspaces
+  26                            U. Operating Ownership, Change Control & Commercial
+  27                            Governance
+  28                            Canonical RBAC & Segregation-of-Duties Matrix
+                                Mandatory Production Acceptance Checklist
+  Confidential -- Internal Use  Minimum Engineering Data Model
+
+                                ZSU-COM-OPS-001 | v1.0  Page 2
+ZOIKOSUITE                                Commercial Operations, Subscription & Governed Platform Standard
+
+No.                           Section
+29                            Canonical State Machines & Event Rules
+30                            Control Evaluation, Evidence Integrity & Assurance Standard
+31                            Reconciliation, Lineage, Data Quality & Close Controls
+32                            Observability, Reliability, Incident Controls & Kill Switches
+33                            Critical Analysis of Current Product & Commercial Drift
+34                            Authoritative Source Basis & Precedence
+35                            Final CTO / Commercial Doctrine
+
+REFINED FINAL -- COMMERCIAL, PRODUCT & ENGINEERING BASELINE
+
+This standard is intentionally stricter than a pricing document or feature catalogue. It governs ZoikoSuite commercial truth,
+tenant and legal-entity scope, capability entitlements, connected systems of record, compliance/control intelligence,
+jurisdictional rules, evidence provenance, AI and automation boundaries, human approvals, integrations, reporting,
+ZoikoSuite subscription billing, Zoiko One bundling, security, privacy, retention, testing and production acceptance. Where
+the approved commercial or product record is incomplete, the system must fail closed rather than invent price, legal
+coverage, compliance status, market availability or autonomous authority.
+
+1. Executive Commercial & Product Decisions
+
+Area                          Canonical decision
+Product taxonomy
+                              ZoikoSuite is a governed business operations intelligence platform.
+Commercial model              It unifies control, evidence, policy, workflow and decision intelligence
+Plan taxonomy                 across business operations without claiming to be the universal
+Buyer model                   system of record for every accounting, HR, payroll, billing, tax, legal
+Core commercial object        or ERP domain.
+System-of-record posture
+Compliance posture            Standalone SaaS is independently purchasable. ZoikoSuite may
+                              also be delivered through Zoiko One or enterprise agreements.
+                              Commercial independence must remain explicit even where shared
+                              platform services and native Zoiko integrations are reused.
+
+                              Catalog-controlled. This standard does not invent public plan names,
+                              prices, limits, add-ons, usage rates or trial terms that are not present
+                              in an approved current pricing registry.
+
+                              Primary executive paths are CFO, General Counsel and CIO.
+                              Product packaging may share core platform capabilities while buyer-
+                              specific workflows, evidence and outcomes remain distinct.
+
+                              The customer buys entitlement to a governed platform capability set,
+                              not a promise that every legal, regulatory, tax or operational
+                              obligation is automatically satisfied.
+
+                              Connected ERP, HCM, payroll, billing, accounting, identity,
+                              document, ticketing and legal systems remain authoritative for the
+                              facts they own unless an explicit migration/ownership contract
+                              transfers authority to ZoikoSuite.
+
+                              ZoikoSuite may identify obligations, map controls, collect evidence,
+                              orchestrate review and report status. It must not market
+                              configuration, automation or AI output as guaranteed
+                              legal/regulatory compliance.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0  Page 3
+ZOIKOSUITE                                    Commercial Operations, Subscription & Governed Platform Standard
+
+Area                              Canonical decision
+AI posture
+Evidence posture                  AI supports classification, synthesis, prioritization, drafting,
+Market posture                    recommendations and narrowly approved automations. AI
+Pricing posture                   confidence is never, by itself, authority to change a legal position, file
+Zoiko One posture                 a return, approve financial treatment, terminate employment, change
+Testing posture                   payroll, pay money, or certify compliance.
+Release truth
+                                  Material decisions and control states must be reconstructable from
+                                  versioned source facts, policies, rule versions, actors, approvals and
+                                  events. Current state cannot overwrite historical truth.
+
+                                  Global by controlled configuration and release registry, not by
+                                  universal claim. Jurisdiction, language, residency, provider, legal-
+                                  content, tax, employment and integration availability are
+                                  independently gated.
+
+                                  No feature, integration event, AI token, document, user, entity,
+                                  workflow or record becomes billable merely because it is
+                                  measurable. Billability requires approved catalog definition,
+                                  disclosure, entitlement and customer authorization.
+
+                                  Zoiko One is an optional distribution/integration path, not a
+                                  prerequisite. The same entitlement period must never be invoiced
+                                  twice through direct ZoikoSuite and Zoiko One channels.
+
+                                  Production, staging, sandbox, demo and QA are explicitly classified.
+                                  Synthetic data and non-production provider credentials are
+                                  mandatory for default test paths.
+
+                                  Public claims, runtime capability and commercial entitlement
+                                  consume the same release/market/capability registries. Marketing
+                                  copy never outranks authoritative runtime or contractual state.
+
+IMPORTANT COMMERCIAL CONSISTENCY CORRECTION
+
+ZoikoSuite's approved positioning and persona architecture are strong, but the available controlled record does not establish
+a final paid price book or public plan taxonomy here. Engineering, Design, Finance, Sales, Zoiko One configuration,
+processor objects, contracts, renewal logic and Support must therefore consume one versioned pricing and entitlement
+registry. This document deliberately refuses to invent a price, plan name or trial promise.
+
+2. Canonical ZoikoSuite Architecture
+
+Layer                             Authoritative role
+Commercial account layer
+Organization & workspace layer    Customer contract, plan/catalog version, billing source, subscription,
+Capability & orchestration layer  add-ons, usage authorization, Zoiko One source, renewal and
+Intelligence layer                payment state.
+Evidence & assurance layer
+                                  Tenant identity, legal entities, business units, workspaces, members,
+                                  roles, regions, policies and data classifications.
+
+                                  Obligations, controls, workflows, cases, tasks, attestations, evidence
+                                  requests, approvals, exceptions, remediation and automation
+                                  policies.
+
+                                  Regional intelligence, rule/policy mapping, source-backed
+                                  reasoning, classification, recommendations, summarization,
+                                  prioritization and scenario analysis.
+
+                                  Evidence objects, provenance, control tests, review decisions,
+                                  immutable audit events, replay manifests, retention/legal hold and
+                                  assurance exports.
+
+Confidential -- Internal Use      ZSU-COM-OPS-001 | v1.0  Page 4
+ZOIKOSUITE                             Commercial Operations, Subscription & Governed Platform Standard
+
+Layer                                  Authoritative role
+Integration layer
+Experience layer                       ERP, HCM, payroll, billing, finance, IAM, ticketing, document
+                                       repositories, communication platforms, tax/regulatory sources and
+                                       approved Zoiko products.
+
+                                       Executive command centers, CFO/GC/CIO views, operations
+                                       workspaces, reviewer queues, dashboards, reporting, APIs and
+                                       administrative consoles.
+
+One commercial catalog version controls public pricing, checkout, entitlements, Zoiko One bundle mappings, processor
+products/prices, contracts/order forms, invoices, in-app upgrade paths, support tooling, analytics and renewal logic. One
+capability/release registry separately controls whether a capability exists, is entitled, is production-enabled, is market-eligible
+and is safe to execute.
+
+A feature can therefore be technically implemented but commercially unavailable; commercially entitled but market-restricted;
+market-eligible but disabled by security/incident state; or visible as read-only while execution remains gated. These are
+separate dimensions and must never be compressed into one feature flag.
+
+3. Five-Plane Trust Doctrine -- Non-Negotiable Separation
+
+Plane                                  Scope
+PLANE 1 -- ZOIKO COMMERCIAL ACCOUNT
+PLANE 2 -- TENANT BUSINESS OPERATIONS  What Zoiko Tech Inc charges for access to ZoikoSuite: catalog,
+PLANE 3 -- CONNECTED SYSTEM AUTHORITY  contract, subscription, platform invoice, tax, payment, renewal,
+PLANE 4 -- GOVERNANCE & EVIDENCE       credit/refund and product entitlement.
+PLANE 5 -- AI & AUTOMATION
+                                       The tenant's own operating facts, entities, processes, controls,
+                                       obligations, cases, tasks, evidence, approvals and remediation.
+
+                                       Authoritative facts that remain owned by connected systems:
+                                       accounting/ERP entries, payroll results, HR records, billing
+                                       transactions, IAM identities, legal matter records, source documents
+                                       and provider evidence.
+
+                                       Policies, obligation maps, control definitions, evidence provenance,
+                                       control tests, attestations, exceptions, approvals, audit events,
+                                       review and assurance status.
+
+                                       Model output, rule evaluation, recommendations, prioritization,
+                                       drafted actions and approved agent/tool execution. This plane may
+                                       propose or execute only within explicit authority and must never
+                                       overwrite the other planes without governed interfaces.
+
+ ZoikoSuite subscription payment state may affect access to ZoikoSuite, but it may never mutate the tenant's underlying
+      accounting, payroll, billing, HR or legal facts.
+
+ A connected-system event may update a governed fact or trigger a workflow, but it does not silently become ZoikoSuite
+      commercial usage unless the approved catalog defines that meter and customer authorization exists.
+
+ An AI recommendation may create a reviewable proposal; it does not become a legal conclusion, control pass, filing,
+      payment, employee action or accounting posting without the required deterministic validations and authority.
+
+ Compliance status is derived from scoped obligations, control design/operation, evidence, exceptions and review. A green
+      dashboard cannot exist merely because integrations are healthy.
+
+ Cross-product analytics may aggregate approved metadata after tenant, purpose and data-class checks; raw tenant
+      records remain product- and role-scoped.
+
+4. P0 Launch Blockers -- No-Go Until Closed
+
+1. Lock the current price catalog, public plan taxonomy, billing intervals, currencies, included limits, add-ons, approved usage
+      metrics, overages, cancellation, renewal and Enterprise routing. Missing commercial mappings block live charging.
+
+2. Normalize ZoikoSuite positioning, plan labels, entitlements and CTA language across homepage, pricing, signup, app,
+      Zoiko One, CRM, contracts, email, help center and support tooling.
+
+Confidential -- Internal Use           ZSU-COM-OPS-001 | v1.0  Page 5
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+3. Decide and configure trial/evaluation posture. No "free trial," cardless evaluation or auto-conversion path may exist unless
+      its program terms are explicit and approved.
+
+4. Implement billing_classification and billing_source for every workspace, including Zoiko One, pilots, internal, demo, partner,
+      QA and legacy environments.
+
+5. Implement double-charge prevention between standalone ZoikoSuite and Zoiko One, including period overlap checks,
+      transfer records and split-billing exception approvals.
+
+6. Complete merchant, tax, processor and invoice identity for ZoikoSuite's own subscription billing before live self-service
+      charging.
+
+7. Create capability_registry, market_release_registry and claim_registry as separate production controls. Marketing
+      availability must be generated from approved release truth, not manual page copy.
+
+8. Define the system-of-record matrix for every integrated domain and field family. No integration may silently convert a
+      replica or cache into authoritative truth.
+
+9. Complete obligation/control/evidence schemas, effective-date versioning and status semantics so "compliant," "controlled,"
+      "verified," "complete" and "approved" have deterministic meanings.
+
+10. Define AI risk classes, human-review triggers and autonomous-action allowlist. High-impact actions require deterministic
+      validation and maker-checker where applicable.
+
+11. Implement immutable/auditable evidence and policy histories. Material past decisions must replay against the source/policy
+      versions active at that time.
+
+12. Implement server-side authorization and segregation of duties for policy edits, control overrides, evidence acceptance, role
+      changes, exports, integration credentials, commercial discounts and subscription payment details.
+
+13. Implement idempotency, transactional outbox/equivalent and dedupe across imports, webhooks, workflow triggers, AI tool
+      execution, evidence ingestion, notifications and subscription billing.
+
+14. Complete data-residency, privacy, retention/legal-hold and provider-governance configuration for each launch market and
+      data class.
+
+15. Provision isolated production/staging/test with synthetic data, non-production integrations, test webhooks and isolated
+      communications.
+
+16. Complete Section 27 Production Acceptance Checklist with Product, Commercial, Engineering, Security,
+      Legal/Compliance, Privacy, Data Governance, AI/ML and QA sign-off.
+
+5. A. Commercial Account, Organization, Workspace & Legal Entity
+Model
+
+A1. What is the top-level tenant object?
+
+Decision: ORGANIZATION is the commercial/product tenant. Workspaces and legal entities sit beneath it.
+Commercial / product rationale: Enterprise customers may have multiple business units, jurisdictions and operational
+workspaces without needing duplicate commercial identities.
+Engineering rule: Persist organization_id, commercial_account_id, workspace_id and legal_entity_id separately. Do not infer
+legal entity, region or subscription payer from the signed-in user.
+
+A2. Can one organization operate multiple legal entities and business units?
+
+Decision: Yes, when entitled and market-enabled.
+Commercial / product rationale: Governance, evidence and reporting often differ by legal entity, employing entity, reporting
+entity or operating unit.
+Engineering rule: Every obligation, control, evidence item, workflow and report row carries the appropriate
+organization/workspace/entity scope. Cross-entity aggregation is explicit and traceable.
+
+A3. Can users belong to multiple organizations or workspaces?
+
+Decision: Yes, with scoped membership.
+Commercial / product rationale: Advisers, shared-service teams and group executives may need controlled cross-
+organization access.
+Engineering rule: Resolve actor + organization + workspace + entity + data class + permission on every request; deny by
+default when scope is ambiguous.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0              Page 6
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+A4. What is the commercial account?
+
+Decision: The verified customer record that buys ZoikoSuite.
+Commercial / product rationale: The buyer, payer and contracting entity may differ from operational users and entities being
+governed.
+Engineering rule: commercial_account stores legal customer name, billing/tax facts, contract/order references, processor
+customer refs, billing_source, renewal and payment state. Operational data stays separate.
+
+A5. Can workspaces be created without being billable?
+
+Decision: Yes.
+Commercial / product rationale: Pilots, internal controls, implementation workspaces and sandboxes may be legitimate non-
+billable estates.
+Engineering rule: Workspace charge authorization requires billing_classification + entitlement + catalog/contract + billable
+event. Environment name or workspace age is never enough.
+
+A6. What happens when a member is removed?
+
+Decision: Access ends according to security policy; historical attribution remains.
+Commercial / product rationale: Governance evidence must retain who approved, changed or reviewed past items.
+Engineering rule: Deactivate membership and revoke sessions/tokens; do not delete actor IDs from audit history, evidence,
+approvals or historical exports.
+
+6. B. Plans, Packaging, Contracts, Trials, Entitlements & Upgrades
+
+B1. What are the canonical public plans?
+
+Decision: Whatever the current APPROVED pricing registry defines; this standard does not invent names.
+Commercial / product rationale: The available product record confirms tiered pricing architecture but not a final price book in
+this operating standard.
+Engineering rule: Use stable internal plan_id and catalog_version_id independent of display label. Unknown or unpublished
+mappings fail closed.
+
+B2. What can a plan entitle?
+
+Decision: Approved capability packs, user/entity/workspace limits, integrations, evidence volume, AI/automation allowances,
+support/security options, market scope or contracted capacity.
+Commercial / product rationale: ZoikoSuite is multi-dimensional; packaging must not force schema redesign when the
+commercial model evolves.
+Engineering rule: subscription_item supports metric_type, entitlement_set_id, limits, add-ons, market scope and contract
+overrides. Telemetry alone cannot become a billable metric.
+
+B3. Is a free plan or free trial assumed?
+
+Decision: No.
+Commercial / product rationale: Commercial truth must come from the approved catalog/evaluation program.
+Engineering rule: Use EVALUATION_PROGRAM with duration, payment requirement, entitlement set, conversion policy and
+expiry action. No automatic charge without approved terms and payment authorization.
+
+B4. How do upgrades work?
+
+Decision: Immediate or scheduled according to catalog/contract after commercial preview and required authorization.
+Commercial / product rationale: Capabilities should not race ahead of payment, contract approval, market eligibility or
+security prerequisites.
+Engineering rule: Persist quote/preview, catalog version, effective_at, approver/customer consent and resulting entitlement
+version. Activate only after required prerequisites succeed.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0                Page 7
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+B5. How do downgrades work?
+
+Decision: At renewal by default, subject to compatibility and retention checks.
+Commercial / product rationale: A downgrade can invalidate integrations, entities, workflows, AI allowances or
+retention/security options.
+Engineering rule: Schedule downgrade; generate incompatibility report; block destructive remediation. Historical records and
+evidence are never deleted merely to fit a lower plan.
+
+B6. How are bespoke enterprise terms handled?
+
+Decision: Through approved contract/order-form overlays, not hidden code switches.
+Commercial / product rationale: Enterprise terms may modify quantities, markets, support, data residency, integration scope
+and security commitments.
+Engineering rule: Store contract_entitlement_overlay with effective dates, approval, legal reference, precedence and renewal
+behavior. Every runtime entitlement decision is explainable to a catalog/contract source.
+
+B7. Can AI or integration usage create surprise charges?
+
+Decision: No.
+Commercial / product rationale: Operational telemetry is not commercial consent.
+Engineering rule: A usage meter becomes billable only when meter_definition + catalog rate/allowance + disclosure +
+customer authorization + approved aggregation policy are active.
+
+7. C. Capability, Module & Release Registry
+
+Dimension                     Question answered                              Controlling object
+Capability existence                                                         capability_registry
+Commercial entitlement        Does the capability exist in the code/product  entitlement_service
+Market availability           model?                                         market_release_registry
+Integration readiness                                                        integration_capability_registry
+Security/privacy eligibility  Is this organization entitled under            policy engine
+Operational release state     catalog/contract?                              release_registry
+Execution authority                                                          authorization + automation policy
+Public claim eligibility      Is the capability approved in the              claim_registry
+                              organization/entity jurisdiction and
+                              language?
+
+                              Are required connectors/providers certified
+                              and healthy?
+
+                              Is the data class, residency, provider and
+                              tenant policy compatible?
+
+                              GA / BETA / PILOT / INTERNAL /
+                              DISABLED / INCIDENT_RESTRICTED
+
+                              May this actor/system perform the action
+                              now?
+
+                              May Marketing/Sales describe the capability
+                              as available?
+
+C1. Can the UI infer availability from plan alone?
+
+Decision: No.
+Commercial / product rationale: Entitlement is only one gate among market, provider, release, security and incident state.
+Engineering rule: Capability resolution returns structured reason codes for enabled, unavailable, requires upgrade, market
+blocked, provider unavailable, permissions blocked or incident-restricted states.
+
+C2. Can public marketing claim capabilities from engineering roadmap state?
+
+Decision: No.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0                                                            Page 8
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+Commercial / product rationale: Roadmap, deployed code and approved public availability are different facts.
+Engineering rule: Public claim service consumes only claim_registry entries linked to release evidence, market scope, wording
+owner, approval and expiry/review date.
+
+C3. How are capability changes versioned?
+
+Decision: Published capabilities and entitlement definitions are versioned and effective-dated.
+Commercial / product rationale: Historical contractual and runtime behavior must be reproducible.
+Engineering rule: Never edit a released entitlement or policy meaning in place. Create a new version with
+migration/compatibility rules and rollback target.
+
+8. D. Connected Systems, Systems of Record & Data Authority
+
+Domain                        Authority rule
+General ledger / ERP
+Payroll                       Accounting system or Finance-approved ledger remains
+HR / HCM                      authoritative for posted accounting entries and financial statements
+Billing / AR                  unless explicitly migrated.
+Identity
+Document repository           Approved payroll engine/provider remains authoritative for
+Legal / compliance sources    calculated payroll results, statutory submissions and payment
+ZoikoSuite                    outcomes.
+
+                              Approved HR/HCM system remains authoritative for
+                              employment/master data where designated.
+
+                              Approved billing/invoicing system remains authoritative for issued
+                              invoices/payments where designated; Zoiko Billing may be a native
+                              source when connected.
+
+                              Enterprise IdP / Zoiko identity service is authoritative for identity and
+                              authentication facts; ZoikoSuite owns product memberships and
+                              scopes.
+
+                              Source repository owns original file/version; ZoikoSuite stores
+                              governed references, hashes, approved copies or evidence
+                              snapshots according to policy.
+
+                              Approved legal/regulatory/source registries govern obligation
+                              content and effective dates; model memory is never the authority.
+
+                              Authoritative for its own obligations, control definitions,
+                              workflow/case state, evidence acceptance, attestations, approvals,
+                              exceptions, policy versions and audit events.
+
+D1. Can ZoikoSuite overwrite a connected system because its data appears stale?
+
+Decision: No by default.
+Commercial / product rationale: Staleness is an exception to reconcile, not permission to seize authority.
+Engineering rule: Create data_quality_exception and source_conflict records. Apply documented precedence or route to
+owner; never silently back-write without an approved integration action.
+
+D2. How are conflicting sources handled?
+
+Decision: By field-level source precedence, freshness, verification and review policy.
+Commercial / product rationale: Enterprise integrations frequently disagree during cutovers, timing gaps and manual
+corrections.
+Engineering rule: source_authority_map defines source, field family, precedence, effective dates, conflict route and allowed
+correction path. Ambiguous material facts block downstream high-impact decisions.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0         Page 9
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+D3. Can cached/derived data become authoritative?
+
+Decision: Only for explicitly defined derived facts.
+Commercial / product rationale: A cache improves performance but does not change provenance.
+Engineering rule: Every derived value carries source refs, calculation/rule version, generated_at, expiry/freshness and
+authority_class = DERIVED. Historical replay uses original versions.
+
+9. E. Obligation, Policy, Control & Compliance Model
+
+E1. What is the core governance chain?
+
+Decision: OBLIGATION  REQUIREMENT  POLICY/CONTROL  EVIDENCE/TEST  FINDING/EXCEPTION 
+REMEDIATION  REVIEW/ATTESTATION.
+Commercial / product rationale: This prevents "compliance" from becoming an unexplained dashboard color.
+Engineering rule: Persist scoped, versioned objects and links. Every status must be traceable to source, jurisdiction/entity,
+owner, evidence and review state.
+
+E2. What makes an obligation applicable?
+
+Decision: A versioned applicability decision based on jurisdiction, entity, activity, product/process, thresholds, dates and
+approved source rules.
+Commercial / product rationale: Applicability is contextual and changes over time.
+Engineering rule: Store applicability_decision with source/rule versions, effective dates, facts used, actor/system,
+confidence/uncertainty and review requirement. Unknown applicability does not default to NOT_APPLICABLE.
+
+E3. Can a control be marked effective because it exists?
+
+Decision: No.
+Commercial / product rationale: Design existence and operating effectiveness are different.
+Engineering rule: Separate DESIGN_STATUS and OPERATING_EFFECTIVENESS. Effectiveness requires test/evidence
+under an approved methodology and review cadence.
+
+E4. What does COMPLIANT mean?
+
+Decision: Only a scoped, defined status produced by an approved evaluation rule; it is not a universal legal guarantee.
+Commercial / product rationale: Overbroad labels create legal and product risk.
+Engineering rule: UI/reporting must show scope, as-of date, source coverage, exceptions, evidence freshness and limitations.
+Prefer "control status," "obligation status" or "assessment status" where appropriate.
+
+E5. Can users override control or obligation status?
+
+Decision: Only through governed exception/override workflow.
+Commercial / product rationale: Manual edits without reason or expiry destroy assurance value.
+Engineering rule: Override requires reason, authority, scope, expiry/review, compensating control where applicable and
+immutable audit. High-risk overrides require second approval.
+
+E6. How are attestations handled?
+
+Decision: As signed/attributed assertions with scope and evidence, not automatic proof.
+Commercial / product rationale: An attestation can be important but remains a representation by an identified actor.
+Engineering rule: attestation stores statement/version, subject, period, signer, role, timestamp, evidence refs, expiry and
+challenge/revocation state.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0  Page 10
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+10. F. Regional Intelligence, Jurisdiction & Effective-Date Governance
+
+F1. Can one rule apply globally?
+
+Decision: Only when an approved global rule explicitly has that scope.
+Commercial / product rationale: Business, tax, employment, privacy, reporting and regulatory requirements vary by
+jurisdiction and entity.
+Engineering rule: Every obligation/rule/policy has jurisdiction_scope, entity_scope, effective_from/to, source_version and
+supersession links. "GLOBAL" is an explicit scope, not a default.
+
+F2. How are legal/regulatory changes introduced?
+
+Decision: Through governed source intake, review, impact analysis, version release and effective-date activation.
+Commercial / product rationale: A new publication should not instantly rewrite tenant obligations without validation.
+Engineering rule: Change pipeline: source_received  validated  mapped  reviewed  approved  scheduled/active.
+Impacted tenants/processes are enumerated before activation.
+
+F3. What if a market is unsupported or ambiguous?
+
+Decision: Fail to unsupported/uncertain state and route appropriately.
+Commercial / product rationale: Guessing jurisdictional applicability is unsafe.
+Engineering rule: Use MARKET_UNSUPPORTED / JURISDICTION_UNCERTAIN states. Block definitive compliance claims
+and high-impact automation until resolved.
+
+F4. Can translated regulatory content be authoritative automatically?
+
+Decision: No.
+Commercial / product rationale: Translation can change legal meaning.
+Engineering rule: Translation has approval tier, source-language reference, reviewer and allowed-use. High-impact use may
+require approved localized source or human review.
+
+F5. How are time-zone and legal-day rules handled?
+
+Decision: From market/entity calendars and explicit policy.
+Commercial / product rationale: Deadlines and effective dates can depend on local time, holidays and business-day
+conventions.
+Engineering rule: deadline_rule stores timezone, calendar, holiday source, cutoff semantics, rule version and exception path.
+Never rely on application server timezone.
+
+11. G. AI, Agentic Automation & Human Authority
+
+AI GOVERNANCE DOCTRINE
+
+ZoikoSuite may use AI to reduce analysis and operating work, but the platform must never confuse model capability with
+organizational authority. The deterministic policy layer, source/evidence state, actor permissions, approved tool registry,
+tenant automation policy and required human approvals outrank model preference.
+
+G1. What may AI do by default?
+
+Decision: Classify, summarize, extract, compare, draft, prioritize, recommend and explain within approved data/source scope.
+Commercial / product rationale: These activities can deliver value without silently creating irreversible business effects.
+Engineering rule: AI outputs carry model/prompt/tool versions, source/evidence refs, confidence/limitation metadata and audit
+IDs where material.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0  Page 11
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+G2. What actions require heightened controls?
+
+Decision: Any action affecting money, employment, tax/filing, legal position, external certification, access/security, contractual
+commitment, record deletion, retention/legal hold or regulated reporting.
+Commercial / product rationale: These actions can create irreversible legal, financial or human consequences.
+Engineering rule: Require action risk class, deterministic preconditions, explicit permission, maker-checker/human approval
+where defined, idempotency, postcondition verification and rollback/compensation plan.
+
+G3. Can an AI agent change a policy or control definition?
+
+Decision: Not silently.
+Commercial / product rationale: Policy changes alter governance truth across tenants and historical evaluation.
+Engineering rule: Agent may draft changes; publication requires versioned change request, impact analysis, authorized
+approval, tests and release record.
+
+G4. Can AI mark an obligation compliant?
+
+Decision: Only if a deterministic approved rule defines that status and all required evidence/test conditions are met.
+Commercial / product rationale: Model narrative is not assurance evidence.
+Engineering rule: AI may recommend status or identify evidence gaps; final status engine uses policy/rule logic and any
+required reviewer decision.
+
+G5. What happens when AI is uncertain or sources conflict?
+
+Decision: Route to clarification, limitation or review; do not infer certainty from fluent output.
+Commercial / product rationale: Uncertainty is a real system state.
+Engineering rule: Use classification/risk states including UNCERTAIN/CONFLICT/NO_SOURCE where applicable. High-
+impact actions fail closed.
+
+G6. Can external model providers train on tenant data by default?
+
+Decision: No default training use is authorized.
+Commercial / product rationale: Business, financial, HR and legal data require purpose limitation and provider governance.
+Engineering rule: Provider registry must verify training-use posture, retention, region, DPA/subprocessors and approved data
+classes before production calls.
+
+G7. How are autonomous actions allowed?
+
+Decision: Through explicit action-policy allowlists per tenant, role, risk class and tool.
+Commercial / product rationale: "Agentic" must be a controlled execution model, not broad delegated authority.
+Engineering rule: automation_policy defines action, preconditions, max scope/amount, required approvals, dry-run/preview,
+idempotency, time window, rate/volume limits, kill switch and audit event set.
+
+12. H. Workflow, Cases, Approvals, Tasks & Escalation
+
+H1. What is the canonical workflow lifecycle?
+
+Decision: DRAFT  ACTIVE  WAITING/IN_REVIEW  COMPLETED / CANCELED / FAILED, with separate exception and
+approval dimensions.
+Commercial / product rationale: One status cannot safely represent work, approval, evidence and exceptions.
+Engineering rule: Model work_state, approval_state, evidence_state, risk_state and exception_state separately where
+needed; user-facing status is composed.
+
+H2. How are approvals modeled?
+
+Decision: As explicit decision objects linked to requested action, scope, evidence and policy.
+Commercial / product rationale: An approval must be replayable and revocable/expired where appropriate.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0   Page 12
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+Engineering rule: approval records requester, approver, role, decision, reason, object/action, threshold, evidence refs,
+decided_at, expires_at and self-approval check.
+
+H3. Is maker-checker mandatory everywhere?
+
+Decision: No; it is risk/threshold driven.
+Commercial / product rationale: Universal dual approval creates friction while no approval creates risk.
+Engineering rule: approval_policy determines when second-person approval is required by action, risk class, amount/scope,
+tenant and market. Self-approval attempts are blocked and evented.
+
+H4. How are exceptions handled?
+
+Decision: As first-class objects with owner, severity, due date, risk, evidence and resolution.
+Commercial / product rationale: A failed control or integration must not disappear into notification history.
+Engineering rule: exception record includes source, affected obligation/control/workflow, materiality, owner, SLA/due date,
+remediation, approval and closure evidence.
+
+H5. What happens when a task becomes obsolete after source state changes?
+
+Decision: Re-evaluate and supersede/suppress the task where policy allows.
+Commercial / product rationale: Users should not act on stale generated work.
+Engineering rule: Workflow decision engine checks authoritative state before execution/reminder. Supersession preserves the
+original task and reason rather than deleting history.
+
+13. I. Evidence, Auditability, Attestations & Control Testing
+
+I1. What qualifies as evidence?
+
+Decision: A governed evidence object with provenance, subject/scope, period, source, integrity metadata, access classification
+and review status.
+Commercial / product rationale: Uploading a file is not enough to establish evidentiary relevance or authenticity.
+Engineering rule: evidence_object stores source_system, source_ref, hash/version, acquired_at, subject, period, data_class,
+retention, license/export rights, reviewer state and links to controls/obligations.
+
+I2. Can evidence be edited in place?
+
+Decision: Source metadata may be corrected under audit; original evidence bytes/snapshot cannot be silently overwritten.
+Commercial / product rationale: Historical assurance depends on chain of custody.
+Engineering rule: Use version/append model; preserve original hash and supersession/revocation reason. Derived extracts
+link to source evidence and transformation version.
+
+I3. How are control tests represented?
+
+Decision: As repeatable test definitions and executions.
+Commercial / product rationale: A control result without method, sample and evidence cannot be reproduced.
+Engineering rule: control_test_execution stores test_definition_version, period, population/sample, procedure, evidence refs,
+tester, result, exceptions, reviewer and timestamps.
+
+I4. Can AI-generated evidence summaries substitute for source evidence?
+
+Decision: No.
+Commercial / product rationale: Summary improves usability but is not the source.
+Engineering rule: AI summaries are DERIVED artifacts, linked to evidence refs, model/prompt version and confidence.
+Review/export must preserve access to authorized source evidence or clearly state limitations.
+
+I5. What makes the audit trail production grade?
+
+Decision: Append-preserving, versioned, tenant-scoped, tamper-evident/replayable and complete for material events.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0           Page 13
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+Commercial / product rationale: A mutable activity log is not enough for regulated operating evidence.
+
+Engineering rule: Use transactional outbox/equivalent, immutable event IDs, schema versions, correlation/causation, actor,
+scope, before/after references, reason, timestamps and integrity verification.
+
+14. J. Documents, Records, Retention, Legal Hold & Exports
+
+J1. How is retention determined?
+
+Decision: By record type, tenant contract, jurisdiction, legal/regulatory need, source rights, privacy obligations and legal hold.
+Commercial / product rationale: One global retention period is unsafe.
+Engineering rule: Version retention_policy; every purge checks legal hold, record class, minimum/maximum rules and source-
+system ownership before deletion/redaction.
+
+J2. Does account cancellation delete records?
+
+Decision: No automatic destructive deletion of governed records.
+Commercial / product rationale: Financial, legal, HR and compliance evidence may need retention or export.
+Engineering rule: Separate access state, commercial subscription state and data-retention state. Closure launches
+retention/offboarding workflow.
+
+J3. How does legal hold behave?
+
+Decision: It blocks deletion/redaction actions covered by the hold until authorized release.
+Commercial / product rationale: Ordinary lifecycle automation must not defeat preservation duties.
+Engineering rule: legal_hold specifies scope, custodians/objects, authority, start, status and release approval. Hold checks
+occur in deletion/export/migration paths.
+
+J4. How are exports controlled?
+
+Decision: By role, purpose, data class, recipient scope, source rights, legal hold and market rules.
+Commercial / product rationale: Exports can become the largest uncontrolled data exfiltration surface.
+Engineering rule: Export job uses preview/manifest, approval for restricted classes, watermark/classification where required,
+asynchronous secure generation, expiry and audit event.
+
+J5. Can generated Word/PDF packs imply certification?
+
+Decision: Only when an approved assurance/attestation workflow permits the exact wording.
+Commercial / product rationale: A professional-looking document can be mistaken for legal or audit certification.
+Engineering rule: Template registry separates operational reports, evidence packs, attestations, certifications and drafts.
+External assurance wording requires Legal/Compliance approval and authorized signatory.
+
+15. K. Accounting, Tax, HR, Payroll & Billing Boundaries
+
+Domain                        Boundary
+Accounting
+Tax                           ZoikoSuite may orchestrate controls, evidence, reconciliation, review
+HR                            and decision intelligence. It is not automatically the general ledger or
+                              authoritative financial statement engine.
+
+                              ZoikoSuite may track obligations, source facts, evidence, workflows
+                              and integrations. It does not promise universal tax advice,
+                              calculation, filing or compliance unless a market-specific released
+                              capability explicitly does so.
+
+                              ZoikoSuite may govern employment-related controls/workflows and
+                              integrate HR data. It does not silently replace Zoiko HR or an
+                              external HCM system.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0        Page 14
+ZOIKOSUITE                                Commercial Operations, Subscription & Governed Platform Standard
+
+Domain                        Boundary
+Payroll
+                              ZoikoSuite may govern payroll controls, deadlines, evidence and
+Billing                       exceptions. It does not silently recalculate or become the payroll
+Legal/Compliance              engine unless an explicit approved integration/service owns that
+ZoikoLogia / Kriton           action.
+
+                              ZoikoSuite may govern revenue-operations controls and integrate
+                              Zoiko Billing or external billing systems. Tenant invoices/payments
+                              remain owned by the authoritative billing source.
+
+                              ZoikoSuite supports legal/compliance operations and evidence. It
+                              does not represent AI output as legal advice or regulatory approval.
+
+                              Where integrated, ZoikoLogia/Kriton source-backed intelligence
+                              transfers only through approved scopes; downstream ZoikoSuite
+                              inherits applicable classification, retention and evidence constraints.
+
+K1. Can ZoikoSuite normalize data from these domains?
+
+Decision: Yes, into governed operational facts.
+Commercial / product rationale: Cross-domain intelligence requires a common model without corrupting source authority.
+Engineering rule: normalized_fact retains source_system, source_record, source_version, observed_at, effective_at,
+transformation version and authority class.
+
+K2. Can one executive dashboard combine all domains?
+
+Decision: Yes, with explicit definitions and traceability.
+Commercial / product rationale: CFO/GC/CIO value comes from cross-domain visibility, but aggregation can mislead.
+Engineering rule: Each metric declares source, scope, freshness, currency/entity treatment, calculation version and whether it
+is operational, accounting, legal or estimated.
+
+16. L. Integrations, API, Webhooks, Idempotency & Import Controls
+
+L1. Are material mutation APIs idempotent?
+
+Decision: Yes whenever retries could duplicate or repeat a consequential action.
+Commercial / product rationale: Distributed systems retry; governance automation must not multiply effects.
+Engineering rule: Require idempotency key or deterministic operation key for creates/approvals/executions/exports. Persist
+fingerprint and prior result.
+
+L2. How are outbound webhooks delivered?
+
+Decision: Signed, versioned, at-least-once, tenant-scoped and replayable.
+Commercial / product rationale: Consumers need verification and safe dedupe.
+Engineering rule: Envelope includes event_id, event_type, schema_version, tenant/workspace, environment, occurred_at,
+resource refs and signature. Replays preserve identity or explicit replay metadata.
+
+L3. Can a connector write directly to core tables?
+
+Decision: No.
+Commercial / product rationale: Direct database coupling bypasses authorization, validation, audit and source precedence.
+Engineering rule: All integrations use versioned service/API/event contracts. Shared database writes across product
+boundaries are prohibited.
+
+L4. How are bulk imports handled?
+
+Decision: Stage  validate  preview  approve where required  commit idempotently  reconcile.
+Commercial / product rationale: A malformed import can corrupt control state at scale.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0  Page 15
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+Engineering rule: Batch ID, schema version, row errors, dedupe, dry-run, source mapping, approval threshold and correction
+strategy are mandatory. Rejected rows remain visible.
+
+L5. How are integration failures represented?
+
+Decision: As explicit health/exceptions; they do not silently mutate governance truth.
+Commercial / product rationale: A failed connector is not proof a control failed or passed.
+Engineering rule: integration_job and connection_health are separate from obligation/control state. Downstream high-impact
+decisions check freshness and health before use.
+
+L6. How are provider credentials managed?
+
+Decision: Through centrally governed secret references and narrowly scoped OAuth/service identities.
+Commercial / product rationale: Credentials are a high-impact administrative surface.
+Engineering rule: No secrets in application logs, support tickets, exports or tenant-visible webhooks. Credential changes
+require step-up, approval where material, notification and audit.
+
+17. M. Reporting, Executive Intelligence & Analytics Boundaries
+
+M1. What is an executive score?
+
+Decision: A governed derived metric with explicit definition, components, scope and limitations.
+Commercial / product rationale: Composite scores can obscure evidence gaps or create false precision.
+Engineering rule: metric_definition stores formula/version, inputs, weights, missing-data behavior, owner, approval and display
+wording. Users can drill to source facts and exceptions.
+
+M2. Can "risk" be one global number?
+
+Decision: Only as an approved summary, never as the underlying truth.
+Commercial / product rationale: Legal, financial, security, operational and control risk are heterogeneous.
+Engineering rule: Keep risk domains and drivers separately queryable. Summary score shows uncertainty, data freshness and
+excluded dimensions.
+
+M3. Can dashboards call a control "verified" when evidence is stale?
+
+Decision: No.
+Commercial / product rationale: Evidence freshness and test period matter.
+Engineering rule: Status composition evaluates evidence freshness, test validity, open exceptions and review expiry at read
+time. Stale status becomes EXPIRED/REVIEW_REQUIRED/UNKNOWN per policy.
+
+M4. Can operational dashboards be treated as financial statements?
+
+Decision: No.
+Commercial / product rationale: Cross-domain operational intelligence is not a substitute for Finance-controlled accounting
+reports.
+Engineering rule: Metrics use precise labels; Finance-controlled metrics explicitly identify accounting source and
+close/version. No "recognized revenue," "cash," or statutory figure without approved accounting definition.
+
+M5. How should persona views differ?
+
+Decision: They use the same governed source objects but different lenses and action priorities.
+Commercial / product rationale: Separate data models for CFO/GC/CIO would create conflicting truth.
+Engineering rule: Persona views are projections over shared objects/permissions: CFO emphasizes finance/control/obligation
+economics; GC emphasizes legal/compliance obligations, evidence and exceptions; CIO emphasizes systems, integrations,
+security, data and operational resilience.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0             Page 16
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+18. N. ZoikoSuite Subscription Billing -- Zoiko Charges to Customers
+
+N1. What system bills customers for ZoikoSuite itself?
+
+Decision: A dedicated commercial-account/subscription layer integrated with approved processor/Finance invoicing paths.
+Commercial / product rationale: ZoikoSuite monetization must remain distinct from tenant business-operation records.
+Engineering rule: commercial_account + commercial_subscription + price_catalog + commercial_invoice/payment are
+separate from tenant governance, evidence and connected financial records.
+
+N2. What is the billing metric?
+
+Decision: Catalog-defined.
+Commercial / product rationale: The approved commercial model may evolve across users, entities, capabilities, integrations,
+AI/automation, records or contracted capacity.
+Engineering rule: Model subscription_item.metric_type generically; charge only APPROVED metrics with explicit
+allowance/rate and customer authorization.
+
+N3. Can internal platform telemetry determine the invoice directly?
+
+Decision: Not without a governed commercial meter.
+Commercial / product rationale: Telemetry may be noisy, late, duplicated or non-billable.
+Engineering rule: commercial_usage_meter is a separate Plane 1 ledger with event IDs, validation, dedupe, aggregation
+window and billable state.
+
+N4. Are third-party provider fees automatically Zoiko revenue?
+
+Decision: No.
+Commercial / product rationale: Cloud, model, tax, data, e-signature or integration-provider economics differ from platform
+subscription economics.
+Engineering rule: Tag fee_source and present/contract third-party charges separately unless approved bundle terms explicitly
+include them.
+
+N5. Can ZoikoSuite use its own operational objects as subscription invoices?
+
+Decision: No domain collapse.
+Commercial / product rationale: Dogfooding may reuse services, but commercial entitlement and financial identity must
+remain separate.
+Engineering rule: If shared invoice infrastructure is used, isolate legal seller, namespace, ledger, sequence, processor
+mapping, access controls, reconciliation and kill switch.
+
+N6. How is cancellation handled?
+
+Decision: At period end by default for self-service unless catalog/contract states otherwise; preserve export/retention
+obligations.
+Commercial / product rationale: Immediate destructive shutdown can strand critical records.
+Engineering rule: Store cancel request/effective dates, reason, actor, contract rule, retention/offboarding state and Zoiko One
+relationship.
+
+19. O. Failed Payments, Dunning, Restriction & Termination
+
+O1. What happens after ZoikoSuite's own payment fails?
+
+Decision: Governed recovery, not immediate data loss.
+
+Commercial / product rationale: Business-governance records are operationally sensitive and may be needed during a billing
+dispute.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0        Page 17
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+Engineering rule: Commercial state becomes PAST_DUE; retry/notice starts. Restriction milestones are
+policy/catalog/contract controlled; this document does not invent day counts absent final approval.
+
+O2. What remains available while restricted?
+
+Decision: Essential account/billing remediation, critical history and permitted export/read access according to policy.
+Commercial / product rationale: Customers must be able to understand obligations and retrieve records without continuing
+paid operational expansion.
+Engineering rule: Entitlement state PAST_DUE/RESTRICTED/SUSPENDED is independent of data-retention state and
+underlying connected-system truth.
+
+O3. Does successful retry restore access automatically?
+
+Decision: Yes when authoritative payment/reconciliation confirms it and contract permits.
+Commercial / product rationale: Manual restoration after normal recovery creates unnecessary friction.
+Engineering rule: Entitlement service consumes commercial payment events idempotently; restoration is logged and does not
+re-run tenant workflows.
+
+O4. Can tenant control failures or compliance exceptions suspend ZoikoSuite for
+nonpayment?
+
+Decision: No.
+Commercial / product rationale: Product subscription and tenant governance outcomes are separate planes.
+Engineering rule: No event path from tenant control/obligation state to commercial_subscription suspension except explicit
+safety/legal/abuse controls unrelated to payment.
+
+20. P. Zoiko One Bundling, Cross-Sell & Double-Charge Prevention
+
+P1. Can ZoikoSuite be purchased without Zoiko One?
+
+Decision: Yes.
+Commercial / product rationale: Commercial independence is part of the platform strategy.
+Engineering rule: Standalone onboarding, pricing, contract, support, docs, analytics and legal routes cannot require a Zoiko
+One subscription.
+
+P2. Can Zoiko One provide ZoikoSuite entitlement?
+
+Decision: Yes where bundle/contract includes it.
+Commercial / product rationale: Native distribution should not force a duplicate purchase.
+Engineering rule: billing_source = ZOIKO_ONE_BUNDLE with bundle/contract ref. Disable direct checkout for identical
+overlapping entitlement unless approved migration/upgrade path is active.
+
+P3. How is standalone  Zoiko One migration handled?
+
+Decision: Through an effective-dated commercial transfer.
+Commercial / product rationale: Silent overlap creates double charging and entitlement drift.
+Engineering rule: transfer record maps old/new billing source, cancellation/creation dates, entitlement continuity, credits if
+needed and reconciliation. No overlap without explicit contract logic.
+
+P4. Can shared services be reused?
+
+Decision: Yes where approved.
+Commercial / product rationale: Commercial separation does not require wasteful duplication of identity, notifications, audit,
+integrations or common infrastructure.
+Engineering rule: Shared services expose versioned tenant-scoped contracts. ZoikoSuite retains independent catalog,
+entitlements, product analytics, support, documentation and commercial account.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0  Page 18
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+P5. Can ZoikoSuite data merge automatically with other Zoiko products?
+
+Decision: No.
+Commercial / product rationale: Native integration is valuable but must respect purpose, permissions and data authority.
+Engineering rule: Cross-product data transfer requires integration entitlement, source/recipient scopes, classification,
+minimization, audit and revocation. Shared tenant identity does not equal shared data permission.
+
+21. Q. Global Market Availability, Data Residency & Localization
+
+Q1. What does "global" mean?
+
+Decision: Architecturally capable of multi-jurisdiction operation under verified market configuration.
+Commercial / product rationale: Global architecture is not proof of legal or commercial availability everywhere.
+Engineering rule: market_release_registry gates country/region, entity, language, data residency, provider, source content,
+claims, integrations and support readiness.
+
+Q2. How is data residency enforced?
+
+Decision: Through policy plus infrastructure routing/storage controls.
+Commercial / product rationale: A dropdown preference without technical enforcement is not residency.
+Engineering rule: Every data class resolves allowed regions/providers/storage/backup/export routes before processing;
+incompatible paths fail closed or require approved exception.
+
+Q3. How are cross-border transfers handled?
+
+Decision: Through approved transfer/legal mechanism and provider/region eligibility.
+Commercial / product rationale: International data movement can create obligations independent of application function.
+Engineering rule: transfer_policy records source/destination, data class, provider, mechanism/evidence, tenant contract,
+approval and re-verification trigger.
+
+Q4. How are localized UI and content released?
+
+Decision: Through language/terminology QA and market claim review.
+Commercial / product rationale: Translation quality can affect legal meaning and user trust.
+Engineering rule: localization_release records language, market, reviewed strings, terminology glossary, accessibility result
+and claim approval. No machine-only publication of high-impact legal/compliance content.
+
+22. R. Security, Privacy, AI Data Use & Provider Governance
+
+Control area                  Minimum standard
+Tenant isolation
+Least privilege               Every tenant-scoped object, query, cache, index, file, event, export
+Privileged administration     and analytic path enforces tenant scope. Cross-tenant access is
+Encryption/secrets            denied and auditable.
+Provider governance
+                              Permissions are role + tenant/workspace/entity + data-class + action
+                              scoped; deny precedence applies.
+
+                              Step-up authentication, just-in-time or time-bounded privilege, break-
+                              glass reason/expiry/review and customer-auditable access where
+                              appropriate.
+
+                              Encrypt in transit and at rest; store credentials in approved secrets
+                              systems; never expose secrets in logs, prompts, exports or support
+                              tooling.
+
+                              Provider use requires exact-use approval, security/privacy review,
+                              region eligibility, retention/training posture, subprocessor visibility,
+                              incident terms and offboarding path.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0              Page 19
+ZOIKOSUITE                                Commercial Operations, Subscription & Governed Platform Standard
+
+Control area                  Minimum standard
+AI data minimization
+Training / secondary use      Only minimum approved context may enter model/tool paths;
+Secure SDLC                   PII/confidential fields are redacted/tokenized/withheld where not
+Accessibility                 required.
+
+                              No default use of tenant data for model training or secondary
+                              analytics beyond approved purpose.
+
+                              Threat modeling, code/dependency/secret/IaC scanning, review
+                              gates, penetration testing and remediation evidence before
+                              applicable production release.
+
+                              User-facing surfaces target WCAG 2.2 AA-equivalent product
+                              standard; accessibility must not create security or data-protection
+                              bypasses.
+
+R1. Can Support impersonate a tenant admin?
+
+Decision: Only through explicit, visible, time-bounded support access where enabled.
+Commercial / product rationale: Support troubleshooting must not become hidden privileged access.
+Engineering rule: Impersonation records original actor, customer/tenant authorization where required, scope, reason,
+start/end, actions and prohibits approval/signature actions not explicitly delegated.
+
+R2. Can provider/model changes occur silently?
+
+Decision: No for material provider/model behavior or data-handling changes.
+Commercial / product rationale: Vendor changes can affect privacy, quality, cost and risk.
+Engineering rule: Provider/model registry has version, evidence, review triggers and production authorization token. Material
+change suspends affected use until re-evaluated or approved.
+
+R3. How are data subject/privacy requests handled?
+
+Decision: Through governed workflows respecting source-system authority and legal holds.
+Commercial / product rationale: ZoikoSuite may hold references, derived data and copies while underlying source systems
+hold originals.
+Engineering rule: DSR workflow inventories ZoikoSuite + connected-source responsibilities, executes permitted actions,
+records exceptions/holds, and reconciles completion evidence.
+
+23. S. Communications, Notifications, Portals & Delivery Evidence
+
+S1. What communication estates should be separated?
+
+Decision: At minimum: ZoikoSuite product/service, ZoikoSuite commercial account, tenant-governed workflow notifications,
+and internal operations/security.
+Commercial / product rationale: Sender/audience/purpose separation protects trust, privacy and deliverability.
+Engineering rule: Each estate has sender policy, template registry, audience scope, suppression/collision rules, retention and
+reputation boundary.
+
+S2. Can a notification infer a legal/compliance state?
+
+Decision: No.
+Commercial / product rationale: Rendering code must not become policy logic.
+Engineering rule: Templates receive approved state/value payloads and resource refs. They never calculate compliance,
+deadlines, financial amounts or approval state.
+
+S3. Does "delivered" mean the user accepted or acted?
+
+Decision: No.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0  Page 20
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+Commercial / product rationale: Transport evidence is not acknowledgement or approval.
+Engineering rule: Store provider delivery evidence separately from viewed, acknowledged, approved, signed or completed
+user actions.
+
+S4. How are external portal links secured?
+
+Decision: Authenticated or short-lived purpose-scoped tokens with revocation and anti-enumeration.
+Commercial / product rationale: Governance evidence and reports can contain highly sensitive data.
+Engineering rule: Token embeds/links only opaque refs, expires, is resource/audience scoped, step-up for sensitive actions
+and is auditable.
+
+24. T. Internal, Demo, Pilot, Sandbox & Existing Workspaces
+
+billing_classification        Purpose                             Commercial rule
+COMMERCIAL_STANDALONE         Direct ZoikoSuite customer
+COMMERCIAL_ZOIKO_ONE          Entitled through Zoiko One          May charge under approved
+LEGACY_MIGRATION              Existing customer being normalized  catalog/contract.
+PILOT_NON_BILLABLE            Authorized evaluation/pilot
+INTERNAL                      Zoiko internal use                  No duplicate direct charge for same
+DEMO                          Sales/product demonstration         entitlement period; billing source references
+SANDBOX                       Developer/customer sandbox          bundle/contract.
+QA_AUTOMATION                 Automated testing
+                                                                  Controlled mapping/reconciliation; no new
+                                                                  live charge until commercial source is
+                                                                  approved.
+
+                                                                  No recurring live charge unless the pilot
+                                                                  order expressly authorizes it.
+
+                                                                  No external customer charge; internal cost
+                                                                  allocation does not masquerade as
+                                                                  customer billing.
+
+                                                                  Synthetic/de-identified data; no live high-
+                                                                  impact execution or customer
+                                                                  communications.
+
+                                                                  Synthetic/test integrations; no production
+                                                                  settlement, filings, HR actions or external
+                                                                  certifications.
+
+                                                                  Synthetic only; isolated queues,
+                                                                  model/provider test routes, webhooks and
+                                                                  communications.
+
+T1. Can environment name determine billing or execution safety?
+
+Decision: No.
+Commercial / product rationale: Production can contain demos/pilots; staging can still accidentally connect to live services.
+Engineering rule: Commercial charge and high-impact execution both require explicit classification + entitlement/policy +
+environment + provider/source eligibility. Environment is one control, never the only one.
+
+T2. How are existing workspaces migrated?
+
+Decision: Inventory  classify  map commercial source  map capabilities  map entities/regions  validate
+integrations/data authority  reconcile  dry run  sign off.
+Commercial / product rationale: ZoikoSuite has established platform architecture, so migration risk is first-class.
+Engineering rule: Produce per-tenant migration manifest and exception register. Missing classifications or source authority
+mappings block commercial activation.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0              Page 21
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+25. U. Operating Ownership, Change Control & Commercial
+Governance
+
+Owner                         Accountability
+Product / Commercial
+Finance / Billing Operations  Category, packaging, catalog proposals, entitlements, buyer
+Legal / Compliance            journeys, market offers, roadmap and claim intent.
+Data Governance
+Engineering / Architecture    Merchant setup, ZoikoSuite subscription invoices/payments,
+                              credits/refunds, reconciliation, close and commercial controls.
+AI/ML / AI Governance
+Security / Privacy            Market claims, obligation-source governance, contractual terms,
+QA                            regulated wording, privacy/legal basis, professional boundaries,
+Customer Success / Support    retention/legal hold.
+Solutions / Partnerships
+                              Canonical data definitions, source authority, lineage, evidence
+                              schemas, quality rules, retention metadata and semantic control.
+
+                              Service boundaries, tenant model, policy/evidence/workflow
+                              services, integration contracts, eventing, idempotency, migrations
+                              and reliability.
+
+                              Model/provider routing, evaluation, prompts/tools, risk classification,
+                              human-review triggers, autonomous-action scope, regression and
+                              drift controls.
+
+                              IAM, secrets, tenant isolation, provider review, data minimization,
+                              residency, incident response, secure SDLC.
+
+                              State-machine, negative/adversarial, migration, integration,
+                              security/privacy, AI evaluation and production acceptance evidence.
+
+                              Implementation guidance, case triage and customer operations
+                              without implicit authority to change commercial/legal/control truth.
+
+                              Certified integration patterns, partner scope, implementation
+                              boundaries, commercial handoff and unsupported-use prevention.
+
+U1. Can an approved catalog or entitlement be edited in place?
+
+Decision: No.
+Commercial / product rationale: Historical subscriptions and customer commitments must remain reproducible.
+Engineering rule: Create new catalog/entitlement version with effective dates, migration rules and approvals. Existing
+customers stay on referenced version until governed transition.
+
+U2. What is required for emergency overrides?
+
+Decision: Named approver, reason, exact scope, expiry, customer/market impact, compensating controls and rollback/review
+plan.
+Commercial / product rationale: Emergency operation must not create permanent invisible governance drift.
+Engineering rule: Override object is time-bounded, evented and cannot bypass immutable data, legal hold, tenant isolation or
+prohibited actions.
+
+U3. Who may change payment, provider, data-residency or high-impact execution
+configuration?
+
+Decision: Only tightly restricted roles under dual control where risk warrants.
+Commercial / product rationale: These changes can redirect money/data or enable consequential actions.
+Engineering rule: Step-up MFA, change ticket, dual approval, secret vault, destination/region allowlists where feasible,
+notification and post-change reconciliation are mandatory.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0     Page 22
+ZOIKOSUITE                                                    Commercial Operations, Subscription & Governed Platform Standard
+
+26. Canonical RBAC & Segregation-of-Duties Matrix
+
+Role          Zoiko           Config  Workflows/  Evidence    Approvals   High-         Reports  Control
+              subscriptio             controls                            impact                 note
+              n                                                           actions
+                                                                                                 Cannot
+Organization  Yes             Admin   Scoped      Scoped      Approve by  Policy/thres  Yes      bypass
+Owner                                                         policy      hold                   SoD/high-
+                                                                                                 impact
+ZoikoSuite    Yes             Admin   Admin       Admin       Approve by  Policy/thres  Yes      policy simply
+Admin                                                         policy      hold                   by being
+                                                                                                 Owner.
+Governance    No by           View    Admin       Admin       Approve     No            Yes
+/             default                                         scoped                             Product/tena
+Compliance                                                                                       nt
+Admin                                                                                            administratio
+                                                                                                 n;
+Finance /     No by                               Scoped      Approve     Financial              commercial
+Controller    default                             finance     scoped                             and high-
+                              View    Scoped                              actions if    Yes      impact
+                                                                                                 permissions
+                                                                          granted                remain
+                                                                                                 explicit.
+Legal /                       View    Review      Review      Approve     No            Yes
+Compliance No                                                 scoped                             Owns
+Reviewer                                                                                         obligations,
+                                                                                                 controls,
+Control       No              View    Scoped      Submit      Request     No            Scoped   evidence,
+Owner                                 manage      evidence                                       findings; no
+                                                                                                 subscription
+Evidence      No              No      Task only   Upload/sub  No          No            Limited  payment
+Contributor                                       mit                                            authority by
+                                                                                                 default.
+
+                                                                                                 No
+                                                                                                 legal/securit
+                                                                                                 y admin
+                                                                                                 unless
+                                                                                                 separately
+                                                                                                 granted.
+
+                                                                                                 Reviewer
+                                                                                                 and
+                                                                                                 exception
+                                                                                                 authority
+                                                                                                 within
+                                                                                                 assigned
+                                                                                                 domains.
+
+                                                                                                 Cannot
+                                                                                                 approve
+                                                                                                 own material
+                                                                                                 exception
+                                                                                                 where
+                                                                                                 maker-
+                                                                                                 checker
+                                                                                                 applies.
+
+                                                                                                 Cannot
+                                                                                                 accept own
+                                                                                                 evidence as
+                                                                                                 sufficient
+                                                                                                 unless
+                                                                                                 policy
+                                                                                                 explicitly
+                                                                                                 allows.
+
+Confidential -- Internal Use                     ZSU-COM-OPS-001 | v1.0                          Page 23
+ZOIKOSUITE                                                      Commercial Operations, Subscription & Governed Platform Standard
+
+Role        Zoiko             Config    Workflows/   Evidence   Approvals    High-       Reports      Control
+            subscriptio                 controls                             impact      Technical    note
+            n                                                                actions
+                                                                             No          Technical    Keys/webho
+CIO /                         View      Integration  No         No                       View/export  oks/connecti
+Integration No                          config                               No          scoped       ons; cannot
+Admin                                                                                    Case data    certify
+                                                                             No                       business
+AI /                          View      Automation   No         No                       Operational  compliance.
+Automation No                           config                               No
+Admin                                                                                                 Cannot
+                                                                             Platform                 expand
+Auditor /   No                View      View         View       View         commercial               autonomous
+Read Only                                                                    only                     action scope
+                                                                                                      without
+Support     No                Limited   Limited      Limited    No                                    policy
+Agent                                                                                                 approval.
+
+Zoiko       Platform          Platform  No tenant    No tenant  No tenant                             No mutation;
+Platform    scope                       business                                                      exports
+Ops                                     mutation     acceptance approval                              follow data-
+                                        without                                                       class
+                                        approved                                                      controls.
+                                        path
+                                                                                                      No policy,
+                                                                                                      evidence-
+                                                                                                      acceptance,
+                                                                                                      payment,
+                                                                                                      legal,
+                                                                                                      provider or
+                                                                                                      credential
+                                                                                                      authority.
+
+                                                                                                      Break-glass
+                                                                                                      is time-
+                                                                                                      bounded,
+                                                                                                      audited and
+                                                                                                      customer-
+                                                                                                      visible
+                                                                                                      where
+                                                                                                      appropriate.
+
+SEGREGATION-OF-DUTIES DOCTRINE
+
+The ability to configure a workflow does not imply authority to approve its outcome. The ability to upload evidence does not
+imply authority to accept that evidence. The ability to integrate an ERP does not imply authority to change accounting data.
+The ability to administer ZoikoSuite does not imply authority to change subscription payment details, approve a legal
+position, release a legal hold, or expand AI autonomous-action scope. Role composition is explicit, server-side and
+threshold-aware.
+
+27. Mandatory Production Acceptance Checklist
+
+ID                                                            Acceptance criterion
+COM-01
+COM-02                                                        Final pricing/plan/catalog/limits/add-ons/trial posture are approved
+COM-03                                                        and one catalog version drives web, app, Zoiko One, processor,
+                                                              contracts, support and renewal.
+
+                                                              Every workspace has billing_classification and billing_source; non-
+                                                              commercial classes cannot create live Zoiko charges.
+
+                                                              Standalone and Zoiko One entitlements cannot double charge the
+                                                              same scope/period.
+
+Confidential -- Internal Use                         ZSU-COM-OPS-001 | v1.0                           Page 24
+ZOIKOSUITE                                Commercial Operations, Subscription & Governed Platform Standard
+
+ID                            Acceptance criterion
+PROD-01
+DATA-01                       Capability, entitlement, market, release, integration, execution and
+GOV-01                        public-claim states are separately modeled and tested.
+GOV-02
+AI-01                         System-of-record/field authority matrix is approved for every
+AI-02                         production integration; source conflict paths exist.
+AI-03
+SEC-01                        Obligation/control/evidence/status semantics are versioned, scoped
+PRIV-01                       and reproducible; no generic "compliant" state exists without defined
+INT-01                        evaluation.
+INT-02
+AUD-01                        Control design, operating effectiveness, evidence freshness,
+EVID-01                       exceptions and attestations are distinct.
+REP-01
+QA-01                         AI risk classes, source/evidence rules, review triggers, tool allowlist
+QA-02                         and autonomous-action policies are approved and evaluated.
+OPS-01
+LEGAL-01                      High-impact actions require deterministic preconditions, authority,
+A11Y-01                       idempotency, required approval, postcondition verification and audit.
+GO-01
+                              Provider/model/prompt/tool changes pass evaluation and production
+Confidential -- Internal Use  authorization; tenant data is not used for training by default.
+
+                              Tenant isolation, MFA/step-up, privileged access, break-glass,
+                              secrets, SSO/SCIM where released and access review pass
+                              Security review.
+
+                              Purpose, data class, retention, legal hold, residency/transfer, DSR
+                              and provider processing rules are implemented for launch markets.
+
+                              Imports, webhooks and material mutations are idempotent;
+                              connection failures do not silently alter governance truth.
+
+                              No product or connector writes directly into another product's core
+                              tables; all shared behavior uses approved contracts/events/APIs.
+
+                              Material state changes emit durable immutable/replayable audit
+                              events; integrity and historical replay tests pass.
+
+                              Evidence provenance, hashing/version, source rights, access class,
+                              retention and review state are enforced.
+
+                              Executive metrics are defined, versioned, source-traceable and
+                              labeled so operational intelligence is not misrepresented as
+                              financial/legal assurance.
+
+                              Staging/sandbox uses synthetic or approved de-identified data and
+                              non-production provider credentials/endpoints.
+
+                              Negative tests cover cross-tenant access, stale sources, conflicting
+                              facts, rule changes, duplicate events, replay storms, missing
+                              evidence, AI uncertainty, approval bypass and double charging.
+
+                              Backups, restore, regional failover where applicable, observability,
+                              incident response, provider disablement and action kill switches are
+                              tested.
+
+                              Terms, privacy/DPA, market claims, professional boundaries,
+                              compliance wording, data transfers and public capability claims are
+                              approved.
+
+                              User-facing launch surfaces meet the approved accessibility gate
+                              and do not introduce security/privacy bypasses.
+
+                              Product, Commercial, Engineering, Finance, Security, Privacy,
+                              Legal/Compliance, Data Governance, AI/ML and QA sign the go-live
+                              record.
+
+                              ZSU-COM-OPS-001 | v1.0  Page 25
+  ZOIKOSUITE                              Commercial Operations, Subscription & Governed Platform Standard
+
+28. Minimum Engineering Data Model
+
+Object                                    Minimum fields / control purpose
+organization
+commercial_account                        organization_id, name, state, locale, default_timezone,
+                                          billing_classification, billing_source, created_at
+commercial_subscription
+                                          commercial_account_id, organization_id, legal customer name,
+price_catalog / entitlement_set           billing/tax facts, currency, contacts, processor refs, contract refs,
+workspace / legal_entity / business_unit  status
+membership / role_scope
+capability_registry                       subscription_id, commercial_account_id, plan_id,
+market_release_registry                   catalog_version_id, interval, items/metrics, status, renewal/cancel,
+system_source / source_authority_map      processor/order refs
+normalized_fact
+obligation / requirement                  catalog_version_id, plan/display, prices/currencies/intervals, limits,
+policy / control                          add-ons, meters, evaluation terms, market scope, approval/effective
+applicability_decision                    dates
+workflow / case / task
+approval / exception / remediation        IDs, organization relation, legal/entity metadata, market, timezone,
+evidence_object                           data region, status, entitlement scope
+control_test_definition / execution
+attestation                               actor, org/workspace/entity scope, role/permissions, data class,
+AI run / recommendation                   status, effective dates, source
+automation_action
+integration_connection / job              capability_id, version, module/domain, dependencies, release state,
+                                          execution risk class, claim key
+
+                                          market, capability, entity/data class, language, provider/integration
+                                          prerequisites, legal approval, state/effective dates
+
+                                          source system, domain/field family, authority class, precedence,
+                                          freshness SLA, correction/conflict path
+
+                                          fact_id, subject, value/unit, source refs/version, authority class,
+                                          observed/effective times, transformation version, quality state
+
+                                          source/rule/version, jurisdiction/entity/activity scope, effective dates,
+                                          applicability logic/status, owner
+
+                                          control_id/version, control type, owner, frequency, design status,
+                                          test/evidence requirements, automation policy
+
+                                          obligation, subject scope, facts used, rule/source versions, decision,
+                                          uncertainty, reviewer, effective period
+
+                                          workflow/case/task IDs, type/version, subject, owner, states, due
+                                          date, priority, dependencies, correlation
+
+                                          action/object scope, requester/approver, threshold, reason,
+                                          evidence, status, due/expiry, remediation links
+
+                                          evidence_id, source, hash/version, subject/period, data class, rights,
+                                          retention, reviewer state, integrity refs
+
+                                          version, method, population/sample, period, evidence,
+                                          tester/reviewer, result, findings, exceptions
+
+                                          statement/version, subject/period, signer/role, evidence refs,
+                                          signed_at, expiry/revocation
+
+                                          model/provider/prompt/tool versions, source/evidence refs, risk
+                                          class, confidence/limitations, output hash, review state
+
+                                          action_id, policy/version, requested/proposed/executed state, tool,
+                                          preconditions, approvals, idempotency, result/rollback
+
+                                          provider/system, account/env, scopes, secret ref, health,
+                                          market/data region, sync cursor, job state/errors
+
+Confidential -- Internal Use              ZSU-COM-OPS-001 | v1.0  Page 26
+ZOIKOSUITE                                 Commercial Operations, Subscription & Governed Platform Standard
+
+Object                         Minimum fields / control purpose
+webhook_event / outbox
+retention_policy / legal_hold  event_id, direction, schema version, tenant/scope, resource,
+report_metric_definition       retry/replay, signature, idempotency
+commercial_usage_meter
+audit_event / replay_manifest  record class, jurisdiction, rule/duration, hold scope, effective version,
+                               release authority
+
+                               metric_id/version, inputs/formula, scope, owner, accounting/legal
+                               classification, missing-data behavior, display rules
+
+                               Plane 1 metric events, quantity/unit/window, source, dedupe,
+                               validation, billable state, catalog linkage
+
+                               actor, role, tenant/scope, event/object, schema version, before/after
+                               refs, reason, correlation/causation, integrity, replay completeness
+
+29. Canonical State Machines & Event Rules
+
+Dimension                      States
+Obligation applicability
+Control design                 UNASSESSED / APPLICABLE / NOT_APPLICABLE / UNCERTAIN
+Control effectiveness          / SUPERSEDED
+Evidence
+Exception                      DRAFT / REVIEW_REQUIRED / APPROVED / REJECTED /
+Approval                       RETIRED
+Workflow work state
+AI recommendation              NOT_TESTED / EFFECTIVE / PARTIALLY_EFFECTIVE /
+Automation action              INEFFECTIVE / INCONCLUSIVE / EXPIRED
+Integration health
+Market release                 REQUESTED / SUBMITTED / VALIDATING / ACCEPTED /
+Commercial entitlement         REJECTED / SUPERSEDED / EXPIRED / REVOKED
+
+                               OPEN / TRIAGED / REMEDIATING / ACCEPTED_RISK / WAIVED /
+                               RESOLVED / REOPENED
+
+                               NOT_REQUIRED / PENDING / APPROVED / REJECTED /
+                               EXPIRED / REVOKED
+
+                               DRAFT / ACTIVE / WAITING / IN_REVIEW / COMPLETED /
+                               FAILED / CANCELED
+
+                               GENERATED / LIMITED / REVIEW_REQUIRED / ACCEPTED /
+                               REJECTED / SUPERSEDED
+
+                               PROPOSED / VALIDATING / APPROVAL_PENDING /
+                               AUTHORIZED / EXECUTING / SUCCEEDED / FAILED /
+                               COMPENSATING / REVERSED / BLOCKED
+
+                               UNKNOWN / HEALTHY / DEGRADED / STALE / FAILED /
+                               SUSPENDED
+
+                               INTERNAL / PILOT / BETA / GA / RESTRICTED / SUSPENDED /
+                               RETIRED
+
+                               EVALUATION / ACTIVE / PAST_DUE / RESTRICTED /
+                               SUSPENDED / CANCELED / TERMINATED
+
+ Do not compress independent dimensions into one universal status. A control can be APPROVED in design,
+      INEFFECTIVE in operation, supported by EXPIRED evidence and have an OPEN remediation exception simultaneously.
+
+ Every material state transition emits an immutable fact event only after successful transaction commit through an
+      outbox/equivalent pattern.
+
+ Event names describe facts: evidence.accepted, control_test.completed, exception.opened, approval.granted,
+      automation_action.blocked, entitlement.restricted.
+
+ Consumer retries are idempotent; consumer failure never re-executes the originating high-impact action.
+ Analytics events are non-authoritative and cannot set compliance, entitlement, approval, evidence or execution states.
+
+Confidential -- Internal Use   ZSU-COM-OPS-001 | v1.0  Page 27
+ZOIKOSUITE                                                      Commercial Operations, Subscription & Governed Platform Standard
+
+ Provider or source event ordering may be non-sequential. Consumers compare object version and event identity;
+      contradictory material state routes to reconciliation rather than guessing.
+
+30. Control Evaluation, Evidence Integrity & Assurance Standard
+
+Assurance layer                                                 Required meaning
+Applicability
+Control design                                                  Proves why an obligation/requirement applies or does not apply to a
+Operating effectiveness                                         scoped entity/process at an effective date.
+Evidence sufficiency
+Exception materiality                                           Proves the defined control is capable, on paper, of addressing the
+Attestation                                                     mapped requirement.
+Assurance output
+                                                                Proves the control operated as intended during a stated period using
+                                                                an approved test method and evidence.
+
+                                                                Proves evidence is relevant, complete enough, fresh,
+                                                                authentic/provenanced and accessible to an authorized reviewer.
+
+                                                                Classifies finding severity and required remediation/approval; does
+                                                                not silently change control state.
+
+                                                                Records a named actor's assertion; may supplement but does not
+                                                                automatically replace objective evidence/test requirements.
+
+                                                                Report/pack faithfully represents scope, limitations, exceptions,
+                                                                evidence freshness and reviewer/signatory authority.
+
+Assurance packs and executive dashboards must expose "as of" date, entity/workspace scope, source/version set, coverage,
+open exceptions, stale/missing evidence, unresolved applicability and reviewer state. A percentage without this context is an
+operational convenience, not a defensible assurance conclusion.
+
+31. Reconciliation, Lineage, Data Quality & Close Controls
+
+Domain                        Reconciliation relation           Cadence                         Owner
+Commercial subscriptions                                                                        Billing Operations
+Connected facts               Catalog/contract entitlement      Daily automated + period close
+Obligations                   processor/Finance invoices                                        Integration + Data Governance
+Controls/evidence             payments/credits/refunds 
+AI/automation                 ZoikoSuite entitlement state                                      Legal/Compliance +
+Exports/reports                                                                                 Governance Ops
+Zoiko One                     Source records  normalized        Continuous / per sync
+                              facts  data freshness/quality                                     Control Owners + Reviewers
+                               downstream decisions
+                                                                                                AI Governance +
+                              Source version                    On source/rule release +        Product/Operations
+                              rule/applicability version        scheduled review
+                              impacted entities/processes                                       Data Governance + Product
+                              active obligations
+                                                                                                Commercial Ops
+                              Control requirements 
+
+                              evidence/test executions          Continuous + review cycle
+
+                              status  exceptions/remediation
+
+                              AI run/recommendation             Per action + monitoring
+                              approved source/evidence 
+                              action policy  approval  tool
+                              result/postcondition
+
+                              Underlying versioned facts        Per generation
+                              metric/report version 
+                              generated artifact hash/manifest
+
+                              Bundle entitlement  direct        Daily + renewal
+                              ZoikoSuite commercial state 
+                              transfer/migration records
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0                                                            Page 28
+ZOIKOSUITE                    Commercial Operations, Subscription & Governed Platform Standard
+
+ Exceptions are first-class records with owner, impact, source systems, aging, resolution code and audit history.
+ Automated reconciliation may propose corrections but may not silently delete, backfill or overwrite authoritative records.
+ Period close may freeze selected governance/reporting definitions for reproducibility while still allowing legitimate new
+
+      evidence, incident response and corrective events with explicit post-close dating.
+ Dashboards distinguish missing, stale, conflicting and reconciled data. Approximate or partially sourced values are labeled
+
+      and never presented as exact statutory/accounting truth.
+
+32. Observability, Reliability, Incident Controls & Kill Switches
+
+Signal family                 Required observability
+Commercial integrity
+Tenant/data integrity         Catalog mismatch, entitlement drift, double-billing risk, meter dedupe
+Governance engine             conflicts, processor/webhook lag, restoration failures
+Evidence
+AI/automation                 Cross-tenant denials, missing tenant scope, source freshness
+Integrations                  breach, conflicting authoritative facts, transformation errors
+Privacy/security
+Reports/metrics               Obligation/rule activation failures, policy version mismatch, invalid
+Communications                state transitions, control evaluation errors
+
+                              Upload/hash failure, evidence expiry spikes, provenance gaps,
+                              acceptance/review backlog, replay integrity failure
+
+                              Model/provider error, source-grounding gaps, uncertain
+                              classifications, blocked high-impact actions, approval bypass
+                              attempts, tool failure, abnormal autonomous-action rate
+
+                              Sync lag, webhook failure, auth expiry, schema drift, replay backlog,
+                              provider account mismatch
+
+                              Unauthorized export, role escalation, break-glass use, secret
+                              access, region violation, data minimization failure, provider policy
+                              mismatch
+
+                              Metric definition drift, stale source percentages, partial-data
+                              warnings, generation failures, inconsistent replicas
+
+                              Delivery/bounce, sender verification, suppression collision, queue
+                              backlog, sensitive-template policy failure
+
+Numeric availability, latency, recovery, data-freshness and AI quality objectives must be approved from measured production
+capacity and business criticality before external commitment. This standard intentionally does not invent SLA percentages.
+Internal alerts, owners, severity models, runbooks and safe-degraded behavior are mandatory before go-live.
+
+32.1. What kill switches are required?
+
+Decision: Granular controls for commercial charging, high-impact automation/tool actions, model/provider use, obligation/rule
+activation, selected imports/syncs, outbound notifications/exports and public claim publication.
+Commercial / product rationale: In an incident, stopping new harm must not require taking the whole platform offline.
+Engineering rule: Kill switch is plane/domain/provider/tenant scoped, privileged, logged, approval-controlled, visible in
+operations, and has reconciliation/restart procedure. It does not erase already-committed history.
+
+32.2. What is safe degraded mode?
+
+Decision: Preserve read/evidence/history where safe; stop actions whose authority or correctness cannot be proven.
+Commercial / product rationale: Governance systems must fail predictably rather than fabricate continuity.
+Engineering rule: Each service defines DEGRADED behavior: e.g., stale integration  display last verified fact with timestamp
+but block high-impact action; model outage  deterministic workflow remains; evidence store outage  material approvals fail
+closed.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0  Page 29
+ZOIKOSUITE                                                                 Commercial Operations, Subscription & Governed Platform Standard
+
+33. Critical Analysis of Current Product & Commercial Drift
+
+Drift / risk                  Why it matters                     Severity  Refined resolution
+Category breadth                                                 Critical
+Pricing truth                 ZoikoSuite spans compliance        High      Lock "governed business
+Zoiko product adjacency       and business operations,                     operations intelligence platform"
+Compliance language           creating risk of being described             category; publish a system-of-
+AI authority                  as ERP/HCM/accounting                        record matrix and prohibit
+Dashboard confidence          replacement without explicit                 implicit replacement claims.
+Regional intelligence         system-of-record boundaries.
+Evidence quality                                                           One approved commercial
+System authority              Tiered pricing architecture                  catalog; fail closed on missing
+Commercial vs tenant state    exists, but final plan                       mappings; no price/trial
+Zoiko One overlap             names/prices/limits are not                  invention in code or copy.
+Provider coupling             established in this standard.
+                                                                           Native integrations via explicit
+                              Payroll, HR, Billing and           Critical  contracts; separate commercial
+                              ZoikoLogia/Kriton can create                 entitlements and authoritative
+                              ambiguity about what ZoikoSuite              data ownership; no shared-table
+                              owns versus integrates.                      shortcuts.
+
+                              A platform that maps obligations   Critical  Use scoped status semantics,
+                              and controls can easily                      source/effective-date versioning,
+                              overstate "compliance" as                    limitations and claim registry;
+                              guaranteed outcome.                          external assurance wording
+                                                                           requires approval.
+                              Agentic automation can drift       Critical
+                              from recommendation to                       Action-risk taxonomy, allowlist,
+                              unsupervised consequential                   deterministic preconditions,
+                              action.                                      human approval, idempotency,
+                                                                           postcondition verification and kill
+                              Executive summaries can hide       High      switches.
+                              stale/missing evidence or
+                              conflicting sources.                         Every metric/status carries
+                                                                           freshness, source, scope,
+                              Global positioning can be          High      coverage and exceptions; drill-
+                              mistaken for universal legal                 through is mandatory.
+                              coverage.
+                                                                           Market release registry gates
+                              Uploading documents can be         High      jurisdiction, source, language,
+                              mistaken for proving control                 data region, provider, integration
+                              effectiveness.                               and public claim.
+
+                              Connected-system replicas can      Critical  Separate evidence
+                              become de facto truth through                submission/acceptance from
+                              convenience.                                 test methodology, effectiveness
+                                                                           result and attestation.
+                              Past-due SaaS billing could be     Critical
+                              incorrectly linked to tenant                 Field-level source authority map,
+                              operational/compliance data.                 conflict state, freshness checks
+                                                                           and controlled back-write paths.
+                              Bundle/direct paths can create     Critical
+                              double charging or entitlement               Commercial entitlement plane
+                              conflict.                                    remains separate; restriction
+                                                                           affects product access, not
+                              AI, data or integration providers  High      underlying business truth.
+                              can become invisible policy
+                              authorities.                                 billing_source, transfer records,
+                                                                           overlap detection and renewal
+                                                                           reconciliation.
+
+                                                                           Provider registry, exact-use
+                                                                           approval, abstraction,
+                                                                           contract/security/privacy
+                                                                           evidence, re-verification and
+                                                                           offboarding.
+
+Confidential -- Internal Use  ZSU-COM-OPS-001 | v1.0                       Page 30
+ZOIKOSUITE                                                                     Commercial Operations, Subscription & Governed Platform Standard
+
+Drift / risk                  Why it matters                         Severity  Refined resolution
+Historical reproducibility
+                              Updating rules, scores or source       Critical  Version all material
+Support privilege             mappings can rewrite past                        source/rule/metric definitions;
+                              reports.                                         reports and decisions replay
+Launch visual completeness                                                     against historical versions.
+                              Enterprise support may need            High
+                              deep visibility and become an                    Visible/time-bounded support
+                              ungoverned admin route.                          access, no implicit
+                                                                               approval/payment/policy
+                              A polished CFO/GC/CIO                  High      authority, break-glass
+                              experience can appear ready                      governance.
+                              before commercial, data, legal
+                              and operational controls are                     Section 27 signed acceptance is
+                              complete.                                        the go-live gate, not UI
+                                                                               completion.
+
+REFINED EXECUTIVE JUDGMENT
+
+The decisive refinement is to separate five kinds of truth that can otherwise collapse into one dashboard: commercial
+entitlement, tenant operating facts, connected-system authority, governance/evidence state, and AI/automation output. Once
+these are separated -- and linked by versioned source authority, market/release registries and immutable evidence --
+ZoikoSuite can scale across CFO, General Counsel and CIO use cases without becoming an uncontrolled ERP clone, an
+overclaiming "compliance guarantee," or an autonomous model acting beyond organizational authority.
+
+34. Authoritative Source Basis & Precedence
+
+Source                                                               Use in this standard
+ZoikoSuite Landing Page Wireframe -- approved canonical
+                                                                     Product category, compliance/business-operations positioning,
+ZoikoSuite persona pages v2.0 -- /for-cfo, /for-gc, /for-cio         modular platform structure, compliance engine, regional intelligence,
+Approved ZoikoSuite commercial separation framework                  AI automation, integrations, pricing architecture and market-facing
+Zoiko Billing / Payroll / HR standalone-product commercial doctrine  trust posture.
+
+ZoikoLogia / Kriton controlled integration and governance estate     Primary executive buyer paths, risk framing, capability-to-outcome
+                                                                     mapping, ERP/HCM displacement/coexistence narrative, assurance
+Approved Zoiko Group software delivery standard                      requirements and role-specific demo conversion.
+Current signed contracts/order forms and approved pricing catalog
+Applicable legal/regulatory, privacy, tax, employment, security and  Standalone SaaS + optional Zoiko One; independent commercial
+provider documentation                                               model with shared technical platform services where approved.
+
+                                                                     Cross-product commercial separation principles, billing_source
+                                                                     discipline, shared-service boundaries and prevention of implicit
+                                                                     bundling/double charging.
+
+                                                                     Source/evidence governance, privacy/security, audit replay, AI
+                                                                     safety, provider governance and ZoikoSuite transfer constraints
+                                                                     relevant to native intelligence integration.
+
+                                                                     Understand before building; agree before integrating; test
+                                                                     throughout; demonstrate outcomes; release only against
+                                                                     documented evidence.
+
+                                                                     Highest commercial authority for customer-specific price,
+                                                                     entitlement, term, market and service commitment.
+
+                                                                     Market-specific implementation truth; must be revalidated at release
+                                                                     and cannot be replaced by generic "global" assumptions.
+
+Source-of-truth precedence: signed customer contract/order form and approved current commercial catalog  authoritative
+tenant/source-system facts and approved governance state  approved market/capability/provider/policy registries  current
+product documentation and communications  public marketing. Where sources conflict, charging and high-impact execution
+
+Confidential -- Internal Use                  ZSU-COM-OPS-001 | v1.0           Page 31
+ZOIKOSUITE                             Commercial Operations, Subscription & Governed Platform Standard
+
+fail closed, the discrepancy is recorded, and an accountable owner resolves it. Marketing never overrides contractual, legal,
+security or authoritative operational state.
+
+35. Final CTO / Commercial Doctrine
+
+ONE PLATFORM -- FIVE PLANES OF TRUST -- ZERO SILENT AUTHORITY
+
+ZoikoSuite must make complex business operations governable, explainable and auditable without confusing visibility with
+authority. Every commercial entitlement has a source. Every operational fact has an owner. Every obligation has jurisdiction
+and time. Every control has a definition. Every evidence item has provenance. Every status has a rule. Every approval has
+an accountable actor. Every AI output has boundaries. Every autonomous action has explicit authority. Every public claim is
+tied to release truth. When price, market availability, source authority, evidence sufficiency, compliance status, provider
+eligibility or execution authority is uncertain, the platform must refuse to guess.
+
+ Commercial truth is versioned and governed; code and telemetry do not invent charges.
+ Tenant operating truth and ZoikoSuite subscription state are separate; access restriction never rewrites business facts.
+ Connected systems remain authoritative for the domains they own; ZoikoSuite governs lineage, orchestration, evidence
+
+      and decision context around them.
+ Compliance is a scoped, evidence-backed operational state -- never a universal guarantee produced by a green
+
+      dashboard.
+ AI accelerates work but does not become the legal, financial, employment, security or regulatory authority.
+ Zoiko One is an integration and distribution advantage, not a prerequisite and not a duplicate billing path.
+ Global design means verified market configuration, effective dates, residency and source authority -- not universal launch
+
+      claims.
+ Assurance depends on evidence provenance, testing, exceptions, approval and replayability; documents alone do not
+
+      prove effectiveness.
+ Production readiness is demonstrated through data authority, reconciliation, negative testing, access control, AI evaluation,
+
+      safe degraded states, recovery and signed acceptance -- not visual completeness.
+
+ APPROVAL STATUS
+
+ This document is the recommended commercial, product and engineering baseline for ZoikoSuite commercial mode. It
+ becomes the controlling production standard when Product, Commercial, Finance, Engineering, Security, Privacy,
+ Legal/Compliance, Data Governance, AI/ML and QA formally approve the final price catalog, plan/entitlement registry,
+ market and claim registries, system-of-record matrix, AI execution policy, integration certifications, security/privacy controls,
+ numeric service objectives and Section 27 acceptance record.
+
+Controlled Sign-Off Record
+
+Function                      Status                           Approver / Date
+Product / Commercial          Pending
+Engineering / Architecture    Pending
+Finance / Billing Operations  Pending
+Security                      Pending
+Privacy / Data Governance     Pending
+Legal / Compliance            Pending
+AI/ML / AI Governance         Pending
+QA / Release Management       Pending
+
+Confidential -- Internal Use           ZSU-COM-OPS-001 | v1.0                   Page 32
+

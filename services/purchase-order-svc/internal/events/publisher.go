@@ -38,7 +38,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 
 // PublishOrderIssued corresponds to §12.9's purchase.order.issued event.
 func (p *Publisher) PublishOrderIssued(ctx context.Context, o domain.PurchaseOrder) {
-	p.emit(ctx, "purchase.order.issued", o.CorrelationID, map[string]any{
+	p.emit(ctx, "purchase.order.issued", o.CorrelationID, o.PurchaseOrderID, map[string]any{
 		"purchase_order_id":   o.PurchaseOrderID,
 		"tenant_id":           o.TenantID,
 		"legal_entity_id":     o.LegalEntityID,
@@ -51,7 +51,7 @@ func (p *Publisher) PublishOrderIssued(ctx context.Context, o domain.PurchaseOrd
 
 // PublishOrderAmended corresponds to §12.9's purchase.order.amended event.
 func (p *Publisher) PublishOrderAmended(ctx context.Context, o domain.PurchaseOrder) {
-	p.emit(ctx, "purchase.order.amended", o.CorrelationID, map[string]any{
+	p.emit(ctx, "purchase.order.amended", o.CorrelationID, o.PurchaseOrderID, map[string]any{
 		"purchase_order_id": o.PurchaseOrderID,
 		"version":           o.Version,
 		"total_amount":      o.TotalAmount,
@@ -60,12 +60,12 @@ func (p *Publisher) PublishOrderAmended(ctx context.Context, o domain.PurchaseOr
 
 // PublishOrderClosed corresponds to §12.9's purchase.order.closed event.
 func (p *Publisher) PublishOrderClosed(ctx context.Context, o domain.PurchaseOrder) {
-	p.emit(ctx, "purchase.order.closed", o.CorrelationID, map[string]any{
+	p.emit(ctx, "purchase.order.closed", o.CorrelationID, o.PurchaseOrderID, map[string]any{
 		"purchase_order_id": o.PurchaseOrderID,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -84,7 +84,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

@@ -75,12 +75,12 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) 
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO vendor_invoices (
 				invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
-				amount, currency_code, due_date, status, created_by_principal_id,
+				amount, currency_code, due_date, status, source_contract_id, created_by_principal_id,
 				correlation_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, inv.InvoiceID, inv.TenantID, inv.LegalEntityID, inv.VendorID, inv.InvoiceNumber,
-			inv.Amount, inv.CurrencyCode, inv.DueDate, string(inv.Status), inv.CreatedByPrincipalID,
+			inv.Amount, inv.CurrencyCode, inv.DueDate, string(inv.Status), inv.SourceContractID, inv.CreatedByPrincipalID,
 			inv.CorrelationID, now)
 		if err != nil {
 			return err
@@ -88,7 +88,7 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) 
 		if tag.RowsAffected() == 0 {
 			row := tx.QueryRow(ctx, `
 				SELECT invoice_id, legal_entity_id, vendor_id, invoice_number, amount, currency_code,
-				       due_date, status, created_by_principal_id, validated_by_principal_id,
+				       due_date, status, source_contract_id, created_by_principal_id, validated_by_principal_id,
 				       approved_by_principal_id, payment_requested_by_principal_id,
 				       created_at, validated_at, approved_at, payment_requested_at
 				FROM vendor_invoices WHERE tenant_id = $1 AND correlation_id = $2
@@ -96,7 +96,7 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) 
 			var status string
 			if err := row.Scan(
 				&inv.InvoiceID, &inv.LegalEntityID, &inv.VendorID, &inv.InvoiceNumber, &inv.Amount, &inv.CurrencyCode,
-				&inv.DueDate, &status, &inv.CreatedByPrincipalID, &inv.ValidatedByPrincipalID,
+				&inv.DueDate, &status, &inv.SourceContractID, &inv.CreatedByPrincipalID, &inv.ValidatedByPrincipalID,
 				&inv.ApprovedByPrincipalID, &inv.PaymentRequestedByPrincipalID,
 				&inv.CreatedAt, &inv.ValidatedAt, &inv.ApprovedAt, &inv.PaymentRequestedAt,
 			); err != nil {
@@ -128,14 +128,14 @@ func (s *PgStore) GetInvoice(ctx context.Context, invoiceID string) (*domain.Ven
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
 			SELECT invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
-			       amount, currency_code, due_date, status, created_by_principal_id,
+			       amount, currency_code, due_date, status, source_contract_id, created_by_principal_id,
 			       validated_by_principal_id, approved_by_principal_id, payment_requested_by_principal_id,
 			       correlation_id, created_at, validated_at, approved_at, payment_requested_at
 			FROM vendor_invoices WHERE invoice_id = $1 AND tenant_id = $2
 		`, invoiceID, tenantID)
 		if err := row.Scan(
 			&inv.InvoiceID, &inv.TenantID, &inv.LegalEntityID, &inv.VendorID, &inv.InvoiceNumber,
-			&inv.Amount, &inv.CurrencyCode, &inv.DueDate, &status, &inv.CreatedByPrincipalID,
+			&inv.Amount, &inv.CurrencyCode, &inv.DueDate, &status, &inv.SourceContractID, &inv.CreatedByPrincipalID,
 			&inv.ValidatedByPrincipalID, &inv.ApprovedByPrincipalID, &inv.PaymentRequestedByPrincipalID,
 			&inv.CorrelationID, &inv.CreatedAt, &inv.ValidatedAt, &inv.ApprovedAt, &inv.PaymentRequestedAt,
 		); err != nil {
@@ -160,7 +160,7 @@ func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFi
 	err := s.withRLS(ctx, filter.TenantID, func(tx pgx.Tx) error {
 		query := `
 			SELECT invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
-			       amount, currency_code, due_date, status, created_by_principal_id,
+			       amount, currency_code, due_date, status, source_contract_id, created_by_principal_id,
 			       validated_by_principal_id, approved_by_principal_id, payment_requested_by_principal_id,
 			       correlation_id, created_at, validated_at, approved_at, payment_requested_at
 			FROM vendor_invoices
@@ -180,7 +180,7 @@ func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFi
 			var status string
 			if err := rows.Scan(
 				&inv.InvoiceID, &inv.TenantID, &inv.LegalEntityID, &inv.VendorID, &inv.InvoiceNumber,
-				&inv.Amount, &inv.CurrencyCode, &inv.DueDate, &status, &inv.CreatedByPrincipalID,
+				&inv.Amount, &inv.CurrencyCode, &inv.DueDate, &status, &inv.SourceContractID, &inv.CreatedByPrincipalID,
 				&inv.ValidatedByPrincipalID, &inv.ApprovedByPrincipalID, &inv.PaymentRequestedByPrincipalID,
 				&inv.CorrelationID, &inv.CreatedAt, &inv.ValidatedAt, &inv.ApprovedAt, &inv.PaymentRequestedAt,
 			); err != nil {

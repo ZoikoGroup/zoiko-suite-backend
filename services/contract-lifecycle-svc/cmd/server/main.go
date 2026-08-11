@@ -18,6 +18,7 @@ import (
 	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/config"
 	"zoiko.io/contract-lifecycle-svc/internal/events"
+	"zoiko.io/contract-lifecycle-svc/internal/governancelog"
 	"zoiko.io/contract-lifecycle-svc/internal/handler"
 	"zoiko.io/contract-lifecycle-svc/internal/health"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
@@ -42,7 +43,16 @@ func main() {
 	defer cancel()
 
 	var pool *pgxpool.Pool
-	pool, err = pgxpool.New(ctx, cfg.DSN())
+	poolCfg, err := pgxpool.ParseConfig(cfg.DSN())
+	if err != nil {
+		logger.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+	pool, err = pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		logger.Warn("unable to connect to database on startup", zap.Error(err))
 	} else {
@@ -53,8 +63,9 @@ func main() {
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	governanceLogClient := governancelog.NewClient(cfg.GovernanceLogURL)
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, governanceLogClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

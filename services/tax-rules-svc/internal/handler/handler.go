@@ -102,6 +102,7 @@ func (h *Handler) GetTaxRule(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "tax rule not found")
 			return
 		}
+		h.logger.Error("get tax rule failed", zap.Error(err), zap.String("rule_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to get tax rule")
 		return
 	}
@@ -114,6 +115,7 @@ func (h *Handler) ListTaxRules(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
 	rules, err := h.store.ListTaxRules(r.Context(), jurisdictionID, category, status)
 	if err != nil {
+		h.logger.Error("list tax rules failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to list tax rules")
 		return
 	}
@@ -133,6 +135,7 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "tax rule not found")
 			return
 		}
+		h.logger.Error("fetch tax rule for update failed", zap.Error(err), zap.String("rule_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to fetch tax rule")
 		return
 	}
@@ -176,6 +179,7 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.UpdateTaxRule(r.Context(), existing); err != nil {
+		h.logger.Error("update tax rule failed", zap.Error(err), zap.String("rule_id", id))
 		writeError(w, http.StatusInternalServerError, "failed to update tax rule")
 		return
 	}

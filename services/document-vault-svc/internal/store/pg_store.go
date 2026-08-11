@@ -14,7 +14,14 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/document-vault-svc/internal/domain"
+	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 )
+
+// tenantFromCtx returns the caller's tenant scope, or "" if the request never
+// carried X-Tenant-Id (see svcmiddleware.TenantContext).
+func tenantFromCtx(ctx context.Context) string {
+	return svcmiddleware.TenantFromContext(ctx)
+}
 
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -69,6 +76,7 @@ func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firs
 // AddVersion appends a new immutable version row and bumps documents.current_version
 // — the ONLY mutation ever applied to the documents row post-creation.
 func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion) (*domain.Document, error) {
+	tenantID := tenantFromCtx(ctx)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("document store unavailable: %w", err)
@@ -78,9 +86,9 @@ func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.D
 	var nextVersion int
 	err = tx.QueryRow(ctx, `
 		UPDATE documents SET current_version = current_version + 1, updated_at = now()
-		WHERE document_id = $1
+		WHERE document_id = $1 AND ($2 = '' OR tenant_id = $2)
 		RETURNING current_version
-	`, documentID).Scan(&nextVersion)
+	`, documentID, tenantID).Scan(&nextVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrDocumentNotFound
 	}
@@ -107,13 +115,18 @@ func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.D
 	return s.FindDocumentByID(ctx, documentID)
 }
 
+// FindDocumentByID looks up a document by ID, scoped to the caller's tenant
+// (via svcmiddleware.TenantFromContext) when present. An empty tenant in
+// context (e.g. a not-yet-migrated caller) falls back to unscoped lookup —
+// tightening that further requires making the header mandatory platform-wide.
 func (s *PgStore) FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error) {
+	tenantID := tenantFromCtx(ctx)
 	var d domain.Document
 	err := s.pool.QueryRow(ctx, `
 		SELECT document_id, tenant_id, legal_entity_id, title, classification, retention_policy,
 			residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at
-		FROM documents WHERE document_id = $1
-	`, documentID).Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification, &d.RetentionPolicy,
+		FROM documents WHERE document_id = $1 AND ($2 = '' OR tenant_id = $2)
+	`, documentID, tenantID).Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification, &d.RetentionPolicy,
 		&d.ResidencyRegionCode, &d.CurrentVersion, &d.Status, &d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrDocumentNotFound
@@ -124,7 +137,13 @@ func (s *PgStore) FindDocumentByID(ctx context.Context, documentID string) (*dom
 	return &d, nil
 }
 
+// FindVersion looks up a document version, but only after confirming the
+// parent document belongs to the caller's tenant — the version row itself
+// carries no tenant_id, so scoping goes through the parent.
 func (s *PgStore) FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error) {
+	if _, err := s.FindDocumentByID(ctx, documentID); err != nil {
+		return nil, err
+	}
 	var v domain.DocumentVersion
 	err := s.pool.QueryRow(ctx, `
 		SELECT document_version_id, document_id, version, checksum_sha256, storage_key, size_bytes,
@@ -141,7 +160,11 @@ func (s *PgStore) FindVersion(ctx context.Context, documentID string, version in
 	return &v, nil
 }
 
+// ListVersions scopes through the parent document the same way FindVersion does.
 func (s *PgStore) ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error) {
+	if _, err := s.FindDocumentByID(ctx, documentID); err != nil {
+		return nil, err
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT document_version_id, document_id, version, checksum_sha256, storage_key, size_bytes,
 			content_type, created_by_principal_id, created_at
@@ -182,6 +205,9 @@ func (s *PgStore) RecordAccess(ctx context.Context, log *domain.DocumentAccessLo
 }
 
 func (s *PgStore) ListAccessLog(ctx context.Context, documentID string) ([]domain.DocumentAccessLog, error) {
+	if _, err := s.FindDocumentByID(ctx, documentID); err != nil {
+		return nil, err
+	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT access_log_id, document_id, document_version_id, accessed_by_principal_id, access_type,
 			correlation_id, accessed_at

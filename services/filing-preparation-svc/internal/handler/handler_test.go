@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/filing-preparation-svc/internal/authz"
 	"zoiko.io/filing-preparation-svc/internal/domain"
+	"zoiko.io/filing-preparation-svc/internal/evidencereq"
 )
 
 type mockStore struct {
@@ -74,12 +75,12 @@ func (m *mockStore) Update(ctx context.Context, d *domain.FilingDraft) error {
 	return nil
 }
 
-func (m *mockStore) Validate(ctx context.Context, id string, req *domain.ValidateDraftRequest) (*domain.FilingDraft, error) {
+func (m *mockStore) Validate(ctx context.Context, id string, req *domain.ValidateDraftRequest, evidenceSufficient bool, blockReason string) (*domain.FilingDraft, error) {
 	d, ok := m.items[id]
 	if !ok {
 		return nil, domain.ErrDraftNotFound
 	}
-	d.ValidateEvidence(req.RequiredDocumentTypes)
+	d.ApplyEvidenceOutcome(evidenceSufficient, blockReason)
 	d.UpdatedAt = time.Now().UTC()
 	return d, nil
 }
@@ -103,6 +104,27 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, draftID, tenantI
 	return nil
 }
 
+// stubEvidenceReq grants sufficiency by default, matching a
+// SATISFIED/NO_REQUIREMENTS_DEFINED outcome but skipping the network call.
+// Tests can set result/err to exercise the blocked and fail-closed paths.
+type stubEvidenceReq struct {
+	result evidencereq.EvaluateResult
+	err    error
+}
+
+func (s *stubEvidenceReq) Evaluate(_ context.Context, _, _, _, _, _, _ string, _ []evidencereq.Artifact) (evidencereq.EvaluateResult, error) {
+	if s.err != nil {
+		return evidencereq.EvaluateResult{}, s.err
+	}
+	return s.result, nil
+}
+
+// newSufficientEvidenceReq is the default stub: always reports sufficient
+// evidence, matching a SATISFIED/NO_REQUIREMENTS_DEFINED outcome.
+func newSufficientEvidenceReq() *stubEvidenceReq {
+	return &stubEvidenceReq{result: evidencereq.EvaluateResult{Sufficient: true}}
+}
+
 // newGrantingAuthzServer starts a stub authorization-svc that grants every
 // request, mirroring the real service's always-200 contract.
 func newGrantingAuthzServer(t *testing.T) *httptest.Server {
@@ -121,7 +143,7 @@ func setupTestRouter(t *testing.T) (*chi.Mux, *mockStore) {
 	authzSrv := newGrantingAuthzServer(t)
 	az := authz.NewClient(authzSrv.URL)
 	logger, _ := zap.NewDevelopment()
-	h := New(st, pub, az, logger)
+	h := New(st, pub, az, newSufficientEvidenceReq(), logger)
 
 	r := chi.NewRouter()
 	RegisterRoutes(r, h)
@@ -206,5 +228,91 @@ func TestCreateAndValidateFilingDraft(t *testing.T) {
 	}
 	if finalized.ValidationStatus != domain.StatusReadyForSubmission {
 		t.Errorf("expected status READY_FOR_SUBMISSION, got %s", finalized.ValidationStatus)
+	}
+}
+
+// TestValidate_IgnoresCallerSuppliedRequiredDocs is a regression test for
+// the actual bug this fix closes: RequiredDocumentTypes is caller-supplied
+// and must NOT be what decides sufficiency — only evidence-requirements-svc's
+// real evaluation may. An empty list must not silently pass when the
+// catalog says evidence is missing.
+func TestValidate_IgnoresCallerSuppliedRequiredDocs(t *testing.T) {
+	st := newMockStore()
+	pub := &mockPublisher{}
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
+	logger, _ := zap.NewDevelopment()
+	evidenceReq := &stubEvidenceReq{result: evidencereq.EvaluateResult{Sufficient: false, Reason: "catalog requires INVOICE_SUMMARY"}}
+	h := New(st, pub, az, evidenceReq, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	created := &domain.FilingDraft{DraftID: "fprep-test-201", LegalEntityID: "entity-001", FilingType: "VAT", ValidationStatus: domain.StatusDraft}
+	st.items[created.DraftID] = created
+
+	// Caller sends an EMPTY required_document_types — the old bug let this
+	// always pass. The real catalog (stubbed above) says evidence is missing.
+	valBody, _ := json.Marshal(domain.ValidateDraftRequest{RequiredDocumentTypes: nil, ValidatedBy: "checker"})
+	valReq := httptest.NewRequest("POST", "/v1/filing-preparation/drafts/"+created.DraftID+"/validate", bytes.NewBuffer(valBody))
+	valReq.Header.Set("Content-Type", "application/json")
+	valReq.Header.Set("X-Principal-Id", "user-001")
+	valW := httptest.NewRecorder()
+	r.ServeHTTP(valW, valReq)
+
+	if valW.Code != http.StatusOK {
+		t.Fatalf("expected status 200 (Validate always 200s, BLOCKED is a valid persisted state), got %d", valW.Code)
+	}
+	var validated domain.FilingDraft
+	if err := json.NewDecoder(valW.Body).Decode(&validated); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if validated.ValidationStatus != domain.StatusBlocked {
+		t.Fatalf("expected BLOCKED despite empty required_document_types, got %s", validated.ValidationStatus)
+	}
+	if validated.BlockReasons != "catalog requires INVOICE_SUMMARY" {
+		t.Errorf("expected the real catalog's reason to be recorded, got %q", validated.BlockReasons)
+	}
+
+	// Finalize must now be refused — BLOCKED is enforced downstream too.
+	finBody, _ := json.Marshal(domain.FinalizeDraftRequest{FinalizedBy: "tax_head"})
+	finReq := httptest.NewRequest("POST", "/v1/filing-preparation/drafts/"+created.DraftID+"/finalize", bytes.NewBuffer(finBody))
+	finReq.Header.Set("Content-Type", "application/json")
+	finReq.Header.Set("X-Principal-Id", "user-001")
+	finW := httptest.NewRecorder()
+	r.ServeHTTP(finW, finReq)
+	if finW.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 finalizing a BLOCKED draft, got %d — %s", finW.Code, finW.Body.String())
+	}
+}
+
+// TestValidate_EvidenceServiceUnavailable_Returns503 proves a transport
+// failure is never conflated with "evidence missing" — it must fail closed
+// without writing any status at all.
+func TestValidate_EvidenceServiceUnavailable_Returns503(t *testing.T) {
+	st := newMockStore()
+	pub := &mockPublisher{}
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
+	logger, _ := zap.NewDevelopment()
+	evidenceReq := &stubEvidenceReq{err: evidencereq.ErrServiceUnavailable}
+	h := New(st, pub, az, evidenceReq, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	created := &domain.FilingDraft{DraftID: "fprep-test-202", LegalEntityID: "entity-001", FilingType: "VAT", ValidationStatus: domain.StatusDraft}
+	st.items[created.DraftID] = created
+
+	valBody, _ := json.Marshal(domain.ValidateDraftRequest{ValidatedBy: "checker"})
+	valReq := httptest.NewRequest("POST", "/v1/filing-preparation/drafts/"+created.DraftID+"/validate", bytes.NewBuffer(valBody))
+	valReq.Header.Set("Content-Type", "application/json")
+	valReq.Header.Set("X-Principal-Id", "user-001")
+	valW := httptest.NewRecorder()
+	r.ServeHTTP(valW, valReq)
+
+	if valW.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when evidence-requirements-svc is unavailable, got %d — %s", valW.Code, valW.Body.String())
+	}
+	if st.items[created.DraftID].ValidationStatus != domain.StatusDraft {
+		t.Errorf("draft status must not change when evidence check fails closed, got %s", st.items[created.DraftID].ValidationStatus)
 	}
 }

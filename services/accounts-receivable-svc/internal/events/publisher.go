@@ -33,7 +33,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 
 // PublishInvoiceIssued publishes invoice.issued event.
 func (p *Publisher) PublishInvoiceIssued(ctx context.Context, inv domain.CustomerInvoice) {
-	p.emit(ctx, "invoice.issued", inv.CorrelationID, map[string]any{
+	p.emit(ctx, "invoice.issued", inv.CorrelationID, inv.InvoiceID, map[string]any{
 		"invoice_id":      inv.InvoiceID,
 		"tenant_id":       inv.TenantID,
 		"legal_entity_id": inv.LegalEntityID,
@@ -43,28 +43,28 @@ func (p *Publisher) PublishInvoiceIssued(ctx context.Context, inv domain.Custome
 
 // PublishInvoiceSent publishes invoice.sent event.
 func (p *Publisher) PublishInvoiceSent(ctx context.Context, inv domain.CustomerInvoice) {
-	p.emit(ctx, "invoice.sent", inv.CorrelationID, map[string]any{
+	p.emit(ctx, "invoice.sent", inv.CorrelationID, inv.InvoiceID, map[string]any{
 		"invoice_id": inv.InvoiceID,
 	})
 }
 
 // PublishReceivableOverdue publishes receivable.overdue event.
 func (p *Publisher) PublishReceivableOverdue(ctx context.Context, inv domain.CustomerInvoice) {
-	p.emit(ctx, "receivable.overdue", inv.CorrelationID, map[string]any{
+	p.emit(ctx, "receivable.overdue", inv.CorrelationID, inv.InvoiceID, map[string]any{
 		"invoice_id": inv.InvoiceID,
 	})
 }
 
 // PublishPaymentReceived publishes payment.received event.
 func (p *Publisher) PublishPaymentReceived(ctx context.Context, inv domain.CustomerInvoice) {
-	p.emit(ctx, "payment.received", inv.CorrelationID, map[string]any{
+	p.emit(ctx, "payment.received", inv.CorrelationID, inv.InvoiceID, map[string]any{
 		"invoice_id":    inv.InvoiceID,
 		"amount":        inv.Amount,
 		"currency_code": inv.CurrencyCode,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -83,7 +83,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

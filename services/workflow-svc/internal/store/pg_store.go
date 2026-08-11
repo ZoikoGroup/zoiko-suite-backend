@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
 
 // Store is the interface consumed by the handler.
@@ -57,9 +58,15 @@ func scanInstance(row pgx.Row) (*domain.WorkflowInstance, error) {
 	return w, err
 }
 
+// FindWorkflowByID is the choke point every other Store method routes
+// through before mutating a workflow, so scoping it to the caller's tenant
+// (via svcmiddleware.TenantFromContext) closes the cross-tenant read/write
+// gap for the whole service in one place. An empty tenant in context (a
+// caller that predates the X-Tenant-Id header) falls back to unscoped lookup.
 func (s *PgStore) FindWorkflowByID(ctx context.Context, workflowInstanceID string) (*domain.WorkflowInstance, error) {
-	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE workflow_instance_id = $1;`
-	row := s.pool.QueryRow(ctx, query, workflowInstanceID)
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE workflow_instance_id = $1 AND ($2 = '' OR tenant_id = $2);`
+	row := s.pool.QueryRow(ctx, query, workflowInstanceID, tenantID)
 	w, err := scanInstance(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -80,6 +87,9 @@ func scanStage(row pgx.Row) (*domain.WorkflowStage, error) {
 }
 
 func (s *PgStore) FindStagesByWorkflowID(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowStage, error) {
+	if _, err := s.FindWorkflowByID(ctx, workflowInstanceID); err != nil {
+		return nil, err
+	}
 	const query = `SELECT ` + stageColumns + ` FROM workflow_stages WHERE workflow_instance_id = $1 ORDER BY stage_order;`
 	rows, err := s.pool.Query(ctx, query, workflowInstanceID)
 	if err != nil {
@@ -182,7 +192,11 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 		stages = append(stages, st)
 	}
 
-	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "", "PENDING", params.InitiatedBy, nil); err != nil {
+	var correlationID *string
+	if params.CorrelationID != "" {
+		correlationID = &params.CorrelationID
+	}
+	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "", "PENDING", params.InitiatedBy, nil, correlationID, nil); err != nil {
 		return nil, nil, err
 	}
 
@@ -193,11 +207,11 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	return instance, stages, nil
 }
 
-func insertTransition(ctx context.Context, tx pgx.Tx, workflowInstanceID, fromState, toState, actedBy string, rationale *string) error {
+func insertTransition(ctx context.Context, tx pgx.Tx, workflowInstanceID, fromState, toState, actedBy string, rationale, correlationID, causationID *string) error {
 	const query = `
-		INSERT INTO workflow_transitions (workflow_instance_id, from_state, to_state, acted_by, rationale)
-		VALUES ($1, $2, $3, $4, $5);`
-	if _, err := tx.Exec(ctx, query, workflowInstanceID, fromState, toState, actedBy, rationale); err != nil {
+		INSERT INTO workflow_transitions (workflow_instance_id, from_state, to_state, acted_by, rationale, correlation_id, causation_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7);`
+	if _, err := tx.Exec(ctx, query, workflowInstanceID, fromState, toState, actedBy, rationale, correlationID, causationID); err != nil {
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return nil
@@ -300,7 +314,11 @@ func (s *PgStore) SubmitAction(ctx context.Context, params domain.SubmitActionPa
 	}
 
 	rationale := fmt.Sprintf("stage %d %s by %s", st.StageOrder, wantStatus, params.ActorPrincipalID)
-	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "PENDING", newInstanceStatus, params.ActorPrincipalID, &rationale); err != nil {
+	var instanceCorrelationID *string
+	if current.CorrelationID != "" {
+		instanceCorrelationID = &current.CorrelationID
+	}
+	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "PENDING", newInstanceStatus, params.ActorPrincipalID, &rationale, instanceCorrelationID, params.CausationID); err != nil {
 		return nil, nil, false, err
 	}
 
@@ -372,7 +390,11 @@ func (s *PgStore) transitionInstanceStatus(ctx context.Context, workflowInstance
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
-	if err := insertTransition(ctx, tx, workflowInstanceID, fromState, toState, actorPrincipalID, nil); err != nil {
+	var instanceCorrelationID *string
+	if updated.CorrelationID != "" {
+		instanceCorrelationID = &updated.CorrelationID
+	}
+	if err := insertTransition(ctx, tx, workflowInstanceID, fromState, toState, actorPrincipalID, nil, instanceCorrelationID, nil); err != nil {
 		return nil, false, err
 	}
 

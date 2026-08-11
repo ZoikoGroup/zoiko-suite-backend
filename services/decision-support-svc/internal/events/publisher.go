@@ -35,7 +35,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 // with doctrine §17.6: "Any service changing important business state must
 // emit events and support evidence generation."
 func (p *Publisher) PublishRecommended(ctx context.Context, r domain.Recommendation) {
-	p.emit(ctx, "decision_support.recommended", r.CorrelationID, map[string]any{
+	p.emit(ctx, "decision_support.recommended", r.CorrelationID, r.RecommendationID, map[string]any{
 		"recommendation_id":  r.RecommendationID,
 		"legal_entity_id":    r.LegalEntityID,
 		"subject_type":       r.SubjectType,
@@ -46,7 +46,7 @@ func (p *Publisher) PublishRecommended(ctx context.Context, r domain.Recommendat
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -69,7 +69,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),
