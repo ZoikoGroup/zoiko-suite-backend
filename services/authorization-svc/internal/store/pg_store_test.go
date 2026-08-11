@@ -45,6 +45,14 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, string(mig2)); err != nil {
 		t.Fatalf("failed to execute migration 2: %v", err)
 	}
+
+	mig3, err := os.ReadFile("../../deployments/migrations/000003_nullable_legal_entity_for_tenant_scope.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 3: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(mig3)); err != nil {
+		t.Fatalf("failed to execute migration 3: %v", err)
+	}
 }
 
 // setupRoleWithGrant creates a role + bundle + active assignment for

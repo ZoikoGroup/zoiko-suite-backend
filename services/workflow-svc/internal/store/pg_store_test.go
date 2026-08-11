@@ -36,6 +36,14 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, string(mig1)); err != nil {
 		t.Fatalf("failed to execute migration 1: %v", err)
 	}
+
+	mig2, err := os.ReadFile("../../deployments/migrations/000002_add_transition_linkage_keys.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 2: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(mig2)); err != nil {
+		t.Fatalf("failed to execute migration 2: %v", err)
+	}
 }
 
 func twoStageParams() domain.CreateWorkflowParams {

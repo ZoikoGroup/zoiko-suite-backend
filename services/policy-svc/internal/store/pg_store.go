@@ -213,12 +213,20 @@ func scanPolicyVersion(row pgx.Row) (*domain.PolicyVersion, error) {
 // or belongs to the caller's own tenant. An empty tenant in context (a caller
 // that predates the X-Tenant-Id header) falls back to unscoped lookup.
 func (s *PgStore) FindPolicyVersionByID(ctx context.Context, policyVersionID string) (*domain.PolicyVersion, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
+	// tenant_id is a UUID column — passing "" and comparing with a plain
+	// "$2 = '' OR ..." makes Postgres try to resolve $2 as both text and
+	// uuid in one prepared statement ("operator does not exist: uuid =
+	// text"). A nil *string sends an actual SQL NULL instead, so every
+	// usage below agrees $2 is uuid.
+	var tenantID *string
+	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
+		tenantID = &t
+	}
 	const query = `
 		SELECT ` + policyVersionColumns + `
 		FROM policy_versions
 		WHERE policy_version_id = $1
-		  AND ($2 = '' OR tenant_id IS NULL OR tenant_id = $2::uuid);`
+		  AND ($2::uuid IS NULL OR tenant_id IS NULL OR tenant_id = $2::uuid);`
 
 	row := s.pool.QueryRow(ctx, query, policyVersionID, tenantID)
 	v, err := scanPolicyVersion(row)
