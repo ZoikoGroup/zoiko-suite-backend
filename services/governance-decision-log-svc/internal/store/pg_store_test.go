@@ -34,7 +34,12 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS governance_decisions CASCADE;`)
-	for _, name := range []string{"000001_initial_schema.up.sql", "000002_add_rls.up.sql"} {
+	for _, name := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_rls.up.sql",
+		"000003_enforce_immutability.up.sql",
+		"000004_add_event_linkage_keys.up.sql",
+	} {
 		migSQL, err := os.ReadFile(filepath.Join(migDir, name))
 		if err != nil {
 			t.Fatalf("failed to read migration file %s: %v", name, err)

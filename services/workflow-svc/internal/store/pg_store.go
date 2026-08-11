@@ -64,8 +64,16 @@ func scanInstance(row pgx.Row) (*domain.WorkflowInstance, error) {
 // gap for the whole service in one place. An empty tenant in context (a
 // caller that predates the X-Tenant-Id header) falls back to unscoped lookup.
 func (s *PgStore) FindWorkflowByID(ctx context.Context, workflowInstanceID string) (*domain.WorkflowInstance, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE workflow_instance_id = $1 AND ($2 = '' OR tenant_id = $2);`
+	// tenant_id is a UUID column — passing "" and comparing with a plain
+	// "$2 = '' OR tenant_id = $2" makes Postgres try to resolve $2 as both
+	// text and uuid in one prepared statement ("operator does not exist:
+	// uuid = text"). A nil *string sends an actual SQL NULL instead, so both
+	// usages below agree $2 is uuid.
+	var tenantID *string
+	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
+		tenantID = &t
+	}
+	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE workflow_instance_id = $1 AND ($2::uuid IS NULL OR tenant_id = $2::uuid);`
 	row := s.pool.QueryRow(ctx, query, workflowInstanceID, tenantID)
 	w, err := scanInstance(row)
 	if err != nil {

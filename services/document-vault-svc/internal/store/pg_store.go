@@ -17,10 +17,20 @@ import (
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 )
 
-// tenantFromCtx returns the caller's tenant scope, or "" if the request never
-// carried X-Tenant-Id (see svcmiddleware.TenantContext).
-func tenantFromCtx(ctx context.Context) string {
-	return svcmiddleware.TenantFromContext(ctx)
+// tenantFromCtx returns the caller's tenant scope, or nil if the request
+// never carried X-Tenant-Id (see svcmiddleware.TenantContext). Returning a
+// *string rather than "" matters here: tenant_id is a UUID column, and a
+// query like "$1 = '' OR tenant_id = $1" makes Postgres try to resolve the
+// same parameter as both text and uuid in one prepared statement, which
+// fails with "operator does not exist: uuid = text" before a single row is
+// even evaluated. Passing an actual SQL NULL (via a nil *string) and
+// comparing with "$1::uuid IS NULL OR tenant_id = $1::uuid" avoids the
+// ambiguity entirely — both usages agree $1 is uuid.
+func tenantFromCtx(ctx context.Context) *string {
+	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
+		return &t
+	}
+	return nil
 }
 
 type PgStore struct {
@@ -86,7 +96,7 @@ func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.D
 	var nextVersion int
 	err = tx.QueryRow(ctx, `
 		UPDATE documents SET current_version = current_version + 1, updated_at = now()
-		WHERE document_id = $1 AND ($2 = '' OR tenant_id = $2)
+		WHERE document_id = $1 AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
 		RETURNING current_version
 	`, documentID, tenantID).Scan(&nextVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -125,7 +135,7 @@ func (s *PgStore) FindDocumentByID(ctx context.Context, documentID string) (*dom
 	err := s.pool.QueryRow(ctx, `
 		SELECT document_id, tenant_id, legal_entity_id, title, classification, retention_policy,
 			residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at
-		FROM documents WHERE document_id = $1 AND ($2 = '' OR tenant_id = $2)
+		FROM documents WHERE document_id = $1 AND ($2::uuid IS NULL OR tenant_id = $2::uuid)
 	`, documentID, tenantID).Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification, &d.RetentionPolicy,
 		&d.ResidencyRegionCode, &d.CurrentVersion, &d.Status, &d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
