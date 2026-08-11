@@ -7,11 +7,13 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/board-resolutions-svc/internal/authz"
 	"zoiko.io/board-resolutions-svc/internal/domain"
 	"zoiko.io/board-resolutions-svc/internal/events"
+	"zoiko.io/board-resolutions-svc/internal/evidencereq"
 	"zoiko.io/board-resolutions-svc/internal/middleware"
 	"zoiko.io/board-resolutions-svc/internal/store"
 )
@@ -22,6 +24,12 @@ type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// EvidenceReqClient verifies evidence sufficiency before a resolution may be
+// passed. Implementations must fail closed, same doctrine as AuthZClient.
+type EvidenceReqClient interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, artifacts []evidencereq.Artifact) error
+}
+
 const (
 	actionMeetingCreate    = "MEETING_CREATE"
 	actionResolutionCreate = "RESOLUTION_CREATE"
@@ -30,14 +38,15 @@ const (
 )
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	store       store.Store
+	publisher   events.Publisher
+	authz       AuthZClient
+	evidenceReq EvidenceReqClient
+	logger      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, pub events.Publisher, az AuthZClient, er EvidenceReqClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, publisher: pub, authz: az, evidenceReq: er, logger: logger}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -54,6 +63,14 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "forbidden")
 	} else {
 		writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+	}
+}
+
+func (h *Handler) writeEvidenceErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, evidencereq.ErrEvidenceMissing) {
+		writeError(w, http.StatusUnprocessableEntity, "required evidence is missing")
+	} else {
+		writeError(w, http.StatusServiceUnavailable, "evidence-requirements-svc unavailable")
 	}
 }
 
@@ -311,6 +328,38 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 	// self-approval check belongs here, not there.)
 	if existing.CreatedBy == principalID {
 		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
+
+	// No finalization path may skip required evidence states
+	// (03-microservices.md §8.6). domain_code is the resolution's own
+	// category (GOVERNANCE/FINANCIAL/OPERATIONAL/EXECUTIVE/STATUTORY) —
+	// real data already on the record, not an invented dimension.
+	//
+	// correlationID must NOT default to the resolution's own ID:
+	// evidence-requirements-svc's Evaluate is deliberately idempotent on
+	// correlation_id (a genuine retry must replay, not re-evaluate) — falling
+	// back to a fixed per-resolution value made every retry-after-attaching-
+	// evidence permanently replay the FIRST attempt's result, even after
+	// real evidence was attached. Caught live: a resolution blocked on the
+	// first pass attempt stayed blocked forever on retry until this was
+	// fixed. Each call without a caller-supplied X-Correlation-ID is a
+	// distinct real-world attempt, not a retry — retries are exactly what
+	// the header is for, and callers who want retry-safety must supply it.
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		correlationID = "resolution-pass-" + uuid.New().String()
+	}
+	var artifacts []evidencereq.Artifact
+	if req.DocumentVaultID != nil && *req.DocumentVaultID != "" {
+		artifacts = append(artifacts, evidencereq.Artifact{
+			EvidenceType: "SUPPORTING_DOCUMENT",
+			ReferenceID:  *req.DocumentVaultID,
+		})
+	}
+	if err := h.evidenceReq.EvaluateSufficient(r.Context(), tenantID, existing.LegalEntityID,
+		string(existing.Category), actionResolutionPass, correlationID, principalID, artifacts); err != nil {
+		h.writeEvidenceErr(w, err)
 		return
 	}
 

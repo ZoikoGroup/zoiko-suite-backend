@@ -39,10 +39,10 @@ type AuthZClient interface {
 // action type per lifecycle stage — nothing in the docs specifies
 // finer-grained codes for v1.
 const (
-	actionCreateInvoice  = "AP_INVOICE_CREATE"
+	actionCreateInvoice   = "AP_INVOICE_CREATE"
 	actionValidateInvoice = "AP_INVOICE_VALIDATE"
-	actionApproveInvoice = "AP_INVOICE_APPROVE"
-	actionRequestPayment = "AP_PAYMENT_REQUEST"
+	actionApproveInvoice  = "AP_INVOICE_APPROVE"
+	actionRequestPayment  = "AP_PAYMENT_REQUEST"
 )
 
 type Handler struct {
@@ -103,6 +103,7 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		CurrencyCode:         req.CurrencyCode,
 		DueDate:              req.DueDate,
 		Status:               domain.InvoiceStatusReceived,
+		SourceContractID:     req.SourceContractID,
 		CreatedByPrincipalID: principalID,
 		CorrelationID:        req.CorrelationID,
 	}

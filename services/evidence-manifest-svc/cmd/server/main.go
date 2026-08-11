@@ -41,6 +41,11 @@ func main() {
 	if err != nil {
 		log.Fatal("failed to parse db pool config", zap.Error(err))
 	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
 	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
 		log.Fatal("failed to create db pool", zap.Error(err))

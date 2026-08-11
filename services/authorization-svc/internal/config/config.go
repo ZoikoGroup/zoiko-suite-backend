@@ -22,6 +22,18 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// MTLS fields wire the material-path mTLS pilot (docs/original_doc/
+	// zoiko_suite_doc5.txt:76,251 — mTLS mandated for "material paths", not
+	// every call). Disabled by default: MTLSEnabled=false leaves every
+	// existing caller on the plain HTTP port untouched. When enabled, this
+	// service ALSO listens on MTLSPort with a server certificate obtained
+	// from mtls-management-svc, requiring a verified client certificate
+	// signed by the same CA — the plain port keeps running alongside it, so
+	// turning this on never breaks a caller that hasn't migrated yet.
+	MTLSEnabled              bool
+	MTLSPort                 int
+	MTLSManagementServiceURL string
 }
 
 type DBConfig struct {
@@ -75,6 +87,10 @@ func Load() (*Config, error) {
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		MTLSEnabled:              envBool("MTLS_ENABLED", false),
+		MTLSPort:                 envInt("MTLS_PORT", 8449),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}, nil
 }
 
@@ -95,4 +111,16 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }

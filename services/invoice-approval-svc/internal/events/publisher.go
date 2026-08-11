@@ -31,7 +31,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 }
 
 func (p *Publisher) PublishApprovalStarted(ctx context.Context, correlationID string, req domain.InvoiceApprovalRequest) {
-	p.emit(ctx, "invoice.approval.started", correlationID, map[string]any{
+	p.emit(ctx, "invoice.approval.started", correlationID, req.ApprovalRequestID, map[string]any{
 		"approval_request_id":     req.ApprovalRequestID,
 		"tenant_id":               req.TenantID,
 		"legal_entity_id":         req.LegalEntityID,
@@ -45,7 +45,7 @@ func (p *Publisher) PublishApprovalStarted(ctx context.Context, correlationID st
 }
 
 func (p *Publisher) PublishApproved(ctx context.Context, correlationID string, req domain.InvoiceApprovalRequest) {
-	p.emit(ctx, "invoice.approved", correlationID, map[string]any{
+	p.emit(ctx, "invoice.approved", correlationID, req.ApprovalRequestID, map[string]any{
 		"approval_request_id":  req.ApprovalRequestID,
 		"tenant_id":            req.TenantID,
 		"legal_entity_id":      req.LegalEntityID,
@@ -58,7 +58,7 @@ func (p *Publisher) PublishApproved(ctx context.Context, correlationID string, r
 }
 
 func (p *Publisher) PublishRejected(ctx context.Context, correlationID string, req domain.InvoiceApprovalRequest, reason string) {
-	p.emit(ctx, "invoice.rejected", correlationID, map[string]any{
+	p.emit(ctx, "invoice.rejected", correlationID, req.ApprovalRequestID, map[string]any{
 		"approval_request_id":  req.ApprovalRequestID,
 		"tenant_id":            req.TenantID,
 		"legal_entity_id":      req.LegalEntityID,
@@ -69,7 +69,7 @@ func (p *Publisher) PublishRejected(ctx context.Context, correlationID string, r
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -92,7 +92,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

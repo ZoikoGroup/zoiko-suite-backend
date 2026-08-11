@@ -121,14 +121,18 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		Description:          req.Description,
 		CreatedByPrincipalID: principalID,
 		CorrelationID:        req.CorrelationID,
+		SourceEventID:        req.SourceEventID,
+		GovernanceDecisionID: req.GovernanceDecisionID,
 	}
 	lines := make([]domain.JournalLine, len(req.Lines))
 	for i, l := range req.Lines {
 		lines[i] = domain.JournalLine{
-			AccountCode:  l.AccountCode,
-			DebitAmount:  l.DebitAmount,
-			CreditAmount: l.CreditAmount,
-			Description:  l.Description,
+			AccountCode:        l.AccountCode,
+			DebitAmount:        l.DebitAmount,
+			CreditAmount:       l.CreditAmount,
+			Description:        l.Description,
+			TaxCode:            l.TaxCode,
+			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
 		}
 	}
 
@@ -362,10 +366,12 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	reversingLines := make([]domain.JournalLine, len(lines))
 	for i, l := range lines {
 		reversingLines[i] = domain.JournalLine{
-			AccountCode:  l.AccountCode,
-			DebitAmount:  l.CreditAmount, // exact debit/credit inverse
-			CreditAmount: l.DebitAmount,
-			Description:  l.Description,
+			AccountCode:        l.AccountCode,
+			DebitAmount:        l.CreditAmount, // exact debit/credit inverse
+			CreditAmount:       l.DebitAmount,
+			Description:        l.Description,
+			TaxCode:            l.TaxCode, // same tax basis as the line being reversed
+			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
 		}
 	}
 

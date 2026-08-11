@@ -54,6 +54,14 @@ type PolicyVersion struct {
 	// globally, if TenantID is also nil).
 	LegalEntityID *string `json:"legal_entity_id"`
 
+	// ScopeType is GLOBAL | TENANT | LEGAL_ENTITY — the explicit, named form
+	// of what TenantID/LegalEntityID's nullness already encodes. Per
+	// docs/original_doc/zoiko_suite_doc7.txt §F1 ("'GLOBAL' is an explicit
+	// scope, not a default"), enforced consistent with TenantID/LegalEntityID
+	// by a DB CHECK constraint (migration 000003) — this field is derived,
+	// never set independently of them.
+	ScopeType string `json:"scope_type"`
+
 	// RulePayload holds the actual rule content. json.RawMessage so it is
 	// inlined in API responses as JSON, not base64-encoded bytes.
 	RulePayload json.RawMessage `json:"rule_payload"`
@@ -77,6 +85,28 @@ type PolicyVersion struct {
 
 	CreatedAt            time.Time `json:"created_at"`
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// Scope type constants for PolicyVersion.ScopeType.
+const (
+	ScopeTypeGlobal      = "GLOBAL"
+	ScopeTypeTenant      = "TENANT"
+	ScopeTypeLegalEntity = "LEGAL_ENTITY"
+)
+
+// DeriveScopeType returns the explicit scope name for a given
+// tenantID/legalEntityID nullness pattern — the single source of truth the
+// store uses both when inserting a new version and when scanning one back,
+// so the derivation can never drift between the two.
+func DeriveScopeType(tenantID, legalEntityID *string) string {
+	switch {
+	case tenantID == nil:
+		return ScopeTypeGlobal
+	case legalEntityID == nil:
+		return ScopeTypeTenant
+	default:
+		return ScopeTypeLegalEntity
+	}
 }
 
 // ApplicablePolicyVersion is a PolicyVersion enriched with its owning

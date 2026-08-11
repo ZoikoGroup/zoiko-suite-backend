@@ -19,7 +19,7 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	invoices     map[string]*domain.VendorInvoice
+	invoices      map[string]*domain.VendorInvoice
 	byCorrelation map[string]string
 
 	createErr     error
@@ -86,10 +86,18 @@ type stubPublisher struct {
 	received, validated, approved, paymentRequested int
 }
 
-func (p *stubPublisher) PublishVendorInvoiceReceived(_ context.Context, _ domain.VendorInvoice)  { p.received++ }
-func (p *stubPublisher) PublishVendorInvoiceValidated(_ context.Context, _ domain.VendorInvoice) { p.validated++ }
-func (p *stubPublisher) PublishVendorInvoiceApproved(_ context.Context, _ domain.VendorInvoice)  { p.approved++ }
-func (p *stubPublisher) PublishPaymentRequested(_ context.Context, _ domain.VendorInvoice)       { p.paymentRequested++ }
+func (p *stubPublisher) PublishVendorInvoiceReceived(_ context.Context, _ domain.VendorInvoice) {
+	p.received++
+}
+func (p *stubPublisher) PublishVendorInvoiceValidated(_ context.Context, _ domain.VendorInvoice) {
+	p.validated++
+}
+func (p *stubPublisher) PublishVendorInvoiceApproved(_ context.Context, _ domain.VendorInvoice) {
+	p.approved++
+}
+func (p *stubPublisher) PublishPaymentRequested(_ context.Context, _ domain.VendorInvoice) {
+	p.paymentRequested++
+}
 
 type stubAuthZ struct {
 	err error

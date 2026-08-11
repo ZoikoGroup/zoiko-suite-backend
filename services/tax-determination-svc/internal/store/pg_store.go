@@ -31,7 +31,7 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
-	_, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID))
+	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
 
@@ -63,12 +63,12 @@ func (s *PgStore) CreateDetermination(ctx context.Context, d *domain.TaxDetermin
 	_, err = tx.Exec(ctx, `
 		INSERT INTO tax_determinations
 			(determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
-			 rule_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage, calculated_tax_amount,
+			 rule_id, tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage, calculated_tax_amount,
 			 exempt_amount, currency, status, effective_from, effective_to, evaluated_at, evaluated_by,
 			 created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
 		d.DeterminationID, d.TenantID, d.TransactionID, d.SourceModule, d.LegalEntityID, d.JurisdictionID,
-		d.RuleID, d.TaxCategory, d.GrossAmount, d.TaxableAmount, d.TaxRatePercentage, d.CalculatedTaxAmount,
+		d.RuleID, d.TaxLogicSnapshotID, d.TaxCategory, d.GrossAmount, d.TaxableAmount, d.TaxRatePercentage, d.CalculatedTaxAmount,
 		d.ExemptAmount, d.Currency, string(d.Status), d.EffectiveFrom, d.EffectiveTo, d.EvaluatedAt, d.EvaluatedBy,
 		d.CreatedAt, d.UpdatedAt,
 	)
@@ -89,17 +89,18 @@ func (s *PgStore) GetDetermination(ctx context.Context, id string) (*domain.TaxD
 		return nil, err
 	}
 
+	tenantID := middleware.GetTenantID(ctx)
 	var d domain.TaxDetermination
 	var status string
 	err = tx.QueryRow(ctx, `
 		SELECT determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
-		       COALESCE(rule_id,''), tax_category, gross_amount, taxable_amount, tax_rate_percentage,
+		       COALESCE(rule_id,''), tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage,
 		       calculated_tax_amount, exempt_amount, currency, status, effective_from, effective_to,
 		       evaluated_at, evaluated_by, created_at, updated_at
-		FROM tax_determinations WHERE determination_id = $1`, id,
+		FROM tax_determinations WHERE determination_id = $1 AND tenant_id = $2`, id, tenantID,
 	).Scan(
 		&d.DeterminationID, &d.TenantID, &d.TransactionID, &d.SourceModule, &d.LegalEntityID, &d.JurisdictionID,
-		&d.RuleID, &d.TaxCategory, &d.GrossAmount, &d.TaxableAmount, &d.TaxRatePercentage,
+		&d.RuleID, &d.TaxLogicSnapshotID, &d.TaxCategory, &d.GrossAmount, &d.TaxableAmount, &d.TaxRatePercentage,
 		&d.CalculatedTaxAmount, &d.ExemptAmount, &d.Currency, &status, &d.EffectiveFrom, &d.EffectiveTo,
 		&d.EvaluatedAt, &d.EvaluatedBy, &d.CreatedAt, &d.UpdatedAt,
 	)
@@ -124,16 +125,18 @@ func (s *PgStore) ListDeterminations(ctx context.Context, transactionID, jurisdi
 		return nil, err
 	}
 
+	tenantID := middleware.GetTenantID(ctx)
 	rows, err := tx.Query(ctx, `
 		SELECT determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
-		       COALESCE(rule_id,''), tax_category, gross_amount, taxable_amount, tax_rate_percentage,
+		       COALESCE(rule_id,''), tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage,
 		       calculated_tax_amount, exempt_amount, currency, status, effective_from, effective_to,
 		       evaluated_at, evaluated_by, created_at, updated_at
 		FROM tax_determinations
-		WHERE ($1 = '' OR transaction_id = $1)
+		WHERE tenant_id = $4
+		  AND ($1 = '' OR transaction_id = $1)
 		  AND ($2 = '' OR jurisdiction_id = $2)
 		  AND ($3 = '' OR status = $3)
-		ORDER BY created_at DESC`, transactionID, jurisdictionID, status,
+		ORDER BY created_at DESC`, transactionID, jurisdictionID, status, tenantID,
 	)
 	if err != nil {
 		return nil, err
@@ -146,7 +149,7 @@ func (s *PgStore) ListDeterminations(ctx context.Context, transactionID, jurisdi
 		var stat string
 		if err := rows.Scan(
 			&d.DeterminationID, &d.TenantID, &d.TransactionID, &d.SourceModule, &d.LegalEntityID, &d.JurisdictionID,
-			&d.RuleID, &d.TaxCategory, &d.GrossAmount, &d.TaxableAmount, &d.TaxRatePercentage,
+			&d.RuleID, &d.TaxLogicSnapshotID, &d.TaxCategory, &d.GrossAmount, &d.TaxableAmount, &d.TaxRatePercentage,
 			&d.CalculatedTaxAmount, &d.ExemptAmount, &d.Currency, &stat, &d.EffectiveFrom, &d.EffectiveTo,
 			&d.EvaluatedAt, &d.EvaluatedBy, &d.CreatedAt, &d.UpdatedAt,
 		); err != nil {
@@ -170,14 +173,15 @@ func (s *PgStore) UpdateDetermination(ctx context.Context, d *domain.TaxDetermin
 	}
 
 	d.UpdatedAt = time.Now().UTC()
+	tenantID := middleware.GetTenantID(ctx)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE tax_determinations
 		SET gross_amount=$1, taxable_amount=$2, tax_rate_percentage=$3, calculated_tax_amount=$4,
 		    exempt_amount=$5, status=$6, effective_to=$7, updated_at=$8
-		WHERE determination_id=$9`,
+		WHERE determination_id=$9 AND tenant_id=$10`,
 		d.GrossAmount, d.TaxableAmount, d.TaxRatePercentage, d.CalculatedTaxAmount,
-		d.ExemptAmount, string(d.Status), d.EffectiveTo, d.UpdatedAt, d.DeterminationID,
+		d.ExemptAmount, string(d.Status), d.EffectiveTo, d.UpdatedAt, d.DeterminationID, tenantID,
 	)
 	if err != nil {
 		return fmt.Errorf("update tax determination: %w", err)
@@ -207,12 +211,13 @@ func (s *PgStore) OverrideDetermination(ctx context.Context, id string, req *dom
 	d.Status = domain.StatusOverridden
 	d.CalculatedTaxAmount = req.OverriddenTaxAmount
 	d.UpdatedAt = time.Now().UTC()
+	tenantID := middleware.GetTenantID(ctx)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE tax_determinations
 		SET calculated_tax_amount=$1, status=$2, updated_at=$3
-		WHERE determination_id=$4`,
-		d.CalculatedTaxAmount, string(d.Status), d.UpdatedAt, id,
+		WHERE determination_id=$4 AND tenant_id=$5`,
+		d.CalculatedTaxAmount, string(d.Status), d.UpdatedAt, id, tenantID,
 	)
 	if err != nil {
 		return nil, err

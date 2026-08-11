@@ -22,9 +22,9 @@ import "time"
 type InvoiceStatus string
 
 const (
-	InvoiceStatusReceived        InvoiceStatus = "RECEIVED"
-	InvoiceStatusValidated       InvoiceStatus = "VALIDATED"
-	InvoiceStatusApproved        InvoiceStatus = "APPROVED"
+	InvoiceStatusReceived         InvoiceStatus = "RECEIVED"
+	InvoiceStatusValidated        InvoiceStatus = "VALIDATED"
+	InvoiceStatusApproved         InvoiceStatus = "APPROVED"
 	InvoiceStatusPaymentRequested InvoiceStatus = "PAYMENT_REQUESTED"
 )
 
@@ -49,15 +49,19 @@ type VendorInvoice struct {
 	DueDate       time.Time     `json:"due_date"`
 	Status        InvoiceStatus `json:"status"`
 
-	CreatedByPrincipalID       string     `json:"created_by_principal_id"`
-	ValidatedByPrincipalID     *string    `json:"validated_by_principal_id,omitempty"`
-	ApprovedByPrincipalID      *string    `json:"approved_by_principal_id,omitempty"`
-	PaymentRequestedByPrincipalID *string `json:"payment_requested_by_principal_id,omitempty"`
-	CorrelationID              string     `json:"correlation_id"`
-	CreatedAt                  time.Time  `json:"created_at"`
-	ValidatedAt                *time.Time `json:"validated_at,omitempty"`
-	ApprovedAt                 *time.Time `json:"approved_at,omitempty"`
-	PaymentRequestedAt         *time.Time `json:"payment_requested_at,omitempty"`
+	// SourceContractID is nil unless this invoice was issued against a real
+	// contract-lifecycle-svc contract.
+	SourceContractID *string `json:"source_contract_id,omitempty"`
+
+	CreatedByPrincipalID          string     `json:"created_by_principal_id"`
+	ValidatedByPrincipalID        *string    `json:"validated_by_principal_id,omitempty"`
+	ApprovedByPrincipalID         *string    `json:"approved_by_principal_id,omitempty"`
+	PaymentRequestedByPrincipalID *string    `json:"payment_requested_by_principal_id,omitempty"`
+	CorrelationID                 string     `json:"correlation_id"`
+	CreatedAt                     time.Time  `json:"created_at"`
+	ValidatedAt                   *time.Time `json:"validated_at,omitempty"`
+	ApprovedAt                    *time.Time `json:"approved_at,omitempty"`
+	PaymentRequestedAt            *time.Time `json:"payment_requested_at,omitempty"`
 }
 
 // ── wire types (request bodies) ─────────────────────────────────────────────
@@ -71,6 +75,9 @@ type CreateVendorInvoiceRequest struct {
 	CurrencyCode  string    `json:"currency_code"`
 	DueDate       time.Time `json:"due_date"`
 	CorrelationID string    `json:"correlation_id"`
+	// SourceContractID is optional: the contract-lifecycle-svc contract
+	// this invoice was issued against, when one exists.
+	SourceContractID *string `json:"source_contract_id,omitempty"`
 }
 
 // ListInvoicesFilter holds optional filters for querying invoices.

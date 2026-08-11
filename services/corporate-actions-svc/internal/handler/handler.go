@@ -7,11 +7,13 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/corporate-actions-svc/internal/authz"
 	"zoiko.io/corporate-actions-svc/internal/domain"
 	"zoiko.io/corporate-actions-svc/internal/events"
+	"zoiko.io/corporate-actions-svc/internal/evidencereq"
 	"zoiko.io/corporate-actions-svc/internal/middleware"
 	"zoiko.io/corporate-actions-svc/internal/store"
 )
@@ -22,6 +24,13 @@ type AuthZClient interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// EvidenceReqClient verifies evidence sufficiency before a corporate action
+// may be executed. Implementations must fail closed, same doctrine as
+// AuthZClient.
+type EvidenceReqClient interface {
+	EvaluateSufficient(ctx context.Context, tenantID, legalEntityID, domainCode, actionType, correlationID, principalID string, artifacts []evidencereq.Artifact) error
+}
+
 const (
 	actionCorporateActionCreate  = "CORPORATE_ACTION_CREATE"
 	actionCorporateActionUpdate  = "CORPORATE_ACTION_UPDATE"
@@ -29,14 +38,15 @@ const (
 )
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	store       store.Store
+	publisher   events.Publisher
+	authz       AuthZClient
+	evidenceReq EvidenceReqClient
+	logger      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, pub events.Publisher, az AuthZClient, er EvidenceReqClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, publisher: pub, authz: az, evidenceReq: er, logger: logger}
 }
 
 // requirePrincipal extracts the calling principal from the X-Principal-Id
@@ -58,6 +68,16 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+// writeEvidenceErr maps an evidence-requirements-svc error to the
+// appropriate HTTP response, failing closed on anything ambiguous.
+func (h *Handler) writeEvidenceErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, evidencereq.ErrEvidenceMissing) {
+		writeError(w, http.StatusUnprocessableEntity, "required evidence is missing")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "evidence-requirements-svc unavailable")
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -249,6 +269,36 @@ func (h *Handler) ExecuteAction(w http.ResponseWriter, r *http.Request) {
 	// their own submission.
 	if existing.CreatedBy == principalID {
 		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
+
+	// No finalization path may skip required evidence states
+	// (03-microservices.md §8.6). domain_code is the action's own type
+	// (MERGER/ACQUISITION/SHARE_ISSUANCE/...) — real data already on the
+	// record, not an invented dimension.
+	//
+	// correlationID must NOT default to the action's own ID:
+	// evidence-requirements-svc's Evaluate is deliberately idempotent on
+	// correlation_id (a genuine retry must replay, not re-evaluate) — a
+	// fixed per-action fallback would make every retry-after-attaching-
+	// evidence permanently replay the FIRST attempt's result (caught live
+	// on the sibling board-resolutions-svc fix). Each call without a
+	// caller-supplied X-Correlation-ID is a distinct real-world attempt,
+	// not a retry — retries are exactly what the header is for.
+	correlationID := r.Header.Get("X-Correlation-ID")
+	if correlationID == "" {
+		correlationID = "action-execute-" + uuid.New().String()
+	}
+	var artifacts []evidencereq.Artifact
+	if req.DocumentVaultID != nil && *req.DocumentVaultID != "" {
+		artifacts = append(artifacts, evidencereq.Artifact{
+			EvidenceType: "SUPPORTING_DOCUMENT",
+			ReferenceID:  *req.DocumentVaultID,
+		})
+	}
+	if err := h.evidenceReq.EvaluateSufficient(r.Context(), tenantID, existing.LegalEntityID,
+		string(existing.ActionType), actionCorporateActionExecute, correlationID, principalID, artifacts); err != nil {
+		h.writeEvidenceErr(w, err)
 		return
 	}
 

@@ -25,6 +25,23 @@ type Store interface {
 	PassResolution(ctx context.Context, id string, req *domain.PassResolutionRequest) (*domain.BoardResolution, error)
 }
 
+// effectiveDateColumns is the SELECT fragment for the two effective-date
+// columns, which MUST be read as text.
+//
+// effective_from/effective_to are DATE columns, but domain.BoardMeeting and
+// domain.BoardResolution declare them as string / *string because the API
+// contract is a plain "YYYY-MM-DD", not an RFC3339 timestamp. pgx happily
+// ENCODEs a Go string into a DATE parameter on write (INSERT/RETURNING
+// worked), but cannot DECODE a DATE into a *string on a plain SELECT — every
+// read here failed with a scan error, surfaced generically as "failed to
+// get resolution"/"failed to get meeting" with no logged detail (same
+// asymmetric read/write bug already fixed in contract-lifecycle-svc's
+// store).
+//
+// TO_CHAR rather than ::TEXT so the format does not depend on the session's
+// DateStyle. NULL effective_to passes through as NULL.
+const effectiveDateColumns = `TO_CHAR(effective_from, 'YYYY-MM-DD'), TO_CHAR(effective_to, 'YYYY-MM-DD')`
+
 type PgStore struct {
 	pool *pgxpool.Pool
 }
@@ -89,7 +106,7 @@ func (s *PgStore) GetMeeting(ctx context.Context, id string) (*domain.BoardMeeti
 	var status string
 	err = tx.QueryRow(ctx, `
 		SELECT meeting_id, tenant_id, legal_entity_id, title, scheduled_at, COALESCE(location,''), status,
-		       COALESCE(minutes_summary,''), effective_from, effective_to, created_by, created_at, updated_at
+		       COALESCE(minutes_summary,''), `+effectiveDateColumns+`, created_by, created_at, updated_at
 		FROM board_meetings WHERE meeting_id = $1`, id,
 	).Scan(
 		&m.MeetingID, &m.TenantID, &m.LegalEntityID, &m.Title, &m.ScheduledAt, &m.Location, &status,
@@ -118,7 +135,7 @@ func (s *PgStore) ListMeetings(ctx context.Context, legalEntityID string) ([]dom
 
 	rows, err := tx.Query(ctx, `
 		SELECT meeting_id, tenant_id, legal_entity_id, title, scheduled_at, COALESCE(location,''), status,
-		       COALESCE(minutes_summary,''), effective_from, effective_to, created_by, created_at, updated_at
+		       COALESCE(minutes_summary,''), `+effectiveDateColumns+`, created_by, created_at, updated_at
 		FROM board_meetings
 		WHERE ($1 = '' OR legal_entity_id = $1)
 		ORDER BY scheduled_at DESC`, legalEntityID,
@@ -197,7 +214,7 @@ func (s *PgStore) GetResolution(ctx context.Context, id string) (*domain.BoardRe
 	err = tx.QueryRow(ctx, `
 		SELECT resolution_id, meeting_id, tenant_id, legal_entity_id, resolution_number, title, content, category,
 		       status, votes_for, votes_against, abstentions, passed_at, passed_by, document_vault_id,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       `+effectiveDateColumns+`, created_by, created_at, updated_at
 		FROM board_resolutions WHERE resolution_id = $1`, id,
 	).Scan(
 		&r.ResolutionID, &r.MeetingID, &r.TenantID, &r.LegalEntityID, &r.ResolutionNumber, &r.Title, &r.Content, &category,
@@ -229,7 +246,7 @@ func (s *PgStore) ListResolutions(ctx context.Context, legalEntityID, meetingID,
 	rows, err := tx.Query(ctx, `
 		SELECT resolution_id, meeting_id, tenant_id, legal_entity_id, resolution_number, title, content, category,
 		       status, votes_for, votes_against, abstentions, passed_at, passed_by, document_vault_id,
-		       effective_from, effective_to, created_by, created_at, updated_at
+		       `+effectiveDateColumns+`, created_by, created_at, updated_at
 		FROM board_resolutions
 		WHERE ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR meeting_id = $2)

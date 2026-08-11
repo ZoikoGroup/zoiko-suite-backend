@@ -7,6 +7,8 @@ import (
 	"go.uber.org/zap"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/handler"
@@ -46,6 +48,7 @@ func main() {
 	}()
 	logger.Info("mtls-management-svc listening on :" + port)
 	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -31,28 +31,28 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 }
 
 func (p *Publisher) PublishRoleCreated(ctx context.Context, r domain.RoleDefinition) {
-	p.emit(ctx, "role.created", r.CorrelationID, map[string]any{
+	p.emit(ctx, "role.created", r.CorrelationID, r.RoleDefinitionID, map[string]any{
 		"role_definition_id": r.RoleDefinitionID,
 		"role_code":          r.RoleCode,
 	})
 }
 
 func (p *Publisher) PublishRoleUpdated(ctx context.Context, r domain.RoleDefinition) {
-	p.emit(ctx, "role.updated", r.CorrelationID, map[string]any{
+	p.emit(ctx, "role.updated", r.CorrelationID, r.RoleDefinitionID, map[string]any{
 		"role_definition_id": r.RoleDefinitionID,
 		"status":             r.Status,
 	})
 }
 
 func (p *Publisher) PublishBundleUpdated(ctx context.Context, b domain.PermissionBundleDef) {
-	p.emit(ctx, "permission.bundle.updated", b.CorrelationID, map[string]any{
+	p.emit(ctx, "permission.bundle.updated", b.CorrelationID, b.BundleID, map[string]any{
 		"bundle_id":          b.BundleID,
 		"role_definition_id": b.RoleDefinitionID,
 		"permitted_actions":  b.PermittedActions,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -75,7 +75,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),
