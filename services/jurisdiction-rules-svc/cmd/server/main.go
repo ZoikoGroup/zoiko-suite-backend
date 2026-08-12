@@ -209,6 +209,15 @@ func newPublisher(cfg *config.Config, log *zap.Logger) (events.Publisher, func()
 		// committed by the time an event is emitted; the caller should not
 		// wait on the event backbone to hear about it.
 		WriteTimeout: 5 * time.Second,
+		// Without this, every write to this service costs an extra second.
+		// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+		// WriteMessages of a single message waits for the batch to fill (100
+		// messages) or for that timer, whichever comes first. These events are
+		// emitted one per state transition, so the batch never fills and the
+		// timer always wins — and publishing is on the request path, so the
+		// caller pays for it. Ordering and synchronous delivery are unchanged;
+		// only the artificial wait goes away.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	return events.NewPublisher(log, cfg.Kafka.Topic, writer), func() { _ = writer.Close() }
 }

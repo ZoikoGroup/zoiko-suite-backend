@@ -168,3 +168,103 @@ Follow-up (separate, not yet filed): the tests above cover Tenant and
 LegalEntity only. EntityHierarchy, EntityJurisdictionAssignment,
 DataResidencyPolicy, and TaxIdentityBundle still have no integration
 test coverage.
+
+
+## Resolved: vendor-due-diligence-svc could conclude a check without its evidence
+internal/handler/handler.go recorded the screening outcome and the evidence
+supporting it in two separate transactions, and the evidence write's failure
+was logged and swallowed — then the response returned the evidence record
+anyway. A caller could therefore be handed a COMPLETED/CLEAR check together
+with the evidence for it while the store held the check and no evidence at
+all, and a later GET returned the clean outcome with an empty evidence list.
+For a service whose stated purpose is due-diligence evidence, that is an
+unevidenced compliance pass which reads exactly like an evidenced one.
+
+Replaced AddEvidence + CompleteCheck with a single store.ConcludeCheck: one
+transaction, guarded on the check still being STARTED so a second conclusion
+cannot overwrite a terminal one (the unguarded UPDATE allowed FLAGGED to be
+replaced with CLEAR). Proved with internal/store/pg_store_test.go —
+TestConcludeCheck_EvidenceFailureRollsBackTheConclusion forces an unusable
+evidence row and asserts the check stays STARTED, and
+TestConcludeCheck_ConcurrentConclusionsExactlyOneWins races eight
+conclusions and asserts exactly one succeeds with exactly one evidence row.
+The service previously had no store tests, which is why this survived: the
+handler stub is a map and cannot fail one write while the other succeeds.
+
+## Resolved: CLEAR was indistinguishable from a real sanctions clearance
+The only screening this service performs is an exact, case-insensitive match
+against a hardcoded list of two vendor names. There is no sanctions or
+watchlist feed anywhere on this platform to call — external-data-feed-svc
+carries MARKET_DATA, CREDIT_SCORE, COMPANY_INFO, FX_RATE and ESG_DATA only —
+so the stub stands in for an integration that does not exist rather than
+shortcutting one that does. Because the match is exact, "Acme Sanctioned
+Holdings Ltd" screens CLEAR while "Acme Sanctioned Holdings" is flagged.
+
+Nothing on the wire said so. risk_outcome was CLEAR and screening_basis was
+free-text prose, which is not a contract, so any consumer reading CLEAR as
+"this vendor is clear" would report an effectively unscreened counterparty as
+a screened one that passed. Added vendor_dd_checks.screening_source
+(migration 000002), written STUB_DENYLIST, returned on the read API AND
+published on vendor.dd.completed — putting it on the read API alone would
+have fixed the defect for whoever looks at the console and left it in place
+for every automated consumer, which is the more dangerous half.
+
+## Resolved: FAILED was unwritable and vendor.dd.failed unemittable
+FAILED was a status no code path could set and vendor.dd.failed was an event
+declared in 03-microservices.md §12.10 with nothing able to publish it. A
+check whose conclusion failed was abandoned in STARTED, where it stayed
+forever — indistinguishable in the register from any other row, with no route
+to retry it and nothing downstream told a screening had been attempted and
+lost. Added store.MarkFailed and the handler failure path, and migration
+000002 adds a CHECK constraint making a partially-applied conclusion
+unrepresentable (an outcome requires a conclusion, and a conclusion requires
+its timestamp).
+
+Note on that constraint: `risk_outcome IN ('CLEAR','FLAGGED')` alone did NOT
+enforce it. A CHECK rejects a row only when its expression evaluates to
+FALSE, and `NULL IN (...)` evaluates to NULL — so the COMPLETED branch went
+NULL, the disjunction went `FALSE OR FALSE OR NULL` = NULL, and a COMPLETED
+check carrying no outcome at all was accepted: precisely the state the
+constraint existed to forbid. It needs an explicit IS NOT NULL beside the IN.
+
+## Resolved: a blank vendor name was screened rather than refused
+`vendor_name: "   "` passed the `!= ""` check, then screenVendorName trimmed
+it to "" , matched nothing, and the check concluded COMPLETED/CLEAR — a clean
+due-diligence result for a vendor with no name. Inputs are now trimmed before
+the emptiness test. Screening also collapses internal whitespace, so a stray
+double space cannot defeat the only screening there is.
+
+## Resolved: a malformed authorization scope read as an outage
+authorization-svc stores legal_entity_id in a uuid column and answers 503
+`store_unavailable` for a non-UUID one — its own instance of the platform-wide
+habit of reporting a driver error as an outage. From a calling service that
+503 is indistinguishable from authorization-svc genuinely being down, so a
+caller who mistyped a legal_entity_id filter was told the authorization plane
+had failed. Callers must therefore validate the scope themselves before
+asking: handler.validScope answers 400 `invalid_scope`.
+
+Worth noting for other services: it is specifically the value used as the
+AUTHORIZATION SCOPE that must be a UUID, not necessarily the column. In this
+service legal_entity_id and counterparty_id are VARCHAR(255) (only check_id
+is uuid), so a malformed counterparty filter is a valid comparison that
+matches nothing and must NOT be reported as invalid.
+
+Still open for this service: the screening itself. Replace
+stubSanctionsDenylist with a real sanctions/watchlist integration when one
+exists on the platform; screening_source is the field that will distinguish
+its results from the stub's, and every historical row stays honest about
+having been screened by the stub.
+
+## Open: authorization-svc role creation reports a duplicate as an outage
+Re-POSTing an existing role answers 503 `store_unavailable` rather than 200 or
+409. Recorded in seed-demo-rbac.ps1, which tolerates it and relies on its
+end-of-run verification instead.
+
+## Open: several databases in deployments/init-db.sh do not exist on an
+## existing postgres volume
+init-db.sh only runs on first volume initialisation, so a database added to it
+later is absent from any volume created before that. vendor_due_diligence and
+counterparty_management both had to be created and migrated by hand.
+counterparty-management-svc reported `healthy` throughout — its readiness
+probe does not detect that its own database is missing, so a healthy container
+is not evidence its schema exists.

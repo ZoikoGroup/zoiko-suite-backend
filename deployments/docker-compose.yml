@@ -1199,15 +1199,23 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # 8129, not 8112. benefits-svc also published "8112:8112", so the two could
+  # never both start — whichever came up first took the port and the other died
+  # binding it. 8129 is what deployments/traefik-dynamic/all-services.yml already
+  # routes this service to (http://purchase-order-svc:8129), so through the
+  # gateway it was unreachable at 8112 in a way that looks like a dead service,
+  # and it is also what zoiko-suite-fe's .env.local has always said. Moving this
+  # one rather than benefits-svc keeps benefits inside the payroll block
+  # (8110-8114) and makes compose, Traefik, and the console agree.
   purchase-order-svc:
     build:
       context: ../services/purchase-order-svc
       dockerfile: Dockerfile
     container_name: purchase-order-svc
     ports:
-      - "8112:8112"
+      - "8129:8129"
     environment:
-      PORT: "8112"
+      PORT: "8129"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_order
@@ -1228,7 +1236,7 @@ services:
       purchase-request-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8112/healthz"]
+      test: ["CMD", "/healthcheck", "http://localhost:8129/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

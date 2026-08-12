@@ -25,8 +25,7 @@ type envelope struct {
 }
 
 // Publisher implements event publishing against the Kafka event
-// backbone. Publishing is stubbed (logged, not written to Kafka) until a
-// kafka.Writer is injected — same posture as every other service here.
+// backbone — same posture as every other service here.
 type Publisher struct {
 	log   *zap.Logger
 	topic string
@@ -77,7 +76,8 @@ func (p *Publisher) PublishRotationCompleted(ctx context.Context, secretPolicyID
 }
 
 // emit serialises the payload into the canonical envelope and writes to
-// Kafka. Stub: logs structured JSON until kafka.Writer is injected.
+// Kafka. With no producer (local development, no brokers) it drops the
+// event and says so at Debug.
 func (p *Publisher) emit(eventType, correlationID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
