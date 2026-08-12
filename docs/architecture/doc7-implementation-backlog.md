@@ -99,16 +99,23 @@ restarting; noted here since it's the same class of stale-artifact trap as
 the pgx prepared-statement-cache issue from Chunk 6, but one layer further
 out (image vs. connection cache).
 
-## Chunk 9 — AI Governance & Automation Policy (net-new, Plane 5)
+## Chunk 9 — AI Governance & Automation Policy (net-new, Plane 5) — ✅ Done 2026-08-12
+
+Resolution: new service `ai-governance-svc` — a record-keeping and
+gate-checking layer only; it never runs models or executes automations
+itself, per doc7 §11's own doctrine that "the deterministic policy layer...
+tenant automation policy and required human approvals outrank model
+preference." `AIRunType` and risk categories are quoted verbatim from §G1/§G2
+rather than locally invented taxonomies.
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 23 | AI run/recommendation object — model/prompt/tool version, source/evidence refs, confidence, audit ID | §G1 | Not Started | |
-| 24 | Action-risk classification + human-review-trigger taxonomy | §G2, §AI-01 | Not Started | |
-| 25 | `automation_action` object — preconditions, approvals, idempotency, postcondition verification, rollback | §G2, §G7 | Not Started | |
-| 26 | Autonomous-action allowlist per tenant/role/risk-class/tool | §G7 | Not Started | |
-| 27 | Provider/model registry — training-use posture, retention, region, DPA verification | §G6 | Not Started | |
-| 28 | Maker-checker / self-approval blocking for AI-proposed policy or control changes | §G3 | Not Started | |
+| 23 | AI run/recommendation object — model/prompt/tool version, source/evidence refs, confidence, audit ID | §G1 | Done | `ai_runs` table, `POST/GET /v1/ai-runs`; live-verified a RECOMMEND run with source/evidence refs and confidence recorded |
+| 24 | Action-risk classification + human-review-trigger taxonomy | §G2, §AI-01 | Done | `action_risk_classifications`; risk_category values are §G2's own enumerated list (MONEY/EMPLOYMENT/TAX_FILING/.../REGULATED_REPORTING) verbatim |
+| 25 | `automation_action` object — preconditions, approvals, idempotency, postcondition verification, rollback | §G2, §G7 | Done | `automation_actions`, unique `(tenant_id, idempotency_key)`; live-verified a duplicate idempotency_key 409s |
+| 26 | Autonomous-action allowlist per tenant/role/risk-class/tool | §G7 | Done | `automation_policies` + `GET /v1/automation-policies/resolve`; fail-closed by default — live-verified an unlisted action 403s (NOT_ALLOWLISTED) and an allowlisted one proceeds |
+| 27 | Provider/model registry — training-use posture, retention, region, DPA verification | §G6 | Done | `model_provider_registrations`; defaults to `NO_TRAINING` per §G6 ("No default training use is authorized"); `GET .../verify?data_class=` live-verified blocking an unapproved data class and an unregistered provider |
+| 28 | Maker-checker / self-approval blocking for AI-proposed policy or control changes | §G3 | Done | `policy_change_approvals` (for policy/control changes) and the decision step on `automation_actions` (for heightened-risk automation) both enforce `decider != proposer`; live-verified self-approval 403s on both objects, a different approver succeeds on both |
 
 ## Chunk 10 — Governance/Evidence Plane Gaps (extend existing services)
 
@@ -154,3 +161,4 @@ out (image vs. connection cache).
 - 2026-08-12 — Chunk 6 (items 6–12) complete: price_catalogs/plans/entitlement_limits, commercial_subscriptions, evaluation_programs, contract_entitlement_overlays, commercial_usage_meter_events, subscription_change_requests — all added to commercial-account-svc. Two real bugs caught during live verification and fixed before commit: usage_event_id was declared UUID but is a caller-supplied idempotency key (not guaranteed UUID-shaped); catalog/plan-admin actions were calling authorization-svc with an empty scope, which it rejects (fixed to use the platform-scope convention already established elsewhere in this codebase). All 7 items build/vet/test clean and live-verified end-to-end.
 - 2026-08-12 — Chunk 7 (items 13–18) complete: new `capability-registry-svc` — capabilities, market_releases, integration_capabilities, releases (append-only), capability_claims, plus a capability-resolution endpoint checking all four in priority order. Built and live-verified cleanly on the first pass.
 - 2026-08-12 — Chunk 8 (items 19–21) complete, item 22 Blocked: extended commercial-account-svc with billing_source on commercial_subscriptions, billing_source_transfers, and subscription_status_events (append-only dunning audit trail) via migration 000003. New endpoints: `POST /v1/subscriptions/{id}/status` (dunning transitions, fail-closed via ValidSubscriptionStatusTransitions, idempotent same-status no-op), `GET /v1/subscriptions/{id}/status-events`, `POST /v1/billing-source-transfers` (atomic cancel-old/create-new). Double-billing prevention is structural (existing partial unique index), not just application logic. Live-verified the full ACTIVE→PAST_DUE→RESTRICTED→SUSPENDED→ACTIVE cycle, an idempotent repeat logging no extra event, a rejected invalid transition (409), and a DIRECT→ZOIKO_ONE_BUNDLE transfer. Caught a stale-image trap during verification: a container *restart* does not pick up new code, only a rebuild does — fixed by rebuilding the image before restarting.
+- 2026-08-12 — Chunk 9 (items 23–28) complete: new `ai-governance-svc` — ai_runs, action_risk_classifications, automation_policies (allowlist), automation_actions, model_provider_registrations, policy_change_approvals. Pure record-keeping/gate-checking layer, never executes models or automations itself. Built and live-verified cleanly on the first pass: an unallowlisted autonomous action 403s, an allowlisted one proceeds and requires maker-checker approval, self-approval is blocked on both automation-action decisions and policy-change approvals (403 for the proposer, 200 for a different approver), a duplicate idempotency_key 409s, and the model-provider verify endpoint correctly blocks an unapproved data class and an unregistered provider.

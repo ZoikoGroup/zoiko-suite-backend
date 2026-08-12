@@ -22,6 +22,7 @@ services:
       - ../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
       - ../services/commercial-account-svc/deployments/migrations:/migrations/commercial-account:ro
       - ../services/capability-registry-svc/deployments/migrations:/migrations/capability-registry:ro
+      - ../services/ai-governance-svc/deployments/migrations:/migrations/ai-governance:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
@@ -2849,6 +2850,42 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── ai-governance-svc (Port: 8146) ──────────────────────────────────────
+  # Plane 5 — AI, Agentic Automation & Human Authority (doc7 §11). Record-
+  # keeping and gate-checking for AI runs, action-risk classification,
+  # automation allowlists, provider/model registry, and maker-checker
+  # self-approval blocking — never runs models or executes automations
+  # itself.
+  ai-governance-svc:
+    build:
+      context: ../services/ai-governance-svc
+      dockerfile: Dockerfile
+    container_name: ai-governance-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8146:8146"
+    environment:
+      PORT: "8146"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/ai_governance?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
