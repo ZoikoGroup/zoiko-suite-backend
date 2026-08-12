@@ -34,6 +34,7 @@ import (
 	"zoiko.io/workflow-svc/internal/events"
 	"zoiko.io/workflow-svc/internal/handler"
 	"zoiko.io/workflow-svc/internal/health"
+	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/store"
 	"zoiko.io/workflow-svc/internal/telemetry"
 )
@@ -123,6 +124,7 @@ func main() {
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
+	r.Use(svcmiddleware.TenantContext())
 
 	h := handler.New(pgStore, publisher, authzClient, log)
 	handler.RegisterRoutes(r, h)

@@ -77,6 +77,14 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "title, due_date, and obligation_type are required")
 		return
 	}
+	if req.ObligationType != domain.ObligationTypeContractual {
+		writeError(w, http.StatusBadRequest, "obligation_type must be CONTRACTUAL — this service tracks contract-derived obligations only; statutory/regulatory/internal-policy obligations belong in obligations-svc")
+		return
+	}
+	if req.SourceType != "" && !domain.SourceType(req.SourceType).Valid() {
+		writeError(w, http.StatusBadRequest, "source_type must be CONTRACT or CLAUSE")
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -169,6 +177,10 @@ func (h *Handler) UpdateObligation(w http.ResponseWriter, r *http.Request) {
 		existing.Description = req.Description
 	}
 	if req.ObligationType != "" {
+		if req.ObligationType != domain.ObligationTypeContractual {
+			writeError(w, http.StatusBadRequest, "obligation_type must be CONTRACTUAL — this service tracks contract-derived obligations only; statutory/regulatory/internal-policy obligations belong in obligations-svc")
+			return
+		}
 		existing.ObligationType = req.ObligationType
 	}
 	if req.RiskLevel != "" {

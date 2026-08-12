@@ -31,7 +31,7 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
-	_, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID))
+	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
 
@@ -87,6 +87,7 @@ func (s *PgStore) GetVATReturn(ctx context.Context, id string) (*domain.VATRetur
 		return nil, err
 	}
 
+	tenantID := middleware.GetTenantID(ctx)
 	var r domain.VATReturn
 	var status string
 	err = tx.QueryRow(ctx, `
@@ -94,7 +95,7 @@ func (s *PgStore) GetVATReturn(ctx context.Context, id string) (*domain.VATRetur
 		       tax_period, total_sales_amount, total_purchase_amount, output_tax_amount, input_tax_amount,
 		       net_tax_payable, currency, status, filed_at, filed_by, effective_from, effective_to,
 		       created_by, created_at, updated_at
-		FROM vat_returns WHERE return_id = $1`, id,
+		FROM vat_returns WHERE return_id = $1 AND tenant_id = $2`, id, tenantID,
 	).Scan(
 		&r.ReturnID, &r.TenantID, &r.LegalEntityID, &r.JurisdictionID, &r.TaxRegistrationNumber,
 		&r.TaxPeriod, &r.TotalSalesAmount, &r.TotalPurchaseAmount, &r.OutputTaxAmount, &r.InputTaxAmount,
@@ -122,16 +123,18 @@ func (s *PgStore) ListVATReturns(ctx context.Context, legalEntityID, jurisdictio
 		return nil, err
 	}
 
+	tenantID := middleware.GetTenantID(ctx)
 	rows, err := tx.Query(ctx, `
 		SELECT return_id, tenant_id, legal_entity_id, jurisdiction_id, tax_registration_number,
 		       tax_period, total_sales_amount, total_purchase_amount, output_tax_amount, input_tax_amount,
 		       net_tax_payable, currency, status, filed_at, filed_by, effective_from, effective_to,
 		       created_by, created_at, updated_at
 		FROM vat_returns
-		WHERE ($1 = '' OR legal_entity_id = $1)
+		WHERE tenant_id = $4
+		  AND ($1 = '' OR legal_entity_id = $1)
 		  AND ($2 = '' OR jurisdiction_id = $2)
 		  AND ($3 = '' OR status = $3)
-		ORDER BY created_at DESC`, legalEntityID, jurisdictionID, status,
+		ORDER BY created_at DESC`, legalEntityID, jurisdictionID, status, tenantID,
 	)
 	if err != nil {
 		return nil, err
@@ -169,14 +172,15 @@ func (s *PgStore) UpdateVATReturn(ctx context.Context, r *domain.VATReturn) erro
 
 	r.NetTaxPayable = r.OutputTaxAmount - r.InputTaxAmount
 	r.UpdatedAt = time.Now().UTC()
+	tenantID := middleware.GetTenantID(ctx)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE vat_returns
 		SET total_sales_amount=$1, total_purchase_amount=$2, output_tax_amount=$3, input_tax_amount=$4,
 		    net_tax_payable=$5, status=$6, effective_to=$7, updated_at=$8
-		WHERE return_id=$9`,
+		WHERE return_id=$9 AND tenant_id=$10`,
 		r.TotalSalesAmount, r.TotalPurchaseAmount, r.OutputTaxAmount, r.InputTaxAmount,
-		r.NetTaxPayable, string(r.Status), r.EffectiveTo, r.UpdatedAt, r.ReturnID,
+		r.NetTaxPayable, string(r.Status), r.EffectiveTo, r.UpdatedAt, r.ReturnID, tenantID,
 	)
 	if err != nil {
 		return fmt.Errorf("update vat return: %w", err)
@@ -208,12 +212,13 @@ func (s *PgStore) FileVATReturn(ctx context.Context, id, filedBy string) (*domai
 	r.FiledAt = &now
 	r.FiledBy = &filedBy
 	r.UpdatedAt = now
+	tenantID := middleware.GetTenantID(ctx)
 
 	_, err = tx.Exec(ctx, `
 		UPDATE vat_returns
 		SET status=$1, filed_at=$2, filed_by=$3, updated_at=$4
-		WHERE return_id=$5`,
-		string(r.Status), r.FiledAt, r.FiledBy, r.UpdatedAt, id,
+		WHERE return_id=$5 AND tenant_id=$6`,
+		string(r.Status), r.FiledAt, r.FiledBy, r.UpdatedAt, id, tenantID,
 	)
 	if err != nil {
 		return nil, err

@@ -12,9 +12,17 @@ import (
 	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/domain"
 	"zoiko.io/contract-lifecycle-svc/internal/events"
+	"zoiko.io/contract-lifecycle-svc/internal/governancelog"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
 	"zoiko.io/contract-lifecycle-svc/internal/store"
 )
+
+// GovernanceLogClient verifies a governance decision was GRANTED before an
+// action authorized by it is allowed to proceed. Implementations must fail
+// closed, same doctrine as AuthZClient.
+type GovernanceLogClient interface {
+	VerifyGranted(ctx context.Context, tenantID, decisionID, legalEntityID, actionType string) error
+}
 
 // AuthZClient checks whether a principal is permitted to perform an action
 // against authorization-svc. Implementations must fail closed: any error
@@ -25,24 +33,25 @@ type AuthZClient interface {
 
 // Action types passed to authorization-svc for each write route.
 const (
-	actionContractCreate = "CONTRACT_CREATE"
-	actionContractUpdate = "CONTRACT_UPDATE"
-	actionContractSubmit = "CONTRACT_SUBMIT_FOR_APPROVAL"
-	actionContractActivate = "CONTRACT_ACTIVATE"
+	actionContractCreate    = "CONTRACT_CREATE"
+	actionContractUpdate    = "CONTRACT_UPDATE"
+	actionContractSubmit    = "CONTRACT_SUBMIT_FOR_APPROVAL"
+	actionContractActivate  = "CONTRACT_ACTIVATE"
 	actionContractTerminate = "CONTRACT_TERMINATE"
 )
 
 // Handler holds all dependencies for the HTTP layer.
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthZClient
-	logger    *zap.Logger
+	store         store.Store
+	publisher     events.Publisher
+	authz         AuthZClient
+	governanceLog GovernanceLogClient
+	logger        *zap.Logger
 }
 
 // New creates a new Handler.
-func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, pub events.Publisher, az AuthZClient, gl GovernanceLogClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, publisher: pub, authz: az, governanceLog: gl, logger: logger}
 }
 
 // RegisterRoutes mounts all contract lifecycle routes onto the given router.
@@ -245,6 +254,10 @@ func (h *Handler) ActivateContract(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "signed_by is required")
 		return
 	}
+	if req.GovernanceDecisionID == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrGovernanceDecisionRequired.Error())
+		return
+	}
 
 	existing, err := h.store.GetContract(r.Context(), id)
 	if err != nil {
@@ -262,6 +275,14 @@ func (h *Handler) ActivateContract(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractActivate); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// A contract must not go ACTIVE on a signature alone — verify the
+	// governance decision the caller cites was actually GRANTED for this
+	// legal entity and this action, not just that some decision ID exists.
+	if err := h.governanceLog.VerifyGranted(r.Context(), tenantID, req.GovernanceDecisionID, existing.LegalEntityID, actionContractActivate); err != nil {
+		h.writeGovernanceLogErr(w, err)
 		return
 	}
 
@@ -369,6 +390,17 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+func (h *Handler) writeGovernanceLogErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, governancelog.ErrDecisionNotFound):
+		writeError(w, http.StatusBadRequest, "governance_decision_id not found for this tenant")
+	case errors.Is(err, governancelog.ErrDecisionNotGranted):
+		writeError(w, http.StatusForbidden, "governance decision was not granted for this activation")
+	default:
+		writeError(w, http.StatusServiceUnavailable, "governance decision log unavailable")
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

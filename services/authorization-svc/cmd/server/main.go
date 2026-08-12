@@ -34,9 +34,16 @@ import (
 	"zoiko.io/authorization-svc/internal/handler"
 	"zoiko.io/authorization-svc/internal/health"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/mtls"
 	"zoiko.io/authorization-svc/internal/store"
 	"zoiko.io/authorization-svc/internal/telemetry"
 )
+
+// platformScopeID is the legal_entity_id presented when provisioning this
+// service's own mTLS identity — an infrastructure certificate, not scoped
+// to any one tenant's data, same convention as AUTHZ_PLATFORM_SCOPE_ID
+// elsewhere in this codebase.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	cfg, err := config.Load()
@@ -149,6 +156,36 @@ func main() {
 		}
 	}()
 
+	// mTLS pilot (material-path only, docs/original_doc/zoiko_suite_doc5.txt:
+	// 76,251): a SECOND listener, same router, gated behind MTLS_ENABLED so
+	// every caller still on the plain port above keeps working unchanged.
+	var mtlsSrv *http.Server
+	if cfg.MTLSEnabled {
+		identity, err := mtls.ProvisionServerIdentity(context.Background(), cfg.MTLSManagementServiceURL, "authorization-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision server identity", zap.Error(err))
+		}
+		tlsConfig, err := mtls.ServerTLSConfig(identity)
+		if err != nil {
+			log.Fatal("mtls: failed to build server tls config", zap.Error(err))
+		}
+		mtlsAddr := ":" + strconv.Itoa(cfg.MTLSPort)
+		mtlsSrv = &http.Server{
+			Addr:         mtlsAddr,
+			Handler:      r,
+			TLSConfig:    tlsConfig,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		go func() {
+			log.Info("mTLS listener starting", zap.String("addr", mtlsAddr))
+			if err := mtlsSrv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- err
+			}
+		}()
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -162,6 +199,11 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+	if mtlsSrv != nil {
+		if err := mtlsSrv.Shutdown(shutdownCtx); err != nil {
+			log.Error("mtls listener shutdown failed", zap.Error(err))
+		}
 	}
 	log.Info("server stopped")
 }

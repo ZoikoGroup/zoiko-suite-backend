@@ -83,7 +83,7 @@ func (s *stubStore) FindGrantedActions(_ context.Context, _, _ string) ([]string
 func (s *stubStore) FindDelegatedActions(_ context.Context, _, _ string) ([]string, string, error) {
 	return s.delegatedActions, s.delegatedBasis, s.delegatedErr
 }
-func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _ string) (string, bool, error) {
+func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _, _ string) (string, bool, error) {
 	return s.sodConflictAction, s.sodHasConflict, s.sodErr
 }
 func (s *stubStore) RecordAccessDecision(_ context.Context, _, _, _, outcome, basis, _ string) (*domain.AccessDecisionLog, error) {

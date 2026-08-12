@@ -32,7 +32,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 }
 
 func (p *Publisher) PublishLeaveRequested(ctx context.Context, correlationID string, r domain.LeaveRequest) {
-	p.emit(ctx, "leave.requested", correlationID, map[string]any{
+	p.emit(ctx, "leave.requested", correlationID, r.RequestID, map[string]any{
 		"request_id":    r.RequestID,
 		"tenant_id":     r.TenantID,
 		"employee_id":   r.EmployeeID,
@@ -45,7 +45,7 @@ func (p *Publisher) PublishLeaveRequested(ctx context.Context, correlationID str
 }
 
 func (p *Publisher) PublishLeaveApproved(ctx context.Context, correlationID string, r domain.LeaveRequest) {
-	p.emit(ctx, "leave.approved", correlationID, map[string]any{
+	p.emit(ctx, "leave.approved", correlationID, r.RequestID, map[string]any{
 		"request_id":     r.RequestID,
 		"tenant_id":      r.TenantID,
 		"employee_id":    r.EmployeeID,
@@ -58,7 +58,7 @@ func (p *Publisher) PublishLeaveApproved(ctx context.Context, correlationID stri
 }
 
 func (p *Publisher) PublishLeaveRejected(ctx context.Context, correlationID string, r domain.LeaveRequest) {
-	p.emit(ctx, "leave.rejected", correlationID, map[string]any{
+	p.emit(ctx, "leave.rejected", correlationID, r.RequestID, map[string]any{
 		"request_id":     r.RequestID,
 		"tenant_id":      r.TenantID,
 		"employee_id":    r.EmployeeID,
@@ -69,7 +69,7 @@ func (p *Publisher) PublishLeaveRejected(ctx context.Context, correlationID stri
 }
 
 func (p *Publisher) PublishBalanceUpdated(ctx context.Context, correlationID string, b domain.LeaveBalance) {
-	p.emit(ctx, "leave.balance.updated", correlationID, map[string]any{
+	p.emit(ctx, "leave.balance.updated", correlationID, b.BalanceID, map[string]any{
 		"balance_id":      b.BalanceID,
 		"tenant_id":       b.TenantID,
 		"employee_id":     b.EmployeeID,
@@ -82,7 +82,7 @@ func (p *Publisher) PublishBalanceUpdated(ctx context.Context, correlationID str
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -105,7 +105,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

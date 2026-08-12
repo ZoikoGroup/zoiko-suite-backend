@@ -36,11 +36,7 @@ USER nonroot:nonroot
 # Health probe port (matches config.Load() PORT default = 8087).
 EXPOSE 8087
 
-# First HEALTHCHECK instruction in this repo (context.md §7.8) — every
-# other service here relies on an external prober hitting /healthz
-# directly; this one also declares it at the image level since
-# distroless has nothing else capable of running one internally.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/healthcheck"]
+    CMD ["/healthcheck", "http://localhost:8087/healthz"]
 
 ENTRYPOINT ["/secret-vault-integration-svc"]

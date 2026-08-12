@@ -38,7 +38,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 
 // PublishRequestCreated corresponds to §12.8's purchase.request.created event.
 func (p *Publisher) PublishRequestCreated(ctx context.Context, r domain.PurchaseRequest) {
-	p.emit(ctx, "purchase.request.created", r.CorrelationID, map[string]any{
+	p.emit(ctx, "purchase.request.created", r.CorrelationID, r.RequestID, map[string]any{
 		"request_id":      r.RequestID,
 		"tenant_id":       r.TenantID,
 		"legal_entity_id": r.LegalEntityID,
@@ -48,20 +48,20 @@ func (p *Publisher) PublishRequestCreated(ctx context.Context, r domain.Purchase
 
 // PublishRequestApproved corresponds to §12.8's purchase.request.approved event.
 func (p *Publisher) PublishRequestApproved(ctx context.Context, r domain.PurchaseRequest) {
-	p.emit(ctx, "purchase.request.approved", r.CorrelationID, map[string]any{
+	p.emit(ctx, "purchase.request.approved", r.CorrelationID, r.RequestID, map[string]any{
 		"request_id": r.RequestID,
 	})
 }
 
 // PublishRequestRejected corresponds to §12.8's purchase.request.rejected event.
 func (p *Publisher) PublishRequestRejected(ctx context.Context, r domain.PurchaseRequest) {
-	p.emit(ctx, "purchase.request.rejected", r.CorrelationID, map[string]any{
+	p.emit(ctx, "purchase.request.rejected", r.CorrelationID, r.RequestID, map[string]any{
 		"request_id": r.RequestID,
 		"reason":     r.RejectionReason,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -80,7 +80,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

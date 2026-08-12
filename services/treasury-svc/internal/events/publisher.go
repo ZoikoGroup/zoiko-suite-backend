@@ -33,7 +33,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 
 // PublishCashPositionUpdated emits the cash.position.updated event.
 func (p *Publisher) PublishCashPositionUpdated(ctx context.Context, correlationID string, balance domain.CashBalance) {
-	p.emit(ctx, "cash.position.updated", correlationID, map[string]any{
+	p.emit(ctx, "cash.position.updated", correlationID, balance.TenantID, map[string]any{
 		"tenant_id":         balance.TenantID,
 		"bank_account_id":   balance.BankAccountID,
 		"ledger_balance":    balance.LedgerBalance,
@@ -44,9 +44,9 @@ func (p *Publisher) PublishCashPositionUpdated(ctx context.Context, correlationI
 
 // PublishEffectiveCashUpdated emits the effective.cash.position.updated event.
 func (p *Publisher) PublishEffectiveCashUpdated(ctx context.Context, correlationID string, resp domain.EffectiveCashResponse) {
-	p.emit(ctx, "effective.cash.position.updated", correlationID, map[string]any{
+	p.emit(ctx, "effective.cash.position.updated", correlationID, resp.TenantID, map[string]any{
 		"tenant_id":                resp.TenantID,
-		"legal_entity_id":           resp.LegalEntityID,
+		"legal_entity_id":          resp.LegalEntityID,
 		"currency_code":            resp.CurrencyCode,
 		"effective_available_cash": resp.EffectiveAvailableCash,
 		"as_of_timestamp":          resp.AsOfTimestamp,
@@ -60,17 +60,17 @@ func (p *Publisher) PublishLiquidityThresholdBreached(ctx context.Context, corre
 	if resp.ThresholdDetails != nil {
 		minRequired = resp.ThresholdDetails.MinimumRequiredBalance
 	}
-	p.emit(ctx, "liquidity.threshold.breached", correlationID, map[string]any{
+	p.emit(ctx, "liquidity.threshold.breached", correlationID, resp.TenantID, map[string]any{
 		"tenant_id":                resp.TenantID,
-		"legal_entity_id":           resp.LegalEntityID,
+		"legal_entity_id":          resp.LegalEntityID,
 		"currency_code":            resp.CurrencyCode,
 		"minimum_required_balance": minRequired,
 		"effective_available_cash": resp.EffectiveAvailableCash,
-		"escalation_email":        escalationEmail,
+		"escalation_email":         escalationEmail,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -89,7 +89,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

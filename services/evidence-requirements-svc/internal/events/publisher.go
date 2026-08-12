@@ -72,13 +72,13 @@ func (p *Publisher) PublishEvaluation(ctx context.Context, e domain.EvidenceEval
 
 	switch e.Outcome {
 	case domain.OutcomeSatisfied:
-		p.emit(ctx, "evidence.requirement.satisfied", e.CorrelationID, payload)
+		p.emit(ctx, "evidence.requirement.satisfied", e.CorrelationID, e.EvaluationID, payload)
 	case domain.OutcomeMissing:
 		// The unmet detail rides along: a consumer reacting to a blocked
 		// finalization needs to know WHAT is missing, not just that
 		// something is.
 		payload["unmet"] = json.RawMessage(e.UnmetPayload)
-		p.emit(ctx, "evidence.requirement.missing", e.CorrelationID, payload)
+		p.emit(ctx, "evidence.requirement.missing", e.CorrelationID, e.EvaluationID, payload)
 	default:
 		p.log.Warn("evidence evaluation had no requirements defined — no event published",
 			zap.String("evaluation_id", e.EvaluationID),
@@ -88,7 +88,7 @@ func (p *Publisher) PublishEvaluation(ctx context.Context, e domain.EvidenceEval
 	}
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -107,7 +107,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

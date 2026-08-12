@@ -51,6 +51,13 @@ type JournalHeader struct {
 	// at the FINALIZED journal it reverses. Nil for every ordinary journal.
 	ReversalOfJournalID *string `json:"reversal_of_journal_id,omitempty"`
 
+	// SourceEventID and GovernanceDecisionID are Atomic Linking references
+	// (doctrine §3.3): the upstream event and/or governance decision that
+	// caused this posting, when one exists. Both nil for a manually-entered
+	// journal — neither is fabricated when there's nothing real to link to.
+	SourceEventID        *string `json:"source_event_id,omitempty"`
+	GovernanceDecisionID *string `json:"governance_decision_id,omitempty"`
+
 	Description string `json:"description"`
 
 	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
@@ -77,6 +84,14 @@ type JournalLine struct {
 	DebitAmount   float64 `json:"debit_amount"`
 	CreditAmount  float64 `json:"credit_amount"`
 	Description   string  `json:"description,omitempty"`
+
+	// TaxCode and TaxLogicSnapshotID are nil unless this line has a tax
+	// component. No TaxLogicSnapshot-producing service exists yet anywhere
+	// in this platform, so TaxLogicSnapshotID is currently always nil in
+	// practice — a documented v1 gap (see migration 000003), not an
+	// oversight.
+	TaxCode            *string `json:"tax_code,omitempty"`
+	TaxLogicSnapshotID *string `json:"tax_logic_snapshot_id,omitempty"`
 }
 
 // JournalWithLines is the full aggregate returned by read endpoints.
@@ -92,6 +107,9 @@ type CreateJournalLineInput struct {
 	DebitAmount  float64 `json:"debit_amount,omitempty"`
 	CreditAmount float64 `json:"credit_amount,omitempty"`
 	Description  string  `json:"description,omitempty"`
+
+	TaxCode            *string `json:"tax_code,omitempty"`
+	TaxLogicSnapshotID *string `json:"tax_logic_snapshot_id,omitempty"`
 }
 
 type CreateJournalRequest struct {
@@ -101,6 +119,11 @@ type CreateJournalRequest struct {
 	Description   string                   `json:"description"`
 	Lines         []CreateJournalLineInput `json:"lines"`
 	CorrelationID string                   `json:"correlation_id"`
+
+	// SourceEventID and GovernanceDecisionID are optional Atomic Linking
+	// references — see JournalHeader's field docs.
+	SourceEventID        *string `json:"source_event_id,omitempty"`
+	GovernanceDecisionID *string `json:"governance_decision_id,omitempty"`
 }
 
 type ReverseJournalRequest struct {
@@ -140,6 +163,6 @@ var (
 	// closed, same pattern as schema-registry-svc.
 	ErrIdentityMissing = errorString("caller identity missing")
 
-	ErrPeriodLocked             = errorString("accounting period is closed or locked")
+	ErrPeriodLocked            = errorString("accounting period is closed or locked")
 	ErrCloseServiceUnavailable = errorString("financial-close-svc unavailable")
 )

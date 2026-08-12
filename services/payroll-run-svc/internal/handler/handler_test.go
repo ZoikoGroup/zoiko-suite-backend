@@ -106,7 +106,7 @@ func (s *stubStore) GetShadowComparisonsByRun(_ context.Context, runID string) (
 	return s.shadowComps[runID], nil
 }
 
-func (s *stubStore) FinalizePayrollRun(_ context.Context, runID string) error {
+func (s *stubStore) FinalizePayrollRun(_ context.Context, runID string, governanceDecisionID *string) error {
 	r, ok := s.runs[runID]
 	if !ok {
 		return domain.ErrPayrollRunNotFound
@@ -122,6 +122,9 @@ func (s *stubStore) FinalizePayrollRun(_ context.Context, runID string) error {
 	r.Status = "COMPLETED"
 	r.UpdatedAt = now
 	r.FinalizedAt = &now
+	r.GovernanceDecisionID = governanceDecisionID
+	hash := "stub-snapshot-hash"
+	r.SnapshotHash = &hash
 	return nil
 }
 
@@ -430,5 +433,42 @@ func TestFinalizeRun_LocksRunAndEnforcesImmutability(t *testing.T) {
 
 	if pub.completed != 1 {
 		t.Errorf("expected 1 completed event got %d", pub.completed)
+	}
+}
+
+// TestFinalizeRun_RecordsGovernanceDecisionAndSnapshotHash proves finalizing
+// a run with a governance_decision_id records it verbatim, and that a real
+// (non-empty, non-placeholder) snapshot hash is computed regardless of
+// whether the caller supplied a decision.
+func TestFinalizeRun_RecordsGovernanceDecisionAndSnapshotHash(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeClient{}, &stubContractClient{})
+
+	rrInit := doReq(r, http.MethodPost, "/v1/payroll/runs", map[string]any{
+		"legal_entity_id":  "le-us",
+		"pay_period_start": "2024-01-01",
+		"pay_period_end":   "2024-01-31",
+		"pay_date":         "2024-02-05",
+		"correlation_id":   "corr-finalize-gov-1",
+	}, "payroll-admin")
+	var run domain.PayrollRun
+	_ = json.NewDecoder(rrInit.Body).Decode(&run)
+
+	_ = doReq(r, http.MethodPost, "/v1/payroll/runs/"+run.RunID+"/calculate", nil, "payroll-admin")
+
+	rrFin := doReq(r, http.MethodPost, "/v1/payroll/runs/"+run.RunID+"/finalize",
+		map[string]any{"governance_decision_id": "dec-payroll-001"}, "payroll-admin")
+	if rrFin.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rrFin.Code, rrFin.Body.String())
+	}
+
+	var finalizedRun domain.PayrollRun
+	_ = json.NewDecoder(rrFin.Body).Decode(&finalizedRun)
+	if finalizedRun.GovernanceDecisionID == nil || *finalizedRun.GovernanceDecisionID != "dec-payroll-001" {
+		t.Errorf("expected governance_decision_id to be recorded, got %v", finalizedRun.GovernanceDecisionID)
+	}
+	if finalizedRun.SnapshotHash == nil || *finalizedRun.SnapshotHash == "" {
+		t.Errorf("expected a non-empty snapshot_hash to be computed, got %v", finalizedRun.SnapshotHash)
 	}
 }

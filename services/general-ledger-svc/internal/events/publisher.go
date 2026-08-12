@@ -38,7 +38,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 
 // PublishJournalCreated corresponds to §10.1's journal.created event.
 func (p *Publisher) PublishJournalCreated(ctx context.Context, h domain.JournalHeader) {
-	p.emit(ctx, "journal.created", h.CorrelationID, map[string]any{
+	p.emit(ctx, "journal.created", h.CorrelationID, h.JournalID, map[string]any{
 		"journal_id":      h.JournalID,
 		"tenant_id":       h.TenantID,
 		"legal_entity_id": h.LegalEntityID,
@@ -48,7 +48,7 @@ func (p *Publisher) PublishJournalCreated(ctx context.Context, h domain.JournalH
 
 // PublishJournalValidated corresponds to §10.1's journal.validated event.
 func (p *Publisher) PublishJournalValidated(ctx context.Context, h domain.JournalHeader) {
-	p.emit(ctx, "journal.validated", h.CorrelationID, map[string]any{
+	p.emit(ctx, "journal.validated", h.CorrelationID, h.JournalID, map[string]any{
 		"journal_id": h.JournalID,
 	})
 }
@@ -56,7 +56,7 @@ func (p *Publisher) PublishJournalValidated(ctx context.Context, h domain.Journa
 // PublishJournalPosted corresponds to §10.1's journal.posted event — emitted
 // on the VALIDATED -> FINALIZED transition.
 func (p *Publisher) PublishJournalPosted(ctx context.Context, h domain.JournalHeader) {
-	p.emit(ctx, "journal.posted", h.CorrelationID, map[string]any{
+	p.emit(ctx, "journal.posted", h.CorrelationID, h.JournalID, map[string]any{
 		"journal_id": h.JournalID,
 	})
 }
@@ -65,13 +65,13 @@ func (p *Publisher) PublishJournalPosted(ctx context.Context, h domain.JournalHe
 // reversingJournalID is the new journal created to carry the reversing
 // entries — the original journal's own rows are never edited.
 func (p *Publisher) PublishJournalReversed(ctx context.Context, h domain.JournalHeader, reversingJournalID string) {
-	p.emit(ctx, "journal.reversed", h.CorrelationID, map[string]any{
-		"journal_id":            h.JournalID,
-		"reversing_journal_id":  reversingJournalID,
+	p.emit(ctx, "journal.reversed", h.CorrelationID, h.JournalID, map[string]any{
+		"journal_id":           h.JournalID,
+		"reversing_journal_id": reversingJournalID,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -90,7 +90,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

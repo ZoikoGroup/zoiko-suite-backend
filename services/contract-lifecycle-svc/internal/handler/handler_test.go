@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/domain"
 	"zoiko.io/contract-lifecycle-svc/internal/events"
+	"zoiko.io/contract-lifecycle-svc/internal/governancelog"
 )
 
 // --- In-memory stub store ---
@@ -78,6 +81,7 @@ func (s *stubStore) ActivateContract(_ context.Context, id string, req *domain.A
 	}
 	c.Status = domain.ContractStatusActive
 	c.SignedBy = &req.SignedBy
+	c.GovernanceDecisionID = &req.GovernanceDecisionID
 	return c, nil
 }
 
@@ -128,11 +132,24 @@ func (s *stubAuthzClient) CheckAllowed(_ context.Context, _, _, _ string) error 
 	return nil
 }
 
+// --- Stub governance-log client ---
+
+// stubGovernanceLogClient grants every verification by default, matching
+// the "GRANTED" outcome but skipping the network call. Tests can flip
+// err to exercise the fail-closed path.
+type stubGovernanceLogClient struct {
+	err error
+}
+
+func (s *stubGovernanceLogClient) VerifyGranted(_ context.Context, _, _, _, _ string) error {
+	return s.err
+}
+
 // --- Test helpers ---
 
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -222,6 +239,102 @@ func TestTerminateContract_NotFound(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// newChiRouter builds the real production router (RegisterRoutes), unlike
+// newTestRouter below which is a hand-rolled stub that never actually
+// invokes the handler. Needed for ActivateContract since it reads
+// chi.URLParam(r, "id").
+func newChiRouter(h *Handler) http.Handler {
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+	return r
+}
+
+func TestActivateContract_MissingGovernanceDecisionID(t *testing.T) {
+	store := newStubStore()
+	store.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusPendingApproval,
+	}
+	logger, _ := zap.NewDevelopment()
+	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
+	router := newChiRouter(h)
+
+	body := domain.ActivateContractRequest{SignedBy: "user-001", SignedAt: time.Now()}
+	req := buildRequest(http.MethodPost, "/v1/contracts/ctr-001/activate", body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when governance_decision_id is missing, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestActivateContract_GovernanceDecisionNotGranted(t *testing.T) {
+	store := newStubStore()
+	store.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusPendingApproval,
+	}
+	logger, _ := zap.NewDevelopment()
+	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{err: governancelog.ErrDecisionNotGranted}, logger)
+	router := newChiRouter(h)
+
+	body := domain.ActivateContractRequest{SignedBy: "user-001", SignedAt: time.Now(), GovernanceDecisionID: "dec-001"}
+	req := buildRequest(http.MethodPost, "/v1/contracts/ctr-001/activate", body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when governance decision was not granted, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestActivateContract_GovernanceLogUnavailable(t *testing.T) {
+	store := newStubStore()
+	store.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusPendingApproval,
+	}
+	logger, _ := zap.NewDevelopment()
+	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{err: governancelog.ErrServiceUnavailable}, logger)
+	router := newChiRouter(h)
+
+	body := domain.ActivateContractRequest{SignedBy: "user-001", SignedAt: time.Now(), GovernanceDecisionID: "dec-001"}
+	req := buildRequest(http.MethodPost, "/v1/contracts/ctr-001/activate", body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when governance log is unavailable, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestActivateContract_Success(t *testing.T) {
+	store := newStubStore()
+	store.contracts["ctr-001"] = &domain.Contract{
+		ContractID: "ctr-001", TenantID: "tenant-test-01", LegalEntityID: "le-001",
+		Status: domain.ContractStatusPendingApproval,
+	}
+	logger, _ := zap.NewDevelopment()
+	h := New(store, &stubPublisher{}, &stubAuthzClient{}, &stubGovernanceLogClient{}, logger)
+	router := newChiRouter(h)
+
+	body := domain.ActivateContractRequest{SignedBy: "user-001", SignedAt: time.Now(), GovernanceDecisionID: "dec-001"}
+	req := buildRequest(http.MethodPost, "/v1/contracts/ctr-001/activate", body)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", w.Code, w.Body.String())
+	}
+	var resp domain.Contract
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Status != domain.ContractStatusActive {
+		t.Errorf("expected ACTIVE, got %s", resp.Status)
+	}
+	if resp.GovernanceDecisionID == nil || *resp.GovernanceDecisionID != "dec-001" {
+		t.Errorf("expected governance_decision_id to be recorded, got %v", resp.GovernanceDecisionID)
 	}
 }
 

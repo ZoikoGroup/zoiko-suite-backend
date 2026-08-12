@@ -76,7 +76,10 @@ spec:
         - name: KAFKA_EVENTS_TOPIC
           value: "zoiko.identity.events"
         - name: JWT_SIGNING_SECRET
-          value: "local-dev-jwt-signing-secret-key-32-chars-long"
+          valueFrom:
+            secretKeyRef:
+              name: identity-signing-key
+              key: jwt-signing-secret
         - name: JWT_SIGNING_PRIVATE_KEY_PATH
           value: "/keys/envelope_signing_key.pem"
         - name: JWT_KEY_ID

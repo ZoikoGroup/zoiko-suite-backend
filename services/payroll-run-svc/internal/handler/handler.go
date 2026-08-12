@@ -27,7 +27,7 @@ type Store interface {
 	SaveCalculatedResults(ctx context.Context, runID string, totalGross, totalNet, totalTax, totalDeductions float64, slips []domain.PaySlip, shadowComps []domain.ShadowComparison) error
 	GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.PaySlip, error)
 	GetShadowComparisonsByRun(ctx context.Context, runID string) ([]domain.ShadowComparison, error)
-	FinalizePayrollRun(ctx context.Context, runID string) error
+	FinalizePayrollRun(ctx context.Context, runID string, governanceDecisionID *string) error
 }
 
 type Publisher interface {
@@ -584,7 +584,14 @@ func (h *Handler) FinalizeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.FinalizePayrollRun(r.Context(), id); err != nil {
+	// Body is optional — a caller with no governance decision to cite may
+	// finalize with an empty body, same as before this field existed.
+	var req domain.FinalizeRunRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	if err := h.store.FinalizePayrollRun(r.Context(), id, req.GovernanceDecisionID); err != nil {
 		if errors.Is(err, domain.ErrRunAlreadyFinalized) {
 			writeError(w, http.StatusConflict, "already_finalized", err.Error())
 			return

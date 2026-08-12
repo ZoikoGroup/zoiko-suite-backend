@@ -6,6 +6,8 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: zoiko-postgres
+    mem_limit: 1g
+    cpus: "1.0"
     ports:
       - "5432:5432"
     environment:
@@ -83,6 +85,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: zoiko-redis
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "6379:6379"
     healthcheck:
@@ -95,6 +99,8 @@ services:
   kafka:
     image: apache/kafka:latest
     container_name: zoiko-kafka
+    mem_limit: 1g
+    cpus: "1.0"
     ports:
       - "9092:9092"
     environment:
@@ -128,6 +134,8 @@ services:
   minio:
     image: minio/minio:RELEASE.2024-11-07T00-52-20Z
     container_name: zoiko-minio
+    mem_limit: 512m
+    cpus: "0.5"
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
@@ -153,6 +161,8 @@ services:
   opensearch:
     image: opensearchproject/opensearch:2.17.0
     container_name: zoiko-opensearch
+    mem_limit: 1g
+    cpus: "1.0"
     environment:
       - discovery.type=single-node
       - DISABLE_SECURITY_PLUGIN=true
@@ -175,6 +185,8 @@ services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.153.0
     container_name: zoiko-otel-collector
+    mem_limit: 256m
+    cpus: "0.5"
     command: ["--config=/etc/otel-collector-config.yaml"]
     volumes:
       - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
@@ -186,6 +198,8 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.60
     container_name: zoiko-jaeger
+    mem_limit: 512m
+    cpus: "0.5"
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
@@ -195,6 +209,8 @@ services:
   prometheus:
     image: prom/prometheus:v2.55.1
     container_name: zoiko-prometheus
+    mem_limit: 512m
+    cpus: "0.5"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus-rules.yml:/etc/prometheus/rules.yml:ro
@@ -205,6 +221,8 @@ services:
   grafana:
     image: grafana/grafana:11.3.1
     container_name: zoiko-grafana
+    mem_limit: 256m
+    cpus: "0.5"
     environment:
       GF_SECURITY_ADMIN_PASSWORD: "admin"
       GF_AUTH_ANONYMOUS_ENABLED: "false"
@@ -223,6 +241,8 @@ services:
   identity-svc-keygen:
     image: alpine:3.19
     container_name: identity-svc-keygen
+    mem_limit: 128m
+    cpus: "0.25"
     volumes:
       - identity_jwt_keys:/keys
     entrypoint: ["/bin/sh", "-c"]
@@ -254,6 +274,8 @@ services:
   docker-proxy:
     image: nginx:1.27-alpine
     container_name: zoiko-docker-proxy
+    mem_limit: 128m
+    cpus: "0.25"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./docker-proxy.nginx.conf:/etc/nginx/nginx.conf:ro
@@ -266,6 +288,8 @@ services:
   gateway:
     image: traefik:v3.1
     container_name: zoiko-gateway
+    mem_limit: 256m
+    cpus: "0.5"
     command:
       - "--providers.docker=true"
       - "--providers.docker.endpoint=tcp://docker-proxy:2375"
@@ -327,6 +351,8 @@ services:
       context: ./gtrm/pool
       dockerfile: Dockerfile
     container_name: eu-pool
+    mem_limit: 128m
+    cpus: "0.25"
     environment:
       POOL_REGION: "eu"
       POOL_NAME: "eu-pool"
@@ -344,6 +370,8 @@ services:
       context: ./gtrm/pool
       dockerfile: Dockerfile
     container_name: us-pool
+    mem_limit: 128m
+    cpus: "0.25"
     environment:
       POOL_REGION: "us"
       POOL_NAME: "us-pool"
@@ -361,6 +389,8 @@ services:
       context: ./gtrm/pool
       dockerfile: Dockerfile
     container_name: uk-pool
+    mem_limit: 128m
+    cpus: "0.25"
     environment:
       POOL_REGION: "uk"
       POOL_NAME: "uk-pool"
@@ -378,6 +408,8 @@ services:
       context: ./gtrm/pool
       dockerfile: Dockerfile
     container_name: quarantine-terminator
+    mem_limit: 128m
+    cpus: "0.25"
     environment:
       POOL_NAME: "quarantine-terminator"
       POOL_MODE: "terminator"
@@ -395,6 +427,8 @@ services:
       context: ../services/identity-context-svc
       dockerfile: Dockerfile
     container_name: identity-context-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8080:8080"
     environment:
@@ -446,6 +480,8 @@ services:
       context: ../services/gateway-auth-svc
       dockerfile: Dockerfile
     container_name: gateway-auth-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8092:8092"
     environment:
@@ -470,6 +506,8 @@ services:
       context: ../services/tenant-entity-registry-svc
       dockerfile: Dockerfile
     container_name: tenant-entity-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8081:8081"
     environment:
@@ -517,6 +555,8 @@ services:
       context: ../services/jurisdiction-rules-svc
       dockerfile: Dockerfile
     container_name: jurisdiction-rules-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8082:8082"
     environment:
@@ -587,6 +627,8 @@ services:
       context: ../services/governance-decision-log-svc
       dockerfile: Dockerfile
     container_name: governance-decision-log-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8083:8083"
     environment:
@@ -626,6 +668,8 @@ services:
       context: ../services/audit-event-store-svc
       dockerfile: Dockerfile
     container_name: audit-event-store-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8084:8084"
     environment:
@@ -659,6 +703,8 @@ services:
       context: ../services/policy-svc
       dockerfile: Dockerfile
     container_name: policy-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8085:8085"
     environment:
@@ -703,6 +749,8 @@ services:
       context: ../services/configuration-feature-flag-svc
       dockerfile: Dockerfile
     container_name: configuration-feature-flag-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8086:8086"
     environment:
@@ -728,15 +776,19 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-    # No healthcheck: this service's Dockerfile, unlike every other service's,
-    # never built a cmd/healthcheck binary or declared a HEALTHCHECK
-    # instruction — a pre-existing gap, not something to fake here with a
-    # test command referencing a binary that doesn't exist in this image.
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8086/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: on-failure
 
   # ── 8. secret-vault-integration-svc (Port: 8087) ─────────────────────────────
-  # No compose entry existed before the Observability Baseline retrofit —
-  # same pre-existing gap as configuration-feature-flag-svc above.
+  # No compose entry existed before the Observability Baseline retrofit.
+  # Unlike configuration-feature-flag-svc above, this service's Dockerfile
+  # already builds a cmd/healthcheck binary, so the healthcheck: stanza below
+  # is real, not aspirational.
   # VAULT_MASTER_KEY_HEX below is a throwaway local-dev key, same posture as
   # identity-svc's envelope signing key — never used in staging/production.
   secret-vault-integration-svc:
@@ -744,6 +796,8 @@ services:
       context: ../services/secret-vault-integration-svc
       dockerfile: Dockerfile
     container_name: secret-vault-integration-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8087:8087"
     environment:
@@ -787,6 +841,8 @@ services:
       context: ../services/obligations-svc
       dockerfile: Dockerfile
     container_name: obligations-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8088:8088"
     environment:
@@ -821,6 +877,8 @@ services:
       context: ../services/authorization-svc
       dockerfile: Dockerfile
     container_name: authorization-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8089:8089"
     environment:
@@ -855,6 +913,8 @@ services:
       context: ../services/workflow-svc
       dockerfile: Dockerfile
     container_name: workflow-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8090:8090"
     environment:
@@ -891,6 +951,8 @@ services:
       context: ../services/schema-registry-svc
       dockerfile: Dockerfile
     container_name: schema-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8093:8093"
     environment:
@@ -924,6 +986,8 @@ services:
   document-vault-storage-init:
     image: alpine:3.19
     container_name: document-vault-storage-init
+    mem_limit: 128m
+    cpus: "0.25"
     volumes:
       - document_vault_storage:/data/documents
     entrypoint: ["/bin/sh", "-c", "chown -R 65532:65532 /data/documents"]
@@ -941,6 +1005,8 @@ services:
       context: ../services/document-vault-svc
       dockerfile: Dockerfile
     container_name: document-vault-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8094:8094"
     environment:
@@ -988,6 +1054,8 @@ services:
       context: ../services/evidence-manifest-svc
       dockerfile: Dockerfile
     container_name: evidence-manifest-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8095:8095"
     environment:
@@ -1032,6 +1100,8 @@ services:
       context: ..
       dockerfile: services/search-indexer-svc/Dockerfile
     container_name: search-indexer-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8096:8096"
     environment:
@@ -1063,6 +1133,8 @@ services:
       context: ../services/workflow-history-svc
       dockerfile: Dockerfile
     container_name: workflow-history-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8097:8097"
     environment:
@@ -1103,6 +1175,8 @@ services:
       context: ../services/general-ledger-svc
       dockerfile: Dockerfile
     container_name: general-ledger-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8098:8098"
     environment:
@@ -1144,6 +1218,8 @@ services:
       context: ../services/accounts-payable-svc
       dockerfile: Dockerfile
     container_name: accounts-payable-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8099:8099"
     environment:
@@ -1177,6 +1253,8 @@ services:
       context: ../services/purchase-request-svc
       dockerfile: Dockerfile
     container_name: purchase-request-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8100:8100"
     environment:
@@ -1210,6 +1288,8 @@ services:
       context: ../services/purchase-order-svc
       dockerfile: Dockerfile
     container_name: purchase-order-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8129:8129"
     environment:
@@ -1250,6 +1330,8 @@ services:
       context: ../services/spend-controls-svc
       dockerfile: Dockerfile
     container_name: spend-controls-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8131:8131"
     environment:
@@ -1290,6 +1372,8 @@ services:
       context: ../services/vendor-due-diligence-svc
       dockerfile: Dockerfile
     container_name: vendor-due-diligence-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8132:8132"
     environment:
@@ -1333,6 +1417,8 @@ services:
       context: ../services/notification-svc
       dockerfile: Dockerfile
     container_name: notification-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8133:8133"
     environment:
@@ -1373,6 +1459,8 @@ services:
       context: ../services/procurement-workflow-svc
       dockerfile: Dockerfile
     container_name: procurement-workflow-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8134:8134"
     environment:
@@ -1417,6 +1505,8 @@ services:
       context: ../services/performance-review-svc
       dockerfile: Dockerfile
     container_name: performance-review-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8135:8135"
     environment:
@@ -1459,6 +1549,8 @@ services:
       context: ../services/delegated-authority-svc
       dockerfile: Dockerfile
     container_name: delegated-authority-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8136:8136"
     environment:
@@ -1499,6 +1591,8 @@ services:
       context: ../services/access-control-svc
       dockerfile: Dockerfile
     container_name: access-control-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8137:8137"
     environment:
@@ -1541,6 +1635,8 @@ services:
       context: ../services/decision-support-svc
       dockerfile: Dockerfile
     container_name: decision-support-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8138:8138"
     environment:
@@ -1585,6 +1681,8 @@ services:
       context: ../services/mtls-management-svc
       dockerfile: Dockerfile
     container_name: mtls-management-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8140:8140"
     environment:
@@ -1613,6 +1711,8 @@ services:
       context: ../services/evidence-requirements-svc
       dockerfile: Dockerfile
     container_name: evidence-requirements-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8130:8130"
     environment:
@@ -1649,6 +1749,8 @@ services:
       context: ../services/accounts-receivable-svc
       dockerfile: Dockerfile
     container_name: accounts-receivable-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8101:8101"
     environment:
@@ -1685,6 +1787,8 @@ services:
       context: ../services/treasury-svc
       dockerfile: Dockerfile
     container_name: treasury-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8103:8103"
     environment:
@@ -1730,6 +1834,8 @@ services:
       context: ../services/financial-close-svc
       dockerfile: Dockerfile
     container_name: financial-close-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8104:8104"
     environment:
@@ -1781,6 +1887,8 @@ services:
       context: ../services/bank-reconciliation-svc
       dockerfile: Dockerfile
     container_name: bank-reconciliation-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8102:8102"
     environment:
@@ -1817,6 +1925,8 @@ services:
       context: ../services/intercompany-accounting-svc
       dockerfile: Dockerfile
     container_name: intercompany-accounting-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8105:8105"
     environment:
@@ -1853,6 +1963,8 @@ services:
       context: ../services/consolidation-svc
       dockerfile: Dockerfile
     container_name: consolidation-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8106:8106"
     environment:
@@ -1892,6 +2004,8 @@ services:
       context: ../services/invoice-approval-svc
       dockerfile: Dockerfile
     container_name: invoice-approval-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8107:8107"
     environment:
@@ -1931,6 +2045,8 @@ services:
       context: ../services/employee-master-svc
       dockerfile: Dockerfile
     container_name: employee-master-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8108:8108"
     environment:
@@ -1964,6 +2080,8 @@ services:
       context: ../services/employment-contracts-svc
       dockerfile: Dockerfile
     container_name: employment-contracts-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8109:8109"
     environment:
@@ -2000,6 +2118,8 @@ services:
       context: ../services/payroll-run-svc
       dockerfile: Dockerfile
     container_name: payroll-run-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8110:8110"
     environment:
@@ -2039,6 +2159,8 @@ services:
       context: ../services/compensation-svc
       dockerfile: Dockerfile
     container_name: compensation-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8111:8111"
     environment:
@@ -2075,6 +2197,8 @@ services:
       context: ../services/benefits-svc
       dockerfile: Dockerfile
     container_name: benefits-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8112:8112"
     environment:
@@ -2111,6 +2235,8 @@ services:
       context: ../services/payroll-tax-svc
       dockerfile: Dockerfile
     container_name: payroll-tax-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8113:8113"
     environment:
@@ -2147,6 +2273,8 @@ services:
       context: ../services/payroll-exceptions-svc
       dockerfile: Dockerfile
     container_name: payroll-exceptions-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8114:8114"
     environment:
@@ -2183,6 +2311,8 @@ services:
       context: ../services/leave-absence-svc
       dockerfile: Dockerfile
     container_name: leave-absence-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8115:8115"
     environment:
@@ -2219,6 +2349,8 @@ services:
       context: ../services/org-structure-svc
       dockerfile: Dockerfile
     container_name: org-structure-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8116:8116"
     environment:
@@ -2255,6 +2387,8 @@ services:
       context: ../services/offboarding-severance-svc
       dockerfile: Dockerfile
     container_name: offboarding-severance-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8117:8117"
     environment:
@@ -2294,6 +2428,8 @@ services:
       context: ../services/workforce-compliance-svc
       dockerfile: Dockerfile
     container_name: workforce-compliance-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8118:8118"
     environment:
@@ -2334,6 +2470,8 @@ services:
       context: ../services/contract-lifecycle-svc
       dockerfile: Dockerfile
     container_name: contract-lifecycle-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8119:8119"
     environment:
@@ -2343,12 +2481,15 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      GOVERNANCE_LOG_URL: "http://governance-svc:8083"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      governance-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -2363,6 +2504,8 @@ services:
       context: ../services/clause-template-svc
       dockerfile: Dockerfile
     container_name: clause-template-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8120:8120"
     environment:
@@ -2392,6 +2535,8 @@ services:
       context: ../services/obligation-tracking-svc
       dockerfile: Dockerfile
     container_name: obligation-tracking-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8121:8121"
     environment:
@@ -2421,6 +2566,8 @@ services:
       context: ../services/board-resolutions-svc
       dockerfile: Dockerfile
     container_name: board-resolutions-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8122:8122"
     environment:
@@ -2430,12 +2577,15 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.board-resolutions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      EVIDENCE_REQ_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -2450,6 +2600,8 @@ services:
       context: ../services/corporate-actions-svc
       dockerfile: Dockerfile
     container_name: corporate-actions-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8123:8123"
     environment:
@@ -2459,12 +2611,15 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      EVIDENCE_REQ_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      evidence-requirements-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -2479,6 +2634,8 @@ services:
       context: ../services/counterparty-management-svc
       dockerfile: Dockerfile
     container_name: counterparty-management-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8124:8124"
     environment:
@@ -2508,6 +2665,8 @@ services:
       context: ../services/tax-rules-svc
       dockerfile: Dockerfile
     container_name: tax-rules-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8125:8125"
     environment:
@@ -2537,6 +2696,8 @@ services:
       context: ../services/tax-determination-svc
       dockerfile: Dockerfile
     container_name: tax-determination-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8126:8126"
     environment:
@@ -2569,6 +2730,8 @@ services:
       context: ../services/vat-gst-svc
       dockerfile: Dockerfile
     container_name: vat-gst-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8127:8127"
     environment:
@@ -2601,6 +2764,8 @@ services:
       context: ../services/corporate-tax-svc
       dockerfile: Dockerfile
     container_name: corporate-tax-svc
+    mem_limit: 256m
+    cpus: "0.5"
     ports:
       - "8128:8128"
     environment:

@@ -203,6 +203,9 @@ type submitActionRequest struct {
 	ActorPrincipalID string  `json:"actor_principal_id"`
 	Action           string  `json:"action"`
 	Rationale        *string `json:"rationale,omitempty"`
+	// CausationID is optional: the event/decision that caused this specific
+	// action, when the caller knows it.
+	CausationID *string `json:"causation_id,omitempty"`
 }
 
 // SubmitAction handles POST /v1/workflows/{workflow_instance_id}/actions.
@@ -272,7 +275,8 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
-		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: req.ActorPrincipalID, Action: req.Action, Rationale: req.Rationale,
+		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: req.ActorPrincipalID, Action: req.Action,
+		Rationale: req.Rationale, CausationID: req.CausationID,
 	})
 	if err != nil {
 		switch {

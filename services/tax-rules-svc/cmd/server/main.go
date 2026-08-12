@@ -21,9 +21,14 @@ import (
 	"zoiko.io/tax-rules-svc/internal/handler"
 	"zoiko.io/tax-rules-svc/internal/health"
 	"zoiko.io/tax-rules-svc/internal/middleware"
+	"zoiko.io/tax-rules-svc/internal/mtls"
 	"zoiko.io/tax-rules-svc/internal/store"
 	"zoiko.io/tax-rules-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	logger, err := telemetry.NewLogger("tax-rules-svc")
@@ -42,7 +47,16 @@ func main() {
 	defer cancel()
 
 	var pool *pgxpool.Pool
-	pool, err = pgxpool.New(ctx, cfg.DSN())
+	poolCfg, err := pgxpool.ParseConfig(cfg.DSN())
+	if err != nil {
+		logger.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+	pool, err = pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		logger.Warn("unable to connect to database on startup", zap.Error(err))
 	} else {
@@ -52,7 +66,18 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "tax-rules-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 
 	h := handler.New(pgStore, publisher, authzClient, logger)
 

@@ -13,6 +13,7 @@ type Config struct {
 	AuthzServiceURL      string
 	EvidenceManifestURL  string
 	JurisdictionRulesURL string
+	EvidenceReqURL       string
 }
 
 func Load() (*Config, error) {
@@ -32,6 +33,7 @@ func Load() (*Config, error) {
 		AuthzServiceURL:      getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		EvidenceManifestURL:  getEnvOrDefault("EVIDENCE_MANIFEST_URL", "http://evidence-manifest-svc:8090"),
 		JurisdictionRulesURL: getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8081"),
+		EvidenceReqURL:       getEnvOrDefault("EVIDENCE_REQ_URL", "http://evidence-requirements-svc:8130"),
 	}, nil
 }
 

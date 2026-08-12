@@ -85,11 +85,13 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO journal_headers (
 				journal_id, tenant_id, legal_entity_id, fiscal_period, status,
-				description, created_by_principal_id, correlation_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				description, created_by_principal_id, correlation_id, created_at,
+				source_event_id, governance_decision_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, h.JournalID, h.TenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
-			h.Description, h.CreatedByPrincipalID, h.CorrelationID, now)
+			h.Description, h.CreatedByPrincipalID, h.CorrelationID, now,
+			h.SourceEventID, h.GovernanceDecisionID)
 		if err != nil {
 			return err
 		}
@@ -106,7 +108,8 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 			}
 			rows, err := tx.Query(ctx, `
 				SELECT journal_line_id, journal_id, line_number, account_code,
-				       debit_amount, credit_amount, COALESCE(description, '')
+				       debit_amount, credit_amount, COALESCE(description, ''),
+				       tax_code, tax_logic_snapshot_id
 				FROM journal_lines WHERE journal_id = $1 AND tenant_id = $2
 				ORDER BY line_number
 			`, h.JournalID, tenantID)
@@ -117,7 +120,8 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 			for rows.Next() {
 				var l domain.JournalLine
 				if err := rows.Scan(&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
-					&l.DebitAmount, &l.CreditAmount, &l.Description); err != nil {
+					&l.DebitAmount, &l.CreditAmount, &l.Description,
+					&l.TaxCode, &l.TaxLogicSnapshotID); err != nil {
 					return err
 				}
 				resultLines = append(resultLines, l)
@@ -135,10 +139,12 @@ func (s *PgStore) CreateJournal(ctx context.Context, h *domain.JournalHeader, li
 			_, err := tx.Exec(ctx, `
 				INSERT INTO journal_lines (
 					journal_line_id, journal_id, tenant_id, line_number,
-					account_code, debit_amount, credit_amount, description
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+					account_code, debit_amount, credit_amount, description,
+					tax_code, tax_logic_snapshot_id
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			`, lines[i].JournalLineID, h.JournalID, h.TenantID, lines[i].LineNumber,
-				lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description)
+				lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description,
+				lines[i].TaxCode, lines[i].TaxLogicSnapshotID)
 			if err != nil {
 				return err
 			}
@@ -173,7 +179,8 @@ func (s *PgStore) GetJournal(ctx context.Context, journalID string) (*domain.Jou
 			SELECT journal_id, tenant_id, legal_entity_id, fiscal_period, status,
 			       reversal_of_journal_id, description, created_by_principal_id,
 			       validated_by_principal_id, posted_by_principal_id, reversed_by_principal_id,
-			       correlation_id, created_at, validated_at, posted_at, reversed_at
+			       correlation_id, created_at, validated_at, posted_at, reversed_at,
+			       source_event_id, governance_decision_id
 			FROM journal_headers WHERE journal_id = $1 AND tenant_id = $2
 		`, journalID, tenantID)
 		if err := row.Scan(
@@ -181,6 +188,7 @@ func (s *PgStore) GetJournal(ctx context.Context, journalID string) (*domain.Jou
 			&h.ReversalOfJournalID, &h.Description, &h.CreatedByPrincipalID,
 			&h.ValidatedByPrincipalID, &h.PostedByPrincipalID, &h.ReversedByPrincipalID,
 			&h.CorrelationID, &h.CreatedAt, &h.ValidatedAt, &h.PostedAt, &h.ReversedAt,
+			&h.SourceEventID, &h.GovernanceDecisionID,
 		); err != nil {
 			return err
 		}
@@ -206,7 +214,8 @@ func (s *PgStore) listLines(ctx context.Context, tenantID, journalID string) ([]
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
 			SELECT journal_line_id, journal_id, line_number, account_code,
-			       debit_amount, credit_amount, COALESCE(description, '')
+			       debit_amount, credit_amount, COALESCE(description, ''),
+			       tax_code, tax_logic_snapshot_id
 			FROM journal_lines WHERE journal_id = $1 AND tenant_id = $2 ORDER BY line_number ASC
 		`, journalID, tenantID)
 		if err != nil {
@@ -216,7 +225,8 @@ func (s *PgStore) listLines(ctx context.Context, tenantID, journalID string) ([]
 		for rows.Next() {
 			var l domain.JournalLine
 			if err := rows.Scan(&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
-				&l.DebitAmount, &l.CreditAmount, &l.Description); err != nil {
+				&l.DebitAmount, &l.CreditAmount, &l.Description,
+				&l.TaxCode, &l.TaxLogicSnapshotID); err != nil {
 				return err
 			}
 			lines = append(lines, l)
@@ -235,7 +245,8 @@ func (s *PgStore) ListJournals(ctx context.Context, filter domain.ListJournalsFi
 			SELECT journal_id, tenant_id, legal_entity_id, fiscal_period, status,
 			       reversal_of_journal_id, description, created_by_principal_id,
 			       validated_by_principal_id, posted_by_principal_id, reversed_by_principal_id,
-			       correlation_id, created_at, validated_at, posted_at, reversed_at
+			       correlation_id, created_at, validated_at, posted_at, reversed_at,
+			       source_event_id, governance_decision_id
 			FROM journal_headers
 			WHERE tenant_id = $1
 			  AND ($2 = '' OR legal_entity_id::text = $2)
@@ -256,6 +267,7 @@ func (s *PgStore) ListJournals(ctx context.Context, filter domain.ListJournalsFi
 				&h.ReversalOfJournalID, &h.Description, &h.CreatedByPrincipalID,
 				&h.ValidatedByPrincipalID, &h.PostedByPrincipalID, &h.ReversedByPrincipalID,
 				&h.CorrelationID, &h.CreatedAt, &h.ValidatedAt, &h.PostedAt, &h.ReversedAt,
+				&h.SourceEventID, &h.GovernanceDecisionID,
 			); err != nil {
 				return err
 			}

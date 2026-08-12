@@ -37,6 +37,22 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, string(mig1)); err != nil {
 		t.Fatalf("failed to execute migration 1: %v", err)
 	}
+
+	mig2, err := os.ReadFile("../../deployments/migrations/000002_add_sod_rule_tenant_scoping.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 2: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(mig2)); err != nil {
+		t.Fatalf("failed to execute migration 2: %v", err)
+	}
+
+	mig3, err := os.ReadFile("../../deployments/migrations/000003_nullable_legal_entity_for_tenant_scope.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 3: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(mig3)); err != nil {
+		t.Fatalf("failed to execute migration 3: %v", err)
+	}
 }
 
 // setupRoleWithGrant creates a role + bundle + active assignment for
@@ -57,7 +73,7 @@ func setupRoleWithGrant(t *testing.T, s *store.PgStore, tenantID, principalID, l
 		t.Fatalf("create bundle: %v", err)
 	}
 	if _, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
-		PrincipalID: principalID, RoleID: role.RoleID, LegalEntityID: legalEntityID,
+		PrincipalID: principalID, RoleID: role.RoleID, LegalEntityID: &legalEntityID,
 		EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
 	}); err != nil {
 		t.Fatalf("create assignment: %v", err)
@@ -127,6 +143,58 @@ func TestPgStore_FindGrantedActions_RBAC(t *testing.T) {
 	}
 }
 
+func TestPgStore_CreateRoleAssignment_TenantWideRequiresTenantScopedRole(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+	tenantID := "00000000-0000-0000-0000-000000000001"
+
+	entityRole, _, err := s.CreateRole(ctx, domain.CreateRoleParams{
+		TenantID: tenantID, RoleCode: "ENTITY_ROLE", RoleName: "Entity Role", RoleScopeType: "LEGAL_ENTITY", CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
+		PrincipalID: "principal-1", RoleID: entityRole.RoleID, LegalEntityID: nil,
+		EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
+	}); !errors.Is(err, domain.ErrLegalEntityRequiredForRoleScope) {
+		t.Fatalf("expected ErrLegalEntityRequiredForRoleScope for a LEGAL_ENTITY-scoped role with no legal_entity_id, got %v", err)
+	}
+
+	tenantRole, _, err := s.CreateRole(ctx, domain.CreateRoleParams{
+		TenantID: tenantID, RoleCode: "TENANT_ROLE", RoleName: "Tenant Role", RoleScopeType: "TENANT", CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
+		RoleID: tenantRole.RoleID, BundleCode: "default", PermittedActions: []string{"PLATFORM_ADMIN"},
+	}); err != nil {
+		t.Fatalf("create bundle: %v", err)
+	}
+	if _, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
+		PrincipalID: "principal-1", RoleID: tenantRole.RoleID, LegalEntityID: nil,
+		EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
+	}); err != nil {
+		t.Fatalf("expected tenant-wide assignment to succeed for a TENANT-scoped role, got: %v", err)
+	}
+
+	// A tenant-wide grant must be visible when evaluating ANY legal entity.
+	for _, entity := range []string{"00000000-0000-0000-0000-0000000000e1", "00000000-0000-0000-0000-0000000000e2"} {
+		actions, _, err := s.FindGrantedActions(ctx, "principal-1", entity)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(actions) != 1 || actions[0] != "PLATFORM_ADMIN" {
+			t.Fatalf("expected tenant-wide grant to apply in entity %s, got %v", entity, actions)
+		}
+	}
+}
+
 func TestPgStore_RevokeRoleAssignment_EndsGrant(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()
@@ -140,7 +208,7 @@ func TestPgStore_RevokeRoleAssignment_EndsGrant(t *testing.T) {
 	role, _, _ := s.CreateRole(ctx, domain.CreateRoleParams{TenantID: tenantID, RoleCode: "R1", RoleName: "R1", RoleScopeType: "LEGAL_ENTITY", CreatedByPrincipalID: "admin-1"})
 	_, _ = s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}})
 	assignment, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
-		PrincipalID: "principal-1", RoleID: role.RoleID, LegalEntityID: legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
+		PrincipalID: "principal-1", RoleID: role.RoleID, LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
 	})
 	if err != nil {
 		t.Fatalf("create assignment: %v", err)
@@ -177,7 +245,7 @@ func TestPgStore_DelegatedAuthority_RevocationIsOneWay(t *testing.T) {
 	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
 	d, err := s.CreateDelegatedAuthority(ctx, domain.CreateDelegatedAuthorityParams{
 		DelegatorPrincipalID: "boss-1", DelegatePrincipalID: "principal-1", ScopeType: "FULL",
-		LegalEntityID: legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
+		LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("create delegation: %v", err)
@@ -213,7 +281,7 @@ func TestPgStore_FindDelegatedActions_ResolvesViaDelegator(t *testing.T) {
 
 	if _, err := s.CreateDelegatedAuthority(ctx, domain.CreateDelegatedAuthorityParams{
 		DelegatorPrincipalID: "boss-1", DelegatePrincipalID: "assistant-1", ScopeType: "FULL",
-		LegalEntityID: legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
+		LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
 	}); err != nil {
 		t.Fatalf("create delegation: %v", err)
 	}
@@ -244,7 +312,7 @@ func TestPgStore_CheckSoDConflict(t *testing.T) {
 		t.Fatalf("create sod rule: %v", err)
 	}
 
-	conflicting, hasConflict, err := s.CheckSoDConflict(ctx, []string{"PAYMENT_INITIATE"}, "PAYMENT_APPROVE")
+	conflicting, hasConflict, err := s.CheckSoDConflict(ctx, []string{"PAYMENT_INITIATE"}, "PAYMENT_APPROVE", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -252,12 +320,59 @@ func TestPgStore_CheckSoDConflict(t *testing.T) {
 		t.Fatalf("expected conflict with PAYMENT_INITIATE, got conflict=%v action=%s", hasConflict, conflicting)
 	}
 
-	_, hasConflict, err = s.CheckSoDConflict(ctx, []string{"PAYMENT_VIEW"}, "PAYMENT_APPROVE")
+	_, hasConflict, err = s.CheckSoDConflict(ctx, []string{"PAYMENT_VIEW"}, "PAYMENT_APPROVE", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if hasConflict {
 		t.Fatalf("expected no conflict for unrelated actions")
+	}
+}
+
+func TestPgStore_CheckSoDConflict_TenantScoping(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	tenantA := "11111111-1111-1111-1111-111111111111"
+	tenantB := "22222222-2222-2222-2222-222222222222"
+
+	if _, err := s.CreateSoDRule(ctx, domain.CreateSoDRuleParams{
+		DomainCode: "HR", ActionA: "OFFBOARD_INITIATE", ActionB: "OFFBOARD_APPROVE", ConflictType: "MUTUALLY_EXCLUSIVE",
+		TenantID: &tenantA,
+	}); err != nil {
+		t.Fatalf("create tenant-scoped sod rule: %v", err)
+	}
+
+	// Same principal, same held action, different tenants: tenant A's rule
+	// must apply for tenant A and must NOT leak into tenant B's evaluation.
+	_, hasConflict, err := s.CheckSoDConflict(ctx, []string{"OFFBOARD_INITIATE"}, "OFFBOARD_APPROVE", tenantA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasConflict {
+		t.Fatalf("expected tenant A's SoD rule to apply within tenant A")
+	}
+
+	_, hasConflict, err = s.CheckSoDConflict(ctx, []string{"OFFBOARD_INITIATE"}, "OFFBOARD_APPROVE", tenantB)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hasConflict {
+		t.Fatalf("tenant A's SoD rule must not apply within tenant B")
+	}
+
+	// Omitting tenant_id entirely (empty string, the pre-existing calling
+	// convention) must not accidentally match a tenant-scoped rule either.
+	_, hasConflict, err = s.CheckSoDConflict(ctx, []string{"OFFBOARD_INITIATE"}, "OFFBOARD_APPROVE", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hasConflict {
+		t.Fatalf("a tenant-scoped rule must not apply when no tenant is supplied")
 	}
 }
 

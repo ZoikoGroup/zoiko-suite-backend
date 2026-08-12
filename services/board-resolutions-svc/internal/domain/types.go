@@ -6,8 +6,8 @@ import (
 )
 
 var (
-	ErrMeetingNotFound          = errors.New("board meeting not found")
-	ErrResolutionNotFound       = errors.New("board resolution not found")
+	ErrMeetingNotFound            = errors.New("board meeting not found")
+	ErrResolutionNotFound         = errors.New("board resolution not found")
 	ErrResolutionAlreadyFinalized = errors.New("resolution is already passed, rejected, or rescinded")
 
 	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties

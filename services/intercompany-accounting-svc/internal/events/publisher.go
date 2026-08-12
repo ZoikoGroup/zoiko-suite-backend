@@ -31,7 +31,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 }
 
 func (p *Publisher) PublishEntryCreated(ctx context.Context, correlationID string, entry domain.IntercompanyEntry) {
-	p.emit(ctx, "intercompany.entry.created", correlationID, map[string]any{
+	p.emit(ctx, "intercompany.entry.created", correlationID, entry.IntercompanyEntryID, map[string]any{
 		"intercompany_entry_id":  entry.IntercompanyEntryID,
 		"tenant_id":              entry.TenantID,
 		"source_legal_entity_id": entry.SourceLegalEntityID,
@@ -45,7 +45,7 @@ func (p *Publisher) PublishEntryCreated(ctx context.Context, correlationID strin
 }
 
 func (p *Publisher) PublishEntryPosted(ctx context.Context, correlationID string, entry domain.IntercompanyEntry) {
-	p.emit(ctx, "intercompany.entry.posted", correlationID, map[string]any{
+	p.emit(ctx, "intercompany.entry.posted", correlationID, entry.IntercompanyEntryID, map[string]any{
 		"intercompany_entry_id":  entry.IntercompanyEntryID,
 		"tenant_id":              entry.TenantID,
 		"source_legal_entity_id": entry.SourceLegalEntityID,
@@ -60,7 +60,7 @@ func (p *Publisher) PublishEntryPosted(ctx context.Context, correlationID string
 }
 
 func (p *Publisher) PublishMismatchDetected(ctx context.Context, correlationID string, entry domain.IntercompanyEntry, reason string) {
-	p.emit(ctx, "intercompany.mismatch.detected", correlationID, map[string]any{
+	p.emit(ctx, "intercompany.mismatch.detected", correlationID, entry.IntercompanyEntryID, map[string]any{
 		"intercompany_entry_id":  entry.IntercompanyEntryID,
 		"tenant_id":              entry.TenantID,
 		"source_legal_entity_id": entry.SourceLegalEntityID,
@@ -72,7 +72,7 @@ func (p *Publisher) PublishMismatchDetected(ctx context.Context, correlationID s
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -95,7 +95,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

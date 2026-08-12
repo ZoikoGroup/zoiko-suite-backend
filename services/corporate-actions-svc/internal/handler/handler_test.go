@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/corporate-actions-svc/internal/domain"
 	"zoiko.io/corporate-actions-svc/internal/events"
+	"zoiko.io/corporate-actions-svc/internal/evidencereq"
 )
 
 type stubStore struct {
@@ -83,9 +84,20 @@ func (s *stubAuthzClient) CheckAllowed(_ context.Context, _, _, _ string) error 
 	return nil
 }
 
+// stubEvidenceReq grants sufficiency by default, matching a
+// SATISFIED/NO_REQUIREMENTS_DEFINED outcome but skipping the network call.
+// Tests can set err to exercise the fail-closed path.
+type stubEvidenceReq struct {
+	err error
+}
+
+func (s *stubEvidenceReq) EvaluateSufficient(_ context.Context, _, _, _, _, _, _ string, _ []evidencereq.Artifact) error {
+	return s.err
+}
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -161,6 +173,52 @@ func TestExecuteAction(t *testing.T) {
 	_ = json.NewDecoder(wExec.Body).Decode(&executed)
 	if executed.Status != domain.ActionStatusExecuted {
 		t.Errorf("expected EXECUTED, got %s", executed.Status)
+	}
+}
+
+func TestExecuteAction_EvidenceMissing_Returns422(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{err: evidencereq.ErrEvidenceMissing}, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	body := domain.CreateCorporateActionRequest{
+		LegalEntityID: "le-001", Title: "Merger with Acme", ActionType: domain.ActionTypeMerger,
+		EffectiveDate: "2026-05-01", CreatedBy: "ceo-001",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
+	var created domain.CorporateAction
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	execBody := domain.ExecuteCorporateActionRequest{ExecutedBy: "ceo-001"}
+	wExec := httptest.NewRecorder()
+	r.ServeHTTP(wExec, buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody))
+	if wExec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when required evidence is missing, got %d — %s", wExec.Code, wExec.Body.String())
+	}
+}
+
+func TestExecuteAction_EvidenceServiceUnavailable_Returns503(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, &stubEvidenceReq{err: evidencereq.ErrServiceUnavailable}, logger)
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	body := domain.CreateCorporateActionRequest{
+		LegalEntityID: "le-001", Title: "Merger with Acme", ActionType: domain.ActionTypeMerger,
+		EffectiveDate: "2026-05-01", CreatedBy: "ceo-001",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/corporate-actions", body))
+	var created domain.CorporateAction
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	execBody := domain.ExecuteCorporateActionRequest{ExecutedBy: "ceo-001"}
+	wExec := httptest.NewRecorder()
+	r.ServeHTTP(wExec, buildRequest(http.MethodPost, "/v1/corporate-actions/"+created.ActionID+"/execute", execBody))
+	if wExec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when evidence-requirements-svc is unavailable, got %d — %s", wExec.Code, wExec.Body.String())
 	}
 }
 

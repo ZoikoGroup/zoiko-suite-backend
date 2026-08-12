@@ -31,15 +31,22 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, filename, _, _ := runtime.Caller(0)
-	migPath := filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000001_initial_schema.up.sql")
-	migSQL, err := os.ReadFile(migPath)
-	if err != nil {
-		t.Fatalf("failed to read migration file %s: %v", migPath, err)
-	}
+	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS governance_decisions CASCADE;`)
-	if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
-		t.Fatalf("failed to execute migration: %v", err)
+	for _, name := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_rls.up.sql",
+		"000003_enforce_immutability.up.sql",
+		"000004_add_event_linkage_keys.up.sql",
+	} {
+		migSQL, err := os.ReadFile(filepath.Join(migDir, name))
+		if err != nil {
+			t.Fatalf("failed to read migration file %s: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
+			t.Fatalf("failed to execute migration %s: %v", name, err)
+		}
 	}
 
 	return pool
@@ -75,12 +82,31 @@ func TestPgStore_Insert_Integration(t *testing.T) {
 		t.Fatalf("expected created=true for first insert")
 	}
 
-	got, err := s.FindByID(ctx, "dec-int-001")
+	got, err := s.FindByID(ctx, "tenant-1", "dec-int-001")
 	if err != nil {
 		t.Fatalf("unexpected error on FindByID: %v", err)
 	}
 	if got.TenantID != d.TenantID || got.Outcome != d.Outcome || got.RuleBasis != d.RuleBasis {
 		t.Errorf("stored row does not match input: got %+v, want %+v", got, d)
+	}
+}
+
+// TestPgStore_FindByID_ScopedToTenant verifies FindByID cannot return a row
+// belonging to a different tenant, even when the decision_id is known —
+// closing the gap where GetDecision used to ignore tenant scope entirely.
+func TestPgStore_FindByID_ScopedToTenant(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	d := sampleDecision("dec-cross-tenant")
+	if _, err := s.Insert(ctx, d); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	_, err := s.FindByID(ctx, "tenant-OTHER", "dec-cross-tenant")
+	if !errors.Is(err, domain.ErrDecisionNotFound) {
+		t.Fatalf("expected ErrDecisionNotFound when querying with the wrong tenant, got %v", err)
 	}
 }
 
@@ -123,7 +149,7 @@ func TestPgStore_Insert_IdempotentOnDuplicateDecisionID(t *testing.T) {
 	}
 
 	// The original outcome must have won — no silent overwrite.
-	got, err := s.FindByID(ctx, d.DecisionID)
+	got, err := s.FindByID(ctx, "tenant-1", d.DecisionID)
 	if err != nil {
 		t.Fatalf("unexpected error on FindByID: %v", err)
 	}
@@ -139,7 +165,7 @@ func TestPgStore_FindByID_NotFound(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
 
-	_, err := s.FindByID(ctx, "does-not-exist")
+	_, err := s.FindByID(ctx, "tenant-1", "does-not-exist")
 	if err != domain.ErrDecisionNotFound {
 		t.Fatalf("expected ErrDecisionNotFound, got %v", err)
 	}
@@ -164,10 +190,10 @@ func TestPgStore_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 	if _, err := s.Insert(ctx, sampleDecision("dec-unavailable")); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("Insert: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
-	if _, err := s.FindByID(ctx, "dec-unavailable"); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, err := s.FindByID(ctx, "tenant-1", "dec-unavailable"); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("FindByID: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
-	if _, err := s.List(ctx, store.ListParams{}); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, err := s.List(ctx, store.ListParams{TenantID: "tenant-1"}); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("List: expected error to wrap ErrStoreUnavailable, got %v", err)
 	}
 }
@@ -211,7 +237,7 @@ func TestPgStore_List_NoFilters_ReturnsAllNewestFirst(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{})
+	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -231,7 +257,7 @@ func TestPgStore_List_FilterByActor(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{ActorID: "actor-2"})
+	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActorID: "actor-2"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -248,7 +274,7 @@ func TestPgStore_List_FilterByEntity(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{LegalEntityID: "entity-A"})
+	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", LegalEntityID: "entity-A"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -264,7 +290,7 @@ func TestPgStore_List_FilterByAction(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{ActionType: "TAX_FILING"})
+	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActionType: "TAX_FILING"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -280,7 +306,7 @@ func TestPgStore_List_FilterByRuleBasis(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{RuleBasis: "policy-v3-sod"})
+	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", RuleBasis: "policy-v3-sod"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -299,14 +325,32 @@ func TestPgStore_List_FilterByTimeRange(t *testing.T) {
 
 	base := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
 	results, err := s.List(ctx, store.ListParams{
-		From: base.AddDate(0, 0, 1),
-		To:   base.AddDate(0, 0, 2),
+		TenantID: "tenant-1",
+		From:     base.AddDate(0, 0, 1),
+		To:       base.AddDate(0, 0, 2),
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results in range, got %d: %+v", len(results), results)
+	}
+}
+
+// TestPgStore_List_ScopedToTenant verifies List never returns another
+// tenant's rows, even with no other filters applied.
+func TestPgStore_List_ScopedToTenant(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	seedListFixtures(t, ctx, s) // all fixtures are tenant-1
+
+	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-OTHER"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected 0 results for a tenant with no rows, got %d: %+v", len(results), results)
 	}
 }
 
@@ -319,6 +363,7 @@ func TestPgStore_List_FiltersCompose(t *testing.T) {
 	seedListFixtures(t, ctx, s)
 
 	results, err := s.List(ctx, store.ListParams{
+		TenantID:      "tenant-1",
 		ActorID:       "actor-1",
 		LegalEntityID: "entity-A",
 		RuleBasis:     "policy-v9-tax",
@@ -339,7 +384,7 @@ func TestPgStore_List_NoMatch_ReturnsEmptyNotError(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	seedListFixtures(t, ctx, s)
 
-	results, err := s.List(ctx, store.ListParams{ActorID: "does-not-exist"})
+	results, err := s.List(ctx, store.ListParams{TenantID: "tenant-1", ActorID: "does-not-exist"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

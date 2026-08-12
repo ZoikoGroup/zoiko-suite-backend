@@ -65,6 +65,12 @@ type WorkflowTransition struct {
 	ActedBy   string  `json:"acted_by"`
 	Rationale *string `json:"rationale"`
 
+	// CorrelationID is carried forward from the owning WorkflowInstance's
+	// own correlation_id. CausationID is nil unless the caller submitting
+	// this specific action supplied one.
+	CorrelationID *string `json:"correlation_id,omitempty"`
+	CausationID   *string `json:"causation_id,omitempty"`
+
 	ActedAt time.Time `json:"acted_at"`
 }
 
@@ -92,6 +98,9 @@ type SubmitActionParams struct {
 	// Action: APPROVE | REJECT.
 	Action    string
 	Rationale *string
+	// CausationID is optional: the event/decision that caused this specific
+	// action, when the caller knows it.
+	CausationID *string
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
