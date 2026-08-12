@@ -157,6 +157,7 @@ func main() {
 
 	h := handler.New(pgStore, publisher, decisionLogClient, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
+	handler.RegisterControlTestRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

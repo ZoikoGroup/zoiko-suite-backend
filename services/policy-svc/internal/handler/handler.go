@@ -26,6 +26,16 @@ type PolicyStore interface {
 	ActivateVersion(ctx context.Context, policyVersionID, actorID string) (*domain.PolicyVersion, []*domain.PolicyVersion, bool, error)
 	ListVersionHistory(ctx context.Context, policyID string) ([]*domain.PolicyVersion, error)
 	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error)
+
+	// ── Chunk 10: control tests & attestations ──────────────────────────────
+	CreateControlTestDefinition(ctx context.Context, params domain.CreateControlTestDefinitionParams) (*domain.ControlTestDefinition, bool, error)
+	FindControlTestDefinitionByID(ctx context.Context, id string) (*domain.ControlTestDefinition, error)
+	CreateControlTestExecution(ctx context.Context, params domain.CreateControlTestExecutionParams) (*domain.ControlTestExecution, error)
+	ListControlTestExecutions(ctx context.Context, controlTestDefinitionID string) ([]*domain.ControlTestExecution, error)
+	ResolveControlEffectiveness(ctx context.Context, controlRef string) (*domain.ControlEffectiveness, error)
+	CreateAttestation(ctx context.Context, params domain.CreateAttestationParams) (*domain.Attestation, error)
+	FindAttestationByID(ctx context.Context, id string) (*domain.Attestation, error)
+	RevokeAttestation(ctx context.Context, attestationID, reason string) (*domain.Attestation, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on for

@@ -138,6 +138,7 @@ func main() {
 
 	h := handler.New(pgStore, publisher, jurisdictionValidator, log)
 	handler.RegisterRoutes(r, h)
+	handler.RegisterApplicabilityRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

@@ -47,6 +47,23 @@ type stubStore struct {
 	createVersionCalls int
 	activateCalls      int
 	activateActor      string
+
+	// Chunk 10: control tests & attestations.
+	definition              *domain.ControlTestDefinition
+	definitionErr           error
+	executions              []*domain.ControlTestExecution
+	effectiveness           *domain.ControlEffectiveness
+	attestation             *domain.Attestation
+	attestationErr          error
+	revoked                 *domain.Attestation
+	revokeErr               error
+	createDefinitionErr     error
+	createExecutionErr      error
+	createDefinitionCalls   int
+	createExecutionCalls    int
+	createExecutionTester   string
+	createAttestationCalls  int
+	createAttestationSigner string
 }
 
 func (s *stubStore) CreatePolicy(_ context.Context, _ domain.CreatePolicyParams) (*domain.Policy, bool, error) {
@@ -75,6 +92,83 @@ func (s *stubStore) ListVersionHistory(_ context.Context, _ string) ([]*domain.P
 
 func (s *stubStore) FindApplicableVersions(_ context.Context, _ string, _, _ *string) ([]*domain.ApplicablePolicyVersion, error) {
 	return s.applicable, s.applicableErr
+}
+
+// ── Chunk 10: control tests & attestations ──────────────────────────────────
+
+func (s *stubStore) CreateControlTestDefinition(_ context.Context, params domain.CreateControlTestDefinitionParams) (*domain.ControlTestDefinition, bool, error) {
+	s.createDefinitionCalls++
+	if s.createDefinitionErr != nil {
+		return nil, false, s.createDefinitionErr
+	}
+	return &domain.ControlTestDefinition{
+		ControlTestDefinitionID: "ctd-1",
+		ControlRef:              params.ControlRef,
+		TestCode:                params.TestCode,
+		Title:                   params.Title,
+		Methodology:             params.Methodology,
+		DesignStatus:            "DESIGNED",
+		CreatedByPrincipalID:    params.CreatedByPrincipalID,
+	}, true, nil
+}
+
+func (s *stubStore) FindControlTestDefinitionByID(_ context.Context, _ string) (*domain.ControlTestDefinition, error) {
+	return s.definition, s.definitionErr
+}
+
+func (s *stubStore) CreateControlTestExecution(_ context.Context, params domain.CreateControlTestExecutionParams) (*domain.ControlTestExecution, error) {
+	s.createExecutionCalls++
+	s.createExecutionTester = params.TesterPrincipalID
+	// Mirrors PgStore.CreateControlTestExecution: it validates the parent
+	// definition exists before inserting.
+	if s.definitionErr != nil {
+		return nil, s.definitionErr
+	}
+	if s.createExecutionErr != nil {
+		return nil, s.createExecutionErr
+	}
+	return &domain.ControlTestExecution{
+		ControlTestExecutionID:  "cte-1",
+		ControlTestDefinitionID: params.ControlTestDefinitionID,
+		PeriodStart:             params.PeriodStart,
+		PeriodEnd:               params.PeriodEnd,
+		TesterPrincipalID:       params.TesterPrincipalID,
+		Result:                  params.Result,
+	}, nil
+}
+
+func (s *stubStore) ListControlTestExecutions(_ context.Context, _ string) ([]*domain.ControlTestExecution, error) {
+	return s.executions, nil
+}
+
+func (s *stubStore) ResolveControlEffectiveness(_ context.Context, controlRef string) (*domain.ControlEffectiveness, error) {
+	if s.effectiveness != nil {
+		return s.effectiveness, nil
+	}
+	return &domain.ControlEffectiveness{ControlRef: controlRef, DesignStatus: "NOT_TESTED", OperatingEffectiveness: "NO_EXECUTIONS_RECORDED"}, nil
+}
+
+func (s *stubStore) CreateAttestation(_ context.Context, params domain.CreateAttestationParams) (*domain.Attestation, error) {
+	s.createAttestationCalls++
+	s.createAttestationSigner = params.SignerPrincipalID
+	return &domain.Attestation{
+		AttestationID:        "att-1",
+		Statement:            params.Statement,
+		StatementVersion:     params.StatementVersion,
+		SubjectRef:           params.SubjectRef,
+		SignerPrincipalID:    params.SignerPrincipalID,
+		SignerRole:           params.SignerRole,
+		AttestationStatus:    "ACTIVE",
+		CreatedByPrincipalID: params.CreatedByPrincipalID,
+	}, nil
+}
+
+func (s *stubStore) FindAttestationByID(_ context.Context, _ string) (*domain.Attestation, error) {
+	return s.attestation, s.attestationErr
+}
+
+func (s *stubStore) RevokeAttestation(_ context.Context, _, _ string) (*domain.Attestation, error) {
+	return s.revoked, s.revokeErr
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -144,6 +238,17 @@ func newTestRouterWithAuthz(s *stubStore, p *stubPublisher, d *stubDecisionLog, 
 	r := chi.NewRouter()
 	h := handler.New(s, p, d, az, testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
+	return r
+}
+
+// newControlTestRouter wires a router with control-test/attestation routes
+// included — the base newTestRouter* helpers above only register
+// handler.RegisterRoutes.
+func newControlTestRouter(s *stubStore, az *stubAuthz) chi.Router {
+	r := chi.NewRouter()
+	h := handler.New(s, &stubPublisher{}, &stubDecisionLog{}, az, testAuthzScopeID, zap.NewNop())
+	handler.RegisterRoutes(r, h)
+	handler.RegisterControlTestRoutes(r, h)
 	return r
 }
 
