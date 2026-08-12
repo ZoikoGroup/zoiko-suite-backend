@@ -38,6 +38,25 @@ type Store interface {
 	GetMembership(ctx context.Context, membershipID string) (*domain.Membership, error)
 	ListMembershipsByOrganization(ctx context.Context, organizationID string) ([]domain.Membership, error)
 	DeactivateMembership(ctx context.Context, membershipID, organizationID string) error
+
+	// ── Chunk 6: Plans, Pricing & Entitlements ──────────────────────────────
+	CreatePriceCatalog(ctx context.Context, c *domain.PriceCatalog) error
+	GetPriceCatalog(ctx context.Context, catalogVersionID string) (*domain.PriceCatalog, error)
+	CreatePlan(ctx context.Context, p *domain.Plan) error
+	GetPlan(ctx context.Context, planID string) (*domain.Plan, error)
+	SetEntitlementLimit(ctx context.Context, l *domain.EntitlementLimit) error
+	ListEntitlementLimitsByPlan(ctx context.Context, planID string) ([]domain.EntitlementLimit, error)
+	CreateSubscription(ctx context.Context, sub *domain.CommercialSubscription) error
+	GetSubscription(ctx context.Context, subscriptionID string) (*domain.CommercialSubscription, error)
+	UpdateSubscriptionPlan(ctx context.Context, subscriptionID, planID, catalogVersionID string) error
+	CreateEvaluationProgram(ctx context.Context, e *domain.EvaluationProgram) error
+	GetEvaluationProgramBySubscription(ctx context.Context, subscriptionID string) (*domain.EvaluationProgram, error)
+	CreateOverlay(ctx context.Context, o *domain.ContractEntitlementOverlay) error
+	ResolveEntitlement(ctx context.Context, subscriptionID, metricType string) (*domain.ResolvedEntitlement, error)
+	RecordUsageEvent(ctx context.Context, e *domain.UsageMeterEvent) error
+	CreateChangeRequest(ctx context.Context, c *domain.SubscriptionChangeRequest) error
+	GetChangeRequest(ctx context.Context, changeRequestID string) (*domain.SubscriptionChangeRequest, error)
+	ApplyChangeRequest(ctx context.Context, changeRequestID string) (*domain.CommercialSubscription, error)
 }
 
 type PgStore struct {

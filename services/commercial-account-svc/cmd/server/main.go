@@ -74,6 +74,7 @@ func main() {
 	r.Get("/readyz", health.ReadyzHandler(pool))
 
 	handler.RegisterRoutes(r, h)
+	handler.RegisterSubscriptionRoutes(r, h)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,

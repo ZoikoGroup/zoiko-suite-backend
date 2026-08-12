@@ -20,12 +20,14 @@ import (
 type stubStore struct {
 	accounts    map[string]*domain.CommercialAccount
 	memberships map[string]*domain.Membership
+	sub         *subscriptionStubData
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
 		accounts:    make(map[string]*domain.CommercialAccount),
 		memberships: make(map[string]*domain.Membership),
+		sub:         newSubscriptionStubData(),
 	}
 }
 

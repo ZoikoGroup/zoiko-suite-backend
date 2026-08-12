@@ -42,15 +42,22 @@ duplicating it.
 
 ## Chunk 6 — Plans, Pricing & Entitlements (net-new, Plane 1)
 
+Resolution: extends `commercial-account-svc` (Chunk 5) rather than a new
+service — a subscription/plan/entitlement is meaningless without the
+commercial_account it bills, and entitlement resolution needs both in one
+transaction boundary. `entitlement_service` is satisfied by a
+`ResolveEntitlement` method, not a separate service, since it has no
+independent data of its own to own.
+
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 6 | `price_catalog` / `catalog_version_id` — plans, prices, limits, add-ons, market scope | §B1 | Not Started | |
-| 7 | `entitlement_service` + `subscription_item` (metric_type, entitlement_set_id, limits) | §B2 | Not Started | |
-| 8 | `commercial_subscription` — plan, interval, status, renewal/cancel, processor refs | §N1 | Not Started | |
-| 9 | `EVALUATION_PROGRAM` object for trials — no free trial exists today without one | §B3 | Not Started | |
-| 10 | Upgrade/downgrade workflow — quote/preview, effective_at, consent, resulting entitlement version | §B4–B5 | Not Started | |
-| 11 | `contract_entitlement_overlay` for bespoke enterprise terms | §B6 | Not Started | |
-| 12 | `commercial_usage_meter` — separate Plane 1 ledger with dedupe/aggregation before anything becomes billable | §B7, §N3 | Not Started | |
+| 6 | `price_catalog` / `catalog_version_id` — plans, prices, limits, add-ons, market scope | §B1 | Done | `price_catalogs` + `plans` tables; plan_code/display_name are data, never switched on; live-verified create catalog → create plan → set limit |
+| 7 | `entitlement_service` + `subscription_item` (metric_type, entitlement_set_id, limits) | §B2 | Done | `ResolveEntitlement(subscriptionID, metricType)` — plan limit, overridden by an active contract overlay if one exists; live-verified both PLAN and OVERLAY resolution paths |
+| 8 | `commercial_subscription` — plan, interval, status, renewal/cancel, processor refs | §N1 | Done | Status values are doc7 §29's canonical state machine verbatim (EVALUATION/ACTIVE/PAST_DUE/RESTRICTED/SUSPENDED/CANCELED/TERMINATED); one non-terminal subscription per commercial account enforced by a partial unique index; live-verified |
+| 9 | `EVALUATION_PROGRAM` object for trials — no free trial exists today without one | §B3 | Done | `evaluation_programs`, one per subscription; live-verified create (14-day trial, expires_at computed) + duplicate rejected 409 |
+| 10 | Upgrade/downgrade workflow — quote/preview, effective_at, consent, resulting entitlement version | §B4–B5 | Done | `subscription_change_requests`: PREVIEWED → APPLIED, applied atomically in one transaction; a subscription is never repointed without a prior, inspectable preview row. Live-verified: preview leaves subscription unchanged, confirm repoints it, second confirm correctly 409s |
+| 11 | `contract_entitlement_overlay` for bespoke enterprise terms | §B6 | Done | `contract_entitlement_overlays`, wins over the plan's own limit when active; live-verified override changes ResolveEntitlement's answer from PLAN/10 to OVERLAY/500 |
+| 12 | `commercial_usage_meter` — separate Plane 1 ledger with dedupe/aggregation before anything becomes billable | §B7, §N3 | Done | `commercial_usage_meter_events`, caller-supplied idempotency key as primary key (TEXT, not UUID — a real bug caught during live verification and fixed before commit); live-verified retry does not double-count |
 
 ## Chunk 7 — Capability & Release Registries (net-new, Plane 1)
 
@@ -124,3 +131,4 @@ duplicating it.
 
 - 2026-08-11 — Initial backlog created from full §28 data-model audit against the running codebase.
 - 2026-08-12 — Chunk 5 (items 1–5) complete: new `commercial-account-svc` (commercial_accounts + memberships), `workspace` added to tenant-entity-registry-svc with mandatory billing_classification/billing_source. All 5 items build/vet/test clean and live-verified against real Postgres + authorization-svc.
+- 2026-08-12 — Chunk 6 (items 6–12) complete: price_catalogs/plans/entitlement_limits, commercial_subscriptions, evaluation_programs, contract_entitlement_overlays, commercial_usage_meter_events, subscription_change_requests — all added to commercial-account-svc. Two real bugs caught during live verification and fixed before commit: usage_event_id was declared UUID but is a caller-supplied idempotency key (not guaranteed UUID-shaped); catalog/plan-admin actions were calling authorization-svc with an empty scope, which it rejects (fixed to use the platform-scope convention already established elsewhere in this codebase). All 7 items build/vet/test clean and live-verified end-to-end.

@@ -76,6 +76,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_regi
 # Apply migrations for commercial-account-svc
 echo "Applying migrations for commercial_account..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000002_add_plans_and_subscriptions.up.sql
 
 # Apply migrations for jurisdiction-rules-svc
 echo "Applying migrations for jurisdiction_rules..."

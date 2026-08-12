@@ -17,6 +17,14 @@ import (
 	"zoiko.io/commercial-account-svc/internal/store"
 )
 
+// platformScopeID is the legal_entity_id passed to authorization-svc for
+// actions that aren't scoped to one commercial account (catalog/plan
+// administration) — authorization-svc rejects an empty legal_entity_id, and
+// this is the same platform-wide scope ID convention used elsewhere in this
+// codebase (e.g. policy-svc, configuration-feature-flag-svc's
+// AUTHZ_PLATFORM_SCOPE_ID).
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+
 // Action constants passed to authorization-svc as action_type.
 const (
 	CommercialAccountCreate = "COMMERCIAL_ACCOUNT_CREATE"
