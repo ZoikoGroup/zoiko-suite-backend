@@ -105,6 +105,7 @@ echo "Applying migrations for policy..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000002_add_activation_audit.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000003_add_explicit_scope_type.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000004_add_control_tests.up.sql
 
 # Apply migrations for authorization-svc
 echo "Applying migrations for authorization_svc..."
@@ -128,6 +129,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integ
 # Apply migrations for obligations-svc
 echo "Applying migrations for obligations..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000002_add_applicability_decisions.up.sql
 
 # Apply migrations for schema-registry-svc
 echo "Applying migrations for schema_registry..."

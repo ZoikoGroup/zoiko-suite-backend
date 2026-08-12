@@ -117,18 +117,33 @@ rather than locally invented taxonomies.
 | 27 | Provider/model registry — training-use posture, retention, region, DPA verification | §G6 | Done | `model_provider_registrations`; defaults to `NO_TRAINING` per §G6 ("No default training use is authorized"); `GET .../verify?data_class=` live-verified blocking an unapproved data class and an unregistered provider |
 | 28 | Maker-checker / self-approval blocking for AI-proposed policy or control changes | §G3 | Done | `policy_change_approvals` (for policy/control changes) and the decision step on `automation_actions` (for heightened-risk automation) both enforce `decider != proposer`; live-verified self-approval 403s on both objects, a different approver succeeds on both |
 
-## Chunk 10 — Governance/Evidence Plane Gaps (extend existing services)
+## Chunk 10 — Governance/Evidence Plane Gaps (extend existing services) — items 29–31 ✅ Done 2026-08-12, items 32–36 deferred
+
+Resolution for 29–31: extended policy-svc (control tests + attestations —
+both are governance-record concepts that already lives in this service's
+domain, not a new bounded context) and obligations-svc (applicability
+decisions — obligation-specific, extends the service that already owns
+`obligations`). Items 32–36 are each cross-cutting across 4+ existing
+services (outbox touches every service that publishes events; retention/
+legal-hold touches every service that stores anything deletable; replay
+manifests need policy-svc + governance-decision-log-svc + audit-event-
+store-svc together; report metrics and source-authority mapping are
+reporting/connected-systems concerns with no natural single owner). Building
+any of them properly means a dedicated session scoped to that one item
+across every affected service, not a shared slot in this chunk — flagged
+here as the deliberate reason they're Not Started rather than attempted as
+shallow, single-service stubs.
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 29 | `control_test_definition` / `control_test_execution` — separate design-status from operating-effectiveness (currently collapsed in policy-svc) | §E3, §I3 | Not Started | |
-| 30 | `attestation` object — signed/attributed assertions with expiry/revocation (doesn't exist under any name today) | §E6 | Not Started | |
-| 31 | `applicability_decision` — versioned, with confidence/uncertainty and UNASSESSED/APPLICABLE/UNCERTAIN states (closest today is `access_decision_log`, which is generic, not obligation-specific) | §E2, §29 | Not Started | |
-| 32 | Transactional outbox pattern — every service currently publishes Kafka events directly with no outbox table; a crash between DB commit and publish can silently drop an event | §L1–L2, §I5 | Not Started | |
-| 33 | `retention_policy` / `legal_hold` objects — don't exist anywhere; needed before any real data-deletion path is safe | §J1, §J3 | Not Started | |
-| 34 | `replay_manifest` for historical decision replay against the source/policy versions active at the time | §I5, §29 | Not Started | |
-| 35 | `report_metric_definition` — versioned formula/scope/owner for every executive metric | §M1 | Not Started | |
-| 36 | `source_authority_map` / `normalized_fact` — field-level source-of-truth precedence for connected systems | §D1–D3 | Not Started | |
+| 29 | `control_test_definition` / `control_test_execution` — separate design-status from operating-effectiveness (currently collapsed in policy-svc) | §E3, §I3 | Done | policy-svc migration 000004; `control_test_definitions` (immutable, DESIGN_STATUS) + `control_test_executions` (append-only, OPERATING_EFFECTIVENESS in `result`); `GET /v1/controls/{control_ref}/effectiveness` composes both as independent fields; live-verified a control that is TESTED (design exists) while its latest execution is INEFFECTIVE — the two never collapse into one status |
+| 30 | `attestation` object — signed/attributed assertions with expiry/revocation (doesn't exist under any name today) | §E6 | Done | `attestations` table in the same migration; signer/role/period/evidence_refs/expiry + ACTIVE/CHALLENGED/REVOKED state; live-verified create → revoke → a second revoke attempt 409s (illegal transition, not silently re-applied) |
+| 31 | `applicability_decision` — versioned, with confidence/uncertainty and UNASSESSED/APPLICABLE/UNCERTAIN states (closest today is `access_decision_log`, which is generic, not obligation-specific) | §E2, §29 | Done | obligations-svc migration 000002; append-only `applicability_decisions`; `GET .../applicability` returns UNASSESSED when no row exists for a scope — never coerced to NOT_APPLICABLE; live-verified three independent scopes on the same obligation resolving to UNASSESSED, APPLICABLE, and UNCERTAIN respectively, plus a decision missing both actor and system rejected with 400. Real bug caught during live verification: `facts_used` was typed `[]byte` in Go, which `encoding/json` silently base64-encodes instead of inlining — fixed to `json.RawMessage` before commit |
+| 32 | Transactional outbox pattern — every service currently publishes Kafka events directly with no outbox table; a crash between DB commit and publish can silently drop an event | §L1–L2, §I5 | Not Started | Deferred — cross-cutting across every event-publishing service; needs its own session |
+| 33 | `retention_policy` / `legal_hold` objects — don't exist anywhere; needed before any real data-deletion path is safe | §J1, §J3 | Not Started | Deferred — cross-cutting across every service that stores deletable data; needs its own session |
+| 34 | `replay_manifest` for historical decision replay against the source/policy versions active at the time | §I5, §29 | Not Started | Deferred — needs policy-svc + governance-decision-log-svc + audit-event-store-svc together; needs its own session |
+| 35 | `report_metric_definition` — versioned formula/scope/owner for every executive metric | §M1 | Not Started | Deferred — reporting concern with no natural single owning service yet; needs its own session |
+| 36 | `source_authority_map` / `normalized_fact` — field-level source-of-truth precedence for connected systems | §D1–D3 | Not Started | Deferred — connected-systems concern with no natural single owning service yet; needs its own session |
 
 ## Chunk 11 — Cross-Cutting Reliability & Security Controls
 
@@ -162,3 +177,4 @@ rather than locally invented taxonomies.
 - 2026-08-12 — Chunk 7 (items 13–18) complete: new `capability-registry-svc` — capabilities, market_releases, integration_capabilities, releases (append-only), capability_claims, plus a capability-resolution endpoint checking all four in priority order. Built and live-verified cleanly on the first pass.
 - 2026-08-12 — Chunk 8 (items 19–21) complete, item 22 Blocked: extended commercial-account-svc with billing_source on commercial_subscriptions, billing_source_transfers, and subscription_status_events (append-only dunning audit trail) via migration 000003. New endpoints: `POST /v1/subscriptions/{id}/status` (dunning transitions, fail-closed via ValidSubscriptionStatusTransitions, idempotent same-status no-op), `GET /v1/subscriptions/{id}/status-events`, `POST /v1/billing-source-transfers` (atomic cancel-old/create-new). Double-billing prevention is structural (existing partial unique index), not just application logic. Live-verified the full ACTIVE→PAST_DUE→RESTRICTED→SUSPENDED→ACTIVE cycle, an idempotent repeat logging no extra event, a rejected invalid transition (409), and a DIRECT→ZOIKO_ONE_BUNDLE transfer. Caught a stale-image trap during verification: a container *restart* does not pick up new code, only a rebuild does — fixed by rebuilding the image before restarting.
 - 2026-08-12 — Chunk 9 (items 23–28) complete: new `ai-governance-svc` — ai_runs, action_risk_classifications, automation_policies (allowlist), automation_actions, model_provider_registrations, policy_change_approvals. Pure record-keeping/gate-checking layer, never executes models or automations itself. Built and live-verified cleanly on the first pass: an unallowlisted autonomous action 403s, an allowlisted one proceeds and requires maker-checker approval, self-approval is blocked on both automation-action decisions and policy-change approvals (403 for the proposer, 200 for a different approver), a duplicate idempotency_key 409s, and the model-provider verify endpoint correctly blocks an unapproved data class and an unregistered provider.
+- 2026-08-12 — Chunk 10 (items 29–31) complete, items 32–36 explicitly deferred as follow-up (see Chunk 10 section for why each is cross-cutting): extended policy-svc with control_test_definitions/control_test_executions/attestations (migration 000004) and obligations-svc with applicability_decisions (migration 000002). Live-verified the doc7 §E3 payoff directly — a control showing TESTED design status with an independently INEFFECTIVE latest execution result — plus attestation revoke-then-re-revoke correctly 409ing, and three applicability scopes on one obligation resolving to UNASSESSED/APPLICABLE/UNCERTAIN respectively. One real bug caught and fixed before commit: obligations-svc's `facts_used` field was typed `[]byte`, which Go's `encoding/json` silently base64-encodes instead of serializing as inline JSON — changed to `json.RawMessage`.

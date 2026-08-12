@@ -44,6 +44,11 @@ type Store interface {
 	// obligation. Fails with domain.ErrObligationNotFound if obligation_id
 	// does not exist.
 	ListFilingRequirements(ctx context.Context, obligationID string) ([]*domain.FilingRequirement, error)
+
+	// ── Chunk 10: applicability decisions (doc7 §E2) ────────────────────────
+	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, error)
+	ListApplicabilityDecisions(ctx context.Context, obligationID, jurisdictionCode, entityRef string) ([]*domain.ApplicabilityDecision, error)
+	FindCurrentApplicability(ctx context.Context, obligationID, jurisdictionCode, entityRef string) (*domain.CurrentApplicability, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
