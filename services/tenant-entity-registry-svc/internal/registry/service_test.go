@@ -23,6 +23,7 @@ import (
 type memStore struct {
 	tenants           map[string]*domain.Tenant
 	entities          map[string]*domain.LegalEntity
+	workspaces        map[string]*domain.Workspace
 	bundles           map[string]*domain.TaxIdentityBundle
 	residencyPolicies map[string]*domain.DataResidencyPolicy
 	lastUpdateActor   string // records ActorPrincipalID from the last UpdateEntity call
@@ -33,6 +34,7 @@ func newMemStore() *memStore {
 	return &memStore{
 		tenants:           make(map[string]*domain.Tenant),
 		entities:          make(map[string]*domain.LegalEntity),
+		workspaces:        make(map[string]*domain.Workspace),
 		bundles:           make(map[string]*domain.TaxIdentityBundle),
 		residencyPolicies: make(map[string]*domain.DataResidencyPolicy),
 	}
@@ -122,6 +124,20 @@ func (m *memStore) GetEntityStatus(_ context.Context, id string) (*domain.Entity
 		EntityStatus: e.EntityStatus,
 	}, nil
 }
+func (m *memStore) CreateWorkspace(_ context.Context, w *domain.Workspace) error {
+	m.workspaces[w.WorkspaceID] = w
+	return nil
+}
+func (m *memStore) GetWorkspaceByID(_ context.Context, id string) (*domain.Workspace, error) {
+	w, ok := m.workspaces[id]
+	if !ok {
+		return nil, nil
+	}
+	return w, nil
+}
+func (m *memStore) ListWorkspacesByTenant(_ context.Context, _ string) ([]*domain.Workspace, error) {
+	return []*domain.Workspace{}, nil
+}
 func (m *memStore) CreateHierarchy(_ context.Context, _ *domain.EntityHierarchy) error { return nil }
 func (m *memStore) EndDateHierarchy(_ context.Context, _ string, _ time.Time, _, _ string) error {
 	return nil
@@ -185,6 +201,7 @@ type noopPublisher struct{}
 func (noopPublisher) PublishTenantCreated(_ context.Context, _ *domain.Tenant, _ string)      {}
 func (noopPublisher) PublishEntityCreated(_ context.Context, _ *domain.LegalEntity, _ string) {}
 func (noopPublisher) PublishEntityUpdated(_ context.Context, _ *domain.LegalEntity, _ string) {}
+func (noopPublisher) PublishWorkspaceCreated(_ context.Context, _ *domain.Workspace, _ string) {}
 func (noopPublisher) PublishEntityStatusChanged(_ context.Context, _, _ string, _, _ domain.EntityStatus, _ string) {
 }
 func (noopPublisher) PublishEntityHierarchyChanged(_ context.Context, _ *domain.EntityHierarchy, _ string, _ string) {

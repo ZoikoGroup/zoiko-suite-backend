@@ -57,6 +57,16 @@ type Store interface {
 	// legalEntityID), most-specific-scope first. See the method's own
 	// doc comment on PgStore for the precedence rule.
 	FindApplicableVersions(ctx context.Context, policyType string, tenantID, legalEntityID *string) ([]*domain.ApplicablePolicyVersion, error)
+
+	// ── Chunk 10: control tests & attestations (doc7 §E3, §E6, §I3) ─────────
+	CreateControlTestDefinition(ctx context.Context, params domain.CreateControlTestDefinitionParams) (*domain.ControlTestDefinition, bool, error)
+	FindControlTestDefinitionByID(ctx context.Context, id string) (*domain.ControlTestDefinition, error)
+	CreateControlTestExecution(ctx context.Context, params domain.CreateControlTestExecutionParams) (*domain.ControlTestExecution, error)
+	ListControlTestExecutions(ctx context.Context, controlTestDefinitionID string) ([]*domain.ControlTestExecution, error)
+	ResolveControlEffectiveness(ctx context.Context, controlRef string) (*domain.ControlEffectiveness, error)
+	CreateAttestation(ctx context.Context, params domain.CreateAttestationParams) (*domain.Attestation, error)
+	FindAttestationByID(ctx context.Context, id string) (*domain.Attestation, error)
+	RevokeAttestation(ctx context.Context, attestationID, reason string) (*domain.Attestation, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.

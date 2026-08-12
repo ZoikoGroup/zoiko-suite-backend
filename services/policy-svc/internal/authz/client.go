@@ -44,6 +44,11 @@ const (
 	ActionPolicyCreate          = "POLICY_CREATE"
 	ActionPolicyVersionCreate   = "POLICY_VERSION_CREATE"
 	ActionPolicyVersionActivate = "POLICY_VERSION_ACTIVATE"
+
+	ActionControlTestDefinitionCreate = "CONTROL_TEST_DEFINITION_CREATE"
+	ActionControlTestExecutionRecord  = "CONTROL_TEST_EXECUTION_RECORD"
+	ActionAttestationCreate           = "ATTESTATION_CREATE"
+	ActionAttestationRevoke           = "ATTESTATION_REVOKE"
 )
 
 // HTTPClient implements Client against a real authorization-svc instance.

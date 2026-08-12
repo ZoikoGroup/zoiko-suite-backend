@@ -38,6 +38,14 @@ type stubStore struct {
 	filingErr     error
 	filingList    []*domain.FilingRequirement
 	filingListErr error
+
+	// Chunk 10: applicability decisions.
+	applicabilityDecision   *domain.ApplicabilityDecision
+	applicabilityCreateErr  error
+	applicabilityList       []*domain.ApplicabilityDecision
+	applicabilityListErr    error
+	currentApplicability    *domain.CurrentApplicability
+	currentApplicabilityErr error
 }
 
 func (s *stubStore) CreateObligation(_ context.Context, _ domain.CreateObligationParams) (*domain.Obligation, bool, error) {
@@ -62,6 +70,20 @@ func (s *stubStore) CreateFilingRequirement(_ context.Context, _ domain.CreateFi
 
 func (s *stubStore) ListFilingRequirements(_ context.Context, _ string) ([]*domain.FilingRequirement, error) {
 	return s.filingList, s.filingListErr
+}
+
+// ── Chunk 10: applicability decisions ───────────────────────────────────────
+
+func (s *stubStore) CreateApplicabilityDecision(_ context.Context, _ domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, error) {
+	return s.applicabilityDecision, s.applicabilityCreateErr
+}
+
+func (s *stubStore) ListApplicabilityDecisions(_ context.Context, _, _, _ string) ([]*domain.ApplicabilityDecision, error) {
+	return s.applicabilityList, s.applicabilityListErr
+}
+
+func (s *stubStore) FindCurrentApplicability(_ context.Context, _, _, _ string) (*domain.CurrentApplicability, error) {
+	return s.currentApplicability, s.currentApplicabilityErr
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -115,6 +137,17 @@ func newTestRouterFull(s *stubStore, p *stubPublisher, v *stubValidator) chi.Rou
 	r := chi.NewRouter()
 	h := handler.New(s, p, v, zap.NewNop())
 	handler.RegisterRoutes(r, h)
+	return r
+}
+
+// newApplicabilityTestRouter wires a router with applicability-decision
+// routes included — the base newTestRouter* helpers above only register
+// handler.RegisterRoutes.
+func newApplicabilityTestRouter(s *stubStore) chi.Router {
+	r := chi.NewRouter()
+	h := handler.New(s, &stubPublisher{}, &stubValidator{}, zap.NewNop())
+	handler.RegisterRoutes(r, h)
+	handler.RegisterApplicabilityRoutes(r, h)
 	return r
 }
 
