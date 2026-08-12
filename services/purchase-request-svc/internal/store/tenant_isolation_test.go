@@ -151,11 +151,21 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
 	return f
 }
 
-// TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent proves the
+// TestPgStore_CreateRequest_RetriedCorrelationID_CreatesExactlyOneRow proves the
 // idempotency guarantee against a REAL Postgres unique index — this is the
 // exact scenario a network-timeout-triggered client retry produces, and it
 // must resolve to the original request, never a duplicate.
-func TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+//
+// The sibling assertion lives in pg_store_test.go as
+// TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent, which checks
+// that the replay's body does not overwrite the stored request. This one is
+// kept separate because only it counts the rows, and because the two run under
+// different harnesses: pg_store_test.go against TEST_DATABASE_URL, this file
+// against the embedded Postgres stood up by TestMain under the `integration`
+// tag. Do NOT give them the same name — untagged files compile in the tagged
+// build too, so a shared name is a redeclaration that breaks `go test
+// -tags=integration ./internal/store/`.
+func TestPgStore_CreateRequest_RetriedCorrelationID_CreatesExactlyOneRow(t *testing.T) {
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 

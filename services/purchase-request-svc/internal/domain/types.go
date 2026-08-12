@@ -81,6 +81,14 @@ var (
 	ErrInvalidTransition = errorString("invalid purchase request status transition")
 	ErrStoreUnavailable  = errorString("purchase request store unavailable")
 
+	// ErrInvalidIdentifier is a non-UUID value compared against a uuid column.
+	// It dies inside the pg driver as SQLSTATE 22P02 before any row is
+	// examined, and without this it reached the caller as a generic store
+	// failure — a 503 store_unavailable, i.e. a typo wearing an outage's
+	// clothes. A malformed id cannot name an existing request, so callers
+	// treat this as absent rather than as the database being down.
+	ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
+
 	ErrAuthorizationDenied             = errorString("authorization denied for this purchase request action")
 	ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
 

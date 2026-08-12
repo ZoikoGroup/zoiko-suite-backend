@@ -2,9 +2,12 @@ package store_test
 
 import (
 	"context"
+	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,12 +23,21 @@ import (
 // openTestPool connects to a real Postgres and reapplies the migration from
 // a clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set — same
 // convention as every other service in this platform.
+//
+// WARNING, and the reason for requireThrowawayDatabase below: this DROPs
+// vendor_invoices. Point TEST_DATABASE_URL at the `accounts_payable` database
+// that a running accounts-payable-svc uses and it will silently delete that
+// register — which is exactly what happened once during this service's console
+// work, wiping a seeded demo set mid-session. The loss looks like a service bug
+// afterwards, not like a test, so the database name is checked before anything
+// is dropped.
 func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
+	requireThrowawayDatabase(t, dsn)
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -56,6 +68,31 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// requireThrowawayDatabase fails the test unless the DSN's database name marks
+// it as disposable. Two names are legitimate: CI points TEST_DATABASE_URL at
+// `testdb`, and the local convention is `accounts_payable_test`. Both contain
+// "test"; the live `accounts_payable` database does not, which is the case this
+// guard exists to catch.
+//
+// The name is taken from the parsed DSN rather than matched against the whole
+// string, so a host or password that happens to contain "test" cannot vouch for
+// a live database. Anything that does not parse as a URL is refused rather than
+// waved through — the suite DROPs tables, so an unreadable target is not a
+// target worth guessing at.
+func requireThrowawayDatabase(t *testing.T, dsn string) {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("refusing to run: TEST_DATABASE_URL is not a parseable URL: %v", err)
+	}
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if !strings.Contains(strings.ToLower(dbName), "test") {
+		t.Fatalf("refusing to run: TEST_DATABASE_URL names database %q, which is not recognisably "+
+			"disposable, and this suite DROPs vendor_invoices. Use accounts_payable_test (or CI's "+
+			"testdb), not accounts_payable.", dbName)
+	}
+}
+
 func newTestInvoice(tenantID string) *domain.VendorInvoice {
 	return &domain.VendorInvoice{
 		InvoiceID:            uuid.New().String(),
@@ -70,6 +107,170 @@ func newTestInvoice(tenantID string) *domain.VendorInvoice {
 		CreatedByPrincipalID: "test-admin",
 		CorrelationID:        "corr-" + uuid.New().String(),
 	}
+}
+
+// The (tenant_id, vendor_id, invoice_number) UNIQUE constraint has existed since
+// 000001, but nothing recognised its violation: SQLSTATE 23505 fell through to
+// the generic branch and the API answered 503 `store_unavailable`. Booking the
+// same vendor invoice twice is a caller mistake, not an outage.
+//
+// This is the test the fix hangs on — the mapping is by constraint NAME, so a
+// renamed constraint in a future migration silently restores the old behaviour
+// unless this fails.
+func TestPgStore_CreateInvoice_DuplicateInvoiceNumber_IsDistinguishable(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	first := newTestInvoice(tenantID)
+	if _, err := s.CreateInvoice(ctx, first); err != nil {
+		t.Fatalf("first CreateInvoice failed: %v", err)
+	}
+
+	// Same vendor and number, but a fresh correlation_id — so this is a genuine
+	// second submission, not the idempotent replay of the first.
+	second := newTestInvoice(tenantID)
+	second.VendorID = first.VendorID
+	second.InvoiceNumber = first.InvoiceNumber
+
+	_, err := s.CreateInvoice(ctx, second)
+	if err == nil {
+		t.Fatal("expected a duplicate (vendor, invoice_number) to be refused")
+	}
+	if !errors.Is(err, domain.ErrDuplicateInvoiceNumber) {
+		t.Fatalf("expected ErrDuplicateInvoiceNumber, got %v", err)
+	}
+}
+
+// A different vendor may reuse a number: the constraint is per (tenant, vendor),
+// and two vendors numbering their invoices "INV-001" is ordinary.
+func TestPgStore_CreateInvoice_SameNumberDifferentVendor_Allowed(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	first := newTestInvoice(tenantID)
+	if _, err := s.CreateInvoice(ctx, first); err != nil {
+		t.Fatalf("first CreateInvoice failed: %v", err)
+	}
+
+	second := newTestInvoice(tenantID)
+	second.VendorID = "a-different-vendor"
+	second.InvoiceNumber = first.InvoiceNumber
+
+	created, err := s.CreateInvoice(ctx, second)
+	if err != nil {
+		t.Fatalf("a different vendor must be allowed to reuse a number: %v", err)
+	}
+	if !created {
+		t.Fatal("expected a real insert, not a replay")
+	}
+}
+
+// A malformed id cannot name a row, so it is absent. It used to die inside the
+// pgx driver as SQLSTATE 22P02 and surface as 503 — a typo in a URL reading as an
+// outage.
+func TestPgStore_GetInvoice_MalformedUUID_ReadsAsAbsent(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	ctx := svcmiddleware.WithTenant(context.Background(), uuid.New().String())
+
+	got, err := s.GetInvoice(ctx, "not-a-uuid")
+	if err != nil {
+		t.Fatalf("a malformed id must not be an error, got %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil invoice, got %+v", got)
+	}
+}
+
+// Same for a transition: not found, not unavailable. Kept apart from
+// invalid_transition, since "no such invoice" and "wrong state" differ.
+func TestPgStore_TransitionInvoice_MalformedUUID_IsNotFound(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	err := s.TransitionInvoice(ctx, tenantID, "not-a-uuid",
+		domain.InvoiceStatusReceived, domain.InvoiceStatusValidated, "principal-1")
+
+	if !errors.Is(err, domain.ErrInvoiceNotFound) {
+		t.Fatalf("expected ErrInvoiceNotFound, got %v", err)
+	}
+}
+
+// The scan targets and the column list are derived from one slice, and a read of
+// every column is what proves they are still in step. This is the policy-svc
+// defect shape: there, one query had drifted to 10 of 12 columns, the two it
+// dropped stayed nil and serialised as null, and every test still passed.
+func TestPgStore_ReadShape_EveryColumnIsPopulated(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	inv := newTestInvoice(tenantID)
+	if _, err := s.CreateInvoice(ctx, inv); err != nil {
+		t.Fatalf("CreateInvoice failed: %v", err)
+	}
+	// Walk the whole lifecycle so the three actor and three timestamp columns are
+	// all non-null by the end — a dropped column reads as nil, which is exactly
+	// what an un-reached stage also looks like.
+	for _, hop := range []struct{ from, to domain.InvoiceStatus }{
+		{domain.InvoiceStatusReceived, domain.InvoiceStatusValidated},
+		{domain.InvoiceStatusValidated, domain.InvoiceStatusApproved},
+		{domain.InvoiceStatusApproved, domain.InvoiceStatusPaymentRequested},
+	} {
+		if err := s.TransitionInvoice(ctx, tenantID, inv.InvoiceID, hop.from, hop.to, "principal-"+string(hop.to)); err != nil {
+			t.Fatalf("transition %s -> %s failed: %v", hop.from, hop.to, err)
+		}
+	}
+
+	assertFullyPopulated := func(t *testing.T, label string, got *domain.VendorInvoice) {
+		t.Helper()
+		if got.InvoiceID == "" || got.TenantID == "" || got.LegalEntityID == "" {
+			t.Fatalf("%s: identity columns not populated: %+v", label, got)
+		}
+		if got.VendorID == "" || got.InvoiceNumber == "" || got.CurrencyCode == "" {
+			t.Fatalf("%s: descriptive columns not populated: %+v", label, got)
+		}
+		if got.Amount == 0 || got.DueDate.IsZero() || got.CreatedAt.IsZero() {
+			t.Fatalf("%s: amount/date columns not populated: %+v", label, got)
+		}
+		if got.CorrelationID == "" || got.CreatedByPrincipalID == "" {
+			t.Fatalf("%s: provenance columns not populated: %+v", label, got)
+		}
+		if got.ValidatedByPrincipalID == nil || got.ApprovedByPrincipalID == nil || got.PaymentRequestedByPrincipalID == nil {
+			t.Fatalf("%s: actor columns not populated after a full lifecycle: %+v", label, got)
+		}
+		if got.ValidatedAt == nil || got.ApprovedAt == nil || got.PaymentRequestedAt == nil {
+			t.Fatalf("%s: transition timestamps not populated after a full lifecycle: %+v", label, got)
+		}
+	}
+
+	// Both read paths, because they are separate SELECTs that must agree.
+	got, err := s.GetInvoice(ctx, inv.InvoiceID)
+	if err != nil || got == nil {
+		t.Fatalf("GetInvoice failed: %v", err)
+	}
+	assertFullyPopulated(t, "GetInvoice", got)
+
+	list, err := s.ListInvoices(ctx, domain.ListInvoicesFilter{TenantID: tenantID})
+	if err != nil {
+		t.Fatalf("ListInvoices failed: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("expected 1 invoice, got %d", len(list))
+	}
+	assertFullyPopulated(t, "ListInvoices", &list[0])
 }
 
 func TestPgStore_CreateInvoice_And_GetInvoice(t *testing.T) {
