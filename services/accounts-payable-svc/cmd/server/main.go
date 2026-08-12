@@ -116,15 +116,39 @@ func main() {
 	// metadata request, so every write to a not-yet-existing topic fails
 	// with "Unknown Topic Or Partition" regardless of the broker-side
 	// setting.
-	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
+	//
+	// An explicitly empty KAFKA_BROKERS selects the log-only publisher instead.
+	// config.validate permits that for ENV=local and refuses it everywhere else,
+	// so a production deployment cannot reach this branch and silently stop
+	// publishing.
+	var publisher handler.Publisher
+	if len(cfg.Kafka.Brokers) == 0 {
+		publisher = events.NewLogOnlyPublisher(log)
+	} else {
+		kafkaWriter := &kafka.Writer{
+			Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:                  cfg.Kafka.Topic,
+			Balancer:               &kafka.LeastBytes{},
+			AllowAutoTopicCreation: true,
+			// Without this, every write to this service costs an extra second.
+			//
+			// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+			// WriteMessages of a single message waits for the batch to fill (100
+			// messages) or for that timer to expire, whichever comes first. These
+			// events are emitted one per state transition, so the batch never
+			// fills and the timer always wins — and because publishing happens on
+			// the request path, the caller pays for it. Measured: 2.0s per
+			// create, of which ~1s was this timer (the other ~1s is
+			// authorization-svc's /v1/authorize, which is not ours to fix here).
+			//
+			// The events stay ordered and still publish synchronously; only the
+			// artificial wait goes away. Async: true would also remove it, but it
+			// makes publish failures invisible to the request that caused them.
+			BatchTimeout: 10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+		publisher = events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	}
-	defer func() { _ = kafkaWriter.Close() }()
-
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

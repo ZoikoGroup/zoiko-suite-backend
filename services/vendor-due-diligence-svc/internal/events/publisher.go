@@ -51,7 +51,15 @@ func (p *Publisher) PublishCompleted(ctx context.Context, correlationID string, 
 		"vendor_name":     check.VendorName,
 		"risk_outcome":    check.RiskOutcome,
 		"screening_basis": check.ScreeningBasis,
-		"completed_at":    check.CompletedAt,
+		// On the event as well as on the API response, and for the same reason. A
+		// consumer of this event sees risk_outcome CLEAR and would otherwise have no
+		// way to know it came from a hardcoded two-name denylist rather than a
+		// sanctions feed. Leaving it off the wire here while putting it on the read
+		// API would fix the defect for whoever looks at the console and leave it in
+		// place for every automated consumer — which is the more dangerous half.
+		// screening_basis is prose and not a contract; this is.
+		"screening_source": check.ScreeningSource,
+		"completed_at":     check.CompletedAt,
 	})
 }
 

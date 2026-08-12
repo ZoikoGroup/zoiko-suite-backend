@@ -141,18 +141,35 @@ func main() {
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
 
-	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
-		// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
-		// Writer refuses to produce to a topic it doesn't already know about
-		// unless this is also set client-side — without it, every publish to
-		// a not-yet-existing topic fails with "Unknown Topic Or Partition"
-		// even though the broker would have created it.
-		AllowAutoTopicCreation: true,
+	// An explicitly empty KAFKA_BROKERS selects the publisher's existing dry mode
+	// (a nil producer logs instead of publishing). config.validate permits that
+	// for ENV=local and refuses it everywhere else, so a production deployment
+	// cannot reach it and silently stop publishing breach events.
+	var kafkaWriter *kafka.Writer
+	if len(cfg.Kafka.Brokers) > 0 {
+		kafkaWriter = &kafka.Writer{
+			Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:    cfg.Kafka.Topic,
+			Balancer: &kafka.LeastBytes{},
+			// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
+			// Writer refuses to produce to a topic it doesn't already know about
+			// unless this is also set client-side — without it, every publish to
+			// a not-yet-existing topic fails with "Unknown Topic Or Partition"
+			// even though the broker would have created it.
+			AllowAutoTopicCreation: true,
+			// Without this, every blocked spend check costs an extra second.
+			// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+			// write of a single message waits for the batch to fill (100 messages)
+			// or for that timer, whichever comes first. These events fire one per
+			// breach, so the batch never fills and the timer always wins — and
+			// publishing happens on the request path, so the caller pays for it.
+			BatchTimeout: 10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+	} else {
+		log.Warn("no Kafka brokers configured — breach events will be logged, not published",
+			zap.String("consequence", "spend.threshold.breached and spend.block.applied reach no consumer"))
 	}
-	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log}
