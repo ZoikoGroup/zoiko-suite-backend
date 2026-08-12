@@ -209,6 +209,14 @@ var (
 	ErrEvaluationNotFound  = errorString("evidence evaluation not found")
 	ErrStoreUnavailable    = errorString("evidence requirements store unavailable")
 
+	// ErrInvalidIdentifier is a non-UUID value compared against a uuid column.
+	// It dies inside the pg driver as SQLSTATE 22P02 before any row is
+	// examined, and without this it reached the caller as a generic store
+	// failure — a 503 store_unavailable, i.e. a typo wearing an outage's
+	// clothes. A malformed id cannot name an existing row, so callers treat
+	// this as absent rather than as the database being down.
+	ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
+
 	// ErrAlreadyRetired is returned when end-dating a requirement that
 	// already carries an effective_to. Surfaced as 422, never a silent
 	// no-op — invoice-approval-svc's non-atomic read-then-write is the
