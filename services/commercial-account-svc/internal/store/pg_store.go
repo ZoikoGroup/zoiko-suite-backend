@@ -57,6 +57,11 @@ type Store interface {
 	CreateChangeRequest(ctx context.Context, c *domain.SubscriptionChangeRequest) error
 	GetChangeRequest(ctx context.Context, changeRequestID string) (*domain.SubscriptionChangeRequest, error)
 	ApplyChangeRequest(ctx context.Context, changeRequestID string) (*domain.CommercialSubscription, error)
+
+	// ── Chunk 8: Zoiko One Billing & Double-Charge Prevention ───────────────
+	TransitionSubscriptionStatus(ctx context.Context, subscriptionID string, newStatus domain.SubscriptionStatus, allowedPriors []domain.SubscriptionStatus, reason *string, principalID string) error
+	CreateBillingSourceTransfer(ctx context.Context, transfer *domain.BillingSourceTransfer, newSub *domain.CommercialSubscription) error
+	ListStatusEventsBySubscription(ctx context.Context, subscriptionID string) ([]domain.SubscriptionStatusEvent, error)
 }
 
 type PgStore struct {

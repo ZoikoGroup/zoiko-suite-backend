@@ -20,6 +20,8 @@ type subscriptionStubData struct {
 	overlays      map[string][]domain.ContractEntitlementOverlay // keyed by commercial_account_id
 	usageEvents   map[string]*domain.UsageMeterEvent
 	changeReqs    map[string]*domain.SubscriptionChangeRequest
+	statusEvents  map[string][]domain.SubscriptionStatusEvent // keyed by subscription_id
+	transfers     map[string]*domain.BillingSourceTransfer
 }
 
 func newSubscriptionStubData() *subscriptionStubData {
@@ -32,6 +34,8 @@ func newSubscriptionStubData() *subscriptionStubData {
 		overlays:      make(map[string][]domain.ContractEntitlementOverlay),
 		usageEvents:   make(map[string]*domain.UsageMeterEvent),
 		changeReqs:    make(map[string]*domain.SubscriptionChangeRequest),
+		statusEvents:  make(map[string][]domain.SubscriptionStatusEvent),
+		transfers:     make(map[string]*domain.BillingSourceTransfer),
 	}
 }
 
@@ -202,4 +206,74 @@ func (s *stubStore) ApplyChangeRequest(_ context.Context, changeRequestID string
 	c.Status = "APPLIED"
 	c.AppliedAt = &now
 	return sub, nil
+}
+
+func (s *stubStore) TransitionSubscriptionStatus(_ context.Context, subscriptionID string, newStatus domain.SubscriptionStatus, allowedPriors []domain.SubscriptionStatus, reason *string, principalID string) error {
+	sub, ok := s.sub.subscriptions[subscriptionID]
+	if !ok {
+		return domain.ErrSubscriptionNotFound
+	}
+	if sub.Status == newStatus {
+		return nil
+	}
+	allowed := false
+	for _, p := range allowedPriors {
+		if sub.Status == p {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return domain.ErrInvalidStatusTransition
+	}
+	previous := sub.Status
+	sub.Status = newStatus
+	sub.UpdatedAt = time.Now().UTC()
+	s.sub.statusEvents[subscriptionID] = append(s.sub.statusEvents[subscriptionID], domain.SubscriptionStatusEvent{
+		StatusEventID:        uuidNewStringForTest(),
+		SubscriptionID:       subscriptionID,
+		PreviousStatus:       string(previous),
+		NewStatus:            string(newStatus),
+		Reason:               reason,
+		CreatedAt:            time.Now().UTC(),
+		CreatedByPrincipalID: principalID,
+	})
+	return nil
+}
+
+func (s *stubStore) ListStatusEventsBySubscription(_ context.Context, subscriptionID string) ([]domain.SubscriptionStatusEvent, error) {
+	return s.sub.statusEvents[subscriptionID], nil
+}
+
+func (s *stubStore) CreateBillingSourceTransfer(_ context.Context, transfer *domain.BillingSourceTransfer, newSub *domain.CommercialSubscription) error {
+	if transfer.OldSubscriptionID != nil {
+		old, ok := s.sub.subscriptions[*transfer.OldSubscriptionID]
+		if !ok {
+			return domain.ErrSubscriptionNotFound
+		}
+		if old.Status == domain.SubscriptionStatusCanceled || old.Status == domain.SubscriptionStatusTerminated {
+			return domain.ErrSubscriptionNotFound
+		}
+		old.Status = domain.SubscriptionStatusCanceled
+		now := time.Now().UTC()
+		old.CanceledAt = &now
+		old.UpdatedAt = now
+	}
+	if newSub != nil {
+		for _, existing := range s.sub.subscriptions {
+			if existing.CommercialAccountID == newSub.CommercialAccountID &&
+				existing.SubscriptionID != newSub.SubscriptionID &&
+				existing.Status != domain.SubscriptionStatusCanceled &&
+				existing.Status != domain.SubscriptionStatusTerminated {
+				return domain.ErrActiveSubscriptionExists
+			}
+		}
+		s.sub.subscriptions[newSub.SubscriptionID] = newSub
+	}
+	s.sub.transfers[transfer.TransferID] = transfer
+	return nil
+}
+
+func uuidNewStringForTest() string {
+	return time.Now().UTC().Format("20060102T150405.000000000")
 }

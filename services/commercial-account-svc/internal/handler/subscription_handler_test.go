@@ -221,3 +221,163 @@ func TestSubscriptionChange_PreviewThenConfirm_SecondConfirmFails(t *testing.T) 
 		t.Fatalf("expected 409 on second confirm, got %d", wConfirmAgain.Code)
 	}
 }
+
+// TestDunning_EscalatesThenRecoversIdempotently exercises the doc7 §O1-O3
+// state machine end to end: ACTIVE -> PAST_DUE -> RESTRICTED -> SUSPENDED as
+// dunning escalates, then a recovery straight back to ACTIVE, and finally a
+// repeat of that same recovery call proving it's an idempotent no-op rather
+// than an error.
+func TestDunning_EscalatesThenRecoversIdempotently(t *testing.T) {
+	h := newTestHandler()
+	r := newSubscriptionTestRouter(h)
+
+	_, planID := createTestCatalogAndPlan(t, r, "org-dun-1")
+	wSub := httptest.NewRecorder()
+	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: "ca-dun-1",
+		PlanID:              planID,
+	}))
+	var sub domain.CommercialSubscription
+	_ = json.NewDecoder(wSub.Body).Decode(&sub)
+	if sub.Status != domain.SubscriptionStatusActive {
+		t.Fatalf("expected new subscription to start ACTIVE, got %s", sub.Status)
+	}
+
+	setStatus := func(newStatus string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/subscriptions/"+sub.SubscriptionID+"/status", domain.SetSubscriptionStatusRequest{
+			NewStatus: newStatus,
+			Reason:    "test escalation",
+		}))
+		return w
+	}
+
+	for _, step := range []string{"PAST_DUE", "RESTRICTED", "SUSPENDED"} {
+		w := setStatus(step)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 transitioning to %s, got %d — %s", step, w.Code, w.Body.String())
+		}
+	}
+
+	wRecover := setStatus("ACTIVE")
+	if wRecover.Code != http.StatusOK {
+		t.Fatalf("expected 200 recovering to ACTIVE, got %d — %s", wRecover.Code, wRecover.Body.String())
+	}
+
+	// Idempotent repeat: already ACTIVE, must succeed without error.
+	wRecoverAgain := setStatus("ACTIVE")
+	if wRecoverAgain.Code != http.StatusOK {
+		t.Fatalf("expected 200 on idempotent repeat recovery, got %d — %s", wRecoverAgain.Code, wRecoverAgain.Body.String())
+	}
+
+	wEvents := httptest.NewRecorder()
+	r.ServeHTTP(wEvents, buildRequest(http.MethodGet, "/v1/subscriptions/"+sub.SubscriptionID+"/status-events", nil))
+	if wEvents.Code != http.StatusOK {
+		t.Fatalf("expected 200 listing status events, got %d — %s", wEvents.Code, wEvents.Body.String())
+	}
+	var eventsResp struct {
+		StatusEvents []domain.SubscriptionStatusEvent `json:"status_events"`
+	}
+	_ = json.NewDecoder(wEvents.Body).Decode(&eventsResp)
+	// 4 real transitions logged (ACTIVE->PAST_DUE->RESTRICTED->SUSPENDED->ACTIVE);
+	// the idempotent repeat must NOT add a 5th event.
+	if len(eventsResp.StatusEvents) != 4 {
+		t.Fatalf("expected exactly 4 logged status events, got %d", len(eventsResp.StatusEvents))
+	}
+}
+
+// TestDunning_RejectsInvalidTransition proves the state machine is
+// fail-closed: a terminal CANCELED subscription can never be reactivated
+// straight to ACTIVE.
+func TestDunning_RejectsInvalidTransition(t *testing.T) {
+	h := newTestHandler()
+	r := newSubscriptionTestRouter(h)
+
+	_, planID := createTestCatalogAndPlan(t, r, "org-dun-2")
+	wSub := httptest.NewRecorder()
+	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: "ca-dun-2",
+		PlanID:              planID,
+	}))
+	var sub domain.CommercialSubscription
+	_ = json.NewDecoder(wSub.Body).Decode(&sub)
+
+	wCancel := httptest.NewRecorder()
+	r.ServeHTTP(wCancel, buildRequest(http.MethodPost, "/v1/subscriptions/"+sub.SubscriptionID+"/status", domain.SetSubscriptionStatusRequest{
+		NewStatus: "CANCELED",
+	}))
+	if wCancel.Code != http.StatusOK {
+		t.Fatalf("expected 200 canceling, got %d — %s", wCancel.Code, wCancel.Body.String())
+	}
+
+	wReactivate := httptest.NewRecorder()
+	r.ServeHTTP(wReactivate, buildRequest(http.MethodPost, "/v1/subscriptions/"+sub.SubscriptionID+"/status", domain.SetSubscriptionStatusRequest{
+		NewStatus: "ACTIVE",
+	}))
+	if wReactivate.Code != http.StatusConflict {
+		t.Fatalf("expected 409 rejecting CANCELED->ACTIVE, got %d — %s", wReactivate.Code, wReactivate.Body.String())
+	}
+}
+
+// TestBillingSourceTransfer_CancelsOldAndPreventsDoubleBilling verifies doc7
+// §P3: transferring an account from DIRECT to ZOIKO_ONE_BUNDLE cancels the
+// old subscription and creates a new one in the same atomic operation, and
+// the account never ends up with two simultaneously non-terminal
+// subscriptions.
+func TestBillingSourceTransfer_CancelsOldAndPreventsDoubleBilling(t *testing.T) {
+	h := newTestHandler()
+	r := newSubscriptionTestRouter(h)
+
+	_, planID := createTestCatalogAndPlan(t, r, "org-transfer-1")
+	wSub := httptest.NewRecorder()
+	r.ServeHTTP(wSub, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: "ca-transfer-1",
+		PlanID:              planID,
+		BillingSource:       "DIRECT",
+	}))
+	var oldSub domain.CommercialSubscription
+	_ = json.NewDecoder(wSub.Body).Decode(&oldSub)
+
+	wTransfer := httptest.NewRecorder()
+	r.ServeHTTP(wTransfer, buildRequest(http.MethodPost, "/v1/billing-source-transfers", domain.TransferBillingSourceRequest{
+		CommercialAccountID: "ca-transfer-1",
+		OldSubscriptionID:   oldSub.SubscriptionID,
+		NewBillingSource:    "ZOIKO_ONE_BUNDLE",
+	}))
+	if wTransfer.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on transfer, got %d — %s", wTransfer.Code, wTransfer.Body.String())
+	}
+	var transfer domain.BillingSourceTransfer
+	_ = json.NewDecoder(wTransfer.Body).Decode(&transfer)
+	if transfer.NewSubscriptionID == nil {
+		t.Fatalf("expected transfer to record a new_subscription_id")
+	}
+
+	wOld := httptest.NewRecorder()
+	r.ServeHTTP(wOld, buildRequest(http.MethodGet, "/v1/subscriptions/"+oldSub.SubscriptionID, nil))
+	var oldAfter domain.CommercialSubscription
+	_ = json.NewDecoder(wOld.Body).Decode(&oldAfter)
+	if oldAfter.Status != domain.SubscriptionStatusCanceled {
+		t.Fatalf("expected old subscription CANCELED after transfer, got %s", oldAfter.Status)
+	}
+
+	wNew := httptest.NewRecorder()
+	r.ServeHTTP(wNew, buildRequest(http.MethodGet, "/v1/subscriptions/"+*transfer.NewSubscriptionID, nil))
+	var newSub domain.CommercialSubscription
+	_ = json.NewDecoder(wNew.Body).Decode(&newSub)
+	if newSub.BillingSource != domain.BillingSourceZoikoOneBundle || newSub.Status != domain.SubscriptionStatusActive {
+		t.Fatalf("expected new subscription ACTIVE on ZOIKO_ONE_BUNDLE, got %+v", newSub)
+	}
+
+	// A second attempt to create yet another active subscription on the same
+	// account (without going through a transfer that cancels one first) must
+	// be blocked by the existing double-billing constraint.
+	wDup := httptest.NewRecorder()
+	r.ServeHTTP(wDup, buildRequest(http.MethodPost, "/v1/subscriptions", domain.CreateSubscriptionRequest{
+		CommercialAccountID: "ca-transfer-1",
+		PlanID:              planID,
+	}))
+	if wDup.Code != http.StatusConflict {
+		t.Fatalf("expected 409 preventing a second concurrent subscription, got %d — %s", wDup.Code, wDup.Body.String())
+	}
+}

@@ -76,14 +76,28 @@ those remain the caller's own separate checks.
 | 17 | `release_registry` — GA / BETA / PILOT / INTERNAL / DISABLED / INCIDENT_RESTRICTED state | §C | Done | `releases`, append-only (history never overwritten, per §32.1 kill-switch doctrine); live-verified INCIDENT_RESTRICTED overriding an already-GA market release |
 | 18 | Capability-resolution endpoint returning structured reason codes (enabled / unavailable / requires-upgrade / market-blocked / provider-unavailable / incident-restricted) | §C1 | Done | `GET /v1/capability-resolution/{code}`; live-verified all 4 reason-code paths (ENABLED, MARKET_BLOCKED, INCIDENT_RESTRICTED, PROVIDER_UNAVAILABLE) plus CAPABILITY_UNKNOWN |
 
-## Chunk 8 — Zoiko One Billing & Double-Charge Prevention (net-new, Plane 1)
+## Chunk 8 — Zoiko One Billing & Double-Charge Prevention (extends commercial-account-svc, Plane 1) — ✅ Done 2026-08-12
+
+Resolution: extends commercial-account-svc rather than a new service —
+dunning/transfers are tightly coupled to `commercial_subscriptions`, a
+sibling concept of what the service already owns, not a cross-cutting new
+bounded context. `billing_source` reuses tenant-entity-registry-svc's exact
+vocabulary (DIRECT/ZOIKO_ONE_BUNDLE) rather than a second, competing enum.
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 19 | Double-charge prevention — period-overlap checks, transfer records, split-billing exceptions | §P3, P0-blocker #5 | Not Started | |
-| 20 | `transfer` record for standalone ↔ Zoiko One migration | §P3 | Not Started | |
-| 21 | Failed-payment/dunning state machine — PAST_DUE → RESTRICTED → SUSPENDED, idempotent restore-on-retry | §O1–O3 | Not Started | |
-| 22 | Merchant/tax/processor/invoice identity setup for ZoikoSuite's own billing | P0-blocker #6 | Not Started | |
+| 19 | Double-charge prevention — period-overlap checks, transfer records, split-billing exceptions | §P3, P0-blocker #5 | Done | Structural, not just application-level: the existing "one non-terminal subscription per commercial_account_id" partial unique index (migration 000002) is what actually makes double-billing impossible; live-verified a second concurrent `CreateSubscription` on the same account 409s even after a transfer |
+| 20 | `transfer` record for standalone ↔ Zoiko One migration | §P3 | Done | `billing_source_transfers` table + `POST /v1/billing-source-transfers`; atomically cancels the old subscription and creates the new one in one transaction, never a silent swap; live-verified DIRECT→ZOIKO_ONE_BUNDLE transfer leaves exactly one ACTIVE subscription |
+| 21 | Failed-payment/dunning state machine — PAST_DUE → RESTRICTED → SUSPENDED, idempotent restore-on-retry | §O1–O3 | Done | `ValidSubscriptionStatusTransitions` map + `subscription_status_events` append-only audit trail; `POST /v1/subscriptions/{id}/status`; live-verified full ACTIVE→PAST_DUE→RESTRICTED→SUSPENDED→ACTIVE escalation/recovery, a same-status idempotent repeat that logs no extra event, and a rejected ACTIVE→RESTRICTED direct jump (409) |
+| 22 | Merchant/tax/processor/invoice identity setup for ZoikoSuite's own billing | P0-blocker #6 | Blocked | Real business/legal setup (merchant-of-record agreement, tax registration, payment processor account) — not buildable as generic code per the "don't fabricate a signal with nothing real to populate it" doctrine; no code changes attempted |
+
+Bug caught during live verification: the running container was still serving
+the pre-Chunk-8 binary (missing `billing_source` from JSON responses) after
+only a container *restart* — restart reuses the existing image, it doesn't
+rebuild it. Fixed by `docker compose build commercial-account-svc` before
+restarting; noted here since it's the same class of stale-artifact trap as
+the pgx prepared-statement-cache issue from Chunk 6, but one layer further
+out (image vs. connection cache).
 
 ## Chunk 9 — AI Governance & Automation Policy (net-new, Plane 5)
 
@@ -138,3 +152,5 @@ those remain the caller's own separate checks.
 - 2026-08-11 — Initial backlog created from full §28 data-model audit against the running codebase.
 - 2026-08-12 — Chunk 5 (items 1–5) complete: new `commercial-account-svc` (commercial_accounts + memberships), `workspace` added to tenant-entity-registry-svc with mandatory billing_classification/billing_source. All 5 items build/vet/test clean and live-verified against real Postgres + authorization-svc.
 - 2026-08-12 — Chunk 6 (items 6–12) complete: price_catalogs/plans/entitlement_limits, commercial_subscriptions, evaluation_programs, contract_entitlement_overlays, commercial_usage_meter_events, subscription_change_requests — all added to commercial-account-svc. Two real bugs caught during live verification and fixed before commit: usage_event_id was declared UUID but is a caller-supplied idempotency key (not guaranteed UUID-shaped); catalog/plan-admin actions were calling authorization-svc with an empty scope, which it rejects (fixed to use the platform-scope convention already established elsewhere in this codebase). All 7 items build/vet/test clean and live-verified end-to-end.
+- 2026-08-12 — Chunk 7 (items 13–18) complete: new `capability-registry-svc` — capabilities, market_releases, integration_capabilities, releases (append-only), capability_claims, plus a capability-resolution endpoint checking all four in priority order. Built and live-verified cleanly on the first pass.
+- 2026-08-12 — Chunk 8 (items 19–21) complete, item 22 Blocked: extended commercial-account-svc with billing_source on commercial_subscriptions, billing_source_transfers, and subscription_status_events (append-only dunning audit trail) via migration 000003. New endpoints: `POST /v1/subscriptions/{id}/status` (dunning transitions, fail-closed via ValidSubscriptionStatusTransitions, idempotent same-status no-op), `GET /v1/subscriptions/{id}/status-events`, `POST /v1/billing-source-transfers` (atomic cancel-old/create-new). Double-billing prevention is structural (existing partial unique index), not just application logic. Live-verified the full ACTIVE→PAST_DUE→RESTRICTED→SUSPENDED→ACTIVE cycle, an idempotent repeat logging no extra event, a rejected invalid transition (409), and a DIRECT→ZOIKO_ONE_BUNDLE transfer. Caught a stale-image trap during verification: a container *restart* does not pick up new code, only a rebuild does — fixed by rebuilding the image before restarting.

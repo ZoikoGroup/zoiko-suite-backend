@@ -128,15 +128,19 @@ func (s *PgStore) ListEntitlementLimitsByPlan(ctx context.Context, planID string
 }
 
 func (s *PgStore) CreateSubscription(ctx context.Context, sub *domain.CommercialSubscription) error {
+	billingSource := sub.BillingSource
+	if billingSource == "" {
+		billingSource = domain.BillingSourceDirect
+	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO commercial_subscriptions (
 			subscription_id, commercial_account_id, plan_id, catalog_version_id, billing_interval,
 			status, renewal_date, canceled_at, processor_subscription_ref,
-			created_at, updated_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			created_at, updated_at, created_by_principal_id, billing_source
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 	`, sub.SubscriptionID, sub.CommercialAccountID, sub.PlanID, sub.CatalogVersionID, sub.BillingInterval,
 		string(sub.Status), sub.RenewalDate, sub.CanceledAt, sub.ProcessorSubscriptionRef,
-		sub.CreatedAt, sub.UpdatedAt, sub.CreatedByPrincipalID,
+		sub.CreatedAt, sub.UpdatedAt, sub.CreatedByPrincipalID, string(billingSource),
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -150,15 +154,16 @@ func (s *PgStore) CreateSubscription(ctx context.Context, sub *domain.Commercial
 func (s *PgStore) GetSubscription(ctx context.Context, subscriptionID string) (*domain.CommercialSubscription, error) {
 	var sub domain.CommercialSubscription
 	var status string
+	var billingSource string
 	err := s.pool.QueryRow(ctx, `
 		SELECT subscription_id, commercial_account_id, plan_id, catalog_version_id, billing_interval,
 		       status, renewal_date, canceled_at, processor_subscription_ref,
-		       created_at, updated_at, created_by_principal_id
+		       created_at, updated_at, created_by_principal_id, billing_source
 		FROM commercial_subscriptions WHERE subscription_id = $1
 	`, subscriptionID).Scan(
 		&sub.SubscriptionID, &sub.CommercialAccountID, &sub.PlanID, &sub.CatalogVersionID, &sub.BillingInterval,
 		&status, &sub.RenewalDate, &sub.CanceledAt, &sub.ProcessorSubscriptionRef,
-		&sub.CreatedAt, &sub.UpdatedAt, &sub.CreatedByPrincipalID,
+		&sub.CreatedAt, &sub.UpdatedAt, &sub.CreatedByPrincipalID, &billingSource,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrSubscriptionNotFound
@@ -167,7 +172,167 @@ func (s *PgStore) GetSubscription(ctx context.Context, subscriptionID string) (*
 		return nil, err
 	}
 	sub.Status = domain.SubscriptionStatus(status)
+	sub.BillingSource = domain.BillingSource(billingSource)
 	return &sub, nil
+}
+
+// TransitionSubscriptionStatus atomically moves a subscription to newStatus,
+// enforcing that its current status is one of allowedPriors (fail-closed —
+// doc7 §O2/§O3 dunning escalation/recovery is a state machine, not a free
+// field), and appends the transition to subscription_status_events in the
+// same transaction so the full PAST_DUE -> RESTORED history survives even
+// though the subscription row only ever shows current status. A same-status
+// "transition" (target == current) is treated as an idempotent no-op success
+// per §O3 ("does not re-run tenant workflows") rather than a rejected
+// transition.
+func (s *PgStore) TransitionSubscriptionStatus(ctx context.Context, subscriptionID string, newStatus domain.SubscriptionStatus, allowedPriors []domain.SubscriptionStatus, reason *string, principalID string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transition: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var currentStatus string
+	err = tx.QueryRow(ctx, `SELECT status FROM commercial_subscriptions WHERE subscription_id = $1`, subscriptionID).Scan(&currentStatus)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.ErrSubscriptionNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("lookup subscription status: %w", err)
+	}
+
+	if domain.SubscriptionStatus(currentStatus) == newStatus {
+		return tx.Commit(ctx)
+	}
+
+	allowed := false
+	for _, p := range allowedPriors {
+		if domain.SubscriptionStatus(currentStatus) == p {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return fmt.Errorf("%w: %s -> %s", domain.ErrInvalidStatusTransition, currentStatus, newStatus)
+	}
+
+	now := time.Now().UTC()
+	tag, err := tx.Exec(ctx, `
+		UPDATE commercial_subscriptions
+		SET status = $1, updated_at = $2
+		WHERE subscription_id = $3 AND status = $4
+	`, string(newStatus), now, subscriptionID, currentStatus)
+	if err != nil {
+		return fmt.Errorf("update subscription status: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: %s -> %s", domain.ErrInvalidStatusTransition, currentStatus, newStatus)
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO subscription_status_events (
+			status_event_id, subscription_id, previous_status, new_status, reason,
+			created_at, created_by_principal_id
+		) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
+	`, subscriptionID, currentStatus, string(newStatus), reason, now, principalID)
+	if err != nil {
+		return fmt.Errorf("insert status event: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+// CreateBillingSourceTransfer implements doc7 §P3's standalone <-> Zoiko One
+// migration: never a silent swap. In one transaction it optionally cancels
+// the old subscription, creates the new one, and records the transfer row —
+// the partial-unique-index constraint from migration 000002 (one non-terminal
+// subscription per commercial_account_id) structurally prevents the account
+// from ending up double-billed across both subscriptions.
+func (s *PgStore) CreateBillingSourceTransfer(ctx context.Context, transfer *domain.BillingSourceTransfer, newSub *domain.CommercialSubscription) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transfer: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if transfer.OldSubscriptionID != nil {
+		now := time.Now().UTC()
+		tag, err := tx.Exec(ctx, `
+			UPDATE commercial_subscriptions
+			SET status = $1, canceled_at = $2, updated_at = $2
+			WHERE subscription_id = $3 AND status != ALL($4)
+		`, string(domain.SubscriptionStatusCanceled), now, *transfer.OldSubscriptionID,
+			[]string{string(domain.SubscriptionStatusCanceled), string(domain.SubscriptionStatusTerminated)},
+		)
+		if err != nil {
+			return fmt.Errorf("cancel old subscription: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrSubscriptionNotFound
+		}
+	}
+
+	if newSub != nil {
+		billingSource := newSub.BillingSource
+		if billingSource == "" {
+			billingSource = domain.BillingSource(transfer.NewBillingSource)
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO commercial_subscriptions (
+				subscription_id, commercial_account_id, plan_id, catalog_version_id, billing_interval,
+				status, renewal_date, canceled_at, processor_subscription_ref,
+				created_at, updated_at, created_by_principal_id, billing_source
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		`, newSub.SubscriptionID, newSub.CommercialAccountID, newSub.PlanID, newSub.CatalogVersionID, newSub.BillingInterval,
+			string(newSub.Status), newSub.RenewalDate, newSub.CanceledAt, newSub.ProcessorSubscriptionRef,
+			newSub.CreatedAt, newSub.UpdatedAt, newSub.CreatedByPrincipalID, string(billingSource),
+		)
+		if err != nil {
+			if isUniqueViolation(err) {
+				return fmt.Errorf("%w: commercial_account_id %s", domain.ErrActiveSubscriptionExists, newSub.CommercialAccountID)
+			}
+			return fmt.Errorf("insert new subscription: %w", err)
+		}
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO billing_source_transfers (
+			transfer_id, commercial_account_id, old_billing_source, new_billing_source,
+			old_subscription_id, new_subscription_id, entitlement_continuity, credit_amount,
+			reconciliation_status, created_at, created_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, transfer.TransferID, transfer.CommercialAccountID, transfer.OldBillingSource, transfer.NewBillingSource,
+		transfer.OldSubscriptionID, transfer.NewSubscriptionID, transfer.EntitlementContinuity, transfer.CreditAmount,
+		transfer.ReconciliationStatus, transfer.CreatedAt, transfer.CreatedByPrincipalID,
+	)
+	if err != nil {
+		return fmt.Errorf("insert billing source transfer: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (s *PgStore) ListStatusEventsBySubscription(ctx context.Context, subscriptionID string) ([]domain.SubscriptionStatusEvent, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT status_event_id, subscription_id, previous_status, new_status, reason,
+		       created_at, created_by_principal_id
+		FROM subscription_status_events WHERE subscription_id = $1 ORDER BY created_at DESC
+	`, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []domain.SubscriptionStatusEvent
+	for rows.Next() {
+		var e domain.SubscriptionStatusEvent
+		if err := rows.Scan(&e.StatusEventID, &e.SubscriptionID, &e.PreviousStatus, &e.NewStatus, &e.Reason,
+			&e.CreatedAt, &e.CreatedByPrincipalID); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // UpdateSubscriptionPlan is used by ApplyChangeRequest — an upgrade/downgrade

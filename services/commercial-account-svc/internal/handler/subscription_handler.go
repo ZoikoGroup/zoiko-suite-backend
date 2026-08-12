@@ -22,6 +22,8 @@ const (
 	OverlayCreate             = "CONTRACT_OVERLAY_CREATE"
 	SubscriptionChangePreview = "SUBSCRIPTION_CHANGE_PREVIEW"
 	SubscriptionChangeConfirm = "SUBSCRIPTION_CHANGE_CONFIRM"
+	SubscriptionStatusSet     = "SUBSCRIPTION_STATUS_SET"
+	BillingSourceTransferSet  = "BILLING_SOURCE_TRANSFER_CREATE"
 )
 
 func RegisterSubscriptionRoutes(r chi.Router, h *Handler) {
@@ -40,12 +42,15 @@ func RegisterSubscriptionRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}/entitlements/{metricType}", h.ResolveEntitlement)
 		r.Post("/{id}/evaluation-program", h.CreateEvaluationProgram)
 		r.Post("/{id}/usage-events", h.RecordUsageEvent)
+		r.Post("/{id}/status", h.SetSubscriptionStatus)
+		r.Get("/{id}/status-events", h.ListStatusEvents)
 	})
 	r.Route("/v1/subscription-change-requests", func(r chi.Router) {
 		r.Post("/", h.PreviewSubscriptionChange)
 		r.Post("/{id}/confirm", h.ConfirmSubscriptionChange)
 	})
 	r.Post("/v1/contract-entitlement-overlays", h.CreateOverlay)
+	r.Post("/v1/billing-source-transfers", h.TransferBillingSource)
 }
 
 func (h *Handler) CreatePriceCatalog(w http.ResponseWriter, r *http.Request) {
@@ -226,6 +231,10 @@ func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
 	if req.StartAsEvaluation {
 		status = domain.SubscriptionStatusEvaluation
 	}
+	billingSource := domain.BillingSourceDirect
+	if req.BillingSource != "" {
+		billingSource = domain.BillingSource(req.BillingSource)
+	}
 	now := time.Now().UTC()
 	sub := &domain.CommercialSubscription{
 		SubscriptionID:       uuid.NewString(),
@@ -233,6 +242,7 @@ func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
 		PlanID:               plan.PlanID,
 		CatalogVersionID:     plan.CatalogVersionID,
 		BillingInterval:      plan.BillingInterval,
+		BillingSource:        billingSource,
 		Status:               status,
 		CreatedAt:            now,
 		UpdatedAt:            now,
@@ -532,4 +542,200 @@ func (h *Handler) ConfirmSubscriptionChange(w http.ResponseWriter, r *http.Reque
 
 	_ = h.publisher.Publish(r.Context(), "commercial_subscription.plan_changed", updated.SubscriptionID, updated.CommercialAccountID, updated)
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// SetSubscriptionStatus drives the doc7 §O1-O3 dunning state machine — e.g.
+// a payment webhook handler posts ACTIVE -> PAST_DUE on failure, or PAST_DUE
+// -> ACTIVE on a successful retry. Rejects any transition not in
+// domain.ValidSubscriptionStatusTransitions; a same-status request succeeds
+// idempotently without re-running tenant workflows (§O3).
+func (h *Handler) SetSubscriptionStatus(w http.ResponseWriter, r *http.Request) {
+	subscriptionID := chi.URLParam(r, "id")
+	var req domain.SetSubscriptionStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.NewStatus == "" {
+		writeError(w, http.StatusBadRequest, "new_status is required")
+		return
+	}
+	newStatus := domain.SubscriptionStatus(req.NewStatus)
+	// ValidSubscriptionStatusTransitions is keyed fromStatus -> []toStatus;
+	// invert it here to get every status allowed to transition INTO newStatus.
+	var fromStatuses []domain.SubscriptionStatus
+	for from, tos := range domain.ValidSubscriptionStatusTransitions {
+		for _, to := range tos {
+			if to == newStatus {
+				fromStatuses = append(fromStatuses, from)
+				break
+			}
+		}
+	}
+	if len(fromStatuses) == 0 {
+		writeError(w, http.StatusBadRequest, "new_status is not a recognized subscription status")
+		return
+	}
+
+	sub, err := h.store.GetSubscription(r.Context(), subscriptionID)
+	if err != nil {
+		if errors.Is(err, domain.ErrSubscriptionNotFound) {
+			writeError(w, http.StatusNotFound, "subscription not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch subscription")
+		return
+	}
+
+	principalID, ok2 := h.requirePrincipal(w, r)
+	if !ok2 {
+		return
+	}
+	if !h.authorize(w, r, principalID, sub.CommercialAccountID, SubscriptionStatusSet) {
+		return
+	}
+
+	var reason *string
+	if req.Reason != "" {
+		reason = &req.Reason
+	}
+	if err := h.store.TransitionSubscriptionStatus(r.Context(), subscriptionID, newStatus, fromStatuses, reason, principalID); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrSubscriptionNotFound):
+			writeError(w, http.StatusNotFound, "subscription not found")
+		case errors.Is(err, domain.ErrInvalidStatusTransition):
+			writeError(w, http.StatusConflict, "subscription status transition not allowed")
+		default:
+			h.logger.Error("set subscription status failed", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "failed to set subscription status")
+		}
+		return
+	}
+
+	updated, err := h.store.GetSubscription(r.Context(), subscriptionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to fetch updated subscription")
+		return
+	}
+	_ = h.publisher.Publish(r.Context(), "commercial_subscription.status_changed", updated.SubscriptionID, updated.CommercialAccountID, updated)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+func (h *Handler) ListStatusEvents(w http.ResponseWriter, r *http.Request) {
+	subscriptionID := chi.URLParam(r, "id")
+	events, err := h.store.ListStatusEventsBySubscription(r.Context(), subscriptionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list status events")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"status_events": events})
+}
+
+// TransferBillingSource implements doc7 §P3's standalone <-> Zoiko One
+// migration: an effective-dated commercial transfer record, never a silent
+// swap. Cancelling the old subscription and creating the new one happen in
+// one atomic transaction; the "one non-terminal subscription per account"
+// constraint from migration 000002 structurally prevents the account from
+// ending up double-billed across both.
+func (h *Handler) TransferBillingSource(w http.ResponseWriter, r *http.Request) {
+	var req domain.TransferBillingSourceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.CommercialAccountID == "" || req.NewBillingSource == "" {
+		writeError(w, http.StatusBadRequest, "commercial_account_id and new_billing_source are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, req.CommercialAccountID, BillingSourceTransferSet) {
+		return
+	}
+
+	var oldSub *domain.CommercialSubscription
+	var oldBillingSource *string
+	if req.OldSubscriptionID != "" {
+		s, err := h.store.GetSubscription(r.Context(), req.OldSubscriptionID)
+		if err != nil {
+			if errors.Is(err, domain.ErrSubscriptionNotFound) {
+				writeError(w, http.StatusBadRequest, "old subscription not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "failed to fetch old subscription")
+			return
+		}
+		oldSub = s
+		bs := string(s.BillingSource)
+		oldBillingSource = &bs
+	}
+
+	targetPlanID := req.TargetPlanID
+	if targetPlanID == "" {
+		if oldSub == nil {
+			writeError(w, http.StatusBadRequest, "target_plan_id is required when old_subscription_id is not given")
+			return
+		}
+		targetPlanID = oldSub.PlanID
+	}
+	plan, err := h.store.GetPlan(r.Context(), targetPlanID)
+	if err != nil {
+		if errors.Is(err, domain.ErrPlanNotFound) {
+			writeError(w, http.StatusBadRequest, "target plan not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch target plan")
+		return
+	}
+
+	now := time.Now().UTC()
+	newSubID := uuid.NewString()
+	newSub := &domain.CommercialSubscription{
+		SubscriptionID:       newSubID,
+		CommercialAccountID:  req.CommercialAccountID,
+		PlanID:               plan.PlanID,
+		CatalogVersionID:     plan.CatalogVersionID,
+		BillingInterval:      plan.BillingInterval,
+		BillingSource:        domain.BillingSource(req.NewBillingSource),
+		Status:               domain.SubscriptionStatusActive,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+		CreatedByPrincipalID: principalID,
+	}
+
+	transfer := &domain.BillingSourceTransfer{
+		TransferID:            uuid.NewString(),
+		CommercialAccountID:   req.CommercialAccountID,
+		OldBillingSource:      oldBillingSource,
+		NewBillingSource:      req.NewBillingSource,
+		NewSubscriptionID:     &newSubID,
+		EntitlementContinuity: true,
+		CreditAmount:          req.CreditAmount,
+		ReconciliationStatus:  "PENDING",
+		CreatedAt:             now,
+		CreatedByPrincipalID:  principalID,
+	}
+	if req.OldSubscriptionID != "" {
+		transfer.OldSubscriptionID = &req.OldSubscriptionID
+	}
+
+	if err := h.store.CreateBillingSourceTransfer(r.Context(), transfer, newSub); err != nil {
+		if errors.Is(err, domain.ErrActiveSubscriptionExists) {
+			writeError(w, http.StatusConflict, "commercial account already has a non-terminal subscription")
+			return
+		}
+		if errors.Is(err, domain.ErrSubscriptionNotFound) {
+			writeError(w, http.StatusBadRequest, "old subscription not found or already terminal")
+			return
+		}
+		h.logger.Error("billing source transfer failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to transfer billing source")
+		return
+	}
+
+	_ = h.publisher.Publish(r.Context(), "commercial_subscription.billing_source_transferred", transfer.TransferID, transfer.CommercialAccountID, transfer)
+	writeJSON(w, http.StatusCreated, transfer)
 }

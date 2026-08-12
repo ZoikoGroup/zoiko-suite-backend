@@ -85,12 +85,41 @@ const (
 	SubscriptionStatusTerminated SubscriptionStatus = "TERMINATED"
 )
 
+// ValidSubscriptionStatusTransitions is the doc7 §O1-O3 dunning state
+// machine: ACTIVE -> PAST_DUE on payment failure; PAST_DUE -> RESTRICTED ->
+// SUSPENDED as dunning escalates (day-count thresholds intentionally left
+// to catalog/contract policy, not invented here per §O1); any of
+// PAST_DUE/RESTRICTED/SUSPENDED -> ACTIVE on a successful payment retry,
+// idempotently (§O3 — "does not re-run tenant workflows"). Any transition
+// not in this map is rejected fail-closed, same doctrine as
+// tenant-entity-registry-svc's ValidEntityStatusTransitions.
+var ValidSubscriptionStatusTransitions = map[SubscriptionStatus][]SubscriptionStatus{
+	SubscriptionStatusEvaluation: {SubscriptionStatusActive, SubscriptionStatusCanceled, SubscriptionStatusSuspended},
+	SubscriptionStatusActive:     {SubscriptionStatusPastDue, SubscriptionStatusCanceled},
+	SubscriptionStatusPastDue:    {SubscriptionStatusRestricted, SubscriptionStatusActive, SubscriptionStatusCanceled},
+	SubscriptionStatusRestricted: {SubscriptionStatusSuspended, SubscriptionStatusActive, SubscriptionStatusCanceled},
+	SubscriptionStatusSuspended:  {SubscriptionStatusActive, SubscriptionStatusTerminated},
+	SubscriptionStatusCanceled:   {},
+	SubscriptionStatusTerminated: {},
+}
+
+// BillingSource records where a subscription's commercial authority comes
+// from — doc7 §P2. Reuses tenant-entity-registry-svc's exact vocabulary
+// (DIRECT/ZOIKO_ONE_BUNDLE/NONE) rather than a second, competing enum.
+type BillingSource string
+
+const (
+	BillingSourceDirect         BillingSource = "DIRECT"
+	BillingSourceZoikoOneBundle BillingSource = "ZOIKO_ONE_BUNDLE"
+)
+
 type CommercialSubscription struct {
 	SubscriptionID           string             `json:"subscription_id"`
 	CommercialAccountID      string             `json:"commercial_account_id"`
 	PlanID                   string             `json:"plan_id"`
 	CatalogVersionID         string             `json:"catalog_version_id"`
 	BillingInterval          string             `json:"billing_interval"`
+	BillingSource            BillingSource      `json:"billing_source"`
 	Status                   SubscriptionStatus `json:"status"`
 	RenewalDate              *time.Time         `json:"renewal_date,omitempty"`
 	CanceledAt               *time.Time         `json:"canceled_at,omitempty"`
@@ -98,6 +127,58 @@ type CommercialSubscription struct {
 	CreatedAt                time.Time          `json:"created_at"`
 	UpdatedAt                time.Time          `json:"updated_at"`
 	CreatedByPrincipalID     string             `json:"created_by_principal_id"`
+}
+
+// SetSubscriptionStatusRequest drives the dunning state machine — the
+// caller (e.g. a payment webhook handler) names the target status; the
+// service validates it against ValidSubscriptionStatusTransitions.
+type SetSubscriptionStatusRequest struct {
+	NewStatus     string `json:"new_status"`
+	Reason        string `json:"reason,omitempty"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// BillingSourceTransfer is doc7 §P3's effective-dated commercial transfer
+// record for a standalone <-> Zoiko One migration — never a silent swap.
+type BillingSourceTransfer struct {
+	TransferID            string    `json:"transfer_id"`
+	CommercialAccountID   string    `json:"commercial_account_id"`
+	OldBillingSource      *string   `json:"old_billing_source,omitempty"`
+	NewBillingSource      string    `json:"new_billing_source"`
+	OldSubscriptionID     *string   `json:"old_subscription_id,omitempty"`
+	NewSubscriptionID     *string   `json:"new_subscription_id,omitempty"`
+	EntitlementContinuity bool      `json:"entitlement_continuity"`
+	CreditAmount          *float64  `json:"credit_amount,omitempty"`
+	ReconciliationStatus  string    `json:"reconciliation_status"` // PENDING | RECONCILED | DISPUTED — data
+	CreatedAt             time.Time `json:"created_at"`
+	CreatedByPrincipalID  string    `json:"created_by_principal_id"`
+}
+
+// TransferBillingSourceRequest performs the transfer atomically: optionally
+// cancels OldSubscriptionID and creates a fresh subscription on
+// NewBillingSource for the SAME plan (or TargetPlanID if given), all in one
+// transaction — the existing "one non-terminal subscription per account"
+// constraint (migration 000002) is what actually makes double-billing
+// structurally impossible here, not application-level care alone.
+type TransferBillingSourceRequest struct {
+	CommercialAccountID string   `json:"commercial_account_id"`
+	OldSubscriptionID   string   `json:"old_subscription_id,omitempty"`
+	NewBillingSource    string   `json:"new_billing_source"`
+	TargetPlanID        string   `json:"target_plan_id,omitempty"` // defaults to old subscription's plan if omitted
+	CreditAmount        *float64 `json:"credit_amount,omitempty"`
+	CorrelationID       string   `json:"correlation_id"`
+}
+
+// SubscriptionStatusEvent is the append-only dunning/status-transition
+// audit trail doc7 §O3 requires ("restoration is logged").
+type SubscriptionStatusEvent struct {
+	StatusEventID        string    `json:"status_event_id"`
+	SubscriptionID       string    `json:"subscription_id"`
+	PreviousStatus       string    `json:"previous_status"`
+	NewStatus            string    `json:"new_status"`
+	Reason               *string   `json:"reason,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
 
 type CreateSubscriptionRequest struct {
@@ -109,8 +190,10 @@ type CreateSubscriptionRequest struct {
 	// EVALUATION subscription with no evaluation_programs row is a real,
 	// deliberately unusual state a caller can end up in if they skip that
 	// second call — not silently converted to a trial for them.
-	StartAsEvaluation bool   `json:"start_as_evaluation,omitempty"`
-	CorrelationID     string `json:"correlation_id"`
+	StartAsEvaluation bool `json:"start_as_evaluation,omitempty"`
+	// BillingSource defaults to DIRECT when omitted.
+	BillingSource string `json:"billing_source,omitempty"`
+	CorrelationID string `json:"correlation_id"`
 }
 
 // EvaluationProgram is the trial terms doc7 §B3 requires before any
@@ -235,4 +318,7 @@ var (
 	ErrActiveSubscriptionExists  = errorString("conflict: commercial account already has a non-terminal subscription")
 	ErrDuplicateUsageEvent       = errorString("usage event already recorded")
 	ErrInvalidChangeRequestState = errorString("change request is not in a state that allows this action")
+	// ErrInvalidStatusTransition is returned when the requested
+	// SubscriptionStatus transition is not in ValidSubscriptionStatusTransitions.
+	ErrInvalidStatusTransition = errorString("subscription status transition not allowed")
 )
