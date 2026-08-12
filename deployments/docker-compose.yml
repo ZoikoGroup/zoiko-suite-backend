@@ -20,6 +20,7 @@ services:
       - ../services/audit-event-store-svc/deployments/migrations:/migrations/audit-event-store:ro
       - ../services/identity-context-svc/deployments/migrations:/migrations/identity-context:ro
       - ../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
+      - ../services/commercial-account-svc/deployments/migrations:/migrations/commercial-account:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
@@ -2785,6 +2786,40 @@ services:
       authorization-svc:
         condition: service_healthy
       tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── commercial-account-svc (Port: 8144) ───────────────────────────────────────
+  # Plane 1 — Zoiko Commercial Account (doc7 §3). Owns commercial_accounts and
+  # memberships; deliberately separate from tenant-entity-registry-svc's
+  # Plane 2 tenant/workspace/legal_entity data.
+  commercial-account-svc:
+    build:
+      context: ../services/commercial-account-svc
+      dockerfile: Dockerfile
+    container_name: commercial-account-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8144:8144"
+    environment:
+      PORT: "8144"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/commercial_account?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

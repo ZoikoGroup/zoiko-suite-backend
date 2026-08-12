@@ -37,6 +37,9 @@ type svc interface {
 	CreateEntity(ctx context.Context, req domain.CreateEntityRequest) (*domain.LegalEntity, error)
 	GetEntity(ctx context.Context, legalEntityID string) (*domain.LegalEntity, error)
 	ListEntities(ctx context.Context, tenantID string) ([]*domain.LegalEntity, error)
+	CreateWorkspace(ctx context.Context, req domain.CreateWorkspaceRequest) (*domain.Workspace, error)
+	GetWorkspace(ctx context.Context, workspaceID string) (*domain.Workspace, error)
+	ListWorkspaces(ctx context.Context, tenantID string) ([]*domain.Workspace, error)
 	UpdateEntity(ctx context.Context, legalEntityID string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error)
 	GetEntityStatus(ctx context.Context, legalEntityID string) (*domain.EntityStatusResponse, error)
 	TransitionEntityStatus(ctx context.Context, legalEntityID string, req domain.TransitionEntityStatusRequest) error
@@ -95,6 +98,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		// ── Entities ─────────────────────────────────────────────────────────
 		r.Get("/tenants/{tenantID}/entities", h.ListEntities)
+		r.Get("/tenants/{tenantID}/workspaces", h.ListWorkspaces)
+		r.Post("/workspaces", h.CreateWorkspace)
+		r.Get("/workspaces/{workspaceID}", h.GetWorkspace)
 		r.Post("/entities", h.CreateEntity)
 		r.Get("/entities/{entityID}", h.GetEntity)
 		r.Patch("/entities/{entityID}", h.UpdateEntity)
@@ -209,6 +215,37 @@ func (h *Handler) ListEntities(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, entities)
+}
+
+func (h *Handler) CreateWorkspace(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateWorkspaceRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	ws, err := h.svc.CreateWorkspace(r.Context(), req)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, ws)
+}
+
+func (h *Handler) GetWorkspace(w http.ResponseWriter, r *http.Request) {
+	ws, err := h.svc.GetWorkspace(r.Context(), chi.URLParam(r, "workspaceID"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ws)
+}
+
+func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
+	workspaces, err := h.svc.ListWorkspaces(r.Context(), chi.URLParam(r, "tenantID"))
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, workspaces)
 }
 
 func (h *Handler) UpdateEntity(w http.ResponseWriter, r *http.Request) {

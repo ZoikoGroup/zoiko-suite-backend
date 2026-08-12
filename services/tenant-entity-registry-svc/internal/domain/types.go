@@ -56,6 +56,30 @@ type LegalEntity struct {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace  (docs/original_doc/zoiko_suite_doc7.txt §A5/§T)
+// A workspace sits beneath a tenant and may optionally scope to one legal
+// entity. Workspaces can legitimately be non-billable (pilots, internal
+// controls, sandboxes) — BillingClassification is mandatory precisely so
+// that fact is never inferred from environment name or workspace age.
+// ---------------------------------------------------------------------------
+
+type Workspace struct {
+	WorkspaceID           string              `json:"workspace_id"`
+	TenantID              string              `json:"tenant_id"`
+	LegalEntityID         *string             `json:"legal_entity_id"`
+	Name                  string              `json:"name"`
+	BusinessUnit          *string             `json:"business_unit"`
+	BillingClassification BillingClassification `json:"billing_classification"`
+	BillingSource         BillingSource       `json:"billing_source"`
+	CommercialAccountID   *string             `json:"commercial_account_id"`
+	Status                WorkspaceStatus     `json:"status"`
+	CreatedAt             time.Time           `json:"created_at"`
+	UpdatedAt             time.Time           `json:"updated_at"`
+	CreatedByPrincipalID  string              `json:"created_by_principal_id"`
+	UpdatedByPrincipalID  string              `json:"updated_by_principal_id"`
+}
+
+// ---------------------------------------------------------------------------
 // EntityHierarchy  (data-model §05.1)
 // Effective-dated — end-date to close, never hard-delete.
 // ---------------------------------------------------------------------------
@@ -196,6 +220,17 @@ type CreateEntityRequest struct {
 	PrimaryJurisdictionID string     `json:"primary_jurisdiction_id"`
 	DataResidencyPolicyID string     `json:"data_residency_policy_id"`
 	CorrelationID         string     `json:"correlation_id"`
+}
+
+type CreateWorkspaceRequest struct {
+	TenantID               string `json:"tenant_id"`
+	LegalEntityID          string `json:"legal_entity_id,omitempty"`
+	Name                   string `json:"name"`
+	BusinessUnit           string `json:"business_unit,omitempty"`
+	BillingClassification  string `json:"billing_classification"`
+	BillingSource          string `json:"billing_source,omitempty"`
+	CommercialAccountID    string `json:"commercial_account_id,omitempty"`
+	CorrelationID          string `json:"correlation_id"`
 }
 
 type UpdateEntityRequest struct {

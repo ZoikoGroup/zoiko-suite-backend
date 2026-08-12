@@ -289,6 +289,86 @@ func (s *Service) CreateEntity(
 	return e, nil
 }
 
+// CreateWorkspace creates a workspace beneath a tenant. BillingClassification
+// is mandatory and validated against ValidBillingClassifications — a
+// non-billable class (INTERNAL/DEMO/SANDBOX/QA_AUTOMATION/PILOT_NON_BILLABLE)
+// is a legitimate workspace, an unrecognized string is not (doc7 §T/§A5:
+// "Environment name or workspace age is never enough").
+func (s *Service) CreateWorkspace(
+	ctx context.Context,
+	req domain.CreateWorkspaceRequest,
+) (*domain.Workspace, error) {
+	if err := s.authorize(ctx, "workspace", "create"); err != nil {
+		return nil, err
+	}
+
+	classification := domain.BillingClassification(req.BillingClassification)
+	if !domain.ValidBillingClassifications[classification] {
+		return nil, fmt.Errorf("%w: unrecognized billing_classification %q", ErrInvalidInput, req.BillingClassification)
+	}
+
+	billingSource := domain.BillingSource(req.BillingSource)
+	if billingSource == "" {
+		billingSource = domain.BillingSourceNone
+	}
+
+	w := &domain.Workspace{
+		WorkspaceID:            newID(),
+		TenantID:               req.TenantID,
+		LegalEntityID:          nullableString(req.LegalEntityID),
+		Name:                   req.Name,
+		BusinessUnit:           nullableString(req.BusinessUnit),
+		BillingClassification: classification,
+		BillingSource:          billingSource,
+		CommercialAccountID:    nullableString(req.CommercialAccountID),
+		Status:                 domain.WorkspaceStatusActive,
+		CreatedAt:              time.Now().UTC(),
+		CreatedByPrincipalID:   domain.PrincipalFromContext(ctx),
+	}
+
+	if err := s.store.CreateWorkspace(ctx, w); err != nil {
+		s.log.Error("create workspace failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
+		return nil, fmt.Errorf("store.CreateWorkspace: %w", err)
+	}
+
+	go s.events.PublishWorkspaceCreated(ctx, w, req.CorrelationID)
+
+	s.log.Info("workspace created",
+		zap.String("workspace_id", w.WorkspaceID),
+		zap.String("tenant_id", w.TenantID),
+		zap.String("billing_classification", string(w.BillingClassification)),
+		zap.String("correlation_id", req.CorrelationID),
+	)
+	return w, nil
+}
+
+// GetWorkspace retrieves a workspace by ID. Returns ErrNotFound if absent.
+func (s *Service) GetWorkspace(ctx context.Context, workspaceID string) (*domain.Workspace, error) {
+	w, err := s.store.GetWorkspaceByID(ctx, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("store.GetWorkspaceByID: %w", err)
+	}
+	if w == nil {
+		return nil, ErrNotFound
+	}
+	return w, nil
+}
+
+// ListWorkspaces returns all workspaces for a tenant.
+func (s *Service) ListWorkspaces(ctx context.Context, tenantID string) ([]*domain.Workspace, error) {
+	if err := s.assertTenantScope(ctx, tenantID); err != nil {
+		return nil, err
+	}
+	workspaces, err := s.store.ListWorkspacesByTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if workspaces == nil {
+		workspaces = []*domain.Workspace{}
+	}
+	return workspaces, nil
+}
+
 // GetEntity retrieves a legal entity by ID. Returns ErrNotFound if absent.
 func (s *Service) GetEntity(ctx context.Context, legalEntityID string) (*domain.LegalEntity, error) {
 	e, err := s.store.GetEntityByID(ctx, legalEntityID)
