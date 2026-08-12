@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -90,6 +91,25 @@ func scanRequirement(row pgx.Row) (*domain.EvidenceRequirement, error) {
 	}
 	r.RequirementPayload = json.RawMessage(payload)
 	return &r, nil
+}
+
+// mapPgError translates driver-level failures that are really caller mistakes
+// into domain errors, so they stop being reported as outages.
+//
+// 22P02 (invalid_text_representation) is the one that matters here:
+// evidence_requirement_id, evaluation_id, tenant_id and legal_entity_id are all
+// uuid columns, so a mistyped id fails inside the driver before any row is
+// examined. Left unmapped it surfaced as 503 store_unavailable —
+// indistinguishable from the database being unreachable.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	if pgErr.Code == "22P02" {
+		return domain.ErrInvalidIdentifier
+	}
+	return err
 }
 
 // CreateRequirement inserts an evidence requirement. Idempotent on
@@ -164,12 +184,17 @@ func (s *PgStore) GetRequirement(ctx context.Context, requirementID string) (*do
 			 WHERE evidence_requirement_id = $1 AND tenant_id = $2`,
 			requirementID, tenantID))
 		if err != nil {
-			return err
+			return mapPgError(err)
 		}
 		out = r
 		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	// A malformed id cannot name an existing requirement, so it is absent — not
+	// an outage, and reported identically to another tenant's requirement.
+	if errors.Is(err, domain.ErrInvalidIdentifier) {
 		return nil, nil
 	}
 	if err != nil {
@@ -274,6 +299,12 @@ func (s *PgStore) EndDateRequirement(ctx context.Context, tenantID, requirementI
 		if err == nil {
 			out = r
 			return nil
+		}
+		// A malformed id names no requirement, so it is a not-found rather than
+		// an "already retired" claim about a row that does not exist. Checked
+		// before ErrNoRows because 22P02 is not a no-rows result.
+		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
+			return domain.ErrRequirementNotFound
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
@@ -383,12 +414,15 @@ func (s *PgStore) GetEvaluation(ctx context.Context, evaluationID string) (*doma
 			 WHERE evaluation_id = $1 AND tenant_id = $2`,
 			evaluationID, tenantID))
 		if err != nil {
-			return err
+			return mapPgError(err)
 		}
 		out = e
 		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if errors.Is(err, domain.ErrInvalidIdentifier) {
 		return nil, nil
 	}
 	if err != nil {

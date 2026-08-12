@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,17 +30,14 @@ import (
 // WARNING: this suite DROPs its tables. Point TEST_DATABASE_URL at the
 // vendor_due_diligence database a running service uses and it deletes that data,
 // which afterwards looks like a service bug rather than a test. The name is
-// checked before anything is dropped.
+// checked by requireThrowawayDatabase before anything is dropped.
 func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
-	if !strings.Contains(dsn, "_test") {
-		t.Fatal(`refusing to run: TEST_DATABASE_URL must name a database containing "_test" ` +
-			`because this suite DROPs its tables. Use vendor_due_diligence_test, not vendor_due_diligence.`)
-	}
+	requireThrowawayDatabase(t, dsn)
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -72,6 +70,31 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+// requireThrowawayDatabase fails the test unless the DSN's database name marks
+// it as disposable. Two names are legitimate: CI points TEST_DATABASE_URL at
+// `testdb`, and the local convention is `vendor_due_diligence_test`. Both
+// contain "test"; the live `vendor_due_diligence` database does not, which is
+// the case this guard exists to catch.
+//
+// The name is taken from the parsed DSN rather than matched against the whole
+// string, so a host or password that happens to contain "test" cannot vouch for
+// a live database. Anything that does not parse as a URL is refused rather than
+// waved through — the suite DROPs tables, so an unreadable target is not a
+// target worth guessing at.
+func requireThrowawayDatabase(t *testing.T, dsn string) {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("refusing to run: TEST_DATABASE_URL is not a parseable URL: %v", err)
+	}
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if !strings.Contains(strings.ToLower(dbName), "test") {
+		t.Fatalf("refusing to run: TEST_DATABASE_URL names database %q, which is not recognisably "+
+			"disposable, and this suite DROPs its tables. Use vendor_due_diligence_test (or CI's "+
+			"testdb), not vendor_due_diligence.", dbName)
+	}
 }
 
 const (
