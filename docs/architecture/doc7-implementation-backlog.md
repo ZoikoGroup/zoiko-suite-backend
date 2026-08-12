@@ -61,14 +61,20 @@ independent data of its own to own.
 
 ## Chunk 7 — Capability & Release Registries (net-new, Plane 1)
 
+Resolution: new service `capability-registry-svc` — five deliberately
+separate tables/objects, matching §7's own warning that these dimensions
+must never collapse into one feature flag. Does NOT call out to
+commercial-account-svc (entitlement) or policy-svc (security eligibility) —
+those remain the caller's own separate checks.
+
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 13 | `capability_registry` — does the capability exist at all | §C | Not Started | |
-| 14 | `market_release_registry` — jurisdiction/entity/language gating | §C, §Q1 | Not Started | |
-| 15 | `integration_capability_registry` — connector/provider certification status | §C | Not Started | |
-| 16 | `claim_registry` — what marketing/sales may say is available, linked to release evidence | §C2 | Not Started | |
-| 17 | `release_registry` — GA / BETA / PILOT / INTERNAL / DISABLED / INCIDENT_RESTRICTED state | §C | Not Started | |
-| 18 | Capability-resolution endpoint returning structured reason codes (enabled / unavailable / requires-upgrade / market-blocked / provider-unavailable / incident-restricted) | §C1 | Not Started | |
+| 13 | `capability_registry` — does the capability exist at all | §C | Done | `capabilities` table; capability_code is data, never switched on |
+| 14 | `market_release_registry` — jurisdiction/entity/language gating | §C, §Q1 | Done | `market_releases`; state values are doc7 §29's "Market release" list verbatim; live-verified GA-in-UK vs no-release-in-DE |
+| 15 | `integration_capability_registry` — connector/provider certification status | §C | Done | `integration_capabilities`; live-verified an uncertified provider blocks resolution |
+| 16 | `claim_registry` — what marketing/sales may say is available, linked to release evidence | §C2 | Done | `capability_claims`; wording_owner + approver required fields, never auto-generated from roadmap state |
+| 17 | `release_registry` — GA / BETA / PILOT / INTERNAL / DISABLED / INCIDENT_RESTRICTED state | §C | Done | `releases`, append-only (history never overwritten, per §32.1 kill-switch doctrine); live-verified INCIDENT_RESTRICTED overriding an already-GA market release |
+| 18 | Capability-resolution endpoint returning structured reason codes (enabled / unavailable / requires-upgrade / market-blocked / provider-unavailable / incident-restricted) | §C1 | Done | `GET /v1/capability-resolution/{code}`; live-verified all 4 reason-code paths (ENABLED, MARKET_BLOCKED, INCIDENT_RESTRICTED, PROVIDER_UNAVAILABLE) plus CAPABILITY_UNKNOWN |
 
 ## Chunk 8 — Zoiko One Billing & Double-Charge Prevention (net-new, Plane 1)
 

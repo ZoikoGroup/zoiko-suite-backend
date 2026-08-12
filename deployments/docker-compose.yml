@@ -21,6 +21,7 @@ services:
       - ../services/identity-context-svc/deployments/migrations:/migrations/identity-context:ro
       - ../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
       - ../services/commercial-account-svc/deployments/migrations:/migrations/commercial-account:ro
+      - ../services/capability-registry-svc/deployments/migrations:/migrations/capability-registry:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
@@ -2813,6 +2814,41 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── capability-registry-svc (Port: 8145) ──────────────────────────────────────
+  # Plane 1 — Capability, Module & Release Registry (doc7 §7). Owns
+  # capability existence, market release, integration readiness, operational
+  # release state, and public claim eligibility as five deliberately
+  # separate objects — never compressed into one feature flag.
+  capability-registry-svc:
+    build:
+      context: ../services/capability-registry-svc
+      dockerfile: Dockerfile
+    container_name: capability-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8145:8145"
+    environment:
+      PORT: "8145"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/capability_registry?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:

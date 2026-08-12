@@ -10,6 +10,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE audit_event_store;
     CREATE DATABASE tenant_entity_registry;
     CREATE DATABASE commercial_account;
+    CREATE DATABASE capability_registry;
     CREATE DATABASE jurisdiction_rules;
     CREATE DATABASE governance_decision_log;
     CREATE DATABASE identity_context;
@@ -77,6 +78,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_regi
 echo "Applying migrations for commercial_account..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000002_add_plans_and_subscriptions.up.sql
+# Apply migrations for capability-registry-svc
+echo "Applying migrations for capability_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "capability_registry" -f /migrations/capability-registry/000001_initial_schema.up.sql
 
 # Apply migrations for jurisdiction-rules-svc
 echo "Applying migrations for jurisdiction_rules..."
