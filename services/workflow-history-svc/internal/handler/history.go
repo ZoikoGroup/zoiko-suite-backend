@@ -2,9 +2,12 @@
 //
 // Endpoints:
 //
-//	GET /v1/workflows/{workflow_instance_id}/history
-//	  Returns the full chronological transition list for one workflow instance.
-//	  404 if no events exist for the given instance ID.
+//	GET /v1/workflows/{workflow_instance_id}/history?tenant_id=...
+//	  Returns the full chronological transition list for one workflow instance,
+//	  scoped to the given tenant_id. 404 if no events exist for the given
+//	  instance ID within that tenant — indistinguishable from the instance
+//	  belonging to a different tenant, so this endpoint cannot be used to
+//	  probe for the existence of another tenant's workflow instances.
 //
 //	GET /v1/workflows/history?tenant_id=...&legal_entity_id=...&from=...&to=...
 //	  Cross-workflow query for all transitions within a time window for a
@@ -72,15 +75,21 @@ func toResponse(e store.WorkflowHistoryEvent) historyEventResponse {
 //
 // Returns the full chronological transition list for one workflow instance,
 // ordered by recorded_at ASC (earliest event first).
-// 404 if no events exist for the given instance ID.
+// 400 if tenant_id is missing. 404 if no events exist for the given instance
+// ID within that tenant.
 func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 	instanceID := chi.URLParam(r, "workflow_instance_id")
 	if instanceID == "" {
 		writeError(w, http.StatusBadRequest, "workflow_instance_id is required")
 		return
 	}
+	tenantID := r.URL.Query().Get("tenant_id")
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "tenant_id is required")
+		return
+	}
 
-	events, err := h.read.ListByInstance(r.Context(), instanceID)
+	events, err := h.read.ListByInstance(r.Context(), tenantID, instanceID)
 	if err != nil {
 		h.log.Error("GetInstanceHistory: store error",
 			zap.String("workflow_instance_id", instanceID),

@@ -21,6 +21,13 @@ type PayrollRun struct {
 	CreatedAt            time.Time  `json:"created_at"`
 	UpdatedAt            time.Time  `json:"updated_at"`
 	FinalizedAt          *time.Time `json:"finalized_at,omitempty"`
+
+	// GovernanceDecisionID is nil unless the caller finalizing this run
+	// supplied one. SnapshotHash is computed by this service itself at the
+	// moment of finalization, over the run's own totals — a reproducibility
+	// hash an auditor can recompute from the stored numbers.
+	GovernanceDecisionID *string `json:"governance_decision_id,omitempty"`
+	SnapshotHash         *string `json:"snapshot_hash,omitempty"`
 }
 
 type PaySlip struct {
@@ -80,6 +87,9 @@ type CalculateRunRequest struct {
 
 type FinalizeRunRequest struct {
 	ConfirmationNote string `json:"confirmation_note,omitempty"`
+	// GovernanceDecisionID is optional: the governance-decision-log-svc
+	// decision that authorized this finalization, when the caller has one.
+	GovernanceDecisionID *string `json:"governance_decision_id,omitempty"`
 }
 
 type errorString string

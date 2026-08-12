@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -15,15 +16,43 @@ import (
 	"zoiko.io/obligation-tracking-svc/internal/store"
 )
 
+const (
+	actionObligationCreate  = "OBLIGATION_CREATE"
+	actionObligationUpdate  = "OBLIGATION_UPDATE"
+	actionObligationFulfill = "OBLIGATION_FULFILL"
+)
+
+// AuthZClient is the subset of authz.Client used by the handler, so tests can stub it.
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthZClient
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthZClient, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -46,6 +75,23 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Title == "" || req.DueDate == "" || req.ObligationType == "" {
 		writeError(w, http.StatusBadRequest, "title, due_date, and obligation_type are required")
+		return
+	}
+	if req.ObligationType != domain.ObligationTypeContractual {
+		writeError(w, http.StatusBadRequest, "obligation_type must be CONTRACTUAL — this service tracks contract-derived obligations only; statutory/regulatory/internal-policy obligations belong in obligations-svc")
+		return
+	}
+	if req.SourceType != "" && !domain.SourceType(req.SourceType).Valid() {
+		writeError(w, http.StatusBadRequest, "source_type must be CONTRACT or CLAUSE")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionObligationCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -131,6 +177,10 @@ func (h *Handler) UpdateObligation(w http.ResponseWriter, r *http.Request) {
 		existing.Description = req.Description
 	}
 	if req.ObligationType != "" {
+		if req.ObligationType != domain.ObligationTypeContractual {
+			writeError(w, http.StatusBadRequest, "obligation_type must be CONTRACTUAL — this service tracks contract-derived obligations only; statutory/regulatory/internal-policy obligations belong in obligations-svc")
+			return
+		}
 		existing.ObligationType = req.ObligationType
 	}
 	if req.RiskLevel != "" {
@@ -147,6 +197,15 @@ func (h *Handler) UpdateObligation(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.EffectiveTo != nil {
 		existing.EffectiveTo = req.EffectiveTo
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionObligationUpdate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
 	}
 
 	if err := h.store.UpdateObligation(r.Context(), existing); err != nil {
@@ -169,6 +228,25 @@ func (h *Handler) FulfillObligation(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.FulfilledBy == "" {
 		writeError(w, http.StatusBadRequest, "fulfilled_by is required")
+		return
+	}
+
+	existing, err := h.store.GetObligation(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrObligationNotFound) {
+			writeError(w, http.StatusNotFound, "obligation not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch obligation")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionObligationFulfill); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 

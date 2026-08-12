@@ -53,7 +53,7 @@ func (p *Publisher) PublishContextResolved(
 	ctx context.Context,
 	principalID, tenantID, legalEntityID, sessionContextID, correlationID string,
 ) error {
-	return p.emit("identity.context.resolved", map[string]any{
+	return p.emit("identity.context.resolved", sessionContextID, map[string]any{
 		"principal_id":       principalID,
 		"tenant_id":          tenantID,
 		"legal_entity_id":    legalEntityID,
@@ -66,7 +66,7 @@ func (p *Publisher) PublishResolutionFailed(
 	ctx context.Context,
 	subject, correlationID, reason string,
 ) error {
-	return p.emit("identity.context.resolution_failed", map[string]any{
+	return p.emit("identity.context.resolution_failed", subject, map[string]any{
 		"principal_id_or_subject": subject,
 		"correlation_id":          correlationID,
 		"failure_reason":          reason,
@@ -79,7 +79,7 @@ func (p *Publisher) PublishSessionInvalidated(
 	reason domain.InvalidationReason,
 	correlationID string,
 ) error {
-	return p.emit("session.invalidated", map[string]any{
+	return p.emit("session.invalidated", sessionContextID, map[string]any{
 		"session_context_id":  sessionContextID,
 		"principal_id":        principalID,
 		"invalidation_reason": reason,
@@ -88,7 +88,7 @@ func (p *Publisher) PublishSessionInvalidated(
 }
 
 func (p *Publisher) PublishRiskSignalUnavailable(ctx context.Context, principalID, correlationID string) error {
-	return p.emit("session.risk.changed", map[string]any{
+	return p.emit("session.risk.changed", principalID, map[string]any{
 		"principal_id":   principalID,
 		"new_posture":    string(domain.TrustPostureStandard),
 		"signal_source":  "UNAVAILABLE",
@@ -102,7 +102,7 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 	newStatus domain.PrincipalStatus,
 	actorID, correlationID string,
 ) error {
-	return p.emit("principal.status.changed", map[string]any{
+	return p.emit("principal.status.changed", principalID, map[string]any{
 		"principal_id":   principalID,
 		"tenant_id":      tenantID,
 		"new_status":     string(newStatus),
@@ -114,7 +114,7 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 // emit serialises the payload and writes to the Kafka topic.
 // Returns an error so callers can detect failures (Gap 1 fix).
 // Stub: logs structured JSON until kafka.Writer is injected.
-func (p *Publisher) emit(eventType string, payload map[string]any) error {
+func (p *Publisher) emit(eventType, key string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
@@ -133,7 +133,7 @@ func (p *Publisher) emit(eventType string, payload map[string]any) error {
 
 	// Topic is set on the Writer itself (main.go), not here — kafka-go
 	// rejects a Message that also specifies Topic when the Writer already has one.
-	msg := kafka.Message{Value: data}
+	msg := kafka.Message{Key: []byte(key), Value: data}
 	if err := p.producer.WriteMessages(context.Background(), msg); err != nil {
 		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
 	}

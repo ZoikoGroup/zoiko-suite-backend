@@ -32,44 +32,44 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 }
 
 func (p *Publisher) PublishBenefitEnrolled(ctx context.Context, correlationID string, e domain.BenefitElection) {
-	p.emit(ctx, "benefit.enrolled", correlationID, map[string]any{
-		"election_id":                 e.ElectionID,
-		"tenant_id":                   e.TenantID,
-		"employee_id":                 e.EmployeeID,
-		"plan_id":                     e.PlanID,
-		"coverage_level":              e.CoverageLevel,
+	p.emit(ctx, "benefit.enrolled", correlationID, e.ElectionID, map[string]any{
+		"election_id":                  e.ElectionID,
+		"tenant_id":                    e.TenantID,
+		"employee_id":                  e.EmployeeID,
+		"plan_id":                      e.PlanID,
+		"coverage_level":               e.CoverageLevel,
 		"employee_contribution_amount": e.EmployeeContributionAmount,
 		"employer_contribution_amount": e.EmployerContributionAmount,
-		"effective_from":              e.EffectiveFrom,
-		"enrolled_at":                 e.CreatedAt,
+		"effective_from":               e.EffectiveFrom,
+		"enrolled_at":                  e.CreatedAt,
 	})
 }
 
 func (p *Publisher) PublishBenefitChanged(ctx context.Context, correlationID string, e domain.BenefitElection) {
-	p.emit(ctx, "benefit.changed", correlationID, map[string]any{
-		"election_id":                 e.ElectionID,
-		"tenant_id":                   e.TenantID,
-		"employee_id":                 e.EmployeeID,
-		"plan_id":                     e.PlanID,
-		"coverage_level":              e.CoverageLevel,
+	p.emit(ctx, "benefit.changed", correlationID, e.ElectionID, map[string]any{
+		"election_id":                  e.ElectionID,
+		"tenant_id":                    e.TenantID,
+		"employee_id":                  e.EmployeeID,
+		"plan_id":                      e.PlanID,
+		"coverage_level":               e.CoverageLevel,
 		"employee_contribution_amount": e.EmployeeContributionAmount,
 		"employer_contribution_amount": e.EmployerContributionAmount,
-		"updated_at":                  e.UpdatedAt,
+		"updated_at":                   e.UpdatedAt,
 	})
 }
 
 func (p *Publisher) PublishBenefitTerminated(ctx context.Context, correlationID string, e domain.BenefitElection) {
-	p.emit(ctx, "benefit.terminated", correlationID, map[string]any{
-		"election_id":    e.ElectionID,
-		"tenant_id":      e.TenantID,
-		"employee_id":    e.EmployeeID,
-		"plan_id":        e.PlanID,
-		"effective_to":   e.EffectiveTo,
-		"terminated_at":  time.Now().UTC(),
+	p.emit(ctx, "benefit.terminated", correlationID, e.ElectionID, map[string]any{
+		"election_id":   e.ElectionID,
+		"tenant_id":     e.TenantID,
+		"employee_id":   e.EmployeeID,
+		"plan_id":       e.PlanID,
+		"effective_to":  e.EffectiveTo,
+		"terminated_at": time.Now().UTC(),
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -92,7 +92,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

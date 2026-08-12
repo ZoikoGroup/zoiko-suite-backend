@@ -35,6 +35,7 @@ import (
 	"zoiko.io/policy-svc/internal/events"
 	"zoiko.io/policy-svc/internal/handler"
 	"zoiko.io/policy-svc/internal/health"
+	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 	"zoiko.io/policy-svc/internal/store"
 	"zoiko.io/policy-svc/internal/telemetry"
 )
@@ -152,6 +153,7 @@ func main() {
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
+	r.Use(svcmiddleware.TenantContext())
 
 	h := handler.New(pgStore, publisher, decisionLogClient, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)

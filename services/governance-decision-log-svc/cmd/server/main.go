@@ -5,7 +5,7 @@
 //  2. Initialise structured logger (zap)
 //  3. Connect to PostgreSQL pool (pgxpool) — Tier 0 pool sizing
 //  4. Construct PgStore
-//  5. Construct event publisher (stub — logs until kafka.Writer is injected)
+//  5. Construct event publisher (real Kafka producer)
 //  6. Construct HTTP handler + mount routes on chi router
 //  7. Mount health probes (/healthz, /readyz)
 //  8. Start HTTP server with graceful shutdown
@@ -28,9 +28,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
-	"go.uber.org/zap"
-
 	"github.com/segmentio/kafka-go"
+	"go.uber.org/zap"
 
 	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/config"

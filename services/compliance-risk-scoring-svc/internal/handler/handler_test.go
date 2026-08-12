@@ -2,25 +2,32 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"go.uber.org/zap"
-	"zoiko.io/compliance-risk-scoring-svc/internal/authz"
 	"zoiko.io/compliance-risk-scoring-svc/internal/domain"
 	"zoiko.io/compliance-risk-scoring-svc/internal/events"
 	"zoiko.io/compliance-risk-scoring-svc/internal/handler"
 	"zoiko.io/compliance-risk-scoring-svc/internal/store"
 )
 
+// fakeAuthzClient always grants, so handler tests exercise business logic
+// without depending on a live authorization-svc.
+type fakeAuthzClient struct{}
+
+func (fakeAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	return nil
+}
+
 func setupTestRouter() http.Handler {
 	logger := zap.NewNop()
 	memStore := store.NewMemoryStore()
 	publisher := events.NewPublisher([]string{"localhost:9092"}, "zoiko.compliance-risk-scoring.events", logger)
-	authzClient := authz.NewClient("http://localhost:8089", logger)
-	h := handler.NewHandler(memStore, publisher, authzClient, logger)
+	h := handler.NewHandler(memStore, publisher, fakeAuthzClient{}, logger)
 
 	return handler.NewRouter(h)
 }
@@ -64,6 +71,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 	body, _ := json.Marshal(calcReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/risk-scores/calculate", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "tenant-risk-99")
+	req.Header.Set("X-Principal-Id", "principal-1")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -113,16 +121,23 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 	}
 
 	// 4. Create Threshold Rule
-	ruleReq := domain.RiskThresholdRule{
-		RuleName:            "High Policy Breach Threshold",
-		RiskCategory:        domain.CategoryPolicyViolations,
-		HighThreshold:       50.0,
-		CriticalThreshold:   75.0,
-		NotificationChannel: "COMPLIANCE_OPS_SLACK",
+	ruleReq := struct {
+		domain.RiskThresholdRule
+		LegalEntityID string `json:"legal_entity_id"`
+	}{
+		RiskThresholdRule: domain.RiskThresholdRule{
+			RuleName:            "High Policy Breach Threshold",
+			RiskCategory:        domain.CategoryPolicyViolations,
+			HighThreshold:       50.0,
+			CriticalThreshold:   75.0,
+			NotificationChannel: "COMPLIANCE_OPS_SLACK",
+		},
+		LegalEntityID: "LE-2002",
 	}
 	ruleBody, _ := json.Marshal(ruleReq)
 	ruleHTTPReq := httptest.NewRequest(http.MethodPost, "/v1/risk-scores/thresholds", bytes.NewBuffer(ruleBody))
 	ruleHTTPReq.Header.Set("X-Tenant-ID", "tenant-risk-99")
+	ruleHTTPReq.Header.Set("X-Principal-Id", "principal-1")
 	ruleHTTPReq.Header.Set("Content-Type", "application/json")
 	ruleRec := httptest.NewRecorder()
 
@@ -146,6 +161,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 	// 6. Archive Assessment
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/risk-scores/"+createdAssessment.ID, nil)
 	delReq.Header.Set("X-Tenant-ID", "tenant-risk-99")
+	delReq.Header.Set("X-Principal-Id", "principal-1")
 	delRec := httptest.NewRecorder()
 
 	router.ServeHTTP(delRec, delReq)

@@ -16,6 +16,14 @@ import (
 	"zoiko.io/corporate-tax-svc/internal/store"
 )
 
+// Action types passed to authorization-svc for each write endpoint.
+const (
+	ActionTaxReturnCreate = "TAX_RETURN_CREATE"
+	ActionTaxReturnUpdate = "TAX_RETURN_UPDATE"
+	ActionTaxReturnSubmit = "TAX_RETURN_SUBMIT"
+	ActionTaxReturnAssess = "TAX_RETURN_ASSESS"
+)
+
 // Handler wires together the HTTP layer with the store and event bus.
 type Handler struct {
 	store     store.Store
@@ -40,8 +48,39 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 }
 
+// principalIDOrUnauthorized extracts the caller's principal from the
+// X-Principal-Id header, writing a 401 via writeError if it is missing.
+func principalIDOrUnauthorized(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// checkAuthorized calls authorization-svc and fails closed: any error other
+// than an explicit denial is treated as a service-unavailable (503), and a
+// denial is a 403. Returns true if the caller may proceed.
+func (h *Handler) checkAuthorized(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		}
+		return false
+	}
+	return true
+}
+
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
+
+	principalID, ok := principalIDOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
 
 	var req domain.CreateTaxReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -50,6 +89,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LegalEntityID == "" || req.JurisdictionID == "" || req.FiscalYear == 0 {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, jurisdiction_id, and fiscal_year are required")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principalID, req.LegalEntityID, ActionTaxReturnCreate) {
 		return
 	}
 
@@ -119,6 +162,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := principalIDOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
 	existing, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrTaxReturnNotFound) {
@@ -126,6 +174,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch corporate tax return")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnUpdate) {
 		return
 	}
 
@@ -156,6 +208,25 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := principalIDOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrTaxReturnNotFound) {
+			writeError(w, http.StatusNotFound, "corporate tax return not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch corporate tax return")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnSubmit) {
+		return
+	}
+
 	var req domain.SubmitTaxReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -185,6 +256,25 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
+
+	principalID, ok := principalIDOrUnauthorized(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrTaxReturnNotFound) {
+			writeError(w, http.StatusNotFound, "corporate tax return not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch corporate tax return")
+		return
+	}
+
+	if !h.checkAuthorized(w, r, principalID, existing.LegalEntityID, ActionTaxReturnAssess) {
+		return
+	}
 
 	var req domain.AssessTaxReturnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

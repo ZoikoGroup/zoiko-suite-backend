@@ -177,7 +177,7 @@ func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.Contract,
 		       COALESCE(description,''), counterparty_id, counterparty_name, status, version,
 		       `+effectiveDateColumns+`, signed_at, signed_by,
 		       terminated_at, terminated_by, termination_note,
-		       currency, total_value, document_vault_id, created_by, created_at, updated_at
+		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at
 		FROM contracts WHERE contract_id = $1 AND tenant_id = $2`,
 		id, middleware.GetTenantID(ctx),
 	).Scan(
@@ -185,7 +185,7 @@ func (s *PgStore) GetContract(ctx context.Context, id string) (*domain.Contract,
 		&c.Description, &c.CounterpartyID, &c.CounterpartyName, &status, &c.Version,
 		&c.EffectiveFrom, &c.EffectiveTo, &c.SignedAt, &c.SignedBy,
 		&c.TerminatedAt, &c.TerminatedBy, &c.TerminationNote,
-		&c.Currency, &c.TotalValue, &c.DocumentVaultID, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
+		&c.Currency, &c.TotalValue, &c.DocumentVaultID, &c.GovernanceDecisionID, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
 	)
 	if err != nil {
 		if errorsIs(err, pgx.ErrNoRows) {
@@ -215,7 +215,7 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID string) ([]do
 		       COALESCE(description,''), counterparty_id, counterparty_name, status, version,
 		       `+effectiveDateColumns+`, signed_at, signed_by,
 		       terminated_at, terminated_by, termination_note,
-		       currency, total_value, document_vault_id, created_by, created_at, updated_at
+		       currency, total_value, document_vault_id, governance_decision_id, created_by, created_at, updated_at
 		FROM contracts
 		WHERE tenant_id = $2 AND ($1 = '' OR legal_entity_id = $1)
 		ORDER BY created_at DESC`,
@@ -235,7 +235,7 @@ func (s *PgStore) ListContracts(ctx context.Context, legalEntityID string) ([]do
 			&c.Description, &c.CounterpartyID, &c.CounterpartyName, &status, &c.Version,
 			&c.EffectiveFrom, &c.EffectiveTo, &c.SignedAt, &c.SignedBy,
 			&c.TerminatedAt, &c.TerminatedBy, &c.TerminationNote,
-			&c.Currency, &c.TotalValue, &c.DocumentVaultID, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
+			&c.Currency, &c.TotalValue, &c.DocumentVaultID, &c.GovernanceDecisionID, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -331,14 +331,15 @@ func (s *PgStore) ActivateContract(ctx context.Context, id string, req *domain.A
 	c.SignedBy = &req.SignedBy
 	c.SignedAt = &req.SignedAt
 	c.DocumentVaultID = req.DocumentVaultID
+	c.GovernanceDecisionID = &req.GovernanceDecisionID
 	c.UpdatedAt = now
 	c.Version++
 
 	_, err = tx.Exec(ctx, `
 		UPDATE contracts
-		SET status=$1, signed_by=$2, signed_at=$3, document_vault_id=$4, version=$5, updated_at=$6
-		WHERE contract_id=$7 AND tenant_id=$8`,
-		string(c.Status), c.SignedBy, c.SignedAt, c.DocumentVaultID, c.Version, c.UpdatedAt, id,
+		SET status=$1, signed_by=$2, signed_at=$3, document_vault_id=$4, governance_decision_id=$5, version=$6, updated_at=$7
+		WHERE contract_id=$8 AND tenant_id=$9`,
+		string(c.Status), c.SignedBy, c.SignedAt, c.DocumentVaultID, c.GovernanceDecisionID, c.Version, c.UpdatedAt, id,
 		middleware.GetTenantID(ctx),
 	)
 	if err != nil {

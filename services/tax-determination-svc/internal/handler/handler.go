@@ -1,8 +1,12 @@
 package handler
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -16,16 +20,75 @@ import (
 	"zoiko.io/tax-determination-svc/internal/store"
 )
 
+// snapshotTaxRule computes a content-addressed reference over the actual
+// rule fields tax-rules-svc returned, pinning a determination to the exact
+// rule content applied — independent of later edits to the mutable rule row
+// rule_id points at. Returns nil for the zero-tax fallback (tax-rules-svc
+// unreachable): there is no real rule content to snapshot, and fabricating
+// one would misrepresent a fallback as a governed rule application.
+func snapshotTaxRule(rule *rules.TaxRuleDTO) *string {
+	// "trule-fallback" is this handler's own (currently unreachable) local
+	// fallback; "trule-default-fallback"/"trule-default-zero" are
+	// rules.Client's actual fallback sentinels — a transport error or an
+	// empty rule set from tax-rules-svc, respectively. None represent a
+	// real, governed rule application.
+	if rule == nil || rule.RuleID == "trule-fallback" ||
+		rule.RuleID == "trule-default-fallback" || rule.RuleID == "trule-default-zero" {
+		return nil
+	}
+	canonical := fmt.Sprintf("%s|%s|%s|%.6f|%.6f|%s",
+		rule.RuleID, rule.RuleCode, rule.Category, rule.TaxRatePercentage, rule.StandardDeductions, rule.Status)
+	sum := sha256.Sum256([]byte(canonical))
+	hash := hex.EncodeToString(sum[:])
+	return &hash
+}
+
+// Action constants for authorization-svc calls, shaped <RESOURCE>_<VERB>.
+const (
+	ActionTaxDeterminationCreate   = "TAX_DETERMINATION_CREATE"
+	ActionTaxDeterminationOverride = "TAX_DETERMINATION_OVERRIDE"
+)
+
+// AuthzChecker is the subset of authz.Client's contract the handler depends
+// on. It is an interface (rather than *authz.Client directly) so tests can
+// substitute a stub without exercising real HTTP calls.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+var _ AuthzChecker = (*authz.Client)(nil)
+
 type Handler struct {
 	store       store.Store
 	publisher   events.Publisher
-	authz       *authz.Client
+	authz       AuthzChecker
 	rulesClient *rules.Client
 	logger      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, rc *rules.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthzChecker, rc *rules.Client, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, rulesClient: rc, logger: logger}
+}
+
+// authorize extracts the caller's principal from the X-Principal-Id header
+// and checks the action against authorization-svc before any mutation is
+// performed. It writes the appropriate error response itself when the
+// caller should not proceed.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, legalEntityID, actionType string) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		} else {
+			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		}
+		return "", false
+	}
+	return principalID, true
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -47,6 +110,10 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TransactionID == "" || req.JurisdictionID == "" || req.TaxCategory == "" || req.GrossAmount <= 0 {
 		writeError(w, http.StatusBadRequest, "transaction_id, jurisdiction_id, tax_category, and positive gross_amount are required")
+		return
+	}
+
+	if _, ok := h.authorize(w, r, req.LegalEntityID, ActionTaxDeterminationCreate); !ok {
 		return
 	}
 
@@ -73,6 +140,7 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		LegalEntityID:       req.LegalEntityID,
 		JurisdictionID:      req.JurisdictionID,
 		RuleID:              rule.RuleID,
+		TaxLogicSnapshotID:  snapshotTaxRule(rule),
 		TaxCategory:         req.TaxCategory,
 		GrossAmount:         req.GrossAmount,
 		TaxableAmount:       taxableAmount,
@@ -135,6 +203,20 @@ func (h *Handler) OverrideDetermination(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.Reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required for tax override")
+		return
+	}
+
+	existing, err := h.store.GetDetermination(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrTaxDeterminationNotFound) {
+			writeError(w, http.StatusNotFound, "tax determination not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get tax determination")
+		return
+	}
+
+	if _, ok := h.authorize(w, r, existing.LegalEntityID, ActionTaxDeterminationOverride); !ok {
 		return
 	}
 

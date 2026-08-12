@@ -15,17 +15,30 @@ import (
 	"zoiko.io/reporting-orchestration-svc/internal/store"
 )
 
-func newRouter() http.Handler {
+// newGrantingAuthzServer stands in for authorization-svc in tests: it
+// always grants, matching the real service's contract of always returning
+// HTTP 200 with a decision in the body.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func newRouter(t *testing.T) http.Handler {
 	logger := zap.NewNop()
 	s := store.NewMemoryStore()
 	p := events.NewPublisher([]string{"localhost:9092"}, "zoiko.reporting-orchestration.events", logger)
-	a := authz.NewClient("http://localhost:8089", logger)
+	authzSrv := newGrantingAuthzServer(t)
+	a := authz.NewClient(authzSrv.URL, logger)
 	h := handler.NewHandler(s, p, a, logger)
 	return handler.NewRouter(h)
 }
 
 func TestHealthCheck(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -43,7 +56,7 @@ func TestHealthCheck(t *testing.T) {
 }
 
 func TestCreateDefinitionAndTriggerRun(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 
 	// 1. Create Report Definition
 	createReq := domain.CreateDefinitionRequest{
@@ -58,6 +71,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/reports/definitions", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-01")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -108,6 +122,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 	runReq := httptest.NewRequest(http.MethodPost, "/v1/reports/definitions/"+def.ID+"/runs", bytes.NewBuffer(runBody))
 	runReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	runReq.Header.Set("Content-Type", "application/json")
+	runReq.Header.Set("X-Principal-Id", "principal-01")
 	runRec := httptest.NewRecorder()
 	router.ServeHTTP(runRec, runReq)
 
@@ -155,6 +170,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 	patchReq := httptest.NewRequest(http.MethodPatch, "/v1/reports/definitions/"+def.ID+"/status", bytes.NewBuffer(patchBody))
 	patchReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	patchReq.Header.Set("Content-Type", "application/json")
+	patchReq.Header.Set("X-Principal-Id", "principal-01")
 	patchRec := httptest.NewRecorder()
 	router.ServeHTTP(patchRec, patchReq)
 	if patchRec.Code != http.StatusOK {
@@ -163,7 +179,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 }
 
 func TestValidationErrors(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 
 	// Missing legal_entity_id
 	body, _ := json.Marshal(domain.CreateDefinitionRequest{ReportName: "Test"})
@@ -178,7 +194,7 @@ func TestValidationErrors(t *testing.T) {
 }
 
 func TestTriggerRunOnMissingDefinition(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 
 	runBody, _ := json.Marshal(domain.TriggerRunRequest{TriggeredBy: domain.TriggerManual})
 	req := httptest.NewRequest(http.MethodPost, "/v1/reports/definitions/non-existent-id/runs", bytes.NewBuffer(runBody))

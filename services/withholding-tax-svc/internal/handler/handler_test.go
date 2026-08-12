@@ -119,10 +119,22 @@ func (p *mockPublisher) Publish(ctx context.Context, eventType, obligationID, te
 	return nil
 }
 
-func setupTestRouter() (*chi.Mux, *mockStore) {
+// newGrantingAuthzServer stands in for authorization-svc and always grants,
+// matching the real contract: HTTP 200 with {"decision_outcome": "GRANTED"}.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) (*chi.Mux, *mockStore) {
 	st := newMockStore()
 	pub := &mockPublisher{}
-	az := authz.NewClient("http://localhost:8089")
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
 	logger, _ := zap.NewDevelopment()
 	h := New(st, pub, az, logger)
 
@@ -132,9 +144,10 @@ func setupTestRouter() (*chi.Mux, *mockStore) {
 }
 
 func TestCalculateWithholding(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	reqPayload := domain.CalculateWithholdingRequest{
+		LegalEntityID:          "entity-001",
 		GrossPaymentAmount:     10000.0,
 		TaxableBaseAmount:      10000.0,
 		WithholdingRatePercent: 15.0,
@@ -144,6 +157,7 @@ func TestCalculateWithholding(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/withholding-tax/calculate", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "user-001")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -162,7 +176,7 @@ func TestCalculateWithholding(t *testing.T) {
 }
 
 func TestCreateAndRemitObligation(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	reqPayload := domain.CreateObligationRequest{
 		LegalEntityID:          "entity-001",
@@ -180,6 +194,7 @@ func TestCreateAndRemitObligation(t *testing.T) {
 
 	req := httptest.NewRequest("POST", "/v1/withholding-tax", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "user-001")
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -204,6 +219,7 @@ func TestCreateAndRemitObligation(t *testing.T) {
 	remitBody, _ := json.Marshal(remitPayload)
 	remitReq := httptest.NewRequest("POST", "/v1/withholding-tax/"+created.ObligationID+"/remit", bytes.NewBuffer(remitBody))
 	remitReq.Header.Set("Content-Type", "application/json")
+	remitReq.Header.Set("X-Principal-Id", "user-001")
 	remitW := httptest.NewRecorder()
 
 	r.ServeHTTP(remitW, remitReq)

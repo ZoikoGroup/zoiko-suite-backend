@@ -21,7 +21,7 @@ import (
 // ── stubs ────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	invoices     map[string]*domain.VendorInvoice
+	invoices      map[string]*domain.VendorInvoice
 	byCorrelation map[string]string
 
 	createErr     error
@@ -88,10 +88,18 @@ type stubPublisher struct {
 	received, validated, approved, paymentRequested int
 }
 
-func (p *stubPublisher) PublishVendorInvoiceReceived(_ context.Context, _ domain.VendorInvoice)  { p.received++ }
-func (p *stubPublisher) PublishVendorInvoiceValidated(_ context.Context, _ domain.VendorInvoice) { p.validated++ }
-func (p *stubPublisher) PublishVendorInvoiceApproved(_ context.Context, _ domain.VendorInvoice)  { p.approved++ }
-func (p *stubPublisher) PublishPaymentRequested(_ context.Context, _ domain.VendorInvoice)       { p.paymentRequested++ }
+func (p *stubPublisher) PublishVendorInvoiceReceived(_ context.Context, _ domain.VendorInvoice) {
+	p.received++
+}
+func (p *stubPublisher) PublishVendorInvoiceValidated(_ context.Context, _ domain.VendorInvoice) {
+	p.validated++
+}
+func (p *stubPublisher) PublishVendorInvoiceApproved(_ context.Context, _ domain.VendorInvoice) {
+	p.approved++
+}
+func (p *stubPublisher) PublishPaymentRequested(_ context.Context, _ domain.VendorInvoice) {
+	p.paymentRequested++
+}
 
 type stubAuthZ struct {
 	err error
@@ -436,7 +444,7 @@ func TestValidateInvoice_FromReceived_Succeeds(t *testing.T) {
 
 func TestApproveInvoice_FromValidated_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusValidated}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator"}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -449,6 +457,26 @@ func TestApproveInvoice_FromValidated_Succeeds(t *testing.T) {
 	}
 	if pub.approved != 1 {
 		t.Fatalf("expected vendor.invoice.approved to be published once, got %d", pub.approved)
+	}
+}
+
+func TestApproveInvoice_BySameCreator_Returns403(t *testing.T) {
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the principal who created the invoice may not be the one approving it.
+	s := newStubStore()
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-1"}
+
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/approve", nil, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 approving an invoice created by the same principal, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.invoices["i1"].Status != domain.InvoiceStatusValidated {
+		t.Fatalf("expected status to remain VALIDATED after rejected self-approval, got %s", s.invoices["i1"].Status)
+	}
+	if pub.approved != 0 {
+		t.Fatalf("expected no approved event to be published for a rejected self-approval, got %d", pub.approved)
 	}
 }
 

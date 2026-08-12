@@ -20,13 +20,20 @@ const (
 )
 
 type TaxDetermination struct {
-	DeterminationID     string              `json:"determination_id"`
-	TenantID            string              `json:"tenant_id"`
-	TransactionID       string              `json:"transaction_id"`
-	SourceModule        string              `json:"source_module"` // INVOICE, PAYROLL, PURCHASE_ORDER, AP, AR
-	LegalEntityID       string              `json:"legal_entity_id"`
-	JurisdictionID      string              `json:"jurisdiction_id"`
-	RuleID              string              `json:"rule_id,omitempty"`
+	DeterminationID string `json:"determination_id"`
+	TenantID        string `json:"tenant_id"`
+	TransactionID   string `json:"transaction_id"`
+	SourceModule    string `json:"source_module"` // INVOICE, PAYROLL, PURCHASE_ORDER, AP, AR
+	LegalEntityID   string `json:"legal_entity_id"`
+	JurisdictionID  string `json:"jurisdiction_id"`
+	RuleID          string `json:"rule_id,omitempty"`
+	// TaxLogicSnapshotID is a content-addressed (SHA-256) reference over the
+	// actual rule fields applied at determination time — pins this
+	// determination to the exact rule content used, independent of later
+	// edits to the mutable rule row rule_id points at. Nil only when the
+	// zero-tax fallback was used (tax-rules-svc unreachable, no real rule
+	// content to snapshot).
+	TaxLogicSnapshotID  *string             `json:"tax_logic_snapshot_id,omitempty"`
 	TaxCategory         string              `json:"tax_category"`
 	GrossAmount         float64             `json:"gross_amount"`
 	TaxableAmount       float64             `json:"taxable_amount"`

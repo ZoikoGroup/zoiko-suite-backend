@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -16,15 +17,58 @@ import (
 	"zoiko.io/filing-tracker-svc/internal/store"
 )
 
+// Action types passed to authorization-svc for each write action this
+// service performs. No domain service self-authorizes a material action.
+const (
+	ActionFilingRequirementCreate = "FILING_REQUIREMENT_CREATE"
+	ActionFilingRequirementUpdate = "FILING_REQUIREMENT_UPDATE"
+	ActionFilingSubmit            = "FILING_SUBMIT"
+	ActionFilingConfirm           = "FILING_CONFIRM"
+	ActionFilingMarkOverdue       = "FILING_MARK_OVERDUE"
+)
+
+// AuthzClient is the authorization-svc contract this handler depends on.
+// Defined here (rather than depending on the concrete *authz.Client) so
+// tests can supply a stub.
+type AuthzClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
 type Handler struct {
 	store     store.Store
 	publisher events.Publisher
-	authz     *authz.Client
+	authz     AuthzClient
 	logger    *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
+func New(st store.Store, pub events.Publisher, az AuthzClient, logger *zap.Logger) *Handler {
 	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+}
+
+// requirePrincipal extracts the caller's principal from the X-Principal-Id
+// header. If missing, it writes a 401 and returns ok=false.
+func requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// checkAllowed calls authorization-svc and writes the appropriate error
+// response (403 for an explicit denial, 503 for anything else, including
+// unavailability) if the action is not granted. Fails CLOSED.
+func (h *Handler) checkAllowed(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authz.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to perform this action")
+			return false
+		}
+		writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		return false
+	}
+	return true
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -42,6 +86,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.CreateRequirementRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -49,6 +98,10 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.LegalEntityID == "" || req.JurisdictionID == "" || req.FilingAuthority == "" || req.DueDate == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id, jurisdiction_id, filing_authority, and due_date are required")
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, req.LegalEntityID, ActionFilingRequirementCreate) {
 		return
 	}
 
@@ -111,6 +164,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	existing, err := h.store.GetByID(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrRequirementNotFound) {
@@ -118,6 +176,10 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeError(w, http.StatusInternalServerError, "failed to fetch filing requirement")
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, existing.LegalEntityID, ActionFilingRequirementUpdate) {
 		return
 	}
 
@@ -143,6 +205,21 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrRequirementNotFound) {
+			writeError(w, http.StatusNotFound, "filing requirement not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch filing requirement")
+		return
+	}
+
 	var req domain.SubmitFilingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -150,6 +227,10 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.SubmissionReference == "" || req.SubmittedBy == "" {
 		writeError(w, http.StatusBadRequest, "submission_reference and submitted_by are required")
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, existing.LegalEntityID, ActionFilingSubmit) {
 		return
 	}
 
@@ -173,6 +254,21 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
 
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrRequirementNotFound) {
+			writeError(w, http.StatusNotFound, "filing requirement not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch filing requirement")
+		return
+	}
+
 	var req domain.ConfirmFilingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -180,6 +276,10 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ConfirmationReference == "" {
 		writeError(w, http.StatusBadRequest, "confirmation_reference is required")
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, existing.LegalEntityID, ActionFilingConfirm) {
 		return
 	}
 
@@ -202,6 +302,25 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	tenantID := middleware.GetTenantID(r.Context())
+
+	principalID, ok := requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	existing, err := h.store.GetByID(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrRequirementNotFound) {
+			writeError(w, http.StatusNotFound, "filing requirement not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch filing requirement")
+		return
+	}
+
+	if !h.checkAllowed(w, r, principalID, existing.LegalEntityID, ActionFilingMarkOverdue) {
+		return
+	}
 
 	todayStr := time.Now().Format("2006-01-02")
 	f, err := h.store.MarkOverdue(r.Context(), id, todayStr)

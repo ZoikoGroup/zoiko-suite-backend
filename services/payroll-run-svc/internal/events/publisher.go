@@ -32,7 +32,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 }
 
 func (p *Publisher) PublishRunInitiated(ctx context.Context, correlationID string, r domain.PayrollRun) {
-	p.emit(ctx, "payroll.run.initiated", correlationID, map[string]any{
+	p.emit(ctx, "payroll.run.initiated", correlationID, r.RunID, map[string]any{
 		"run_id":           r.RunID,
 		"tenant_id":        r.TenantID,
 		"legal_entity_id":  r.LegalEntityID,
@@ -47,7 +47,7 @@ func (p *Publisher) PublishRunInitiated(ctx context.Context, correlationID strin
 }
 
 func (p *Publisher) PublishRunCalculated(ctx context.Context, correlationID string, r domain.PayrollRun) {
-	p.emit(ctx, "payroll.run.calculated", correlationID, map[string]any{
+	p.emit(ctx, "payroll.run.calculated", correlationID, r.RunID, map[string]any{
 		"run_id":               r.RunID,
 		"tenant_id":            r.TenantID,
 		"legal_entity_id":      r.LegalEntityID,
@@ -62,7 +62,7 @@ func (p *Publisher) PublishRunCalculated(ctx context.Context, correlationID stri
 }
 
 func (p *Publisher) PublishRunCompleted(ctx context.Context, correlationID string, r domain.PayrollRun) {
-	p.emit(ctx, "payroll.run.completed", correlationID, map[string]any{
+	p.emit(ctx, "payroll.run.completed", correlationID, r.RunID, map[string]any{
 		"run_id":               r.RunID,
 		"tenant_id":            r.TenantID,
 		"legal_entity_id":      r.LegalEntityID,
@@ -77,7 +77,7 @@ func (p *Publisher) PublishRunCompleted(ctx context.Context, correlationID strin
 }
 
 func (p *Publisher) PublishRunBlocked(ctx context.Context, correlationID string, r domain.PayrollRun, reason string) {
-	p.emit(ctx, "payroll.run.blocked", correlationID, map[string]any{
+	p.emit(ctx, "payroll.run.blocked", correlationID, r.RunID, map[string]any{
 		"run_id":          r.RunID,
 		"tenant_id":       r.TenantID,
 		"legal_entity_id": r.LegalEntityID,
@@ -87,7 +87,7 @@ func (p *Publisher) PublishRunBlocked(ctx context.Context, correlationID string,
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -110,7 +110,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

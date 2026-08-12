@@ -37,6 +37,16 @@ type Config struct {
 	OTELExporterEndpoint string
 }
 
+// KafkaConfig holds event-backbone connection parameters. Per
+// docs/architecture/03-microservices.md §8.2, this service publishes
+// jurisdiction.rule.updated and jurisdiction.rule.activated — see
+// internal/events/publisher.go for what is and isn't wired.
+type KafkaConfig struct {
+	Brokers []string
+	GroupID string
+	Topic   string
+}
+
 // DBConfig holds PostgreSQL connection parameters.
 type DBConfig struct {
 	Host     string
@@ -45,13 +55,6 @@ type DBConfig struct {
 	User     string
 	Password string
 	SSLMode  string
-}
-
-// KafkaConfig holds event backbone connection parameters.
-type KafkaConfig struct {
-	Brokers []string
-	GroupID string
-	Topic   string
 }
 
 func (d DBConfig) DSN() string {

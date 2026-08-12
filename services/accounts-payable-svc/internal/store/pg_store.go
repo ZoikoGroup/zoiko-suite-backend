@@ -49,6 +49,7 @@ var invoiceColumns = []string{
 	"currency_code",
 	"due_date",
 	"status",
+	"source_contract_id",
 	"created_by_principal_id",
 	"validated_by_principal_id",
 	"approved_by_principal_id",
@@ -76,6 +77,7 @@ func scanTargets(inv *domain.VendorInvoice, status *string) []any {
 		&inv.CurrencyCode,
 		&inv.DueDate,
 		status,
+		&inv.SourceContractID,
 		&inv.CreatedByPrincipalID,
 		&inv.ValidatedByPrincipalID,
 		&inv.ApprovedByPrincipalID,
@@ -186,12 +188,12 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) 
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO vendor_invoices (
 				invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
-				amount, currency_code, due_date, status, created_by_principal_id,
+				amount, currency_code, due_date, status, source_contract_id, created_by_principal_id,
 				correlation_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, inv.InvoiceID, inv.TenantID, inv.LegalEntityID, inv.VendorID, inv.InvoiceNumber,
-			inv.Amount, inv.CurrencyCode, inv.DueDate, string(inv.Status), inv.CreatedByPrincipalID,
+			inv.Amount, inv.CurrencyCode, inv.DueDate, string(inv.Status), inv.SourceContractID, inv.CreatedByPrincipalID,
 			inv.CorrelationID, now)
 		if err != nil {
 			return mapPgError(err)

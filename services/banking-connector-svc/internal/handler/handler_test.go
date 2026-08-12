@@ -18,10 +18,23 @@ import (
 	"zoiko.io/banking-connector-svc/internal/store"
 )
 
-func setupTestRouter() (chi.Router, *events.MockPublisher) {
+// newGrantingAuthzServer stands in for authorization-svc in tests: it
+// always grants, matching the real service's contract of always returning
+// HTTP 200 with a decision in the body.
+func newGrantingAuthzServer(t *testing.T) *httptest.Server {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"decision_outcome": "GRANTED"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func setupTestRouter(t *testing.T) (chi.Router, *events.MockPublisher) {
 	st := store.NewMemoryStore()
 	pub := events.NewMockPublisher()
-	az := authz.NewClient("http://localhost:8081")
+	authzSrv := newGrantingAuthzServer(t)
+	az := authz.NewClient(authzSrv.URL)
 	logger := zap.NewNop()
 
 	h := New(st, pub, az, logger)
@@ -33,7 +46,7 @@ func setupTestRouter() (chi.Router, *events.MockPublisher) {
 }
 
 func TestBankingFlow(t *testing.T) {
-	r, _ := setupTestRouter()
+	r, _ := setupTestRouter(t)
 
 	connReq := domain.CreateConnectionRequest{
 		LegalEntityID: "le-101",
@@ -47,6 +60,7 @@ func TestBankingFlow(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/banking/connections", bytes.NewReader(connBytes))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-test")
+	req.Header.Set("X-Principal-Id", "principal-01")
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -73,6 +87,7 @@ func TestBankingFlow(t *testing.T) {
 	stmtHTTP := httptest.NewRequest("POST", "/v1/banking/statements", bytes.NewReader(stmtBytes))
 	stmtHTTP.Header.Set("Content-Type", "application/json")
 	stmtHTTP.Header.Set("X-Tenant-ID", "tenant-test")
+	stmtHTTP.Header.Set("X-Principal-Id", "principal-01")
 
 	stmtW := httptest.NewRecorder()
 	r.ServeHTTP(stmtW, stmtHTTP)

@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/vat-gst-svc/internal/authz"
 	"zoiko.io/vat-gst-svc/internal/domain"
 	"zoiko.io/vat-gst-svc/internal/events"
 )
@@ -79,9 +80,22 @@ func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
+// stubAuthz is a test double for AuthzChecker. By default it grants every
+// request; tests that need to exercise the deny/unavailable paths can flip
+// err to authz.ErrAuthorizationDenied or authz.ErrAuthzServiceUnavailable.
+type stubAuthz struct {
+	err error
+}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return s.err
+}
+
+var _ AuthzChecker = (*stubAuthz)(nil)
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, nil, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -92,6 +106,7 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "principal-test-01")
 	return r
 }
 
@@ -161,5 +176,78 @@ func TestFileVATReturn(t *testing.T) {
 	_ = json.NewDecoder(wFile.Body).Decode(&filed)
 	if filed.Status != domain.StatusFiled {
 		t.Errorf("expected FILED, got %s", filed.Status)
+	}
+}
+
+func TestCreateVATReturn_MissingPrincipalHeader(t *testing.T) {
+	h := newTestHandler()
+	body := domain.CreateVATReturnRequest{
+		LegalEntityID:  "le-001",
+		JurisdictionID: "uk-england",
+		TaxPeriod:      "2026-Q1",
+	}
+	req := buildRequest(http.MethodPost, "/v1/vat-returns", body)
+	req.Header.Del("X-Principal-Id")
+
+	w := httptest.NewRecorder()
+	h.CreateVATReturn(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateVATReturn_AuthzDenied(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{err: authz.ErrAuthorizationDenied}, logger)
+	body := domain.CreateVATReturnRequest{
+		LegalEntityID:  "le-001",
+		JurisdictionID: "uk-england",
+		TaxPeriod:      "2026-Q1",
+	}
+	w := httptest.NewRecorder()
+	h.CreateVATReturn(w, buildRequest(http.MethodPost, "/v1/vat-returns", body))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateVATReturn_AuthzServiceUnavailable(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{err: authz.ErrAuthzServiceUnavailable}, logger)
+	body := domain.CreateVATReturnRequest{
+		LegalEntityID:  "le-001",
+		JurisdictionID: "uk-england",
+		TaxPeriod:      "2026-Q1",
+	}
+	w := httptest.NewRecorder()
+	h.CreateVATReturn(w, buildRequest(http.MethodPost, "/v1/vat-returns", body))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFileVATReturn_MissingPrincipalHeader(t *testing.T) {
+	h := newTestHandler()
+	r := chi.NewRouter()
+	RegisterRoutes(r, h)
+
+	body := domain.CreateVATReturnRequest{
+		LegalEntityID:  "le-001",
+		JurisdictionID: "uk-england",
+		TaxPeriod:      "2026-Q1",
+		CreatedBy:      "tax-officer-01",
+	}
+	wCreate := httptest.NewRecorder()
+	r.ServeHTTP(wCreate, buildRequest(http.MethodPost, "/v1/vat-returns", body))
+	var created domain.VATReturn
+	_ = json.NewDecoder(wCreate.Body).Decode(&created)
+
+	fileReq := buildRequest(http.MethodPost, "/v1/vat-returns/"+created.ReturnID+"/file", domain.FileVATReturnRequest{FiledBy: "tax-director"})
+	fileReq.Header.Del("X-Principal-Id")
+
+	wFile := httptest.NewRecorder()
+	r.ServeHTTP(wFile, fileReq)
+	if wFile.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d — %s", wFile.Code, wFile.Body.String())
 	}
 }

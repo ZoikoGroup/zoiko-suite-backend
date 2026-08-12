@@ -31,7 +31,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 }
 
 func (p *Publisher) PublishStarted(ctx context.Context, correlationID string, check domain.VendorDDCheck) {
-	p.emit(ctx, "vendor.dd.started", correlationID, map[string]any{
+	p.emit(ctx, "vendor.dd.started", correlationID, check.CheckID, map[string]any{
 		"check_id":                  check.CheckID,
 		"tenant_id":                 check.TenantID,
 		"legal_entity_id":           check.LegalEntityID,
@@ -43,7 +43,7 @@ func (p *Publisher) PublishStarted(ctx context.Context, correlationID string, ch
 }
 
 func (p *Publisher) PublishCompleted(ctx context.Context, correlationID string, check domain.VendorDDCheck) {
-	p.emit(ctx, "vendor.dd.completed", correlationID, map[string]any{
+	p.emit(ctx, "vendor.dd.completed", correlationID, check.CheckID, map[string]any{
 		"check_id":        check.CheckID,
 		"tenant_id":       check.TenantID,
 		"legal_entity_id": check.LegalEntityID,
@@ -64,7 +64,7 @@ func (p *Publisher) PublishCompleted(ctx context.Context, correlationID string, 
 }
 
 func (p *Publisher) PublishFailed(ctx context.Context, correlationID string, check domain.VendorDDCheck, reason string) {
-	p.emit(ctx, "vendor.dd.failed", correlationID, map[string]any{
+	p.emit(ctx, "vendor.dd.failed", correlationID, check.CheckID, map[string]any{
 		"check_id":        check.CheckID,
 		"tenant_id":       check.TenantID,
 		"legal_entity_id": check.LegalEntityID,
@@ -75,7 +75,7 @@ func (p *Publisher) PublishFailed(ctx context.Context, correlationID string, che
 	})
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -98,7 +98,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Info("simulating publish event in dry mode", zap.String("event_type", eventType))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

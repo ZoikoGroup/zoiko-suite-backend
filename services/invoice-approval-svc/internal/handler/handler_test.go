@@ -271,3 +271,43 @@ func TestSubmitDecision_MultiStepApprovalAndRejection(t *testing.T) {
 		t.Fatalf("expected 409 got %d", rrConflict.Code)
 	}
 }
+
+// TestSubmitDecision_SelfApprovalNotAllowed enforces the platform's
+// Segregation of Duties doctrine (docs/original_doc/zoiko_suite_doc1.txt
+// §12.3): the principal who created the approval request may not also be
+// the one who decides it.
+func TestSubmitDecision_SelfApprovalNotAllowed(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubClients{})
+
+	rrCreate := doReq(r, http.MethodPost, "/v1/invoice-approvals/", map[string]any{
+		"invoice_id":      "inv-300",
+		"legal_entity_id": "le-us",
+		"invoice_amount":  2500.0,
+		"currency_code":   "USD",
+	}, "principal-initiator")
+
+	var created domain.InvoiceApprovalRequest
+	_ = json.NewDecoder(rrCreate.Body).Decode(&created)
+
+	rrDecide := doReq(r, http.MethodPost, "/v1/invoice-approvals/"+created.ApprovalRequestID+"/decide", map[string]any{
+		"decision": "APPROVED",
+	}, "principal-initiator")
+
+	if rrDecide.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 self-approval got %d: %s", rrDecide.Code, rrDecide.Body.String())
+	}
+
+	// The request must remain untouched — still PENDING, no decision saved.
+	stored, err := s.GetRequest(context.Background(), created.ApprovalRequestID)
+	if err != nil {
+		t.Fatalf("GetRequest: %v", err)
+	}
+	if stored.Status != "PENDING" {
+		t.Errorf("expected request to remain PENDING after rejected self-approval, got %q", stored.Status)
+	}
+	if pub.approved != 0 {
+		t.Errorf("expected no approved event on self-approval attempt, got %d", pub.approved)
+	}
+}

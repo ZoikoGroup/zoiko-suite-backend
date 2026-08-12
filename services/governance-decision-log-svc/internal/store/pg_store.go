@@ -5,7 +5,7 @@
 // audit-event-store-svc/internal/store/store.go):
 //   - No UPDATE or DELETE on any stored decision — ever.
 //   - Idempotency is guaranteed by a single atomic database statement:
-//       INSERT INTO governance_decisions … ON CONFLICT (decision_id) DO NOTHING
+//     INSERT INTO governance_decisions … ON CONFLICT (decision_id) DO NOTHING
 //     A prior SELECT-EXISTS check is explicitly prohibited: two concurrent
 //     callers can both pass a SELECT EXISTS check before either inserts,
 //     producing a duplicate row. The ON CONFLICT clause makes the entire
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -30,6 +31,7 @@ import (
 // (03-microservices.md §8.7): actor, entity, action, rule basis, time
 // range. All fields are optional and compose with AND semantics.
 type ListParams struct {
+	TenantID      string
 	ActorID       string
 	LegalEntityID string
 	ActionType    string
@@ -47,12 +49,14 @@ type Store interface {
 	// Returns (true, nil) if this call performed the insert.
 	Insert(ctx context.Context, d domain.GovernanceDecision) (created bool, err error)
 
-	// FindByID retrieves a single decision by its DecisionID.
-	// Returns domain.ErrDecisionNotFound if no row matches.
-	FindByID(ctx context.Context, decisionID string) (*domain.GovernanceDecision, error)
+	// FindByID retrieves a single decision by its DecisionID, scoped to
+	// tenantID. A decision belonging to a different tenant is indistinguishable
+	// from a nonexistent one — returns domain.ErrDecisionNotFound in both cases.
+	FindByID(ctx context.Context, tenantID, decisionID string) (*domain.GovernanceDecision, error)
 
-	// List returns a paginated slice of decisions matching params. All
-	// filter fields are optional and compose with AND semantics.
+	// List returns a paginated slice of decisions matching params, always
+	// scoped to params.TenantID. All other filter fields are optional and
+	// compose with AND semantics.
 	List(ctx context.Context, params ListParams) ([]*domain.GovernanceDecision, error)
 }
 
@@ -65,6 +69,31 @@ type PgStore struct {
 // New constructs a PgStore.
 func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
+}
+
+// withRLS runs fn inside a transaction with app.tenant_id set via
+// set_config, so the tenant_isolation_policy RLS policy on
+// governance_decisions (migration 000002) actually scopes every statement
+// fn issues. Mirrors the withRLS pattern used throughout the platform (e.g.
+// employee-master-svc).
+func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set tenant context: %w", err)
+	}
+
+	if err := fn(tx); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 // Insert writes d into governance_decisions.
@@ -80,23 +109,31 @@ func (s *PgStore) Insert(ctx context.Context, d domain.GovernanceDecision) (bool
 	const q = `
 INSERT INTO governance_decisions
     (decision_id, tenant_id, legal_entity_id, actor_id, action_type,
-     outcome, rule_basis, evaluation_context, correlation_id, decided_at)
+     outcome, rule_basis, evaluation_context, correlation_id,
+     workflow_instance_id, causation_id, decided_at)
 VALUES
-    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (decision_id) DO NOTHING`
 
-	tag, err := s.pool.Exec(ctx, q,
-		d.DecisionID,
-		d.TenantID,
-		d.LegalEntityID,
-		d.ActorID,
-		d.ActionType,
-		d.Outcome,
-		d.RuleBasis,
-		nullableJSON(d.EvaluationContext),
-		d.CorrelationID,
-		d.DecidedAt,
-	)
+	var tag pgconn.CommandTag
+	err := s.withRLS(ctx, d.TenantID, func(tx pgx.Tx) error {
+		var execErr error
+		tag, execErr = tx.Exec(ctx, q,
+			d.DecisionID,
+			d.TenantID,
+			d.LegalEntityID,
+			d.ActorID,
+			d.ActionType,
+			d.Outcome,
+			d.RuleBasis,
+			nullableJSON(d.EvaluationContext),
+			d.CorrelationID,
+			d.WorkflowInstanceID,
+			d.CausationID,
+			d.DecidedAt,
+		)
+		return execErr
+	})
 	if err != nil {
 		s.log.Error("pg Insert failed", zap.String("decision_id", d.DecisionID), zap.Error(err))
 		return false, fmt.Errorf("%w: insert governance decision %q: %v", domain.ErrStoreUnavailable, d.DecisionID, err)
@@ -115,7 +152,8 @@ ON CONFLICT (decision_id) DO NOTHING`
 // Order must match scanDecision exactly.
 const decisionColumns = `
 	decision_id, tenant_id, legal_entity_id, actor_id, action_type,
-	outcome, rule_basis, evaluation_context, correlation_id, decided_at`
+	outcome, rule_basis, evaluation_context, correlation_id,
+	workflow_instance_id, causation_id, decided_at`
 
 // scanDecision scans one row produced by a decisionColumns SELECT.
 func scanDecision(row pgx.Row) (*domain.GovernanceDecision, error) {
@@ -130,18 +168,27 @@ func scanDecision(row pgx.Row) (*domain.GovernanceDecision, error) {
 		&d.RuleBasis,
 		&d.EvaluationContext,
 		&d.CorrelationID,
+		&d.WorkflowInstanceID,
+		&d.CausationID,
 		&d.DecidedAt,
 	)
 	return &d, err
 }
 
-// FindByID retrieves a single decision row.
-func (s *PgStore) FindByID(ctx context.Context, decisionID string) (*domain.GovernanceDecision, error) {
+// FindByID retrieves a single decision row, scoped to tenantID. The explicit
+// tenant_id = $2 filter is deliberate defense-in-depth alongside the RLS
+// policy — see withRLS — rather than relying on RLS alone.
+func (s *PgStore) FindByID(ctx context.Context, tenantID, decisionID string) (*domain.GovernanceDecision, error) {
 	const q = `SELECT ` + decisionColumns + `
 FROM governance_decisions
-WHERE decision_id = $1`
+WHERE decision_id = $1 AND tenant_id = $2`
 
-	d, err := scanDecision(s.pool.QueryRow(ctx, q, decisionID))
+	var d *domain.GovernanceDecision
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanDecision(tx.QueryRow(ctx, q, decisionID, tenantID))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrDecisionNotFound
 	}
@@ -173,6 +220,10 @@ func (s *PgStore) List(ctx context.Context, params ListParams) ([]*domain.Govern
 		args = append(args, val)
 		argIdx++
 	}
+
+	// tenant_id is always the first condition — every List call is
+	// tenant-scoped, backstopped by the RLS policy set in withRLS below.
+	addCond("tenant_id = $%d", params.TenantID)
 
 	if params.ActorID != "" {
 		addCond("actor_id = $%d", params.ActorID)
@@ -208,25 +259,26 @@ LIMIT  $%d OFFSET $%d`,
 	)
 	args = append(args, limit, params.Offset)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	var results []*domain.GovernanceDecision
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		rows, queryErr := tx.Query(ctx, query, args...)
+		if queryErr != nil {
+			return queryErr
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			d, scanErr := scanDecision(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, d)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg List failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: list governance decisions: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.GovernanceDecision
-	for rows.Next() {
-		d, scanErr := scanDecision(rows)
-		if scanErr != nil {
-			s.log.Error("pg List scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: list governance decisions: scan: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, d)
-	}
-	if err := rows.Err(); err != nil {
-		s.log.Error("pg List rows error", zap.Error(err))
-		return nil, fmt.Errorf("%w: list governance decisions: rows: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
 }

@@ -77,9 +77,15 @@ func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}
 
 var _ events.Publisher = (*stubPublisher)(nil)
 
+type stubAuthzClient struct{}
+
+func (s *stubAuthzClient) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return nil
+}
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, nil, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthzClient{}, logger)
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -90,6 +96,7 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Tenant-Id", "tenant-test-01")
+	r.Header.Set("X-Principal-Id", "principal-test-01")
 	return r
 }
 
@@ -99,9 +106,9 @@ func TestCreateObligation(t *testing.T) {
 		LegalEntityID:  "le-001",
 		SourceType:     "CONTRACT",
 		SourceID:       "ctr-123",
-		Title:          "Annual Tax Filing",
-		Description:    "Submit corporate income tax return",
-		ObligationType: domain.ObligationTypeStatutory,
+		Title:          "Deliver Q1 SLA report",
+		Description:    "SLA reporting obligation extracted from vendor contract",
+		ObligationType: domain.ObligationTypeContractual,
 		RiskLevel:      domain.RiskLevelHigh,
 		DueDate:        "2026-04-15",
 		EffectiveFrom:  "2026-01-01",
@@ -116,11 +123,50 @@ func TestCreateObligation(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
-	if resp.Title != "Annual Tax Filing" {
+	if resp.Title != "Deliver Q1 SLA report" {
 		t.Errorf("unexpected title: %s", resp.Title)
 	}
 	if resp.Status != domain.ObligationStatusPending {
 		t.Errorf("expected PENDING, got %s", resp.Status)
+	}
+}
+
+// TestCreateObligation_RejectsNonContractualType proves obligation-tracking-svc
+// no longer accepts statutory/regulatory/internal-policy obligations —
+// per docs/original_doc/zoiko_suite_doc4.txt:531, those route to
+// obligations-svc; this service owns contract-derived obligations only.
+func TestCreateObligation_RejectsNonContractualType(t *testing.T) {
+	h := newTestHandler()
+	body := domain.CreateObligationRequest{
+		LegalEntityID:  "le-001",
+		Title:          "Annual Tax Filing",
+		ObligationType: "STATUTORY",
+		DueDate:        "2026-04-15",
+		CreatedBy:      "user-001",
+	}
+	w := httptest.NewRecorder()
+	h.CreateObligation(w, buildRequest(http.MethodPost, "/v1/obligations", body))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-contractual obligation_type, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+// TestCreateObligation_RejectsInvalidSourceType proves a bare regulation
+// source (no contract involved) is refused — that belongs in obligations-svc.
+func TestCreateObligation_RejectsInvalidSourceType(t *testing.T) {
+	h := newTestHandler()
+	body := domain.CreateObligationRequest{
+		LegalEntityID:  "le-001",
+		SourceType:     "REGULATION",
+		Title:          "Some obligation",
+		ObligationType: domain.ObligationTypeContractual,
+		DueDate:        "2026-04-15",
+		CreatedBy:      "user-001",
+	}
+	w := httptest.NewRecorder()
+	h.CreateObligation(w, buildRequest(http.MethodPost, "/v1/obligations", body))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for source_type=REGULATION, got %d — %s", w.Code, w.Body.String())
 	}
 }
 
@@ -132,8 +178,10 @@ func TestFulfillObligation(t *testing.T) {
 	// First create an obligation
 	body := domain.CreateObligationRequest{
 		LegalEntityID:  "le-001",
-		Title:          "Quarterly Audit Review",
-		ObligationType: domain.ObligationTypeRegulatory,
+		SourceType:     "CLAUSE",
+		SourceID:       "clause-456",
+		Title:          "Quarterly deliverable review",
+		ObligationType: domain.ObligationTypeContractual,
 		DueDate:        "2026-03-31",
 		CreatedBy:      "user-001",
 	}

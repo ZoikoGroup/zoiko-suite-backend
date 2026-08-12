@@ -8,18 +8,24 @@ import (
 var (
 	ErrCorporateActionNotFound = errors.New("corporate action not found")
 	ErrActionAlreadyExecuted   = errors.New("corporate action is already executed")
+
+	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties
+	// doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal
+	// who created a record may not be the same principal who approves,
+	// executes, or resolves it.
+	ErrSelfApprovalNotAllowed = errors.New("principal may not approve or decide on their own submission")
 )
 
 type ActionType string
 
 const (
-	ActionTypeMerger             ActionType = "MERGER"
-	ActionTypeAcquisition        ActionType = "ACQUISITION"
-	ActionTypeShareIssuance      ActionType = "SHARE_ISSUANCE"
-	ActionTypeShareBuyback       ActionType = "SHARE_BUYBACK"
-	ActionTypeRestructure        ActionType = "RESTRUCTURE"
+	ActionTypeMerger              ActionType = "MERGER"
+	ActionTypeAcquisition         ActionType = "ACQUISITION"
+	ActionTypeShareIssuance       ActionType = "SHARE_ISSUANCE"
+	ActionTypeShareBuyback        ActionType = "SHARE_BUYBACK"
+	ActionTypeRestructure         ActionType = "RESTRUCTURE"
 	ActionTypeDividendDeclaration ActionType = "DIVIDEND_DECLARATION"
-	ActionTypeNameChange         ActionType = "NAME_CHANGE"
+	ActionTypeNameChange          ActionType = "NAME_CHANGE"
 )
 
 type ActionStatus string
@@ -27,8 +33,8 @@ type ActionStatus string
 const (
 	ActionStatusProposed      ActionStatus = "PROPOSED"
 	ActionStatusBoardApproved ActionStatus = "BOARD_APPROVED"
-	ActionStatusExecuted       ActionStatus = "EXECUTED"
-	ActionStatusCancelled      ActionStatus = "CANCELLED"
+	ActionStatusExecuted      ActionStatus = "EXECUTED"
+	ActionStatusCancelled     ActionStatus = "CANCELLED"
 )
 
 type CorporateAction struct {

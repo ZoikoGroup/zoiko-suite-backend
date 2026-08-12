@@ -182,6 +182,11 @@ func (h *Handler) ApproveRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if pr.RequestedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", domain.ErrSelfApprovalNotAllowed.Error())
+		return
+	}
+
 	if err := h.store.TransitionRequest(r.Context(), pr.TenantID, requestID, domain.RequestStatusApproved, principalID, nil); err != nil {
 		h.handleTransitionErr(w, err)
 		return
@@ -225,6 +230,11 @@ func (h *Handler) RejectRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, pr.LegalEntityID, actionRejectRequest); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if pr.RequestedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", domain.ErrSelfApprovalNotAllowed.Error())
 		return
 	}
 

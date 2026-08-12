@@ -3,10 +3,20 @@ package authz
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+)
+
+var (
+	// ErrAuthzServiceUnavailable is returned when authorization-svc cannot be
+	// reached or does not respond with HTTP 200. Callers must fail closed.
+	ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
+	// ErrAuthorizationDenied is returned when authorization-svc explicitly
+	// denies the requested action.
+	ErrAuthorizationDenied = errors.New("authorization denied")
 )
 
 // Client talks to the Governance Plane authorization-svc.
@@ -64,4 +74,39 @@ func (c *Client) Authorize(ctx context.Context, tenantID, actorID, action, resou
 		return false, err
 	}
 	return res.Allowed, nil
+}
+
+// CheckAllowed calls authorization-svc's real contract (POST /v1/authorize
+// with principal_id/legal_entity_id/action_type, decision in
+// decision_outcome) and fails closed: any transport error, non-200
+// response, or non-GRANTED decision results in a non-nil error.
+func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	reqBody, _ := json.Marshal(map[string]string{
+		"principal_id":    principalID,
+		"legal_entity_id": legalEntityID,
+		"action_type":     actionType,
+	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", strings.NewReader(string(reqBody)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return ErrAuthzServiceUnavailable
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return ErrAuthzServiceUnavailable
+	}
+	var res struct {
+		DecisionOutcome string `json:"decision_outcome"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return err
+	}
+	if res.DecisionOutcome != "GRANTED" {
+		return ErrAuthorizationDenied
+	}
+	return nil
 }

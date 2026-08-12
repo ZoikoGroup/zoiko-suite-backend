@@ -46,6 +46,12 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE workforce_compliance;
     CREATE DATABASE spend_controls;
     CREATE DATABASE vendor_due_diligence;
+    CREATE DATABASE notification;
+    CREATE DATABASE procurement_workflow;
+    CREATE DATABASE performance_review;
+    CREATE DATABASE delegated_authority;
+    CREATE DATABASE access_control;
+    CREATE DATABASE decision_support;
 EOSQL
 
 echo "Databases created successfully. Running migration scripts..."
@@ -53,6 +59,7 @@ echo "Databases created successfully. Running migration scripts..."
 # Apply migrations for audit-event-store-svc
 echo "Applying migrations for audit_event_store..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "audit_event_store" -f /migrations/audit-event-store/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "audit_event_store" -f /migrations/audit-event-store/000002_add_hash_chain_fields.up.sql
 
 # Apply migrations for identity-context-svc
 echo "Applying migrations for identity_context..."
@@ -74,18 +81,25 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules
 # Apply migrations for governance-decision-log-svc
 echo "Applying migrations for governance_decision_log..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000002_add_rls.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000003_enforce_immutability.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000004_add_event_linkage_keys.up.sql
 # Apply migrations for policy-svc
 echo "Applying migrations for policy..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000002_add_activation_audit.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000003_add_explicit_scope_type.up.sql
 
 # Apply migrations for authorization-svc
 echo "Applying migrations for authorization_svc..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc" -f /migrations/authorization/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc" -f /migrations/authorization/000002_add_sod_rule_tenant_scoping.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc" -f /migrations/authorization/000003_nullable_legal_entity_for_tenant_scope.up.sql
 
 # Apply migrations for workflow-svc
 echo "Applying migrations for workflow..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow" -f /migrations/workflow/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow" -f /migrations/workflow/000002_add_transition_linkage_keys.up.sql
 
 # Apply migrations for configuration-feature-flag-svc
 echo "Applying migrations for configuration_feature_flag..."
@@ -110,20 +124,25 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "document_vault" -f
 # Apply migrations for evidence-manifest-svc
 echo "Applying migrations for evidence_manifest..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_manifest" -f /migrations/evidence-manifest/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_manifest" -f /migrations/evidence-manifest/000002_enforce_immutability.up.sql
 
 # Apply migrations for workflow-history-svc
 echo "Applying migrations for workflow_history..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000002_add_rls.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000003_enforce_immutability.up.sql
 
 # Apply migrations for general-ledger-svc
 echo "Applying migrations for general_ledger..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000002_add_idempotency_index.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000003_add_atomic_linking.up.sql
 
 # Apply migrations for accounts-payable-svc
 echo "Applying migrations for accounts_payable..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000002_add_idempotency_index.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000003_add_source_contract_id.up.sql
 
 # Apply migrations for accounts-receivable-svc
 echo "Applying migrations for accounts_receivable..."
@@ -147,6 +166,30 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "spend_controls" -f
 echo "Applying migrations for vendor_due_diligence..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligence" -f /migrations/vendor-due-diligence/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligence" -f /migrations/vendor-due-diligence/000002_screening_source.up.sql
+
+# Apply migrations for notification-svc
+echo "Applying migrations for notification..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "notification" -f /migrations/notification/000001_initial_schema.up.sql
+
+# Apply migrations for procurement-workflow-svc
+echo "Applying migrations for procurement_workflow..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "procurement_workflow" -f /migrations/procurement-workflow/000001_initial_schema.up.sql
+
+# Apply migrations for performance-review-svc
+echo "Applying migrations for performance_review..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "performance_review" -f /migrations/performance-review/000001_initial_schema.up.sql
+
+# Apply migrations for delegated-authority-svc
+echo "Applying migrations for delegated_authority..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "delegated_authority" -f /migrations/delegated-authority/000001_initial_schema.up.sql
+
+# Apply migrations for access-control-svc
+echo "Applying migrations for access_control..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "access_control" -f /migrations/access-control/000001_initial_schema.up.sql
+
+# Apply migrations for decision-support-svc
+echo "Applying migrations for decision_support..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "decision_support" -f /migrations/decision-support/000001_initial_schema.up.sql
 
 # Apply migrations for treasury-svc
 echo "Applying migrations for treasury..."
@@ -188,6 +231,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contrac
 echo "Applying migrations for payroll_run..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000002_add_idempotency_index.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000003_add_finalization_linkage.up.sql
 
 # Apply migrations for compensation-svc
 echo "Applying migrations for compensation..."
@@ -311,6 +355,7 @@ EOSQL
 # Apply migrations for tax-determination-svc
 echo "Applying migrations for tax_determination..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_determination" -f /migrations/tax-determination/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_determination" -f /migrations/tax-determination/000002_add_tax_logic_snapshot.up.sql
 
 # Create database for vat-gst-svc
 echo "Creating database: vat_gst..."

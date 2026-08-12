@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/domain"
+	svcmiddleware "zoiko.io/governance-decision-log-svc/internal/middleware"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 )
 
@@ -21,7 +22,7 @@ import (
 // Allows the handler to be tested without a real database.
 type DecisionStore interface {
 	Insert(ctx context.Context, d domain.GovernanceDecision) (created bool, err error)
-	FindByID(ctx context.Context, decisionID string) (*domain.GovernanceDecision, error)
+	FindByID(ctx context.Context, tenantID, decisionID string) (*domain.GovernanceDecision, error)
 	List(ctx context.Context, params store.ListParams) ([]*domain.GovernanceDecision, error)
 }
 
@@ -103,6 +104,7 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 // function (same convention as jurisdiction-rules-svc).
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Use(correlationIDMiddleware)
+	r.Use(svcmiddleware.TenantContext())
 	r.Post("/v1/decisions", h.CreateDecision)
 	r.Get("/v1/decisions", h.ListDecisions)
 	r.Get("/v1/decisions/{decision_id}", h.GetDecision)
@@ -132,7 +134,11 @@ type createDecisionRequest struct {
 	RuleBasis         string          `json:"rule_basis"`
 	EvaluationContext json.RawMessage `json:"evaluation_context,omitempty"`
 	CorrelationID     string          `json:"correlation_id"`
-	DecidedAt         *time.Time      `json:"decided_at,omitempty"`
+	// WorkflowInstanceID and CausationID are optional Event Linkage Keys
+	// (doctrine §3.3) — omit either when not known.
+	WorkflowInstanceID *string    `json:"workflow_instance_id,omitempty"`
+	CausationID        *string    `json:"causation_id,omitempty"`
+	DecidedAt          *time.Time `json:"decided_at,omitempty"`
 }
 
 // requiredFields lists the fields that must be non-empty. evaluation_context
@@ -207,16 +213,18 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	d := domain.GovernanceDecision{
-		DecisionID:        req.DecisionID,
-		TenantID:          req.TenantID,
-		LegalEntityID:     req.LegalEntityID,
-		ActorID:           req.ActorID,
-		ActionType:        req.ActionType,
-		Outcome:           req.Outcome,
-		RuleBasis:         req.RuleBasis,
-		EvaluationContext: req.EvaluationContext,
-		CorrelationID:     req.CorrelationID,
-		DecidedAt:         decidedAt,
+		DecisionID:         req.DecisionID,
+		TenantID:           req.TenantID,
+		LegalEntityID:      req.LegalEntityID,
+		ActorID:            req.ActorID,
+		ActionType:         req.ActionType,
+		Outcome:            req.Outcome,
+		RuleBasis:          req.RuleBasis,
+		EvaluationContext:  req.EvaluationContext,
+		CorrelationID:      req.CorrelationID,
+		WorkflowInstanceID: req.WorkflowInstanceID,
+		CausationID:        req.CausationID,
+		DecidedAt:          decidedAt,
 	}
 
 	created, err := h.store.Insert(r.Context(), d)
@@ -258,16 +266,27 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 
 // GetDecision handles GET /v1/decisions/{decision_id}.
 //
+// Requires X-Tenant-Id. A decision belonging to a different tenant is
+// indistinguishable from a nonexistent one — both return 404, never a 403,
+// so this endpoint cannot be used to probe for the existence of another
+// tenant's decisions.
+//
 // Response:
 //
 //	200 → decision found
-//	404 → no decision with this decision_id
+//	400 → missing X-Tenant-Id
+//	404 → no decision with this decision_id for this tenant
 //	503 → store unavailable
 func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
 	decisionID := chi.URLParam(r, "decision_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tenant_id"})
+		return
+	}
 
-	d, err := h.store.FindByID(r.Context(), decisionID)
+	d, err := h.store.FindByID(r.Context(), tenantID, decisionID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrDecisionNotFound):
@@ -308,9 +327,15 @@ func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
 //	503 → store unavailable
 func (h *Handler) ListDecisions(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tenant_id"})
+		return
+	}
 	q := r.URL.Query()
 
 	params := store.ListParams{
+		TenantID:      tenantID,
 		ActorID:       q.Get("actor"),
 		LegalEntityID: q.Get("entity"),
 		ActionType:    q.Get("action"),

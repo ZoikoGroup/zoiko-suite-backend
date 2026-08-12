@@ -48,9 +48,10 @@ type Store interface {
 
 	// CheckSoDConflict returns the conflicting action name and true if
 	// grantedActions already contains an action that conflicts with
-	// candidateAction per an active sod_rules row (global or matching
-	// jurisdictionID).
-	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction string) (string, bool, error)
+	// candidateAction per an active sod_rules row. Only globally-applicable
+	// rules (tenant_id IS NULL) are considered when tenantID is "" — pass
+	// the caller's tenant to also bring that tenant's own SoD rules in.
+	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
 
 	RecordAccessDecision(ctx context.Context, principalID, legalEntityID, actionType, outcome, basis, correlationID string) (*domain.AccessDecisionLog, error)
 	FindAccessDecisionByID(ctx context.Context, accessDecisionID string) (*domain.AccessDecisionLog, error)
@@ -167,8 +168,16 @@ func scanAssignment(row pgx.Row) (*domain.PrincipalRoleAssignment, error) {
 }
 
 func (s *PgStore) CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
-	if _, err := s.FindRoleByID(ctx, params.RoleID); err != nil {
+	role, err := s.FindRoleByID(ctx, params.RoleID)
+	if err != nil {
 		return nil, err
+	}
+	// A nil LegalEntityID means "grant across the whole tenant" — only
+	// coherent for a role whose own scope is TENANT. Granting an
+	// entity-scoped role with no entity would silently make it apply
+	// everywhere, defeating the point of role_scope_type.
+	if params.LegalEntityID == nil && role.RoleScopeType != "TENANT" {
+		return nil, domain.ErrLegalEntityRequiredForRoleScope
 	}
 	if params.PrincipalRoleAssignmentID == "" {
 		params.PrincipalRoleAssignmentID = uuid.New().String()
@@ -276,13 +285,13 @@ func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRule
 	}
 
 	const query = `
-		INSERT INTO sod_rules (sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, active_flag, created_at;`
+		INSERT INTO sod_rules (sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, tenant_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, tenant_id, active_flag, created_at;`
 
-	row := s.pool.QueryRow(ctx, query, params.SoDRuleID, params.DomainCode, params.ActionA, params.ActionB, params.ConflictType, params.JurisdictionID)
+	row := s.pool.QueryRow(ctx, query, params.SoDRuleID, params.DomainCode, params.ActionA, params.ActionB, params.ConflictType, params.JurisdictionID, params.TenantID)
 	r := &domain.SoDRule{}
-	if err := row.Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType, &r.JurisdictionID, &r.ActiveFlag, &r.CreatedAt); err != nil {
+	if err := row.Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType, &r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt); err != nil {
 		s.log.Error("pg CreateSoDRule failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
@@ -292,7 +301,9 @@ func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRule
 // ── evaluation queries ───────────────────────────────────────────────────────
 
 // FindGrantedActions unions permitted_actions from every currently-active
-// role assignment + active bundle for (principalID, legalEntityID).
+// role assignment + active bundle for (principalID, legalEntityID). A
+// tenant-wide assignment (pra.legal_entity_id IS NULL) matches regardless
+// of which legal entity is being evaluated.
 func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error) {
 	const query = `
 		SELECT r.role_code, pb.permitted_actions
@@ -300,7 +311,7 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 		JOIN roles r ON r.role_id = pra.role_id AND r.active_flag
 		JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
 		WHERE pra.principal_id = $1
-		  AND pra.legal_entity_id = $2
+		  AND (pra.legal_entity_id = $2 OR pra.legal_entity_id IS NULL)
 		  AND pra.effective_from <= NOW()
 		  AND (pra.effective_to IS NULL OR pra.effective_to > NOW());`
 
@@ -347,13 +358,14 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 
 // FindDelegatedActions resolves active, non-expired delegations to
 // principalID in legalEntityID, and returns the union of each delegator's
-// own currently-granted actions.
+// own currently-granted actions. A tenant-wide delegation (legal_entity_id
+// IS NULL) matches regardless of which legal entity is being evaluated.
 func (s *PgStore) FindDelegatedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error) {
 	const query = `
 		SELECT delegator_principal_id
 		FROM delegated_authorities
 		WHERE delegate_principal_id = $1
-		  AND legal_entity_id = $2
+		  AND (legal_entity_id = $2 OR legal_entity_id IS NULL)
 		  AND revocation_status = 'ACTIVE'
 		  AND effective_from <= NOW()
 		  AND (effective_to IS NULL OR effective_to > NOW());`
@@ -402,18 +414,24 @@ func (s *PgStore) FindDelegatedActions(ctx context.Context, principalID, legalEn
 // already contains an action that an active sod_rules row pairs with
 // candidateAction — checked in both directions (action_a/action_b are
 // unordered from the caller's perspective).
-func (s *PgStore) CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction string) (string, bool, error) {
+func (s *PgStore) CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error) {
 	if len(grantedActions) == 0 {
 		return "", false, nil
 	}
 
+	// tenant_id IS NULL matches globally-applicable rules unconditionally.
+	// NULLIF($2, '')::uuid turns an empty tenantID into SQL NULL, so the
+	// tenant_id = ... half of the OR is simply never true when the caller
+	// didn't supply a tenant — global-only matching, same as before this
+	// column existed.
 	const query = `
 		SELECT action_a, action_b
 		FROM sod_rules
 		WHERE active_flag
-		  AND (action_a = $1 OR action_b = $1);`
+		  AND (action_a = $1 OR action_b = $1)
+		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid);`
 
-	rows, err := s.pool.Query(ctx, query, candidateAction)
+	rows, err := s.pool.Query(ctx, query, candidateAction, tenantID)
 	if err != nil {
 		s.log.Error("pg CheckSoDConflict failed", zap.Error(err))
 		return "", false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)

@@ -30,7 +30,7 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 
 func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	tenantID := middleware.GetTenantID(ctx)
-	_, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID))
+	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }
 
@@ -90,7 +90,7 @@ func (s *PgStore) GetTaxRule(ctx context.Context, id string) (*domain.TaxRule, e
 	var cat, status string
 	err = tx.QueryRow(ctx, `
 		SELECT rule_id, tenant_id, jurisdiction_id, rule_code, name, category, tax_rate_percentage,
-		       standard_deductions, exemptions_json, status, version, effective_from, effective_to,
+		       standard_deductions, exemptions_json, status, version, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM tax_rules WHERE rule_id = $1`, id,
 	).Scan(
@@ -122,7 +122,7 @@ func (s *PgStore) ListTaxRules(ctx context.Context, jurisdictionID, category, st
 
 	rows, err := tx.Query(ctx, `
 		SELECT rule_id, tenant_id, jurisdiction_id, rule_code, name, category, tax_rate_percentage,
-		       standard_deductions, exemptions_json, status, version, effective_from, effective_to,
+		       standard_deductions, exemptions_json, status, version, effective_from::text, effective_to::text,
 		       created_by, created_at, updated_at
 		FROM tax_rules
 		WHERE ($1 = '' OR jurisdiction_id = $1)

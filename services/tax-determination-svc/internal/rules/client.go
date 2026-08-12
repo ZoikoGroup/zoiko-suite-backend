@@ -11,14 +11,14 @@ import (
 )
 
 type TaxRuleDTO struct {
-	RuleID            string  `json:"rule_id"`
-	JurisdictionID    string  `json:"jurisdiction_id"`
-	RuleCode          string  `json:"rule_code"`
-	Name              string  `json:"name"`
-	Category          string  `json:"category"`
-	TaxRatePercentage float64 `json:"tax_rate_percentage"`
+	RuleID             string  `json:"rule_id"`
+	JurisdictionID     string  `json:"jurisdiction_id"`
+	RuleCode           string  `json:"rule_code"`
+	Name               string  `json:"name"`
+	Category           string  `json:"category"`
+	TaxRatePercentage  float64 `json:"tax_rate_percentage"`
 	StandardDeductions float64 `json:"standard_deductions"`
-	Status            string  `json:"status"`
+	Status             string  `json:"status"`
 }
 
 type Client struct {

@@ -38,7 +38,7 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *Publis
 
 // PublishVendorInvoiceReceived corresponds to §10.3's vendor.invoice.received event.
 func (p *Publisher) PublishVendorInvoiceReceived(ctx context.Context, inv domain.VendorInvoice) {
-	p.emit(ctx, "vendor.invoice.received", inv.CorrelationID, map[string]any{
+	p.emit(ctx, "vendor.invoice.received", inv.CorrelationID, inv.InvoiceID, map[string]any{
 		"invoice_id":      inv.InvoiceID,
 		"tenant_id":       inv.TenantID,
 		"legal_entity_id": inv.LegalEntityID,
@@ -48,14 +48,14 @@ func (p *Publisher) PublishVendorInvoiceReceived(ctx context.Context, inv domain
 
 // PublishVendorInvoiceValidated corresponds to §10.3's vendor.invoice.validated event.
 func (p *Publisher) PublishVendorInvoiceValidated(ctx context.Context, inv domain.VendorInvoice) {
-	p.emit(ctx, "vendor.invoice.validated", inv.CorrelationID, map[string]any{
+	p.emit(ctx, "vendor.invoice.validated", inv.CorrelationID, inv.InvoiceID, map[string]any{
 		"invoice_id": inv.InvoiceID,
 	})
 }
 
 // PublishVendorInvoiceApproved corresponds to §10.3's vendor.invoice.approved event.
 func (p *Publisher) PublishVendorInvoiceApproved(ctx context.Context, inv domain.VendorInvoice) {
-	p.emit(ctx, "vendor.invoice.approved", inv.CorrelationID, map[string]any{
+	p.emit(ctx, "vendor.invoice.approved", inv.CorrelationID, inv.InvoiceID, map[string]any{
 		"invoice_id": inv.InvoiceID,
 	})
 }
@@ -65,9 +65,9 @@ func (p *Publisher) PublishVendorInvoiceApproved(ctx context.Context, inv domain
 // handoff point to a future Treasury/Payments service, which will consume
 // this event to actually execute payment — out of scope here.
 func (p *Publisher) PublishPaymentRequested(ctx context.Context, inv domain.VendorInvoice) {
-	p.emit(ctx, "payment.requested", inv.CorrelationID, map[string]any{
-		"invoice_id": inv.InvoiceID,
-		"amount":     inv.Amount,
+	p.emit(ctx, "payment.requested", inv.CorrelationID, inv.InvoiceID, map[string]any{
+		"invoice_id":    inv.InvoiceID,
+		"amount":        inv.Amount,
 		"currency_code": inv.CurrencyCode,
 	})
 }
@@ -117,7 +117,7 @@ func (p *LogOnlyPublisher) record(eventType string, inv domain.VendorInvoice) {
 	)
 }
 
-func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) {
+func (p *Publisher) emit(ctx context.Context, eventType, correlationID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		p.log.Error("failed to marshal event payload", zap.String("event_type", eventType), zap.Error(err))
@@ -136,7 +136,7 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID string, p
 		p.log.Error("failed to marshal event envelope", zap.String("event_type", eventType), zap.Error(err))
 		return
 	}
-	if err := p.producer.WriteMessages(ctx, kafka.Message{Value: body}); err != nil {
+	if err := p.producer.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: body}); err != nil {
 		p.log.Error("failed to publish event",
 			zap.String("event_type", eventType),
 			zap.String("topic", p.topic),

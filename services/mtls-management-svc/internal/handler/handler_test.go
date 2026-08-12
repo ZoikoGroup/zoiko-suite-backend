@@ -2,32 +2,70 @@ package handler_test
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"go.uber.org/zap"
+	internalca "zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
 	"zoiko.io/mtls-management-svc/internal/handler"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
 
-func newRouter() http.Handler {
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), zap.NewNop()))
+// newRouter builds a router backed by a real CA persisted under a
+// per-test temp directory — every test gets its own isolated CA, so tests
+// can't interfere with each other's issued certificates.
+func newRouter(t *testing.T) http.Handler {
+	t.Helper()
+	c, err := internalca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create test CA: %v", err)
+	}
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, zap.NewNop()))
+}
+
+// mustParsePEMCertificate fails the test if pemBytes is not a real,
+// parseable X.509 certificate — the whole point of this fix is that these
+// are no longer fabricated strings.
+func mustParsePEMCertificate(t *testing.T, pemBytes string) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode([]byte(pemBytes))
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatalf("certificate_pem did not decode to a PEM CERTIFICATE block: %q", pemBytes)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("certificate_pem did not parse as a valid X.509 certificate: %v", err)
+	}
+	return cert
+}
+
+func mustParsePEMPrivateKey(t *testing.T, pemBytes string) {
+	t.Helper()
+	block, _ := pem.Decode([]byte(pemBytes))
+	if block == nil || block.Type != "EC PRIVATE KEY" {
+		t.Fatalf("private_key_pem did not decode to a PEM EC PRIVATE KEY block: %q", pemBytes)
+	}
+	if _, err := x509.ParseECPrivateKey(block.Bytes); err != nil {
+		t.Fatalf("private_key_pem did not parse as a valid EC private key: %v", err)
+	}
 }
 
 func TestHealthCheck(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	w := httptest.NewRecorder()
-	newRouter().ServeHTTP(w, r)
+	newRouter(t).ServeHTTP(w, r)
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
 }
 
 func TestProvisionRotateRevoke(t *testing.T) {
-	router := newRouter()
+	router := newRouter(t)
 	// Provision
 	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "ledger-svc", CommonName: "ledger-svc.zoiko.internal", RotationDays: 90, AutoRotate: true})
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
@@ -37,8 +75,11 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	if w.Code != 201 {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body)
 	}
-	var cert domain.MtlsCertificate
-	json.Unmarshal(w.Body.Bytes(), &cert)
+	var result domain.ProvisionCertResult
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to decode provision response: %v", err)
+	}
+	cert := result.Certificate
 	if cert.ID == "" {
 		t.Fatal("expected cert ID")
 	}
@@ -46,13 +87,37 @@ func TestProvisionRotateRevoke(t *testing.T) {
 		t.Fatalf("expected ACTIVE, got %s", cert.Status)
 	}
 
-	// Get
+	// The core of this fix: the returned certificate and private key must
+	// be REAL, parseable X.509 material, not fabricated strings.
+	leafCert := mustParsePEMCertificate(t, cert.CertificatePEM)
+	if leafCert.Subject.CommonName != "ledger-svc.zoiko.internal" {
+		t.Fatalf("expected CommonName ledger-svc.zoiko.internal, got %s", leafCert.Subject.CommonName)
+	}
+	mustParsePEMPrivateKey(t, result.PrivateKeyPEM)
+	caCert := mustParsePEMCertificate(t, result.CACertPEM)
+
+	// Verify the leaf is actually signed by the returned CA cert — proving
+	// this isn't just "two unrelated valid certificates," but a real chain.
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+	if _, err := leafCert.Verify(x509.VerifyOptions{
+		Roots:     pool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}); err != nil {
+		t.Fatalf("issued leaf certificate does not verify against the returned CA certificate: %v", err)
+	}
+
+	// Get — GetCert must return the public cert but must NEVER leak a
+	// private key field.
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates/"+cert.ID, nil)
 	req2.Header.Set("X-Tenant-ID", "t1")
 	w2 := httptest.NewRecorder()
 	router.ServeHTTP(w2, req2)
 	if w2.Code != 200 {
 		t.Fatalf("expected 200 on get, got %d", w2.Code)
+	}
+	if bytes.Contains(w2.Body.Bytes(), []byte("PRIVATE KEY")) {
+		t.Fatal("GetCert response must never contain private key material")
 	}
 
 	// List
@@ -68,8 +133,11 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	if int(listResp["count"].(float64)) < 1 {
 		t.Fatal("expected at least 1 cert")
 	}
+	if bytes.Contains(w3.Body.Bytes(), []byte("PRIVATE KEY")) {
+		t.Fatal("ListCerts response must never contain private key material")
+	}
 
-	// Rotate
+	// Rotate — must issue a genuinely different key pair and certificate.
 	req4 := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates/"+cert.ID+"/rotate", nil)
 	req4.Header.Set("X-Tenant-ID", "t1")
 	w4 := httptest.NewRecorder()
@@ -77,10 +145,21 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	if w4.Code != 200 {
 		t.Fatalf("expected 200 on rotate, got %d", w4.Code)
 	}
-	var rotated domain.MtlsCertificate
-	json.Unmarshal(w4.Body.Bytes(), &rotated)
+	var rotateResult domain.ProvisionCertResult
+	json.Unmarshal(w4.Body.Bytes(), &rotateResult)
+	rotated := rotateResult.Certificate
 	if rotated.Fingerprint == cert.Fingerprint {
 		t.Fatal("fingerprint should change after rotation")
+	}
+	if rotated.SerialNumber == cert.SerialNumber {
+		t.Fatal("serial number should change after rotation")
+	}
+	if rotateResult.PrivateKeyPEM == result.PrivateKeyPEM {
+		t.Fatal("rotation must issue a genuinely new private key, not reuse the old one")
+	}
+	rotatedLeaf := mustParsePEMCertificate(t, rotated.CertificatePEM)
+	if _, err := rotatedLeaf.Verify(x509.VerifyOptions{Roots: pool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+		t.Fatalf("rotated leaf certificate does not verify against the CA: %v", err)
 	}
 
 	// Policy
@@ -108,8 +187,31 @@ func TestValidationError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
 	req.Header.Set("X-Tenant-ID", "t1")
 	w := httptest.NewRecorder()
-	newRouter().ServeHTTP(w, req)
+	newRouter(t).ServeHTTP(w, req)
 	if w.Code != 400 {
 		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// TestCA_LoadOrCreate_PersistsAcrossRestarts verifies that reloading a CA
+// from the same directory returns the SAME root certificate — the property
+// that makes certificate rotation safe across service restarts, unlike the
+// old design where every restart would have generated a fresh CA (this
+// service never generated a CA at all before this fix, but the property
+// matters going forward).
+func TestCA_LoadOrCreate_PersistsAcrossRestarts(t *testing.T) {
+	dir := t.TempDir()
+
+	first, err := internalca.LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("first LoadOrCreate failed: %v", err)
+	}
+	second, err := internalca.LoadOrCreate(dir)
+	if err != nil {
+		t.Fatalf("second LoadOrCreate (reload) failed: %v", err)
+	}
+
+	if string(first.CertificatePEM()) != string(second.CertificatePEM()) {
+		t.Fatal("reloading the CA from the same directory must return the same root certificate")
 	}
 }

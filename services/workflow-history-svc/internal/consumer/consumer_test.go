@@ -126,7 +126,7 @@ func TestHandle_ApprovalGranted_InheritsContext(t *testing.T) {
 	assert.Equal(t, 2, fake.Count())
 
 	// Verify the approval event inherited the tenant context.
-	events, err := fake.ListByInstance(ctx, "wf-001")
+	events, err := fake.ListByInstance(ctx, "t-001", "wf-001")
 	require.NoError(t, err)
 	require.Len(t, events, 2)
 	assert.Equal(t, "t-001", events[1].TenantID)
@@ -179,7 +179,7 @@ func TestHandle_WorkflowCompleted_FullChain(t *testing.T) {
 
 	assert.Equal(t, 3, fake.Count())
 
-	history, err := fake.ListByInstance(ctx, "wf-001")
+	history, err := fake.ListByInstance(ctx, "t-001", "wf-001")
 	require.NoError(t, err)
 	require.Len(t, history, 3)
 	assert.Equal(t, "workflow.started", history[0].EventType)

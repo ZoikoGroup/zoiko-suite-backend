@@ -35,7 +35,16 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	dbPool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		logger.Fatal("failed to parse db pool config", zap.Error(err))
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 1 * time.Minute
+	dbPool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		logger.Warn("Failed to connect to database, falling back to MemoryStore", zap.Error(err))
 		dataStore = store.NewMemoryStore()

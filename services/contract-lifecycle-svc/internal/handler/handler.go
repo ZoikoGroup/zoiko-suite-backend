@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -11,21 +12,46 @@ import (
 	"zoiko.io/contract-lifecycle-svc/internal/authz"
 	"zoiko.io/contract-lifecycle-svc/internal/domain"
 	"zoiko.io/contract-lifecycle-svc/internal/events"
+	"zoiko.io/contract-lifecycle-svc/internal/governancelog"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
 	"zoiko.io/contract-lifecycle-svc/internal/store"
 )
 
+// GovernanceLogClient verifies a governance decision was GRANTED before an
+// action authorized by it is allowed to proceed. Implementations must fail
+// closed, same doctrine as AuthZClient.
+type GovernanceLogClient interface {
+	VerifyGranted(ctx context.Context, tenantID, decisionID, legalEntityID, actionType string) error
+}
+
+// AuthZClient checks whether a principal is permitted to perform an action
+// against authorization-svc. Implementations must fail closed: any error
+// returned means the caller must refuse the write.
+type AuthZClient interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// Action types passed to authorization-svc for each write route.
+const (
+	actionContractCreate    = "CONTRACT_CREATE"
+	actionContractUpdate    = "CONTRACT_UPDATE"
+	actionContractSubmit    = "CONTRACT_SUBMIT_FOR_APPROVAL"
+	actionContractActivate  = "CONTRACT_ACTIVATE"
+	actionContractTerminate = "CONTRACT_TERMINATE"
+)
+
 // Handler holds all dependencies for the HTTP layer.
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     *authz.Client
-	logger    *zap.Logger
+	store         store.Store
+	publisher     events.Publisher
+	authz         AuthZClient
+	governanceLog GovernanceLogClient
+	logger        *zap.Logger
 }
 
 // New creates a new Handler.
-func New(st store.Store, pub events.Publisher, az *authz.Client, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, pub events.Publisher, az AuthZClient, gl GovernanceLogClient, logger *zap.Logger) *Handler {
+	return &Handler{store: st, publisher: pub, authz: az, governanceLog: gl, logger: logger}
 }
 
 // RegisterRoutes mounts all contract lifecycle routes onto the given router.
@@ -54,6 +80,15 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Title == "" || req.CounterpartyID == "" || req.EffectiveFrom == "" {
 		writeError(w, http.StatusBadRequest, "title, counterparty_id, and effective_from are required")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionContractCreate); err != nil {
+		h.writeAuthzErr(w, err)
 		return
 	}
 
@@ -127,6 +162,15 @@ func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractUpdate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	var req domain.UpdateContractRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -179,6 +223,15 @@ func (h *Handler) SubmitForApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractSubmit); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	if err := h.store.UpdateContractStatus(r.Context(), id, domain.ContractStatusPendingApproval, ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to submit contract")
 		return
@@ -199,6 +252,37 @@ func (h *Handler) ActivateContract(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.SignedBy == "" {
 		writeError(w, http.StatusBadRequest, "signed_by is required")
+		return
+	}
+	if req.GovernanceDecisionID == "" {
+		writeError(w, http.StatusBadRequest, domain.ErrGovernanceDecisionRequired.Error())
+		return
+	}
+
+	existing, err := h.store.GetContract(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrContractNotFound) {
+			writeError(w, http.StatusNotFound, "contract not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch contract")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractActivate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// A contract must not go ACTIVE on a signature alone — verify the
+	// governance decision the caller cites was actually GRANTED for this
+	// legal entity and this action, not just that some decision ID exists.
+	if err := h.governanceLog.VerifyGranted(r.Context(), tenantID, req.GovernanceDecisionID, existing.LegalEntityID, actionContractActivate); err != nil {
+		h.writeGovernanceLogErr(w, err)
 		return
 	}
 
@@ -235,6 +319,25 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	existing, err := h.store.GetContract(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, domain.ErrContractNotFound) {
+			writeError(w, http.StatusNotFound, "contract not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch contract")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionContractTerminate); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	c, err := h.store.TerminateContract(r.Context(), id, &req)
 	if err != nil {
 		switch {
@@ -266,6 +369,39 @@ func (h *Handler) ListContractVersions(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Helpers ---
+
+// requirePrincipal extracts the calling principal from the X-Principal-Id
+// header. If it is missing, it writes a 401 response and returns ok=false.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
+		return "", false
+	}
+	return principalID, true
+}
+
+// writeAuthzErr writes the appropriate HTTP response for an authz.CheckAllowed
+// error. Denials map to 403; anything else (including authz-svc being
+// unavailable) fails closed and maps to 503.
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, authz.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "not authorized to perform this action")
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+}
+
+func (h *Handler) writeGovernanceLogErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, governancelog.ErrDecisionNotFound):
+		writeError(w, http.StatusBadRequest, "governance_decision_id not found for this tenant")
+	case errors.Is(err, governancelog.ErrDecisionNotGranted):
+		writeError(w, http.StatusForbidden, "governance decision was not granted for this activation")
+	default:
+		writeError(w, http.StatusServiceUnavailable, "governance decision log unavailable")
+	}
+}
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")

@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/domain"
+	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 )
 
 // nilScopeUUID is the sentinel used in COALESCE() to make dedup/uniqueness
@@ -201,17 +202,33 @@ func scanPolicyVersion(row pgx.Row) (*domain.PolicyVersion, error) {
 		&v.CreatedAt,
 		&v.CreatedByPrincipalID,
 	)
+	if err == nil {
+		v.ScopeType = domain.DeriveScopeType(v.TenantID, v.LegalEntityID)
+	}
 	return v, err
 }
 
-// FindPolicyVersionByID looks up a version by its UUID primary key.
+// FindPolicyVersionByID looks up a version by its UUID primary key, scoped to
+// the caller's tenant: visible if the version is global (tenant_id IS NULL)
+// or belongs to the caller's own tenant. An empty tenant in context (a caller
+// that predates the X-Tenant-Id header) falls back to unscoped lookup.
 func (s *PgStore) FindPolicyVersionByID(ctx context.Context, policyVersionID string) (*domain.PolicyVersion, error) {
+	// tenant_id is a UUID column — passing "" and comparing with a plain
+	// "$2 = '' OR ..." makes Postgres try to resolve $2 as both text and
+	// uuid in one prepared statement ("operator does not exist: uuid =
+	// text"). A nil *string sends an actual SQL NULL instead, so every
+	// usage below agrees $2 is uuid.
+	var tenantID *string
+	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
+		tenantID = &t
+	}
 	const query = `
 		SELECT ` + policyVersionColumns + `
 		FROM policy_versions
-		WHERE policy_version_id = $1;`
+		WHERE policy_version_id = $1
+		  AND ($2::uuid IS NULL OR tenant_id IS NULL OR tenant_id = $2::uuid);`
 
-	row := s.pool.QueryRow(ctx, query, policyVersionID)
+	row := s.pool.QueryRow(ctx, query, policyVersionID, tenantID)
 	v, err := scanPolicyVersion(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -240,11 +257,13 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 		params.RulePayload = []byte(`{}`)
 	}
 
+	scopeType := domain.DeriveScopeType(params.TenantID, params.LegalEntityID)
+
 	const query = `
 		INSERT INTO policy_versions (
 			policy_version_id, policy_id, tenant_id, legal_entity_id, rule_payload,
-			effective_from, effective_to, version_status, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DRAFT', $8)
+			effective_from, effective_to, version_status, created_by_principal_id, scope_type
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'DRAFT', $8, $9)
 		ON CONFLICT (
 			policy_id,
 			COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID),
@@ -256,7 +275,7 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 
 	row := s.pool.QueryRow(ctx, query,
 		params.PolicyVersionID, params.PolicyID, params.TenantID, params.LegalEntityID, params.RulePayload,
-		params.EffectiveFrom, params.EffectiveTo, params.CreatedByPrincipalID,
+		params.EffectiveFrom, params.EffectiveTo, params.CreatedByPrincipalID, scopeType,
 	)
 
 	v, err := scanPolicyVersion(row)
@@ -524,6 +543,7 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 			s.log.Error("pg FindApplicableVersions scan failed", zap.Error(scanErr))
 			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
 		}
+		v.ScopeType = domain.DeriveScopeType(v.TenantID, v.LegalEntityID)
 		results = append(results, v)
 	}
 	if err := rows.Err(); err != nil {

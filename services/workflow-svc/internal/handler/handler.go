@@ -119,6 +119,16 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the initiator of a workflow may not be listed as an approver in any
+	// of its own stages. This is a validation error on the caller-supplied
+	// workflow definition, not an authz decision.
+	for _, st := range req.Stages {
+		if st.ApproverPrincipalID == req.InitiatedBy {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].approver_principal_id"})
+			return
+		}
+	}
 
 	instance, stages, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, WorkflowType: req.WorkflowType,
@@ -193,6 +203,9 @@ type submitActionRequest struct {
 	ActorPrincipalID string  `json:"actor_principal_id"`
 	Action           string  `json:"action"`
 	Rationale        *string `json:"rationale,omitempty"`
+	// CausationID is optional: the event/decision that caused this specific
+	// action, when the caller knows it.
+	CausationID *string `json:"causation_id,omitempty"`
 }
 
 // SubmitAction handles POST /v1/workflows/{workflow_instance_id}/actions.
@@ -238,6 +251,17 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3),
+	// defense-in-depth: the principal who initiated the workflow may never
+	// submit an approve/reject action on it, regardless of whether they are
+	// (incorrectly) recorded as an assigned approver for the current stage.
+	// This covers instances created before CreateWorkflow's validation
+	// existed, or via any path that bypasses it.
+	if req.ActorPrincipalID == instanceForAuthzCheck.InitiatedBy {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
+		return
+	}
+
 	if err := h.authz.CheckApprovalAllowed(r.Context(), req.ActorPrincipalID, instanceForAuthzCheck.LegalEntityID); err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
@@ -251,7 +275,8 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
-		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: req.ActorPrincipalID, Action: req.Action, Rationale: req.Rationale,
+		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: req.ActorPrincipalID, Action: req.Action,
+		Rationale: req.Rationale, CausationID: req.CausationID,
 	})
 	if err != nil {
 		switch {

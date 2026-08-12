@@ -41,10 +41,10 @@ type AuthZClient interface {
 // action type per lifecycle stage — nothing in the docs specifies
 // finer-grained codes for v1.
 const (
-	actionCreateInvoice  = "AP_INVOICE_CREATE"
+	actionCreateInvoice   = "AP_INVOICE_CREATE"
 	actionValidateInvoice = "AP_INVOICE_VALIDATE"
-	actionApproveInvoice = "AP_INVOICE_APPROVE"
-	actionRequestPayment = "AP_PAYMENT_REQUEST"
+	actionApproveInvoice  = "AP_INVOICE_APPROVE"
+	actionRequestPayment  = "AP_PAYMENT_REQUEST"
 )
 
 type Handler struct {
@@ -104,6 +104,7 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		CurrencyCode:         req.CurrencyCode,
 		DueDate:              req.DueDate.Time,
 		Status:               domain.InvoiceStatusReceived,
+		SourceContractID:     req.SourceContractID,
 		CreatedByPrincipalID: principalID,
 		CorrelationID:        req.CorrelationID,
 	}
@@ -252,6 +253,13 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, inv.LegalEntityID, actionApproveInvoice); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// a payment batch/invoice creator may not approve their own submission.
+	if inv.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_allowed", domain.ErrSelfApprovalNotAllowed.Error())
 		return
 	}
 

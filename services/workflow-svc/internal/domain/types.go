@@ -65,6 +65,12 @@ type WorkflowTransition struct {
 	ActedBy   string  `json:"acted_by"`
 	Rationale *string `json:"rationale"`
 
+	// CorrelationID is carried forward from the owning WorkflowInstance's
+	// own correlation_id. CausationID is nil unless the caller submitting
+	// this specific action supplied one.
+	CorrelationID *string `json:"correlation_id,omitempty"`
+	CausationID   *string `json:"causation_id,omitempty"`
+
 	ActedAt time.Time `json:"acted_at"`
 }
 
@@ -92,6 +98,9 @@ type SubmitActionParams struct {
 	// Action: APPROVE | REJECT.
 	Action    string
 	Rationale *string
+	// CausationID is optional: the event/decision that caused this specific
+	// action, when the caller knows it.
+	CausationID *string
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -103,6 +112,19 @@ var ErrWrongApprover = errorString("actor is not the approver for the current st
 var ErrStoreUnavailable = errorString("workflow store unavailable")
 var ErrAuthorizationDenied = errorString("authorization denied for this approval action")
 var ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
+
+// ErrInitiatorCannotBeApprover is a creation-time validation error:
+// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3)
+// forbids a workflow's initiator from being listed as an approver in any
+// of its own stages.
+var ErrInitiatorCannotBeApprover = errorString("initiated_by may not appear as an approver in any stage")
+
+// ErrSelfApprovalNotAllowed is the decision-time, defense-in-depth
+// enforcement of the same Segregation of Duties doctrine: the principal who
+// initiated a workflow may not submit an approve/reject action on it, even
+// if they were (incorrectly) recorded as an assigned approver for the
+// current stage.
+var ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
 
 type errorString string
 

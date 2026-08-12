@@ -3,11 +3,18 @@ package authz
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 )
+
+// ErrAuthorizationDenied is returned when authorization-svc explicitly denies the action.
+var ErrAuthorizationDenied = errors.New("authorization denied")
+
+// ErrAuthzServiceUnavailable is returned when authorization-svc could not be reached or
+// returned an unexpected response. Callers must treat this as a denial (fail closed).
+var ErrAuthzServiceUnavailable = errors.New("authorization service unavailable")
 
 type Client struct {
 	httpClient *http.Client
@@ -22,43 +29,52 @@ func NewClient(baseURL string) *Client {
 }
 
 type authorizeRequest struct {
-	TenantID   string `json:"tenant_id"`
-	ActorID    string `json:"actor_id"`
-	Action     string `json:"action"`
-	ResourceID string `json:"resource_id"`
+	PrincipalID   string `json:"principal_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	ActionType    string `json:"action_type"`
 }
 
 type authorizeResponse struct {
-	Allowed bool   `json:"allowed"`
-	Reason  string `json:"reason"`
+	DecisionOutcome string `json:"decision_outcome"`
 }
 
-func (c *Client) Authorize(ctx context.Context, tenantID, actorID, action, resourceID string) (bool, error) {
-	body, _ := json.Marshal(authorizeRequest{
-		TenantID:   tenantID,
-		ActorID:    actorID,
-		Action:     action,
-		ResourceID: resourceID,
+// CheckAllowed calls authorization-svc's POST /v1/authorize and fails closed: any
+// transport error, non-200 response, decode error, or non-GRANTED decision results
+// in a non-nil error (ErrAuthorizationDenied for explicit denial, otherwise
+// ErrAuthzServiceUnavailable).
+func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	body, err := json.Marshal(authorizeRequest{
+		PrincipalID:   principalID,
+		LegalEntityID: legalEntityID,
+		ActionType:    actionType,
 	})
+	if err != nil {
+		return err
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/authorize", strings.NewReader(string(body)))
 	if err != nil {
-		return false, err
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return true, nil
+		return ErrAuthzServiceUnavailable
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode == http.StatusForbidden {
-		return false, nil
-	}
+
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("authz service returned %d", resp.StatusCode)
+		return ErrAuthzServiceUnavailable
 	}
+
 	var res authorizeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return false, err
+		return ErrAuthzServiceUnavailable
 	}
-	return res.Allowed, nil
+
+	if res.DecisionOutcome != "GRANTED" {
+		return ErrAuthorizationDenied
+	}
+	return nil
 }
