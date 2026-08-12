@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/spend-controls-svc/internal/domain"
@@ -43,14 +44,38 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	return nil
 }
 
-func (s *PgStore) CreatePolicy(ctx context.Context, p *domain.SpendPolicy) error {
+// CreatePolicy sets a limit, end-dating any limit it replaces. Returns how many
+// prior policies it superseded.
+//
+// The supersede is what makes active_flag mean anything. Before this, the column
+// was written TRUE on create and never changed by any code path: creating a second
+// limit for the same entity and category left BOTH rows active, while evaluation
+// silently used only `ORDER BY created_at DESC LIMIT 1`. So a category could carry
+// three "active" limits of which exactly one was ever enforced, and the console's
+// register — which lists what it is told is active — showed limits that were not
+// in force next to one that was, indistinguishably.
+//
+// Doing it in the same transaction as the insert matters: two operators setting a
+// limit for the same category at once would otherwise both deactivate the other's
+// row and leave nothing, or leave two.
+func (s *PgStore) CreatePolicy(ctx context.Context, p *domain.SpendPolicy) (superseded int, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return domain.ErrIdentityMissing
+		return 0, domain.ErrTenantMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE spend_policies
+			SET active_flag = FALSE, updated_at = $4
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND category = $3 AND active_flag = TRUE
+		`, tenantID, p.LegalEntityID, p.Category, p.UpdatedAt)
+		if err != nil {
+			return err
+		}
+		superseded = int(tag.RowsAffected())
+
+		_, err = tx.Exec(ctx, `
 			INSERT INTO spend_policies (
 				spend_policy_id, tenant_id, legal_entity_id, category, period,
 				threshold_amount, currency_code, active_flag, created_by_principal_id,
@@ -61,12 +86,59 @@ func (s *PgStore) CreatePolicy(ctx context.Context, p *domain.SpendPolicy) error
 			p.CreatedAt, p.UpdatedAt)
 		return err
 	})
+	if err != nil {
+		return 0, err
+	}
+	return superseded, nil
 }
 
-func (s *PgStore) ListPolicies(ctx context.Context, legalEntityID, category string) ([]domain.SpendPolicy, error) {
+// DeactivatePolicy withdraws a limit, leaving the row in place.
+//
+// Without this there was no way to stop governing a category at all: active_flag
+// could only ever be TRUE, so the closest available action was to set an absurdly
+// high threshold and pretend. The row is kept rather than deleted, so the history
+// of what was once enforced — and every consumption recorded against it — survives.
+//
+// Returns ErrPolicyNotFound when the id names no active policy in this tenant,
+// which covers "already withdrawn" and "another tenant's policy" identically.
+func (s *PgStore) DeactivatePolicy(ctx context.Context, spendPolicyID string) error {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return domain.ErrTenantMissing
+	}
+
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE spend_policies
+			SET active_flag = FALSE, updated_at = $3
+			WHERE tenant_id = $1 AND spend_policy_id = $2 AND active_flag = TRUE
+		`, tenantID, spendPolicyID, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return domain.ErrPolicyNotFound
+	}
+	return nil
+}
+
+// ListPolicies returns policies for the tenant, newest first.
+//
+// activeOnly restricts the result to limits actually in force. The console asks
+// for that by default: a register headed "limits in force" must not list withdrawn
+// or superseded ones beside live ones, which is exactly what it did while
+// active_flag was never set FALSE by anything.
+func (s *PgStore) ListPolicies(ctx context.Context, legalEntityID, category string, activeOnly bool) ([]domain.SpendPolicy, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrTenantMissing
 	}
 
 	var out []domain.SpendPolicy
@@ -87,6 +159,9 @@ func (s *PgStore) ListPolicies(ctx context.Context, legalEntityID, category stri
 		if category != "" {
 			args = append(args, category)
 			query += fmt.Sprintf(" AND category = $%d", len(args))
+		}
+		if activeOnly {
+			query += " AND active_flag = TRUE"
 		}
 		query += " ORDER BY created_at DESC"
 
@@ -115,57 +190,25 @@ func (s *PgStore) ListPolicies(ctx context.Context, legalEntityID, category stri
 	return out, nil
 }
 
-// FindActivePolicy returns the single active policy matching legalEntityID
-// and category, or nil if none is configured — callers must treat "no
-// policy" as a distinct outcome from "policy denies."
-func (s *PgStore) FindActivePolicy(ctx context.Context, legalEntityID, category string) (*domain.SpendPolicy, error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
-	}
-
-	var p domain.SpendPolicy
-	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT spend_policy_id, tenant_id, legal_entity_id, category, period,
-			       threshold_amount, currency_code, active_flag, created_by_principal_id,
-			       created_at, updated_at
-			FROM spend_policies
-			WHERE tenant_id = $1 AND legal_entity_id = $2 AND category = $3 AND active_flag = TRUE
-			ORDER BY created_at DESC
-			LIMIT 1
-		`, tenantID, legalEntityID, category).Scan(
-			&p.SpendPolicyID, &p.TenantID, &p.LegalEntityID, &p.Category, &p.Period,
-			&p.ThresholdAmount, &p.CurrencyCode, &p.ActiveFlag, &p.CreatedByPrincipalID,
-			&p.CreatedAt, &p.UpdatedAt,
-		)
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &p, nil
-}
-
 // SumConsumption sums ALLOWED consumption amounts for a policy since a given
 // window start — the running total a new spend-check's amount is added to
 // before comparing against the policy's threshold.
-func (s *PgStore) SumConsumption(ctx context.Context, spendPolicyID string, since time.Time) (float64, error) {
+//
+// Only sums rows whose currency matches the one asked for. Nothing in this
+// platform holds an FX rate, so adding a USD row to a GBP total would produce a
+// number that is not an amount of money in any currency.
+//
+// NOTE: this is exported for reporting and tests. It is NOT what the spend-check
+// path uses — see EvaluateSpend, which must sum and insert in one transaction.
+func (s *PgStore) SumConsumption(ctx context.Context, spendPolicyID, currencyCode string, since time.Time) (float64, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return 0, domain.ErrIdentityMissing
+		return 0, domain.ErrTenantMissing
 	}
 
 	var total float64
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT COALESCE(SUM(amount), 0)
-			FROM spend_consumptions
-			WHERE tenant_id = $1 AND spend_policy_id = $2
-			  AND decision_outcome = 'ALLOWED' AND recorded_at >= $3
-		`, tenantID, spendPolicyID, since).Scan(&total)
+		return tx.QueryRow(ctx, sumConsumptionSQL, tenantID, spendPolicyID, currencyCode, since).Scan(&total)
 	})
 	if err != nil {
 		return 0, err
@@ -173,29 +216,276 @@ func (s *PgStore) SumConsumption(ctx context.Context, spendPolicyID string, sinc
 	return total, nil
 }
 
-// FindConsumptionByCorrelation looks up a prior spend-check by idempotency
-// key, so a retried request replays the original decision instead of
-// re-evaluating (and potentially double-counting) consumption.
-func (s *PgStore) FindConsumptionByCorrelation(ctx context.Context, correlationID string) (*domain.SpendConsumption, error) {
+// One definition, used by both SumConsumption and EvaluateSpend, so the number
+// a report shows and the number the threshold is enforced against cannot drift
+// apart.
+const sumConsumptionSQL = `
+	SELECT COALESCE(SUM(amount), 0)
+	FROM spend_consumptions
+	WHERE tenant_id = $1 AND spend_policy_id = $2
+	  AND decision_outcome = 'ALLOWED'
+	  AND currency_code = $3
+	  AND recorded_at >= $4
+`
+
+// periodWindowSQL is the enforcement window, expressed in SQL.
+//
+// It must mean exactly what periodStart means in Go, because both answer the same
+// question — how much has been committed in the window this limit governs — and a
+// disagreement between them shows a reader one number while the service enforces
+// another. PER_TRANSACTION has no window: every row counts, since the figure is
+// then a lifetime total rather than a budget.
+const periodWindowSQL = `
+	p.period = 'PER_TRANSACTION'
+	OR c.recorded_at >= (
+		CASE p.period
+			WHEN 'ANNUAL' THEN date_trunc('year',  now() AT TIME ZONE 'UTC')
+			ELSE               date_trunc('month', now() AT TIME ZONE 'UTC')
+		END
+	) AT TIME ZONE 'UTC'
+`
+
+// PolicyUsageTotals returns committed spend and refusal counts per active policy,
+// aggregated in the database.
+//
+// This exists because the console was computing the same figures by loading every
+// consumption row for the tenant and summing them in JavaScript, which was wrong in
+// two ways. It grew without bound — one row per spend check, forever, fetched on
+// every page render. And it applied **no period window**, so a MONTHLY limit's
+// meter showed lifetime spend while enforcement counted only the current month: the
+// register could report a budget as exhausted when this month was empty and the
+// next check would in fact be permitted.
+func (s *PgStore) PolicyUsageTotals(ctx context.Context, legalEntityID, category string) ([]domain.PolicyUsageTotal, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return nil, domain.ErrTenantMissing
 	}
 
-	var c domain.SpendConsumption
+	var out []domain.PolicyUsageTotal
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, `
-			SELECT consumption_id, tenant_id, legal_entity_id, spend_policy_id, amount,
-			       currency_code, COALESCE(source_reference, ''), correlation_id,
-			       decision_outcome, recorded_by_principal_id, recorded_at
-			FROM spend_consumptions
-			WHERE tenant_id = $1 AND correlation_id = $2
-		`, tenantID, correlationID).Scan(
-			&c.ConsumptionID, &c.TenantID, &c.LegalEntityID, &c.SpendPolicyID, &c.Amount,
-			&c.CurrencyCode, &c.SourceReference, &c.CorrelationID,
-			&c.DecisionOutcome, &c.RecordedByPrincipalID, &c.RecordedAt,
-		)
+		query := `
+			SELECT p.spend_policy_id,
+			       COALESCE(SUM(
+			         CASE WHEN c.decision_outcome = 'ALLOWED'
+			               AND c.currency_code = p.currency_code
+			               AND (` + periodWindowSQL + `)
+			              THEN c.amount ELSE 0 END
+			       ), 0) AS consumed,
+			       COUNT(CASE WHEN c.decision_outcome = 'BLOCKED' THEN 1 END) AS refused
+			FROM spend_policies p
+			LEFT JOIN spend_consumptions c
+			       ON c.spend_policy_id = p.spend_policy_id
+			      AND c.tenant_id = p.tenant_id
+			WHERE p.tenant_id = $1 AND p.active_flag = TRUE
+		`
+		args := []any{tenantID}
+		if legalEntityID != "" {
+			args = append(args, legalEntityID)
+			query += fmt.Sprintf(" AND p.legal_entity_id = $%d", len(args))
+		}
+		if category != "" {
+			args = append(args, category)
+			query += fmt.Sprintf(" AND p.category = $%d", len(args))
+		}
+		query += " GROUP BY p.spend_policy_id"
+
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t domain.PolicyUsageTotal
+			if err := rows.Scan(&t.SpendPolicyID, &t.Consumed, &t.RefusedCount); err != nil {
+				return err
+			}
+			out = append(out, t)
+		}
+		return rows.Err()
 	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// EvaluateSpend decides whether a proposed spend fits its policy and records
+// the outcome — both inside a single transaction, with the policy row locked.
+//
+// The lock is the point. Previously the running total was summed in one
+// transaction and the consumption inserted in another, so two checks arriving
+// together each saw the same prior total, each concluded it fit, and each was
+// recorded: a 10,000 threshold could be overspent without limit by simultaneous
+// requests. SELECT ... FOR UPDATE on the policy serialises checks against the
+// same policy, which is the granularity that matters — checks against different
+// policies still run concurrently.
+//
+// Refusals are recorded too, as BLOCKED rows excluded from the running total.
+// They used to exist only as Kafka events, which left no queryable trace of a
+// refused attempt and made decision_outcome a column that was always 'ALLOWED'.
+func (s *PgStore) EvaluateSpend(ctx context.Context, in domain.SpendEvaluation) (*domain.SpendDecision, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrTenantMissing
+	}
+
+	decision := &domain.SpendDecision{}
+
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// A prior decision for this correlation id wins outright: a retry must
+		// replay it, never re-evaluate and book the spend a second time.
+		existing, err := findConsumptionTx(ctx, tx, tenantID, in.CorrelationID)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			decision.Outcome = existing.DecisionOutcome
+			decision.Basis = "replayed_prior_decision"
+			decision.ConsumptionID = existing.ConsumptionID
+			decision.Replayed = true
+			decision.PriorConsumption = 0
+			decision.ProjectedTotal = existing.Amount
+			// Reload the policy so a replay can still report the figures the
+			// decision was made against, rather than a decision with no basis.
+			policy, err := findPolicyForUpdateTx(ctx, tx, tenantID, existing.LegalEntityID, in.Category, existing.SpendPolicyID)
+			if err != nil {
+				return err
+			}
+			decision.Policy = policy
+			return nil
+		}
+
+		policy, err := findPolicyForUpdateTx(ctx, tx, tenantID, in.LegalEntityID, in.Category, "")
+		if err != nil {
+			return err
+		}
+		if policy == nil {
+			// No policy is a distinct outcome from a policy that permits. The
+			// spend is allowed because nothing constrains it, and nothing is
+			// recorded because there is no budget to consume.
+			decision.Outcome = "ALLOWED"
+			decision.Basis = "no_policy_configured"
+			decision.ProjectedTotal = in.Amount
+			return nil
+		}
+		decision.Policy = policy
+
+		if policy.CurrencyCode != in.CurrencyCode {
+			return domain.ErrCurrencyMismatch
+		}
+
+		var prior float64
+		if policy.Period != "PER_TRANSACTION" {
+			if err := tx.QueryRow(ctx, sumConsumptionSQL,
+				tenantID, policy.SpendPolicyID, in.CurrencyCode, periodStart(policy.Period),
+			).Scan(&prior); err != nil {
+				return err
+			}
+		}
+		projected := prior + in.Amount
+
+		decision.PriorConsumption = prior
+		decision.ProjectedTotal = projected
+
+		if projected > policy.ThresholdAmount {
+			decision.Outcome = "BLOCKED"
+			decision.Basis = "threshold_exceeded"
+		} else {
+			decision.Outcome = "ALLOWED"
+			decision.Basis = "within_threshold"
+		}
+
+		consumptionID := uuid.NewString()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO spend_consumptions (
+				consumption_id, tenant_id, legal_entity_id, spend_policy_id, amount,
+				currency_code, source_reference, correlation_id, decision_outcome,
+				recorded_by_principal_id, recorded_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		`, consumptionID, tenantID, in.LegalEntityID, policy.SpendPolicyID, in.Amount,
+			in.CurrencyCode, nullIfEmpty(in.SourceReference), in.CorrelationID, decision.Outcome,
+			in.PrincipalID, time.Now().UTC()); err != nil {
+			return err
+		}
+		decision.ConsumptionID = consumptionID
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return decision, nil
+}
+
+// periodStart returns the start of the current enforcement window — the point
+// consumption is summed from. Lives beside the sum it governs.
+func periodStart(period string) time.Time {
+	now := time.Now().UTC()
+	if period == "ANNUAL" {
+		return time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	}
+	return time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC) // MONTHLY
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// findPolicyForUpdateTx locks the matching active policy for the duration of the
+// transaction. When policyID is non-empty it looks that policy up directly,
+// which is what a replay needs; otherwise it resolves the active policy for the
+// entity and category.
+func findPolicyForUpdateTx(ctx context.Context, tx pgx.Tx, tenantID, legalEntityID, category, policyID string) (*domain.SpendPolicy, error) {
+	var (
+		p    domain.SpendPolicy
+		row  pgx.Row
+		cols = `spend_policy_id, tenant_id, legal_entity_id, category, period,
+		         threshold_amount, currency_code, active_flag, created_by_principal_id,
+		         created_at, updated_at`
+	)
+
+	if policyID != "" {
+		row = tx.QueryRow(ctx, `SELECT `+cols+`
+			FROM spend_policies WHERE tenant_id = $1 AND spend_policy_id = $2 FOR UPDATE`,
+			tenantID, policyID)
+	} else {
+		row = tx.QueryRow(ctx, `SELECT `+cols+`
+			FROM spend_policies
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND category = $3 AND active_flag = TRUE
+			ORDER BY created_at DESC
+			LIMIT 1
+			FOR UPDATE`,
+			tenantID, legalEntityID, category)
+	}
+
+	if err := row.Scan(
+		&p.SpendPolicyID, &p.TenantID, &p.LegalEntityID, &p.Category, &p.Period,
+		&p.ThresholdAmount, &p.CurrencyCode, &p.ActiveFlag, &p.CreatedByPrincipalID,
+		&p.CreatedAt, &p.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &p, nil
+}
+
+func findConsumptionTx(ctx context.Context, tx pgx.Tx, tenantID, correlationID string) (*domain.SpendConsumption, error) {
+	var c domain.SpendConsumption
+	err := tx.QueryRow(ctx, `
+		SELECT consumption_id, tenant_id, legal_entity_id, spend_policy_id, amount,
+		       currency_code, COALESCE(source_reference, ''), correlation_id,
+		       decision_outcome, recorded_by_principal_id, recorded_at
+		FROM spend_consumptions
+		WHERE tenant_id = $1 AND correlation_id = $2
+	`, tenantID, correlationID).Scan(
+		&c.ConsumptionID, &c.TenantID, &c.LegalEntityID, &c.SpendPolicyID, &c.Amount,
+		&c.CurrencyCode, &c.SourceReference, &c.CorrelationID,
+		&c.DecisionOutcome, &c.RecordedByPrincipalID, &c.RecordedAt,
+	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -205,58 +495,10 @@ func (s *PgStore) FindConsumptionByCorrelation(ctx context.Context, correlationI
 	return &c, nil
 }
 
-// RecordConsumption inserts an ALLOWED consumption row, idempotent on
-// (tenant_id, correlation_id): if a retry races a concurrent original
-// request, the loser fetches and returns the winner's row instead of
-// erroring or double-counting.
-func (s *PgStore) RecordConsumption(ctx context.Context, c *domain.SpendConsumption) (created bool, err error) {
-	tenantID := svcmiddleware.TenantFromContext(ctx)
-	if tenantID == "" {
-		return false, domain.ErrIdentityMissing
-	}
-
-	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO spend_consumptions (
-				consumption_id, tenant_id, legal_entity_id, spend_policy_id, amount,
-				currency_code, source_reference, correlation_id, decision_outcome,
-				recorded_by_principal_id, recorded_at
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-			ON CONFLICT (tenant_id, correlation_id) DO NOTHING
-		`, c.ConsumptionID, tenantID, c.LegalEntityID, c.SpendPolicyID, c.Amount,
-			c.CurrencyCode, c.SourceReference, c.CorrelationID, c.DecisionOutcome,
-			c.RecordedByPrincipalID, c.RecordedAt)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() == 1 {
-			created = true
-			return nil
-		}
-
-		// Conflict: a consumption for this (tenant_id, correlation_id)
-		// already exists — a concurrent retry won the race. Fetch its
-		// values so the caller returns the winner's decision, not its own.
-		row := tx.QueryRow(ctx, `
-			SELECT consumption_id, spend_policy_id, amount, currency_code,
-			       COALESCE(source_reference, ''), decision_outcome, recorded_at
-			FROM spend_consumptions WHERE tenant_id = $1 AND correlation_id = $2
-		`, tenantID, c.CorrelationID)
-		return row.Scan(
-			&c.ConsumptionID, &c.SpendPolicyID, &c.Amount, &c.CurrencyCode,
-			&c.SourceReference, &c.DecisionOutcome, &c.RecordedAt,
-		)
-	})
-	if err != nil {
-		return false, err
-	}
-	return created, nil
-}
-
 func (s *PgStore) ListConsumptions(ctx context.Context, legalEntityID, spendPolicyID string) ([]domain.SpendConsumption, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return nil, domain.ErrTenantMissing
 	}
 
 	var out []domain.SpendConsumption

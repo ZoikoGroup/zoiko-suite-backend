@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -71,8 +73,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateVendorInvoiceRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := requiredInvoiceFieldMissing(req); missing != "" {
@@ -101,7 +102,7 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		InvoiceNumber:        req.InvoiceNumber,
 		Amount:               req.Amount,
 		CurrencyCode:         req.CurrencyCode,
-		DueDate:              req.DueDate,
+		DueDate:              req.DueDate.Time,
 		Status:               domain.InvoiceStatusReceived,
 		SourceContractID:     req.SourceContractID,
 		CreatedByPrincipalID: principalID,
@@ -110,6 +111,19 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 
 	created, err := h.store.CreateInvoice(r.Context(), inv)
 	if err != nil {
+		// A re-keyed invoice number is the caller's mistake, with a remedy they
+		// can act on. It used to arrive here indistinguishable from a dead
+		// database and answer 503.
+		if errors.Is(err, domain.ErrDuplicateInvoiceNumber) {
+			writeError(w, http.StatusConflict, "duplicate_invoice_number",
+				"this vendor already has an invoice with this number for this tenant")
+			return
+		}
+		if errors.Is(err, domain.ErrInvalidIdentifier) {
+			writeError(w, http.StatusBadRequest, "invalid_field",
+				"tenant_id and legal_entity_id must both be UUIDs")
+			return
+		}
 		h.log.Error("CreateInvoice: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
@@ -158,9 +172,21 @@ func (h *Handler) ListInvoices(w http.ResponseWriter, r *http.Request) {
 	}
 	invoices, err := h.store.ListInvoices(r.Context(), filter)
 	if err != nil {
+		// tenant_id is compared against a uuid column, so a non-UUID is a bad
+		// query parameter — a 400 naming the field, not a 503 implying the
+		// register is down.
+		if errors.Is(err, domain.ErrInvalidIdentifier) {
+			writeError(w, http.StatusBadRequest, "invalid_field", "tenant_id must be a UUID")
+			return
+		}
 		h.log.Error("ListInvoices: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	// A nil slice marshals to JSON null, which every caller then has to special-case.
+	// An empty register is an empty list.
+	if invoices == nil {
+		invoices = []domain.VendorInvoice{}
 	}
 	writeJSON(w, http.StatusOK, invoices)
 }
@@ -304,10 +330,58 @@ func (h *Handler) handleTransitionErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrInvalidTransition):
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidTransition.Error())
+	case errors.Is(err, domain.ErrInvoiceNotFound):
+		// Reachable when the id cannot name a row at all. Kept apart from
+		// invalid_transition: "there is no such invoice" and "that invoice is
+		// not in a state this action can act on" are different facts, and the
+		// remedy differs.
+		writeError(w, http.StatusNotFound, "invoice_not_found", "")
 	default:
 		h.log.Error("TransitionInvoice: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
+}
+
+// maxRequestBytes caps a request body. Without it a single client can stream an
+// unbounded body straight into the decoder and hold a connection and memory for
+// as long as it likes. An invoice header is a few hundred bytes; 64 KiB is
+// already generous.
+const maxRequestBytes = 64 << 10
+
+// decodeJSON reads a JSON body strictly, and reports WHY it was refused.
+//
+// Two deliberate strictnesses:
+//
+//   - DisallowUnknownFields. Without it a misspelled key is silently discarded
+//     and the service answers 201 for a record missing the value the caller
+//     believed they sent — `{"vendorid": "..."}` created an invoice with no
+//     vendor at all. Accepting a body and ignoring part of it is worse than
+//     rejecting it, because nothing downstream can tell the difference.
+//   - MaxBytesReader, for the size cap above.
+//
+// Returns false when it has already written the response.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		switch {
+		case errors.As(err, &maxErr):
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				fmt.Sprintf("body exceeds %d bytes", maxRequestBytes))
+		case strings.HasPrefix(err.Error(), "json: unknown field "):
+			// The message already names the offending key, and that name is the
+			// entire remedy.
+			writeError(w, http.StatusBadRequest, "unknown_field", err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		}
+		return false
+	}
+	return true
 }
 
 func requiredInvoiceFieldMissing(req domain.CreateVendorInvoiceRequest) string {

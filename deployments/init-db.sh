@@ -165,6 +165,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "spend_controls" -f
 # Apply migrations for vendor-due-diligence-svc
 echo "Applying migrations for vendor_due_diligence..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligence" -f /migrations/vendor-due-diligence/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligence" -f /migrations/vendor-due-diligence/000002_screening_source.up.sql
 
 # Apply migrations for notification-svc
 echo "Applying migrations for notification..."
@@ -271,7 +272,6 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severa
 echo "Applying migrations for workforce_compliance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000002_fix_tenant_isolation_and_idempotency.up.sql
-fix/workforce-engine-critical-bugs
 
 
 # ── Phase 5 ─────────────────────────────────────────────────────────────────
@@ -376,7 +376,6 @@ EOSQL
 # Apply migrations for corporate-tax-svc
 echo "Applying migrations for corporate_tax..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_tax" -f /migrations/corporate-tax/000001_initial_schema.up.sql
- main
 
 # Create database for evidence-requirements-svc — the seventh and final
 # Governance Platform service (03-microservices.md §5.1, §8.6).

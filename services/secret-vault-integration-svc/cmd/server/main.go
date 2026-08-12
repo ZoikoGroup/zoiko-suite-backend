@@ -7,7 +7,8 @@
 //  4. Construct PgStore
 //  5. Construct the vault backend (LocalFileVaultBackend for v1 — see
 //     internal/vault/backend.go and context.md §7.6)
-//  6. Construct event publisher (stub — logs until kafka.Writer is injected)
+//  6. Construct event publisher over a kafka.Writer (a logged no-op when no
+//     brokers are configured, which is refused outside local development)
 //  7. Construct HTTP handler + mount routes on chi router
 //  8. Mount health probes (/healthz, /readyz)
 //  9. Start HTTP server with graceful shutdown
@@ -114,7 +115,7 @@ func main() {
 		log.Fatal("failed to construct vault backend", zap.Error(err))
 	}
 
-	// ── 6. Event publisher (stub — logs until kafka.Writer is injected) ─────────
+	// ── 6. Event publisher ────────────────────────────────────────────────────
 	kafkaWriter := newKafkaWriter(cfg, log)
 	if kafkaWriter != nil {
 		defer func() { _ = kafkaWriter.Close() }()
@@ -224,5 +225,14 @@ func newKafkaWriter(cfg *config.Config, log *zap.Logger) *kafka.Writer {
 		// holding the request open — the write is already committed by the
 		// time an event is emitted.
 		WriteTimeout: 5 * time.Second,
+		// Without this, every write to this service costs an extra second.
+		// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+		// WriteMessages of a single message waits for the batch to fill (100
+		// messages) or for that timer, whichever comes first. These events are
+		// emitted one per state transition, so the batch never fills and the
+		// timer always wins — and publishing is on the request path, so the
+		// caller pays for it. Ordering and synchronous delivery are unchanged;
+		// only the artificial wait goes away.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 }
