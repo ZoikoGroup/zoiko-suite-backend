@@ -105,11 +105,17 @@ func main() {
 	// metadata request, so every write to a not-yet-existing topic fails
 	// with "Unknown Topic Or Partition" regardless of the broker-side
 	// setting.
+	// BatchTimeout is 10ms, not the library default of 1s. Publishing is
+	// synchronous on the request path and a single lock emits up to two events
+	// (close.started, then closed or blocked), so the default was costing about
+	// two seconds per close on batching delay alone. Same value, same reason, as
+	// every other producer in this estate.
 	kafkaWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		BatchTimeout:           10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
@@ -127,7 +133,7 @@ func main() {
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, log)
+	h := handler.New(pgStore, publisher, clientsWrapper, clientsWrapper, []byte(cfg.CloseSigningKey), log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

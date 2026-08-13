@@ -1860,7 +1860,19 @@ services:
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       AP_SERVICE_URL: "http://accounts-payable-svc:8099"
       AR_SERVICE_URL: "http://accounts-receivable-svc:8101"
-      VAULT_SERVICE_URL: "http://document-vault-svc:8092"
+      # 8094, which is the port document-vault-svc actually listens on and what
+      # evidence-requirements-svc has always used. This said 8092 — a port
+      # nothing in this platform serves — so every close failed at the evidence
+      # upload with "failed to record close evidence in vault", which reads as
+      # the vault being broken rather than as never having been contacted.
+      VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # HMAC secret for the close evidence signature. The service refuses to
+      # start without one, deliberately: the signature was previously keyed with
+      # the tenant id — a public value — so anything it "guaranteed" was
+      # forgeable. This is a LOCAL DEVELOPMENT value and must come from the
+      # secret store in any real deployment; rotating it invalidates the
+      # signature on evidence already recorded, so treat it as long-lived.
+      CLOSE_SIGNING_KEY: "${CLOSE_SIGNING_KEY:-local-dev-close-signing-key-not-for-production}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -112,6 +112,15 @@ $BUNDLES = @(
         Actions = @("GL_JOURNAL_CREATE", "GL_JOURNAL_VALIDATE", "GL_JOURNAL_POST", "GL_JOURNAL_REVERSE")
     },
     @{
+        # financial-close-svc separates registering a period from reading the
+        # register and from initiating a close. VIEW is needed for the console's
+        # register AND for the readiness check, which is a read: without it the
+        # period register answers 403 rather than an empty list.
+        Code    = "CLOSE_FULL"
+        Service = "financial-close-svc"
+        Actions = @("PERIOD_CLOSE_CONFIG", "PERIOD_CLOSE_VIEW", "PERIOD_CLOSE_INITIATE")
+    },
+    @{
         # spend-controls-svc separates setting a limit from spending against it,
         # and checks VIEW on its two read routes as well -- the reads are
         # authorized unconditionally, so without VIEW the console's registers
