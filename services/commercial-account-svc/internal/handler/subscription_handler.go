@@ -258,7 +258,12 @@ func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "commercial_subscription.created", sub.SubscriptionID, sub.CommercialAccountID, sub)
+	// commercial_subscription.created is published via the transactional
+	// outbox (internal/outbox), written in the same DB transaction as the
+	// INSERT above — see PgStore.CreateSubscription. No direct publish
+	// call here: that would either double-publish or, if removed without
+	// the outbox in place, silently drop the event on a crash between
+	// commit and publish (doc7 backlog item 32).
 	writeJSON(w, http.StatusCreated, sub)
 }
 

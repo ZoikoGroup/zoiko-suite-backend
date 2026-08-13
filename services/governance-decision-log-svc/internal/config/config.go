@@ -25,6 +25,11 @@ type Config struct {
 	// authorization-svc rejects an empty legal_entity_id outright.
 	AuthZPlatformScopeID string
 
+	// PolicyServiceURL is the base URL of policy-svc. Used only by
+	// ReplayDecision to fetch the EXACT policy version a past decision
+	// used (backlog item 34) — never for authorization.
+	PolicyServiceURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -68,6 +73,7 @@ func Load() (*Config, error) {
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
+		PolicyServiceURL:     env("POLICY_SERVICE_URL", "http://policy-svc:8085"),
 		Kafka: KafkaConfig{
 			Brokers: envList("KAFKA_BROKERS", []string{"localhost:9092"}),
 			GroupID: env("KAFKA_GROUP_ID", "governance-decision-log-svc"),
