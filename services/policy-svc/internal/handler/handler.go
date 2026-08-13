@@ -135,6 +135,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/policies/{policy_id}/versions", h.CreatePolicyVersion)
 	r.Post("/v1/policies/{policy_id}/versions/{version_id}/activate", h.ActivateVersion)
 	r.Get("/v1/policies/{policy_id}/versions", h.ListVersionHistory)
+	r.Get("/v1/policy-versions/{version_id}", h.GetPolicyVersionByID)
 }
 
 // correlationIDMiddleware echoes X-Correlation-ID from the request into the
@@ -580,6 +581,46 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 		results = []*domain.PolicyVersion{}
 	}
 	writeJSON(w, http.StatusOK, results)
+}
+
+// ── GET /v1/policy-versions/{version_id} ────────────────────────────────────
+
+// GetPolicyVersionByID handles GET /v1/policy-versions/{version_id} — a
+// raw fetch of one version by ID, independent of its owning policy_id or
+// current activation state. This is the "as of" lookup doc7's replay
+// doctrine needs: FindApplicableVersions/Evaluate always resolve whatever
+// is ACTIVE right now, but a replay must re-evaluate against the EXACT
+// version a past decision actually used, whether or not that version is
+// still ACTIVE today.
+//
+// Response:
+//
+//	200 → the PolicyVersion
+//	404 → version_id not found
+//	503 → store unavailable
+func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
+	versionID := chi.URLParam(r, "version_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	v, err := h.store.FindPolicyVersionByID(r.Context(), versionID)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrPolicyVersionNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{
+				"error":             "policy_version_not_found",
+				"policy_version_id": versionID,
+			})
+		default:
+			h.log.Error("GetPolicyVersionByID: store unavailable",
+				zap.String("policy_version_id", versionID),
+				zap.String("correlation_id", correlationID),
+				zap.Error(err),
+			)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
 }
 
 // ── GET /v1/policies (applicable policy set) ────────────────────────────────

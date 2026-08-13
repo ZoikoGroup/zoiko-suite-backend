@@ -56,7 +56,16 @@ func (p *KafkaPublisher) Publish(ctx context.Context, eventType string, entityID
 		Value: data,
 	})
 	if err != nil {
-		p.logger.Warn("kafka publish failed — event dropped", zap.String("event_type", eventType), zap.Error(err))
+		// Every existing call site discards this return value (`_ =
+		// h.publisher.Publish(...)`), so returning the real error here
+		// changes nothing for them — they keep behaving exactly as
+		// before, fire-and-forget. It matters for internal/outbox's
+		// Relay, which is a NEW caller that actually checks this error to
+		// decide whether to mark an outbox row published or retry it;
+		// swallowing the error here would make that retry logic dead
+		// code.
+		p.logger.Warn("kafka publish failed", zap.String("event_type", eventType), zap.Error(err))
+		return err
 	}
 	return nil
 }

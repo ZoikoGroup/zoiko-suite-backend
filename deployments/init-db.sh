@@ -13,6 +13,9 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE capability_registry;
     CREATE DATABASE ai_governance;
     CREATE DATABASE kill_switch_registry;
+    CREATE DATABASE retention_registry;
+    CREATE DATABASE metric_registry;
+    CREATE DATABASE source_authority;
     CREATE DATABASE jurisdiction_rules;
     CREATE DATABASE governance_decision_log;
     CREATE DATABASE identity_context;
@@ -81,6 +84,7 @@ echo "Applying migrations for commercial_account..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000002_add_plans_and_subscriptions.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000003_add_dunning_and_transfers.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000004_add_outbox_events.up.sql
 # Apply migrations for capability-registry-svc
 echo "Applying migrations for capability_registry..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "capability_registry" -f /migrations/capability-registry/000001_initial_schema.up.sql
@@ -91,6 +95,18 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "ai_governance" -f 
 # Apply migrations for kill-switch-registry-svc
 echo "Applying migrations for kill_switch_registry..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "kill_switch_registry" -f /migrations/kill-switch-registry/000001_initial_schema.up.sql
+
+# Apply migrations for retention-registry-svc
+echo "Applying migrations for retention_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "retention_registry" -f /migrations/retention-registry/000001_initial_schema.up.sql
+
+# Apply migrations for metric-registry-svc
+echo "Applying migrations for metric_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "metric_registry" -f /migrations/metric-registry/000001_initial_schema.up.sql
+
+# Apply migrations for source-authority-svc
+echo "Applying migrations for source_authority..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "source_authority" -f /migrations/source-authority/000001_initial_schema.up.sql
 
 # Apply migrations for jurisdiction-rules-svc
 echo "Applying migrations for jurisdiction_rules..."
@@ -105,6 +121,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decisio
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000002_add_rls.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000003_enforce_immutability.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000004_add_event_linkage_keys.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000005_add_replay_manifests.up.sql
 # Apply migrations for policy-svc
 echo "Applying migrations for policy..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000001_initial_schema.up.sql

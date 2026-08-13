@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
+	"zoiko.io/commercial-account-svc/internal/outbox"
 )
 
 func (s *PgStore) CreatePriceCatalog(ctx context.Context, c *domain.PriceCatalog) error {
@@ -127,12 +128,25 @@ func (s *PgStore) ListEntitlementLimitsByPlan(ctx context.Context, planID string
 	return out, rows.Err()
 }
 
+// CreateSubscription inserts the subscription and its
+// commercial_subscription.created outbox event in ONE transaction
+// (doc7 backlog item 32 — transactional outbox pilot). Either both are
+// durable or neither is; there is no window where the subscription
+// exists but nothing downstream can ever learn about it because a
+// separate publish call after commit happened to fail.
 func (s *PgStore) CreateSubscription(ctx context.Context, sub *domain.CommercialSubscription) error {
 	billingSource := sub.BillingSource
 	if billingSource == "" {
 		billingSource = domain.BillingSourceDirect
 	}
-	_, err := s.pool.Exec(ctx, `
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin create subscription: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	_, err = tx.Exec(ctx, `
 		INSERT INTO commercial_subscriptions (
 			subscription_id, commercial_account_id, plan_id, catalog_version_id, billing_interval,
 			status, renewal_date, canceled_at, processor_subscription_ref,
@@ -147,6 +161,21 @@ func (s *PgStore) CreateSubscription(ctx context.Context, sub *domain.Commercial
 			return fmt.Errorf("%w: commercial_account_id %s", domain.ErrActiveSubscriptionExists, sub.CommercialAccountID)
 		}
 		return fmt.Errorf("insert subscription: %w", err)
+	}
+
+	tenantID := sub.CommercialAccountID
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "commercial_subscription",
+		AggregateID:   sub.SubscriptionID,
+		EventType:     "commercial_subscription.created",
+		Payload:       sub,
+		TenantID:      &tenantID,
+	}); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit create subscription: %w", err)
 	}
 	return nil
 }

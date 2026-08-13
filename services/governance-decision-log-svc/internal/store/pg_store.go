@@ -58,6 +58,10 @@ type Store interface {
 	// scoped to params.TenantID. All other filter fields are optional and
 	// compose with AND semantics.
 	List(ctx context.Context, params ListParams) ([]*domain.GovernanceDecision, error)
+
+	// ── replay manifests (backlog item 34) ──────────────────────────────────
+	CreateReplayManifest(ctx context.Context, m *domain.ReplayManifest) error
+	ListReplayManifestsByDecision(ctx context.Context, decisionID string) ([]*domain.ReplayManifest, error)
 }
 
 // PgStore implements Store against PostgreSQL via pgxpool.
@@ -290,6 +294,70 @@ func nullableJSON(raw []byte) interface{} {
 		return nil
 	}
 	return raw
+}
+
+// ── replay manifests (backlog item 34) ────────────────────────────────────────
+
+const replayManifestColumns = `
+	replay_manifest_id, decision_id, policy_version_id,
+	replayed_outcome, original_outcome, outcomes_match, replay_notes,
+	replayed_at, replayed_by_principal_id`
+
+func scanReplayManifest(row pgx.Row) (*domain.ReplayManifest, error) {
+	m := &domain.ReplayManifest{}
+	err := row.Scan(
+		&m.ReplayManifestID, &m.DecisionID, &m.PolicyVersionID,
+		&m.ReplayedOutcome, &m.OriginalOutcome, &m.OutcomesMatch, &m.ReplayNotes,
+		&m.ReplayedAt, &m.ReplayedByPrincipalID,
+	)
+	return m, err
+}
+
+// CreateReplayManifest inserts a new manifest. No RLS/tenant scoping —
+// replay_manifests has no tenant_id of its own; access is via its parent
+// decision_id, which IS tenant-scoped.
+func (s *PgStore) CreateReplayManifest(ctx context.Context, m *domain.ReplayManifest) error {
+	const q = `
+		INSERT INTO replay_manifests (
+			replay_manifest_id, decision_id, policy_version_id,
+			replayed_outcome, original_outcome, outcomes_match, replay_notes,
+			replayed_by_principal_id
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+
+	_, err := s.pool.Exec(ctx, q,
+		m.ReplayManifestID, m.DecisionID, m.PolicyVersionID,
+		m.ReplayedOutcome, m.OriginalOutcome, m.OutcomesMatch, m.ReplayNotes,
+		m.ReplayedByPrincipalID,
+	)
+	if err != nil {
+		s.log.Error("pg CreateReplayManifest failed", zap.String("decision_id", m.DecisionID), zap.Error(err))
+		return fmt.Errorf("%w: insert replay manifest: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+func (s *PgStore) ListReplayManifestsByDecision(ctx context.Context, decisionID string) ([]*domain.ReplayManifest, error) {
+	const q = `SELECT ` + replayManifestColumns + `
+FROM replay_manifests
+WHERE decision_id = $1
+ORDER BY replayed_at DESC`
+
+	rows, err := s.pool.Query(ctx, q, decisionID)
+	if err != nil {
+		s.log.Error("pg ListReplayManifestsByDecision failed", zap.String("decision_id", decisionID), zap.Error(err))
+		return nil, fmt.Errorf("%w: list replay manifests: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+
+	var out []*domain.ReplayManifest
+	for rows.Next() {
+		m, scanErr := scanReplayManifest(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("%w: scan replay manifest: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 // ─── compile-time interface check ──────────────────────────────────────────
