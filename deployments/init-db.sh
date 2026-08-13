@@ -12,6 +12,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-E
     CREATE DATABASE commercial_account;
     CREATE DATABASE capability_registry;
     CREATE DATABASE ai_governance;
+    CREATE DATABASE kill_switch_registry;
     CREATE DATABASE jurisdiction_rules;
     CREATE DATABASE governance_decision_log;
     CREATE DATABASE identity_context;
@@ -86,6 +87,10 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "capability_registr
 # Apply migrations for ai-governance-svc
 echo "Applying migrations for ai_governance..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "ai_governance" -f /migrations/ai-governance/000001_initial_schema.up.sql
+
+# Apply migrations for kill-switch-registry-svc
+echo "Applying migrations for kill_switch_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "kill_switch_registry" -f /migrations/kill-switch-registry/000001_initial_schema.up.sql
 
 # Apply migrations for jurisdiction-rules-svc
 echo "Applying migrations for jurisdiction_rules..."

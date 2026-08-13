@@ -145,14 +145,32 @@ shallow, single-service stubs.
 | 35 | `report_metric_definition` — versioned formula/scope/owner for every executive metric | §M1 | Not Started | Deferred — reporting concern with no natural single owning service yet; needs its own session |
 | 36 | `source_authority_map` / `normalized_fact` — field-level source-of-truth precedence for connected systems | §D1–D3 | Not Started | Deferred — connected-systems concern with no natural single owning service yet; needs its own session |
 
-## Chunk 11 — Cross-Cutting Reliability & Security Controls
+## Chunk 11 — Cross-Cutting Reliability & Security Controls — item 37 ✅ Done 2026-08-13, items 38–40 deferred/blocked
+
+Resolution for item 37: new service `kill-switch-registry-svc` — genuinely
+cross-cutting (used by every plane, not owned by any one existing bounded
+context), so it gets its own service per this session's established
+new-vs-extend test. Distinct from capability-registry-svc's `Release`/
+`ReleaseState`: that answers "is this one capability operationally
+enabled" (capability_id-scoped only, a product-availability question).
+This answers "must this class of action be stopped right now" across four
+independently-nullable scope dimensions at once (plane/domain/provider/
+tenant) — an incident-response question. Append-only `kill_switch_events`
+(ENGAGE/DISENGAGE) with a `event_seq BIGSERIAL` ordering column (not just
+`created_at`, which can tie under rapid successive calls — a real bug
+caught and fixed during unit testing before commit). `GET
+/v1/kill-switches/resolve` returns the most specific currently-engaged
+switch across every compatible scope tier; `GET /v1/kill-switches` lists
+every distinct scope's current state (the "visible in operations"
+requirement); `GET /v1/kill-switches/history` returns one scope's full
+audit trail, never erased.
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 37 | Kill switches — plane/domain/provider/tenant-scoped, for commercial charging, automation, model/provider use, obligation activation, imports/syncs, exports, public claims | §32.1 | Not Started | |
-| 38 | Safe-degraded-mode definitions per service (stale integration → show timestamped last-known fact; evidence-store outage → fail closed on approvals) | §32.2 | Not Started | |
-| 39 | Wire §32's observability signal families (commercial integrity, tenant/data integrity drift, governance-engine errors, AI/automation anomalies) into the existing OTel/Prometheus setup | §32 | Not Started | |
-| 40 | Numeric SLOs (availability/latency/recovery/AI-quality) — intentionally not invented by the spec; needs real production measurement first | §32 | Not Started | |
+| 37 | Kill switches — plane/domain/provider/tenant-scoped, for commercial charging, automation, model/provider use, obligation activation, imports/syncs, exports, public claims | §32.1 | Done | New `kill-switch-registry-svc`; live-verified engage validation (reconciliation_procedure_ref required), a platform-wide switch blocking an unrelated narrow scope, most-specific-match resolution between a domain-wide and a tenant-scoped switch both engaged at once, disengage clearing resolution, a rejected repeat-disengage (409), and the full 3-event audit history surviving engage→disengage→re-engage with nothing erased |
+| 38 | Safe-degraded-mode definitions per service (stale integration → show timestamped last-known fact; evidence-store outage → fail closed on approvals) | §32.2 | Not Started | Deferred — this is a per-service *behavior* requirement (each of ~90 services must define its own DEGRADED response), not a shared object one new table or service can satisfy; needs its own audit-and-implement pass across the whole fleet |
+| 39 | Wire §32's observability signal families (commercial integrity, tenant/data integrity drift, governance-engine errors, AI/automation anomalies) into the existing OTel/Prometheus setup | §32 | Not Started | Deferred — cross-cutting instrumentation across every service, same class of scope as Chunk 10's items 32–36; needs its own session |
+| 40 | Numeric SLOs (availability/latency/recovery/AI-quality) — intentionally not invented by the spec; needs real production measurement first | §32 | Blocked | doc7 itself states this standard "intentionally does not invent SLA percentages" — needs real measured production capacity and business-criticality sign-off, not code |
 
 ## Chunk 12 — Production Acceptance Sign-Off (§27 checklist, process gate)
 

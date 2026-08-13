@@ -23,6 +23,7 @@ services:
       - ../services/commercial-account-svc/deployments/migrations:/migrations/commercial-account:ro
       - ../services/capability-registry-svc/deployments/migrations:/migrations/capability-registry:ro
       - ../services/ai-governance-svc/deployments/migrations:/migrations/ai-governance:ro
+      - ../services/kill-switch-registry-svc/deployments/migrations:/migrations/kill-switch-registry:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
@@ -2886,6 +2887,43 @@ services:
       DATABASE_URL: "postgres://postgres:postgres@postgres:5432/ai_governance?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── kill-switch-registry-svc (Port: 8147) ───────────────────────────────
+  # Cross-cutting incident-response control (doc7 §32.1). Append-only
+  # ENGAGE/DISENGAGE log scoped across plane/domain/provider/tenant
+  # independently; resolve returns the most specific currently-engaged
+  # switch for a given check. Distinct from capability-registry-svc's
+  # Release/ReleaseState, which is capability_id-scoped product-
+  # availability state, not an incident-response stop.
+  kill-switch-registry-svc:
+    build:
+      context: ../services/kill-switch-registry-svc
+      dockerfile: Dockerfile
+    container_name: kill-switch-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8147:8147"
+    environment:
+      PORT: "8147"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/kill_switch_registry?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.kill-switch-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
