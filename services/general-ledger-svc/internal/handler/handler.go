@@ -7,21 +7,36 @@ import (
 	"errors"
 	"net/http"
 
+	"strconv"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
+	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
 
 // Store is the persistence contract the handler depends on.
 type Store interface {
 	CreateJournal(ctx context.Context, h *domain.JournalHeader, lines []domain.JournalLine) (resultLines []domain.JournalLine, created bool, err error)
 	GetJournal(ctx context.Context, journalID string) (*domain.JournalHeader, []domain.JournalLine, error)
+
+	// GetJournalByCorrelationID resolves the idempotency key to the journal it
+	// created, so a retried reversal can be recognised as one.
+	GetJournalByCorrelationID(ctx context.Context, tenantID, correlationID string) (*domain.JournalHeader, []domain.JournalLine, error)
 	ListJournals(ctx context.Context, filter domain.ListJournalsFilter) ([]domain.JournalHeader, error)
 	TransitionJournal(ctx context.Context, tenantID, journalID string, fromStatus, toStatus domain.JournalStatus, actorPrincipalID string) error
-	SumLines(ctx context.Context, tenantID, journalID string) (debitTotal, creditTotal float64, err error)
+
+	// ReverseJournal posts the reversing journal and marks the original
+	// REVERSED in one transaction — see the store method's comment for why
+	// these cannot be two calls.
+	ReverseJournal(ctx context.Context, tenantID, originalJournalID string, reversing *domain.JournalHeader, reversingLines []domain.JournalLine, actorPrincipalID string) (resultLines []domain.JournalLine, created bool, err error)
+
+	// SumLines returns exact minor units (cents), not float64 — the balance
+	// invariant below is decided by exact equality.
+	SumLines(ctx context.Context, tenantID, journalID string) (debitTotal, creditTotal int64, err error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -97,6 +112,19 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	// The body names a tenant and so does the gateway. Only one of them was
+	// verified. They used to be allowed to disagree, and the store then wrote
+	// the row under the body's tenant while scoping the transaction to the
+	// header's — filing a journal into a ledger the caller has no relationship
+	// with, invisible to the tenant who created it.
+	if req.TenantID != tenantID {
+		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionCreateJournal); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -138,6 +166,14 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 
 	resultLines, created, err := h.store.CreateJournal(r.Context(), header, lines)
 	if err != nil {
+		// tenant_id and legal_entity_id are compared against uuid columns, so a
+		// non-UUID is a bad field — a 400 naming them, not a 503 implying the
+		// ledger is down.
+		if errors.Is(err, domain.ErrInvalidIdentifier) {
+			writeError(w, http.StatusBadRequest, "invalid_field",
+				"tenant_id and legal_entity_id must both be UUIDs")
+			return
+		}
 		h.log.Error("CreateJournal: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
@@ -173,26 +209,83 @@ func (h *Handler) GetJournal(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── GET /v1/journals ──────────────────────────────────────────────────────────
-
+//
+// Scoped to the caller's VERIFIED tenant, not to the tenant_id in the query
+// string. It used to be the other way around: GetJournal filtered by the
+// gateway-verified X-Tenant-Id and answered 404 for another tenant's journal,
+// while ListJournals passed the query parameter straight through to the WHERE
+// clause. So the boundary this service enforced one journal at a time could be
+// stepped over wholesale — `?tenant_id=<anyone>` returned that tenant's entire
+// general ledger, every entity, every period, amounts and all. A read that
+// needs no id to guess is the worse of the two leaks, and it was the unguarded
+// one.
+//
+// tenant_id is still accepted, because callers inside the estate send it
+// (accounts-receivable-svc, financial-close-svc, consolidation-svc), but it is
+// now only permitted to agree with the verified scope. Disagreement is refused
+// outright rather than served under either tenant, and rather than answered
+// with an empty list — an empty register reads as "this tenant has no
+// journals", which is a different and more misleading claim than "no".
 func (h *Handler) ListJournals(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
 	q := r.URL.Query()
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
+		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+
+	limit, ok := parseLimit(w, q.Get("limit"))
+	if !ok {
+		return
+	}
+
 	filter := domain.ListJournalsFilter{
-		TenantID:      q.Get("tenant_id"),
+		TenantID:      tenantID,
 		LegalEntityID: q.Get("legal_entity_id"),
 		FiscalPeriod:  q.Get("fiscal_period"),
 		Status:        q.Get("status"),
+		Limit:         limit,
 	}
-	if filter.TenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "tenant_id")
-		return
-	}
+
 	journals, err := h.store.ListJournals(r.Context(), filter)
 	if err != nil {
+		if errors.Is(err, domain.ErrInvalidIdentifier) {
+			// legal_entity_id is compared as text, so it cannot land here; the
+			// verified tenant is the only uuid comparison left, and a gateway
+			// that forwarded a non-UUID tenant scope is a fault worth naming
+			// rather than reporting as a dead store.
+			writeError(w, http.StatusBadRequest, "invalid_field", "tenant scope must be a UUID")
+			return
+		}
 		h.log.Error("ListJournals: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
+	// A nil slice marshals to JSON null, which every caller then has to
+	// special-case. An empty ledger is an empty list.
+	if journals == nil {
+		journals = []domain.JournalHeader{}
+	}
 	writeJSON(w, http.StatusOK, journals)
+}
+
+// parseLimit reads an optional ?limit. A limit that isn't a positive integer is
+// refused rather than silently replaced with the default — a caller who asked
+// for a specific page size and got another one has no way to notice.
+func parseLimit(w http.ResponseWriter, raw string) (int, bool) {
+	if raw == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_field", "limit must be a positive integer")
+		return 0, false
+	}
+	return n, true
 }
 
 // ── POST /v1/journals/{journal_id}/validate ──────────────────────────────────
@@ -222,6 +315,10 @@ func (h *Handler) ValidateJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Exact equality on exact minor units. Postgres sums the NUMERIC(18,2)
+	// columns and returns cents as bigint, so this compares integers — the
+	// same test written over two float64 sums would reject journals that
+	// balance perfectly well in decimal.
 	debitTotal, creditTotal, err := h.store.SumLines(r.Context(), header.TenantID, journalID)
 	if err != nil {
 		h.log.Error("ValidateJournal: failed to sum lines", zap.Error(err))
@@ -326,17 +423,31 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "journal_not_found", "")
 		return
 	}
-	if header.Status != domain.JournalStatusFinalized {
-		writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible", domain.ErrOnlyFinalizedReversible.Error())
-		return
-	}
 
+	// Authorization is checked before the state of the journal is reported on,
+	// so an unauthorized caller cannot use the difference between 422 and 412
+	// to read a journal's posting status.
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionReverseJournal); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if header.Status != domain.JournalStatusFinalized {
+		// A journal that is already REVERSED may be the caller's own reversal
+		// coming back after a network timeout. Reversal advertises an
+		// idempotency key, and this check used to reject the retry before the
+		// store could recognise it — answering "only a FINALIZED journal may be
+		// reversed", which reads as a refusal for an operation that in fact
+		// succeeded. The idempotent branch below it was unreachable code.
+		if replay, replayLines, ok := h.reversalReplay(r.Context(), header, journalID, req.CorrelationID); ok {
+			writeJSON(w, http.StatusOK, domain.JournalWithLines{JournalHeader: *replay, Lines: replayLines})
+			return
+		}
+		writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible", domain.ErrOnlyFinalizedReversible.Error())
 		return
 	}
 
@@ -375,31 +486,62 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resultLines, created, err := h.store.CreateJournal(r.Context(), reversingHeader, reversingLines)
+	// One transaction: the reversing journal is posted and the original marked
+	// REVERSED together, or neither happens. As two calls, a failure between
+	// them left the books holding both the original posting and its inverse as
+	// live FINALIZED entries — a double-counted ledger no later request would
+	// ever reconcile.
+	resultLines, created, err := h.store.ReverseJournal(
+		r.Context(), header.TenantID, journalID, reversingHeader, reversingLines, principalID)
 	if err != nil {
-		h.log.Error("ReverseJournal: failed to create reversing journal", zap.Error(err))
+		// The original stopped being FINALIZED between the read above and the
+		// write — a concurrent reversal won the race. Its reversing journal
+		// rolled back with it, so there is nothing to clean up.
+		if errors.Is(err, domain.ErrInvalidTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible",
+				domain.ErrOnlyFinalizedReversible.Error())
+			return
+		}
+		h.log.Error("ReverseJournal: failed to post reversing journal", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
 
-	// created=false means this correlation_id already reversed this journal
-	// on an earlier call — a retry, not a new reversal. The original
-	// journal is already REVERSED; re-running TransitionJournal would
-	// correctly fail with ErrInvalidTransition (it's not FINALIZED anymore)
-	// and wrongly report a retry as an error. Return the original result.
+	// created=false means this correlation_id already reversed this journal on
+	// an earlier call — a retry, not a new reversal. reversingHeader has been
+	// resolved to the journal that actually exists, so the reply is the stored
+	// reversal rather than a fresh id for a row that was never written.
 	if !created {
 		writeJSON(w, http.StatusOK, domain.JournalWithLines{JournalHeader: *reversingHeader, Lines: resultLines})
 		return
 	}
 
-	if err := h.store.TransitionJournal(r.Context(), header.TenantID, journalID,
-		domain.JournalStatusFinalized, domain.JournalStatusReversed, principalID); err != nil {
-		h.handleTransitionErr(w, err)
-		return
-	}
-
+	header.Status = domain.JournalStatusReversed
 	h.publisher.PublishJournalReversed(r.Context(), *header, reversingHeader.JournalID)
 	writeJSON(w, http.StatusCreated, domain.JournalWithLines{JournalHeader: *reversingHeader, Lines: resultLines})
+}
+
+// reversalReplay reports whether this exact reversal has already been applied:
+// the journal is REVERSED, and the caller's correlation_id belongs to a journal
+// that reverses this one. Only then is the earlier reversal returned — a
+// correlation_id that names some unrelated journal is not this caller's
+// reversal coming back, and must not be answered as though it were.
+func (h *Handler) reversalReplay(ctx context.Context, header *domain.JournalHeader, journalID, correlationID string) (*domain.JournalHeader, []domain.JournalLine, bool) {
+	if header.Status != domain.JournalStatusReversed || correlationID == "" {
+		return nil, nil, false
+	}
+	existing, lines, err := h.store.GetJournalByCorrelationID(ctx, header.TenantID, correlationID)
+	if err != nil {
+		// Treat a failed lookup as "not a replay". The caller then gets the
+		// ordinary 422, which is the truthful answer for a REVERSED journal;
+		// inventing a success here would be worse than an unhelpful refusal.
+		h.log.Error("reversalReplay: lookup failed", zap.Error(err))
+		return nil, nil, false
+	}
+	if existing == nil || existing.ReversalOfJournalID == nil || *existing.ReversalOfJournalID != journalID {
+		return nil, nil, false
+	}
+	return existing, lines, true
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -463,6 +605,21 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireTenant reads the caller's verified tenant scope from X-Tenant-Id, set
+// by the same gateway ForwardAuth step that sets X-Principal-Id (see
+// internal/middleware.TenantContext). A request with no verified tenant scope
+// never passed that verification, and is refused rather than served under a
+// tenant it names itself — the whole point of the header is that it is the one
+// tenant claim in the request the caller did not write.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", domain.ErrTenantScopeMissing.Error())
+		return "", false
+	}
+	return tenantID, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

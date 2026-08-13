@@ -101,6 +101,17 @@ $BUNDLES = @(
         Actions = @("AP_INVOICE_CREATE", "AP_INVOICE_VALIDATE", "AP_INVOICE_APPROVE", "AP_PAYMENT_REQUEST")
     },
     @{
+        # general-ledger-svc gates each Tri-Phase Commit hop on its own action,
+        # plus reversal. Holding one does not imply the next -- that separation
+        # is the point, and it means all four are needed to walk a journal from
+        # a draft to the books and back off them again. Its reads are NOT
+        # authorized (they are scoped by the verified X-Tenant-Id instead), so
+        # unlike spend-controls there is no VIEW action to grant.
+        Code    = "GL_FULL"
+        Service = "general-ledger-svc"
+        Actions = @("GL_JOURNAL_CREATE", "GL_JOURNAL_VALIDATE", "GL_JOURNAL_POST", "GL_JOURNAL_REVERSE")
+    },
+    @{
         # spend-controls-svc separates setting a limit from spending against it,
         # and checks VIEW on its two read routes as well -- the reads are
         # authorized unconditionally, so without VIEW the console's registers
