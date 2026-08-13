@@ -172,12 +172,29 @@ audit trail, never erased.
 | 39 | Wire §32's observability signal families (commercial integrity, tenant/data integrity drift, governance-engine errors, AI/automation anomalies) into the existing OTel/Prometheus setup | §32 | Not Started | Deferred — cross-cutting instrumentation across every service, same class of scope as Chunk 10's items 32–36; needs its own session |
 | 40 | Numeric SLOs (availability/latency/recovery/AI-quality) — intentionally not invented by the spec; needs real production measurement first | §32 | Blocked | doc7 itself states this standard "intentionally does not invent SLA percentages" — needs real measured production capacity and business-criticality sign-off, not code |
 
-## Chunk 12 — Production Acceptance Sign-Off (§27 checklist, process gate)
+## Chunk 12 — Production Acceptance Sign-Off (§27 checklist, process gate) — traceability input done 2026-08-13, sign-off itself Not Started (correctly — it's not an engineering task)
+
+Resolution: items 41 and 42 are the actual human sign-off — no amount of
+code changes this by an engineering session. What IS a legitimate
+engineering deliverable is the evidence trail those named function owners
+need in order to make that decision quickly and accurately, rather than
+re-deriving "what's actually built" from scratch themselves. Built
+`docs/architecture/doc7-acceptance-checklist-traceability.md`: all 23
+§27 criteria (re-counted carefully against the source text — the backlog's
+original "26" was an early estimate before a careful read), each mapped
+to its current implementation status (Done/live-verified, mechanism-ready-
+pending-approval, Partial, Not Started, or out of this backend backlog's
+scope) with the specific evidence backing that status. Roughly a third of
+the 22 engineering-addressable criteria are genuinely Done and
+live-verified; the rest map directly back to already-identified deferred
+items (DATA-01/PRIV-01/REP-01 ↔ backlog items 36/33/35) or are explicitly
+outside a backend-only backlog's reach (A11Y-01, QA-01, a formal SEC-01
+review).
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 41 | Work through all 26 acceptance criteria (COM-01 through GO-01) with named function owners (Product, Engineering, Finance, Security, Privacy, Legal, AI/ML, QA) | §27 | Not Started | Process, not code |
-| 42 | Controlled Sign-Off Record — every function currently shows "Pending" with no approver/date | §35 | Not Started | Gate for doc7 becoming the controlling production standard |
+| 41 | Work through all 23 acceptance criteria (COM-01 through GO-01) with named function owners (Product, Engineering, Finance, Security, Privacy, Legal, AI/ML, QA) | §27 | Not Started | Process, not code — but the traceability matrix those owners need now exists: `docs/architecture/doc7-acceptance-checklist-traceability.md` |
+| 42 | Controlled Sign-Off Record — every function currently shows "Pending" with no approver/date | §35 | Not Started | Gate for doc7 becoming the controlling production standard — cannot be closed by this session; requires the actual named approvers |
 
 ---
 
@@ -196,3 +213,5 @@ audit trail, never erased.
 - 2026-08-12 — Chunk 8 (items 19–21) complete, item 22 Blocked: extended commercial-account-svc with billing_source on commercial_subscriptions, billing_source_transfers, and subscription_status_events (append-only dunning audit trail) via migration 000003. New endpoints: `POST /v1/subscriptions/{id}/status` (dunning transitions, fail-closed via ValidSubscriptionStatusTransitions, idempotent same-status no-op), `GET /v1/subscriptions/{id}/status-events`, `POST /v1/billing-source-transfers` (atomic cancel-old/create-new). Double-billing prevention is structural (existing partial unique index), not just application logic. Live-verified the full ACTIVE→PAST_DUE→RESTRICTED→SUSPENDED→ACTIVE cycle, an idempotent repeat logging no extra event, a rejected invalid transition (409), and a DIRECT→ZOIKO_ONE_BUNDLE transfer. Caught a stale-image trap during verification: a container *restart* does not pick up new code, only a rebuild does — fixed by rebuilding the image before restarting.
 - 2026-08-12 — Chunk 9 (items 23–28) complete: new `ai-governance-svc` — ai_runs, action_risk_classifications, automation_policies (allowlist), automation_actions, model_provider_registrations, policy_change_approvals. Pure record-keeping/gate-checking layer, never executes models or automations itself. Built and live-verified cleanly on the first pass: an unallowlisted autonomous action 403s, an allowlisted one proceeds and requires maker-checker approval, self-approval is blocked on both automation-action decisions and policy-change approvals (403 for the proposer, 200 for a different approver), a duplicate idempotency_key 409s, and the model-provider verify endpoint correctly blocks an unapproved data class and an unregistered provider.
 - 2026-08-12 — Chunk 10 (items 29–31) complete, items 32–36 explicitly deferred as follow-up (see Chunk 10 section for why each is cross-cutting): extended policy-svc with control_test_definitions/control_test_executions/attestations (migration 000004) and obligations-svc with applicability_decisions (migration 000002). Live-verified the doc7 §E3 payoff directly — a control showing TESTED design status with an independently INEFFECTIVE latest execution result — plus attestation revoke-then-re-revoke correctly 409ing, and three applicability scopes on one obligation resolving to UNASSESSED/APPLICABLE/UNCERTAIN respectively. One real bug caught and fixed before commit: obligations-svc's `facts_used` field was typed `[]byte`, which Go's `encoding/json` silently base64-encodes instead of serializing as inline JSON — changed to `json.RawMessage`.
+- 2026-08-13 — Chunk 11 (item 37) complete, items 38–40 deferred/blocked: new `kill-switch-registry-svc` — append-only ENGAGE/DISENGAGE events scoped across plane/domain/provider/tenant independently, with a resolve endpoint returning the most specific currently-engaged match, an operations-visibility list, and per-scope audit history. One real bug caught and fixed before commit: ordering "latest event" by `created_at` alone can tie under rapid successive calls — added a `BIGSERIAL event_seq` column as the true ordering key. Live-verified engage validation, a platform-wide switch blocking an unrelated scope, most-specific-match resolution between two simultaneously engaged switches, disengage clearing resolution, a rejected repeat disengage, and full audit history surviving an engage→disengage→re-engage cycle.
+- 2026-08-13 — Chunk 12 (items 41–42): the sign-off itself is correctly Not Started — no engineering session can perform it, it requires the actual named function owners. What was built instead is the evidence trail those owners need: `docs/architecture/doc7-acceptance-checklist-traceability.md`, mapping all 23 §27 criteria (re-counted carefully from source — earlier backlog text said 26) to current implementation status with specific evidence. ~1/3 of the 22 engineering-addressable criteria are Done/live-verified; the rest map back to already-deferred backlog items or fall outside this backend-only backlog's scope (frontend accessibility, formal Security review, staging/sandbox data policy).
