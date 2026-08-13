@@ -36,6 +36,7 @@ import (
 	"zoiko.io/governance-decision-log-svc/internal/events"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
 	"zoiko.io/governance-decision-log-svc/internal/health"
+	"zoiko.io/governance-decision-log-svc/internal/policyclient"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 	"zoiko.io/governance-decision-log-svc/internal/telemetry"
 )
@@ -130,7 +131,8 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, authzClient, cfg.AuthZPlatformScopeID, log)
+	policyClient := policyclient.NewHTTPClient(cfg.PolicyServiceURL)
+	h := handler.New(pgStore, publisher, authzClient, policyClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 7. Health probes + metrics ────────────────────────────────────────────

@@ -467,6 +467,42 @@ func TestActivateVersion_Success(t *testing.T) {
 	}
 }
 
+// ── GetPolicyVersionByID ─────────────────────────────────────────────────────
+
+func TestGetPolicyVersionByID_Found(t *testing.T) {
+	store := &stubStore{
+		findVersion: &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "SUPERSEDED"},
+	}
+	r := newTestRouter(store)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/pv-1", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var got domain.PolicyVersion
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	// The whole point of this endpoint: it returns a version regardless of
+	// whether it's still ACTIVE — a replay needs the EXACT version used at
+	// decision time, not "whatever is current now".
+	if got.VersionStatus != "SUPERSEDED" {
+		t.Errorf("expected a SUPERSEDED version to still be fetchable by ID, got status %s", got.VersionStatus)
+	}
+}
+
+func TestGetPolicyVersionByID_NotFound(t *testing.T) {
+	store := &stubStore{findVersionErr: domain.ErrPolicyVersionNotFound}
+	r := newTestRouter(store)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/does-not-exist", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestActivateVersion_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	store := &stubStore{
 		findVersion:  &domain.PolicyVersion{PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "ACTIVE"},

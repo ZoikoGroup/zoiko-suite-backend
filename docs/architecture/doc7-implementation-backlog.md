@@ -123,43 +123,86 @@ Resolution for 29–31: extended policy-svc (control tests + attestations —
 both are governance-record concepts that already lives in this service's
 domain, not a new bounded context) and obligations-svc (applicability
 decisions — obligation-specific, extends the service that already owns
-`obligations`). Items 32–36 are each cross-cutting across 4+ existing
-services (outbox touches every service that publishes events; retention/
-legal-hold touches every service that stores anything deletable; replay
-manifests need policy-svc + governance-decision-log-svc + audit-event-
-store-svc together; report metrics and source-authority mapping are
-reporting/connected-systems concerns with no natural single owner). Building
-any of them properly means a dedicated session scoped to that one item
-across every affected service, not a shared slot in this chunk — flagged
-here as the deliberate reason they're Not Started rather than attempted as
-shallow, single-service stubs.
+`obligations`).
+
+**Update 2026-08-13/14 — items 32–36 completed as a follow-up pass.**
+Each is genuinely cross-cutting, so none was force-fit into a single
+service: 33 and 35 got their own new, self-contained registries
+(`retention-registry-svc`, `metric-registry-svc`); 36 got a new registry
+too (`source-authority-svc`) but is explicitly scaffold-only — its schema
+and conflict-detection logic are real and live-verified, but *populating*
+`source_authority_maps` with real precedence rules requires knowing every
+actual connected system's field ownership, which is operational knowledge
+this pass cannot invent; 34 extended two existing services together
+(policy-svc + governance-decision-log-svc) rather than creating a new one,
+since the reproducibility question is inherently about those two
+services' existing objects; 32 (transactional outbox) is fleet-wide by
+nature and was deliberately scoped to a proven pilot — the pattern
+(`internal/outbox`) plus one real write path (commercial-account-svc's
+`CreateSubscription`) — with the rest of the fleet left as an incremental,
+service-by-service rollout, not re-attempted here.
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
 | 29 | `control_test_definition` / `control_test_execution` — separate design-status from operating-effectiveness (currently collapsed in policy-svc) | §E3, §I3 | Done | policy-svc migration 000004; `control_test_definitions` (immutable, DESIGN_STATUS) + `control_test_executions` (append-only, OPERATING_EFFECTIVENESS in `result`); `GET /v1/controls/{control_ref}/effectiveness` composes both as independent fields; live-verified a control that is TESTED (design exists) while its latest execution is INEFFECTIVE — the two never collapse into one status |
 | 30 | `attestation` object — signed/attributed assertions with expiry/revocation (doesn't exist under any name today) | §E6 | Done | `attestations` table in the same migration; signer/role/period/evidence_refs/expiry + ACTIVE/CHALLENGED/REVOKED state; live-verified create → revoke → a second revoke attempt 409s (illegal transition, not silently re-applied) |
 | 31 | `applicability_decision` — versioned, with confidence/uncertainty and UNASSESSED/APPLICABLE/UNCERTAIN states (closest today is `access_decision_log`, which is generic, not obligation-specific) | §E2, §29 | Done | obligations-svc migration 000002; append-only `applicability_decisions`; `GET .../applicability` returns UNASSESSED when no row exists for a scope — never coerced to NOT_APPLICABLE; live-verified three independent scopes on the same obligation resolving to UNASSESSED, APPLICABLE, and UNCERTAIN respectively, plus a decision missing both actor and system rejected with 400. Real bug caught during live verification: `facts_used` was typed `[]byte` in Go, which `encoding/json` silently base64-encodes instead of inlining — fixed to `json.RawMessage` before commit |
-| 32 | Transactional outbox pattern — every service currently publishes Kafka events directly with no outbox table; a crash between DB commit and publish can silently drop an event | §L1–L2, §I5 | Not Started | Deferred — cross-cutting across every event-publishing service; needs its own session |
-| 33 | `retention_policy` / `legal_hold` objects — don't exist anywhere; needed before any real data-deletion path is safe | §J1, §J3 | Not Started | Deferred — cross-cutting across every service that stores deletable data; needs its own session |
-| 34 | `replay_manifest` for historical decision replay against the source/policy versions active at the time | §I5, §29 | Not Started | Deferred — needs policy-svc + governance-decision-log-svc + audit-event-store-svc together; needs its own session |
-| 35 | `report_metric_definition` — versioned formula/scope/owner for every executive metric | §M1 | Not Started | Deferred — reporting concern with no natural single owning service yet; needs its own session |
-| 36 | `source_authority_map` / `normalized_fact` — field-level source-of-truth precedence for connected systems | §D1–D3 | Not Started | Deferred — connected-systems concern with no natural single owning service yet; needs its own session |
+| 32 | Transactional outbox pattern — every service currently publishes Kafka events directly with no outbox table; a crash between DB commit and publish can silently drop an event | §L1–L2, §I5 | Done (pilot) | New `internal/outbox` package (Insert into the SAME tx as the business write; a `Relay` polls unpublished rows and publishes on an interval) piloted on commercial-account-svc's `CreateSubscription`. Live-verified the outbox row exists immediately (durable, pre-publish) and the relay publishes it within its poll interval. Found and fixed a real latent bug while wiring this: `KafkaPublisher.Publish` unconditionally returned `nil` even when the Kafka write failed, which would have made the relay's retry/failure-tracking permanently dead code — fixed to return the real error (safe: every existing call site already discarded the return value). Rest of the fleet is an intentional incremental rollout, not attempted here. |
+| 33 | `retention_policy` / `legal_hold` objects — don't exist anywhere; needed before any real data-deletion path is safe | §J1, §J3 | Done | New `retention-registry-svc`; versioned `retention_policies` + append-only `legal_holds`; `GET /v1/retention/resolve` composes both — a hold blocks regardless of what the policy says, never deletes anything itself. Live-verified a hold blocking resolution despite a permissive policy, release clearing it, and a rejected repeat release (409). Real bug caught and fixed: the handler never set `CreatedAt`/`StartedAt` on the Go struct before insert, so the immediate POST response showed the zero value even though the DB row was correct — same class of bug caught twice more below. |
+| 34 | `replay_manifest` for historical decision replay against the source/policy versions active at the time | §I5, §29 | Done | Extended policy-svc (new `GET /v1/policy-versions/{id}` — fetch a version "as of," not "whatever's current") and governance-decision-log-svc (new `replay_manifests` table, append-only with the same immutability-trigger doctrine as `governance_decisions` itself, plus `POST /v1/decisions/{id}/replay`). Live-verified the core guarantee end-to-end: recorded a real decision, superseded its policy version with a very different threshold, then replayed the decision and confirmed it re-resolved the *original* (now-superseded) version, not the new one — reproducing the original ESCALATED outcome exactly. Also live-verified a genuine drift case (mismatched outcome, still recorded faithfully, not coerced to match). |
+| 35 | `report_metric_definition` — versioned formula/scope/owner for every executive metric | §M1 | Done | New `metric-registry-svc`; versioned-by-new-row `report_metric_definitions` (mirrors policy-svc's one-ACTIVE-version-per-code doctrine); every definition carries doc7 REP-01's required disclaimer ("Operational intelligence — not financial or legal assurance") explicitly in Go, not just as a DB default. Live-verified v1 create → v2 publish supersedes v1 atomically → both survive in history → current-lookup returns v2. Two real bugs caught and fixed: `CreatedAt` not set on the struct (same class as item 33), and `DefinitionStatus` never set either — the unit tests didn't catch it because the stub store's own test double happened to set it independently, masking the handler bug; only live verification against real Postgres caught it. |
+| 36 | `source_authority_map` / `normalized_fact` — field-level source-of-truth precedence for connected systems | §D1–D3 | Done (scaffold) | New `source-authority-svc`; versioned `source_authority_maps` (precedence per field family/source system) + append-only `normalized_facts`. `GET /v1/source-authority/resolve` returns the highest-precedence current fact, or `ambiguous=true` with the conflicting facts and a conflict route when two equally-ranked sources disagree — never guesses (doc7 §D2). Live-verified both paths: a lower-precedence source losing to a higher one, and two same-tier sources disagreeing correctly blocking resolution. Deliberately scaffold-only: the schema and resolution logic are real, but populating real precedence rules for actual connected systems (payroll, HR, billing connectors) is operational knowledge this pass cannot invent — same doctrine as item 22's merchant/tax setup. |
 
-## Chunk 11 — Cross-Cutting Reliability & Security Controls
+## Chunk 11 — Cross-Cutting Reliability & Security Controls — item 37 ✅ Done 2026-08-13, items 38–40 deferred/blocked
+
+Resolution for item 37: new service `kill-switch-registry-svc` — genuinely
+cross-cutting (used by every plane, not owned by any one existing bounded
+context), so it gets its own service per this session's established
+new-vs-extend test. Distinct from capability-registry-svc's `Release`/
+`ReleaseState`: that answers "is this one capability operationally
+enabled" (capability_id-scoped only, a product-availability question).
+This answers "must this class of action be stopped right now" across four
+independently-nullable scope dimensions at once (plane/domain/provider/
+tenant) — an incident-response question. Append-only `kill_switch_events`
+(ENGAGE/DISENGAGE) with a `event_seq BIGSERIAL` ordering column (not just
+`created_at`, which can tie under rapid successive calls — a real bug
+caught and fixed during unit testing before commit). `GET
+/v1/kill-switches/resolve` returns the most specific currently-engaged
+switch across every compatible scope tier; `GET /v1/kill-switches` lists
+every distinct scope's current state (the "visible in operations"
+requirement); `GET /v1/kill-switches/history` returns one scope's full
+audit trail, never erased.
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 37 | Kill switches — plane/domain/provider/tenant-scoped, for commercial charging, automation, model/provider use, obligation activation, imports/syncs, exports, public claims | §32.1 | Not Started | |
-| 38 | Safe-degraded-mode definitions per service (stale integration → show timestamped last-known fact; evidence-store outage → fail closed on approvals) | §32.2 | Not Started | |
-| 39 | Wire §32's observability signal families (commercial integrity, tenant/data integrity drift, governance-engine errors, AI/automation anomalies) into the existing OTel/Prometheus setup | §32 | Not Started | |
-| 40 | Numeric SLOs (availability/latency/recovery/AI-quality) — intentionally not invented by the spec; needs real production measurement first | §32 | Not Started | |
+| 37 | Kill switches — plane/domain/provider/tenant-scoped, for commercial charging, automation, model/provider use, obligation activation, imports/syncs, exports, public claims | §32.1 | Done | New `kill-switch-registry-svc`; live-verified engage validation (reconciliation_procedure_ref required), a platform-wide switch blocking an unrelated narrow scope, most-specific-match resolution between a domain-wide and a tenant-scoped switch both engaged at once, disengage clearing resolution, a rejected repeat-disengage (409), and the full 3-event audit history surviving engage→disengage→re-engage with nothing erased |
+| 38 | Safe-degraded-mode definitions per service (stale integration → show timestamped last-known fact; evidence-store outage → fail closed on approvals) | §32.2 | Not Started | Deferred — this is a per-service *behavior* requirement (each of ~90 services must define its own DEGRADED response), not a shared object one new table or service can satisfy; needs its own audit-and-implement pass across the whole fleet |
+| 39 | Wire §32's observability signal families (commercial integrity, tenant/data integrity drift, governance-engine errors, AI/automation anomalies) into the existing OTel/Prometheus setup | §32 | Not Started | Deferred — cross-cutting instrumentation across every service, same class of scope as Chunk 10's items 32–36; needs its own session |
+| 40 | Numeric SLOs (availability/latency/recovery/AI-quality) — intentionally not invented by the spec; needs real production measurement first | §32 | Blocked | doc7 itself states this standard "intentionally does not invent SLA percentages" — needs real measured production capacity and business-criticality sign-off, not code |
 
-## Chunk 12 — Production Acceptance Sign-Off (§27 checklist, process gate)
+## Chunk 12 — Production Acceptance Sign-Off (§27 checklist, process gate) — traceability input done 2026-08-13, sign-off itself Not Started (correctly — it's not an engineering task)
+
+Resolution: items 41 and 42 are the actual human sign-off — no amount of
+code changes this by an engineering session. What IS a legitimate
+engineering deliverable is the evidence trail those named function owners
+need in order to make that decision quickly and accurately, rather than
+re-deriving "what's actually built" from scratch themselves. Built
+`docs/architecture/doc7-acceptance-checklist-traceability.md`: all 23
+§27 criteria (re-counted carefully against the source text — the backlog's
+original "26" was an early estimate before a careful read), each mapped
+to its current implementation status (Done/live-verified, mechanism-ready-
+pending-approval, Partial, Not Started, or out of this backend backlog's
+scope) with the specific evidence backing that status. Roughly a third of
+the 22 engineering-addressable criteria are genuinely Done and
+live-verified; the rest map directly back to already-identified deferred
+items (DATA-01/PRIV-01/REP-01 ↔ backlog items 36/33/35) or are explicitly
+outside a backend-only backlog's reach (A11Y-01, QA-01, a formal SEC-01
+review).
 
 | # | Item | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 41 | Work through all 26 acceptance criteria (COM-01 through GO-01) with named function owners (Product, Engineering, Finance, Security, Privacy, Legal, AI/ML, QA) | §27 | Not Started | Process, not code |
-| 42 | Controlled Sign-Off Record — every function currently shows "Pending" with no approver/date | §35 | Not Started | Gate for doc7 becoming the controlling production standard |
+| 41 | Work through all 23 acceptance criteria (COM-01 through GO-01) with named function owners (Product, Engineering, Finance, Security, Privacy, Legal, AI/ML, QA) | §27 | Not Started | Process, not code — but the traceability matrix those owners need now exists: `docs/architecture/doc7-acceptance-checklist-traceability.md` |
+| 42 | Controlled Sign-Off Record — every function currently shows "Pending" with no approver/date | §35 | Not Started | Gate for doc7 becoming the controlling production standard — cannot be closed by this session; requires the actual named approvers |
 
 ---
 
@@ -178,3 +221,6 @@ shallow, single-service stubs.
 - 2026-08-12 — Chunk 8 (items 19–21) complete, item 22 Blocked: extended commercial-account-svc with billing_source on commercial_subscriptions, billing_source_transfers, and subscription_status_events (append-only dunning audit trail) via migration 000003. New endpoints: `POST /v1/subscriptions/{id}/status` (dunning transitions, fail-closed via ValidSubscriptionStatusTransitions, idempotent same-status no-op), `GET /v1/subscriptions/{id}/status-events`, `POST /v1/billing-source-transfers` (atomic cancel-old/create-new). Double-billing prevention is structural (existing partial unique index), not just application logic. Live-verified the full ACTIVE→PAST_DUE→RESTRICTED→SUSPENDED→ACTIVE cycle, an idempotent repeat logging no extra event, a rejected invalid transition (409), and a DIRECT→ZOIKO_ONE_BUNDLE transfer. Caught a stale-image trap during verification: a container *restart* does not pick up new code, only a rebuild does — fixed by rebuilding the image before restarting.
 - 2026-08-12 — Chunk 9 (items 23–28) complete: new `ai-governance-svc` — ai_runs, action_risk_classifications, automation_policies (allowlist), automation_actions, model_provider_registrations, policy_change_approvals. Pure record-keeping/gate-checking layer, never executes models or automations itself. Built and live-verified cleanly on the first pass: an unallowlisted autonomous action 403s, an allowlisted one proceeds and requires maker-checker approval, self-approval is blocked on both automation-action decisions and policy-change approvals (403 for the proposer, 200 for a different approver), a duplicate idempotency_key 409s, and the model-provider verify endpoint correctly blocks an unapproved data class and an unregistered provider.
 - 2026-08-12 — Chunk 10 (items 29–31) complete, items 32–36 explicitly deferred as follow-up (see Chunk 10 section for why each is cross-cutting): extended policy-svc with control_test_definitions/control_test_executions/attestations (migration 000004) and obligations-svc with applicability_decisions (migration 000002). Live-verified the doc7 §E3 payoff directly — a control showing TESTED design status with an independently INEFFECTIVE latest execution result — plus attestation revoke-then-re-revoke correctly 409ing, and three applicability scopes on one obligation resolving to UNASSESSED/APPLICABLE/UNCERTAIN respectively. One real bug caught and fixed before commit: obligations-svc's `facts_used` field was typed `[]byte`, which Go's `encoding/json` silently base64-encodes instead of serializing as inline JSON — changed to `json.RawMessage`.
+- 2026-08-13 — Chunk 11 (item 37) complete, items 38–40 deferred/blocked: new `kill-switch-registry-svc` — append-only ENGAGE/DISENGAGE events scoped across plane/domain/provider/tenant independently, with a resolve endpoint returning the most specific currently-engaged match, an operations-visibility list, and per-scope audit history. One real bug caught and fixed before commit: ordering "latest event" by `created_at` alone can tie under rapid successive calls — added a `BIGSERIAL event_seq` column as the true ordering key. Live-verified engage validation, a platform-wide switch blocking an unrelated scope, most-specific-match resolution between two simultaneously engaged switches, disengage clearing resolution, a rejected repeat disengage, and full audit history surviving an engage→disengage→re-engage cycle.
+- 2026-08-13 — Chunk 12 (items 41–42): the sign-off itself is correctly Not Started — no engineering session can perform it, it requires the actual named function owners. What was built instead is the evidence trail those owners need: `docs/architecture/doc7-acceptance-checklist-traceability.md`, mapping all 23 §27 criteria (re-counted carefully from source — earlier backlog text said 26) to current implementation status with specific evidence. ~1/3 of the 22 engineering-addressable criteria are Done/live-verified; the rest map back to already-deferred backlog items or fall outside this backend-only backlog's scope (frontend accessibility, formal Security review, staging/sandbox data policy).
+- 2026-08-14 — Chunk 10 items 32–36 (previously deferred as follow-up) all completed: new `retention-registry-svc` (33), `metric-registry-svc` (35), `source-authority-svc` (36, deliberately scaffold-only — see item notes), policy-svc + governance-decision-log-svc extended with a replay endpoint (34), and a transactional-outbox pilot (`internal/outbox` + commercial-account-svc's `CreateSubscription`, item 32). Live-verified every one against real Postgres + authorization-svc, including the item 34 centerpiece: replaying a decision after its policy version was superseded correctly re-resolved the *original* version, not the current one, reproducing the exact original outcome. Four real bugs caught and fixed during live verification, three of the same shape across three different services (retention-registry-svc, metric-registry-svc's two fields, and a stub-store test masking one of them) — a handler constructs a domain struct for the immediate API response but never sets `CreatedAt`/`DefinitionStatus` on it, relying only on a DB column default the in-memory response object never re-reads — plus one real latent bug in commercial-account-svc's Kafka publisher, which unconditionally swallowed write errors and would have made the new outbox relay's retry logic permanently dead code.

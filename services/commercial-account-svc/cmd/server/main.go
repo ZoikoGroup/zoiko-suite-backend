@@ -21,6 +21,7 @@ import (
 	"zoiko.io/commercial-account-svc/internal/handler"
 	"zoiko.io/commercial-account-svc/internal/health"
 	"zoiko.io/commercial-account-svc/internal/middleware"
+	"zoiko.io/commercial-account-svc/internal/outbox"
 	"zoiko.io/commercial-account-svc/internal/store"
 	"zoiko.io/commercial-account-svc/internal/telemetry"
 )
@@ -75,6 +76,15 @@ func main() {
 
 	handler.RegisterRoutes(r, h)
 	handler.RegisterSubscriptionRoutes(r, h)
+
+	// Outbox relay (doc7 backlog item 32 pilot): publishes rows written by
+	// PgStore.CreateSubscription in the same transaction as the business
+	// write, decoupling "the fact is durable" from "Kafka was reachable at
+	// that exact moment." Runs until relayCancel is called at shutdown.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	relay := outbox.NewRelay(pool, publisher, 5*time.Second, 50, logger)
+	go relay.Start(relayCtx)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
