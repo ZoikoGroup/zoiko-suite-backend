@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,13 +33,98 @@ import (
 	"zoiko.io/employment-contracts-svc/internal/telemetry"
 )
 
+// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
+// authorization-svc may be reused locally before it is asked again.
+//
+// Doc 05 (Security Architecture Specification) §6.5 anticipates exactly
+// this cost: "For Tier 0 and latency-sensitive services, policy and
+// authorization evaluation may use high-speed distributed enforcement
+// patterns, including local policy caches... provided policy source
+// remains centralized, policy provenance is auditable, stale decision
+// risk is bounded, fail-safe behavior is defined." This constant is that
+// bound — short enough that a permission revocation or role change
+// propagates within one cache generation, long enough to absorb the
+// repeat checks a single user action or request burst produces.
+//
+// Only real GRANTED/DENIED decisions are ever cached. An unreachable or
+// misbehaving authorization-svc is never cached — that would turn one
+// transient outage into a standing permit-or-deny for every subsequent
+// caller on this instance, which defeats fail-closed.
+const decisionCacheTTL = 5 * time.Second
+
+type cachedDecision struct {
+	deniedErr error
+	expiresAt time.Time
+}
+
 type httpAuthzClient struct {
 	baseURL string
 	client  *http.Client
 	log     *zap.Logger
+
+	cacheMu     sync.Mutex
+	cache       map[string]cachedDecision
+	cacheWrites int
 }
 
 func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType
+
+	if decision, hit := a.lookupCache(key); hit {
+		return decision
+	}
+
+	err := a.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+
+	// Cache the decision itself (GRANTED or DENIED), never an unavailable
+	// outcome — see the doc comment on decisionCacheTTL.
+	if err == nil || errors.Is(err, domain.ErrAuthorizationDenied) {
+		a.storeCache(key, err)
+	}
+
+	return err
+}
+
+// lookupCache returns the cached decision for key and whether it is still
+// within decisionCacheTTL. An expired entry is evicted on read.
+func (a *httpAuthzClient) lookupCache(key string) (error, bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	d, ok := a.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(d.expiresAt) {
+		delete(a.cache, key)
+		return nil, false
+	}
+	return d.deniedErr, true
+}
+
+// storeCache records a real GRANTED/DENIED decision. Every 1000th write
+// sweeps expired entries so a long-lived instance with many distinct
+// (principal, entity, action) combinations doesn't grow the map
+// unboundedly between reads of the same key.
+func (a *httpAuthzClient) storeCache(key string, decision error) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	a.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
+
+	a.cacheWrites++
+	if a.cacheWrites%1000 == 0 {
+		now := time.Now()
+		for k, v := range a.cache {
+			if now.After(v.expiresAt) {
+				delete(a.cache, k)
+			}
+		}
+	}
+}
+
+// checkAllowedLive is the real, uncached call to authorization-svc.
+func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	reqBody, _ := json.Marshal(map[string]string{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
@@ -158,7 +244,7 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log}
+	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
 	employeeClient := employee.NewClient(cfg.EmployeeMasterURL, &http.Client{Timeout: 5 * time.Second})
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
