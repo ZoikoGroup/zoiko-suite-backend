@@ -112,6 +112,16 @@ $BUNDLES = @(
         Actions = @("GL_JOURNAL_CREATE", "GL_JOURNAL_VALIDATE", "GL_JOURNAL_POST", "GL_JOURNAL_REVERSE")
     },
     @{
+        # bank-reconciliation-svc gates ingest, match, exception and statement
+        # completion separately. Its two READ routes are not authorized at all
+        # -- they are scoped by the verified X-Tenant-Id instead, the same
+        # posture as general-ledger-svc, whose journals this service
+        # reconciles against -- so there is no VIEW action to grant.
+        Code    = "BANKREC_FULL"
+        Service = "bank-reconciliation-svc"
+        Actions = @("BANKREC_STATEMENT_INGEST", "BANKREC_MATCH", "BANKREC_FLAG_EXCEPTION", "BANKREC_COMPLETE_STATEMENT")
+    },
+    @{
         # financial-close-svc separates registering a period from reading the
         # register and from initiating a close. VIEW is needed for the console's
         # register AND for the readiness check, which is a read: without it the

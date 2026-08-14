@@ -67,8 +67,14 @@ func (p *Publisher) PublishReconciliationExceptionRaised(ctx context.Context, l 
 // PublishReconciliationCompleted corresponds to §10.5's
 // reconciliation.completed event — emitted once every line for a given bank
 // account + statement date is no longer UNMATCHED.
-func (p *Publisher) PublishReconciliationCompleted(ctx context.Context, tenantID, bankAccountID, statementDate string) {
-	p.emit(ctx, "reconciliation.completed", "", bankAccountID, map[string]any{
+//
+// correlationID is threaded through from the request's X-Correlation-ID.
+// This event used to be emitted with an empty one while every other event
+// here carried the value, so the completion of a statement was the single
+// thing in this service's event stream that could not be traced back to the
+// request that caused it.
+func (p *Publisher) PublishReconciliationCompleted(ctx context.Context, correlationID, tenantID, bankAccountID, statementDate string) {
+	p.emit(ctx, "reconciliation.completed", correlationID, bankAccountID, map[string]any{
 		"tenant_id":       tenantID,
 		"bank_account_id": bankAccountID,
 		"statement_date":  statementDate,

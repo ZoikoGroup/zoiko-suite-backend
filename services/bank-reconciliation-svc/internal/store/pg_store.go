@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -52,6 +53,27 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	return tx.Commit(ctx)
 }
 
+// mapPgError translates driver-level errors that are really caller mistakes
+// into domain errors, so they can be answered 400 instead of 503.
+//
+// 22P02 is an invalid text representation (a malformed UUID), 22007/22008 an
+// invalid datetime, 22001 a string longer than the column allows. Without
+// this every one of them reached the handler as an opaque error and was
+// reported as "store unavailable" — telling the caller the database is down
+// when the database is fine and the request was wrong. The same defect was
+// found in accounts-payable, purchase-request, purchase-order,
+// evidence-requirements, general-ledger and financial-close.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "22P02", "22007", "22008", "22001":
+			return domain.ErrInvalidIdentifier
+		}
+	}
+	return err
+}
+
 func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
 		return t
@@ -59,12 +81,15 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 	return fallback
 }
 
+// selectColumns and scanLine are kept adjacent and in the same order on
+// purpose: they are one list split in two, and a column added to one but not
+// the other is a scan error at runtime rather than a compile error.
 const selectColumns = `
 	statement_line_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
 	amount, currency_code, bank_reference, status,
 	matched_journal_id, matched_by_principal_id, matched_at,
 	exception_reason, flagged_by_principal_id, flagged_at,
-	correlation_id, created_at
+	gl_cash_account_code, correlation_id, created_at
 `
 
 func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) error {
@@ -74,7 +99,7 @@ func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) erro
 		&l.Amount, &l.CurrencyCode, &l.BankReference, &status,
 		&l.MatchedJournalID, &l.MatchedByPrincipalID, &l.MatchedAt,
 		&l.ExceptionReason, &l.FlaggedByPrincipalID, &l.FlaggedAt,
-		&l.CorrelationID, &l.CreatedAt,
+		&l.GLCashAccountCode, &l.CorrelationID, &l.CreatedAt,
 	); err != nil {
 		return err
 	}
@@ -91,38 +116,45 @@ func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) erro
 // unique index added in 000002 and resolves to the ORIGINAL line — mutating
 // *l in place to reflect it — rather than creating a duplicate. Returns
 // created=false when the row already existed.
+// The tenant the row is written under is the one resolved here, and the SAME
+// value is used for the RLS scope, the tenant_id column, and the idempotency
+// lookup. It used to be resolved twice: withRLS got the context's verified
+// tenant while the INSERT wrote l.TenantID, which the handler took straight
+// from the request body. Because this pool connects as a superuser, RLS does
+// not stop the mismatch — so a caller could set the header to its own tenant
+// and the body to somebody else's and land a row in a register it has no
+// rights to. One value, used everywhere, is the fix.
 func (s *PgStore) CreateStatementLine(ctx context.Context, l *domain.StatementLine) (created bool, err error) {
 	tenantID := tenantFromCtxOrFallback(ctx, l.TenantID)
+	l.TenantID = tenantID
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO statement_lines (
 				statement_line_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
-				amount, currency_code, bank_reference, status, correlation_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				amount, currency_code, bank_reference, status, gl_cash_account_code,
+				correlation_id, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
-		`, l.StatementLineID, l.TenantID, l.LegalEntityID, l.BankAccountID, l.StatementDate,
-			l.Amount, l.CurrencyCode, l.BankReference, string(l.Status), l.CorrelationID, now)
+		`, l.StatementLineID, tenantID, l.LegalEntityID, l.BankAccountID, l.StatementDate,
+			l.Amount, l.CurrencyCode, l.BankReference, string(l.Status), l.GLCashAccountCode,
+			l.CorrelationID, now)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			row := tx.QueryRow(ctx, `
-				SELECT statement_line_id, legal_entity_id, bank_account_id, statement_date, amount,
-				       currency_code, bank_reference, status, matched_journal_id, matched_by_principal_id,
-				       matched_at, exception_reason, flagged_by_principal_id, flagged_at, created_at
+			// Replay of a prior request with this correlation_id. Re-read the
+			// stored row in full — including statement_line_id, which the
+			// handler had already generated a fresh uuid for. Returning that
+			// unstored id would hand the caller an identifier that 404s on
+			// every subsequent call.
+			row := tx.QueryRow(ctx, `SELECT `+selectColumns+`
 				FROM statement_lines WHERE tenant_id = $1 AND correlation_id = $2
-			`, l.TenantID, l.CorrelationID)
-			var status string
-			if err := row.Scan(
-				&l.StatementLineID, &l.LegalEntityID, &l.BankAccountID, &l.StatementDate, &l.Amount,
-				&l.CurrencyCode, &l.BankReference, &status, &l.MatchedJournalID, &l.MatchedByPrincipalID,
-				&l.MatchedAt, &l.ExceptionReason, &l.FlaggedByPrincipalID, &l.FlaggedAt, &l.CreatedAt,
-			); err != nil {
+			`, tenantID, l.CorrelationID)
+			if err := scanLine(row, l); err != nil {
 				return err
 			}
-			l.Status = domain.StatementLineStatus(status)
 			created = false
 			return nil
 		}
@@ -130,16 +162,21 @@ func (s *PgStore) CreateStatementLine(ctx context.Context, l *domain.StatementLi
 		created = true
 		return nil
 	})
-	return created, err
+	return created, mapPgError(err)
 }
 
 // GetStatementLine returns (nil, nil) if not found — including when the
 // caller's tenant scope doesn't match the line's tenant (explicit filter,
 // not RLS-only — see package doc).
+//
+// A request carrying NO verified tenant scope is an error, not an absence.
+// It used to return (nil, nil) too, so the handler answered 404
+// statement_line_not_found — telling a caller who had never been scoped that
+// the row does not exist, which is both wrong and quietly reassuring.
 func (s *PgStore) GetStatementLine(ctx context.Context, statementLineID string) (*domain.StatementLine, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, nil
+		return nil, domain.ErrTenantScopeMissing
 	}
 
 	var l domain.StatementLine
@@ -153,15 +190,34 @@ func (s *PgStore) GetStatementLine(ctx context.Context, statementLineID string) 
 		return nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, mapPgError(err)
 	}
 	return &l, nil
 }
 
-// ListStatementLines returns statement lines matching the given filter
-// (tenant_id is required; the others are optional).
+// ListStatementLines returns statement lines matching the given filter.
+//
+// filter.TenantID must be the caller's VERIFIED scope — the handler no longer
+// reads it from ?tenant_id. The explicit tenant filter this package's doc
+// comment is careful about was, until now, filtering by a value the caller
+// supplied, so ?tenant_id=<somebody else> returned their entire bank
+// register: every amount, bank reference and reconciliation state.
+//
+// The result is always non-nil so an empty register encodes as [] and not
+// JSON null, and the page is bounded — see domain.DefaultListLimit.
 func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStatementLinesFilter) ([]domain.StatementLine, error) {
-	var out []domain.StatementLine
+	if filter.TenantID == "" {
+		return nil, domain.ErrTenantScopeMissing
+	}
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = domain.DefaultListLimit
+	}
+	if limit > domain.MaxListLimit {
+		limit = domain.MaxListLimit
+	}
+
+	out := make([]domain.StatementLine, 0)
 	err := s.withRLS(ctx, filter.TenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT `+selectColumns+`
 			FROM statement_lines
@@ -170,7 +226,8 @@ func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStat
 			  AND ($3 = '' OR statement_date = $3::date)
 			  AND ($4 = '' OR status = $4)
 			ORDER BY created_at DESC
-		`, filter.TenantID, filter.BankAccountID, filter.StatementDate, filter.Status)
+			LIMIT $5
+		`, filter.TenantID, filter.BankAccountID, filter.StatementDate, filter.Status, limit)
 		if err != nil {
 			return err
 		}
@@ -184,7 +241,10 @@ func (s *PgStore) ListStatementLines(ctx context.Context, filter domain.ListStat
 		}
 		return rows.Err()
 	})
-	return out, err
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return out, nil
 }
 
 // MatchStatementLine transitions a line from UNMATCHED or EXCEPTION to
@@ -208,7 +268,7 @@ func (s *PgStore) MatchStatementLine(ctx context.Context, tenantID, statementLin
 		return nil
 	})
 	if err != nil {
-		return err
+		return mapPgError(err)
 	}
 	if affected == 0 {
 		return domain.ErrInvalidTransition
@@ -232,7 +292,7 @@ func (s *PgStore) FlagException(ctx context.Context, tenantID, statementLineID, 
 		return nil
 	})
 	if err != nil {
-		return err
+		return mapPgError(err)
 	}
 	if affected == 0 {
 		return domain.ErrInvalidTransition
@@ -242,8 +302,7 @@ func (s *PgStore) FlagException(ctx context.Context, tenantID, statementLineID, 
 
 // CountUnmatched returns how many lines are still UNMATCHED for the given
 // bank account + statement date — used to decide whether the statement can
-// be marked complete. tenant_id is a mandatory, explicit filter argument
-// (not derived from context), matching ListStatementLines' pattern.
+// be marked complete. tenantID must be the caller's verified scope.
 func (s *PgStore) CountUnmatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error) {
 	var count int
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -252,5 +311,49 @@ func (s *PgStore) CountUnmatched(ctx context.Context, tenantID, bankAccountID, s
 			WHERE tenant_id = $1 AND bank_account_id = $2::uuid AND statement_date = $3::date AND status = 'UNMATCHED'
 		`, tenantID, bankAccountID, statementDate).Scan(&count)
 	})
-	return count, err
+	if err != nil {
+		return 0, mapPgError(err)
+	}
+	return count, nil
+}
+
+// StatementLegalEntities returns the distinct legal entities the lines for
+// this bank account + statement date belong to.
+//
+// CompleteStatement authorizes against a legal_entity_id taken from the query
+// string, and nothing previously connected that value to the bank account
+// being completed. So a caller could name an entity it legitimately holds
+// BANKREC_COMPLETE_STATEMENT over, and then complete — and publish
+// reconciliation.completed for — a bank account belonging to a different
+// entity entirely. An authorization check that is not bound to the resource
+// it guards is decoration.
+//
+// Returned as a set rather than a single value because nothing in the schema
+// constrains a bank account to one legal entity; if the data disagrees with
+// that assumption the handler must see it rather than silently read the first
+// row.
+func (s *PgStore) StatementLegalEntities(ctx context.Context, tenantID, bankAccountID, statementDate string) ([]string, error) {
+	out := make([]string, 0, 1)
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT legal_entity_id::text FROM statement_lines
+			WHERE tenant_id = $1 AND bank_account_id = $2::uuid AND statement_date = $3::date
+		`, tenantID, bankAccountID, statementDate)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			out = append(out, id)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return out, nil
 }

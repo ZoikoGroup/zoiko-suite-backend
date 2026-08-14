@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"time"
@@ -33,8 +34,13 @@ var (
 )
 
 // JournalLine mirrors the subset of general-ledger-svc's JournalLine fields
-// needed to compute a journal's net amount.
+// needed to compute a journal's movement on a given account.
+//
+// AccountCode is what makes direction knowable and was previously not read at
+// all — without it every line looks alike and only magnitudes can be
+// compared.
 type JournalLine struct {
+	AccountCode  string  `json:"account_code"`
 	DebitAmount  float64 `json:"debit_amount"`
 	CreditAmount float64 `json:"credit_amount"`
 }
@@ -49,20 +55,43 @@ type Journal struct {
 	Lines         []JournalLine `json:"lines"`
 }
 
-// NetAmount returns the journal's balanced amount — the sum of one side of
-// a balanced double-entry journal (debits and credits are equal by the time
-// a journal is FINALIZED; general-ledger-svc enforces that at VALIDATE).
-func (j Journal) NetAmount() float64 {
-	var debit, credit float64
+// CashMovementCents returns the journal's SIGNED net movement on accountCode,
+// in cents: positive for money into the account (a net debit to it), negative
+// for money out (a net credit). The second return is false when the journal
+// does not touch that account at all, which is not the same as a movement of
+// zero — one means "this journal has nothing to do with this bank account",
+// the other means "it nets to nothing", and a caller must be able to tell
+// them apart.
+//
+// In cents, not float64, and compared exactly rather than within an epsilon.
+// The amounts are NUMERIC(18,2) at both ends; they are only ever float64 in
+// transit because that is what JSON gives us. 0.1+0.2 != 0.3 in binary
+// floating point, and this comparison decides whether money is declared
+// reconciled.
+//
+// This replaces NetAmount, which summed one side of the journal and so was
+// always positive — carrying no direction whatsoever. Comparing its magnitude
+// to a statement line's magnitude meant a 500.00 payment OUT reconciled
+// cleanly against a journal that moved 500.00 IN.
+func (j Journal) CashMovementCents(accountCode string) (int64, bool) {
+	var cents int64
+	var touched bool
 	for _, l := range j.Lines {
-		debit += l.DebitAmount
-		credit += l.CreditAmount
+		if l.AccountCode != accountCode {
+			continue
+		}
+		touched = true
+		cents += toCents(l.DebitAmount) - toCents(l.CreditAmount)
 	}
-	if debit != 0 {
-		return debit
-	}
-	return credit
+	return cents, touched
 }
+
+// ToCents converts a JSON-decoded money amount to exact cents. Rounding is
+// required because a decimal like 12.34 has no exact float64 representation,
+// so 12.34*100 can land on 1233.9999999999998 and truncate to 1233.
+func ToCents(v float64) int64 { return toCents(v) }
+
+func toCents(v float64) int64 { return int64(math.Round(v * 100)) }
 
 // Client is the narrow interface the handler depends on.
 type Client interface {
