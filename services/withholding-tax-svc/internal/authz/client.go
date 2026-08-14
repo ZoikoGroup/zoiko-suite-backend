@@ -7,20 +7,48 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
-// Client talks to the Governance Plane authorization-svc.
-// No domain service self-authorizes a material action (per doctrine.md).
+// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
+// authorization-svc may be reused locally before it is asked again.
+//
+// Doc 05 (Security Architecture Specification) §6.5 anticipates exactly
+// this cost: "For Tier 0 and latency-sensitive services, policy and
+// authorization evaluation may use high-speed distributed enforcement
+// patterns, including local policy caches... provided policy source
+// remains centralized, policy provenance is auditable, stale decision
+// risk is bounded, fail-safe behavior is defined." This constant is that
+// bound — short enough that a permission revocation or role change
+// propagates within one cache generation, long enough to absorb the
+// repeat checks a single user action or request burst produces.
+//
+// Only real GRANTED/DENIED decisions are ever cached. An unreachable or
+// misbehaving authorization-svc is never cached — that would turn one
+// transient outage into a standing permit-or-deny for every subsequent
+// caller on this instance, which defeats fail-closed.
+const decisionCacheTTL = 5 * time.Second
+
+type cachedDecision struct {
+	deniedErr error
+	expiresAt time.Time
+}
+
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
+
+	cacheMu     sync.Mutex
+	cache       map[string]cachedDecision
+	cacheWrites int
 }
 
 func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{Timeout: 5 * time.Second},
+		cache:      make(map[string]cachedDecision),
 	}
 }
 
@@ -32,12 +60,66 @@ var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
 // ErrAuthorizationDenied is returned when authorization-svc explicitly denies the action.
 var ErrAuthorizationDenied = errors.New("authorization denied")
 
-// CheckAllowed calls authorization-svc's real contract: POST /v1/authorize with
+func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType
+
+	if decision, hit := c.lookupCache(key); hit {
+		return decision
+	}
+
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+
+	if err == nil || errors.Is(err, ErrAuthorizationDenied) {
+		c.storeCache(key, err)
+	}
+
+	return err
+}
+
+// lookupCache returns the cached decision for key and whether it is still
+// within decisionCacheTTL. An expired entry is evicted on read.
+func (c *Client) lookupCache(key string) (error, bool) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	d, ok := c.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(d.expiresAt) {
+		delete(c.cache, key)
+		return nil, false
+	}
+	return d.deniedErr, true
+}
+
+// storeCache records a real GRANTED/DENIED decision. Every 1000th write
+// sweeps expired entries so a long-lived instance with many distinct
+// combinations doesn't grow the map unboundedly between reads of the same
+// key.
+func (c *Client) storeCache(key string, decision error) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	c.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
+
+	c.cacheWrites++
+	if c.cacheWrites%1000 == 0 {
+		now := time.Now()
+		for k, v := range c.cache {
+			if now.After(v.expiresAt) {
+				delete(c.cache, k)
+			}
+		}
+	}
+}
+
+// checkAllowedLive calls authorization-svc's real contract: POST /v1/authorize with
 // {"principal_id", "legal_entity_id", "action_type"}. The endpoint always answers
 // HTTP 200 with a decision_outcome of "GRANTED" or "DENIED" in the body. Any failure
 // to reach the service, a non-200 response, or a decision other than "GRANTED" is
 // treated as not authorized (fail closed).
-func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	reqBody, _ := json.Marshal(map[string]string{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,

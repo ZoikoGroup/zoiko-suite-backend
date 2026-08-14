@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"zoiko.io/offboarding-severance-svc/internal/domain"
@@ -14,9 +16,37 @@ type Authorizer interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
+// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
+// authorization-svc may be reused locally before it is asked again.
+//
+// Doc 05 (Security Architecture Specification) §6.5 anticipates exactly
+// this cost: "For Tier 0 and latency-sensitive services, policy and
+// authorization evaluation may use high-speed distributed enforcement
+// patterns, including local policy caches... provided policy source
+// remains centralized, policy provenance is auditable, stale decision
+// risk is bounded, fail-safe behavior is defined." This constant is that
+// bound — short enough that a permission revocation or role change
+// propagates within one cache generation, long enough to absorb the
+// repeat checks a single user action or request burst produces.
+//
+// Only real GRANTED/DENIED decisions are ever cached. An unreachable or
+// misbehaving authorization-svc is never cached — that would turn one
+// transient outage into a standing permit-or-deny for every subsequent
+// caller on this instance, which defeats fail-closed.
+const decisionCacheTTL = 5 * time.Second
+
+type cachedDecision struct {
+	deniedErr error
+	expiresAt time.Time
+}
+
 type Client struct {
 	baseURL    string
 	httpClient *http.Client
+
+	cacheMu     sync.Mutex
+	cache       map[string]cachedDecision
+	cacheWrites int
 }
 
 func NewClient(baseURL string) *Client {
@@ -25,13 +55,72 @@ func NewClient(baseURL string) *Client {
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
+		cache: make(map[string]cachedDecision),
 	}
 }
 
+func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType
+
+	if decision, hit := c.lookupCache(key); hit {
+		return decision
+	}
+
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+
+	// Cache the decision itself (GRANTED or DENIED), never an unavailable
+	// outcome — see the doc comment on decisionCacheTTL.
+	if err == nil || errors.Is(err, domain.ErrAuthorizationDenied) {
+		c.storeCache(key, err)
+	}
+
+	return err
+}
+
+// lookupCache returns the cached decision for key and whether it is still
+// within decisionCacheTTL. An expired entry is evicted on read.
+func (c *Client) lookupCache(key string) (error, bool) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	d, ok := c.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(d.expiresAt) {
+		delete(c.cache, key)
+		return nil, false
+	}
+	return d.deniedErr, true
+}
+
+// storeCache records a real GRANTED/DENIED decision. Every 1000th write
+// sweeps expired entries so a long-lived instance with many distinct
+// (principal, entity, action) combinations doesn't grow the map
+// unboundedly between reads of the same key.
+func (c *Client) storeCache(key string, decision error) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	c.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
+
+	c.cacheWrites++
+	if c.cacheWrites%1000 == 0 {
+		now := time.Now()
+		for k, v := range c.cache {
+			if now.After(v.expiresAt) {
+				delete(c.cache, k)
+			}
+		}
+	}
+}
+
+// checkAllowedLive is the real, uncached call to authorization-svc.
+//
 // CheckAllowed calls authorization-svc's real /v1/authorize endpoint.
 // Fails closed: any transport error or non-200 response is reported as
 // domain.ErrAuthzServiceUnavailable, never treated as an implicit allow.
-func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	body, err := json.Marshal(map[string]string{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
