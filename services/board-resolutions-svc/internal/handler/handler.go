@@ -137,6 +137,9 @@ func (h *Handler) CreateMeeting(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetMeeting(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	m, err := h.store.GetMeeting(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrMeetingNotFound) {
@@ -150,6 +153,9 @@ func (h *Handler) GetMeeting(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListMeetings(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	meetings, err := h.store.ListMeetings(r.Context(), legalEntityID)
 	if err != nil {
@@ -212,6 +218,9 @@ func (h *Handler) CreateResolution(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetResolution(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	res, err := h.store.GetResolution(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, domain.ErrResolutionNotFound) {
@@ -225,6 +234,9 @@ func (h *Handler) GetResolution(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListResolutions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
 	legalEntityID := r.URL.Query().Get("legal_entity_id")
 	meetingID := r.URL.Query().Get("meeting_id")
 	status := r.URL.Query().Get("status")

@@ -192,6 +192,15 @@ $BUNDLES = @(
         Actions = @("NOTIFICATION_SEND", "NOTIFICATION_VIEW")
     },
     @{
+        # board-resolutions-svc authorizes meeting creation against the
+        # meeting's legal entity and resolution create / vote / pass against
+        # the resolution's own legal entity, so the console grants these on
+        # the legal entity scope.
+        Code    = "BOARD_FULL"
+        Service = "board-resolutions-svc"
+        Actions = @("MEETING_CREATE", "RESOLUTION_CREATE", "RESOLUTION_VOTE", "RESOLUTION_PASS")
+    },
+    @{
         # secret-vault-integration-svc authorizes every mutation against
         # authzPlatformScopeID (its handler falls back to the platform scope
         # when a request carries no legal_entity_id, which is the console's
