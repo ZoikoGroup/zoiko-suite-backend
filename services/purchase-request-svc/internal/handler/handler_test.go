@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -69,7 +70,7 @@ func (s *stubStore) ListRequests(_ context.Context, _ domain.ListRequestsFilter)
 	return out, nil
 }
 
-func (s *stubStore) TransitionRequest(_ context.Context, _, requestID string, toStatus domain.RequestStatus, _ string, reason *string) error {
+func (s *stubStore) TransitionRequest(_ context.Context, _, requestID string, toStatus domain.RequestStatus, _ string, _ time.Time, reason *string) error {
 	if s.transitionErr != nil {
 		return s.transitionErr
 	}
@@ -227,6 +228,18 @@ func TestApproveRequest_FromPending_Succeeds(t *testing.T) {
 	if pub.approved != 1 {
 		t.Fatalf("expected purchase.request.approved to be published once, got %d", pub.approved)
 	}
+	// The response must echo who decided and when — a 200 that says APPROVED
+	// without the approver would be a record-shaped lie about what was written.
+	var got domain.PurchaseRequest
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if got.ApprovedByPrincipalID == nil || *got.ApprovedByPrincipalID != "principal-1" {
+		t.Fatalf("expected approved_by_principal_id principal-1 in response, got %v", got.ApprovedByPrincipalID)
+	}
+	if got.ApprovedAt == nil {
+		t.Fatalf("expected approved_at in response")
+	}
 }
 
 func TestApproveRequest_AlreadyApproved_Rejected(t *testing.T) {
@@ -269,6 +282,16 @@ func TestRejectRequest_FromPending_Succeeds(t *testing.T) {
 	}
 	if pub.rejected != 1 {
 		t.Fatalf("expected purchase.request.rejected to be published once, got %d", pub.rejected)
+	}
+	var got domain.PurchaseRequest
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if got.RejectedByPrincipalID == nil || *got.RejectedByPrincipalID != "principal-1" {
+		t.Fatalf("expected rejected_by_principal_id principal-1 in response, got %v", got.RejectedByPrincipalID)
+	}
+	if got.RejectedAt == nil || got.RejectionReason == nil || *got.RejectionReason != "over budget" {
+		t.Fatalf("expected rejected_at and reason in response, got at=%v reason=%v", got.RejectedAt, got.RejectionReason)
 	}
 }
 
