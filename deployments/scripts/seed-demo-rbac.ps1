@@ -65,9 +65,15 @@ $ErrorActionPreference = "Stop"
 $TENANT_ID    = "11111111-1111-1111-1111-111111111111"
 $LEGAL_ENTITY = "22222222-2222-2222-2222-222222222222"
 $PRINCIPAL_ID = "33333333-3333-3333-3333-333333333333"
+$APPROVER_ID  = "66666666-6666-6666-6666-666666666666"
 $ROLE_ID      = "44444444-4444-4444-4444-444444444444"
 
 $ROLE_CODE = "CONSOLE_DEMO_OPERATOR"
+
+# Platform-scope records (decisions, config, flags, secret policies, policy
+# definitions) authorize against this id -- see the platform-scope assignment
+# below and the verification loop at the bottom.
+$PLATFORM_SCOPE = "00000000-0000-0000-0000-00000000f001"
 
 # One bundle per service, so a service's grants can be read off in one place and
 # a newly wired service is one entry rather than an edit in four places.
@@ -149,6 +155,58 @@ $BUNDLES = @(
         Code    = "VENDOR_DD_FULL"
         Service = "vendor-due-diligence-svc"
         Actions = @("VENDOR_DD_INITIATE", "VENDOR_DD_VIEW")
+    },
+    @{
+        # governance-decision-log-svc authorizes every decision write against
+        # authzPlatformScopeID -- decisions are platform records, not
+        # entity-scoped ones -- so this grant is checked on the platform scope
+        # below, never on the legal entity or tenant.
+        Code    = "GOVERNANCE_FULL"
+        Service = "governance-decision-log-svc"
+        Actions = @("GOVERNANCE_DECISION_RECORD")
+    },
+    @{
+        # policy-svc checks POLICY_CREATE / POLICY_VERSION_CREATE /
+        # POLICY_VERSION_ACTIVATE against the legal entity when the policy is
+        # entity-scoped and against authzPlatformScopeID when it is not. The
+        # console always creates entity-scoped policies, but the platform-scope
+        # assignment below also carries these so both paths are granted.
+        Code    = "POLICY_FULL"
+        Service = "policy-svc"
+        Actions = @("POLICY_CREATE", "POLICY_VERSION_CREATE", "POLICY_VERSION_ACTIVATE")
+    },
+    @{
+        # configuration-feature-flag-svc authorizes config and flag writes
+        # against authzPlatformScopeID -- a config value or flag shapes
+        # platform behaviour, so it is a platform action, not an entity one.
+        Code    = "CONFIG_FULL"
+        Service = "configuration-feature-flag-svc"
+        Actions = @("CONFIGURATION_WRITE", "FEATURE_FLAG_WRITE")
+    },
+    @{
+        # secret-vault-integration-svc authorizes every mutation against
+        # authzPlatformScopeID (its handler falls back to the platform scope
+        # when a request carries no legal_entity_id, which is the console's
+        # normal posture). Holds the policy, material, lease and rotate grants.
+        Code    = "VAULT_FULL"
+        Service = "secret-vault-integration-svc"
+        Actions = @(
+            "SECRET_POLICY_CREATE", "SECRET_POLICY_VERSION_CREATE", "SECRET_POLICY_VERSION_ACTIVATE",
+            "SECRET_MATERIAL_WRITE", "SECRET_LEASE_REVOKE", "SECRET_ROTATE"
+        )
+    },
+    @{
+        # contract-lifecycle-svc authorizes each lifecycle transition against
+        # the contract's own legal entity: CONTRACT_CREATE on draft, then a
+        # distinct grant per transition. The FE comment that once claimed this
+        # service skipped authorization was stale -- every mutation goes
+        # through authorization-svc and fails closed on a denial.
+        Code    = "CONTRACT_FULL"
+        Service = "contract-lifecycle-svc"
+        Actions = @(
+            "CONTRACT_CREATE", "CONTRACT_UPDATE", "CONTRACT_SUBMIT_FOR_APPROVAL",
+            "CONTRACT_ACTIVATE", "CONTRACT_TERMINATE"
+        )
     }
 )
 
@@ -278,6 +336,56 @@ if ($missing.Count -eq 0) {
         }
         $step++
     }
+
+    # Third scope: the platform scope. governance-decision-log-svc,
+    # configuration-feature-flag-svc, secret-vault-integration-svc and the
+    # non-entity-scoped paths of policy-svc all authorize against
+    # AUTHZ_PLATFORM_SCOPE_ID (00000000-0000-0000-0000-00000000f001 in
+    # deployments/docker-compose.yml) -- decisions, config values, flags and
+    # secret policies are platform records, not entity-scoped ones. Without an
+    # assignment on that scope the console's Governance Log, Settings and
+    # Secret Vault writes answer 403 even though every legal-entity grant above
+    # is in place.
+    Write-Host "$step  assign role to $PRINCIPAL_ID on the platform scope" -NoNewline
+    try {
+        $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+            principal_id    = $PRINCIPAL_ID
+            role_id         = $ROLE_ID
+            legal_entity_id = $PLATFORM_SCOPE
+            effective_from  = "2020-01-01T00:00:00Z"
+            assigned_by     = $PRINCIPAL_ID
+        }
+        Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
+    } catch {
+        if ("$_" -match "409|23505|duplicate|already") {
+            Write-Host "  -> already assigned" -ForegroundColor DarkGray
+        } else {
+            throw
+        }
+    }
+    $step++
+}
+
+# SoD approver assignment runs even on the already-granted path so the smoke
+# tests can exercise reject-the-creator paths (accounts-payable-svc refuses a
+# creator approving their own invoice). The role and its bundles exist either
+# way by this point.
+Write-Host "assign role to $APPROVER_ID on the legal entity (SoD approver)" -NoNewline
+try {
+    $assignment = Invoke-Authz -Path "/v1/admin/role-assignments" -Body @{
+        principal_id    = $APPROVER_ID
+        role_id         = $ROLE_ID
+        legal_entity_id = $LEGAL_ENTITY
+        effective_from  = "2020-01-01T00:00:00Z"
+        assigned_by     = $PRINCIPAL_ID
+    }
+    Write-Host "  -> $($assignment.status) $($assignment.body.principal_role_assignment_id)"
+} catch {
+    if ("$_" -match "409|23505|duplicate|already") {
+        Write-Host "  -> already assigned" -ForegroundColor DarkGray
+    } else {
+        throw
+    }
 }
 
 # Confirm through the same path the services use, rather than trusting that a
@@ -310,6 +418,23 @@ foreach ($action in $TENANT_SCOPED_ACTIONS) {
     $outcome  = $decision.decision_outcome
     if ($outcome -eq "GRANTED") { $colour = "Green" } else { $colour = "Red"; $failed += "$action (tenant scope)" }
     Write-Host ("     {0,-28} {1,-30} -> {2}" -f "tenant-wide", $action, $outcome) -ForegroundColor $colour
+}
+
+Write-Host "Verifying the platform-scoped actions:" -ForegroundColor Cyan
+# governance-decision-log, configuration-feature-flag, secret-vault and the
+# non-entity-scoped policy paths authorize against AUTHZ_PLATFORM_SCOPE_ID, so
+# these are probed on that scope, not on the legal entity.
+$PLATFORM_SCOPED_ACTIONS = @(
+    ($BUNDLES | Where-Object { $_.Code -eq "GOVERNANCE_FULL" }).Actions
+    ($BUNDLES | Where-Object { $_.Code -eq "CONFIG_FULL" }).Actions
+    ($BUNDLES | Where-Object { $_.Code -eq "VAULT_FULL" }).Actions
+    ($BUNDLES | Where-Object { $_.Code -eq "POLICY_FULL" }).Actions
+) | ForEach-Object { $_ }
+foreach ($action in $PLATFORM_SCOPED_ACTIONS) {
+    $decision = Get-Decision -Action $action -Scope $PLATFORM_SCOPE
+    $outcome  = $decision.decision_outcome
+    if ($outcome -eq "GRANTED") { $colour = "Green" } else { $colour = "Red"; $failed += "$action (platform scope)" }
+    Write-Host ("     {0,-28} {1,-30} -> {2}" -f "platform", $action, $outcome) -ForegroundColor $colour
 }
 
 if ($failed.Count -gt 0) {

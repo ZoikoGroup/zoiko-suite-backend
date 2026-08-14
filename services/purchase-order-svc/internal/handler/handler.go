@@ -122,8 +122,7 @@ func (h *Handler) IssueOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	created, err := h.store.CreateOrder(r.Context(), po)
 	if err != nil {
-		h.log.Error("IssueOrder: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		h.writeStoreErr(w, "IssueOrder", err)
 		return
 	}
 
@@ -141,8 +140,7 @@ func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
 	orderID := chi.URLParam(r, "purchase_order_id")
 	po, err := h.store.GetOrder(r.Context(), orderID)
 	if err != nil {
-		h.log.Error("GetOrder: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		h.writeStoreErr(w, "GetOrder", err)
 		return
 	}
 	if po == nil {
@@ -189,8 +187,7 @@ func (h *Handler) ListAmendments(w http.ResponseWriter, r *http.Request) {
 
 	po, err := h.store.GetOrder(r.Context(), orderID)
 	if err != nil {
-		h.log.Error("ListAmendments: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		h.writeStoreErr(w, "ListAmendments", err)
 		return
 	}
 	if po == nil {
@@ -200,8 +197,7 @@ func (h *Handler) ListAmendments(w http.ResponseWriter, r *http.Request) {
 
 	list, err := h.store.ListAmendments(r.Context(), orderID)
 	if err != nil {
-		h.log.Error("ListAmendments: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		h.writeStoreErr(w, "ListAmendments", err)
 		return
 	}
 	if list == nil {
@@ -232,8 +228,7 @@ func (h *Handler) AmendOrder(w http.ResponseWriter, r *http.Request) {
 	orderID := chi.URLParam(r, "purchase_order_id")
 	po, err := h.store.GetOrder(r.Context(), orderID)
 	if err != nil {
-		h.log.Error("AmendOrder: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		h.writeStoreErr(w, "AmendOrder", err)
 		return
 	}
 	if po == nil {
@@ -267,8 +262,7 @@ func (h *Handler) CloseOrder(w http.ResponseWriter, r *http.Request) {
 	orderID := chi.URLParam(r, "purchase_order_id")
 	po, err := h.store.GetOrder(r.Context(), orderID)
 	if err != nil {
-		h.log.Error("CloseOrder: store unavailable", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		h.writeStoreErr(w, "CloseOrder", err)
 		return
 	}
 	if po == nil {
@@ -304,6 +298,19 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	default:
 		h.log.Error("authorization check failed — failing closed", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "authorization_service_unavailable", "")
+	}
+}
+
+// writeStoreErr maps store errors to HTTP responses. A malformed identifier
+// (e.g. a non-UUID in a path or body field) is a caller error, not an
+// infrastructure failure — it must never surface as 503.
+func (h *Handler) writeStoreErr(w http.ResponseWriter, op string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrInvalidIdentifier):
+		writeError(w, http.StatusBadRequest, "invalid_identifier", "")
+	default:
+		h.log.Error(op+": store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
 }
 
