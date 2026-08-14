@@ -184,6 +184,14 @@ $BUNDLES = @(
         Actions = @("CONFIGURATION_WRITE", "FEATURE_FLAG_WRITE")
     },
     @{
+        # notification-svc authorizes sends against the target legal entity
+        # and views against the legal entity being queried, so the console
+        # grants these on the legal entity scope.
+        Code    = "NOTIFICATION_FULL"
+        Service = "notification-svc"
+        Actions = @("NOTIFICATION_SEND", "NOTIFICATION_VIEW")
+    },
+    @{
         # secret-vault-integration-svc authorizes every mutation against
         # authzPlatformScopeID (its handler falls back to the platform scope
         # when a request carries no legal_entity_id, which is the console's
