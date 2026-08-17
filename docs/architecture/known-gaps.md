@@ -268,3 +268,261 @@ counterparty_management both had to be created and migrated by hand.
 counterparty-management-svc reported `healthy` throughout — its readiness
 probe does not detect that its own database is missing, so a healthy container
 is not evidence its schema exists.
+
+## Resolved: board-resolutions-svc interpolated a request header into SQL
+`setRLS` built its statement as
+`fmt.Sprintf("SET LOCAL app.tenant_id = '%s'", tenantID)`, and tenantID is the
+raw `X-Tenant-Id` header. `X-Tenant-Id: x'; ALTER TABLE board_resolutions
+DISABLE ROW LEVEL SECURITY; --` ran as written — on the statement whose entire
+job is enforcing tenant isolation. Now `set_config('app.tenant_id', $1, true)`,
+so no string is assembled at all.
+
+## Resolved: row-level security applied to none of board-resolutions-svc's queries
+Worth reading even if you never touch this service, because the shape is
+platform-wide. 000001 did `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` and wrote
+a tenant isolation policy. Postgres exempts a table's OWNER from row-level
+security unless the table is also declared FORCE ROW LEVEL SECURITY, and these
+services connect as the owner — so the policy never applied to a single query
+the service made. Combined with reads that carried no `tenant_id` predicate of
+their own (`WHERE resolution_id = $1`, nothing more), one tenant could read
+another's board minutes and resolutions by id.
+
+Both halves are fixed: every statement now carries an explicit tenant
+predicate, and 000002 adds FORCE plus an explicit `WITH CHECK`. Check any other
+service whose store relies on the policy alone — the schema reads as if the
+control is present, and it is not.
+
+## Resolved: notification-svc authorized a list read only if you asked it to
+`CheckAllowed` ran only when `legal_entity_id` was supplied. Omitting it — the
+easier request to make — returned every notification in the tenant, across every
+legal entity, subjects and bodies included, to any principal holding no grant at
+all. A read is authorized by who is asking, never by which query parameters they
+happened to send. Now: supplying the entity requires NOTIFICATION_VIEW on it;
+omitting it means your own inbox, with the recipient filter forced to the caller.
+
+## Resolved: attribution taken from the request body defeated segregation of duties
+board-resolutions-svc wrote `created_by` and `passed_by` from the request body.
+The SoD check compares a resolution's `created_by` against the principal passing
+it, so a drafter could file their resolution under another name and then pass
+their own work — the two strings no longer matched, and the one control the
+doctrine rests on allowed it. Both are now the authenticated principal, and a
+body field naming anyone else answers 400 rather than being silently rewritten.
+
+Grep for other services taking an actor id from a body: any of them whose SoD
+or approval check compares two stored actor fields has the same hole.
+
+## Resolved: an evidence gate that failed open on anything it did not recognise
+board-resolutions-svc's evidencereq client was `if outcome == "MISSING" {
+refuse }; allow`. Everything else passed — including the empty string, which is
+what a renamed field or a changed envelope produces, and indistinguishable from
+SATISFIED under a deny-list. Now an allow-list of SATISFIED /
+NO_REQUIREMENTS_DEFINED; anything else is an unusable answer and the pass is
+refused. Both outbound clients in this service now have tests that drive a real
+`httptest` server with the dependency's literal response shape — the gap that
+let financial-close-svc ship three of these at once.
+
+## Open: notification-svc holds rows from before the channel fix
+The delivery adapter used to report an unrecognised channel as a delivery
+failure, so a caller's typo produced a stored FAILED record and a
+`notification.failed` event — evidence of an attempt no provider ever saw. The
+dev database has one (`channel: 'PIGEON'`). Migration 000002 adds its CHECK
+constraints `NOT VALID` deliberately: new writes are constrained, existing rows
+are preserved. A register that quietly edits its own history is worth less than
+one with an embarrassing row in it. Run `ALTER TABLE ... VALIDATE CONSTRAINT`
+once the backlog has been dealt with by someone who can decide what to do
+with it.
+
+## Resolved: schema-registry-svc worked only on one developer's machine
+Two independent instances of the same shape, both invisible locally and both
+fatal anywhere else.
+
+**The grant.** Registration is gated on SCHEMA_PUBLISH, and
+`seed-demo-rbac.ps1` never granted it. It worked on the development machine
+because a hand-made bundle (`SRB` on role `SR_1255`) had been left in that
+Postgres volume by some earlier ad-hoc seeding. On a fresh volume, in CI, or on
+anyone else's machine, every registration was 403 and the console's form was
+dead while the page rendered perfectly. A `SCHEMA_FULL` bundle is seeded now.
+
+**The migration.** `deployments/init-db.sh` applied only `000001`. Every SELECT
+this service makes names `compatibility_mode` and `owning_service`, which
+`000002` adds — so on a volume initialised from that script the column did not
+exist and every read and write failed. Applied by hand locally, so again
+invisible. Both `000002` and `000003` are listed now.
+
+Worth generalising: a feature that depends on state nobody scripted is
+indistinguishable from a working feature until someone else runs it. Grep
+`init-db.sh` against each service's migrations directory, and each service's
+authorized actions against the seed's bundles.
+
+## Resolved: the seed's own idempotency probe could not see a missing scope
+`seed-demo-rbac.ps1` decides whether it has work to do by probing every action
+-- but only on the LEGAL ENTITY. SCHEMA_PUBLISH was already granted there by the
+stray bundle above, so the probe found nothing missing, skipped every bundle,
+and never granted the PLATFORM scope that schema-registry-svc actually
+authorizes against for an entity-less registration. It then reported success.
+
+This is the same failure the script's header already describes one level down
+(the old single-action early return), recurring one level up in the scope
+dimension. The probe now covers both scopes.
+
+## Resolved: json.Valid is not schema validation
+schema-registry-svc accepted any well-formed JSON as an event contract, under an
+error message that already claimed json_schema "must be a valid JSON object".
+`123`, `"a string"`, `null`, `[]` and `{}` all passed.
+
+The consequence is worse than untidiness: a first version stored as `123` can
+never be evolved. The next registration runs the compatibility check, the stored
+baseline fails to parse into a shape, and every future version of that event
+answers 400 forever -- the registry accepted a value that permanently bricked
+the contract it was recording. Validation is now one shared parse used by both
+the write path and the compatibility checker (they each had their own copy of
+the shape struct, which is how the two could ever disagree), with migration
+000003 as the schema-level backstop.
+
+## Resolved: the console reported a breaking schema change as a version race
+`lib/api/client.ts` folds an error body into one human string from its
+`error`/`field`/`message`/`detail` keys. schema-registry-svc answers a breaking
+change with `{error, violations: [...]}`, and `violations` -- the strings naming
+the exact field that broke -- were dropped before any caller saw them.
+
+The console distinguishes this service's two different 409s by whether
+violations are present, so with them gone EVERY breaking change was reported as
+the other 409: "another registration claimed this version, re-read and
+resubmit". The reader retried, got the same 409, and was told the same thing,
+forever. `ApiError` now carries the parsed `body` alongside the folded message,
+and callers needing a structured member read it directly rather than scraping it
+back out of prose -- the same conclusion financial-close-svc's structured 422
+reached.
+
+Check any other service whose error body carries structured findings: the
+folding is right for the great majority and destructive for exactly these.
+
+## Resolved: jurisdiction-rules-svc had no grants, so its whole admin surface was dead
+Recorded as an open gap when this service was hardened on 5 Aug -- "RBAC seeding
+must grant JURISDICTION_* / JURISDICTION_RULE_* against that same [platform] id;
+seed-demo-rbac.ps1 does not" -- and it stayed open. All five admin routes
+(jurisdiction create/deactivate, rule create/transition/record-drift) were 403
+for every principal, so nothing could register a jurisdiction, record a rule, or
+mark legal drift through any client.
+
+Unlike schema-registry-svc's identical gap, there was not even a stray hand-made
+grant making it appear to work locally. A `JURISDICTION_FULL` bundle is seeded
+now, on the platform scope -- jurisdictions are platform-wide reference data with
+no legal entity of their own, and the service requires AUTHZ_PLATFORM_SCOPE_ID at
+startup for exactly that reason.
+
+That is now three services found with the same shape in one pass
+(schema-registry, jurisdiction-rules, and schema-registry's migrations). The two
+greps worth running against every remaining service: `init-db.sh` against each
+service's `deployments/migrations/` directory, and each service's authorized
+action strings against `seed-demo-rbac.ps1`'s bundles. Note that the action
+strings are DERIVED for this service -- upper(resource + "_" + action) in
+internal/authz -- so they have to be read off the handler's resource/action
+pairs, not guessed from a naming convention.
+
+## Clarified: deactivating a jurisdiction makes it stop resolving
+Worth writing down because the console asserted the opposite and a live
+assertion caught it.
+
+`POST /v1/admin/jurisdictions/{id}/deactivate` clears active_flag and end-dates
+the row -- no hard delete, per platform doctrine. But `GET /v1/jurisdictions/{id}`
+is an ACTIVE-ONLY lookup and answers 404 afterwards. That is deliberate: the
+service's own ErrJurisdictionNotFound is documented as "returned when the
+jurisdiction_id does not exist OR IS INACTIVE. Callers (e.g.
+tenant-entity-registry-svc) must reject the assignment fail-closed."
+
+So the list endpoint and the lookup endpoint disagree on purpose: a deactivated
+jurisdiction is still visible in `GET /v1/jurisdictions` -- which is what lets a
+register explain a historical record -- while being unbindable and
+unvalidatable everywhere else. Deactivation is therefore consequential rather
+than cosmetic, and it affects records ALREADY bound to that jurisdiction, not
+just new ones. The console now says so in both places it mentions deactivation;
+a stale comment in lib/api/jurisdictions.ts had claimed an obligation "CAN be
+bound to an inactive jurisdiction", which is backwards.
+
+## Resolved: a full 17-service audit, and the three shapes it found
+Run 17 Aug across every finished service. Recorded because the SHAPES recur and
+the checks are cheap enough to repeat.
+
+**1. Migrations in the repo that init-db.sh never applied.** Two more, after
+schema-registry-svc's: secret-vault-integration-svc's `000002_add_data_
+classification` and bank-reconciliation-svc's `000003_add_gl_cash_account_code`.
+Both columns existed on the development volume because someone had applied them
+by hand, so both services worked here and would have failed on a fresh volume.
+The second is not cosmetic — without gl_cash_account_code, matching compares
+magnitudes and a statement line of -500.00 reconciles cleanly against a journal
+that moved 500.00 the other way.
+
+**2. Migrations init-db.sh DOES list that this volume never ran.** A different
+failure with the same symptom: init-db.sh only executes when the Postgres data
+directory is empty, so anything added after the volume was created has silently
+never run. governance-decision-log-svc was answering 503 `store_unavailable` on
+every decision read — `column "workflow_instance_id" does not exist` — because
+000004 had never been applied here. Nine migrations across four services were
+missing on this volume. Reconciling is safe to re-run: apply every up migration
+without ON_ERROR_STOP and let the already-applied ones fail on duplicate objects.
+
+**3. A stale image is not visible in any test result.** Every service's image
+was compared against its source. The heuristic to use is narrower than it first
+appears: comparing image-created against last-commit time OVER-reports, because
+an image built from a working-tree file before that file was committed is
+content-identical and cache-hits to the same image. The authoritative check is a
+cached `docker compose build` exiting 0 — if the context changed, it rebuilds.
+Timestamps are a smoke alarm, not the answer.
+
+Also confirmed clean in the same pass: every authorized action string across the
+17 is granted by a seed bundle, every up migration has a down (financial-close-svc
+was missing one), and all 17 are present in the console's service registry.
+
+## Resolved: obligations-svc had no authorization and no tenant dimension
+Two structural gaps in one service, both shipped deliberately and both stale by
+the time they were found.
+
+**No authorization at all.** Its config carried the comment "No AuthZServiceURL
+field: admin writes do not call Authorization Service yet -- it doesn't exist.
+Deliberate, documented deferral matching policy-svc's and
+governance-decision-log-svc's precedent." Both halves had gone stale:
+authorization-svc is live on :8089, fifteen other services call it, and both
+services cited as precedent had since been wired to it. What the deferral left
+behind was an OPEN WRITE SURFACE on a statutory compliance register -- anything
+able to reach the port could raise an obligation, close one, or file against
+one. Three actions now gate it (OBLIGATION_CREATE, OBLIGATION_STATUS_UPDATE,
+FILING_REQUIREMENT_CREATE), one per route rather than a blanket write
+permission, because closing an obligation and raising one are different
+authorities.
+
+**No tenant dimension.** Not a missing filter -- a missing concept. There was no
+tenant_id column, so every read returned every tenant's obligations. The
+sharpest edge was the dedup key: obligation_code carried a GLOBAL unique index
+and creation is idempotent on it (`ON CONFLICT DO NOTHING`, then look up and
+return the existing row). A second tenant registering an ordinary code --
+"VAT-Q1-2026" -- did not create their obligation. They were handed the FIRST
+tenant's, with that tenant's legal entity, due date and source reference, as a
+200. One tenant's compliance register answering with another's record, through
+the documented happy path. Migration 000002 adds tenant_id to both tables, FORCE
+row-level security, and re-scopes the unique index to (tenant_id,
+obligation_code).
+
+Also closed: created_by_principal_id was written from the request body (the
+record of who raised a statutory obligation, self-declared); the status
+transition read and wrote in two statements with no lock, so two concurrent
+closes could both pass the state-machine check and the second overwrote
+closed_at; the register was unbounded; no body size cap or unknown-field
+rejection; Kafka BatchTimeout at the 1s default.
+
+## Open: obligations-svc does not verify the legal entity belongs to the caller's tenant
+Found by the live suite for the pass above, and deliberately NOT closed in it.
+
+Authorization is scoped to the obligation's legal_entity_id, and tenancy is
+scoped by X-Tenant-Id, but nothing checks that the two agree. A principal
+holding OBLIGATION_CREATE on legal entity X can therefore write an obligation
+referencing X into ANY tenant, simply by changing the header -- the row lands in
+the caller's own tenant and is invisible to the entity's real tenant, so this
+is a write-side integrity gap rather than a read leak.
+
+The service already validates jurisdiction_id against jurisdiction-rules-svc and
+fails closed; the same treatment for legal_entity_id against
+tenant-entity-registry-svc is the fix, and it is a new outbound dependency
+rather than a one-line check. Worth checking whether the other entity-scoped
+services have the same hole -- the pattern of "authorize on the entity, scope
+rows by the tenant, never reconcile the two" is not specific to this service.
