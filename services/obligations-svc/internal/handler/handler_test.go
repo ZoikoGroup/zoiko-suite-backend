@@ -39,6 +39,14 @@ type stubStore struct {
 	filingErr     error
 	filingList    []*domain.FilingRequirement
 	filingListErr error
+
+	// Chunk 10: applicability decisions.
+	applicabilityDecision   *domain.ApplicabilityDecision
+	applicabilityCreateErr  error
+	applicabilityList       []*domain.ApplicabilityDecision
+	applicabilityListErr    error
+	currentApplicability    *domain.CurrentApplicability
+	currentApplicabilityErr error
 }
 
 func (s *stubStore) CreateObligation(_ context.Context, _ domain.CreateObligationParams) (*domain.Obligation, bool, error) {
@@ -80,6 +88,20 @@ func (s *stubStore) CreateFilingRequirement(_ context.Context, _ domain.CreateFi
 
 func (s *stubStore) ListFilingRequirements(_ context.Context, _ string) ([]*domain.FilingRequirement, error) {
 	return s.filingList, s.filingListErr
+}
+
+// ── Chunk 10: applicability decisions ───────────────────────────────────────
+
+func (s *stubStore) CreateApplicabilityDecision(_ context.Context, _ domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, error) {
+	return s.applicabilityDecision, s.applicabilityCreateErr
+}
+
+func (s *stubStore) ListApplicabilityDecisions(_ context.Context, _, _, _ string) ([]*domain.ApplicabilityDecision, error) {
+	return s.applicabilityList, s.applicabilityListErr
+}
+
+func (s *stubStore) FindCurrentApplicability(_ context.Context, _, _, _ string) (*domain.CurrentApplicability, error) {
+	return s.currentApplicability, s.currentApplicabilityErr
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -169,6 +191,24 @@ func withIdentity(req *http.Request) *http.Request {
 	req.Header.Set("X-Tenant-Id", testTenant)
 	req.Header.Set("X-Principal-Id", testPrincipal)
 	return req
+}
+
+// newApplicabilityTestRouter wires a router with applicability-decision
+// routes included — the base newTestRouter* helpers above only register
+// handler.RegisterRoutes.
+//
+// Merge note: this arrived from main built on the 4-argument handler.New and a
+// bare chi router. It now passes a GRANTING stubAuthz and installs
+// TenantContext, matching newTestRouterAuthz — without the middleware every
+// request through it would carry no tenant, which this service's store now
+// refuses outright.
+func newApplicabilityTestRouter(s *stubStore) chi.Router {
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	h := handler.New(s, &stubPublisher{}, &stubValidator{}, &stubAuthz{}, zap.NewNop())
+	handler.RegisterRoutes(r, h)
+	handler.RegisterApplicabilityRoutes(r, h)
+	return r
 }
 
 func validCreateBody() string {

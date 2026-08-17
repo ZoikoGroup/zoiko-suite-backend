@@ -35,13 +35,14 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS tax_identity_bundles, entity_jurisdiction_assignments, entity_hierarchies, legal_entities, data_residency_policies, tenants, residency_regions CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS workspaces, tax_identity_bundles, entity_jurisdiction_assignments, entity_hierarchies, legal_entities, data_residency_policies, tenants, residency_regions CASCADE;`)
 
 	for _, mig := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_tenant_id_to_junction_tables.up.sql",
 		"000003_add_residency_region_to_policies.up.sql",
 		"000004_add_data_classification.up.sql",
+		"000005_add_workspaces.up.sql",
 	} {
 		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", mig))
 		if err != nil {

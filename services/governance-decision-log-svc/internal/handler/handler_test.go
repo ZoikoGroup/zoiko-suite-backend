@@ -17,6 +17,7 @@ import (
 	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/domain"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
+	"zoiko.io/governance-decision-log-svc/internal/policyclient"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 )
 
@@ -34,6 +35,11 @@ type stubStore struct {
 	listResult    []*domain.GovernanceDecision
 	listErr       error
 	listGotParams store.ListParams
+
+	createdManifest     *domain.ReplayManifest
+	createManifestErr   error
+	listManifestsResult []*domain.ReplayManifest
+	listManifestsErr    error
 }
 
 func (s *stubStore) Insert(_ context.Context, d domain.GovernanceDecision) (bool, error) {
@@ -51,6 +57,29 @@ func (s *stubStore) List(_ context.Context, params store.ListParams) ([]*domain.
 	return s.listResult, s.listErr
 }
 
+// ── replay manifests ─────────────────────────────────────────────────────────
+
+func (s *stubStore) CreateReplayManifest(_ context.Context, m *domain.ReplayManifest) error {
+	s.createdManifest = m
+	return s.createManifestErr
+}
+
+func (s *stubStore) ListReplayManifestsByDecision(_ context.Context, _ string) ([]*domain.ReplayManifest, error) {
+	return s.listManifestsResult, s.listManifestsErr
+}
+
+// stubPolicyClient implements policyclient.Client for unit testing.
+type stubPolicyClient struct {
+	version *policyclient.PolicyVersion
+	err     error
+}
+
+func (c *stubPolicyClient) GetPolicyVersion(_ context.Context, _ string) (*policyclient.PolicyVersion, error) {
+	return c.version, c.err
+}
+
+var _ policyclient.Client = (*stubPolicyClient)(nil)
+
 // stubPublisher implements handler.EventPublisher for unit testing.
 // No Kafka, no network — purely in-memory, records what it was asked to publish.
 type stubPublisher struct {
@@ -66,8 +95,15 @@ func (p *stubPublisher) PublishDecisionRecorded(_ context.Context, d domain.Gove
 }
 
 func newTestRouter(store handler.DecisionStore, pub handler.EventPublisher) http.Handler {
+	return newTestRouterWithPolicyClient(store, pub, &stubPolicyClient{})
+}
+
+// newTestRouterWithPolicyClient is the same wiring with an explicit policy
+// client — used by the ReplayDecision tests, which need to control what
+// policy-svc "returns" without a real service.
+func newTestRouterWithPolicyClient(store handler.DecisionStore, pub handler.EventPublisher, pc policyclient.Client) http.Handler {
 	r := chi.NewRouter()
-	h := handler.New(store, pub, testAuthz(), testAuthzScopeID, zap.NewNop())
+	h := handler.New(store, pub, testAuthz(), pc, testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -493,7 +529,7 @@ func TestGatedRoutes_401_WithoutPrincipal(t *testing.T) {
 			pub := &stubPublisher{}
 			az := &stubAuthz{}
 			r := chi.NewRouter()
-			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+			handler.RegisterRoutes(r, handler.New(store, pub, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
 
 			// Deliberately NOT wrapped in authed().
 			req := httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body))
@@ -518,7 +554,7 @@ func TestGatedRoutes_403_Denied(t *testing.T) {
 			pub := &stubPublisher{}
 			az := &stubAuthz{err: authz.ErrDenied}
 			r := chi.NewRouter()
-			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+			handler.RegisterRoutes(r, handler.New(store, pub, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
 
 			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
@@ -546,7 +582,7 @@ func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 			pub := &stubPublisher{}
 			az := &stubAuthz{err: authz.ErrUnavailable}
 			r := chi.NewRouter()
-			handler.RegisterRoutes(r, handler.New(store, pub, az, testAuthzScopeID, zap.NewNop()))
+			handler.RegisterRoutes(r, handler.New(store, pub, az, &stubPolicyClient{}, testAuthzScopeID, zap.NewNop()))
 
 			req := authed(httptest.NewRequest(http.MethodPost, route.path, bytes.NewBufferString(route.body)))
 			w := httptest.NewRecorder()
@@ -556,5 +592,141 @@ func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// ── ReplayDecision ───────────────────────────────────────────────────────────
+
+func thresholdPayload(threshold float64) []byte {
+	b, _ := json.Marshal(map[string]float64{"threshold_amount": threshold})
+	return b
+}
+
+func amountContext(amount float64) []byte {
+	b, _ := json.Marshal(map[string]float64{"amount": amount})
+	return b
+}
+
+// TestReplayDecision_ReproducesOriginalOutcome is the core doc7 reproducibility
+// proof: replaying a decision against the EXACT policy version it used, with
+// the SAME facts, must reproduce the SAME outcome.
+func TestReplayDecision_ReproducesOriginalOutcome(t *testing.T) {
+	store := &stubStore{
+		findByIDResult: &domain.GovernanceDecision{
+			DecisionID:        "dec-1",
+			ActionType:        "APPROVAL_THRESHOLD",
+			Outcome:           "ESCALATED",
+			RuleBasis:         "APPROVAL_5K:pv-1",
+			EvaluationContext: amountContext(7500),
+		},
+	}
+	pc := &stubPolicyClient{version: &policyclient.PolicyVersion{PolicyVersionID: "pv-1", RulePayload: thresholdPayload(5000)}}
+	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, pc)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-1/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d — %s", w.Code, w.Body.String())
+	}
+	var manifest domain.ReplayManifest
+	if err := json.Unmarshal(w.Body.Bytes(), &manifest); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if manifest.ReplayedOutcome != "ESCALATED" || !manifest.OutcomesMatch {
+		t.Fatalf("expected replay to reproduce ESCALATED and match, got %+v", manifest)
+	}
+	if store.createdManifest == nil {
+		t.Fatal("expected a replay manifest to be persisted")
+	}
+}
+
+// TestReplayDecision_DetectsDrift proves the manifest can also record a
+// genuine MISMATCH — e.g. if the policy version's rule_payload were somehow
+// different from what was actually used at decision time, or a data
+// integrity issue elsewhere. The manifest must faithfully record this, not
+// silently coerce it into a match.
+func TestReplayDecision_DetectsDrift(t *testing.T) {
+	store := &stubStore{
+		findByIDResult: &domain.GovernanceDecision{
+			DecisionID:        "dec-2",
+			ActionType:        "APPROVAL_THRESHOLD",
+			Outcome:           "GRANTED", // originally recorded as within threshold
+			RuleBasis:         "APPROVAL_5K:pv-2",
+			EvaluationContext: amountContext(7500),
+		},
+	}
+	// If the fetched version's threshold is different from what was
+	// actually in force at decision time, replay will disagree.
+	pc := &stubPolicyClient{version: &policyclient.PolicyVersion{PolicyVersionID: "pv-2", RulePayload: thresholdPayload(5000)}}
+	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, pc)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-2/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (a mismatch is still a recorded fact, not an error), got %d — %s", w.Code, w.Body.String())
+	}
+	var manifest domain.ReplayManifest
+	_ = json.Unmarshal(w.Body.Bytes(), &manifest)
+	if manifest.OutcomesMatch {
+		t.Fatalf("expected outcomes_match=false for a genuine drift, got %+v", manifest)
+	}
+	if manifest.OriginalOutcome != "GRANTED" || manifest.ReplayedOutcome != "ESCALATED" {
+		t.Fatalf("expected original=GRANTED replayed=ESCALATED, got %+v", manifest)
+	}
+}
+
+func TestReplayDecision_UnsupportedActionType501(t *testing.T) {
+	store := &stubStore{
+		findByIDResult: &domain.GovernanceDecision{DecisionID: "dec-3", ActionType: "SOD_RULE", Outcome: "GRANTED", RuleBasis: "x:pv-3"},
+	}
+	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, &stubPolicyClient{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-3/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReplayDecision_PolicyVersionNotFound404(t *testing.T) {
+	store := &stubStore{
+		findByIDResult: &domain.GovernanceDecision{DecisionID: "dec-4", ActionType: "APPROVAL_THRESHOLD", Outcome: "GRANTED", RuleBasis: "x:pv-missing"},
+	}
+	pc := &stubPolicyClient{err: policyclient.ErrPolicyVersionNotFound}
+	h := newTestRouterWithPolicyClient(store, &stubPublisher{}, pc)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-4/replay", bytes.NewBufferString(`{"replayed_by_principal_id":"auditor-1"}`))
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestReplayDecision_MissingReplayedByPrincipal400(t *testing.T) {
+	h := newTestRouter(&stubStore{}, &stubPublisher{})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions/dec-5/replay", bytes.NewBufferString(`{}`))
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d — %s", w.Code, w.Body.String())
 	}
 }

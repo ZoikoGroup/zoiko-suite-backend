@@ -26,6 +26,11 @@ type ObligationStore interface {
 	UpdateObligationStatus(ctx context.Context, obligationID, newStatus string) (*domain.Obligation, bool, error)
 	CreateFilingRequirement(ctx context.Context, params domain.CreateFilingRequirementParams) (*domain.FilingRequirement, error)
 	ListFilingRequirements(ctx context.Context, obligationID string) ([]*domain.FilingRequirement, error)
+
+	// ── Chunk 10: applicability decisions ────────────────────────────────────
+	CreateApplicabilityDecision(ctx context.Context, params domain.CreateApplicabilityDecisionParams) (*domain.ApplicabilityDecision, error)
+	ListApplicabilityDecisions(ctx context.Context, obligationID, jurisdictionCode, entityRef string) ([]*domain.ApplicabilityDecision, error)
+	FindCurrentApplicability(ctx context.Context, obligationID, jurisdictionCode, entityRef string) (*domain.CurrentApplicability, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on for

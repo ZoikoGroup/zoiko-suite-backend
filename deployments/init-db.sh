@@ -9,6 +9,13 @@ set -e
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
     CREATE DATABASE audit_event_store;
     CREATE DATABASE tenant_entity_registry;
+    CREATE DATABASE commercial_account;
+    CREATE DATABASE capability_registry;
+    CREATE DATABASE ai_governance;
+    CREATE DATABASE kill_switch_registry;
+    CREATE DATABASE retention_registry;
+    CREATE DATABASE metric_registry;
+    CREATE DATABASE source_authority;
     CREATE DATABASE jurisdiction_rules;
     CREATE DATABASE governance_decision_log;
     CREATE DATABASE identity_context;
@@ -70,6 +77,36 @@ echo "Applying migrations for tenant_entity_registry..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000002_add_tenant_id_to_junction_tables.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000003_add_residency_region_to_policies.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000004_add_data_classification.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000005_add_workspaces.up.sql
+# Apply migrations for commercial-account-svc
+echo "Applying migrations for commercial_account..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000002_add_plans_and_subscriptions.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000003_add_dunning_and_transfers.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000004_add_outbox_events.up.sql
+# Apply migrations for capability-registry-svc
+echo "Applying migrations for capability_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "capability_registry" -f /migrations/capability-registry/000001_initial_schema.up.sql
+# Apply migrations for ai-governance-svc
+echo "Applying migrations for ai_governance..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "ai_governance" -f /migrations/ai-governance/000001_initial_schema.up.sql
+
+# Apply migrations for kill-switch-registry-svc
+echo "Applying migrations for kill_switch_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "kill_switch_registry" -f /migrations/kill-switch-registry/000001_initial_schema.up.sql
+
+# Apply migrations for retention-registry-svc
+echo "Applying migrations for retention_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "retention_registry" -f /migrations/retention-registry/000001_initial_schema.up.sql
+
+# Apply migrations for metric-registry-svc
+echo "Applying migrations for metric_registry..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "metric_registry" -f /migrations/metric-registry/000001_initial_schema.up.sql
+
+# Apply migrations for source-authority-svc
+echo "Applying migrations for source_authority..."
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "source_authority" -f /migrations/source-authority/000001_initial_schema.up.sql
 
 # Apply migrations for jurisdiction-rules-svc
 echo "Applying migrations for jurisdiction_rules..."
@@ -84,11 +121,13 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decisio
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000002_add_rls.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000003_enforce_immutability.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000004_add_event_linkage_keys.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000005_add_replay_manifests.up.sql
 # Apply migrations for policy-svc
 echo "Applying migrations for policy..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000002_add_activation_audit.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000003_add_explicit_scope_type.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000004_add_control_tests.up.sql
 
 # Apply migrations for authorization-svc
 echo "Applying migrations for authorization_svc..."
@@ -118,12 +157,28 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integ
 # Apply migrations for obligations-svc
 echo "Applying migrations for obligations..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000001_initial_schema.up.sql
-# 000002 adds the tenant dimension this service shipped without — plus the
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000002_add_applicability_decisions.up.sql
+# Renumbered from 000002 to 000003 in the merge: main had independently taken
+# 000002 for applicability_decisions, and two migrations sharing a version is an
+# error to every migration runner that reads these files, even though init-db.sh
+# itself just runs psql in order.
+#
+# 000003 adds the tenant dimension this service shipped without — plus the
 # row-level security that depends on it, and the tenant-scoped dedup index that
 # stops one tenant's idempotent create from returning another tenant's
 # obligation. Not optional: the store selects and writes tenant_id on every
 # statement.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000002_tenant_scoping_and_invariants.up.sql
+#
+# The two are independent — 000003 touches only obligations and
+# filing_requirements, and applicability_decisions needs nothing from it — so
+# the order here is the numbering's, not a dependency.
+#
+# Worth knowing: applicability_decisions arrived without a tenant_id, so it is
+# NOT covered by the row-level security 000003 installs on its sibling tables,
+# and it is reachable only through an obligation_id that IS tenant-scoped.
+# Recorded in known-gaps rather than changed here — renumbering a merge is not
+# the place to redesign another branch's table.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000003_tenant_scoping_and_invariants.up.sql
 
 # Apply migrations for schema-registry-svc
 echo "Applying migrations for schema_registry..."

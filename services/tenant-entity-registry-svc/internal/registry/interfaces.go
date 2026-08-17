@@ -49,6 +49,12 @@ type Store interface {
 	TransitionEntityStatus(ctx context.Context, legalEntityID string, newStatus domain.EntityStatus, allowedPriorStates []domain.EntityStatus, actorID, correlationID string) (int64, string, error)
 	GetEntityStatus(ctx context.Context, legalEntityID string) (*domain.EntityStatusResponse, error)
 
+	// ── Workspace ───────────────────────────────────────────────────────────
+
+	CreateWorkspace(ctx context.Context, w *domain.Workspace) error
+	GetWorkspaceByID(ctx context.Context, workspaceID string) (*domain.Workspace, error)
+	ListWorkspacesByTenant(ctx context.Context, tenantID string) ([]*domain.Workspace, error)
+
 	// ── EntityHierarchy ─────────────────────────────────────────────────────
 
 	CreateHierarchy(ctx context.Context, h *domain.EntityHierarchy) error
@@ -96,6 +102,7 @@ type EventPublisher interface {
 	PublishEntityStatusChanged(ctx context.Context, tenantID, legalEntityID string, previousStatus, newStatus domain.EntityStatus, correlationID string)
 	PublishEntityHierarchyChanged(ctx context.Context, hierarchy *domain.EntityHierarchy, changeType string, correlationID string)
 	PublishEntityJurisdictionChanged(ctx context.Context, assignment *domain.EntityJurisdictionAssignment, changeType string, correlationID string)
+	PublishWorkspaceCreated(ctx context.Context, workspace *domain.Workspace, correlationID string)
 }
 
 // ---------------------------------------------------------------------------

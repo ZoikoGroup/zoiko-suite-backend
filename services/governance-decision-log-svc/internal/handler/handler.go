@@ -10,11 +10,13 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/governance-decision-log-svc/internal/authz"
 	"zoiko.io/governance-decision-log-svc/internal/domain"
 	svcmiddleware "zoiko.io/governance-decision-log-svc/internal/middleware"
+	"zoiko.io/governance-decision-log-svc/internal/policyclient"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 )
 
@@ -24,6 +26,10 @@ type DecisionStore interface {
 	Insert(ctx context.Context, d domain.GovernanceDecision) (created bool, err error)
 	FindByID(ctx context.Context, tenantID, decisionID string) (*domain.GovernanceDecision, error)
 	List(ctx context.Context, params store.ListParams) ([]*domain.GovernanceDecision, error)
+
+	// ── replay manifests (backlog item 34) ──────────────────────────────────
+	CreateReplayManifest(ctx context.Context, m *domain.ReplayManifest) error
+	ListReplayManifestsByDecision(ctx context.Context, decisionID string) ([]*domain.ReplayManifest, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on for
@@ -39,10 +45,11 @@ const ActionRecordDecision = "GOVERNANCE_DECISION_RECORD"
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
-	store     DecisionStore
-	publisher EventPublisher
-	authz     authz.Client
-	log       *zap.Logger
+	store        DecisionStore
+	publisher    EventPublisher
+	authz        authz.Client
+	policyClient policyclient.Client
+	log          *zap.Logger
 
 	// authzPlatformScopeID is the legal_entity_id used when a decision is
 	// not scoped to one. authorization-svc rejects an empty legal_entity_id.
@@ -50,11 +57,12 @@ type Handler struct {
 }
 
 // New constructs a Handler.
-func New(store DecisionStore, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+func New(store DecisionStore, publisher EventPublisher, authzClient authz.Client, policyClient policyclient.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
 	return &Handler{
 		store:                store,
 		publisher:            publisher,
 		authz:                authzClient,
+		policyClient:         policyClient,
 		authzPlatformScopeID: authzPlatformScopeID,
 		log:                  log,
 	}
@@ -108,6 +116,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/decisions", h.CreateDecision)
 	r.Get("/v1/decisions", h.ListDecisions)
 	r.Get("/v1/decisions/{decision_id}", h.GetDecision)
+	r.Post("/v1/decisions/{decision_id}/replay", h.ReplayDecision)
+	r.Get("/v1/decisions/{decision_id}/replay-manifests", h.ListReplayManifests)
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -305,6 +315,165 @@ func (h *Handler) GetDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, d)
+}
+
+// ── POST /v1/decisions/{decision_id}/replay ─────────────────────────────────
+
+type replayDecisionRequest struct {
+	ReplayedByPrincipalID string `json:"replayed_by_principal_id"`
+	CorrelationID         string `json:"correlation_id"`
+}
+
+// ReplayDecision handles POST /v1/decisions/{decision_id}/replay — doc7's
+// reproducibility requirement (backlog item 34). Re-fetches the EXACT
+// policy version the original decision used (via policyClient, never
+// "whatever is active now"), re-runs the same evaluation logic against
+// the SAME evaluation_context that was recorded, and records a permanent
+// replay_manifest stating whether the outcome reproduced.
+//
+// Scoped narrowly for v1, same as policy-svc's own Evaluate: only
+// action_type=APPROVAL_THRESHOLD has replay logic implemented.
+//
+// Response:
+//
+//	201 → replay performed, manifest recorded
+//	400 → missing X-Tenant-Id, missing replayed_by_principal_id, or
+//	      the decision's rule_basis is not parseable
+//	404 → decision not found, or its policy version no longer resolvable
+//	501 → replay not implemented for this decision's action_type
+//	503 → store, policy-svc, or authz unavailable
+func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
+	decisionID := chi.URLParam(r, "decision_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_tenant_id"})
+		return
+	}
+
+	var req replayDecisionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+	if req.ReplayedByPrincipalID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "replayed_by_principal_id"})
+		return
+	}
+
+	decision, err := h.store.FindByID(r.Context(), tenantID, decisionID)
+	if err != nil {
+		if errors.Is(err, domain.ErrDecisionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "decision_not_found", "decision_id": decisionID})
+			return
+		}
+		h.log.Error("ReplayDecision: fetch decision failed", zap.String("decision_id", decisionID), zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	if decision.ActionType != "APPROVAL_THRESHOLD" {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error":       "replay_not_implemented",
+			"action_type": decision.ActionType,
+		})
+		return
+	}
+
+	_, policyVersionID, ok := policyclient.ParseRuleBasis(decision.RuleBasis)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":      "unparseable_rule_basis",
+			"rule_basis": decision.RuleBasis,
+		})
+		return
+	}
+
+	version, err := h.policyClient.GetPolicyVersion(r.Context(), policyVersionID)
+	if err != nil {
+		if errors.Is(err, policyclient.ErrPolicyVersionNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{
+				"error":             "policy_version_not_found",
+				"policy_version_id": policyVersionID,
+			})
+			return
+		}
+		h.log.Error("ReplayDecision: policy-svc unavailable", zap.String("decision_id", decisionID), zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "policy_service_unavailable"})
+		return
+	}
+
+	replayedOutcome, err := replayApprovalThreshold(version.RulePayload, decision.EvaluationContext)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_replay_input", "message": err.Error()})
+		return
+	}
+
+	manifest := &domain.ReplayManifest{
+		ReplayManifestID:      uuid.NewString(),
+		DecisionID:            decisionID,
+		PolicyVersionID:       policyVersionID,
+		ReplayedOutcome:       replayedOutcome,
+		OriginalOutcome:       decision.Outcome,
+		OutcomesMatch:         replayedOutcome == decision.Outcome,
+		ReplayedAt:            time.Now().UTC(),
+		ReplayedByPrincipalID: req.ReplayedByPrincipalID,
+	}
+	if err := h.store.CreateReplayManifest(r.Context(), manifest); err != nil {
+		h.log.Error("ReplayDecision: failed to record manifest", zap.String("decision_id", decisionID), zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	h.log.Info("decision replayed",
+		zap.String("decision_id", decisionID),
+		zap.String("policy_version_id", policyVersionID),
+		zap.Bool("outcomes_match", manifest.OutcomesMatch),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusCreated, manifest)
+}
+
+// replayApprovalThreshold mirrors policy-svc's evaluateApprovalThreshold
+// comparison exactly, including its canonicalOutcome mapping
+// (WITHIN_THRESHOLD -> GRANTED, APPROVAL_REQUIRED -> ESCALATED) — a
+// replay must reproduce the SAME canonical vocabulary the original
+// decision was recorded with, or "outcomes_match" would compare
+// incompatible representations.
+func replayApprovalThreshold(rulePayload, evaluationContext json.RawMessage) (string, error) {
+	var rule struct {
+		ThresholdAmount *float64 `json:"threshold_amount"`
+	}
+	if err := json.Unmarshal(rulePayload, &rule); err != nil || rule.ThresholdAmount == nil {
+		return "", errors.New("policy version has invalid/missing threshold_amount")
+	}
+
+	var action struct {
+		Amount *float64 `json:"amount"`
+	}
+	if err := json.Unmarshal(evaluationContext, &action); err != nil || action.Amount == nil {
+		return "", errors.New("decision's evaluation_context is missing amount")
+	}
+
+	if *action.Amount > *rule.ThresholdAmount {
+		return "ESCALATED", nil
+	}
+	return "GRANTED", nil
+}
+
+// ListReplayManifests handles GET /v1/decisions/{decision_id}/replay-manifests
+// — the full replay history for one decision, newest first.
+func (h *Handler) ListReplayManifests(w http.ResponseWriter, r *http.Request) {
+	decisionID := chi.URLParam(r, "decision_id")
+	results, err := h.store.ListReplayManifestsByDecision(r.Context(), decisionID)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if results == nil {
+		results = []*domain.ReplayManifest{}
+	}
+	writeJSON(w, http.StatusOK, results)
 }
 
 // ListDecisions handles GET /v1/decisions.

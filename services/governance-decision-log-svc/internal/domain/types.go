@@ -69,3 +69,29 @@ type GovernanceDecision struct {
 	// caller omits it, the handler defaults it to server-receipt time.
 	DecidedAt time.Time `json:"decided_at"`
 }
+
+// ErrReplayNotSupportedForActionType is returned when a decision's
+// action_type has no replay logic implemented — same v1 scope limitation
+// as policy-svc's own Evaluate endpoint (APPROVAL_THRESHOLD only), stated
+// explicitly rather than silently claiming a replay that didn't happen.
+var ErrReplayNotSupportedForActionType = errors.New("replay not implemented for this decision's action_type")
+
+// ErrReplayManifestNotFound is returned when a lookup finds no matching
+// replay manifest.
+var ErrReplayManifestNotFound = errors.New("replay manifest not found")
+
+// ReplayManifest is doc7's replay-reproducibility record (backlog item
+// 34): a permanent statement that decision DecisionID was re-evaluated
+// against the EXACT PolicyVersionID it originally used, and whether that
+// replay reproduced the OriginalOutcome. Append-only — never updated.
+type ReplayManifest struct {
+	ReplayManifestID      string    `json:"replay_manifest_id"`
+	DecisionID            string    `json:"decision_id"`
+	PolicyVersionID       string    `json:"policy_version_id"`
+	ReplayedOutcome       string    `json:"replayed_outcome"`
+	OriginalOutcome       string    `json:"original_outcome"`
+	OutcomesMatch         bool      `json:"outcomes_match"`
+	ReplayNotes           *string   `json:"replay_notes,omitempty"`
+	ReplayedAt            time.Time `json:"replayed_at"`
+	ReplayedByPrincipalID string    `json:"replayed_by_principal_id"`
+}

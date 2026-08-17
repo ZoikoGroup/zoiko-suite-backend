@@ -68,6 +68,16 @@ func (p *Publisher) PublishEntityCreated(ctx context.Context, entity *domain.Leg
 	})
 }
 
+func (p *Publisher) PublishWorkspaceCreated(ctx context.Context, workspace *domain.Workspace, correlationID string) {
+	p.emit("workspace.created", correlationID, workspace.WorkspaceID, map[string]any{
+		"tenant_id":               workspace.TenantID,
+		"workspace_id":            workspace.WorkspaceID,
+		"legal_entity_id":         workspace.LegalEntityID,
+		"billing_classification":  workspace.BillingClassification,
+		"billing_source":          workspace.BillingSource,
+	})
+}
+
 func (p *Publisher) PublishEntityUpdated(ctx context.Context, entity *domain.LegalEntity, correlationID string) {
 	p.emit("entity.updated", correlationID, entity.LegalEntityID, map[string]any{
 		"tenant_id":       entity.TenantID,

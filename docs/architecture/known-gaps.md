@@ -526,3 +526,25 @@ tenant-entity-registry-svc is the fix, and it is a new outbound dependency
 rather than a one-line check. Worth checking whether the other entity-scoped
 services have the same hole -- the pattern of "authorize on the entity, scope
 rows by the tenant, never reconcile the two" is not specific to this service.
+
+## Open: applicability_decisions has no tenant dimension
+Noticed while merging origin/main, which added the table and its store
+independently of the tenant-scoping pass above. Not introduced by that merge and
+not changed by it -- redesigning another branch's table is not a merge's job.
+
+applicability_decisions carries no tenant_id, so it is not covered by the
+row-level security that migration 000003 installs on obligations and
+filing_requirements, and internal/store/applicability_store.go names no tenant in
+any of its three statements. The table is reachable only through an
+obligation_id, which IS tenant-scoped -- but the applicability queries do not
+join back to obligations, so an obligation_id belonging to another tenant
+returns that tenant's applicability decisions, including the facts_used payload
+and who decided.
+
+Note the store never touches the obligations table itself, so FORCE ROW LEVEL
+SECURITY does not break it: the foreign-key check runs as the table owner with
+row security off. The feature works; it is the isolation that is missing.
+
+The fix mirrors the obligations pass: add tenant_id, backfill from the parent
+obligation, FORCE RLS with a WITH CHECK policy, and route the queries through
+withTenantTx.

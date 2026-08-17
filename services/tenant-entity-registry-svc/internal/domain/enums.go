@@ -61,6 +61,56 @@ var ValidEntityStatusTransitions = map[EntityStatus][]EntityStatus{
 	EntityStatusDissolved: {}, // terminal state
 }
 
+// WorkspaceStatus is the operational state of a workspace.
+type WorkspaceStatus string
+
+const (
+	WorkspaceStatusActive   WorkspaceStatus = "ACTIVE"
+	WorkspaceStatusArchived WorkspaceStatus = "ARCHIVED"
+)
+
+// BillingClassification is mandatory on every workspace per doc7 §T — it
+// determines whether the workspace may ever generate a live Zoiko charge.
+// Non-commercial classes (INTERNAL, DEMO, SANDBOX, QA_AUTOMATION,
+// PILOT_NON_BILLABLE) must never create live charges regardless of
+// entitlement state.
+type BillingClassification string
+
+const (
+	BillingClassificationCommercialStandalone BillingClassification = "COMMERCIAL_STANDALONE"
+	BillingClassificationCommercialZoikoOne   BillingClassification = "COMMERCIAL_ZOIKO_ONE"
+	BillingClassificationLegacyMigration      BillingClassification = "LEGACY_MIGRATION"
+	BillingClassificationPilotNonBillable     BillingClassification = "PILOT_NON_BILLABLE"
+	BillingClassificationInternal             BillingClassification = "INTERNAL"
+	BillingClassificationDemo                 BillingClassification = "DEMO"
+	BillingClassificationSandbox              BillingClassification = "SANDBOX"
+	BillingClassificationQAAutomation         BillingClassification = "QA_AUTOMATION"
+)
+
+// ValidBillingClassifications is used to fail closed on an unrecognized
+// classification value rather than silently defaulting one in.
+var ValidBillingClassifications = map[BillingClassification]bool{
+	BillingClassificationCommercialStandalone: true,
+	BillingClassificationCommercialZoikoOne:   true,
+	BillingClassificationLegacyMigration:      true,
+	BillingClassificationPilotNonBillable:     true,
+	BillingClassificationInternal:             true,
+	BillingClassificationDemo:                 true,
+	BillingClassificationSandbox:              true,
+	BillingClassificationQAAutomation:         true,
+}
+
+// BillingSource records where the billing_classification's commercial
+// authority comes from, per doc7 §P2 (e.g. a Zoiko One bundle vs. a direct
+// standalone contract). NONE is the default for non-billable classes.
+type BillingSource string
+
+const (
+	BillingSourceNone           BillingSource = "NONE"
+	BillingSourceDirect         BillingSource = "DIRECT"
+	BillingSourceZoikoOneBundle BillingSource = "ZOIKO_ONE_BUNDLE"
+)
+
 // HierarchyRelationshipType classifies the nature of a parent-child entity relationship.
 type HierarchyRelationshipType string
 

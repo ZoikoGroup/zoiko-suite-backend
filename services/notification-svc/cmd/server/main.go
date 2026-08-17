@@ -120,6 +120,8 @@ func main() {
 	}
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+	// The decision cache main.go grew for this client now lives in the authz
+	// package alongside the client itself, so it is covered by client_test.go.
 	authzClient := authz.NewClient(cfg.AuthZServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

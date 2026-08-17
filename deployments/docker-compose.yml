@@ -20,6 +20,13 @@ services:
       - ../services/audit-event-store-svc/deployments/migrations:/migrations/audit-event-store:ro
       - ../services/identity-context-svc/deployments/migrations:/migrations/identity-context:ro
       - ../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
+      - ../services/commercial-account-svc/deployments/migrations:/migrations/commercial-account:ro
+      - ../services/capability-registry-svc/deployments/migrations:/migrations/capability-registry:ro
+      - ../services/ai-governance-svc/deployments/migrations:/migrations/ai-governance:ro
+      - ../services/kill-switch-registry-svc/deployments/migrations:/migrations/kill-switch-registry:ro
+      - ../services/retention-registry-svc/deployments/migrations:/migrations/retention-registry:ro
+      - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
+      - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
       - ../services/governance-decision-log-svc/deployments/migrations:/migrations/governance-decision-log:ro
       - ../services/policy-svc/deployments/migrations:/migrations/policy:ro
@@ -646,6 +653,10 @@ services:
       # as legal_entity_id — authorization-svc rejects an empty one.
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # Used only by POST /v1/decisions/{id}/replay to fetch the EXACT
+      # policy version a past decision used (doc7 backlog item 34) — never
+      # for authorization.
+      POLICY_SERVICE_URL: "http://policy-svc:8085"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "governance-decision-log-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.governance.events"
@@ -2820,6 +2831,252 @@ services:
       authorization-svc:
         condition: service_healthy
       tax-rules-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── commercial-account-svc (Port: 8144) ───────────────────────────────────────
+  # Plane 1 — Zoiko Commercial Account (doc7 §3). Owns commercial_accounts and
+  # memberships; deliberately separate from tenant-entity-registry-svc's
+  # Plane 2 tenant/workspace/legal_entity data.
+  commercial-account-svc:
+    build:
+      context: ../services/commercial-account-svc
+      dockerfile: Dockerfile
+    container_name: commercial-account-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8144:8144"
+    environment:
+      PORT: "8144"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/commercial_account?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── capability-registry-svc (Port: 8145) ──────────────────────────────────────
+  # Plane 1 — Capability, Module & Release Registry (doc7 §7). Owns
+  # capability existence, market release, integration readiness, operational
+  # release state, and public claim eligibility as five deliberately
+  # separate objects — never compressed into one feature flag.
+  capability-registry-svc:
+    build:
+      context: ../services/capability-registry-svc
+      dockerfile: Dockerfile
+    container_name: capability-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8145:8145"
+    environment:
+      PORT: "8145"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/capability_registry?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── ai-governance-svc (Port: 8146) ──────────────────────────────────────
+  # Plane 5 — AI, Agentic Automation & Human Authority (doc7 §11). Record-
+  # keeping and gate-checking for AI runs, action-risk classification,
+  # automation allowlists, provider/model registry, and maker-checker
+  # self-approval blocking — never runs models or executes automations
+  # itself.
+  ai-governance-svc:
+    build:
+      context: ../services/ai-governance-svc
+      dockerfile: Dockerfile
+    container_name: ai-governance-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8146:8146"
+    environment:
+      PORT: "8146"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/ai_governance?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── kill-switch-registry-svc (Port: 8147) ───────────────────────────────
+  # Cross-cutting incident-response control (doc7 §32.1). Append-only
+  # ENGAGE/DISENGAGE log scoped across plane/domain/provider/tenant
+  # independently; resolve returns the most specific currently-engaged
+  # switch for a given check. Distinct from capability-registry-svc's
+  # Release/ReleaseState, which is capability_id-scoped product-
+  # availability state, not an incident-response stop.
+  kill-switch-registry-svc:
+    build:
+      context: ../services/kill-switch-registry-svc
+      dockerfile: Dockerfile
+    container_name: kill-switch-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8147:8147"
+    environment:
+      PORT: "8147"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/kill_switch_registry?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.kill-switch-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── retention-registry-svc (Port: 8148) ─────────────────────────────────
+  # doc7 §J1-J3 backlog item 33: versioned retention_policies + append-only
+  # legal_holds. Never deletes anything itself — answers "is it safe to
+  # delete/export/migrate this right now" for every other service that
+  # owns deletable data.
+  retention-registry-svc:
+    build:
+      context: ../services/retention-registry-svc
+      dockerfile: Dockerfile
+    container_name: retention-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8148:8148"
+    environment:
+      PORT: "8148"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/retention_registry?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.retention-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── metric-registry-svc (Port: 8149) ────────────────────────────────────
+  # doc7 §27 REP-01 / backlog item 35: versioned report_metric_definitions
+  # — defines what an executive metric IS and MEANS; never computes or
+  # stores metric values itself.
+  metric-registry-svc:
+    build:
+      context: ../services/metric-registry-svc
+      dockerfile: Dockerfile
+    container_name: metric-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8149:8149"
+    environment:
+      PORT: "8149"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/metric_registry?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.metric-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── source-authority-svc (Port: 8150) ───────────────────────────────────
+  # doc7 §D1-D3, §K1 / backlog item 36: source_authority_maps (versioned
+  # precedence per field family) + append-only normalized_facts. Resolve
+  # returns the highest-precedence current fact, or Ambiguous=true if two
+  # equally-ranked sources disagree — never guesses (§D2).
+  source-authority-svc:
+    build:
+      context: ../services/source-authority-svc
+      dockerfile: Dockerfile
+    container_name: source-authority-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8150:8150"
+    environment:
+      PORT: "8150"
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/source_authority?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.source-authority.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

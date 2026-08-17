@@ -50,6 +50,13 @@ func TestMain(m *testing.M) {
 	dbPort := uint32(15701 + uint32(os.Getpid()%499))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
+			// Version pinned explicitly — see the doc comment on
+			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+			// main_integration_test.go for why: the unpinned default floats
+			// to whatever major the library calls "latest," and that patch
+			// build can stop resolving from the remote binary repo with no
+			// code change on our side (this is what broke PR #105's CI).
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("ter_isolation_test").
 			Username("postgres").
@@ -94,6 +101,7 @@ func TestMain(m *testing.M) {
 		"000002_add_tenant_id_to_junction_tables.up.sql",
 		"000003_add_residency_region_to_policies.up.sql",
 		"000004_add_data_classification.up.sql",
+		"000005_add_workspaces.up.sql",
 	}
 	for _, mig := range migrations {
 		sql, err := os.ReadFile("../../deployments/migrations/" + mig)

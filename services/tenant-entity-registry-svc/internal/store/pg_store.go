@@ -345,6 +345,87 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 	return results, err
 }
 
+func (s *PgStore) CreateWorkspace(ctx context.Context, w *domain.Workspace) error {
+	s.log.Debug("store.CreateWorkspace", zap.String("workspace_id", w.WorkspaceID))
+	tid := tenantFromCtxOrFallback(ctx, w.TenantID)
+
+	return s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		query := `
+			INSERT INTO workspaces (
+				workspace_id, tenant_id, legal_entity_id, name, business_unit,
+				billing_classification, billing_source, commercial_account_id, status,
+				created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		`
+		now := time.Now().UTC()
+		_, err := tx.Exec(ctx, query,
+			w.WorkspaceID, w.TenantID, w.LegalEntityID, w.Name, w.BusinessUnit,
+			string(w.BillingClassification), string(w.BillingSource), w.CommercialAccountID, string(w.Status),
+			w.CreatedAt, now, w.CreatedByPrincipalID, w.CreatedByPrincipalID,
+		)
+		return err
+	})
+}
+
+func (s *PgStore) GetWorkspaceByID(ctx context.Context, workspaceID string) (*domain.Workspace, error) {
+	s.log.Debug("store.GetWorkspaceByID", zap.String("workspace_id", workspaceID))
+	// See GetEntityByID's comment: no reliance on RLS alone, explicit filter.
+	tid := domain.TenantFromContext(ctx)
+
+	var w domain.Workspace
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		query := `
+			SELECT workspace_id, tenant_id, legal_entity_id, name, business_unit,
+			       billing_classification, billing_source, commercial_account_id, status,
+			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			FROM workspaces WHERE workspace_id = $1 AND tenant_id = $2
+		`
+		return tx.QueryRow(ctx, query, workspaceID, tid).Scan(
+			&w.WorkspaceID, &w.TenantID, &w.LegalEntityID, &w.Name, &w.BusinessUnit,
+			&w.BillingClassification, &w.BillingSource, &w.CommercialAccountID, &w.Status,
+			&w.CreatedAt, &w.UpdatedAt, &w.CreatedByPrincipalID, &w.UpdatedByPrincipalID,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return &w, err
+}
+
+func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string) ([]*domain.Workspace, error) {
+	s.log.Debug("store.ListWorkspacesByTenant", zap.String("tenant_id", tenantID))
+	tid := tenantFromCtxOrFallback(ctx, tenantID)
+
+	var results []*domain.Workspace
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		query := `
+			SELECT workspace_id, tenant_id, legal_entity_id, name, business_unit,
+			       billing_classification, billing_source, commercial_account_id, status,
+			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
+			FROM workspaces WHERE tenant_id = $1
+		`
+		rows, err := tx.Query(ctx, query, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var w domain.Workspace
+			if err := rows.Scan(
+				&w.WorkspaceID, &w.TenantID, &w.LegalEntityID, &w.Name, &w.BusinessUnit,
+				&w.BillingClassification, &w.BillingSource, &w.CommercialAccountID, &w.Status,
+				&w.CreatedAt, &w.UpdatedAt, &w.CreatedByPrincipalID, &w.UpdatedByPrincipalID,
+			); err != nil {
+				return err
+			}
+			results = append(results, &w)
+		}
+		return rows.Err()
+	})
+	return results, err
+}
+
 // UpdateEntity applies a partial update to mutable non-governance fields
 // (legal_name, trading_name, default_currency_code). Returns the updated entity.
 // F5: full implementation — no longer a stub.
