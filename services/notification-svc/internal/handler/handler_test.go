@@ -20,8 +20,9 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	byID   map[string]*domain.Notification
-	byCorr map[string]string // correlation_id -> notification_id
+	byID       map[string]*domain.Notification
+	byCorr     map[string]string // correlation_id -> notification_id
+	lastFilter domain.ListFilter
 }
 
 func newStubStore() *stubStore {
@@ -49,16 +50,17 @@ func (s *stubStore) GetNotification(_ context.Context, id string) (*domain.Notif
 	return n, nil
 }
 
-func (s *stubStore) ListNotifications(_ context.Context, legalEntityID, recipientPrincipalID, status string) ([]domain.Notification, error) {
+func (s *stubStore) ListNotifications(_ context.Context, f domain.ListFilter) ([]domain.Notification, error) {
+	s.lastFilter = f
 	var out []domain.Notification
 	for _, n := range s.byID {
-		if legalEntityID != "" && n.LegalEntityID != legalEntityID {
+		if f.LegalEntityID != "" && n.LegalEntityID != f.LegalEntityID {
 			continue
 		}
-		if recipientPrincipalID != "" && n.RecipientPrincipalID != recipientPrincipalID {
+		if f.RecipientPrincipalID != "" && n.RecipientPrincipalID != f.RecipientPrincipalID {
 			continue
 		}
-		if status != "" && n.Status != status {
+		if f.Status != "" && n.Status != f.Status {
 			continue
 		}
 		out = append(out, *n)
@@ -86,21 +88,45 @@ func (p *stubPublisher) PublishFailed(_ context.Context, _ string, _ domain.Noti
 	p.failed++
 }
 
-type stubAuthZ struct{ err error }
+type stubAuthZ struct {
+	err   error
+	calls []string // actionType per call, in order
+}
 
-func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
+func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, actionType string) error {
+	a.calls = append(a.calls, actionType)
+	return a.err
+}
+
+// stubDeliverer drives the delivery outcome from the test rather than from the
+// channel name, so the FAILED path is exercised by a provider that genuinely
+// refuses — which is what a real adapter failing looks like.
+type stubDeliverer struct {
+	delivered bool
+	reason    string
+}
+
+func (d stubDeliverer) Deliver(_ context.Context, _ domain.Notification) (bool, string) {
+	return d.delivered, d.reason
+}
 
 // ── router factory ─────────────────────────────────────────────────────────────
 
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
+	return newRouterWith(s, pub, authz, stubDeliverer{delivered: true, reason: "delivered via stub"}, "tenant-abc")
+}
+
+func newRouterWith(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handler.Deliverer, tenantID string) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			req = req.WithContext(middleware.WithTenant(req.Context(), "tenant-abc"))
+			if tenantID != "" {
+				req = req.WithContext(middleware.WithTenant(req.Context(), tenantID))
+			}
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop())
+	h := handler.New(s, pub, authz, del, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -181,23 +207,50 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 	}
 }
 
-func TestSendNotification_UnsupportedChannel_Failed(t *testing.T) {
+// An unrecognised channel is a caller mistake caught at the boundary. It used
+// to reach the delivery adapter, which reported it as a delivery failure — so
+// a typo produced a stored FAILED record and a notification.failed event,
+// evidence of an attempt no provider ever saw.
+func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelivery(t *testing.T) {
 	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	store := newStubStore()
+	r := newRouter(store, pub, &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
 		"legal_entity_id":        "le-us",
 		"channel":                "CARRIER_PIGEON",
 		"subject":                "Test",
+		"correlation_id":         "corr-bad-channel",
+	}, "principal-1")
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(store.byID) != 0 {
+		t.Errorf("a rejected channel must not leave a notification record, found %d", len(store.byID))
+	}
+	if pub.failed != 0 {
+		t.Errorf("a rejected channel must not publish notification.failed, got %d", pub.failed)
+	}
+}
+
+// A genuine delivery failure still answers 201: the service's own critical
+// constraint (03-microservices.md §9.7) is that a notification failure must
+// not collapse the workflow that raised it.
+func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouterWith(newStubStore(), pub, &stubAuthZ{},
+		stubDeliverer{delivered: false, reason: "provider rejected the recipient address"}, "tenant-abc")
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
+		"recipient_principal_id": "principal-2",
+		"legal_entity_id":        "le-us",
+		"channel":                "EMAIL",
+		"subject":                "Test",
 		"correlation_id":         "corr-failed",
 	}, "principal-1")
 
-	// Delivery failure must not surface as an error status — the request
-	// itself succeeded (a notification record was created and processed),
-	// only the delivery outcome was FAILED. This is the service's own
-	// critical constraint: notification failure must not collapse the
-	// caller's own operation.
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 (delivery failure is not a request failure) got %d: %s", rr.Code, rr.Body.String())
 	}
@@ -264,5 +317,112 @@ func TestListNotifications_EmptyIsEmptyArrayNotNull(t *testing.T) {
 	}
 	if rr.Body.String() != "[]\n" {
 		t.Errorf("expected empty JSON array, got %q", rr.Body.String())
+	}
+}
+
+// ── the gaps closed in this pass ──────────────────────────────────────────────
+
+// The authorization used to be conditional on the filter, so omitting
+// legal_entity_id — the easier request — returned the whole tenant's
+// notifications to a principal holding no grant at all.
+func TestListNotifications_WithoutLegalEntity_IsScopedToCallersOwnInbox(t *testing.T) {
+	store := newStubStore()
+	authz := &stubAuthZ{}
+	r := newRouter(store, &stubPublisher{}, authz)
+
+	rr := doReq(r, http.MethodGet, "/v1/notifications/", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if store.lastFilter.RecipientPrincipalID != "principal-1" {
+		t.Errorf("an unscoped list must be forced to the caller's own inbox, got recipient filter %q",
+			store.lastFilter.RecipientPrincipalID)
+	}
+}
+
+func TestListNotifications_OtherRecipientWithoutLegalEntity_IsRefused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/notifications/?recipient_principal_id=someone-else", nil, "principal-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 reading another principal's inbox unscoped, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListNotifications_WithLegalEntity_IsAuthorized(t *testing.T) {
+	authz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	r := newRouter(newStubStore(), &stubPublisher{}, authz)
+	rr := doReq(r, http.MethodGet, "/v1/notifications/?legal_entity_id=le-us", nil, "principal-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d", rr.Code)
+	}
+	if len(authz.calls) != 1 || authz.calls[0] != "NOTIFICATION_VIEW" {
+		t.Errorf("expected one NOTIFICATION_VIEW check, got %v", authz.calls)
+	}
+}
+
+// A missing tenant scope used to be noticed first by the store, which reported
+// it as 503 store_unavailable — an outage status for a forgotten header.
+func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
+	r := newRouterWith(newStubStore(), &stubPublisher{}, &stubAuthZ{},
+		stubDeliverer{delivered: true}, "")
+
+	for _, tc := range []struct{ name, method, path string }{
+		{"list", http.MethodGet, "/v1/notifications/"},
+		{"get", http.MethodGet, "/v1/notifications/some-id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := doReq(r, tc.method, tc.path, nil, "principal-1")
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 got %d: %s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
+		"recipient_principal_id": "principal-2",
+		"legal_entity_id":        "le-us",
+		"channel":                "EMAIL",
+		"subject":                "Test",
+		"correlation_id":         "corr-no-tenant",
+	}, "principal-1")
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("send: expected 401 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// A misspelled field used to be discarded silently, so the caller got a 201
+// for a notification that did not say what they wrote.
+func TestSendNotification_UnknownField_IsRejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
+		"recipient_principal_id": "principal-2",
+		"legal_entity_id":        "le-us",
+		"channel":                "EMAIL",
+		"subjekt":                "typo",
+		"subject":                "Real subject",
+		"correlation_id":         "corr-unknown-field",
+	}, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown field, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListNotifications_PagingIsValidated(t *testing.T) {
+	store := newStubStore()
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+
+	for _, q := range []string{"?limit=abc", "?limit=0", "?limit=100000", "?offset=-1"} {
+		rr := doReq(r, http.MethodGet, "/v1/notifications/"+q, nil, "principal-1")
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("%s: expected 400 got %d", q, rr.Code)
+		}
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/notifications/", nil, "principal-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rr.Code)
+	}
+	if store.lastFilter.Limit != 100 {
+		t.Errorf("expected a bounded default limit of 100, got %d", store.lastFilter.Limit)
 	}
 }

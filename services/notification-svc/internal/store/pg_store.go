@@ -7,10 +7,29 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/notification-svc/internal/domain"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
+
+// mapPgError translates the Postgres failures that are really caller mistakes
+// into domain errors, so they stop arriving at the handler as "the store is
+// unavailable".
+//
+// notification_id is a uuid column, so a mistyped id compared against it dies
+// inside the driver as SQLSTATE 22P02 before any row is examined, and used to
+// reach the caller as 503 store_unavailable — an outage status for a typo in a
+// URL. An id that cannot be a UUID names no notification, which is exactly
+// what "not found" means. Same fix, same reasoning, as financial-close-svc,
+// general-ledger-svc and accounts-payable-svc.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return domain.ErrNotificationNotFound
+	}
+	return err
+}
 
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -116,16 +135,17 @@ func (s *PgStore) GetNotification(ctx context.Context, id string) (*domain.Notif
 		return nil, domain.ErrNotificationNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, mapPgError(err)
 	}
 	return &n, nil
 }
 
-func (s *PgStore) ListNotifications(ctx context.Context, legalEntityID, recipientPrincipalID, status string) ([]domain.Notification, error) {
+func (s *PgStore) ListNotifications(ctx context.Context, f domain.ListFilter) ([]domain.Notification, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
 	}
+	legalEntityID, recipientPrincipalID, status := f.LegalEntityID, f.RecipientPrincipalID, f.Status
 
 	var out []domain.Notification
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -150,7 +170,15 @@ func (s *PgStore) ListNotifications(ctx context.Context, legalEntityID, recipien
 			args = append(args, status)
 			query += fmt.Sprintf(" AND status = $%d", len(args))
 		}
-		query += " ORDER BY created_at DESC"
+		// created_at alone is not a total order — two notifications recorded in
+		// the same transaction share a timestamp, and Postgres is free to
+		// return them in either order, so a paged read could show one row twice
+		// and skip another. notification_id breaks the tie.
+		query += " ORDER BY created_at DESC, notification_id DESC"
+		args = append(args, f.Limit)
+		query += fmt.Sprintf(" LIMIT $%d", len(args))
+		args = append(args, f.Offset)
+		query += fmt.Sprintf(" OFFSET $%d", len(args))
 
 		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {

@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -21,8 +19,8 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/notification-svc/internal/authz"
 	"zoiko.io/notification-svc/internal/config"
-	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
@@ -30,51 +28,6 @@ import (
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
-
-type httpAuthzClient struct {
-	baseURL string
-	client  *http.Client
-	log     *zap.Logger
-}
-
-// authorization-svc's /v1/authorize always responds 200, and signals the
-// actual decision via decision_outcome: "GRANTED" | "DENIED" — there is no
-// "allowed" boolean field in its response.
-func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	reqBody, _ := json.Marshal(map[string]string{
-		"principal_id":    principalID,
-		"legal_entity_id": legalEntityID,
-		"action_type":     actionType,
-	})
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/authorize", bytes.NewReader(reqBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		a.log.Error("failed to call authorization-svc", zap.Error(err))
-		return domain.ErrAuthzServiceUnavailable
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return domain.ErrAuthzServiceUnavailable
-	}
-
-	var res struct {
-		DecisionOutcome string `json:"decision_outcome"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return err
-	}
-	if res.DecisionOutcome != "GRANTED" {
-		return domain.ErrAuthorizationDenied
-	}
-	return nil
-}
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -141,20 +94,33 @@ func main() {
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
 
-	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
-		// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
-		// Writer refuses to produce to a not-yet-existing topic unless this
-		// is also set client-side — without it, every first publish to this
-		// service's own topic fails with "Unknown Topic Or Partition".
-		AllowAutoTopicCreation: true,
+	// A deployment says "no broker" with an explicitly empty KAFKA_BROKERS;
+	// the publisher then logs instead of writing, rather than blocking every
+	// send on a dial to a broker that does not exist.
+	var kafkaWriter *kafka.Writer
+	if len(cfg.Kafka.Brokers) > 0 {
+		kafkaWriter = &kafka.Writer{
+			Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:    cfg.Kafka.Topic,
+			Balancer: &kafka.LeastBytes{},
+			// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
+			// Writer refuses to produce to a not-yet-existing topic unless this
+			// is also set client-side — without it, every first publish to this
+			// service's own topic fails with "Unknown Topic Or Partition".
+			AllowAutoTopicCreation: true,
+			// kafka-go's default is 1s: a synchronous WriteMessages waits out
+			// the full batch timeout before returning, so every notification
+			// send paid a wasted second inside the request. Platform-wide
+			// value, same as the other gap-closed services.
+			BatchTimeout: 10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+	} else {
+		log.Warn("KAFKA_BROKERS is empty — events will be logged, not published")
 	}
-	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log}
+	authzClient := authz.NewClient(cfg.AuthZServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -167,7 +133,7 @@ func main() {
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	h := handler.New(pgStore, publisher, authzClient, handler.StubDeliverer{Log: log}, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
