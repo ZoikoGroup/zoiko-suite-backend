@@ -1,5 +1,81 @@
 # Known Architecture & Test Coverage Gaps
 
+## Resolved (2026-08-17): no circuit breakers anywhere on the platform (03-microservices.md §17.7)
+
+7 services (10 packages: accounts-payable-svc, accounts-receivable-svc,
+bank-reconciliation-svc, financial-close-svc, general-ledger-svc,
+purchase-request-svc, treasury-svc) had retry-with-backoff
+(`retryTransport`) for their outbound HTTP calls, but retry and circuit
+breaking are different mechanisms — retry keeps trying a call that keeps
+failing; a breaker stops trying once it's clear the dependency is down.
+No service anywhere had the latter, and no other cross-service HTTP
+client on the platform had either.
+
+Added a closed/open/half-open state machine to the same `retryTransport`
+struct: 5 consecutive failures (any method) trips it open for 10s, during
+which every call fails fast without touching the network; the next call
+after the cooldown is let through as a probe, closing the breaker on
+success or reopening it on failure. Verified with new tests per package
+(breaker trips and short-circuits, a successful half-open probe recovers
+it) plus a full build/vet/test sweep.
+
+## Resolved (2026-08-17): no dead-letter routing anywhere (03-microservices.md §17.7)
+
+audit-event-store-svc and workflow-history-svc were the only two Kafka
+consumers that even acknowledged this in a TODO comment; neither, nor
+any other consumer, had it. Both left a failed message uncommitted
+forever, on the assumption that "the broker will re-deliver after a
+restart" — not actually true, since Kafka consumer group offsets are a
+single per-partition watermark: a *later* message succeeding and
+committing silently carries the offset past an earlier failed one,
+permanently dropping it. Until that happened, the failed message also
+head-of-line-blocked every other message on the partition.
+
+Both runners now retry a failed message a few times against the same
+handler call, and if it still fails, republish it unchanged to
+`<topic>.dlq` (original headers preserved, plus the failure reason,
+source offset, and timestamp) and only then commit past it. A failed DLQ
+publish falls back to the old uncommitted-and-retry behavior, so this
+never makes failure handling worse than before.
+
+## Resolved (2026-08-17): procurement-workflow-svc could strand a real purchase order behind a failed local write
+
+`IssueOrder` called purchase-order-svc, then recorded the resulting
+`purchase_order_id` locally; if that second, purely-local write failed,
+the case stayed APPROVED with no order_id even though the order now
+genuinely existed upstream. 03-microservices.md §17.8's saga-discipline
+mandate has no compensating-transaction mechanism anywhere on this
+platform to unwind that — and shouldn't gain one here, since
+purchase-order-svc keys the order on the case's own ID as an idempotency
+key, so a cancel-and-retry compensation would just race a legitimate
+retry.
+
+The local write is now retried up to 3 times with a short backoff before
+giving up — a transient blip right after a real external side effect is
+worth retrying locally rather than surfacing an error for something that
+already succeeded elsewhere. If every retry still fails, the system stays
+recoverable regardless: a caller retrying the same endpoint re-issues
+against the same idempotency key and gets another chance at the local
+write.
+
+## Resolved (2026-08-17): accounts-payable-svc's RequestPayment was non-duplicating but not idempotent
+
+03-microservices.md §3.7 requires every state-changing API to be
+idempotent. This endpoint had no client-supplied idempotency key (unlike
+invoice creation's `correlation_id`) and relied solely on the
+status-machine guard on `invoice_id`: a retry against an invoice already
+PAYMENT_REQUESTED correctly never published a duplicate event, but it
+also never succeeded — it returned 422, which is non-duplicating, not
+idempotent. A client retrying a timed-out-but-actually-successful call
+had no way to get back the success it already caused.
+
+Now recognizes the retry from the invoice's own state: requesting payment
+on an invoice already PAYMENT_REQUESTED returns 200 with the current
+invoice and does not publish again, whether it was already in that state
+before the call or a concurrent request won the same atomic transition
+first. Any other status is still a genuine invalid transition and still
+422s.
+
 ## Resolved (2026-08-17): every service connected to Postgres as the superuser, which unconditionally bypasses Row-Level Security
 
 This was the single most-cited gap against the original architecture spec
