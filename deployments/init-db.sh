@@ -108,14 +108,34 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "configuration_feat
 # Apply migrations for secret-vault-integration-svc
 echo "Applying migrations for secret_vault_integration..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integration" -f /migrations/secret-vault-integration/000001_initial_schema.up.sql
+# 000002 was never listed here. It adds secret_policies.data_classification,
+# which the store selects on every read -- so on a volume initialised from this
+# script alone the column did not exist and the service failed. It works on the
+# development machine only because the migration was applied by hand, the same
+# shape as schema-registry-svc's 000002 and bank-reconciliation-svc's 000003.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integration" -f /migrations/secret-vault-integration/000002_add_data_classification.up.sql
 
 # Apply migrations for obligations-svc
 echo "Applying migrations for obligations..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000001_initial_schema.up.sql
+# 000002 adds the tenant dimension this service shipped without — plus the
+# row-level security that depends on it, and the tenant-scoped dedup index that
+# stops one tenant's idempotent create from returning another tenant's
+# obligation. Not optional: the store selects and writes tenant_id on every
+# statement.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000002_tenant_scoping_and_invariants.up.sql
 
 # Apply migrations for schema-registry-svc
 echo "Applying migrations for schema_registry..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000001_initial_schema.up.sql
+# 000002 was never listed here. Every SELECT this service makes names
+# compatibility_mode and owning_service, so on a volume initialised from this
+# script alone the column did not exist and every read and write failed. It
+# works on the development machine only because the migration was applied by
+# hand at some point -- the same shape as the SCHEMA_PUBLISH grant that existed
+# only in one developer's database.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000002_add_compatibility_mode.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000003_registry_invariants.up.sql
 
 # Apply migrations for document-vault-svc
 echo "Applying migrations for document_vault..."
@@ -170,6 +190,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligen
 # Apply migrations for notification-svc
 echo "Applying migrations for notification..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "notification" -f /migrations/notification/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "notification" -f /migrations/notification/000002_force_rls_and_constraints.up.sql
 
 # Apply migrations for procurement-workflow-svc
 echo "Applying migrations for procurement_workflow..."
@@ -204,6 +225,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "financial_close" -
 echo "Applying migrations for bank_reconciliation..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliation" -f /migrations/bank-reconciliation/000001_initial_schema.up.sql
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliation" -f /migrations/bank-reconciliation/000002_add_idempotency_index.up.sql
+# 000003 was never listed here, and it is not cosmetic: gl_cash_account_code is
+# what lets a match verify DIRECTION. Without it, matching compares magnitudes,
+# so a statement line of -500.00 reconciles cleanly against a journal that moved
+# 500.00 the other way. On a fresh volume the column is absent entirely.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliation" -f /migrations/bank-reconciliation/000003_add_gl_cash_account_code.up.sql
 
 # Apply migrations for intercompany-accounting-svc
 echo "Applying migrations for intercompany_accounting..."
@@ -315,6 +341,7 @@ EOSQL
 # Apply migrations for board-resolutions-svc
 echo "Applying migrations for board_resolutions..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "board_resolutions" -f /migrations/board-resolutions/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "board_resolutions" -f /migrations/board-resolutions/000002_force_rls_and_constraints.up.sql
 
 # Create database for corporate-actions-svc
 echo "Creating database: corporate_actions..."

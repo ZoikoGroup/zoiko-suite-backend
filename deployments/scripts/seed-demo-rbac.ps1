@@ -224,10 +224,91 @@ $BUNDLES = @(
             "CONTRACT_CREATE", "CONTRACT_UPDATE", "CONTRACT_SUBMIT_FOR_APPROVAL",
             "CONTRACT_ACTIVATE", "CONTRACT_TERMINATE"
         )
+    },
+    @{
+        # schema-registry-svc gates every schema registration on SCHEMA_PUBLISH.
+        #
+        # This bundle was MISSING, and the console's "Register a version" form
+        # worked anyway on this machine only by accident: a hand-made bundle
+        # (SRB on role SR_1255) had been left in the dev database by some
+        # earlier ad-hoc seeding. On a fresh volume, in CI, or on anyone else's
+        # machine, nothing granted SCHEMA_PUBLISH and every registration was a
+        # 403 — the whole write path dead, with the page still rendering
+        # normally. A grant that exists only in one developer's database is
+        # indistinguishable from a working feature right up until someone else
+        # tries it.
+        #
+        # Event contracts are platform-wide reference data with no legal entity
+        # of their own, so the service authorizes against
+        # AUTHZ_PLATFORM_SCOPE_ID when a request carries no legal entity --
+        # the same synthetic scope jurisdiction-rules-svc uses. Both scopes are
+        # granted below for that reason.
+        Code    = "SCHEMA_FULL"
+        Service = "schema-registry-svc"
+        Actions = @("SCHEMA_PUBLISH")
+    },
+    @{
+        # jurisdiction-rules-svc gates all five of its admin routes. Like
+        # schema-registry-svc's, this bundle was missing entirely, so the whole
+        # write surface was 403 for every principal -- and unlike that one there
+        # was not even a stray hand-made grant making it appear to work. This
+        # was recorded as an open gap when the service was hardened on 5 Aug and
+        # is only now closed.
+        #
+        # Jurisdictions are platform-wide reference data: "GB" is not owned by a
+        # legal entity. The service authorizes every mutation against
+        # AUTHZ_PLATFORM_SCOPE_ID (it has no per-entity scope at all and
+        # requires that variable at startup), so these are verified on the
+        # platform scope below.
+        #
+        # The action strings are derived by the service as
+        # upper(resource + "_" + action) -- see internal/authz ActionType -- so
+        # they must match the resource/action pairs its handlers pass, not a
+        # naming convention invented here.
+        # obligations-svc gates its three mutations against the obligation's
+        # own LEGAL ENTITY -- the authority to raise or close a statutory
+        # obligation is entity-scoped, not platform-wide, so this bundle is
+        # verified on the legal entity rather than the platform scope.
+        #
+        # There was no bundle at all because there was no authorization at all:
+        # the service shipped with a documented deferral ("Authorization
+        # Service ... doesn't exist") that had gone stale, leaving an open
+        # write surface on a compliance register.
+        Code    = "OBLIGATION_FULL"
+        Service = "obligations-svc"
+        Actions = @("OBLIGATION_CREATE", "OBLIGATION_STATUS_UPDATE", "FILING_REQUIREMENT_CREATE")
+    },
+    @{
+        Code    = "JURISDICTION_FULL"
+        Service = "jurisdiction-rules-svc"
+        Actions = @(
+            "JURISDICTION_CREATE", "JURISDICTION_DEACTIVATE",
+            "JURISDICTION_RULE_CREATE", "JURISDICTION_RULE_TRANSITION",
+            "JURISDICTION_RULE_RECORD_DRIFT"
+        )
     }
 )
 
 $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
+
+# Actions whose services authorize against AUTHZ_PLATFORM_SCOPE_ID rather than
+# a legal entity: governance-decision-log, configuration-feature-flag,
+# secret-vault, the non-entity-scoped policy paths, and schema-registry (an
+# event contract belongs to the platform, not to a legal entity).
+#
+# Defined here rather than beside the final verification because the "is there
+# anything to do" probe below needs it too. That probe used to look only at the
+# legal entity, which is the very failure this script's header warns about one
+# level down: a platform-scoped action added later could already be granted on
+# the legal entity by some earlier seeding, the probe would find nothing
+# missing, and the run would skip the bundles entirely -- never granting the
+# platform scope. It then reported success and had granted nothing.
+$PLATFORM_SCOPED_ACTION_CODES = @(
+    "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL",
+    "SCHEMA_FULL", "JURISDICTION_FULL")
+$PLATFORM_SCOPED_ACTIONS = $BUNDLES |
+    Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
+    ForEach-Object { $_.Actions }
 
 if ($PSCmdlet.ParameterSetName -eq "Gateway") {
     $AUTHZ = "$($GatewayUrl.TrimEnd('/'))/authorization-svc"
@@ -279,18 +360,30 @@ try {
           "  Via gateway:   `$env:GATEWAY_PORT = '8000'; docker compose -f deployments/docker-compose.yml up -d gateway"
 }
 
-# Probe EVERY action, not just one. A partial grant is the normal state of an
+# Probe EVERY action on EVERY scope it is actually checked on, not just one
+# action and not just one scope. A partial grant is the normal state of an
 # existing volume once this script gains a service, and it is precisely the case
 # the old single-action early return got wrong.
+#
+# The scope half matters as much as the action half: SCHEMA_PUBLISH was already
+# granted on the legal entity by a hand-made bundle left in one developer's
+# database, so a legal-entity-only probe found nothing missing, skipped the
+# bundles, and never granted the platform scope that schema-registry-svc
+# actually authorizes against for an entity-less registration.
 $missing = @()
 foreach ($action in $ALL_ACTIONS) {
     if ((Get-Decision -Action $action -Scope $LEGAL_ENTITY).decision_outcome -ne "GRANTED") {
         $missing += $action
     }
 }
+foreach ($action in $PLATFORM_SCOPED_ACTIONS) {
+    if ((Get-Decision -Action $action -Scope $PLATFORM_SCOPE).decision_outcome -ne "GRANTED") {
+        $missing += "$action (platform scope)"
+    }
+}
 
 if ($missing.Count -eq 0) {
-    Write-Host "Already granted -- $PRINCIPAL_ID holds all $($ALL_ACTIONS.Count) actions on $LEGAL_ENTITY." -ForegroundColor Green
+    Write-Host "Already granted -- $PRINCIPAL_ID holds all $($ALL_ACTIONS.Count) actions on $LEGAL_ENTITY and the platform scope." -ForegroundColor Green
 } else {
     Write-Host "$($missing.Count) of $($ALL_ACTIONS.Count) actions missing: $($missing -join ', ')" -ForegroundColor Yellow
 
@@ -441,12 +534,8 @@ Write-Host "Verifying the platform-scoped actions:" -ForegroundColor Cyan
 # governance-decision-log, configuration-feature-flag, secret-vault and the
 # non-entity-scoped policy paths authorize against AUTHZ_PLATFORM_SCOPE_ID, so
 # these are probed on that scope, not on the legal entity.
-$PLATFORM_SCOPED_ACTIONS = @(
-    ($BUNDLES | Where-Object { $_.Code -eq "GOVERNANCE_FULL" }).Actions
-    ($BUNDLES | Where-Object { $_.Code -eq "CONFIG_FULL" }).Actions
-    ($BUNDLES | Where-Object { $_.Code -eq "VAULT_FULL" }).Actions
-    ($BUNDLES | Where-Object { $_.Code -eq "POLICY_FULL" }).Actions
-) | ForEach-Object { $_ }
+# $PLATFORM_SCOPED_ACTIONS is built near $ALL_ACTIONS, because the
+# "is there anything to do" probe at the top of the run needs it too.
 foreach ($action in $PLATFORM_SCOPED_ACTIONS) {
     $decision = Get-Decision -Action $action -Scope $PLATFORM_SCOPE
     $outcome  = $decision.decision_outcome
