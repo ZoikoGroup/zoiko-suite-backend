@@ -443,8 +443,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: identity_context
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       REDIS_HOST: redis
       REDIS_PORT: "6379"
@@ -522,8 +522,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: tenant_entity_registry
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "tenant-entity-registry-svc"
@@ -571,8 +571,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: jurisdiction_rules
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       # Points at the real Authorization Service. This used to point back at
       # jurisdiction-svc itself ("mock stub authz points back"), which was
@@ -643,8 +643,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: governance_decision_log
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # Authorization gate. These services previously had none at all, so
@@ -688,8 +688,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: audit_event_store
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "audit-event-store-svc"
@@ -723,8 +723,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: policy
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
       # Authorization gate. policy-svc had none: anyone able to reach the
@@ -769,8 +769,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: configuration_feature_flag
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # Authorization gate. These services previously had none at all, so
@@ -816,8 +816,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: secret_vault_integration
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       VAULT_MASTER_KEY_HEX: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       VAULT_LOCAL_STORE_PATH: "/tmp/secret_store.local"
@@ -861,8 +861,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: obligations
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
@@ -897,8 +897,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: authorization_svc
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "authorization-svc"
@@ -933,8 +933,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: workflow
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "workflow-svc"
@@ -971,8 +971,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: schema_registry
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
@@ -1025,8 +1025,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: document_vault
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       STORAGE_DIR: "/data/documents"
       # Throwaway local-dev key — never used in staging/production, same
@@ -1074,8 +1074,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: evidence_manifest
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.evidence.events"
@@ -1153,8 +1153,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: workflow_history
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "workflow-history-svc"
@@ -1195,8 +1195,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: general_ledger
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.general-ledger.events"
@@ -1238,8 +1238,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: accounts_payable
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.accounts-payable.events"
@@ -1273,8 +1273,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_request
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-request.events"
@@ -1316,8 +1316,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_order
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-order.events"
@@ -1358,8 +1358,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: spend_controls
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.spend-controls.events"
@@ -1400,8 +1400,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: vendor_due_diligence
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.vendor-due-diligence.events"
@@ -1445,8 +1445,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: notification
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.notification.events"
@@ -1487,8 +1487,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: procurement_workflow
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.procurement-workflow.events"
@@ -1533,8 +1533,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: performance_review
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.performance-review.events"
@@ -1577,8 +1577,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: delegated_authority
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.delegated-authority.events"
@@ -1619,8 +1619,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: access_control
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.access-control.events"
@@ -1663,8 +1663,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: decision_support
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.decision-support.events"
@@ -1739,8 +1739,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: evidence_requirements
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"
@@ -1777,8 +1777,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: accounts_receivable
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.accounts-receivable.events"
@@ -1815,8 +1815,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: treasury
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.treasury.events"
@@ -1862,8 +1862,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: financial_close
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.close.events"
@@ -1915,8 +1915,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: bank_reconciliation
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.bank-reconciliation.events"
@@ -1953,8 +1953,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: intercompany_accounting
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.intercompany.events"
@@ -1991,8 +1991,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: consolidation_svc
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.consolidation.events"
@@ -2032,8 +2032,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: invoice_approval
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.invoice-approval.events"
@@ -2073,8 +2073,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: employee_master
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.employee.events"
@@ -2108,8 +2108,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: employment_contracts
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
@@ -2146,8 +2146,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: payroll_run
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payroll.events"
@@ -2187,8 +2187,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: compensation
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.compensation.events"
@@ -2225,8 +2225,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: benefits
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.benefits.events"
@@ -2263,8 +2263,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: payroll_tax
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payrolltax.events"
@@ -2301,8 +2301,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: payroll_exceptions
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.payrollexceptions.events"
@@ -2339,8 +2339,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: leave_absence
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.leaveabsence.events"
@@ -2377,8 +2377,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: org_structure
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.orgstructure.events"
@@ -2415,8 +2415,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: offboarding_severance
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.offboarding.events"
@@ -2456,8 +2456,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: workforce_compliance
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.compliance.events"

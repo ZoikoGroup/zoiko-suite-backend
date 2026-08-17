@@ -1,5 +1,48 @@
 # Known Architecture & Test Coverage Gaps
 
+## Resolved (2026-08-17): every service connected to Postgres as the superuser, which unconditionally bypasses Row-Level Security
+
+This was the single most-cited gap against the original architecture spec
+(Doc 01 §11.2, "Row-level authorization enforced at the data access layer"
+as a stated minimum; §17.1 "least privilege" as a core security principle;
+§18.3 lists the tenant/entity model among "Non-Negotiable Foundations").
+55 services define real `CREATE POLICY` tenant-isolation policies — every
+one of them was running with that guarantee silently disabled, because a
+Postgres superuser bypasses RLS regardless of how correct the policy text
+is. This was previously "carried forward" as an accepted, unfixed risk in
+this file (see the tenant-entity-registry-svc entry below) on the basis
+that it was "a separate, estate-wide change" — it has now been made.
+
+Fix: migrations still run as the superuser (DDL/extensions need that), but
+every service now connects at runtime as a new, non-superuser,
+non-owner role, `zoiko_app` (`NOSUPERUSER NOCREATEDB NOCREATEROLE
+NOBYPASSRLS`). A non-owner, non-superuser role is automatically subject to
+`ENABLE ROW LEVEL SECURITY` policies with no further schema change needed
+— `FORCE ROW LEVEL SECURITY` was not required because `zoiko_app` was
+deliberately never made the table owner. Applied to `deployments/init-db.sh`
+and `init-db-phase5/6/7.sh` (so it's automatic for a fresh volume) and to
+`deployments/docker-compose*.yml` (`DB_USER`/`DB_PASSWORD` and the
+`DATABASE_URL`-style services), across all 63 databases in the main stack
+plus the phase5/6/7 stacks.
+
+Live-verified against a running instance, not just reviewed: with
+`app.tenant_id` set to tenant A, a query against `tenants` as the
+superuser returned **both** tenant A's and tenant B's rows (reproducing
+the exact bug); the identical query as `zoiko_app` returned **only**
+tenant A's row. Also verified `zoiko_app` retains full INSERT/UPDATE/DELETE
+for its own tenant's rows (a write scoped to the wrong `tenant_id` is
+correctly rejected by the policy's `WITH CHECK`, not merely its `USING`
+clause), and that `tenant-entity-registry-svc` and `general-ledger-svc`
+both boot and connect cleanly under the new credentials with no
+application-level changes required.
+
+Not in scope for this pass: the ~30 services with tenant-scoped tables
+but no `CREATE POLICY` defined at all still have no RLS to make load-
+bearing — they rely solely on the application-level `WHERE tenant_id = ...`
+filtering that was always the case. Adding real RLS policies to those is a
+separate, larger effort (each needs its own policy design, not just a
+credential change).
+
 ## Resolved: tenant-entity-registry-svc trusted an unsigned JWT for tenant isolation
 
 Three defects that compounded, all closed 2026-08-05 and verified against
@@ -39,13 +82,13 @@ fails closed; and tenant-scoped reads assert the path tenant equals the
 caller's verified tenant, returning 404 rather than 403 so a probe cannot
 confirm a tenant's existence.
 
-Carried forward: the superuser RLS bypass itself is unchanged and affects
-every service in the estate that connects as `postgres`. The explicit scope
-check makes this service safe regardless, which is the same belt-and-braces
-posture purchase-order-svc and general-ledger-svc adopted after real CI
-failures. Running the services as a non-superuser role with FORCE ROW LEVEL
-SECURITY would make the policies load-bearing again and is a separate,
-estate-wide change.
+Formerly carried forward, now resolved: the superuser RLS bypass itself
+affected every service in the estate that connected as `postgres`. See
+"Resolved (2026-08-17)" at the top of this file — every service now
+connects at runtime as a non-superuser `zoiko_app` role, making this
+service's own RLS policies load-bearing again, not just the explicit
+application-level scope check described above (which remains in place as
+defense-in-depth).
 
 Also of note: `internal/store/tenant_isolation_test.go` already documented
 this exact superuser trap and covers the store methods that take a tenant
