@@ -10,6 +10,15 @@ var (
 	ErrResolutionNotFound         = errors.New("board resolution not found")
 	ErrResolutionAlreadyFinalized = errors.New("resolution is already passed, rejected, or rescinded")
 
+	// ErrTenantMissing means the request carried no X-Tenant-Id. It is an
+	// unauthenticated request, not an empty tenant named "default".
+	ErrTenantMissing = errors.New("tenant scope missing")
+
+	// ErrInvalidField is what a value Postgres could not accept becomes —
+	// a malformed date, a malformed identifier — so a caller's typo answers
+	// 400 rather than the 500 an unmapped driver error produced.
+	ErrInvalidField = errors.New("a submitted field is not a valid value")
+
 	// ErrSelfApprovalNotAllowed enforces the platform's Segregation of Duties
 	// doctrine (docs/original_doc/zoiko_suite_doc1.txt §12.3): the principal
 	// who created a record may not be the same principal who approves,
@@ -44,6 +53,48 @@ const (
 	ResolutionStatusRejected  ResolutionStatus = "REJECTED"
 	ResolutionStatusRescinded ResolutionStatus = "RESCINDED"
 )
+
+// IsFinal reports whether the resolution has reached a terminal status and can
+// no longer be voted on or passed.
+//
+// One definition, used by both transitions. They each carried their own list
+// and the lists disagreed: the closing action's omitted REJECTED, so a
+// resolution the board had rejected could still be passed into force.
+func (s ResolutionStatus) IsFinal() bool {
+	return s == ResolutionStatusPassed || s == ResolutionStatusRejected || s == ResolutionStatusRescinded
+}
+
+// IsValidCategory reports whether c is one of the five categories the schema
+// documents. The category is not decoration: it is the domain_code sent to
+// evidence-requirements-svc, so an unrecognised one asks the catalog about a
+// domain that does not exist and comes back with no requirements — an evidence
+// gate silently bypassed by a typo.
+func (c ResolutionCategory) IsValid() bool {
+	switch c {
+	case ResolutionCategoryGovernance, ResolutionCategoryFinancial,
+		ResolutionCategoryOperational, ResolutionCategoryExecutive, ResolutionCategoryStatutory:
+		return true
+	}
+	return false
+}
+
+// MeetingFilter and ResolutionFilter carry every constraint on a register
+// read, including the paging bounds — grouped into a struct rather than a
+// growing list of same-typed string parameters that a caller could transpose
+// without the compiler noticing.
+type MeetingFilter struct {
+	LegalEntityID string
+	Limit         int
+	Offset        int
+}
+
+type ResolutionFilter struct {
+	LegalEntityID string
+	MeetingID     string
+	Status        string
+	Limit         int
+	Offset        int
+}
 
 type BoardMeeting struct {
 	MeetingID      string        `json:"meeting_id"`
