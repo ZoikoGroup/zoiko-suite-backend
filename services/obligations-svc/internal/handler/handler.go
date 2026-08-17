@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/domain"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
+	"zoiko.io/obligations-svc/internal/middleware"
 )
 
 // ObligationStore is the narrow interface the handler depends on.
@@ -40,12 +43,132 @@ type Handler struct {
 	store                 ObligationStore
 	publisher             EventPublisher
 	jurisdictionValidator jurisdiction.Validator
+	authz                 authz.Client
 	log                   *zap.Logger
 }
 
 // New constructs a Handler.
-func New(store ObligationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, jurisdictionValidator: jurisdictionValidator, log: log}
+func New(store ObligationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, authzClient authz.Client, log *zap.Logger) *Handler {
+	return &Handler{
+		store:                 store,
+		publisher:             publisher,
+		jurisdictionValidator: jurisdictionValidator,
+		authz:                 authzClient,
+		log:                   log,
+	}
+}
+
+// ── request preconditions ────────────────────────────────────────────────────
+
+// requirePrincipal refuses a request the gateway never identified.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "identity_missing"})
+		return "", false
+	}
+	return principalID, true
+}
+
+// requireTenant refuses a request that carries no tenant scope.
+//
+// This service had no tenant dimension at all until 000002, so there was
+// nothing to refuse: every read returned every tenant's obligations.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := middleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "tenant_missing"})
+		return "", false
+	}
+	return tenantID, true
+}
+
+// authorize gates a mutation, failing closed.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, action string) bool {
+	err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, action, r.Header.Get("X-Correlation-ID"))
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, domain.ErrAuthorizationDenied) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden", "action_type": action})
+		return false
+	}
+	h.log.Error("authorization check failed — failing closed",
+		zap.String("action_type", action), zap.Error(err))
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authorization_unavailable"})
+	return false
+}
+
+// maxRequestBytes bounds a request body. responsible_function and
+// source_reference are TEXT columns with no width limit, so without a cap one
+// request could stream unbounded memory into the decoder before any validation.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a JSON body with a size cap and no tolerance for unknown
+// fields — a misspelled "due_dat" used to be discarded silently and answer
+// "missing_field: due_date" for a field the caller believed they had sent.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return false
+	}
+	return true
+}
+
+const (
+	defaultLimit = 100
+	maxLimit     = 500
+)
+
+// parsePaging bounds a register read. A discarded strconv error is the
+// platform's recurring shape: limit=abc silently defaulted, and offset=-1
+// reached Postgres and answered 503.
+func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok bool) {
+	limit, offset = defaultLimit, 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxLimit {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "invalid_limit", "detail": "limit must be between 1 and " + strconv.Itoa(maxLimit)})
+			return 0, 0, false
+		}
+		limit = n
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": "invalid_offset", "detail": "offset must be a non-negative integer"})
+			return 0, 0, false
+		}
+		offset = n
+	}
+	return limit, offset, true
+}
+
+// writeStoreErr maps a store failure to the status it deserves.
+func (h *Handler) writeStoreErr(w http.ResponseWriter, what string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrTenantMissing):
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "tenant_missing"})
+	case errors.Is(err, domain.ErrObligationNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "obligation_not_found"})
+	case errors.Is(err, domain.ErrInvalidIdentifier):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_identifier"})
+	case errors.Is(err, domain.ErrInvalidTransition):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+	default:
+		h.log.Error(what, zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+	}
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -146,12 +269,16 @@ func (req createObligationRequest) missingField() string {
 func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
 	var req createObligationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -159,6 +286,24 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 			"error": "missing_field",
 			"field": missing,
 		})
+		return
+	}
+	// created_by_principal_id is accepted so the console's existing payload is
+	// not a 400, but it must name the caller. Taking it from the body would
+	// make the record of who raised a statutory obligation self-declared —
+	// the same defect board-resolutions-svc had, where a body-supplied
+	// created_by defeated the segregation-of-duties check outright.
+	if req.CreatedByPrincipalID != principalID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":  "created_by_mismatch",
+			"detail": "created_by_principal_id must be the authenticated principal — attribution comes from X-Principal-Id, not the request body",
+		})
+		return
+	}
+
+	// Authorized against the obligation's own legal entity: the authority to
+	// raise an obligation is entity-scoped, not platform-wide.
+	if !h.authorize(w, r, principalID, req.LegalEntityID, authz.ActionObligationCreate) {
 		return
 	}
 
@@ -192,7 +337,7 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		SeverityLevel:        req.SeverityLevel,
 		ResponsibleFunction:  req.ResponsibleFunction,
 		SourceReference:      req.SourceReference,
-		CreatedByPrincipalID: req.CreatedByPrincipalID,
+		CreatedByPrincipalID: principalID,
 	}
 
 	o, created, err := h.store.CreateObligation(r.Context(), params)
@@ -204,12 +349,7 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 				"obligation_code": req.ObligationCode,
 			})
 		default:
-			h.log.Error("CreateObligation: store unavailable",
-				zap.String("obligation_code", req.ObligationCode),
-				zap.String("correlation_id", correlationID),
-				zap.Error(err),
-			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+			h.writeStoreErr(w, "CreateObligation: store unavailable", err)
 		}
 		return
 	}
@@ -245,24 +385,17 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 //	503 → store unavailable
 func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 	obligationID := chi.URLParam(r, "obligation_id")
-	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 
 	o, err := h.store.FindObligationByID(r.Context(), obligationID)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrObligationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":         "obligation_not_found",
-				"obligation_id": obligationID,
-			})
-		default:
-			h.log.Error("GetObligation: store unavailable",
-				zap.String("obligation_id", obligationID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(err),
-			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		}
+		h.writeStoreErr(w, "GetObligation: store unavailable", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, o)
@@ -287,10 +420,22 @@ func (h *Handler) GetObligation(w http.ResponseWriter, r *http.Request) {
 //	400 → due_before/due_after not valid RFC3339
 //	503 → store unavailable
 func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
-	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+
 	filter := domain.ListObligationsFilter{
+		Limit:          limit,
+		Offset:         offset,
 		LegalEntityID:  q.Get("legal_entity_id"),
 		JurisdictionID: q.Get("jurisdiction_id"),
 		ObligationType: q.Get("obligation_type"),
@@ -316,11 +461,7 @@ func (h *Handler) ListObligations(w http.ResponseWriter, r *http.Request) {
 
 	results, err := h.store.ListObligations(r.Context(), filter)
 	if err != nil {
-		h.log.Error("ListObligations: store unavailable",
-			zap.String("correlation_id", correlationID),
-			zap.Error(err),
-		)
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		h.writeStoreErr(w, "ListObligations: store unavailable", err)
 		return
 	}
 
@@ -367,12 +508,16 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 	obligationID := chi.URLParam(r, "obligation_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
 	var req updateStatusRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.ObligationStatus == "" {
@@ -383,27 +528,21 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// The obligation is read before the write purely to learn its legal
+	// entity, which is the authorization scope. The transition itself is still
+	// decided under a row lock inside the store — this read is not the check.
+	existing, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, "UpdateObligationStatus: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, authz.ActionObligationStatusUpdate) {
+		return
+	}
+
 	updated, transitioned, err := h.store.UpdateObligationStatus(r.Context(), obligationID, req.ObligationStatus)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrObligationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":         "obligation_not_found",
-				"obligation_id": obligationID,
-			})
-		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{
-				"error":         "invalid_transition",
-				"obligation_id": obligationID,
-			})
-		default:
-			h.log.Error("UpdateObligationStatus: store unavailable",
-				zap.String("obligation_id", obligationID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(err),
-			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		}
+		h.writeStoreErr(w, "UpdateObligationStatus: store unavailable", err)
 		return
 	}
 
@@ -479,12 +618,16 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 	obligationID := chi.URLParam(r, "obligation_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
 	var req createFilingRequirementRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -492,6 +635,17 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 			"error": "missing_field",
 			"field": missing,
 		})
+		return
+	}
+
+	// The parent obligation carries the legal entity this filing is authorized
+	// against — a filing requirement has no entity of its own.
+	parent, err := h.store.FindObligationByID(r.Context(), obligationID)
+	if err != nil {
+		h.writeStoreErr(w, "CreateFilingRequirement: lookup failed", err)
+		return
+	}
+	if !h.authorize(w, r, principalID, parent.LegalEntityID, authz.ActionFilingRequirementAdd) {
 		return
 	}
 
@@ -503,20 +657,7 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 		SubmissionChannel:   req.SubmissionChannel,
 	})
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrObligationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":         "obligation_not_found",
-				"obligation_id": obligationID,
-			})
-		default:
-			h.log.Error("CreateFilingRequirement: store unavailable",
-				zap.String("obligation_id", obligationID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(err),
-			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		}
+		h.writeStoreErr(w, "CreateFilingRequirement: store unavailable", err)
 		return
 	}
 
@@ -540,24 +681,17 @@ func (h *Handler) CreateFilingRequirement(w http.ResponseWriter, r *http.Request
 //	503 → store unavailable
 func (h *Handler) ListFilingRequirements(w http.ResponseWriter, r *http.Request) {
 	obligationID := chi.URLParam(r, "obligation_id")
-	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 
 	results, err := h.store.ListFilingRequirements(r.Context(), obligationID)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrObligationNotFound):
-			writeJSON(w, http.StatusNotFound, map[string]string{
-				"error":         "obligation_not_found",
-				"obligation_id": obligationID,
-			})
-		default:
-			h.log.Error("ListFilingRequirements: store unavailable",
-				zap.String("obligation_id", obligationID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(err),
-			)
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
-		}
+		h.writeStoreErr(w, "ListFilingRequirements: store unavailable", err)
 		return
 	}
 
