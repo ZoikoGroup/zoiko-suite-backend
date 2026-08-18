@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -19,7 +20,7 @@ type Store interface {
 	CreateRequest(ctx context.Context, r *domain.PurchaseRequest) (created bool, err error)
 	GetRequest(ctx context.Context, requestID string) (*domain.PurchaseRequest, error)
 	ListRequests(ctx context.Context, filter domain.ListRequestsFilter) ([]domain.PurchaseRequest, error)
-	TransitionRequest(ctx context.Context, tenantID, requestID string, toStatus domain.RequestStatus, actorPrincipalID string, rejectionReason *string) error
+	TransitionRequest(ctx context.Context, tenantID, requestID string, toStatus domain.RequestStatus, actorPrincipalID string, actedAt time.Time, rejectionReason *string) error
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -187,12 +188,15 @@ func (h *Handler) ApproveRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.TransitionRequest(r.Context(), pr.TenantID, requestID, domain.RequestStatusApproved, principalID, nil); err != nil {
+	now := time.Now().UTC()
+	if err := h.store.TransitionRequest(r.Context(), pr.TenantID, requestID, domain.RequestStatusApproved, principalID, now, nil); err != nil {
 		h.handleTransitionErr(w, err)
 		return
 	}
 
 	pr.Status = domain.RequestStatusApproved
+	pr.ApprovedByPrincipalID = &principalID
+	pr.ApprovedAt = &now
 	h.publisher.PublishRequestApproved(r.Context(), *pr)
 	writeJSON(w, http.StatusOK, pr)
 }
@@ -238,12 +242,15 @@ func (h *Handler) RejectRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.TransitionRequest(r.Context(), pr.TenantID, requestID, domain.RequestStatusRejected, principalID, &req.Reason); err != nil {
+	now := time.Now().UTC()
+	if err := h.store.TransitionRequest(r.Context(), pr.TenantID, requestID, domain.RequestStatusRejected, principalID, now, &req.Reason); err != nil {
 		h.handleTransitionErr(w, err)
 		return
 	}
 
 	pr.Status = domain.RequestStatusRejected
+	pr.RejectedByPrincipalID = &principalID
+	pr.RejectedAt = &now
 	pr.RejectionReason = &req.Reason
 	h.publisher.PublishRequestRejected(r.Context(), *pr)
 	writeJSON(w, http.StatusOK, pr)

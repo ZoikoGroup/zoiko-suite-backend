@@ -234,6 +234,13 @@ func main() {
 		// a not-yet-existing topic fails with "Unknown Topic Or Partition"
 		// even though the broker would have created it.
 		AllowAutoTopicCreation: true,
+		// The library default is 1s, so every delegation event sat in the
+		// writer's batch buffer for a full second before it left the process.
+		// On this service that delay is not cosmetic: authority.revoked is the
+		// signal that tells identity-context-svc to invalidate a session, so a
+		// revocation the operator has already been told succeeded stayed
+		// invisible to the consumer that acts on it.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 

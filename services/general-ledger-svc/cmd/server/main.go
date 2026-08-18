@@ -117,11 +117,17 @@ func main() {
 	// metadata request, so every write to a not-yet-existing topic fails
 	// with "Unknown Topic Or Partition" regardless of the broker-side
 	// setting.
+	// BatchTimeout is 10ms, not the library default of 1s. Publishing here is
+	// synchronous on the request path — every journal create, validate, post
+	// and reverse waits for the write — so the default made each of those
+	// calls take about a second of pure batching delay. Same value, same
+	// reason, as every other producer in this estate.
 	kafkaWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		BatchTimeout:           10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 

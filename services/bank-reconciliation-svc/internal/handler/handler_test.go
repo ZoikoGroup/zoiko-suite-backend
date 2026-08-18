@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 	"zoiko.io/bank-reconciliation-svc/internal/handler"
 	"zoiko.io/bank-reconciliation-svc/internal/ledger"
+	svcmiddleware "zoiko.io/bank-reconciliation-svc/internal/middleware"
 )
 
 // ── stubs ────────────────────────────────────────────────────────────────────
@@ -29,6 +31,13 @@ type stubStore struct {
 	transitionErr  error
 	countUnmatched int
 	countErr       error
+	legalEntities  []string
+	entitiesErr    error
+
+	// lastListFilter records what ListStatementLines was actually asked for,
+	// so a test can assert the tenant came from the verified header rather
+	// than from ?tenant_id.
+	lastListFilter domain.ListStatementLinesFilter
 }
 
 func newStubStore() *stubStore {
@@ -62,11 +71,12 @@ func (s *stubStore) GetStatementLine(_ context.Context, statementLineID string) 
 	return l, nil
 }
 
-func (s *stubStore) ListStatementLines(_ context.Context, _ domain.ListStatementLinesFilter) ([]domain.StatementLine, error) {
+func (s *stubStore) ListStatementLines(_ context.Context, f domain.ListStatementLinesFilter) ([]domain.StatementLine, error) {
+	s.lastListFilter = f
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
-	var out []domain.StatementLine
+	out := make([]domain.StatementLine, 0)
 	for _, l := range s.lines {
 		out = append(out, *l)
 	}
@@ -106,6 +116,23 @@ func (s *stubStore) CountUnmatched(_ context.Context, _, _, _ string) (int, erro
 	return s.countUnmatched, nil
 }
 
+func (s *stubStore) StatementLegalEntities(_ context.Context, _, _, _ string) ([]string, error) {
+	if s.entitiesErr != nil {
+		return nil, s.entitiesErr
+	}
+	if s.legalEntities == nil {
+		// Default to the entity the tests authorize against, so the
+		// resource-binding check is satisfied unless a test sets otherwise.
+		return []string{"e1"}, nil
+	}
+	return s.legalEntities, nil
+}
+
+// cashAcct returns the ledger account code the tests treat as "the bank
+// account". A statement line without one cannot be matched at all, so every
+// seeded line needs it.
+func cashAcct() *string { c := "1000"; return &c }
+
 type stubPublisher struct {
 	ingested, matched, exceptionRaised, completed int
 }
@@ -119,7 +146,7 @@ func (p *stubPublisher) PublishReconciliationMatched(_ context.Context, _ domain
 func (p *stubPublisher) PublishReconciliationExceptionRaised(_ context.Context, _ domain.StatementLine) {
 	p.exceptionRaised++
 }
-func (p *stubPublisher) PublishReconciliationCompleted(_ context.Context, _, _, _ string) {
+func (p *stubPublisher) PublishReconciliationCompleted(_ context.Context, _, _, _, _ string) {
 	p.completed++
 }
 
@@ -140,23 +167,53 @@ func (l *stubLedger) GetJournal(_ context.Context, _, _ string) (*ledger.Journal
 	return l.journal, l.err
 }
 
-func finalizedJournal(legalEntityID string, netAmount float64) *ledger.Journal {
+// finalizedJournal builds a journal that moves `amount` through the test's
+// cash account. A positive amount is a DEBIT to it (money into the bank), a
+// negative amount a CREDIT (money out) — which is the direction a statement
+// line of the same sign must have.
+//
+// The contra line is deliberately posted to a different account, so a journal
+// really does have a direction rather than netting to nothing on one account.
+func finalizedJournal(legalEntityID string, amount float64) *ledger.Journal {
+	cash := ledger.JournalLine{AccountCode: "1000"}
+	contra := ledger.JournalLine{AccountCode: "4000"}
+	if amount >= 0 {
+		cash.DebitAmount = amount
+		contra.CreditAmount = amount
+	} else {
+		cash.CreditAmount = -amount
+		contra.DebitAmount = -amount
+	}
 	return &ledger.Journal{
 		JournalID:     "j1",
 		LegalEntityID: legalEntityID,
 		Status:        "FINALIZED",
-		Lines:         []ledger.JournalLine{{DebitAmount: netAmount}},
+		Lines:         []ledger.JournalLine{cash, contra},
 	}
 }
 
+// newRouter mirrors cmd/server/main.go's middleware stack. TenantContext was
+// previously absent here, so every test ran with no verified tenant scope at
+// all — which is precisely the condition the routes were getting wrong, and
+// the reason the whole class of tenant-scope defects went unnoticed by a
+// 24-test suite.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger) chi.Router {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, p, a, l, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
 
+const testTenant = "t1"
+
 func doRequest(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	return doRequestAs(r, method, path, body, principalID, testTenant)
+}
+
+// doRequestAs sends an explicit tenant scope. Pass "" to omit the header
+// entirely — the one-argument default in doRequest cannot express that.
+func doRequestAs(r chi.Router, method, path string, body any, principalID, tenantID string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -166,23 +223,53 @@ func doRequest(r chi.Router, method, path string, body any, principalID string) 
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
 }
 
+// doRawRequest sends a body verbatim, so a test can send JSON that the Go
+// request type cannot express — an unrecognised field, for instance.
+func doRawRequest(r chi.Router, method, path, body, principalID, tenantID string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+// Compile-time proof the stubs still satisfy the contracts they stand in for.
+// Without these an interface change surfaces as a confusing error at the
+// handler.New call site instead of here.
+var (
+	_ handler.Store       = (*stubStore)(nil)
+	_ handler.Publisher   = (*stubPublisher)(nil)
+	_ handler.AuthZClient = (*stubAuthZ)(nil)
+	_ ledger.Client       = (*stubLedger)(nil)
+)
+
 // ── CreateStatementLine ──────────────────────────────────────────────────────
 
 func validCreateReq() domain.CreateStatementLineRequest {
 	return domain.CreateStatementLineRequest{
-		TenantID:      "t1",
-		LegalEntityID: "e1",
-		BankAccountID: "b1",
-		StatementDate: time.Now(),
-		Amount:        1000,
-		CurrencyCode:  "USD",
-		BankReference: "ACH-1234",
-		CorrelationID: "corr-1",
+		TenantID:          "t1",
+		LegalEntityID:     "e1",
+		BankAccountID:     "b1",
+		StatementDate:     time.Now(),
+		Amount:            1000,
+		CurrencyCode:      "USD",
+		BankReference:     "ACH-1234",
+		GLCashAccountCode: "1000",
+		CorrelationID:     "corr-1",
 	}
 }
 
@@ -268,7 +355,7 @@ func TestCreateStatementLine_ZeroAmount_Rejected(t *testing.T) {
 
 func TestMatchStatementLine_LedgerVerifiedMatch_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 1000)})
@@ -286,7 +373,7 @@ func TestMatchStatementLine_LedgerVerifiedMatch_Succeeds(t *testing.T) {
 
 func TestMatchStatementLine_JournalNotFound_Returns400(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{err: ledger.ErrJournalNotFound})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/match", domain.MatchStatementLineRequest{JournalID: "bogus"}, "principal-1")
@@ -300,7 +387,7 @@ func TestMatchStatementLine_JournalNotFound_Returns400(t *testing.T) {
 
 func TestMatchStatementLine_JournalNotFinalized_Returns400(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	pending := finalizedJournal("e1", 1000)
 	pending.Status = "PENDING"
@@ -313,7 +400,7 @@ func TestMatchStatementLine_JournalNotFinalized_Returns400(t *testing.T) {
 
 func TestMatchStatementLine_WrongLegalEntity_Returns400(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("some-other-entity", 1000)})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/match", domain.MatchStatementLineRequest{JournalID: "j1"}, "principal-1")
@@ -324,7 +411,7 @@ func TestMatchStatementLine_WrongLegalEntity_Returns400(t *testing.T) {
 
 func TestMatchStatementLine_AmountMismatch_Returns400(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 500)})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/match", domain.MatchStatementLineRequest{JournalID: "j1"}, "principal-1")
@@ -335,7 +422,7 @@ func TestMatchStatementLine_AmountMismatch_Returns400(t *testing.T) {
 
 func TestMatchStatementLine_LedgerUnavailable_FailsClosed(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{err: ledger.ErrUnavailable})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/match", domain.MatchStatementLineRequest{JournalID: "j1"}, "principal-1")
@@ -348,7 +435,7 @@ func TestMatchStatementLine_ResolvesException_Succeeds(t *testing.T) {
 	// EXCEPTION -> MATCHED is legal, unlike purchase-request-svc's pure fork.
 	s := newStubStore()
 	reason := "unrecognized fee"
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusException, ExceptionReason: &reason}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusException, ExceptionReason: &reason, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 1000)})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/match", domain.MatchStatementLineRequest{JournalID: "j1"}, "principal-1")
@@ -362,7 +449,7 @@ func TestMatchStatementLine_ResolvesException_Succeeds(t *testing.T) {
 
 func TestMatchStatementLine_AlreadyMatched_Rejected(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusMatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusMatched, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 1000)})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/match", domain.MatchStatementLineRequest{JournalID: "j1"}, "principal-1")
@@ -375,7 +462,7 @@ func TestMatchStatementLine_AlreadyMatched_Rejected(t *testing.T) {
 
 func TestFlagException_RequiresReason(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/exception", domain.FlagExceptionRequest{}, "principal-1")
@@ -386,7 +473,7 @@ func TestFlagException_RequiresReason(t *testing.T) {
 
 func TestFlagException_FromUnmatched_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusUnmatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{})
@@ -404,7 +491,7 @@ func TestFlagException_FromUnmatched_Succeeds(t *testing.T) {
 
 func TestFlagException_AlreadyMatched_Rejected(t *testing.T) {
 	s := newStubStore()
-	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusMatched}
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusMatched, GLCashAccountCode: cashAcct()}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
 	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/exception", domain.FlagExceptionRequest{Reason: "trying anyway"}, "principal-1")
@@ -423,11 +510,15 @@ func TestGetStatementLine_NotFound(t *testing.T) {
 	}
 }
 
-func TestListStatementLines_RequiresTenantID(t *testing.T) {
+// The tenant scope now comes from the verified X-Tenant-Id header, not from
+// ?tenant_id, so its absence is an unauthenticated request (401) rather than
+// a malformed one (400). Reading it from the query string is what let a
+// caller name somebody else's tenant.
+func TestListStatementLines_RequiresVerifiedTenantScope(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
-	rec := doRequest(r, http.MethodGet, "/v1/statement-lines/", nil, "")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 without tenant_id query param, got %d", rec.Code)
+	rec := doRequestAs(r, http.MethodGet, "/v1/statement-lines/", nil, "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no verified tenant scope, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -459,11 +550,11 @@ func TestCompleteStatement_AllResolved_Succeeds(t *testing.T) {
 	}
 }
 
-func TestCompleteStatement_RequiresTenantID(t *testing.T) {
+func TestCompleteStatement_RequiresVerifiedTenantScope(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
-	rec := doRequest(r, http.MethodPost, "/v1/bank-accounts/b1/statements/2026-07-01/complete?legal_entity_id=e1", nil, "principal-1")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 without tenant_id query param, got %d", rec.Code)
+	rec := doRequestAs(r, http.MethodPost, "/v1/bank-accounts/b1/statements/2026-07-01/complete?legal_entity_id=e1", nil, "principal-1", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no verified tenant scope, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

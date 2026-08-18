@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -256,7 +257,7 @@ func TestPgStore_TransitionRequest_MalformedUUID_IsNotFound(t *testing.T) {
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
-	err := s.TransitionRequest(ctx, tenantID, "not-a-uuid", domain.RequestStatusApproved, "approver", nil)
+	err := s.TransitionRequest(ctx, tenantID, "not-a-uuid", domain.RequestStatusApproved, "approver", time.Now().UTC(), nil)
 	if !errors.Is(err, domain.ErrRequestNotFound) {
 		t.Fatalf("err = %v, want ErrRequestNotFound — a malformed id names no request, so "+
 			"answering invalid_transition would assert it exists in the wrong state", err)
@@ -274,7 +275,7 @@ func TestPgStore_TransitionRequest_ApproveThenSecondDecision_Refused(t *testing.
 		t.Fatalf("CreateRequest: %v", err)
 	}
 
-	if err := s.TransitionRequest(ctx, tenantID, req.RequestID, domain.RequestStatusApproved, "approver-1", nil); err != nil {
+	if err := s.TransitionRequest(ctx, tenantID, req.RequestID, domain.RequestStatusApproved, "approver-1", time.Now().UTC(), nil); err != nil {
 		t.Fatalf("first approval: %v", err)
 	}
 
@@ -294,7 +295,7 @@ func TestPgStore_TransitionRequest_ApproveThenSecondDecision_Refused(t *testing.
 
 	// Both branches are terminal. A second decision must be refused rather than
 	// applied, so who decided a request and when cannot be overwritten.
-	err = s.TransitionRequest(ctx, tenantID, req.RequestID, domain.RequestStatusRejected, "approver-2", strPtr("changed my mind"))
+	err = s.TransitionRequest(ctx, tenantID, req.RequestID, domain.RequestStatusRejected, "approver-2", time.Now().UTC(), strPtr("changed my mind"))
 	if !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("second decision err = %v, want ErrInvalidTransition", err)
 	}
@@ -323,7 +324,7 @@ func TestPgStore_TransitionRequest_RejectRecordsReason(t *testing.T) {
 	}
 
 	reason := "outside the approved capex envelope"
-	if err := s.TransitionRequest(ctx, tenantID, req.RequestID, domain.RequestStatusRejected, "approver-1", &reason); err != nil {
+	if err := s.TransitionRequest(ctx, tenantID, req.RequestID, domain.RequestStatusRejected, "approver-1", time.Now().UTC(), &reason); err != nil {
 		t.Fatalf("reject: %v", err)
 	}
 
@@ -358,7 +359,7 @@ func TestPgStore_TransitionRequest_OtherTenant_Refused(t *testing.T) {
 
 	err := s.TransitionRequest(
 		svcmiddleware.WithTenant(context.Background(), intruder),
-		intruder, req.RequestID, domain.RequestStatusApproved, "intruder", nil)
+		intruder, req.RequestID, domain.RequestStatusApproved, "intruder", time.Now().UTC(), nil)
 	if !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("cross-tenant transition err = %v, want it refused", err)
 	}
@@ -391,7 +392,7 @@ func TestPgStore_ListRequests_FiltersAndTenantScope(t *testing.T) {
 	if _, err := s.CreateRequest(ctx, approved); err != nil {
 		t.Fatalf("create approved: %v", err)
 	}
-	if err := s.TransitionRequest(ctx, tenantID, approved.RequestID, domain.RequestStatusApproved, "approver", nil); err != nil {
+	if err := s.TransitionRequest(ctx, tenantID, approved.RequestID, domain.RequestStatusApproved, "approver", time.Now().UTC(), nil); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 

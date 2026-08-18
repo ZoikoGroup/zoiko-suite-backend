@@ -898,7 +898,7 @@ http:
         svc-performance-review-svc:
             loadBalancer:
                 servers:
-                    - url: http://performance-review-svc:8135
+                    - url: http://performance-review-svc:8139
         svc-policy-svc:
             loadBalancer:
                 servers:

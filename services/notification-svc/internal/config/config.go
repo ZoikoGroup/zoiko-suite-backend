@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -28,10 +29,15 @@ type DBConfig struct {
 	SSLMode  string
 }
 
+// DSN builds the connection string from the DB_* variables and nothing else.
+//
+// It used to return TEST_DATABASE_URL when that variable was set, "for
+// integration tests" — but no test calls this function (the store suite opens
+// its own pool from that variable directly), so all it did was give the
+// running service a way to silently connect somewhere other than its
+// configured database if the variable ever leaked into an environment. The
+// store suite DROPs tables. Same removal as financial-close-svc.
 func (d DBConfig) DSN() string {
-	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
-		return dsn
-	}
 	return "host=" + d.Host +
 		" port=" + strconv.Itoa(d.Port) +
 		" dbname=" + d.Name +
@@ -47,7 +53,7 @@ type KafkaConfig struct {
 }
 
 func Load() (*Config, error) {
-	return &Config{
+	cfg := &Config{
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8133),
 		DB: DBConfig{
@@ -59,13 +65,48 @@ func Load() (*Config, error) {
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
 		Kafka: KafkaConfig{
-			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			// os.LookupEnv, not env(): KAFKA_BROKERS= (explicitly empty) is how
+			// a deployment says "no broker — publish in dry mode". env() would
+			// substitute the default and make that unreachable.
+			Brokers: brokers(),
 			GroupID: env("KAFKA_GROUP_ID", "notification-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.notification.events"),
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-	}, nil
+	}
+
+	// Load returned a nil error unconditionally, so every default above was
+	// also a production default: an empty DB password, and an authz URL that
+	// could point at a placeholder. Refuse to start rather than run a
+	// governed service on them.
+	if cfg.Env == "production" {
+		var missing []string
+		if cfg.DB.Password == "" {
+			missing = append(missing, "DB_PASSWORD")
+		}
+		if cfg.DB.SSLMode == "disable" {
+			missing = append(missing, "DB_SSLMODE (must not be 'disable' in production)")
+		}
+		if cfg.AuthZServiceURL == "" || strings.Contains(cfg.AuthZServiceURL, "localhost") {
+			missing = append(missing, "AUTHZ_SERVICE_URL (must be a real authorization-svc address)")
+		}
+		if len(missing) > 0 {
+			return nil, errors.New("invalid production config: " + strings.Join(missing, ", "))
+		}
+	}
+	return cfg, nil
+}
+
+func brokers() []string {
+	v, ok := os.LookupEnv("KAFKA_BROKERS")
+	if !ok {
+		return []string{"localhost:9092"}
+	}
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	return strings.Split(v, ",")
 }
 
 func env(key, def string) string {

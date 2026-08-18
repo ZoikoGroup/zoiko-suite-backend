@@ -31,12 +31,12 @@ type PeriodCreateRequest struct {
 }
 
 type PeriodLockResponse struct {
-	FiscalPeriodID     string     `json:"fiscal_period_id"`
-	PeriodName         string     `json:"period_name"`
-	CloseStatus        string     `json:"close_status"`
-	CloseLockedAt      time.Time  `json:"close_locked_at"`
-	EvidenceDocumentID string     `json:"evidence_document_id"`
-	VerificationHash   string     `json:"verification_hash"`
+	FiscalPeriodID     string    `json:"fiscal_period_id"`
+	PeriodName         string    `json:"period_name"`
+	CloseStatus        string    `json:"close_status"`
+	CloseLockedAt      time.Time `json:"close_locked_at"`
+	EvidenceDocumentID string    `json:"evidence_document_id"`
+	VerificationHash   string    `json:"verification_hash"`
 }
 
 type ReadinessCheckResponse struct {
@@ -60,4 +60,21 @@ var (
 	ErrAPServiceUnavailable    = errorString("accounts-payable-svc unavailable")
 	ErrARServiceUnavailable    = errorString("accounts-receivable-svc unavailable")
 	ErrVaultServiceUnavailable = errorString("document-vault-svc unavailable")
+
+	// ErrLedgerPageTruncated is returned when the ledger answered with a full
+	// page, so there may be journals this service never saw. A trial balance
+	// compiled from a partial ledger is wrong, not merely incomplete, and this
+	// one is about to be hashed and locked as the period's evidence — so the
+	// close is refused rather than signed over an unknown.
+	ErrLedgerPageTruncated = errorString("ledger returned a full page: the trial balance may be incomplete, so the close was refused")
+
+	// ErrTenantScopeMissing is returned when a request carries no verified
+	// tenant scope. Distinguished from a store outage so it answers 401 rather
+	// than 503 — it is the caller's request that is wrong, not the database.
+	ErrTenantScopeMissing = errorString("caller tenant scope missing")
+
+	// ErrEvidenceNotRecorded is returned when the period was locked but its
+	// close evidence could not be written. See the handler for why this is
+	// surfaced rather than logged and swallowed.
+	ErrEvidenceNotRecorded = errorString("period locked but close evidence could not be recorded")
 )

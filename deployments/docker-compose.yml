@@ -865,6 +865,10 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+      # This service had no authorization at all — every write was open to
+      # anything that could reach the port. Its config said the Authorization
+      # Service "doesn't exist"; it does, and fifteen other services call it.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "obligations-svc"
@@ -873,6 +877,8 @@ services:
       postgres:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8088/healthz"]
@@ -975,6 +981,13 @@ services:
       DB_PASSWORD: postgres
       DB_SSLMODE: disable
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
+      # An event contract belongs to the platform, not to a legal entity, so a
+      # registration carrying no X-Legal-Entity-Id is authorized against this
+      # synthetic scope. Passing an empty legal_entity_id through instead got a
+      # 400 from authorization-svc, which the client reports as "authorization
+      # service unavailable" — a 503 blaming infrastructure for a scope the
+      # request was never going to have. Same value as jurisdiction-rules-svc.
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1034,12 +1047,17 @@ services:
       # VAULT_MASTER_KEY_HEX.
       DOCUMENT_VAULT_MASTER_KEY_HEX: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
+      # This service had no authorization at all — every route was open,
+      # including the one that returns the bytes of a RESTRICTED document.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     volumes:
       - document_vault_storage:/data/documents
     depends_on:
       postgres:
         condition: service_healthy
       tenant-svc:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
       document-vault-storage-init:
         condition: service_completed_successfully
@@ -1519,6 +1537,12 @@ services:
   # created against a real, synchronously-validated employee_id from
   # employee-master-svc — a review is never created against an employee_id
   # that hasn't been confirmed to exist.
+  # 8139, not 8135. This published 8135, which vendor-due-diligence-svc also
+  # publishes -- the two could never both start, and whichever came up second
+  # failed to bind. vendor-due-diligence-svc keeps the number: it is wired into
+  # the console, routed on 8135 by Traefik, and defaults to 8135 in its own
+  # config. Nothing outside this file and the Traefik route refers to
+  # performance-review-svc's port.
   performance-review-svc:
     build:
       context: ../services/performance-review-svc
@@ -1527,9 +1551,9 @@ services:
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8135:8135"
+      - "8139:8139"
     environment:
-      PORT: "8135"
+      PORT: "8139"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: performance_review
@@ -1871,7 +1895,19 @@ services:
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
       AP_SERVICE_URL: "http://accounts-payable-svc:8099"
       AR_SERVICE_URL: "http://accounts-receivable-svc:8101"
-      VAULT_SERVICE_URL: "http://document-vault-svc:8092"
+      # 8094, which is the port document-vault-svc actually listens on and what
+      # evidence-requirements-svc has always used. This said 8092 — a port
+      # nothing in this platform serves — so every close failed at the evidence
+      # upload with "failed to record close evidence in vault", which reads as
+      # the vault being broken rather than as never having been contacted.
+      VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # HMAC secret for the close evidence signature. The service refuses to
+      # start without one, deliberately: the signature was previously keyed with
+      # the tenant id — a public value — so anything it "guaranteed" was
+      # forgeable. This is a LOCAL DEVELOPMENT value and must come from the
+      # secret store in any real deployment; rotating it invalidates the
+      # signature on evidence already recorded, so treat it as long-lived.
+      CLOSE_SIGNING_KEY: "${CLOSE_SIGNING_KEY:-local-dev-close-signing-key-not-for-production}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2595,7 +2631,9 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.board-resolutions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      # JURISDICTION_RULES_URL removed: nothing in this service ever read it,
+      # and the value here named jurisdiction-rules-svc on :8081 — which is
+      # tenant-entity-registry-svc's port. jurisdiction-rules-svc is :8082.
       EVIDENCE_REQ_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:

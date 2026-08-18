@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -14,8 +15,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"zoiko.io/document-vault-svc/internal/authz"
 	"zoiko.io/document-vault-svc/internal/domain"
 	"zoiko.io/document-vault-svc/internal/handler"
+	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/residency"
 	"zoiko.io/document-vault-svc/internal/storage"
 )
@@ -26,6 +29,7 @@ type stubStore struct {
 	docs      map[string]*domain.Document
 	versions  map[string][]domain.DocumentVersion
 	accessLog []domain.DocumentAccessLog
+	seq       int
 	createErr error
 	findErr   error
 	recordErr error
@@ -39,11 +43,16 @@ func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *d
 	if s.createErr != nil {
 		return s.createErr
 	}
-	doc.DocumentID = "doc-1"
+	// Unique per create. This used to hardcode "doc-1", so the stub could only
+	// ever hold ONE document — every create overwrote the last. That was
+	// invisible while no endpoint listed documents; it makes a register
+	// untestable, and would have let a broken list endpoint pass.
+	s.seq++
+	doc.DocumentID = fmt.Sprintf("doc-%d", s.seq)
 	doc.CurrentVersion = 1
 	doc.Status = domain.StatusActive
 	v.DocumentID = doc.DocumentID
-	v.DocumentVersionID = "ver-1"
+	v.DocumentVersionID = fmt.Sprintf("ver-%d-1", s.seq)
 	v.Version = 1
 	s.docs[doc.DocumentID] = doc
 	s.versions[doc.DocumentID] = []domain.DocumentVersion{*v}
@@ -95,8 +104,64 @@ func (s *stubStore) RecordAccess(_ context.Context, log *domain.DocumentAccessLo
 	return nil
 }
 
-func (s *stubStore) ListAccessLog(_ context.Context, documentID string) ([]domain.DocumentAccessLog, error) {
-	return s.accessLog, nil
+func (s *stubStore) ListAccessLog(_ context.Context, documentID string, limit, offset int) ([]domain.DocumentAccessLog, error) {
+	out := s.accessLog
+	if offset > 0 {
+		if offset >= len(out) {
+			return nil, nil
+		}
+		out = out[offset:]
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (s *stubStore) ListDocuments(_ context.Context, legalEntityID string, limit, offset int) ([]domain.Document, error) {
+	var out []domain.Document
+	for _, d := range s.docs {
+		if legalEntityID == "" || d.LegalEntityID == legalEntityID {
+			out = append(out, *d)
+		}
+	}
+	if offset > 0 {
+		if offset >= len(out) {
+			return nil, nil
+		}
+		out = out[offset:]
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ── stub authorization client ────────────────────────────────────────────────
+
+// stubAuthz GRANTS by default. Tests that care about the gate set err, or deny
+// a specific (principal, action) pair.
+type stubAuthz struct {
+	err    error
+	denied map[string]bool // "principal|action"
+	calls  []string
+}
+
+func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, _, actionType string) error {
+	a.calls = append(a.calls, principalID+"|"+actionType)
+	if a.denied[principalID+"|"+actionType] {
+		return domain.ErrAuthorizationDenied
+	}
+	return a.err
+}
+
+func (a *stubAuthz) called(principal, action string) bool {
+	for _, c := range a.calls {
+		if c == principal+"|"+action {
+			return true
+		}
+	}
+	return false
 }
 
 // ── stub residency validator ─────────────────────────────────────────────────
@@ -117,9 +182,48 @@ func newTestStorage(t *testing.T) storage.Backend {
 	return b
 }
 
+const (
+	testTenant    = "11111111-1111-1111-1111-111111111111"
+	testPrincipal = "principal-1"
+)
+
+// newRouter stands in for the deployed stack: TenantContext reads X-Tenant-Id,
+// and the gateway has already stamped an identity by the time a request
+// arrives. The injector fills both in when a test has not set them, so the
+// tests below stay about document behaviour.
+//
+// It does NOT paper over the refusals: newRouterRaw omits the injector, and
+// gaps_test.go uses it to assert that a request without identity or tenant is
+// refused rather than served.
 func newRouter(s *stubStore, res residency.Validator, st storage.Backend) chi.Router {
+	return newRouterAuthz(s, res, st, &stubAuthz{})
+}
+
+func newRouterAuthz(s *stubStore, res residency.Validator, st storage.Backend, az authz.Client) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, st, res, zap.NewNop())
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.Header.Get("X-Principal-Id") == "" {
+				req.Header.Set("X-Principal-Id", testPrincipal)
+			}
+			if req.Header.Get("X-Tenant-Id") == "" {
+				req.Header.Set("X-Tenant-Id", testTenant)
+			}
+			next.ServeHTTP(w, req)
+		})
+	})
+	r.Use(svcmiddleware.TenantContext())
+	h := handler.New(s, st, res, az, zap.NewNop())
+	handler.RegisterRoutes(r, h)
+	return r
+}
+
+// newRouterRaw installs no identity and no tenant — the shape of a request that
+// reached this service without passing the gateway.
+func newRouterRaw(s *stubStore, res residency.Validator, st storage.Backend) chi.Router {
+	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
+	h := handler.New(s, st, res, &stubAuthz{}, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -127,7 +231,10 @@ func newRouter(s *stubStore, res residency.Validator, st storage.Backend) chi.Ro
 func createBody(t *testing.T, classification, content string) []byte {
 	t.Helper()
 	body, err := json.Marshal(domain.CreateDocumentRequest{
-		TenantID: "tenant-1", LegalEntityID: "entity-1", Title: "Contract",
+		// Must agree with the request's X-Tenant-Id. The body no longer decides
+		// which tenant a document lands in — the verified header does — and a
+		// body naming a different one is refused rather than ignored.
+		TenantID: testTenant, LegalEntityID: "entity-1", Title: "Contract",
 		Classification: domain.Classification(classification),
 		ContentType:    "text/plain",
 		ContentBase64:  base64.StdEncoding.EncodeToString([]byte(content)),
@@ -174,7 +281,7 @@ func TestCreateDocument_EmptyContent_Returns400(t *testing.T) {
 func TestCreateDocument_ResidencyMismatch_Returns409(t *testing.T) {
 	r := newRouter(newStubStore(), &stubResidency{err: residency.ErrMismatch}, newTestStorage(t))
 	body, _ := json.Marshal(domain.CreateDocumentRequest{
-		TenantID: "t", LegalEntityID: "e", Title: "x", Classification: domain.ClassificationRestricted,
+		TenantID: testTenant, LegalEntityID: "e", Title: "x", Classification: domain.ClassificationRestricted,
 		ResidencyRegionCode: strPtr("eu"), ContentType: "text/plain",
 		ContentBase64: base64.StdEncoding.EncodeToString([]byte("data")),
 	})
@@ -187,7 +294,7 @@ func TestCreateDocument_ResidencyMismatch_Returns409(t *testing.T) {
 func TestCreateDocument_ResidencyServiceUnavailable_FailsClosed503(t *testing.T) {
 	r := newRouter(newStubStore(), &stubResidency{err: residency.ErrServiceUnavailable}, newTestStorage(t))
 	body, _ := json.Marshal(domain.CreateDocumentRequest{
-		TenantID: "t", LegalEntityID: "e", Title: "x", Classification: domain.ClassificationRestricted,
+		TenantID: testTenant, LegalEntityID: "e", Title: "x", Classification: domain.ClassificationRestricted,
 		ResidencyRegionCode: strPtr("eu"), ContentType: "text/plain",
 		ContentBase64: base64.StdEncoding.EncodeToString([]byte("data")),
 	})

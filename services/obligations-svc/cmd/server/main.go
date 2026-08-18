@@ -29,11 +29,13 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/config"
 	"zoiko.io/obligations-svc/internal/events"
 	"zoiko.io/obligations-svc/internal/handler"
 	"zoiko.io/obligations-svc/internal/health"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
+	svcmiddleware "zoiko.io/obligations-svc/internal/middleware"
 	"zoiko.io/obligations-svc/internal/store"
 	"zoiko.io/obligations-svc/internal/telemetry"
 )
@@ -120,11 +122,17 @@ func main() {
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		// kafka-go's default is 1s, and WriteMessages is synchronous — so
+		// every obligation write paid a wasted second inside the request,
+		// waiting out a batch window for a single message. Platform-wide
+		// value, same as the other gap-closed services.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
+	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -134,9 +142,10 @@ func main() {
 	r.Use(otelchi.Middleware("obligations-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
+	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, jurisdictionValidator, log)
+	h := handler.New(pgStore, publisher, jurisdictionValidator, authzClient, log)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 

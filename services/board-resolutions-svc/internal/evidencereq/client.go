@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -107,8 +108,23 @@ func (c *Client) EvaluateSufficient(ctx context.Context, tenantID, legalEntityID
 		return ErrServiceUnavailable
 	}
 
-	if res.Outcome == "MISSING" {
+	// Allow-list, not a deny-list.
+	//
+	// This was `if res.Outcome == "MISSING" { return ErrEvidenceMissing };
+	// return nil` — everything that was not the single word MISSING passed,
+	// which contradicted the doc comment two lines above it and, worse, failed
+	// OPEN. An empty outcome (the zero value, which is what a response shape
+	// that changed or a field renamed on the other side produces), a typo, or
+	// a new outcome the catalog starts returning would all have let a
+	// resolution be passed with its evidence gate unchecked — silently, since
+	// nothing distinguishes "SATISFIED" from "the field wasn't there" once the
+	// comparison is against one specific other value.
+	switch res.Outcome {
+	case "SATISFIED", "NO_REQUIREMENTS_DEFINED":
+		return nil
+	case "MISSING":
 		return ErrEvidenceMissing
+	default:
+		return fmt.Errorf("%w: unrecognised evaluation outcome %q", ErrServiceUnavailable, res.Outcome)
 	}
-	return nil
 }

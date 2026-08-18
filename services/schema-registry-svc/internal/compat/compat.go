@@ -13,19 +13,21 @@ package compat
 import (
 	"encoding/json"
 	"fmt"
+
+	"zoiko.io/schema-registry-svc/internal/domain"
 )
 
-type shape struct {
-	Properties map[string]struct {
-		Type string `json:"type"`
-	} `json:"properties"`
-	Required []string `json:"required"`
-}
-
-func parse(raw json.RawMessage) (shape, error) {
-	var s shape
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return shape{}, fmt.Errorf("parse schema shape: %w", err)
+// The shape parsed here is domain.Shape, shared with the write path.
+//
+// This package used to declare its own identical struct. Two copies of the
+// same parse is how a schema gets accepted at registration and then rejected
+// by the checker on the next version — the registry's own validation and its
+// own compatibility gate disagreeing about what a schema is. One definition,
+// used by both.
+func parse(raw json.RawMessage) (domain.Shape, error) {
+	s, err := domain.ShapeOf(raw)
+	if err != nil {
+		return domain.Shape{}, fmt.Errorf("parse schema shape: %w", err)
 	}
 	return s, nil
 }

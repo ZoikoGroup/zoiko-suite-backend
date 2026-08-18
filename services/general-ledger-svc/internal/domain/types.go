@@ -137,6 +137,11 @@ type ListJournalsFilter struct {
 	LegalEntityID string
 	FiscalPeriod  string
 	Status        string
+
+	// Limit bounds the page. Zero means "the store's default" — a general
+	// ledger only grows, and the register that reads this renders a page at a
+	// time whatever the query returns. See store.DefaultListLimit.
+	Limit int
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
@@ -165,4 +170,22 @@ var (
 
 	ErrPeriodLocked            = errorString("accounting period is closed or locked")
 	ErrCloseServiceUnavailable = errorString("financial-close-svc unavailable")
+
+	// ErrInvalidIdentifier is returned when an id cannot be a UUID at all.
+	// journal_id, tenant_id and legal_entity_id are uuid columns, so Postgres
+	// raises SQLSTATE 22P02 from inside the driver before any row is examined.
+	// Distinguished from a dead store so a typo in a URL stops answering 503.
+	ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
+
+	// ErrTenantScopeMismatch is returned when a request names a tenant other
+	// than the one the caller was verified as. The tenant in a body or query
+	// string is a caller-supplied claim; X-Tenant-Id is the gateway's verified
+	// answer, and where they disagree the request is refused rather than
+	// quietly served under either one.
+	ErrTenantScopeMismatch = errorString("request tenant_id does not match the caller's verified tenant scope")
+
+	// ErrTenantScopeMissing is returned when a request carries no verified
+	// tenant scope at all — it never passed gateway-auth-svc's ForwardAuth
+	// verification. Fail closed, same posture as ErrIdentityMissing.
+	ErrTenantScopeMissing = errorString("caller tenant scope missing")
 )

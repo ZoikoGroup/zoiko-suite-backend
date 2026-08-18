@@ -20,10 +20,15 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	periods   map[string]*domain.FiscalPeriod
-	createErr error
-	getErr    error
-	lockErr   error
+	periods     map[string]*domain.FiscalPeriod
+	createErr   error
+	getErr      error
+	lockErr     error
+	evidenceErr error
+
+	// Recorded so a test can assert what was actually signed and stored, rather
+	// than only that the call did not error.
+	evidence []domain.CloseEvidence
 }
 
 func newStubStore() *stubStore {
@@ -99,7 +104,11 @@ func (s *stubStore) LockFiscalPeriod(_ context.Context, id string, lockedAt time
 	return nil
 }
 
-func (s *stubStore) CreateCloseEvidence(_ context.Context, _ *domain.CloseEvidence) error {
+func (s *stubStore) CreateCloseEvidence(_ context.Context, ev *domain.CloseEvidence) error {
+	if s.evidenceErr != nil {
+		return s.evidenceErr
+	}
+	s.evidence = append(s.evidence, *ev)
 	return nil
 }
 
@@ -129,6 +138,9 @@ type stubClients struct {
 	uploadErr     error
 	trialBalances map[string]float64
 	trialBalErr   error
+
+	apPeriodStart, apPeriodEnd time.Time
+	arPeriodStart, arPeriodEnd time.Time
 }
 
 func (c *stubClients) GetUnpostedJournalsCount(_ context.Context, _, _, _ string) (int, error) {
@@ -143,10 +155,16 @@ func (c *stubClients) CompileTrialBalance(_ context.Context, _, _, _ string) (ma
 	}
 	return map[string]float64{"1000-Cash": 10000.00}, nil
 }
-func (c *stubClients) GetUnsettledAPInvoicesCount(_ context.Context, _, _ string) (int, error) {
+
+// The AP/AR counts take the period bounds, and the stub RECORDS them: the
+// defect being guarded against is the handler failing to pass the period
+// through, which a stub that ignored its arguments could not catch.
+func (c *stubClients) GetUnsettledAPInvoicesCount(_ context.Context, _, _ string, periodStart, periodEnd time.Time) (int, error) {
+	c.apPeriodStart, c.apPeriodEnd = periodStart, periodEnd
 	return c.unsettledAP, c.apErr
 }
-func (c *stubClients) GetUnsettledARInvoicesCount(_ context.Context, _, _ string) (int, error) {
+func (c *stubClients) GetUnsettledARInvoicesCount(_ context.Context, _, _ string, periodStart, periodEnd time.Time) (int, error) {
+	c.arPeriodStart, c.arPeriodEnd = periodStart, periodEnd
 	return c.unsettledAR, c.arErr
 }
 func (c *stubClients) UploadCloseEvidence(_ context.Context, _, _, _ string, _ map[string]float64, _ string) (string, error) {
@@ -158,20 +176,32 @@ func (c *stubClients) UploadCloseEvidence(_ context.Context, _, _, _ string, _ m
 
 // ── router factory ─────────────────────────────────────────────────────────────
 
+// testSigningKey stands in for CLOSE_SIGNING_KEY. Deliberately NOT the tenant
+// id: keying the signature with the tenant was the defect, and a test that
+// reused it could not tell the fix from the bug.
+var testSigningKey = []byte("test-close-signing-key")
+
+const testTenantID = "tenant-abc"
+
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, cl *stubClients) chi.Router {
 	r := chi.NewRouter()
-	r.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			req = req.WithContext(middleware.WithTenant(req.Context(), "tenant-abc"))
-			next.ServeHTTP(w, req)
-		})
-	})
-	h := handler.New(s, pub, authz, cl, zap.NewNop())
+	// The real TenantContext middleware reading X-Tenant-Id, not a hardcoded
+	// context stuffer: whether a request carries a verified tenant scope is now
+	// part of what these tests cover, and a stuffer made every request look
+	// scoped no matter what it sent.
+	r.Use(middleware.TenantContext())
+	h := handler.New(s, pub, authz, cl, testSigningKey, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
 
 func doReq(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	return doReqAs(r, method, path, body, principalID, testTenantID)
+}
+
+// doReqAs sends a request as a caller the gateway verified as tenantID. An
+// empty tenantID sends no X-Tenant-Id at all.
+func doReqAs(r chi.Router, method, path string, body any, principalID, tenantID string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -181,10 +211,21 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 	return rr
 }
+
+// Compile-time proof the stubs still satisfy the contracts the handler depends
+// on — a stub that has silently fallen behind an interface is how a green suite
+// stops meaning anything.
+var (
+	_ handler.Store   = (*stubStore)(nil)
+	_ handler.Clients = (*stubClients)(nil)
+)
 
 // ── CreateFiscalPeriod tests ──────────────────────────────────────────────────
 

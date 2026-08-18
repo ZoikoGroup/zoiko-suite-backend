@@ -118,11 +118,16 @@ func main() {
 	// metadata request, so every write to a not-yet-existing topic fails
 	// with "Unknown Topic Or Partition" regardless of the broker-side
 	// setting.
+	// BatchTimeout is 10ms, not the library default of 1s. Publishing happens
+	// synchronously on the request path, so with the default every ingest,
+	// match, exception and completion waited a full second for a batch window
+	// that will never fill — this service writes one message per request.
 	kafkaWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		BatchTimeout:           10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 

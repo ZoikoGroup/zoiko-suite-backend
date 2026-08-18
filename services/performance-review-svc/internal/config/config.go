@@ -50,7 +50,10 @@ type KafkaConfig struct {
 func Load() (*Config, error) {
 	return &Config{
 		Env:  env("ENV", "local"),
-		Port: envInt("PORT", 8135),
+		// 8139: 8135 belongs to vendor-due-diligence-svc, which is wired into
+		// the console and routed there by Traefik. Both services published
+		// 8135, so they could never both start.
+		Port: envInt("PORT", 8139),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),

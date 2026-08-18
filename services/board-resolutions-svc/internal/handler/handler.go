@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -58,6 +60,119 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
+// requireTenant refuses a request that carries no tenant scope. The middleware
+// used to substitute the literal tenant "default" for a missing header, so an
+// unscoped request quietly read and wrote a shared bucket instead of being
+// turned away.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := middleware.GetTenantID(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "tenant scope missing")
+		return "", false
+	}
+	return tenantID, true
+}
+
+// maxRequestBytes bounds a request body. A resolution's content is TEXT, so
+// without a cap one request could stream unbounded memory into the decoder
+// before any validation ran.
+const maxRequestBytes = 1 << 20 // 1 MiB
+
+// decodeJSON reads a JSON request body with a size cap and no tolerance for
+// unknown fields — a misspelled "titel" used to be discarded silently, so the
+// caller got a 400 for a missing title they believed they had sent, or worse,
+// a resolution stored with a field they thought they had set.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request body exceeds 1 MiB")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return false
+	}
+	return true
+}
+
+const (
+	defaultLimit = 100
+	maxLimit     = 500
+)
+
+// parsePaging bounds a register read. A discarded strconv error is the
+// platform's recurring shape: limit=abc silently defaulted, and offset=-1
+// reached Postgres and answered 500.
+func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok bool) {
+	limit, offset = defaultLimit, 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxLimit {
+			writeError(w, http.StatusBadRequest,
+				"limit must be an integer between 1 and "+strconv.Itoa(maxLimit))
+			return 0, 0, false
+		}
+		limit = n
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be a non-negative integer")
+			return 0, 0, false
+		}
+		offset = n
+	}
+	return limit, offset, true
+}
+
+// requireSelfAttribution refuses a body field that names a principal other
+// than the authenticated caller.
+//
+// created_by and passed_by were taken verbatim from the request body. The
+// segregation-of-duties check compares the resolution's created_by against the
+// principal passing it — so a drafter could file their resolution under
+// somebody else's name and then pass their own work, and the check would
+// compare two different strings and allow it. The one control the doctrine
+// rests on was defeated by a field the same caller filled in.
+//
+// The console already sends its own principal here, so this validates rather
+// than ignores: silently rewriting the field would leave a caller believing an
+// attribution that never happened.
+func requireSelfAttribution(w http.ResponseWriter, field, value, principalID string) bool {
+	if value != "" && value != principalID {
+		writeError(w, http.StatusBadRequest,
+			field+" must be the authenticated principal — attribution is taken from X-Principal-Id, not the request body")
+		return false
+	}
+	return true
+}
+
+// writeStoreErr maps a store failure to the status it deserves. Everything
+// used to answer 500 "failed to …", which reports a caller's bad date or a
+// missing tenant as an outage.
+func (h *Handler) writeStoreErr(w http.ResponseWriter, what string, err error) {
+	switch {
+	case errors.Is(err, domain.ErrTenantMissing):
+		writeError(w, http.StatusUnauthorized, "tenant scope missing")
+	case errors.Is(err, domain.ErrInvalidField):
+		writeError(w, http.StatusBadRequest, "a submitted field is not a valid value")
+	case errors.Is(err, domain.ErrMeetingNotFound):
+		writeError(w, http.StatusNotFound, "board meeting not found")
+	case errors.Is(err, domain.ErrResolutionNotFound):
+		writeError(w, http.StatusNotFound, "board resolution not found")
+	case errors.Is(err, domain.ErrResolutionAlreadyFinalized):
+		writeError(w, http.StatusConflict, "resolution is already finalized")
+	case errors.Is(err, domain.ErrSelfApprovalNotAllowed):
+		writeError(w, http.StatusForbidden, domain.ErrSelfApprovalNotAllowed.Error())
+	default:
+		h.logger.Error(what, zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, what)
+	}
+}
+
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, authz.ErrAuthorizationDenied) {
 		writeError(w, http.StatusForbidden, "forbidden")
@@ -93,20 +208,35 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 // --- Meeting Handlers ---
 
 func (h *Handler) CreateMeeting(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-
 	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
 
 	var req domain.CreateMeetingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Title == "" || req.ScheduledAt.IsZero() {
 		writeError(w, http.StatusBadRequest, "title and scheduled_at are required")
+		return
+	}
+	// legal_entity_id was never checked. Empty, it went to authorization-svc,
+	// which rejects an empty scope — so the refusal read as "authorization
+	// service unavailable" rather than as the missing field it was.
+	if req.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	if req.EffectiveFrom == "" {
+		writeError(w, http.StatusBadRequest, "effective_from is required (YYYY-MM-DD)")
+		return
+	}
+	if !requireSelfAttribution(w, "created_by", req.CreatedBy, principalID) {
 		return
 	}
 
@@ -122,63 +252,99 @@ func (h *Handler) CreateMeeting(w http.ResponseWriter, r *http.Request) {
 		ScheduledAt:   req.ScheduledAt,
 		Location:      req.Location,
 		EffectiveFrom: req.EffectiveFrom,
-		CreatedBy:     req.CreatedBy,
+		CreatedBy:     principalID,
 	}
 
 	if err := h.store.CreateMeeting(r.Context(), m); err != nil {
-		h.logger.Error("create meeting failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to create meeting")
+		h.writeStoreErr(w, "failed to create meeting", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "meeting.created", m.MeetingID, tenantID, m)
+	h.publish(r.Context(), "meeting.created", m.MeetingID, tenantID, m)
 	writeJSON(w, http.StatusCreated, m)
 }
 
 func (h *Handler) GetMeeting(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 	m, err := h.store.GetMeeting(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrMeetingNotFound) {
-			writeError(w, http.StatusNotFound, "meeting not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get meeting")
+		h.writeStoreErr(w, "failed to get meeting", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, m)
 }
 
 func (h *Handler) ListMeetings(w http.ResponseWriter, r *http.Request) {
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	meetings, err := h.store.ListMeetings(r.Context(), legalEntityID)
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+	meetings, err := h.store.ListMeetings(r.Context(), domain.MeetingFilter{
+		LegalEntityID: r.URL.Query().Get("legal_entity_id"),
+		Limit:         limit,
+		Offset:        offset,
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list meetings")
+		h.writeStoreErr(w, "failed to list meetings", err)
 		return
 	}
 	if meetings == nil {
 		meetings = []domain.BoardMeeting{}
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"meetings": meetings, "total": len(meetings)})
+	// "total" is the size of THIS page, which is all this response can honestly
+	// claim — it is not a count of the register. Named accordingly now that the
+	// read is paged, so a console cannot read a page size as a total.
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"meetings": meetings, "total": len(meetings), "limit": limit, "offset": offset,
+	})
 }
 
 // --- Resolution Handlers ---
 
 func (h *Handler) CreateResolution(w http.ResponseWriter, r *http.Request) {
-	tenantID := middleware.GetTenantID(r.Context())
-
 	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
 
 	var req domain.CreateResolutionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Title == "" || req.Content == "" || req.Category == "" {
 		writeError(w, http.StatusBadRequest, "title, content, and category are required")
+		return
+	}
+	if !req.Category.IsValid() {
+		writeError(w, http.StatusBadRequest,
+			"category must be one of GOVERNANCE, FINANCIAL, OPERATIONAL, EXECUTIVE, STATUTORY")
+		return
+	}
+	if req.LegalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	if req.EffectiveFrom == "" {
+		writeError(w, http.StatusBadRequest, "effective_from is required (YYYY-MM-DD)")
+		return
+	}
+	if !requireSelfAttribution(w, "created_by", req.CreatedBy, principalID) {
 		return
 	}
 
@@ -197,70 +363,90 @@ func (h *Handler) CreateResolution(w http.ResponseWriter, r *http.Request) {
 		Category:         req.Category,
 		EffectiveFrom:    req.EffectiveFrom,
 		EffectiveTo:      req.EffectiveTo,
-		CreatedBy:        req.CreatedBy,
+		CreatedBy:        principalID,
 	}
 
 	if err := h.store.CreateResolution(r.Context(), res); err != nil {
-		h.logger.Error("create resolution failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to create resolution")
+		h.writeStoreErr(w, "failed to create resolution", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "resolution.created", res.ResolutionID, tenantID, res)
+	h.publish(r.Context(), "resolution.created", res.ResolutionID, tenantID, res)
 	writeJSON(w, http.StatusCreated, res)
 }
 
 func (h *Handler) GetResolution(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 	res, err := h.store.GetResolution(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrResolutionNotFound) {
-			writeError(w, http.StatusNotFound, "resolution not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get resolution")
+		h.writeStoreErr(w, "failed to get resolution", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
 }
 
 func (h *Handler) ListResolutions(w http.ResponseWriter, r *http.Request) {
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	meetingID := r.URL.Query().Get("meeting_id")
-	status := r.URL.Query().Get("status")
-	resolutions, err := h.store.ListResolutions(r.Context(), legalEntityID, meetingID, status)
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+	resolutions, err := h.store.ListResolutions(r.Context(), domain.ResolutionFilter{
+		LegalEntityID: r.URL.Query().Get("legal_entity_id"),
+		MeetingID:     r.URL.Query().Get("meeting_id"),
+		Status:        r.URL.Query().Get("status"),
+		Limit:         limit,
+		Offset:        offset,
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to list resolutions")
+		h.writeStoreErr(w, "failed to list resolutions", err)
 		return
 	}
 	if resolutions == nil {
 		resolutions = []domain.BoardResolution{}
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"resolutions": resolutions, "total": len(resolutions)})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"resolutions": resolutions, "total": len(resolutions), "limit": limit, "offset": offset,
+	})
 }
 
 func (h *Handler) RecordVotes(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	var req domain.RecordVotesRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// A vote tally is a count of people. Negative counts were accepted and
+	// stored, so a resolution could carry -5 votes against.
+	if req.VotesFor < 0 || req.VotesAgainst < 0 || req.Abstentions < 0 {
+		writeError(w, http.StatusBadRequest, "vote counts may not be negative")
 		return
 	}
 
 	existing, err := h.store.GetResolution(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrResolutionNotFound) {
-			writeError(w, http.StatusNotFound, "resolution not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get resolution")
+		h.writeStoreErr(w, "failed to get resolution", err)
 		return
 	}
 
@@ -271,47 +457,42 @@ func (h *Handler) RecordVotes(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.store.RecordVotes(r.Context(), id, &req)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrResolutionNotFound):
-			writeError(w, http.StatusNotFound, "resolution not found")
-		case errors.Is(err, domain.ErrResolutionAlreadyFinalized):
-			writeError(w, http.StatusConflict, "resolution is already finalized")
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to record votes")
-		}
+		h.writeStoreErr(w, "failed to record votes", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "resolution.votes_recorded", id, tenantID, res)
+	h.publish(r.Context(), "resolution.votes_recorded", id, tenantID, res)
 	writeJSON(w, http.StatusOK, res)
 }
 
 func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	tenantID := middleware.GetTenantID(r.Context())
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
-
-	var req domain.PassResolutionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
-	if req.PassedBy == "" {
-		writeError(w, http.StatusBadRequest, "passed_by is required")
+
+	var req domain.PassResolutionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	// passed_by is no longer read from the body — the pass is attributed to
+	// the authenticated principal. It stays accepted so the console's existing
+	// payload is not a 400, but it must name the caller: see
+	// requireSelfAttribution for why a self-declared attribution defeated the
+	// segregation-of-duties check entirely.
+	if !requireSelfAttribution(w, "passed_by", req.PassedBy, principalID) {
 		return
 	}
 
 	existing, err := h.store.GetResolution(r.Context(), id)
 	if err != nil {
-		if errors.Is(err, domain.ErrResolutionNotFound) {
-			writeError(w, http.StatusNotFound, "resolution not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get resolution")
+		h.writeStoreErr(w, "failed to get resolution", err)
 		return
 	}
 
@@ -363,21 +544,33 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := h.store.PassResolution(r.Context(), id, &req)
+	res, err := h.store.PassResolution(r.Context(), id, principalID, &req)
 	if err != nil {
-		switch {
-		case errors.Is(err, domain.ErrResolutionNotFound):
-			writeError(w, http.StatusNotFound, "resolution not found")
-		case errors.Is(err, domain.ErrResolutionAlreadyFinalized):
-			writeError(w, http.StatusConflict, "resolution is already finalized")
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to pass resolution")
-		}
+		h.writeStoreErr(w, "failed to pass resolution", err)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "resolution.passed", id, tenantID, res)
+	h.publish(r.Context(), "resolution.passed", id, tenantID, res)
 	writeJSON(w, http.StatusOK, res)
+}
+
+// publish emits a domain event and reports a failure rather than discarding
+// it. Every call site was `_ = h.publisher.Publish(...)`, and the publisher's
+// own Publish returned nil unconditionally — so a dropped event was
+// unobservable from both ends.
+//
+// The context is detached from the request: the event describes a write that
+// has already committed, and cancelling it because the caller hung up would
+// drop the record of something that definitively happened.
+func (h *Handler) publish(ctx context.Context, eventType, entityID, tenantID string, payload interface{}) {
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := h.publisher.Publish(pubCtx, eventType, entityID, tenantID, payload); err != nil {
+		h.logger.Error("event publish failed — event dropped",
+			zap.String("event_type", eventType),
+			zap.String("entity_id", entityID),
+			zap.Error(err))
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
