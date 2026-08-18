@@ -1047,12 +1047,17 @@ services:
       # VAULT_MASTER_KEY_HEX.
       DOCUMENT_VAULT_MASTER_KEY_HEX: "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
+      # This service had no authorization at all — every route was open,
+      # including the one that returns the bytes of a RESTRICTED document.
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     volumes:
       - document_vault_storage:/data/documents
     depends_on:
       postgres:
         condition: service_healthy
       tenant-svc:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
       document-vault-storage-init:
         condition: service_completed_successfully
@@ -1532,6 +1537,12 @@ services:
   # created against a real, synchronously-validated employee_id from
   # employee-master-svc — a review is never created against an employee_id
   # that hasn't been confirmed to exist.
+  # 8139, not 8135. This published 8135, which vendor-due-diligence-svc also
+  # publishes -- the two could never both start, and whichever came up second
+  # failed to bind. vendor-due-diligence-svc keeps the number: it is wired into
+  # the console, routed on 8135 by Traefik, and defaults to 8135 in its own
+  # config. Nothing outside this file and the Traefik route refers to
+  # performance-review-svc's port.
   performance-review-svc:
     build:
       context: ../services/performance-review-svc
@@ -1540,9 +1551,9 @@ services:
     mem_limit: 256m
     cpus: "0.5"
     ports:
-      - "8135:8135"
+      - "8139:8139"
     environment:
-      PORT: "8135"
+      PORT: "8139"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: performance_review

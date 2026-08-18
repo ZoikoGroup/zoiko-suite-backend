@@ -279,6 +279,38 @@ $BUNDLES = @(
         Actions = @("OBLIGATION_CREATE", "OBLIGATION_STATUS_UPDATE", "FILING_REQUIREMENT_CREATE")
     },
     @{
+        # delegated-authority-svc had NO bundle at all, so every one of its
+        # four routes answered 403 to every principal -- the same shape as
+        # jurisdiction-rules-svc before 17 Aug. The service has enforced
+        # authorization since it was written; nothing had ever granted it.
+        #
+        # DELEGATION_ADMINISTER is deliberately NOT in this bundle. It is the
+        # authority to create a delegation naming SOMEONE ELSE as delegator,
+        # and handing it to the demo principal alongside DELEGATION_CREATE
+        # would restore exactly the escalation this pass closed. It belongs to
+        # a delegation administrator, granted separately and deliberately --
+        # see BOARD_SMOKE_PASSER for the same "second principal, on purpose"
+        # pattern.
+        # document-vault-svc had no bundle because it had no authorization: every
+        # route, including the download, answered anything that reached the port.
+        #
+        # DOWNLOAD is granted here alongside READ because the demo console needs
+        # to fetch content, but note they are DIFFERENT actions on purpose --
+        # knowing a document exists and reading its bytes are different
+        # disclosures, and a real deployment should be able to grant one without
+        # the other. ACCESS_LOG_READ is likewise separate: it is the record an
+        # investigator consults.
+        Code    = "DOCUMENT_FULL"
+        Service = "document-vault-svc"
+        Actions = @("DOCUMENT_CREATE", "DOCUMENT_READ", "DOCUMENT_DOWNLOAD",
+            "DOCUMENT_VERSION_CREATE", "DOCUMENT_ACCESS_LOG_READ")
+    },
+    @{
+        Code    = "DELEGATION_FULL"
+        Service = "delegated-authority-svc"
+        Actions = @("DELEGATION_CREATE", "DELEGATION_VIEW", "DELEGATION_REVOKE")
+    },
+    @{
         Code    = "JURISDICTION_FULL"
         Service = "jurisdiction-rules-svc"
         Actions = @(

@@ -195,6 +195,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -
 # Apply migrations for document-vault-svc
 echo "Applying migrations for document_vault..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "document_vault" -f /migrations/document-vault/000001_initial_schema.up.sql
+# 000002 adds row-level security, which this service had NONE of -- not even the
+# ENABLE-without-FORCE that the rest of the estate had to be corrected for. It
+# also adds the invariants that stop the access log recording a reader as
+# 'unknown', which the handler used to substitute for an unidentified caller.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "document_vault" -f /migrations/document-vault/000002_force_rls_and_invariants.up.sql
 
 # Apply migrations for evidence-manifest-svc
 echo "Applying migrations for evidence_manifest..."
@@ -258,6 +263,11 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "performance_review
 # Apply migrations for delegated-authority-svc
 echo "Applying migrations for delegated_authority..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "delegated_authority" -f /migrations/delegated-authority/000001_initial_schema.up.sql
+# 000002 FORCEs the row-level security 000001 only ENABLEd -- the policy it
+# wrote had never applied to a query, because the owner is exempt without
+# FORCE -- and adds the status/terminal-evidence invariants the domain
+# enforces in Go and nowhere else.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "delegated_authority" -f /migrations/delegated-authority/000002_force_rls_and_invariants.up.sql
 
 # Apply migrations for access-control-svc
 echo "Applying migrations for access_control..."
