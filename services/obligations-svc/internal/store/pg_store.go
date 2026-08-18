@@ -37,7 +37,7 @@ func mapPgError(err error) error {
 
 // tenantOf reads the caller's tenant and refuses an unscoped call.
 //
-// Before migration 000002 this service had no tenant dimension at all, so every
+// Before migration 000003 this service had no tenant dimension at all, so every
 // query below ran across every tenant's obligations. The predicate is explicit
 // on each statement rather than left to row-level security, because these
 // services connect as the database OWNER and Postgres exempts the owner from
@@ -126,6 +126,10 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 }
 
 // ── obligations ──────────────────────────────────────────────────────────────
+
+// defaultListLimit bounds a register read whose caller did not choose a limit.
+// It matches the HTTP handler's own default so the two cannot drift.
+const defaultListLimit = 100
 
 // obligationColumns is the standard SELECT column list shared by all
 // obligation queries. Order must match scanObligation exactly.
@@ -325,7 +329,16 @@ func (s *PgStore) ListObligations(ctx context.Context, filter domain.ListObligat
 	// either order, so a paged read could show one row twice and skip another.
 	// The primary key breaks the tie.
 	query += " ORDER BY created_at DESC, obligation_id DESC"
-	args = append(args, filter.Limit)
+	// A non-positive limit means "the caller did not choose one", not "return
+	// nothing". The HTTP handler defaults this to 100 and rejects anything
+	// outside 1..500, but the store must not depend on that: a zero-value
+	// filter from any other caller became LIMIT 0, and an empty answer on a
+	// statutory compliance register reads as "this tenant owes nothing".
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = defaultListLimit
+	}
+	args = append(args, limit)
 	query += fmt.Sprintf(" LIMIT $%d", len(args))
 	args = append(args, filter.Offset)
 	query += fmt.Sprintf(" OFFSET $%d;", len(args))

@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"testing"
 	"time"
 
@@ -11,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/obligations-svc/internal/domain"
+	"zoiko.io/obligations-svc/internal/middleware"
 	"zoiko.io/obligations-svc/internal/store"
 )
 
@@ -26,17 +30,58 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// setupTestDB rebuilds the schema by replaying EVERY migration in order, not
+// just the initial one. Applying a subset produces a schema no deployed
+// database has ever had — here it omitted the tenant_id column that 000003
+// adds, so the store's tenant predicates could not compile against it and the
+// whole suite failed the moment TEST_DATABASE_URL was set.
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS filing_requirements, obligations CASCADE;")
+	// Every table any migration creates must be dropped here, or the second
+	// test in a run replays a CREATE TABLE against one that already exists.
+	// applicability_decisions was missing from this list, which stayed invisible
+	// only while the suite replayed 000001 alone.
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS applicability_decisions, filing_requirements, obligations CASCADE;")
 
-	mig1, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
+	// Every up migration in order — DISCOVERED, not listed, so migration 000004
+	// cannot reintroduce this. Sorting by filename is what orders them, which is
+	// what the zero-padded numeric prefix is for.
+	_, filename, _, _ := runtime.Caller(0)
+	migDir := filepath.Join(filepath.Dir(filename), "..", "..", "deployments", "migrations")
+
+	migrations, err := filepath.Glob(filepath.Join(migDir, "*.up.sql"))
 	if err != nil {
-		t.Fatalf("failed to read migration 1: %v", err)
+		t.Fatalf("failed to glob migrations: %v", err)
 	}
-	if _, err := pool.Exec(ctx, string(mig1)); err != nil {
-		t.Fatalf("failed to execute migration 1: %v", err)
+	if len(migrations) == 0 {
+		t.Fatalf("no migrations found in %s", migDir)
 	}
+	sort.Strings(migrations)
+
+	for _, path := range migrations {
+		sql, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(path), err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to execute migration %s: %v", filepath.Base(path), err)
+		}
+	}
+}
+
+// testTenantID and otherTenantID are the two scopes the suite runs under.
+// Obligations are tenant-scoped as of migration 000003.
+const (
+	testTenantID  = "aaaaaaaa-0000-0000-0000-000000000001"
+	otherTenantID = "bbbbbbbb-0000-0000-0000-000000000002"
+)
+
+// tenantCtx carries the tenant the way the store reads it: from the context,
+// which in production only the tenant middleware populates. A bare
+// context.Background() here is an unscoped call, which the store now refuses —
+// so these tests must build the context the middleware would have built.
+func tenantCtx(tenantID string) context.Context {
+	return middleware.WithTenant(context.Background(), tenantID)
 }
 
 func validParams() domain.CreateObligationParams {
@@ -61,7 +106,7 @@ func TestPgStore_CreateObligation_IdempotencyAnd409(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	params := validParams()
 
@@ -108,7 +153,7 @@ func TestPgStore_FindObligationByID_NotFound(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	_, err := s.FindObligationByID(context.Background(), "00000000-0000-0000-0000-000000000099")
+	_, err := s.FindObligationByID(tenantCtx(testTenantID), "00000000-0000-0000-0000-000000000099")
 	if !errors.Is(err, domain.ErrObligationNotFound) {
 		t.Fatalf("expected ErrObligationNotFound, got %v", err)
 	}
@@ -120,7 +165,7 @@ func TestPgStore_ListObligations_Filters(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	p1 := validParams()
 	p1.ObligationCode = "OBL-A"
@@ -159,7 +204,7 @@ func TestPgStore_UpdateObligationStatus_LegalTransitionsAndIdempotency(t *testin
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	o, _, err := s.CreateObligation(ctx, validParams())
 	if err != nil {
@@ -209,7 +254,7 @@ func TestPgStore_UpdateObligationStatus_IllegalSkipTransition(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	o, _, err := s.CreateObligation(ctx, validParams())
 	if err != nil {
@@ -238,7 +283,7 @@ func TestPgStore_FilingRequirement_CreateAndList(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	o, _, err := s.CreateObligation(ctx, validParams())
 	if err != nil {
@@ -273,7 +318,7 @@ func TestPgStore_CreateFilingRequirement_ObligationNotFound(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	_, err := s.CreateFilingRequirement(context.Background(), domain.CreateFilingRequirementParams{
+	_, err := s.CreateFilingRequirement(tenantCtx(testTenantID), domain.CreateFilingRequirementParams{
 		ObligationID:      "00000000-0000-0000-0000-000000000099",
 		FilingType:        "ANNUAL_RETURN",
 		FilingAuthority:   "IRS",
@@ -281,5 +326,47 @@ func TestPgStore_CreateFilingRequirement_ObligationNotFound(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrObligationNotFound) {
 		t.Fatalf("expected ErrObligationNotFound, got %v", err)
+	}
+}
+
+// TestPgStore_ObligationCode_IsScopedPerTenant pins the defect migration 000003
+// closes. obligation_code carried a GLOBAL unique index and creation is
+// idempotent on it, so a second tenant registering an ordinary code was handed
+// the FIRST tenant's obligation as a successful create — their legal entity,
+// their due date, their source reference — through the documented happy path.
+func TestPgStore_ObligationCode_IsScopedPerTenant(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+
+	// The same ordinary code, registered by two unrelated tenants.
+	shared := validParams()
+	shared.ObligationCode = "VAT-Q1-2026"
+
+	first, created, err := s.CreateObligation(tenantCtx(testTenantID), shared)
+	if err != nil || !created {
+		t.Fatalf("first tenant create: created=%v err=%v", created, err)
+	}
+
+	second, created, err := s.CreateObligation(tenantCtx(otherTenantID), shared)
+	if err != nil {
+		t.Fatalf("second tenant create: %v", err)
+	}
+	if !created {
+		t.Fatal("second tenant was handed the first tenant's obligation as an idempotent no-op")
+	}
+	if second.ObligationID == first.ObligationID {
+		t.Fatalf("both tenants share obligation %s — the code is not tenant-scoped", first.ObligationID)
+	}
+
+	// Neither tenant can read the other's by id: another tenant's record reads
+	// as not-found, so its existence cannot be probed.
+	if _, err := s.FindObligationByID(tenantCtx(otherTenantID), first.ObligationID); !errors.Is(err, domain.ErrObligationNotFound) {
+		t.Fatalf("expected ErrObligationNotFound reading across tenants, got %v", err)
+	}
+	if _, err := s.FindObligationByID(tenantCtx(testTenantID), second.ObligationID); !errors.Is(err, domain.ErrObligationNotFound) {
+		t.Fatalf("expected ErrObligationNotFound reading across tenants, got %v", err)
 	}
 }
