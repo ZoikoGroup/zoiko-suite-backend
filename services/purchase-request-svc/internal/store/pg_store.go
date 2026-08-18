@@ -220,7 +220,7 @@ func (s *PgStore) ListRequests(ctx context.Context, filter domain.ListRequestsFi
 // statement — no separate read, no race window. Returns
 // domain.ErrInvalidTransition if zero rows were affected (the request
 // doesn't exist, wasn't PENDING, or belongs to a different tenant).
-func (s *PgStore) TransitionRequest(ctx context.Context, tenantID, requestID string, toStatus domain.RequestStatus, actorPrincipalID string, rejectionReason *string) error {
+func (s *PgStore) TransitionRequest(ctx context.Context, tenantID, requestID string, toStatus domain.RequestStatus, actorPrincipalID string, actedAt time.Time, rejectionReason *string) error {
 	var query string
 	var args []any
 	switch toStatus {
@@ -230,14 +230,14 @@ func (s *PgStore) TransitionRequest(ctx context.Context, tenantID, requestID str
 			SET status = $1, approved_by_principal_id = $2, approved_at = $3
 			WHERE request_id = $4 AND status = 'PENDING' AND tenant_id = $5
 		`
-		args = []any{string(toStatus), actorPrincipalID, time.Now().UTC(), requestID, tenantID}
+		args = []any{string(toStatus), actorPrincipalID, actedAt, requestID, tenantID}
 	case domain.RequestStatusRejected:
 		query = `
 			UPDATE purchase_requests
 			SET status = $1, rejected_by_principal_id = $2, rejected_at = $3, rejection_reason = $4
 			WHERE request_id = $5 AND status = 'PENDING' AND tenant_id = $6
 		`
-		args = []any{string(toStatus), actorPrincipalID, time.Now().UTC(), rejectionReason, requestID, tenantID}
+		args = []any{string(toStatus), actorPrincipalID, actedAt, rejectionReason, requestID, tenantID}
 	default:
 		return domain.ErrInvalidTransition
 	}

@@ -222,7 +222,14 @@ func (h *Handler) ValidateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inv.Status = domain.InvoiceStatusValidated
+	// Re-fetch so the response reflects the transition (validated_by etc.),
+	// rather than the pre-transition snapshot fetched above.
+	inv, err = h.store.GetInvoice(r.Context(), invoiceID)
+	if err != nil || inv == nil {
+		h.log.Error("ValidateInvoice: re-fetch failed after transition", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
 	h.publisher.PublishVendorInvoiceValidated(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
@@ -269,7 +276,14 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inv.Status = domain.InvoiceStatusApproved
+	// Re-fetch so the response reflects the transition (approved_by etc.),
+	// rather than the pre-transition snapshot fetched above.
+	inv, err = h.store.GetInvoice(r.Context(), invoiceID)
+	if err != nil || inv == nil {
+		h.log.Error("ApproveInvoice: re-fetch failed after transition", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
 	h.publisher.PublishVendorInvoiceApproved(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }
@@ -332,7 +346,14 @@ func (h *Handler) RequestPayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inv.Status = domain.InvoiceStatusPaymentRequested
+	// Re-fetch so the response reflects the transition, rather than the
+	// pre-transition snapshot fetched above.
+	inv, err = h.store.GetInvoice(r.Context(), invoiceID)
+	if err != nil || inv == nil {
+		h.log.Error("RequestPayment: re-fetch failed after transition", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
 	h.publisher.PublishPaymentRequested(r.Context(), *inv)
 	writeJSON(w, http.StatusOK, inv)
 }

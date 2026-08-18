@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -24,6 +27,7 @@ func newTestStore(t *testing.T) *store.PgStore {
 	if dsn == "" {
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
+	requireThrowawayDatabase(t, dsn)
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -35,21 +39,42 @@ func newTestStore(t *testing.T) *store.PgStore {
 
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS event_schemas CASCADE;")
 
-	// Every up migration in order, rather than naming one inline. A migration
-	// added later is then applied by the tests automatically — the alternative
-	// has already caused a live incident in this repo, where an unapplied
-	// migration made every write fail in a way that read as a code bug.
-	for _, name := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_compatibility_mode.up.sql",
-	} {
-		migSQL, err := os.ReadFile(filepath.Join(migDir, name))
-		require.NoError(t, err, "read migration %s", name)
+	// Every up migration in order — DISCOVERED, not listed.
+	//
+	// This used to be a hardcoded slice under a comment promising that "a
+	// migration added later is then applied by the tests automatically", which
+	// it was not: adding 000003 would have left the suite testing a schema no
+	// deployment runs, which is the exact failure the comment claimed to
+	// prevent. Globbing makes the promise true.
+	migrations, err := filepath.Glob(filepath.Join(migDir, "*.up.sql"))
+	require.NoError(t, err)
+	require.NotEmpty(t, migrations, "no migrations found in %s", migDir)
+	sort.Strings(migrations)
+
+	for _, path := range migrations {
+		migSQL, err := os.ReadFile(path)
+		require.NoError(t, err, "read migration %s", path)
 		_, err = pool.Exec(ctx, string(migSQL))
-		require.NoError(t, err, "apply migration %s", name)
+		require.NoError(t, err, "apply migration %s", filepath.Base(path))
 	}
 
 	return store.New(pool, zap.NewNop())
+}
+
+// requireThrowawayDatabase refuses to run against anything not recognisably
+// disposable. This suite DROPs event_schemas, and those rows are the canonical
+// record of every event contract on the platform — there is no other copy.
+// Only the database NAME vouches for it; a password that happens to contain
+// "test" must not. Every other service's store suite has this guard; this one
+// did not.
+func requireThrowawayDatabase(t *testing.T, dsn string) {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	require.NoError(t, err, "TEST_DATABASE_URL is not a parseable URL")
+	dbName := strings.TrimPrefix(u.Path, "/")
+	require.Contains(t, strings.ToLower(dbName), "test",
+		"refusing to run: TEST_DATABASE_URL names database %q, which is not recognisably disposable, "+
+			"and this suite DROPs event_schemas. Use schema_registry_test (or CI's testdb).", dbName)
 }
 
 func TestPgStore_Insert_And_LatestVersion(t *testing.T) {
@@ -134,7 +159,7 @@ func TestPgStore_Versions_ReturnsAllOldestFirst(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	versions, err := s.Versions(ctx, "session.invalidated")
+	versions, err := s.Versions(ctx, "session.invalidated", 100, 0)
 	require.NoError(t, err)
 	require.Len(t, versions, 3)
 	assert.Equal(t, []int{1, 2, 3}, []int{versions[0].Version, versions[1].Version, versions[2].Version})
@@ -145,15 +170,15 @@ func TestPgStore_EventNames_ListsDistinctRegisteredEvents(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := s.Insert(ctx, &domain.EventSchema{
-		EventName: "event.a", JSONSchema: json.RawMessage(`{}`), CompatibilityMode: domain.CompatibilityBackward,
+		EventName: "event.a", JSONSchema: json.RawMessage(`{"properties":{"a":{"type":"string"}}}`), CompatibilityMode: domain.CompatibilityBackward,
 	}, 0)
 	require.NoError(t, err)
 	_, err = s.Insert(ctx, &domain.EventSchema{
-		EventName: "event.b", JSONSchema: json.RawMessage(`{}`), CompatibilityMode: domain.CompatibilityBackward,
+		EventName: "event.b", JSONSchema: json.RawMessage(`{"properties":{"a":{"type":"string"}}}`), CompatibilityMode: domain.CompatibilityBackward,
 	}, 0)
 	require.NoError(t, err)
 
-	names, err := s.EventNames(ctx)
+	names, err := s.EventNames(ctx, 100, 0)
 	require.NoError(t, err)
 	assert.Contains(t, names, "event.a")
 	assert.Contains(t, names, "event.b")
@@ -196,7 +221,7 @@ func TestPgStore_Insert_RefusesStaleBaseline(t *testing.T) {
 		"a write against a stale baseline must be refused, not silently versioned")
 
 	// The winner is untouched and no phantom version was created.
-	versions, err := s.Versions(ctx, "race.probe")
+	versions, err := s.Versions(ctx, "race.probe", 100, 0)
 	require.NoError(t, err)
 	assert.Len(t, versions, 1, "the refused write must not have inserted anything")
 
@@ -242,7 +267,7 @@ func TestPgStore_Insert_ConcurrentRegistrationsProduceNoDuplicates(t *testing.T)
 	assert.Equal(t, 1, won, "exactly one writer may claim version 1")
 	assert.Equal(t, writers-1, raced, "every other writer must be told it raced")
 
-	versions, err := s.Versions(ctx, "concurrent.probe")
+	versions, err := s.Versions(ctx, "concurrent.probe", 100, 0)
 	require.NoError(t, err)
 	assert.Len(t, versions, 1, "concurrent registrations must not produce duplicate versions")
 }

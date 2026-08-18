@@ -14,6 +14,7 @@ import (
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
 	"zoiko.io/general-ledger-svc/internal/handler"
+	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
 
 // ── stubs ────────────────────────────────────────────────────────────────────
@@ -27,9 +28,18 @@ type stubStore struct {
 	getErr        error
 	listErr       error
 	transitionErr error
+	reverseErr    error
 	sumErr        error
-	debitTotal    float64
-	creditTotal   float64
+
+	// Minor units (cents), matching the real store — the balance invariant is
+	// decided by exact integer equality, not a float comparison.
+	debitTotal  int64
+	creditTotal int64
+
+	// lastListFilter records what ListJournals was actually asked for, so a
+	// test can assert the tenant the handler passed down rather than only the
+	// rows that came back.
+	lastListFilter domain.ListJournalsFilter
 }
 
 func newStubStore() *stubStore {
@@ -68,13 +78,33 @@ func (s *stubStore) GetJournal(_ context.Context, journalID string) (*domain.Jou
 	return h, s.lines[journalID], nil
 }
 
-func (s *stubStore) ListJournals(_ context.Context, _ domain.ListJournalsFilter) ([]domain.JournalHeader, error) {
+func (s *stubStore) GetJournalByCorrelationID(_ context.Context, tenantID, correlationID string) (*domain.JournalHeader, []domain.JournalLine, error) {
+	if s.getErr != nil {
+		return nil, nil, s.getErr
+	}
+	journalID, ok := s.byCorrelation[correlationID]
+	if !ok {
+		return nil, nil, nil
+	}
+	h, ok := s.journals[journalID]
+	if !ok || h.TenantID != tenantID {
+		return nil, nil, nil
+	}
+	return h, s.lines[journalID], nil
+}
+
+func (s *stubStore) ListJournals(_ context.Context, filter domain.ListJournalsFilter) ([]domain.JournalHeader, error) {
+	s.lastListFilter = filter
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
+	// Filters by tenant like the real store, so a test that asks for another
+	// tenant's ledger cannot pass merely because the stub ignored the scope.
 	var out []domain.JournalHeader
 	for _, h := range s.journals {
-		out = append(out, *h)
+		if h.TenantID == filter.TenantID {
+			out = append(out, *h)
+		}
 	}
 	return out, nil
 }
@@ -91,9 +121,51 @@ func (s *stubStore) TransitionJournal(_ context.Context, _, journalID string, fr
 	return nil
 }
 
-func (s *stubStore) SumLines(_ context.Context, _, _ string) (float64, float64, error) {
+// ReverseJournal mirrors the real store's atomicity: if the original is no
+// longer FINALIZED the reversing journal is NOT created either. A stub that
+// created it anyway would let the handler's double-counting regression pass.
+func (s *stubStore) ReverseJournal(
+	ctx context.Context,
+	_, originalJournalID string,
+	reversing *domain.JournalHeader,
+	reversingLines []domain.JournalLine,
+	actorPrincipalID string,
+) ([]domain.JournalLine, bool, error) {
+	if s.reverseErr != nil {
+		return nil, false, s.reverseErr
+	}
+	if reversing.CorrelationID != "" {
+		if existingID, ok := s.byCorrelation[reversing.CorrelationID]; ok {
+			existing := s.journals[existingID]
+			*reversing = *existing
+			return s.lines[existingID], false, nil
+		}
+	}
+
+	original, ok := s.journals[originalJournalID]
+	if !ok || original.Status != domain.JournalStatusFinalized {
+		return nil, false, domain.ErrInvalidTransition
+	}
+
+	if reversing.CorrelationID != "" {
+		s.byCorrelation[reversing.CorrelationID] = reversing.JournalID
+	}
+	s.journals[reversing.JournalID] = reversing
+	s.lines[reversing.JournalID] = reversingLines
+
+	original.Status = domain.JournalStatusReversed
+	original.ReversedByPrincipalID = &actorPrincipalID
+	return reversingLines, true, nil
+}
+
+func (s *stubStore) SumLines(_ context.Context, _, _ string) (int64, int64, error) {
 	return s.debitTotal, s.creditTotal, s.sumErr
 }
+
+// Compile-time proof the stub still satisfies the contract the handler
+// depends on — a stub that has silently fallen behind the interface is how a
+// green test suite stops meaning anything.
+var _ handler.Store = (*stubStore)(nil)
 
 type stubPublisher struct {
 	created, validated, posted, reversed int
@@ -129,12 +201,27 @@ func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
 
 func newRouterWithClose(s *stubStore, p *stubPublisher, a *stubAuthZ, c close.Client) chi.Router {
 	r := chi.NewRouter()
+	// The real TenantContext middleware, not a hand-rolled context stuffer:
+	// tenant scope reaching the handler is now part of what these tests cover,
+	// and a bare router would test a request pipeline this service never runs.
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, p, a, c, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
 
+// testTenantID is the verified tenant every request carries unless a test is
+// specifically about tenant scope. It matches validCreateReq's body tenant_id.
+const testTenantID = "t1"
+
 func doRequest(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	return doRequestAs(r, method, path, body, principalID, testTenantID)
+}
+
+// doRequestAs sends a request as a caller the gateway verified as tenantID.
+// An empty tenantID sends no X-Tenant-Id at all — a request that never passed
+// ForwardAuth.
+func doRequestAs(r chi.Router, method, path string, body any, principalID, tenantID string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -143,6 +230,9 @@ func doRequest(r chi.Router, method, path string, body any, principalID string) 
 	req.Header.Set("Content-Type", "application/json")
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -404,10 +494,225 @@ func TestGetJournal_NotFound(t *testing.T) {
 	}
 }
 
-func TestListJournals_RequiresTenantID(t *testing.T) {
+func TestListJournals_RequiresVerifiedTenantScope(t *testing.T) {
+	// tenant_id in the query string is no longer what scopes this read, so
+	// supplying one cannot substitute for having passed identity verification.
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
-	rec := doRequest(r, http.MethodGet, "/v1/journals/", nil, "")
+	rec := doRequestAs(r, http.MethodGet, "/v1/journals/?tenant_id=t1", nil, "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no verified X-Tenant-Id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── tenant scope ─────────────────────────────────────────────────────────────
+
+func TestListJournals_ForeignTenantIDInQuery_Refused(t *testing.T) {
+	// The leak this closes: ListJournals passed ?tenant_id straight to the
+	// WHERE clause, so any verified caller could read any tenant's entire
+	// general ledger without needing to guess a single id.
+	s := newStubStore()
+	s.journals["theirs"] = &domain.JournalHeader{
+		JournalID: "theirs", TenantID: "t2", LegalEntityID: "e9",
+		Status: domain.JournalStatusFinalized, Description: "another tenant's ledger",
+	}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequestAs(r, http.MethodGet, "/v1/journals/?tenant_id=t2", nil, "principal-1", "t1")
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 asking for another tenant's ledger, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if bytes.Contains(rec.Body.Bytes(), []byte("another tenant's ledger")) {
+		t.Fatal("response leaked the other tenant's journal")
+	}
+}
+
+func TestListJournals_ScopedToVerifiedTenant_NotQueryParam(t *testing.T) {
+	s := newStubStore()
+	s.journals["mine"] = &domain.JournalHeader{JournalID: "mine", TenantID: "t1", Status: domain.JournalStatusPending}
+	s.journals["theirs"] = &domain.JournalHeader{JournalID: "theirs", TenantID: "t2", Status: domain.JournalStatusPending}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	// No tenant_id query parameter at all: the verified scope is enough, and
+	// is what the store must be asked for.
+	rec := doRequestAs(r, http.MethodGet, "/v1/journals/", nil, "principal-1", "t1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.lastListFilter.TenantID != "t1" {
+		t.Fatalf("store was asked for tenant %q, expected the verified tenant t1", s.lastListFilter.TenantID)
+	}
+
+	var journals []domain.JournalHeader
+	if err := json.Unmarshal(rec.Body.Bytes(), &journals); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(journals) != 1 || journals[0].JournalID != "mine" {
+		t.Fatalf("expected only this tenant's journal, got %+v", journals)
+	}
+}
+
+func TestListJournals_EmptyLedger_IsEmptyArrayNotNull(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/journals/", nil, "principal-1")
+	if got := bytes.TrimSpace(rec.Body.Bytes()); string(got) != "[]" {
+		t.Fatalf("expected an empty JSON array, got %q — null forces every caller to special-case it", got)
+	}
+}
+
+func TestListJournals_InvalidLimit_Rejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	for _, limit := range []string{"0", "-5", "all"} {
+		rec := doRequest(r, http.MethodGet, "/v1/journals/?limit="+limit, nil, "principal-1")
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("limit=%s: expected 400, got %d", limit, rec.Code)
+		}
+	}
+}
+
+func TestCreateJournal_BodyTenantDisagreesWithVerifiedScope_Refused(t *testing.T) {
+	// The write half of the same leak: the row used to be inserted under the
+	// body's tenant_id while the transaction was scoped to the verified one,
+	// filing a journal into a ledger the caller has no relationship with.
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+
+	req := validCreateReq()
+	req.TenantID = "t2" // caller is verified as t1
+
+	rec := doRequestAs(r, http.MethodPost, "/v1/journals/", req, "principal-1", "t1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.journals) != 0 {
+		t.Fatalf("expected no journal to be written, got %d", len(s.journals))
+	}
+}
+
+func TestCreateJournal_MissingTenantScope_Returns401(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequestAs(r, http.MethodPost, "/v1/journals/", validCreateReq(), "principal-1", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no verified tenant scope, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.journals) != 0 {
+		t.Fatalf("expected no journal to be written, got %d", len(s.journals))
+	}
+}
+
+func TestCreateJournal_MalformedUUID_Returns400Not503(t *testing.T) {
+	// SQLSTATE 22P02 from a uuid column used to reach the caller as
+	// "store_unavailable" — a typo reported as an outage.
+	s := newStubStore()
+	s.createErr = domain.ErrInvalidIdentifier
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", validCreateReq(), "principal-1")
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 without tenant_id query param, got %d", rec.Code)
+		t.Fatalf("expected 400 for a non-UUID identifier, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── reversal integrity ───────────────────────────────────────────────────────
+
+func TestReverseJournal_ReversingJournalCarriesLinkAndPostingStamps(t *testing.T) {
+	// reversal_of_journal_id and the posted_* pair were absent from the INSERT
+	// column list, so the link back to the original — the whole basis for
+	// tracing a correction — was generated, returned, and then dropped.
+	s := newStubStore()
+	s.journals["j1"] = &domain.JournalHeader{JournalID: "j1", TenantID: "t1", LegalEntityID: "e1", Status: domain.JournalStatusFinalized}
+	s.lines["j1"] = []domain.JournalLine{{AccountCode: "1000", DebitAmount: 100}}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/journals/j1/reverse",
+		domain.ReverseJournalRequest{Reason: "correction", CorrelationID: "corr-reverse-1"}, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var result domain.JournalWithLines
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// What the response claims must be what was handed to the store — the
+	// defect was precisely a response that outlived the row behind it.
+	stored, ok := s.journals[result.JournalID]
+	if !ok {
+		t.Fatalf("the reversing journal in the response (%s) was never written to the store", result.JournalID)
+	}
+	if stored.ReversalOfJournalID == nil || *stored.ReversalOfJournalID != "j1" {
+		t.Fatalf("stored reversing journal must point back at j1, got %v", stored.ReversalOfJournalID)
+	}
+	if stored.Status != domain.JournalStatusFinalized {
+		t.Fatalf("a reversal is an authoritative posting, expected FINALIZED, got %s", stored.Status)
+	}
+	if stored.PostedByPrincipalID == nil || *stored.PostedByPrincipalID != "principal-1" {
+		t.Fatalf("stored reversing journal must record who posted it, got %v", stored.PostedByPrincipalID)
+	}
+	if result.ReversalOfJournalID == nil || *result.ReversalOfJournalID != "j1" {
+		t.Fatalf("response must carry the reversal link too, got %v", result.ReversalOfJournalID)
+	}
+}
+
+func TestReverseJournal_TransitionRefused_LeavesNoOrphanReversal(t *testing.T) {
+	// The double-counting window: the reversing journal was created FINALIZED
+	// by one call and the original marked REVERSED by a second. If the second
+	// failed, the books held a posting and its inverse, both live.
+	s := newStubStore()
+	s.journals["j1"] = &domain.JournalHeader{JournalID: "j1", TenantID: "t1", LegalEntityID: "e1", Status: domain.JournalStatusFinalized}
+	s.lines["j1"] = []domain.JournalLine{{AccountCode: "1000", DebitAmount: 100}}
+	s.reverseErr = domain.ErrInvalidTransition // the original stopped being FINALIZED
+
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/journals/j1/reverse",
+		domain.ReverseJournalRequest{Reason: "correction", CorrelationID: "corr-reverse-1"}, "principal-1")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when the original is no longer FINALIZED, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.journals) != 1 {
+		t.Fatalf("a refused reversal must leave no reversing journal behind, store holds %d journals", len(s.journals))
+	}
+	if pub.reversed != 0 {
+		t.Fatalf("journal.reversed must not be published for a reversal that did not happen, got %d", pub.reversed)
+	}
+}
+
+func TestReverseJournal_RetriedCorrelationID_ReturnsStoredReversalNotAFreshID(t *testing.T) {
+	s := newStubStore()
+	s.journals["j1"] = &domain.JournalHeader{JournalID: "j1", TenantID: "t1", LegalEntityID: "e1", Status: domain.JournalStatusFinalized}
+	s.lines["j1"] = []domain.JournalLine{{AccountCode: "1000", DebitAmount: 100}}
+
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
+	body := domain.ReverseJournalRequest{Reason: "correction", CorrelationID: "corr-reverse-1"}
+
+	rec1 := doRequest(r, http.MethodPost, "/v1/journals/j1/reverse", body, "principal-1")
+	if rec1.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on the first reversal, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	var first domain.JournalWithLines
+	if err := json.Unmarshal(rec1.Body.Bytes(), &first); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+
+	rec2 := doRequest(r, http.MethodPost, "/v1/journals/j1/reverse", body, "principal-1")
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("expected 200 on the retry, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var second domain.JournalWithLines
+	if err := json.Unmarshal(rec2.Body.Bytes(), &second); err != nil {
+		t.Fatalf("decode second: %v", err)
+	}
+
+	if second.JournalID != first.JournalID {
+		t.Fatalf("the retry returned journal_id %s, but the stored reversal is %s — a fresh id for a row that was never written",
+			second.JournalID, first.JournalID)
+	}
+	if pub.reversed != 1 {
+		t.Fatalf("journal.reversed must publish once across a retry, got %d", pub.reversed)
 	}
 }

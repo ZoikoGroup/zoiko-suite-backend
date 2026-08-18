@@ -1,15 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
@@ -22,8 +19,8 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/notification-svc/internal/authz"
 	"zoiko.io/notification-svc/internal/config"
-	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
@@ -31,137 +28,6 @@ import (
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
-
-// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
-// authorization-svc may be reused locally before it is asked again.
-//
-// Doc 05 (Security Architecture Specification) §6.5 anticipates exactly
-// this cost: "For Tier 0 and latency-sensitive services, policy and
-// authorization evaluation may use high-speed distributed enforcement
-// patterns, including local policy caches... provided policy source
-// remains centralized, policy provenance is auditable, stale decision
-// risk is bounded, fail-safe behavior is defined." This constant is that
-// bound — short enough that a permission revocation or role change
-// propagates within one cache generation, long enough to absorb the
-// repeat checks a single user action or request burst produces.
-//
-// Only real GRANTED/DENIED decisions are ever cached. An unreachable or
-// misbehaving authorization-svc is never cached — that would turn one
-// transient outage into a standing permit-or-deny for every subsequent
-// caller on this instance, which defeats fail-closed.
-const decisionCacheTTL = 5 * time.Second
-
-type cachedDecision struct {
-	deniedErr error
-	expiresAt time.Time
-}
-
-type httpAuthzClient struct {
-	baseURL string
-	client  *http.Client
-	log     *zap.Logger
-
-	cacheMu     sync.Mutex
-	cache       map[string]cachedDecision
-	cacheWrites int
-}
-
-func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
-
-	if decision, hit := a.lookupCache(key); hit {
-		return decision
-	}
-
-	err := a.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
-
-	// Cache the decision itself (GRANTED or DENIED), never an unavailable
-	// outcome — see the doc comment on decisionCacheTTL.
-	if err == nil || errors.Is(err, domain.ErrAuthorizationDenied) {
-		a.storeCache(key, err)
-	}
-
-	return err
-}
-
-// lookupCache returns the cached decision for key and whether it is still
-// within decisionCacheTTL. An expired entry is evicted on read.
-func (a *httpAuthzClient) lookupCache(key string) (error, bool) {
-	a.cacheMu.Lock()
-	defer a.cacheMu.Unlock()
-
-	d, ok := a.cache[key]
-	if !ok {
-		return nil, false
-	}
-	if time.Now().After(d.expiresAt) {
-		delete(a.cache, key)
-		return nil, false
-	}
-	return d.deniedErr, true
-}
-
-// storeCache records a real GRANTED/DENIED decision. Every 1000th write
-// sweeps expired entries so a long-lived instance with many distinct
-// (principal, entity, action) combinations doesn't grow the map
-// unboundedly between reads of the same key.
-func (a *httpAuthzClient) storeCache(key string, decision error) {
-	a.cacheMu.Lock()
-	defer a.cacheMu.Unlock()
-
-	a.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
-
-	a.cacheWrites++
-	if a.cacheWrites%1000 == 0 {
-		now := time.Now()
-		for k, v := range a.cache {
-			if now.After(v.expiresAt) {
-				delete(a.cache, k)
-			}
-		}
-	}
-}
-
-// checkAllowedLive is the real, uncached call to authorization-svc.
-//
-// authorization-svc's /v1/authorize always responds 200, and signals the
-// actual decision via decision_outcome: "GRANTED" | "DENIED" — there is no
-// "allowed" boolean field in its response.
-func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	reqBody, _ := json.Marshal(map[string]string{
-		"principal_id":    principalID,
-		"legal_entity_id": legalEntityID,
-		"action_type":     actionType,
-	})
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/authorize", bytes.NewReader(reqBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		a.log.Error("failed to call authorization-svc", zap.Error(err))
-		return domain.ErrAuthzServiceUnavailable
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return domain.ErrAuthzServiceUnavailable
-	}
-
-	var res struct {
-		DecisionOutcome string `json:"decision_outcome"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return err
-	}
-	if res.DecisionOutcome != "GRANTED" {
-		return domain.ErrAuthorizationDenied
-	}
-	return nil
-}
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -228,20 +94,35 @@ func main() {
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
 
-	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
-		// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
-		// Writer refuses to produce to a not-yet-existing topic unless this
-		// is also set client-side — without it, every first publish to this
-		// service's own topic fails with "Unknown Topic Or Partition".
-		AllowAutoTopicCreation: true,
+	// A deployment says "no broker" with an explicitly empty KAFKA_BROKERS;
+	// the publisher then logs instead of writing, rather than blocking every
+	// send on a dial to a broker that does not exist.
+	var kafkaWriter *kafka.Writer
+	if len(cfg.Kafka.Brokers) > 0 {
+		kafkaWriter = &kafka.Writer{
+			Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:    cfg.Kafka.Topic,
+			Balancer: &kafka.LeastBytes{},
+			// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
+			// Writer refuses to produce to a not-yet-existing topic unless this
+			// is also set client-side — without it, every first publish to this
+			// service's own topic fails with "Unknown Topic Or Partition".
+			AllowAutoTopicCreation: true,
+			// kafka-go's default is 1s: a synchronous WriteMessages waits out
+			// the full batch timeout before returning, so every notification
+			// send paid a wasted second inside the request. Platform-wide
+			// value, same as the other gap-closed services.
+			BatchTimeout: 10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+	} else {
+		log.Warn("KAFKA_BROKERS is empty — events will be logged, not published")
 	}
-	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
+	// The decision cache main.go grew for this client now lives in the authz
+	// package alongside the client itself, so it is covered by client_test.go.
+	authzClient := authz.NewClient(cfg.AuthZServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -254,7 +135,7 @@ func main() {
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	h := handler.New(pgStore, publisher, authzClient, handler.StubDeliverer{Log: log}, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

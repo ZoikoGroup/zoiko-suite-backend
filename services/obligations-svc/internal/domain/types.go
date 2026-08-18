@@ -111,12 +111,21 @@ type CreateObligationParams struct {
 // ListObligationsFilter holds optional filters for querying obligations.
 // Zero-value (empty string / nil) fields are not applied.
 type ListObligationsFilter struct {
+	// TenantID is optional on the filter and mandatory in the store, which
+	// reads it from the request context. Supplying a different one here is
+	// refused: a filter may narrow a read, never widen it to another tenant.
+	TenantID       string
 	LegalEntityID  string
 	JurisdictionID string
 	ObligationType string
 	Status         string
 	DueBefore      *time.Time
 	DueAfter       *time.Time
+
+	// Limit and Offset bound the register read. It was unbounded — every
+	// obligation a tenant had ever recorded, in one response, forever.
+	Limit  int
+	Offset int
 }
 
 // CreateFilingRequirementParams holds input parameters for creating a
@@ -151,6 +160,23 @@ var ErrJurisdictionNotFound = errorString("jurisdiction not found")
 // ErrJurisdictionServiceUnavailable is returned when jurisdiction-rules-svc
 // cannot be reached to validate JurisdictionID.
 var ErrJurisdictionServiceUnavailable = errorString("jurisdiction-rules-svc unavailable")
+
+// ErrTenantMissing is returned when a request carries no X-Tenant-Id. It is an
+// unscoped request, refused rather than defaulted to some shared bucket.
+var ErrTenantMissing = errorString("tenant scope missing")
+
+// ErrAuthorizationDenied is returned when authorization-svc answers DENIED.
+var ErrAuthorizationDenied = errorString("not authorized for this obligation action")
+
+// ErrAuthorizationUnavailable is returned when authorization-svc cannot be
+// reached or gives an answer this service cannot read. Mutations fail closed.
+var ErrAuthorizationUnavailable = errorString("authorization service unavailable")
+
+// ErrInvalidIdentifier is what a malformed UUID becomes. obligation_id and the
+// entity/jurisdiction ids are uuid columns, so a mistyped one dies inside the
+// driver as SQLSTATE 22P02 before any row is examined — and used to surface as
+// 503 store_unavailable, an outage status for a typo in a URL.
+var ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
 
 type errorString string
 

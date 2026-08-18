@@ -238,7 +238,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 	// tenantID as the scope argument — exactly what a handler bug would look
 	// like if TenantID were taken from the request body instead of the
 	// caller's real context.
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", nil)
+	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", time.Now().UTC(), nil)
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
 		"ISOLATION FAILURE: tenant B was able to approve tenant A's request")
 
@@ -251,7 +251,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 		"ISOLATION FAILURE: tenant A's request status was mutated by tenant B")
 
 	// Sanity: tenant B can still approve its OWN request.
-	err = testStore.TransitionRequest(context.Background(), b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", nil)
+	err = testStore.TransitionRequest(context.Background(), b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", time.Now().UTC(), nil)
 	require.NoError(t, err)
 	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
 	gotB, err := testStore.GetRequest(ctxB, b.requestID)
@@ -264,7 +264,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Reject(t *testing.T) {
 	b := setupIsolationFixture(t, "B-Reject")
 
 	reason := "attacker-supplied reason"
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", &reason)
+	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", time.Now().UTC(), &reason)
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
 		"ISOLATION FAILURE: tenant B was able to reject tenant A's request")
 

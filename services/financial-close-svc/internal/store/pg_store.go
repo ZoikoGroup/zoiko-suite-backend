@@ -7,10 +7,29 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/financial-close-svc/internal/domain"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
 )
+
+// mapPgError translates the Postgres failures that are really caller mistakes
+// into domain errors, so they stop arriving at the handler as "the store is
+// unavailable".
+//
+// fiscal_period_id is a uuid column, so a mistyped id compared against it dies
+// inside the driver as SQLSTATE 22P02 before any row is examined — and used to
+// reach the caller as 503 store_unavailable, a status that sends an operator to
+// look at infrastructure over what is a typo in a URL. A period id that cannot
+// be a UUID names no period, which is exactly what "not found" means. Same fix,
+// same reasoning, as accounts-payable-svc and general-ledger-svc.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return domain.ErrFiscalPeriodNotFound
+	}
+	return err
+}
 
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -108,7 +127,7 @@ func (s *PgStore) GetFiscalPeriod(ctx context.Context, id string) (*domain.Fisca
 		return nil, domain.ErrFiscalPeriodNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, mapPgError(err)
 	}
 	return &fp, nil
 }
@@ -178,7 +197,7 @@ func (s *PgStore) LockFiscalPeriod(ctx context.Context, id string, lockedAt time
 		return domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		res, err := tx.Exec(ctx, `
 			UPDATE fiscal_periods
 			SET close_status = 'LOCKED', close_locked_at = $1, evidence_document_id = $2
@@ -192,6 +211,9 @@ func (s *PgStore) LockFiscalPeriod(ctx context.Context, id string, lockedAt time
 		}
 		return nil
 	})
+	// A malformed id names no period, so nothing was locked. Reported as absent
+	// rather than as a dead store, and never as success.
+	return mapPgError(err)
 }
 
 func (s *PgStore) CreateCloseEvidence(ctx context.Context, evidence *domain.CloseEvidence) error {

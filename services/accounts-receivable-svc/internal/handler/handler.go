@@ -310,6 +310,14 @@ func (h *Handler) verifyLedgerFinalized(ctx context.Context, tenantID, legalEnti
 	if err != nil {
 		return err
 	}
+	// general-ledger-svc scopes this read to the verified X-Tenant-Id and
+	// refuses a tenant_id query parameter that disagrees with it. This call
+	// used to send only the query parameter, which worked because that service
+	// filtered by whatever it was handed — the same laxness that let any
+	// caller read any tenant's ledger. Both are sent now, and they agree: this
+	// is a service-to-service call inside the estate, and the tenant is the
+	// invoice's own.
+	req.Header.Set("X-Tenant-Id", tenantID)
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {

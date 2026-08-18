@@ -34,6 +34,11 @@ type Config struct {
 	// TenantRegistryURL is tenant-entity-registry-svc's base URL, used for
 	// the residency check (GET /v1/tenants/{id}/residency-region).
 	TenantRegistryURL string
+
+	// AuthZServiceURL is authorization-svc's base URL. There was no such
+	// field: this service performed no authorization at all, on any route,
+	// including the one that returns document bytes.
+	AuthZServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -59,6 +64,7 @@ func Load() (*Config, error) {
 		StorageDir:          strEnv("STORAGE_DIR", "./data/documents"),
 		StorageMasterKeyHex: strEnv("DOCUMENT_VAULT_MASTER_KEY_HEX", ""),
 		TenantRegistryURL:   strEnv("TENANT_REGISTRY_URL", "http://tenant-svc:8081"),
+		AuthZServiceURL:     strEnv("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 	}, nil
 }
 

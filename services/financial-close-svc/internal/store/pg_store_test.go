@@ -2,9 +2,11 @@ package store_test
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +27,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	if dsn == "" {
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
+	requireThrowawayDatabase(t, dsn)
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -47,6 +50,26 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+// requireThrowawayDatabase refuses to run against anything not recognisably
+// disposable. This suite DROPs fiscal_periods and close_evidences, and those
+// rows are the record of which periods were sealed and what the books said when
+// they were — "we can re-seed it" is not a consolation for close evidence. Only
+// the database NAME vouches for it; a password that happens to contain "test"
+// must not.
+func requireThrowawayDatabase(t *testing.T, dsn string) {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("refusing to run: TEST_DATABASE_URL is not a parseable URL: %v", err)
+	}
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if !strings.Contains(strings.ToLower(dbName), "test") {
+		t.Fatalf("refusing to run: TEST_DATABASE_URL names database %q, which is not recognisably "+
+			"disposable, and this suite DROPs fiscal_periods and close_evidences. Use "+
+			"financial_close_test (or CI's testdb), not financial_close.", dbName)
+	}
 }
 
 // TestPgStore_CreateFiscalPeriod_Retried_IsIdempotent proves the idempotency

@@ -84,7 +84,7 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, authzClient, log)
+	h := handler.New(pgStore, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 
 	healthH := health.New(pool, log)
