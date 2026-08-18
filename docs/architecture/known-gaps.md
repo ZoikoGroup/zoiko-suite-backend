@@ -548,3 +548,226 @@ row security off. The feature works; it is the isolation that is missing.
 The fix mirrors the obligations pass: add tenant_id, backfill from the parent
 obligation, FORCE RLS with a WITH CHECK policy, and route the queries through
 withTenantTx.
+
+## Resolved: delegated-authority-svc let a caller delegate someone else's authority to themselves
+Closed 18 Aug 2026, with migration 000002 and a caller/delegator binding in the
+handler. Found by reading the create path, not by any test -- the service's own
+test suite passed throughout, because every test named a delegator the caller
+was entitled to name.
+
+CreateDelegation ran two authorization checks and neither was the one that
+mattered. It confirmed the CALLER held DELEGATION_CREATE on the legal entity,
+then confirmed the DELEGATOR held the action_type being delegated -- the
+platform's documented invariant, "delegated authority must never exceed the
+delegator's own authority." What it never asked was whether the caller had any
+relationship to the delegator at all. delegator_principal_id was a field in the
+request body, and it was believed.
+
+So any principal holding DELEGATION_CREATE could post a body naming a colleague
+as delegator and themselves as delegate, and receive a 201. Both checks pass:
+they may create delegations, and the colleague really does hold the action. The
+invariant nobody had written down is that a principal may only give away
+authority that is theirs to give. The result was a general-purpose privilege
+escalation reachable through the documented happy path -- take any authority
+held by anyone on an entity you can create delegations on.
+
+The service's own doc comment made this harder to see rather than easier. It
+said the delegator's authority was checked "rather than trusted from the request
+body," which is true of the AUTHORITY and false of the IDENTITY, and reads as
+though the body had been dealt with.
+
+Closed in three parts:
+  - The delegator must be the caller, unless the caller holds the new
+    DELEGATION_ADMINISTER action on the entity. A separate action rather than a
+    wider reading of DELEGATION_CREATE, because the two are different powers:
+    one hands away authority you hold, the other moves authority between other
+    people.
+  - Even WITH DELEGATION_ADMINISTER, a delegation created for another principal
+    may not name its creator as the delegate. Administering delegations between
+    other people is legitimate; being the beneficiary of one you created is the
+    same escalation by a longer route.
+  - delegator and delegate must differ, enforced in the handler and as a NOT
+    VALID CHECK.
+
+DELEGATION_ADMINISTER is deliberately NOT in the demo RBAC bundle. Granting it
+alongside DELEGATION_CREATE would restore the escalation for the demo principal
+and make the fix untestable from the console.
+
+## Resolved: delegated-authority-svc returned the whole tenant's register to an unauthorized reader
+Closed in the same pass. Identical in shape to the notification-svc read gap,
+and worth grepping for a third time.
+
+ListDelegations authorized DELEGATION_VIEW only when the caller supplied a
+legal_entity_id. Omitting it -- the shorter, easier request -- skipped
+authorization entirely and returned every delegation in the tenant to a
+principal holding no grant at all: who may act for whom, on what action, until
+when. On this particular register that map IS the security model, so the
+unauthenticated view was strictly more valuable to an attacker than any single
+delegation.
+
+A read is now scoped one of two ways and there is no third: with a legal entity
+the caller needs DELEGATION_VIEW on it; without one the answer is restricted to
+delegations the caller is personally party to. Asking after another principal's
+delegations without an entity scope is 403 rather than silently narrowed,
+because "you may not ask" and "there are none" are different answers and only
+one of them is reassuring.
+
+## Resolved: delegated-authority-svc had never run on this machine
+Found while bringing the service up to verify the above, 18 Aug 2026.
+
+The service is in docker-compose.yml and its database is in init-db.sh, and it
+still crash-looped on startup with `database "delegated_authority" does not
+exist`. init-db.sh runs ONLY when the Postgres volume is initialised empty, and
+this database was added to the script after the development volume was created,
+so the script had never created it here.
+
+This is the fourth instance of the "works only on this machine" shape and the
+first in the opposite direction -- not state applied by hand that was never
+scripted, but state scripted that was never applied. It also explains why the
+missing RBAC bundle below went unnoticed: the service was never up to return
+the 403s.
+
+Worth running against every service that is in compose but has never been
+observed running, not just the ones with a console page.
+
+## Resolved: delegated-authority-svc had no RBAC bundle at all
+Closed in the same pass by adding DELEGATION_FULL (DELEGATION_CREATE,
+DELEGATION_VIEW, DELEGATION_REVOKE) to seed-demo-rbac.ps1.
+
+Nothing had ever granted a DELEGATION_* action, so every one of the service's
+four routes would have answered 403 to every principal. The service has enforced
+authorization since it was written; the grants simply did not exist. Same shape
+as jurisdiction-rules-svc, whose admin surface had been 403 for twelve days for
+the same reason -- the third time this has been found, and the reason
+seed-demo-rbac.ps1 now reports missing actions before it starts.
+
+## Resolved: delegated-authority-svc's row-level security applied to no query
+Closed by migration 000002. 000001 ran ENABLE ROW LEVEL SECURITY and wrote a
+tenant isolation policy; Postgres exempts a table's owner from row-level
+security unless the table is FORCE, and these services connect as the owner, so
+the policy had never applied to a single statement.
+
+Isolation did not rest on it -- pg_store.go carries an explicit tenant_id
+predicate on every statement, including the expiry sweep -- but a policy that
+silently does nothing reads as a control that is present, and on a register of
+who may act for whom that is the control an auditor would point at. 000002 adds
+FORCE, an explicit WITH CHECK, and NOT VALID invariants for the status
+vocabulary and the terminal-state evidence (a REVOKED row must carry who
+revoked it and when; an EXPIRED row must carry expired_at).
+
+## Open: nothing consumes delegation grants
+Noticed while wiring the console, 18 Aug 2026. Not a defect introduced by that
+pass, and not closed by it.
+
+delegated-authority-svc records delegations and publishes authority.delegated /
+authority.revoked / authority.expired. No service reads the register when making
+an authorization decision: authorization-svc does not call it, and a grep for
+consumers finds only identity-context-svc, which has a DELEGATED_AUTHORITY_URL
+in its config and an InvalidationReasonDelegationRevoked enum value -- an
+intention, not a call site.
+
+So a delegation is currently a governed, audited RECORD that one principal may
+act for another, and not a mechanism that lets them. Every escalation described
+above is therefore a write-integrity and audit-integrity problem today rather
+than a live privilege bypass -- which is the reason to close it now, before
+something starts honouring these rows and turns a forged record into real
+authority retroactively.
+
+## Resolved: document-vault-svc authorized nothing, on any route
+Closed 18 Aug 2026. Found by reading the service, not by any test — its own
+suite of 25 tests passed throughout, because not one of them asked whether a
+caller was allowed to do what it was doing.
+
+There was no authorization of any kind: no authz client, no AUTHZ_SERVICE_URL,
+no check. Every route answered anything that could reach the port, including
+GET /v1/documents/{id}/content, which returns the document bytes — on a service
+whose own schema classifies its contents PUBLIC / INTERNAL / CONFIDENTIAL /
+RESTRICTED, and which financial-close-svc already uses to store close evidence.
+
+Five actions gate it now, and the splits are deliberate:
+  - DOCUMENT_CREATE, DOCUMENT_VERSION_CREATE — filing and amending.
+  - DOCUMENT_READ vs DOCUMENT_DOWNLOAD — knowing a document exists and reading
+    its bytes are different disclosures. The access log has recorded them as
+    different access types (METADATA / DOWNLOAD) since the schema was written;
+    authorization now agrees with the audit trail.
+  - DOCUMENT_ACCESS_LOG_READ — the log says who read what and when. It is the
+    record an investigator consults, and it should not fall out of ordinary read
+    access to the document.
+
+## Resolved: document-vault-svc's tenant filter switched itself off when omitted
+Closed in the same pass, and this is the more dangerous half of the above.
+
+The store's predicate was `($2::uuid IS NULL OR tenant_id = $2::uuid)`, with the
+tenant supplied by a helper that returned nil when the request carried no
+X-Tenant-Id. A NULL there makes the first disjunct TRUE for every row, so the
+filter did not merely fail to narrow — it disabled itself. Combined with the
+absence of authorization, a request with NO headers at all could read and
+download any document belonging to any tenant.
+
+It was documented rather than hidden, which is what makes it worth recording.
+FindDocumentByID's doc comment read: "An empty tenant in context (e.g. a
+not-yet-migrated caller) falls back to unscoped lookup — tightening that further
+requires making the header mandatory platform-wide." That is an accurate
+description of a cross-tenant read on a vault holding RESTRICTED content,
+written as a compatibility note.
+
+A missing tenant is now 401. The store's helper returns an error rather than an
+empty string, so "no tenant" can no longer mean "all tenants" anywhere
+downstream, and migration 000002 adds the row-level security that had never
+existed on any of the three tables — not even the ENABLE-without-FORCE the rest
+of the estate had to be corrected for.
+
+## Resolved: document-vault-svc recorded readers as "unknown", and let them pick a name
+Closed in the same pass.
+
+actorFromHeader was three defects in nine lines. It read X-Actor-Principal-ID
+FIRST — a header nothing in this platform sets and anything may send — taking
+precedence over the X-Principal-Id the gateway verifies, so a caller could
+attribute their own download to a colleague. Failing both, it returned the
+literal string "unknown".
+
+That last one matters most, because the access log is not a convenience: it is
+the append-only record that answers "who downloaded this RESTRICTED document".
+An unidentified caller was not refused; it was RECORDED, and the log could
+answer "unknown" while reading as though it had answered.
+
+The forgeable header is ignored, an unidentified caller is 401 before any access
+is recorded, and 000002 adds NOT VALID CHECK constraints refusing '' and
+'unknown' as a principal on all three tables. NOT VALID because existing rows
+are the true record of what the service did, and a migration must not rewrite an
+audit trail to make a constraint pass.
+
+## Resolved: document-vault-svc had no way to list documents
+Closed by adding GET /v1/documents. Six routes existed and every one of them
+required a document_id the caller already had, so the vault could be written to
+and read from but never browsed. That is why it had no console page: there was
+nothing to put on one.
+
+legal_entity_id is required on the new route rather than optional, because this
+service authorizes per legal entity — a register spanning every entity in the
+tenant would have no single scope to authorize against, and defaulting to "all
+entities the tenant owns" is exactly how the unscoped reads elsewhere in this
+platform came about.
+
+## Open: a register read is not recorded in the access log
+Noticed while writing the live suite for the pass above, and deliberately not
+changed.
+
+000001's comment states the doctrine: "Every read of a document's metadata or
+bytes appends a row here". GET /{id} and /{id}/content honour it. The new
+GET /v1/documents does not — it returns metadata for many documents and records
+nothing, so the log understates who has seen what.
+
+Recording one row per document per list call would make the log unreadable for
+its actual purpose, and a "LIST" access type covering a result set is a schema
+decision rather than a bug fix, so it is left open. Worth settling before anyone
+relies on the access log being a complete account of metadata disclosure — today
+it is a complete account of DOWNLOADS and of single-document reads only.
+
+## Open: retention_policy is a label, not an engine
+Pre-existing, recorded while wiring the console. documents.retention_policy is a
+named string this service stores and nothing enforces: no purge is scheduled by
+it, and no delete is blocked by it — there is no delete route at all.
+ErrRetentionActive is defined in the domain and never returned. A document
+marked for a seven-year hold is not held by anything in this vault; the label
+records an intention that some other system would have to honour.
