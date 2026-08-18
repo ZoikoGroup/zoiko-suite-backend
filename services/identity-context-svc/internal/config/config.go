@@ -18,23 +18,27 @@ type Config struct {
 	JWTKeyID                 string
 
 	// TODO: replace JWTSigningSecret with KMS key reference before Phase 1 production cutover.
-	JWTSigningSecret       string
-	JWTIssuer              string
-	JWTAudienceInternal    string
-	EnvelopeJWTTTLSeconds  int
+	JWTSigningSecret      string
+	JWTIssuer             string
+	JWTAudienceInternal   string
+	EnvelopeJWTTTLSeconds int
 
 	DB    DBConfig
 	Redis RedisConfig
 	Kafka KafkaConfig
 
 	// Upstream Tier 0 service base URLs (read-only calls only)
-	TenantRegistryURL      string
-	DelegatedAuthorityURL  string
-	AccessControlURL       string
+	TenantRegistryURL     string
+	DelegatedAuthorityURL string
+	AccessControlURL      string
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	// SIEMServiceURL is siem-integration-svc. Empty disables streaming —
+	// see internal/siem's doc comment.
+	SIEMServiceURL string
 }
 
 type DBConfig struct {
@@ -56,10 +60,10 @@ func (d DBConfig) DSN() string {
 }
 
 type RedisConfig struct {
-	Host                  string
-	Port                  int
+	Host string
+	Port int
 	// SessionTTLSeconds — hot-path cache TTL for signed envelope JWT (default 5 min)
-	SessionTTLSeconds     int
+	SessionTTLSeconds int
 	// RoleProfileTTLSeconds — role profile cache TTL (default 15 min)
 	RoleProfileTTLSeconds int
 }
@@ -74,10 +78,10 @@ type KafkaConfig struct {
 // Returns an error description string for any missing mandatory value.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:                  envInt("PORT", 8080),
-		JWTSigningSecret:      env("JWT_SIGNING_SECRET", ""),
-		JWTIssuer:             env("JWT_ISSUER", "identity-context-svc"),
-		JWTAudienceInternal:   env("JWT_AUDIENCE", "zoiko-internal"),
+		Port:                     envInt("PORT", 8080),
+		JWTSigningSecret:         env("JWT_SIGNING_SECRET", ""),
+		JWTIssuer:                env("JWT_ISSUER", "identity-context-svc"),
+		JWTAudienceInternal:      env("JWT_AUDIENCE", "zoiko-internal"),
 		JWTSigningPrivateKeyPath: env("JWT_SIGNING_PRIVATE_KEY_PATH", "./envelope_signing_key.pem"),
 		JWTKeyID:                 env("JWT_KEY_ID", "envelope-signing-key-1"),
 
@@ -105,6 +109,7 @@ func Load() (*Config, error) {
 		DelegatedAuthorityURL: env("DELEGATED_AUTHORITY_URL", "http://delegated-authority-svc"),
 		AccessControlURL:      env("ACCESS_CONTROL_URL", "http://access-control-svc"),
 		OTELExporterEndpoint:  env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		SIEMServiceURL:        env("SIEM_SERVICE_URL", ""),
 	}
 	return cfg, nil
 }

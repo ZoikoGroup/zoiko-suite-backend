@@ -147,6 +147,7 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "configuration_feat
 # Apply migrations for secret-vault-integration-svc
 echo "Applying migrations for secret_vault_integration..."
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integration" -f /migrations/secret-vault-integration/000001_initial_schema.up.sql
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integration" -f /migrations/secret-vault-integration/000002_add_data_classification.up.sql
 
 # Apply migrations for obligations-svc
 echo "Applying migrations for obligations..."

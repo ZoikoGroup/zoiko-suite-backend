@@ -379,6 +379,47 @@ Re-POSTing an existing role answers 503 `store_unavailable` rather than 200 or
 409. Recorded in seed-demo-rbac.ps1, which tolerates it and relies on its
 end-of-run verification instead.
 
+## Resolved: secret-vault-integration-svc's 000002 migration was never applied by init-db.sh
+`000002_add_data_classification.up.sql` existed in the repo but init-db.sh
+only ever ran `000001_initial_schema.up.sql` for this service — the same
+class of gap as the "several databases... do not exist" entry below, but for
+a migration rather than a whole database. Found live: `CreateSecretPolicy`
+failed with `column "data_classification" of relation "secret_policies" does
+not exist`, reported to the caller as a generic `store_unavailable` (yet
+another instance of the platform-wide "driver error reported as an outage"
+pattern already documented elsewhere in this file). Fixed by adding the
+missing line to init-db.sh and applying the migration to the running
+container.
+
+## Open: secret-vault-integration-svc's broker never returns usable secret material
+Live-verified the full policy → version → activate → put-material → broker
+flow end-to-end for the first time anywhere on this platform. It works
+exactly as designed through every step — except the design itself is the
+gap: `vault.Backend.Get` (internal/vault/backend.go) deliberately returns an
+opaque lease token, never the raw secret value ("this service brokers
+access to secrets, it does not become a second copy of them"), and no other
+endpoint anywhere in the service exposes the underlying material either.
+
+That means there is currently no functional path — for a service or a
+human — to get a secret's actual value back out of this vault once it has
+been stored. The broker mechanism is fully real for *authorization and
+audit* (who requested what, when, whether they were on the
+allowed_workload_ids list, an immutable GRANTED/DENIED trail) but cannot
+yet serve its apparent purpose of letting a consuming service bootstrap a
+real credential (e.g. its own DB password) at startup.
+
+An initial attempt to wire general-ledger-svc's DB password through this
+path was built, live-tested against the real broker response, found to
+return `"local-lease:aGqKvDINXRJ8370wYH66VVI6Aau0LIKQ"` instead of the
+material that had actually been PUT, and reverted rather than shipped —
+setting DB.Password to that value would have broken the DB connection the
+moment SECRET_VAULT_SERVICE_URL was ever set to a non-empty value. This is
+upstream of what a "wire the existing pieces together" pass can fix: it
+needs a real design decision in secret-vault-integration-svc itself (e.g. a
+genuine material-exchange path scoped to the exact allowed workload, or the
+vault performing operations on the caller's behalf rather than ever handing
+back a value) before any consuming service can be wired to it for real.
+
 ## Open: several databases in deployments/init-db.sh do not exist on an
 ## existing postgres volume
 init-db.sh only runs on first volume initialisation, so a database added to it

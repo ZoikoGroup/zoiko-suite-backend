@@ -271,6 +271,7 @@ services:
     environment:
       PORT: "8140"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
+      SIEM_SERVICE_URL: http://siem-integration-svc:8141
     depends_on:
       authorization-svc:
         condition: service_healthy
@@ -337,6 +338,7 @@ services:
     environment:
       PORT: "8143"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
+      SIEM_SERVICE_URL: http://siem-integration-svc:8141
     depends_on:
       authorization-svc:
         condition: service_healthy

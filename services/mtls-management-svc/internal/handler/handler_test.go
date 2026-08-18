@@ -13,6 +13,7 @@ import (
 	internalca "zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
 	"zoiko.io/mtls-management-svc/internal/handler"
+	"zoiko.io/mtls-management-svc/internal/siem"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
 
@@ -25,7 +26,7 @@ func newRouter(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, zap.NewNop()))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), zap.NewNop()))
 }
 
 // mustParsePEMCertificate fails the test if pemBytes is not a real,

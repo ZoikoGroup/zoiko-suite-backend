@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
+	"zoiko.io/mtls-management-svc/internal/siem"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
 
@@ -28,11 +29,12 @@ func getTenant(r *http.Request) string {
 type Handler struct {
 	store  store.Store
 	ca     *ca.CA
+	siem   *siem.Client
 	logger *zap.Logger
 }
 
-func New(s store.Store, c *ca.CA, l *zap.Logger) *Handler {
-	return &Handler{store: s, ca: c, logger: l}
+func New(s store.Store, c *ca.CA, siemClient *siem.Client, l *zap.Logger) *Handler {
+	return &Handler{store: s, ca: c, siem: siemClient, logger: l}
 }
 
 func NewRouter(h *Handler) http.Handler {
@@ -96,6 +98,11 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Doc 05 §13.2 names "certificate issuance/rotation events" as a
+	// required SIEM signal.
+	h.siem.Stream(r.Context(), tenantID, "certificate.issued", siem.SeverityLow,
+		"Certificate issued for "+req.ServiceName+" ("+req.CommonName+")")
+
 	h.okJSON(w, 201, domain.ProvisionCertResult{
 		Certificate:   *cert,
 		PrivateKeyPEM: string(issued.PrivateKeyPEM),
@@ -150,6 +157,8 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.siem.Stream(r.Context(), tenantID, "certificate.rotated", siem.SeverityLow, "Certificate rotated: "+id)
+
 	h.okJSON(w, 200, domain.ProvisionCertResult{
 		Certificate:   *updated,
 		PrivateKeyPEM: string(issued.PrivateKeyPEM),
@@ -159,10 +168,12 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenant(r)
-	if err := h.store.RevokeCert(r.Context(), tenantID, chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	if err := h.store.RevokeCert(r.Context(), tenantID, id); err != nil {
 		h.errJSON(w, 404, "certificate not found")
 		return
 	}
+	h.siem.Stream(r.Context(), tenantID, "certificate.revoked", siem.SeverityMedium, "Certificate revoked: "+id)
 	h.okJSON(w, 200, map[string]string{"message": "certificate revoked"})
 }
 

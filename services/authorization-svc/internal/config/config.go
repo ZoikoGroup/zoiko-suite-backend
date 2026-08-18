@@ -34,6 +34,10 @@ type Config struct {
 	MTLSEnabled              bool
 	MTLSPort                 int
 	MTLSManagementServiceURL string
+
+	// SIEMServiceURL is siem-integration-svc. Empty disables streaming —
+	// see internal/siem's doc comment.
+	SIEMServiceURL string
 }
 
 type DBConfig struct {
@@ -91,6 +95,7 @@ func Load() (*Config, error) {
 		MTLSEnabled:              envBool("MTLS_ENABLED", false),
 		MTLSPort:                 envInt("MTLS_PORT", 8449),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		SIEMServiceURL:           env("SIEM_SERVICE_URL", ""),
 	}, nil
 }
 

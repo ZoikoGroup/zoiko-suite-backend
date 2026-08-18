@@ -458,6 +458,10 @@ services:
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       ACCESS_CONTROL_URL: "http://identity-svc:8080"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # siem-integration-svc lives in docker-compose.phase6.yml — reachable
+      # only when that file is up alongside this one. Streaming degrades to
+      # a no-op otherwise (see internal/siem's doc comment).
+      SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
     volumes:
       - identity_jwt_keys:/keys:ro
     depends_on:
@@ -496,6 +500,15 @@ services:
       IDENTITY_JWKS_URL: "http://identity-svc:8080/.well-known/jwks.json"
       EXPECTED_ISSUER: "identity-context-svc"
       EXPECTED_AUDIENCE: "zoiko-internal"
+      # carta-svc and siem-integration-svc live in docker-compose.phase6.yml
+      # (a Phase 6 Trust & Intelligence addition) — reachable here only when
+      # that file is brought up alongside this one, e.g.
+      # `docker compose -f docker-compose.yml -f docker-compose.phase6.yml up`.
+      # Both clients degrade to a documented no-op when unreachable (see
+      # internal/carta and internal/siem doc comments), so gateway-auth-svc
+      # still starts and verifies tokens correctly when phase6 isn't running.
+      CARTA_SERVICE_URL: "http://carta-svc:8142"
+      SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
     depends_on:
       identity-svc:
         condition: service_healthy
@@ -905,6 +918,10 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # siem-integration-svc lives in docker-compose.phase6.yml — reachable
+      # only when that file is up alongside this one. Streaming degrades to
+      # a no-op otherwise (see internal/siem's doc comment).
+      SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
     depends_on:
       postgres:
         condition: service_healthy

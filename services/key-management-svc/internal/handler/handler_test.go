@@ -10,11 +10,12 @@ import (
 	"go.uber.org/zap"
 	"zoiko.io/key-management-svc/internal/domain"
 	"zoiko.io/key-management-svc/internal/handler"
+	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
 
 func newRouter() http.Handler {
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), zap.NewNop()))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), siem.New("", "key-management-svc", zap.NewNop()), zap.NewNop()))
 }
 
 func TestHealthCheck(t *testing.T) {

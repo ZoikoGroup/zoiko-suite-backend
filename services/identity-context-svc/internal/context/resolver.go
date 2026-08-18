@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/identity-context-svc/internal/config"
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/siem"
 )
 
 // Sentinel errors — mapped to HTTP status codes in handler.go.
@@ -46,8 +47,8 @@ var (
 //  4. Partial envelopes are PROHIBITED. All six dimensions must resolve or
 //     the service fails closed. Never return a zero-value envelope.
 type Resolver struct {
-	cfg         *config.Config
-	log         *zap.Logger
+	cfg *config.Config
+	log *zap.Logger
 	// wg tracks all in-flight fire-and-forget event publish goroutines.
 	// Drain() blocks until every goroutine completes, allowing main.go to
 	// call it after srv.Shutdown() for a clean graceful shutdown.
@@ -62,6 +63,7 @@ type Resolver struct {
 	events      EventPublisher
 	verifier    TokenVerifier
 	signer      EnvelopeSigner
+	siem        *siem.Client
 }
 
 // NewResolver constructs a Resolver with all required dependencies injected.
@@ -75,6 +77,7 @@ func NewResolver(
 	events EventPublisher,
 	verifier TokenVerifier,
 	signer EnvelopeSigner,
+	siemClient *siem.Client,
 ) *Resolver {
 	return &Resolver{
 		cfg:         cfg,
@@ -86,6 +89,7 @@ func NewResolver(
 		events:      events,
 		verifier:    verifier,
 		signer:      signer,
+		siem:        siemClient,
 	}
 }
 
@@ -194,6 +198,14 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 					zap.Error(err),
 				)
 			}
+			// Doc 05 §13.2 names "MFA/step-up events" as a required SIEM
+			// signal. A blocked trust posture (which correlates strongly
+			// with a missing or stale MFA attestation — see
+			// resolveTrustPosture below) is the actionable case; every
+			// successful resolution is not streamed, for the same
+			// signal-vs-noise reason authorization-svc only streams DENIED.
+			r.siem.Stream(ctx, principal.TenantID, "session.trust_posture_blocked",
+				siem.SeverityHigh, fmt.Sprintf("Trust posture BLOCKED for principal %s (MFA verified: %t)", principal.PrincipalID, claims.MFADone))
 		}()
 		return "", ErrTrustPostureBlocked
 	}
