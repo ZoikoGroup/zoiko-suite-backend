@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/delegated-authority-svc/internal/domain"
 	svcmiddleware "zoiko.io/delegated-authority-svc/internal/middleware"
@@ -18,6 +19,21 @@ type PgStore struct {
 
 func New(pool *pgxpool.Pool) *PgStore {
 	return &PgStore{pool: pool}
+}
+
+// mapPgError turns a malformed identifier into "not found".
+//
+// delegation_id is a uuid column, so a caller passing a non-UUID string reaches
+// Postgres and comes back as 22P02 invalid_text_representation. That was
+// surfacing as 503 store_unavailable -- a request the caller got wrong,
+// reported as an outage, sending whoever is on call to look at a healthy
+// database. A malformed id cannot name a row, which is exactly what 404 means.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return domain.ErrDelegationNotFound
+	}
+	return err
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
@@ -67,7 +83,7 @@ func scanDelegation(row pgx.Row, d *domain.DelegationGrant) error {
 func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGrant) (created bool, err error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return false, domain.ErrIdentityMissing
+		return false, domain.ErrTenantMissing
 	}
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -105,7 +121,7 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 func (s *PgStore) ExpireDue(ctx context.Context) ([]domain.DelegationGrant, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return nil, domain.ErrTenantMissing
 	}
 
 	var out []domain.DelegationGrant
@@ -138,7 +154,7 @@ func (s *PgStore) ExpireDue(ctx context.Context) ([]domain.DelegationGrant, erro
 func (s *PgStore) GetDelegation(ctx context.Context, delegationID string) (*domain.DelegationGrant, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return nil, domain.ErrTenantMissing
 	}
 
 	var d domain.DelegationGrant
@@ -150,38 +166,57 @@ func (s *PgStore) GetDelegation(ctx context.Context, delegationID string) (*doma
 		return nil, domain.ErrDelegationNotFound
 	}
 	if err != nil {
-		return nil, err
+		return nil, mapPgError(err)
 	}
 	return &d, nil
 }
 
-func (s *PgStore) ListDelegations(ctx context.Context, legalEntityID, delegatorPrincipalID, delegatePrincipalID, status string) ([]domain.DelegationGrant, error) {
+func (s *PgStore) ListDelegations(ctx context.Context, f domain.ListDelegationsFilter) ([]domain.DelegationGrant, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return nil, domain.ErrTenantMissing
 	}
 
 	var out []domain.DelegationGrant
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := "SELECT " + delegationColumns + " FROM delegation_grants WHERE tenant_id = $1"
 		args := []any{tenantID}
-		if legalEntityID != "" {
-			args = append(args, legalEntityID)
+		if f.LegalEntityID != "" {
+			args = append(args, f.LegalEntityID)
 			query += fmt.Sprintf(" AND legal_entity_id = $%d", len(args))
 		}
-		if delegatorPrincipalID != "" {
-			args = append(args, delegatorPrincipalID)
+		if f.DelegatorPrincipalID != "" {
+			args = append(args, f.DelegatorPrincipalID)
 			query += fmt.Sprintf(" AND delegator_principal_id = $%d", len(args))
 		}
-		if delegatePrincipalID != "" {
-			args = append(args, delegatePrincipalID)
+		if f.DelegatePrincipalID != "" {
+			args = append(args, f.DelegatePrincipalID)
 			query += fmt.Sprintf(" AND delegate_principal_id = $%d", len(args))
 		}
-		if status != "" {
-			args = append(args, status)
+		if f.Status != "" {
+			args = append(args, f.Status)
 			query += fmt.Sprintf(" AND status = $%d", len(args))
 		}
-		query += " ORDER BY created_at DESC"
+		// The self scope. Applied when the read was NOT authorized against a
+		// legal entity, so an unscoped read answers with the delegations the
+		// caller is party to rather than the tenant's whole register.
+		if f.SelfPrincipalID != "" {
+			args = append(args, f.SelfPrincipalID)
+			query += fmt.Sprintf(" AND (delegator_principal_id = $%d OR delegate_principal_id = $%d)", len(args), len(args))
+		}
+		// delegation_id breaks ties. created_at alone is not a total order --
+		// two grants written in the same transaction share it -- so without
+		// the tiebreaker a paged read can return one row twice and skip
+		// another entirely.
+		query += " ORDER BY created_at DESC, delegation_id DESC"
+		if f.Limit > 0 {
+			args = append(args, f.Limit)
+			query += fmt.Sprintf(" LIMIT $%d", len(args))
+		}
+		if f.Offset > 0 {
+			args = append(args, f.Offset)
+			query += fmt.Sprintf(" OFFSET $%d", len(args))
+		}
 
 		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
@@ -209,7 +244,7 @@ func (s *PgStore) ListDelegations(ctx context.Context, legalEntityID, delegatorP
 func (s *PgStore) RevokeDelegation(ctx context.Context, delegationID, revokedByPrincipalID string) (*domain.DelegationGrant, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
-		return nil, domain.ErrIdentityMissing
+		return nil, domain.ErrTenantMissing
 	}
 
 	var out domain.DelegationGrant
@@ -239,7 +274,7 @@ func (s *PgStore) RevokeDelegation(ctx context.Context, delegationID, revokedByP
 		return scanDelegation(row, &out)
 	})
 	if err != nil {
-		return nil, err
+		return nil, mapPgError(err)
 	}
 	return &out, nil
 }
