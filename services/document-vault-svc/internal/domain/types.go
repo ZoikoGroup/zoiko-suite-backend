@@ -123,4 +123,34 @@ var (
 	ErrRetentionActive         = errors.New("document is under an active retention policy and cannot be purged")
 	ErrResidencyViolation      = errors.New("document access would violate its residency constraint")
 	ErrStoreUnavailable        = errors.New("document store unavailable")
+
+	// ErrIdentityMissing is returned when a request carries no resolved
+	// principal.
+	//
+	// There was no such error, and no such check. The handler read
+	// X-Actor-Principal-ID, fell back to X-Principal-Id, and fell back again to
+	// the literal string "unknown" — so an unidentified caller was not refused,
+	// it was RECORDED, and the append-only access log that exists to answer
+	// "who downloaded this RESTRICTED document" could answer "unknown" and read
+	// as though it had answered.
+	ErrIdentityMissing = errors.New("caller identity missing")
+
+	// ErrTenantMissing is returned when a request carries no X-Tenant-Id.
+	//
+	// Distinct from ErrIdentityMissing so a forgotten tenant header is not
+	// reported as a missing principal. This was the second half of the same
+	// hole: the store's predicate was `($2::uuid IS NULL OR tenant_id = $2)`,
+	// which evaluates TRUE for every row when no tenant is supplied — a filter
+	// that switches itself off when omitted rather than refusing.
+	ErrTenantMissing = errors.New("tenant context missing")
+
+	// ErrAuthorizationDenied is an explicit DENIED from authorization-svc.
+	ErrAuthorizationDenied = errors.New("not authorized for this document action")
+
+	// ErrAuthzServiceUnavailable covers every non-decision from
+	// authorization-svc. Callers must treat it as a refusal.
+	ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
+
+	// ErrInvalidPaging is returned for an out-of-range limit or offset.
+	ErrInvalidPaging = errors.New("limit must be between 1 and 500 and offset must not be negative")
 )

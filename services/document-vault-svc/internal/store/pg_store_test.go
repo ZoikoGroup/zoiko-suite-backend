@@ -120,7 +120,7 @@ func TestPgStore_RecordAccess_IsAppendOnly(t *testing.T) {
 		}))
 	}
 
-	entries, err := s.ListAccessLog(context.Background(), doc.DocumentID)
+	entries, err := s.ListAccessLog(context.Background(), doc.DocumentID, 100, 0)
 	require.NoError(t, err)
 	require.Len(t, entries, 3, "every access must be recorded, none overwritten")
 }

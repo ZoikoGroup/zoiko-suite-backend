@@ -14,7 +14,9 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/document-vault-svc/internal/authz"
 	"zoiko.io/document-vault-svc/internal/domain"
+	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/residency"
 	"zoiko.io/document-vault-svc/internal/storage"
 )
@@ -25,24 +27,42 @@ type Store interface {
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
+	ListDocuments(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.Document, error)
 	RecordAccess(ctx context.Context, log *domain.DocumentAccessLog) error
-	ListAccessLog(ctx context.Context, documentID string) ([]domain.DocumentAccessLog, error)
+	ListAccessLog(ctx context.Context, documentID string, limit, offset int) ([]domain.DocumentAccessLog, error)
 }
 
 type Handler struct {
 	store     Store
 	storage   storage.Backend
 	residency residency.Validator
+	authz     authz.Client
 	log       *zap.Logger
 }
 
-func New(store Store, storageBackend storage.Backend, residencyValidator residency.Validator, log *zap.Logger) *Handler {
-	return &Handler{store: store, storage: storageBackend, residency: residencyValidator, log: log}
+func New(store Store, storageBackend storage.Backend, residencyValidator residency.Validator, authzClient authz.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, storage: storageBackend, residency: residencyValidator, authz: authzClient, log: log}
 }
+
+// maxBodyBytes caps a request body.
+//
+// This service takes base64 content inline, so an unbounded body is read whole
+// into memory and then decoded into a second copy before anything validates
+// it. 12 MiB of base64 is roughly 9 MiB of document.
+const maxBodyBytes = 12 << 20
+
+const (
+	defaultPageLimit = 100
+	maxPageLimit     = 500
+)
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/documents", func(r chi.Router) {
 		r.Post("/", h.CreateDocument)
+		// The register. There was no list route at all, so every one of the
+		// routes below needed a document_id the caller already had — the vault
+		// could be written to and read from, but never browsed.
+		r.Get("/", h.ListDocuments)
 		r.Get("/{documentID}", h.GetDocument)
 		r.Get("/{documentID}/content", h.GetContent)
 		r.Post("/{documentID}/versions", h.AddVersion)
@@ -54,12 +74,30 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 // ── POST /v1/documents ───────────────────────────────────────────────────────
 
 func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
-	var req domain.CreateDocumentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
-	actor := actorFromHeader(r)
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req domain.CreateDocumentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	// tenant_id in the body is no longer what scopes the write — the header is,
+	// because that is the value the gateway verified. A body naming a different
+	// tenant is refused rather than ignored: a caller that believed it was
+	// filing into another tenant should be told it cannot, not quietly have the
+	// document land somewhere else.
+	if req.TenantID != "" && req.TenantID != tenantID {
+		writeError(w, http.StatusBadRequest, "tenant_mismatch",
+			"tenant_id in the body does not match the request's tenant")
+		return
+	}
+	req.TenantID = tenantID
 
 	if missing := requiredFieldMissing(req); missing != "" {
 		writeError(w, http.StatusBadRequest, "missing_field", missing)
@@ -67,6 +105,9 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	if !req.Classification.Valid() {
 		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.Classification))
+		return
+	}
+	if !h.authorize(w, r, actor, req.LegalEntityID, authz.ActionDocumentCreate) {
 		return
 	}
 
@@ -145,24 +186,92 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/documents/{documentID} ───────────────────────────────────────────
 
 func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	documentID := chi.URLParam(r, "documentID")
 	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
 	if err != nil {
 		h.handleStoreError(w, err)
 		return
 	}
+	// Authorized against the document's OWN legal entity, which is why the
+	// lookup comes first. The document is already tenant-scoped by the store,
+	// so this cannot be used to probe another tenant's ids.
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
 
-	h.recordAccess(r, documentID, nil, domain.AccessMetadata)
+	h.recordAccess(r, actor, documentID, nil, domain.AccessMetadata)
 	writeJSON(w, http.StatusOK, doc)
+}
+
+// ── GET /v1/documents ────────────────────────────────────────────────────────
+
+// ListDocuments is the tenant's register for one legal entity.
+//
+// legal_entity_id is required rather than optional. This service authorizes
+// per legal entity, so a register spanning every entity in the tenant would
+// have no single scope to authorize against — and defaulting to "all entities
+// the tenant owns" is how the unscoped reads elsewhere in this platform came
+// about.
+func (h *Handler) ListDocuments(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field",
+			"legal_entity_id is required — documents are authorized per legal entity")
+		return
+	}
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, actor, legalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	docs, err := h.store.ListDocuments(r.Context(), legalEntityID, limit, offset)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if docs == nil {
+		docs = []domain.Document{}
+	}
+	writeJSON(w, http.StatusOK, docs)
 }
 
 // ── GET /v1/documents/{documentID}/content?version=N ────────────────────────
 
 func (h *Handler) GetContent(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	documentID := chi.URLParam(r, "documentID")
 	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
 	if err != nil {
 		h.handleStoreError(w, err)
+		return
+	}
+	// DOWNLOAD, not READ. Knowing a document exists and reading its bytes are
+	// different disclosures — the access log has recorded them as different
+	// access types since day one, and authorization now agrees.
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentDownload) {
 		return
 	}
 
@@ -194,7 +303,7 @@ func (h *Handler) GetContent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.recordAccess(r, documentID, &v.DocumentVersionID, domain.AccessDownload)
+	h.recordAccess(r, actor, documentID, &v.DocumentVersionID, domain.AccessDownload)
 
 	w.Header().Set("Content-Type", v.ContentType)
 	w.Header().Set("X-Checksum-SHA256", v.ChecksumSHA256)
@@ -205,12 +314,29 @@ func (h *Handler) GetContent(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/documents/{documentID}/versions ─────────────────────────────────
 
 func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	documentID := chi.URLParam(r, "documentID")
-	actor := actorFromHeader(r)
+
+	// The document is read before the body so the new version can be authorized
+	// against the entity that owns it. A version is an amendment to an existing
+	// governed record, so the grant that matters is the one on that record.
+	existing, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionDocumentVersionCreate) {
+		return
+	}
 
 	var req domain.CreateDocumentVersionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -252,11 +378,29 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/documents/{documentID}/versions ──────────────────────────────────
 
 func (h *Handler) ListVersions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
 	versions, err := h.store.ListVersions(r.Context(), documentID)
 	if err != nil {
 		h.handleStoreError(w, err)
 		return
+	}
+	if versions == nil {
+		versions = []domain.DocumentVersion{}
 	}
 	writeJSON(w, http.StatusOK, versions)
 }
@@ -264,18 +408,48 @@ func (h *Handler) ListVersions(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/documents/{documentID}/access-log ────────────────────────────────
 
 func (h *Handler) ListAccessLog(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	documentID := chi.URLParam(r, "documentID")
-	logEntries, err := h.store.ListAccessLog(r.Context(), documentID)
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
 	if err != nil {
 		h.handleStoreError(w, err)
 		return
+	}
+	// A separate grant from reading the document. The log says who read what
+	// and when; on a governed vault that is the record an investigator
+	// consults, and it should not fall out of ordinary read access.
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentAccessLogRead) {
+		return
+	}
+	logEntries, err := h.store.ListAccessLog(r.Context(), documentID, limit, offset)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if logEntries == nil {
+		logEntries = []domain.DocumentAccessLog{}
 	}
 	writeJSON(w, http.StatusOK, logEntries)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-func (h *Handler) recordAccess(r *http.Request, documentID string, versionID *string, accessType domain.AccessType) {
+// recordAccess takes the actor as a parameter rather than re-deriving it from
+// headers. It used to call actorFromHeader, which preferred a forgeable
+// X-Actor-Principal-ID and fell back to the literal "unknown" — so the
+// append-only record of who read a RESTRICTED document could be attributed to
+// anyone, or to nobody.
+func (h *Handler) recordAccess(r *http.Request, actor, documentID string, versionID *string, accessType domain.AccessType) {
 	corrID := r.Header.Get("X-Correlation-ID")
 	var corrPtr *string
 	if corrID != "" {
@@ -284,7 +458,7 @@ func (h *Handler) recordAccess(r *http.Request, documentID string, versionID *st
 	entry := &domain.DocumentAccessLog{
 		DocumentID:            documentID,
 		DocumentVersionID:     versionID,
-		AccessedByPrincipalID: actorFromHeader(r),
+		AccessedByPrincipalID: actor,
 		AccessType:            accessType,
 		CorrelationID:         corrPtr,
 	}
@@ -298,6 +472,10 @@ func (h *Handler) recordAccess(r *http.Request, documentID string, versionID *st
 
 func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, domain.ErrTenantMissing):
+		writeError(w, http.StatusUnauthorized, "tenant_missing", err.Error())
+	case errors.Is(err, domain.ErrIdentityMissing):
+		writeError(w, http.StatusUnauthorized, "identity_missing", err.Error())
 	case errors.Is(err, domain.ErrDocumentNotFound):
 		writeError(w, http.StatusNotFound, "document_not_found", "")
 	case errors.Is(err, domain.ErrDocumentVersionNotFound):
@@ -320,8 +498,9 @@ func (h *Handler) handleResidencyError(w http.ResponseWriter, err error) {
 
 func requiredFieldMissing(req domain.CreateDocumentRequest) string {
 	switch {
-	case req.TenantID == "":
-		return "tenant_id"
+	// tenant_id is not checked here any more: it is taken from the verified
+	// X-Tenant-Id header before this runs, so it can never be empty by the time
+	// we reach this point.
 	case req.LegalEntityID == "":
 		return "legal_entity_id"
 	case req.Title == "":
@@ -337,15 +516,84 @@ func requiredFieldMissing(req domain.CreateDocumentRequest) string {
 	}
 }
 
-func actorFromHeader(r *http.Request) string {
-	if a := r.Header.Get("X-Actor-Principal-ID"); a != "" {
-		return a
+// requirePrincipal returns the gateway-verified principal, or refuses.
+//
+// This replaces actorFromHeader, which was three bugs in nine lines. It read
+// X-Actor-Principal-ID FIRST — a header nothing in this platform sets and
+// anything may send, taking precedence over the one the gateway verifies — so a
+// caller could attribute their own download to a colleague. Failing both, it
+// returned the literal string "unknown", so an unidentified caller was not
+// refused but RECORDED, and the append-only log that exists to answer "who
+// downloaded this" could answer "unknown" and read as though it had answered.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, "identity_missing", domain.ErrIdentityMissing.Error())
+		return "", false
 	}
-	// Prefer the identity gateway propagates once fronted by gateway-auth-svc.
-	if a := r.Header.Get("X-Principal-Id"); a != "" {
-		return a
+	return principalID, true
+}
+
+// requireTenant refuses a request carrying no X-Tenant-Id. Without it the
+// store's old predicate widened to every tenant rather than refusing.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "tenant_missing", domain.ErrTenantMissing.Error())
+		return "", false
 	}
-	return "unknown"
+	return tenantID, true
+}
+
+// authorize asks authorization-svc and writes the refusal itself. Returns true
+// only on an explicit GRANTED.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, action string) bool {
+	err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, action)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, domain.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "forbidden", domain.ErrAuthorizationDenied.Error())
+		return false
+	}
+	h.log.Error("authorization check failed — failing closed", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "authz_unavailable", domain.ErrAuthzServiceUnavailable.Error())
+	return false
+}
+
+// decodeJSON caps the body and refuses unknown fields. A misspelled field used
+// to be discarded in silence — on a create that means a document stored with a
+// classification the caller believed they had set.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	return true
+}
+
+func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok bool) {
+	limit, offset = defaultPageLimit, 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > maxPageLimit {
+			writeError(w, http.StatusBadRequest, "invalid_paging", domain.ErrInvalidPaging.Error())
+			return 0, 0, false
+		}
+		limit = n
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_paging", domain.ErrInvalidPaging.Error())
+			return 0, 0, false
+		}
+		offset = n
+	}
+	return limit, offset, true
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

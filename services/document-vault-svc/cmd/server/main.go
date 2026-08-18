@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"zoiko.io/document-vault-svc/internal/authz"
 	"zoiko.io/document-vault-svc/internal/config"
 	"zoiko.io/document-vault-svc/internal/handler"
 	"zoiko.io/document-vault-svc/internal/health"
@@ -66,7 +67,8 @@ func main() {
 
 	pgStore := store.New(pool, log)
 	residencyValidator := residency.NewHTTPValidator(cfg.TenantRegistryURL, log)
-	h := handler.New(pgStore, storageBackend, residencyValidator, log)
+	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+	h := handler.New(pgStore, storageBackend, residencyValidator, authzClient, log)
 	healthH := health.New(pool)
 
 	r := chi.NewRouter()
