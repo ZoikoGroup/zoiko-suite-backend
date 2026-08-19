@@ -364,7 +364,10 @@ func (h *Handler) ProposeAutomationAction(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "failed to propose automation action")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "automation_action.proposed", a.AutomationActionID, a.TenantID, a)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "automation_action.proposed", EntityID: a.AutomationActionID, TenantID: a.TenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: a,
+	})
 	writeJSON(w, http.StatusCreated, a)
 }
 
@@ -427,7 +430,10 @@ func (h *Handler) DecideAutomationAction(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, "failed to decide automation action")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "automation_action.decided", updated.AutomationActionID, updated.TenantID, updated)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "automation_action.decided", EntityID: updated.AutomationActionID, TenantID: updated.TenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
+	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
