@@ -95,6 +95,28 @@ Add the next service as `0022_`. Never renumber a file that has been applied
 anywhere — the number is how you say which migrations a given database has
 already seen.
 
+Each file's line 1 is a comment naming itself, and `sync-migrations.sh` keeps
+that true so it never has to be done by hand:
+
+```
+./sync-migrations.sh              # check only — reports drift, changes nothing
+./sync-migrations.sh --fix        # rewrite each line-1 header to match its file
+./sync-migrations.sh --renumber   # renumber to 0001..NNNN in order, then --fix
+```
+
+`--renumber` is for inserting a migration in the middle: drop in
+`0002a_whatever.sql`, run it, and everything after shifts up with its header
+following. It moves files aside first and places them second, so no rename
+collides part-way through, and it regenerates `zoiko-suite-all.sql` at the end.
+
+The **filename is the source of truth**; the header follows it. And the header
+is only overwritten when line 1 is itself a `-- something.sql` line — a file
+whose header was deleted has some other comment sitting on line 1, and treating
+that as the header to replace would silently eat it.
+
+Run `--renumber` only on migrations nothing has applied yet. It is the right
+tool while this set is still being assembled and the wrong one afterwards.
+
 > If the Supabase CLI is ever adopted, note that `supabase db push` expects
 > `<utc-timestamp>_name.sql` and will not recognise these as versioned
 > migrations. That does not affect the SQL editor route, which is how this is
