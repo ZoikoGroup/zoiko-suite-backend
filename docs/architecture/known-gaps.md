@@ -968,3 +968,29 @@ events now get distinct IDs; the other 19 got the same event_id fix as a
 standalone, minimal, mechanically-verified change (build+vet+test clean
 on every one) without the broader envelope rewrite, which still needs
 doing per service the same way the six Doc 03 §3.7 mandatory cases were.
+
+## Open: commercial-account-svc's outbox-relayed events carry no actor/correlation
+While standardizing this service's event envelope (2026-08-19), the 6
+direct handler-published events (commercial_account.created,
+membership.created/deactivated, commercial_subscription.plan_changed/
+status_changed/billing_source_transferred) all got real actor_id and
+correlation_id, sourced from each handler's own requirePrincipal() call
+and X-Correlation-ID header.
+
+commercial_subscription.created is different: it's published via the
+transactional-outbox Relay (internal/outbox), not a direct handler call,
+and `outbox_events` has no actor_id/correlation_id column — only
+aggregate_type, aggregate_id, event_type, payload, tenant_id. The relayed
+event's envelope genuinely has neither to give, so PublishForOutbox (the
+adapter internal/outbox calls) leaves both empty rather than fabricating
+them.
+
+The real data exists — domain.CommercialSubscription already carries
+CreatedByPrincipalID at the moment outbox.Insert is called inside
+CreateSubscription's transaction (internal/store/subscription_store.go) —
+it just isn't threaded onto the outbox row. Closing this needs a small
+schema change (add actor_id/correlation_id columns to outbox_events) plus
+threading them through outbox.Event → the stored row → the Relay's
+publish call. Deliberately not done in this pass to keep the outbox
+pattern's own correctness (the actual point of today's change) isolated
+from a schema migration.

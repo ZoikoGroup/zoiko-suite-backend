@@ -132,7 +132,10 @@ func (h *Handler) CreateCommercialAccount(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "commercial_account.created", acct.CommercialAccountID, acct.OrganizationID, acct)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "commercial_account.created", EntityID: acct.CommercialAccountID, TenantID: acct.OrganizationID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: acct,
+	})
 	writeJSON(w, http.StatusCreated, acct)
 }
 
@@ -191,7 +194,10 @@ func (h *Handler) CreateMembership(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "membership.created", m.MembershipID, m.OrganizationID, m)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "membership.created", EntityID: m.MembershipID, TenantID: m.OrganizationID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
 	writeJSON(w, http.StatusCreated, m)
 }
 
@@ -255,7 +261,10 @@ func (h *Handler) DeactivateMembership(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "membership.deactivated", id, existing.OrganizationID, nil)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "membership.deactivated", EntityID: id, TenantID: existing.OrganizationID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: nil,
+	})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deactivated"})
 }
 
