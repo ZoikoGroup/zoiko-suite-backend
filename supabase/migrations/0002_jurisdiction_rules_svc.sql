@@ -1,4 +1,4 @@
--- 20260818000100_jurisdiction_rules_svc.sql
+-- 0002_jurisdiction_rules_svc.sql
 -- jurisdiction-rules-svc → schema `jurisdiction_rules`
 --
 -- Squashed end state of the service's four compose-era migrations:

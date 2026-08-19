@@ -81,6 +81,25 @@ schemas** (`app` plus one per service).
 | 19 | secret-vault-integration-svc | `secret_vault_integration` | 4 |
 | 20 | policy-svc | `policy` | 5 |
 
+## Numbering
+
+Migrations are numbered sequentially — `0001_platform_foundation.sql` through
+`0021_policy_svc.sql`. The number is the order they must be applied in and
+nothing else; four digits so they sort correctly in a shell, an editor and a
+diff alike.
+
+`0001` must run first: every other file depends on the `app` schema, the
+`zoiko_backend` role and the identity helpers it creates.
+
+Add the next service as `0022_`. Never renumber a file that has been applied
+anywhere — the number is how you say which migrations a given database has
+already seen.
+
+> If the Supabase CLI is ever adopted, note that `supabase db push` expects
+> `<utc-timestamp>_name.sql` and will not recognise these as versioned
+> migrations. That does not affect the SQL editor route, which is how this is
+> applied today.
+
 ## To apply
 
 `./build-combined.sh` writes **`zoiko-suite-all.sql`** — every migration in

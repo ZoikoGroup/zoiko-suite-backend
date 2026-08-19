@@ -1,4 +1,4 @@
--- 20260818000800_governance_decision_log_svc.sql
+-- 0009_governance_decision_log_svc.sql
 -- governance-decision-log-svc → schema `governance_decision_log`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_rls,

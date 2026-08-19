@@ -1,4 +1,4 @@
--- 20260818001000_purchase_order_svc.sql
+-- 0011_purchase_order_svc.sql
 -- purchase-order-svc → schema `purchase_order`
 --
 -- End state of 000001_initial_schema (the service's only migration).

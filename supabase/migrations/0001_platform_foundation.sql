@@ -1,4 +1,4 @@
--- 20260818000000_platform_foundation.sql
+-- 0001_platform_foundation.sql
 -- Zoiko Suite on Supabase — shared foundation.
 --
 -- Applied ONCE, before any service migration. Every per-service migration in

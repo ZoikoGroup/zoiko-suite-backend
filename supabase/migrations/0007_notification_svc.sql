@@ -1,4 +1,4 @@
--- 20260818000600_notification_svc.sql
+-- 0007_notification_svc.sql
 -- notification-svc → schema `notification`
 --
 -- Squashed end state of 000001_initial_schema and

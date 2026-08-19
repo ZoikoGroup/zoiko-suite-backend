@@ -1,4 +1,4 @@
--- 20260818001500_financial_close_svc.sql
+-- 0016_financial_close_svc.sql
 -- financial-close-svc → schema `financial_close`
 --
 -- End state of 000001_initial_schema (the service's only migration).

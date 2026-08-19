@@ -1,4 +1,4 @@
--- 20260818001800_document_vault_svc.sql
+-- 0019_document_vault_svc.sql
 -- document-vault-svc → schema `document_vault`
 --
 -- Squashed end state of 000001_initial_schema and

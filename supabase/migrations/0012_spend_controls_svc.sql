@@ -1,4 +1,4 @@
--- 20260818001100_spend_controls_svc.sql
+-- 0012_spend_controls_svc.sql
 -- spend-controls-svc → schema `spend_controls`
 --
 -- End state of 000001_initial_schema (the service's only migration).

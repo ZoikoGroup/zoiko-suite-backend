@@ -1,4 +1,4 @@
--- 20260818000900_configuration_feature_flag_svc.sql
+-- 0010_configuration_feature_flag_svc.sql
 -- configuration-feature-flag-svc → schema `configuration_feature_flag`
 --
 -- End state of 000001_initial_schema (the service's only migration).

@@ -1,4 +1,4 @@
--- 20260818001600_board_resolutions_svc.sql
+-- 0017_board_resolutions_svc.sql
 -- board-resolutions-svc → schema `board_resolutions`
 --
 -- Squashed end state of 000001_initial_schema and

@@ -1,4 +1,4 @@
--- 20260818002000_policy_svc.sql
+-- 0021_policy_svc.sql
 -- policy-svc → schema `policy`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_activation_audit,

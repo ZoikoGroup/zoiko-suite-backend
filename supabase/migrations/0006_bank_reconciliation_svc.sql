@@ -1,4 +1,4 @@
--- 20260818000500_bank_reconciliation_svc.sql
+-- 0006_bank_reconciliation_svc.sql
 -- bank-reconciliation-svc → schema `bank_reconciliation`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_idempotency_index

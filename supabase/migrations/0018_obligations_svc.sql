@@ -1,4 +1,4 @@
--- 20260818001700_obligations_svc.sql
+-- 0018_obligations_svc.sql
 -- obligations-svc → schema `obligations`
 --
 -- Squashed end state of 000001_initial_schema,

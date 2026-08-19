@@ -1,4 +1,4 @@
--- 20260818001400_general_ledger_svc.sql
+-- 0015_general_ledger_svc.sql
 -- general-ledger-svc → schema `general_ledger`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_idempotency_index

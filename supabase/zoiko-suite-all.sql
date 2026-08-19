@@ -27,10 +27,10 @@
 
 
 -- ============================================================================
--- FILE: 20260818000000_platform_foundation.sql
+-- FILE: 0001_platform_foundation.sql
 -- ============================================================================
 
--- 20260818000000_platform_foundation.sql
+-- 0001_platform_foundation.sql
 -- Zoiko Suite on Supabase — shared foundation.
 --
 -- Applied ONCE, before any service migration. Every per-service migration in
@@ -193,10 +193,10 @@ COMMENT ON FUNCTION app.reject_mutation() IS
 
 
 -- ============================================================================
--- FILE: 20260818000100_jurisdiction_rules_svc.sql
+-- FILE: 0002_jurisdiction_rules_svc.sql
 -- ============================================================================
 
--- 20260818000100_jurisdiction_rules_svc.sql
+-- 0002_jurisdiction_rules_svc.sql
 -- jurisdiction-rules-svc → schema `jurisdiction_rules`
 --
 -- Squashed end state of the service's four compose-era migrations:
@@ -447,10 +447,10 @@ GRANT SELECT, INSERT ON jurisdiction_rules.jurisdiction_rule_drift_events TO zoi
 
 
 -- ============================================================================
--- FILE: 20260818000200_delegated_authority_svc.sql
+-- FILE: 0003_delegated_authority_svc.sql
 -- ============================================================================
 
--- 20260818000200_delegated_authority_svc.sql
+-- 0003_delegated_authority_svc.sql
 -- delegated-authority-svc → schema `delegated_authority`
 --
 -- Squashed end state of 000001_initial_schema and 000002 (the FORCE RLS +
@@ -613,10 +613,10 @@ GRANT SELECT, INSERT, UPDATE ON delegated_authority.delegation_grants TO zoiko_b
 
 
 -- ============================================================================
--- FILE: 20260818000300_accounts_payable_svc.sql
+-- FILE: 0004_accounts_payable_svc.sql
 -- ============================================================================
 
--- 20260818000300_accounts_payable_svc.sql
+-- 0004_accounts_payable_svc.sql
 -- accounts-payable-svc → schema `accounts_payable`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_idempotency_index
@@ -725,10 +725,10 @@ GRANT SELECT, INSERT, UPDATE ON accounts_payable.vendor_invoices TO zoiko_backen
 
 
 -- ============================================================================
--- FILE: 20260818000400_purchase_request_svc.sql
+-- FILE: 0005_purchase_request_svc.sql
 -- ============================================================================
 
--- 20260818000400_purchase_request_svc.sql
+-- 0005_purchase_request_svc.sql
 -- purchase-request-svc → schema `purchase_request`
 --
 -- Squashed end state of 000001_initial_schema and 000002_add_idempotency_index.
@@ -810,10 +810,10 @@ GRANT SELECT, INSERT, UPDATE ON purchase_request.purchase_requests TO zoiko_back
 
 
 -- ============================================================================
--- FILE: 20260818000500_bank_reconciliation_svc.sql
+-- FILE: 0006_bank_reconciliation_svc.sql
 -- ============================================================================
 
--- 20260818000500_bank_reconciliation_svc.sql
+-- 0006_bank_reconciliation_svc.sql
 -- bank-reconciliation-svc → schema `bank_reconciliation`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_idempotency_index
@@ -919,10 +919,10 @@ GRANT SELECT, INSERT, UPDATE ON bank_reconciliation.statement_lines TO zoiko_bac
 
 
 -- ============================================================================
--- FILE: 20260818000600_notification_svc.sql
+-- FILE: 0007_notification_svc.sql
 -- ============================================================================
 
--- 20260818000600_notification_svc.sql
+-- 0007_notification_svc.sql
 -- notification-svc → schema `notification`
 --
 -- Squashed end state of 000001_initial_schema and
@@ -1047,10 +1047,10 @@ GRANT SELECT, INSERT, UPDATE ON notification.notifications TO zoiko_backend;
 
 
 -- ============================================================================
--- FILE: 20260818000700_schema_registry_svc.sql
+-- FILE: 0008_schema_registry_svc.sql
 -- ============================================================================
 
--- 20260818000700_schema_registry_svc.sql
+-- 0008_schema_registry_svc.sql
 -- schema-registry-svc → schema `schema_registry`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_compatibility_mode
@@ -1171,10 +1171,10 @@ GRANT SELECT, INSERT ON schema_registry.event_schemas TO zoiko_backend;
 
 
 -- ============================================================================
--- FILE: 20260818000800_governance_decision_log_svc.sql
+-- FILE: 0009_governance_decision_log_svc.sql
 -- ============================================================================
 
--- 20260818000800_governance_decision_log_svc.sql
+-- 0009_governance_decision_log_svc.sql
 -- governance-decision-log-svc → schema `governance_decision_log`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_rls,
@@ -1363,10 +1363,10 @@ GRANT SELECT, INSERT ON governance_decision_log.replay_manifests     TO zoiko_ba
 
 
 -- ============================================================================
--- FILE: 20260818000900_configuration_feature_flag_svc.sql
+-- FILE: 0010_configuration_feature_flag_svc.sql
 -- ============================================================================
 
--- 20260818000900_configuration_feature_flag_svc.sql
+-- 0010_configuration_feature_flag_svc.sql
 -- configuration-feature-flag-svc → schema `configuration_feature_flag`
 --
 -- End state of 000001_initial_schema (the service's only migration).
@@ -1542,10 +1542,10 @@ GRANT SELECT, INSERT, UPDATE ON configuration_feature_flag.feature_flags  TO zoi
 
 
 -- ============================================================================
--- FILE: 20260818001000_purchase_order_svc.sql
+-- FILE: 0011_purchase_order_svc.sql
 -- ============================================================================
 
--- 20260818001000_purchase_order_svc.sql
+-- 0011_purchase_order_svc.sql
 -- purchase-order-svc → schema `purchase_order`
 --
 -- End state of 000001_initial_schema (the service's only migration).
@@ -1701,10 +1701,10 @@ GRANT USAGE ON SEQUENCE purchase_order.purchase_order_number_seq TO zoiko_backen
 
 
 -- ============================================================================
--- FILE: 20260818001100_spend_controls_svc.sql
+-- FILE: 0012_spend_controls_svc.sql
 -- ============================================================================
 
--- 20260818001100_spend_controls_svc.sql
+-- 0012_spend_controls_svc.sql
 -- spend-controls-svc → schema `spend_controls`
 --
 -- End state of 000001_initial_schema (the service's only migration).
@@ -1855,10 +1855,10 @@ GRANT SELECT, INSERT ON spend_controls.spend_consumptions TO zoiko_backend;
 
 
 -- ============================================================================
--- FILE: 20260818001200_vendor_due_diligence_svc.sql
+-- FILE: 0013_vendor_due_diligence_svc.sql
 -- ============================================================================
 
--- 20260818001200_vendor_due_diligence_svc.sql
+-- 0013_vendor_due_diligence_svc.sql
 -- vendor-due-diligence-svc → schema `vendor_due_diligence`
 --
 -- Squashed end state of 000001_initial_schema and 000002_screening_source.
@@ -2032,10 +2032,10 @@ GRANT SELECT, INSERT ON vendor_due_diligence.vendor_dd_evidence TO zoiko_backend
 
 
 -- ============================================================================
--- FILE: 20260818001300_evidence_requirements_svc.sql
+-- FILE: 0014_evidence_requirements_svc.sql
 -- ============================================================================
 
--- 20260818001300_evidence_requirements_svc.sql
+-- 0014_evidence_requirements_svc.sql
 -- evidence-requirements-svc → schema `evidence_requirements`
 --
 -- End state of 000001_initial_schema (the service's only migration).
@@ -2229,10 +2229,10 @@ GRANT SELECT, INSERT         ON evidence_requirements.evidence_evaluations  TO z
 
 
 -- ============================================================================
--- FILE: 20260818001400_general_ledger_svc.sql
+-- FILE: 0015_general_ledger_svc.sql
 -- ============================================================================
 
--- 20260818001400_general_ledger_svc.sql
+-- 0015_general_ledger_svc.sql
 -- general-ledger-svc → schema `general_ledger`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_idempotency_index
@@ -2424,10 +2424,10 @@ GRANT SELECT, INSERT         ON general_ledger.journal_lines   TO zoiko_backend;
 
 
 -- ============================================================================
--- FILE: 20260818001500_financial_close_svc.sql
+-- FILE: 0016_financial_close_svc.sql
 -- ============================================================================
 
--- 20260818001500_financial_close_svc.sql
+-- 0016_financial_close_svc.sql
 -- financial-close-svc → schema `financial_close`
 --
 -- End state of 000001_initial_schema (the service's only migration).
@@ -2557,10 +2557,10 @@ GRANT SELECT, INSERT         ON financial_close.close_evidences TO zoiko_backend
 
 
 -- ============================================================================
--- FILE: 20260818001600_board_resolutions_svc.sql
+-- FILE: 0017_board_resolutions_svc.sql
 -- ============================================================================
 
--- 20260818001600_board_resolutions_svc.sql
+-- 0017_board_resolutions_svc.sql
 -- board-resolutions-svc → schema `board_resolutions`
 --
 -- Squashed end state of 000001_initial_schema and
@@ -2748,10 +2748,10 @@ GRANT SELECT, INSERT, UPDATE ON board_resolutions.board_resolutions TO zoiko_bac
 
 
 -- ============================================================================
--- FILE: 20260818001700_obligations_svc.sql
+-- FILE: 0018_obligations_svc.sql
 -- ============================================================================
 
--- 20260818001700_obligations_svc.sql
+-- 0018_obligations_svc.sql
 -- obligations-svc → schema `obligations`
 --
 -- Squashed end state of 000001_initial_schema,
@@ -3049,10 +3049,10 @@ GRANT SELECT, INSERT         ON obligations.applicability_decisions TO zoiko_bac
 
 
 -- ============================================================================
--- FILE: 20260818001800_document_vault_svc.sql
+-- FILE: 0019_document_vault_svc.sql
 -- ============================================================================
 
--- 20260818001800_document_vault_svc.sql
+-- 0019_document_vault_svc.sql
 -- document-vault-svc → schema `document_vault`
 --
 -- Squashed end state of 000001_initial_schema and
@@ -3301,10 +3301,10 @@ GRANT SELECT, INSERT         ON document_vault.document_access_log TO zoiko_back
 
 
 -- ============================================================================
--- FILE: 20260818001900_secret_vault_integration_svc.sql
+-- FILE: 0020_secret_vault_integration_svc.sql
 -- ============================================================================
 
--- 20260818001900_secret_vault_integration_svc.sql
+-- 0020_secret_vault_integration_svc.sql
 -- secret-vault-integration-svc → schema `secret_vault_integration`
 --
 -- Squashed end state of 000001_initial_schema and
@@ -3618,10 +3618,10 @@ GRANT SELECT, INSERT         ON secret_vault_integration.secret_access_audit_log
 
 
 -- ============================================================================
--- FILE: 20260818002000_policy_svc.sql
+-- FILE: 0021_policy_svc.sql
 -- ============================================================================
 
--- 20260818002000_policy_svc.sql
+-- 0021_policy_svc.sql
 -- policy-svc → schema `policy`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_activation_audit,

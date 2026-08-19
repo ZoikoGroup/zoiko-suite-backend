@@ -1,4 +1,4 @@
--- 20260818000200_delegated_authority_svc.sql
+-- 0003_delegated_authority_svc.sql
 -- delegated-authority-svc → schema `delegated_authority`
 --
 -- Squashed end state of 000001_initial_schema and 000002 (the FORCE RLS +

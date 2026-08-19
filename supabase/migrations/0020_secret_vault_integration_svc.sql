@@ -1,4 +1,4 @@
--- 20260818001900_secret_vault_integration_svc.sql
+-- 0020_secret_vault_integration_svc.sql
 -- secret-vault-integration-svc → schema `secret_vault_integration`
 --
 -- Squashed end state of 000001_initial_schema and

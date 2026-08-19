@@ -1,4 +1,4 @@
--- 20260818000400_purchase_request_svc.sql
+-- 0005_purchase_request_svc.sql
 -- purchase-request-svc → schema `purchase_request`
 --
 -- Squashed end state of 000001_initial_schema and 000002_add_idempotency_index.

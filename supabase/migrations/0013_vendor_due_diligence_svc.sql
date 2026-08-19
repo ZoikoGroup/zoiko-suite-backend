@@ -1,4 +1,4 @@
--- 20260818001200_vendor_due_diligence_svc.sql
+-- 0013_vendor_due_diligence_svc.sql
 -- vendor-due-diligence-svc → schema `vendor_due_diligence`
 --
 -- Squashed end state of 000001_initial_schema and 000002_screening_source.

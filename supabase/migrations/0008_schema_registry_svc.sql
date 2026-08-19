@@ -1,4 +1,4 @@
--- 20260818000700_schema_registry_svc.sql
+-- 0008_schema_registry_svc.sql
 -- schema-registry-svc → schema `schema_registry`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_compatibility_mode

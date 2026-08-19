@@ -1,4 +1,4 @@
--- 20260818000300_accounts_payable_svc.sql
+-- 0004_accounts_payable_svc.sql
 -- accounts-payable-svc → schema `accounts_payable`
 --
 -- Squashed end state of 000001_initial_schema, 000002_add_idempotency_index
