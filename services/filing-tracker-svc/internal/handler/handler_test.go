@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/filing-tracker-svc/internal/domain"
+	"zoiko.io/filing-tracker-svc/internal/events"
 )
 
 // mockAuthz always grants, so handler tests exercise the store/publish flow
@@ -126,7 +127,7 @@ func (m *mockStore) MarkOverdue(ctx context.Context, id, todayStr string) (*doma
 
 type mockPublisher struct{}
 
-func (p *mockPublisher) Publish(ctx context.Context, eventType, filingID, tenantID string, payload interface{}) error {
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
 	return nil
 }
 
