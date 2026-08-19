@@ -30,11 +30,15 @@ type Store interface {
 	FinalizePayrollRun(ctx context.Context, runID string, governanceDecisionID *string) error
 }
 
+// actorID on every method is the already-authorized principal from that
+// request's requirePrincipal() call — domain.PayrollRun carries no actor
+// field of its own (no InitiatedBy/CalculatedBy/etc.), so this is the only
+// real source for the event envelope's actor_id (Doc 03 §19).
 type Publisher interface {
-	PublishRunInitiated(ctx context.Context, correlationID string, r domain.PayrollRun)
-	PublishRunCalculated(ctx context.Context, correlationID string, r domain.PayrollRun)
-	PublishRunCompleted(ctx context.Context, correlationID string, r domain.PayrollRun)
-	PublishRunBlocked(ctx context.Context, correlationID string, r domain.PayrollRun, reason string)
+	PublishRunInitiated(ctx context.Context, correlationID, actorID string, r domain.PayrollRun)
+	PublishRunCalculated(ctx context.Context, correlationID, actorID string, r domain.PayrollRun)
+	PublishRunCompleted(ctx context.Context, correlationID, actorID string, r domain.PayrollRun)
+	PublishRunBlocked(ctx context.Context, correlationID, actorID string, r domain.PayrollRun, reason string)
 }
 
 type AuthZClient interface {
@@ -152,7 +156,7 @@ func (h *Handler) InitiateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishRunInitiated(r.Context(), correlationID, *payrollRun)
+	h.publisher.PublishRunInitiated(r.Context(), correlationID, principalID, *payrollRun)
 
 	writeJSON(w, http.StatusCreated, payrollRun)
 }
@@ -249,7 +253,7 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 			contracts[emp.EmployeeID] = ctr
 		}
 		if len(missingContracts) > 0 {
-			h.publisher.PublishRunBlocked(r.Context(), getCorrelationID(r), *run, domain.ErrContractLookupFailed.Error())
+			h.publisher.PublishRunBlocked(r.Context(), getCorrelationID(r), principalID, *run, domain.ErrContractLookupFailed.Error())
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 				"error_code":         "contract_lookup_failed",
 				"error_message":      domain.ErrContractLookupFailed.Error(),
@@ -388,7 +392,7 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 
 	updatedRun, _ := h.store.GetPayrollRun(r.Context(), id)
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishRunCalculated(r.Context(), correlationID, *updatedRun)
+	h.publisher.PublishRunCalculated(r.Context(), correlationID, principalID, *updatedRun)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"run":                updatedRun,
@@ -607,7 +611,7 @@ func (h *Handler) FinalizeRun(w http.ResponseWriter, r *http.Request) {
 
 	finalizedRun, _ := h.store.GetPayrollRun(r.Context(), id)
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishRunCompleted(r.Context(), correlationID, *finalizedRun)
+	h.publisher.PublishRunCompleted(r.Context(), correlationID, principalID, *finalizedRun)
 
 	writeJSON(w, http.StatusOK, finalizedRun)
 }
