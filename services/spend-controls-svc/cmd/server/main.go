@@ -28,9 +28,14 @@ import (
 	"zoiko.io/spend-controls-svc/internal/handler"
 	"zoiko.io/spend-controls-svc/internal/health"
 	svcmiddleware "zoiko.io/spend-controls-svc/internal/middleware"
+	"zoiko.io/spend-controls-svc/internal/mtls"
 	"zoiko.io/spend-controls-svc/internal/store"
 	"zoiko.io/spend-controls-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
 // authorization-svc may be reused locally before it is asked again.
@@ -259,7 +264,23 @@ func main() {
 	}
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
+
+	var httpClientForAuthz *http.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "spend-controls-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		httpClientForAuthz = mtlsHTTPClient
+	} else {
+		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
+	}
+	authzBaseURL := cfg.AuthZServiceURL
+	if cfg.AuthzMTLSEnabled {
+		authzBaseURL = cfg.AuthzMTLSURL
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()

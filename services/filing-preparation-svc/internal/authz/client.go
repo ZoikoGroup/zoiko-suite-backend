@@ -54,6 +54,18 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
+// NewClientWithHTTPClient is NewClient but with a caller-supplied
+// *http.Client — used for the mTLS pilot, where the client's Transport
+// already carries this service's leaf certificate and trusts
+// authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
+	return &Client{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient: httpClient,
+		cache:      make(map[string]cachedDecision),
+	}
+}
+
 // ErrAuthzServiceUnavailable is returned when authorization-svc cannot be
 // reached or does not respond with a usable decision. Callers MUST treat
 // this as a denial (fail closed) — never proceed with the guarded action.

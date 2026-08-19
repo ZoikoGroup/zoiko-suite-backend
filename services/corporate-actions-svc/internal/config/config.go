@@ -13,6 +13,14 @@ type Config struct {
 	AuthzServiceURL      string
 	JurisdictionRulesURL string
 	EvidenceReqURL       string
+
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthzServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -32,6 +40,10 @@ func Load() (*Config, error) {
 		AuthzServiceURL:      getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		JurisdictionRulesURL: getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8081"),
 		EvidenceReqURL:       getEnvOrDefault("EVIDENCE_REQ_URL", "http://evidence-requirements-svc:8130"),
+
+		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: getEnvOrDefault("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}, nil
 }
 

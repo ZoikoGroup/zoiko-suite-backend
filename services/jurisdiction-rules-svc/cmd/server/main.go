@@ -36,6 +36,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
+	"zoiko.io/jurisdiction-rules-svc/internal/mtls"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 	"zoiko.io/jurisdiction-rules-svc/internal/telemetry"
 )
@@ -112,9 +113,19 @@ func main() {
 	// AuthZ client. Fails fast at startup if ENV is production/staging and
 	// AuthZServiceURL is still empty or a dev placeholder — no domain
 	// service may silently fall back to a permit-all stub in production.
-	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
-	if err != nil {
-		log.Fatal("authz client construction failed", zap.Error(err))
+	var authzClient authz.AuthorizationClient
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "jurisdiction-rules-svc", cfg.AuthZPlatformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewHTTPAuthZClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
+	} else {
+		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+		if err != nil {
+			log.Fatal("authz client construction failed", zap.Error(err))
+		}
 	}
 
 	publisher, closeProducer := newPublisher(cfg, log)

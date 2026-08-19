@@ -14,11 +14,21 @@ type Config struct {
 
 	Kafka KafkaConfig
 
-	AuthZServiceURL  string
-	LedgerServiceURL string
-	APServiceURL     string
-	ARServiceURL     string
-	VaultServiceURL  string
+	AuthZServiceURL string
+	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
+	// OFF by default — when false, nothing about the existing authz call
+	// changes.
+	AuthzMTLSEnabled bool
+	// AuthzMTLSURL is authorization-svc's mTLS listener, used only when
+	// AuthzMTLSEnabled is true.
+	AuthzMTLSURL string
+	// MTLSManagementServiceURL is where this service provisions its own
+	// client-side mTLS identity, used only when AuthzMTLSEnabled is true.
+	MTLSManagementServiceURL string
+	LedgerServiceURL         string
+	APServiceURL             string
+	ARServiceURL             string
+	VaultServiceURL          string
 
 	// CloseSigningKey is the HMAC secret the close evidence signature is
 	// computed with. There is deliberately NO default: the signature used to be
@@ -94,10 +104,13 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "financial-close-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.close.events"),
 		},
-		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
-		APServiceURL:     env("AP_SERVICE_URL", "http://accounts-payable-svc:8099"),
-		ARServiceURL:     env("AR_SERVICE_URL", "http://accounts-receivable-svc:8101"),
+		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:         os.Getenv("AUTHZ_MTLS_ENABLED") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		LedgerServiceURL:         env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		APServiceURL:             env("AP_SERVICE_URL", "http://accounts-payable-svc:8099"),
+		ARServiceURL:             env("AR_SERVICE_URL", "http://accounts-receivable-svc:8101"),
 		// 8094 is the port document-vault-svc listens on. This defaulted to
 		// 8092, which nothing in this platform serves.
 		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),

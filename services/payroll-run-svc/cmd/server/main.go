@@ -30,9 +30,14 @@ import (
 	"zoiko.io/payroll-run-svc/internal/handler"
 	"zoiko.io/payroll-run-svc/internal/health"
 	svcmiddleware "zoiko.io/payroll-run-svc/internal/middleware"
+	"zoiko.io/payroll-run-svc/internal/mtls"
 	"zoiko.io/payroll-run-svc/internal/store"
 	"zoiko.io/payroll-run-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
 // authorization-svc may be reused locally before it is asked again.
@@ -246,7 +251,21 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
+
+	var httpClientForAuthz *http.Client
+	authzBaseURL := cfg.AuthZServiceURL
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "payroll-run-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		httpClientForAuthz = mtlsHTTPClient
+		authzBaseURL = cfg.AuthzMTLSURL
+	} else {
+		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	empClient := employee.NewClient(cfg.EmployeeMasterURL, &http.Client{Timeout: 5 * time.Second})
 	ctrClient := contract.NewClient(cfg.EmploymentContractsURL, &http.Client{Timeout: 5 * time.Second})
 

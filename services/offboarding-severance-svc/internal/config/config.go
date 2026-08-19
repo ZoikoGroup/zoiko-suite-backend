@@ -6,18 +6,26 @@ import (
 )
 
 type Config struct {
-	Port                string
-	DBHost              string
-	DBPort              string
-	DBName              string
-	DBUser              string
-	DBPassword          string
-	DBSslMode           string
-	KafkaBrokers        string
-	KafkaEventsTopic    string
-	EmployeeMasterURL   string
+	Port                 string
+	DBHost               string
+	DBPort               string
+	DBName               string
+	DBUser               string
+	DBPassword           string
+	DBSslMode            string
+	KafkaBrokers         string
+	KafkaEventsTopic     string
+	EmployeeMasterURL    string
 	JurisdictionRulesURL string
-	AuthzServiceURL     string
+	AuthzServiceURL      string
+
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthzServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -34,6 +42,10 @@ func Load() (*Config, error) {
 		EmployeeMasterURL:    getEnv("EMPLOYEE_MASTER_URL", "http://localhost:8108"),
 		JurisdictionRulesURL: getEnv("JURISDICTION_RULES_URL", "http://localhost:8081"),
 		AuthzServiceURL:      getEnv("AUTHZ_SERVICE_URL", "http://localhost:8089"),
+
+		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}
 
 	return cfg, nil

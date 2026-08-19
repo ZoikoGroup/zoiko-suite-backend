@@ -20,9 +20,15 @@ import (
 	"zoiko.io/esignature-integration-svc/internal/handler"
 	"zoiko.io/esignature-integration-svc/internal/health"
 	"zoiko.io/esignature-integration-svc/internal/middleware"
+	"zoiko.io/esignature-integration-svc/internal/mtls"
 	"zoiko.io/esignature-integration-svc/internal/store"
 	"zoiko.io/esignature-integration-svc/internal/telemetry"
 )
+
+// platformScopeID is the platform-wide legal entity scope used when
+// provisioning this service's own mTLS client identity from
+// mtls-management-svc (see internal/mtls).
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	logger, err := telemetry.InitLogger()
@@ -61,7 +67,18 @@ func main() {
 
 	st := store.NewPgStore(dbpool)
 	publisher := events.NewKafkaPublisher(strings.Split(cfg.KafkaBrokers, ","), cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "esignature-integration-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 	h := handler.New(st, publisher, authzClient, logger)
 
 	r := chi.NewRouter()

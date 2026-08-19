@@ -60,6 +60,18 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
+// NewClientWithHTTPClient is NewClient but with a caller-supplied
+// *http.Client — used for the mTLS pilot, where the client's Transport
+// already carries this service's leaf certificate and trusts
+// authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
+	return &Client{
+		baseURL: baseURL,
+		client:  httpClient,
+		cache:   make(map[string]cachedDecision),
+	}
+}
+
 // Authorize is retained for backward compatibility but is unused anywhere
 // in this service — it never called authorization-svc and always granted.
 func (c *Client) Authorize(ctx context.Context, tenantID, action, resource string) (bool, error) {

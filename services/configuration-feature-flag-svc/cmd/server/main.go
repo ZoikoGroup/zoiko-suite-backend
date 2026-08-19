@@ -37,6 +37,7 @@ import (
 	"zoiko.io/configuration-feature-flag-svc/internal/events"
 	"zoiko.io/configuration-feature-flag-svc/internal/handler"
 	"zoiko.io/configuration-feature-flag-svc/internal/health"
+	"zoiko.io/configuration-feature-flag-svc/internal/mtls"
 	"zoiko.io/configuration-feature-flag-svc/internal/store"
 	"zoiko.io/configuration-feature-flag-svc/internal/telemetry"
 )
@@ -116,9 +117,18 @@ func main() {
 
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.
-	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
-	if err != nil {
-		log.Fatal("authz client construction failed", zap.Error(err))
+	var authzClient authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "configuration-feature-flag-svc", cfg.AuthZPlatformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewHTTPClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
+	} else {
+		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+		if err != nil {
+			log.Fatal("authz client construction failed", zap.Error(err))
+		}
 	}
 
 	// ── 6. Router + handler ───────────────────────────────────────────────────

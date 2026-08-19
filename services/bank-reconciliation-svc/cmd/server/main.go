@@ -36,9 +36,14 @@ import (
 	"zoiko.io/bank-reconciliation-svc/internal/health"
 	"zoiko.io/bank-reconciliation-svc/internal/ledger"
 	svcmiddleware "zoiko.io/bank-reconciliation-svc/internal/middleware"
+	"zoiko.io/bank-reconciliation-svc/internal/mtls"
 	"zoiko.io/bank-reconciliation-svc/internal/store"
 	"zoiko.io/bank-reconciliation-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -132,7 +137,19 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+
+	var authzClient *authz.HTTPClient
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "bank-reconciliation-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewHTTPClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
+	} else {
+		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+	}
+
 	ledgerClient := ledger.NewHTTPClient(cfg.LedgerServiceURL)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

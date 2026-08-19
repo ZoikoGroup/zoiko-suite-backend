@@ -29,6 +29,7 @@ import (
 	"zoiko.io/consolidation-svc/internal/handler"
 	"zoiko.io/consolidation-svc/internal/health"
 	svcmiddleware "zoiko.io/consolidation-svc/internal/middleware"
+	"zoiko.io/consolidation-svc/internal/mtls"
 	"zoiko.io/consolidation-svc/internal/store"
 	"zoiko.io/consolidation-svc/internal/telemetry"
 )
@@ -51,6 +52,11 @@ import (
 // transient outage into a standing permit-or-deny for every subsequent
 // caller on this instance, which defeats fail-closed.
 const decisionCacheTTL = 5 * time.Second
+
+// platformScopeID is the convention used across this codebase for an
+// authorization-svc scope check that isn't tenant/entity-scoped (e.g.
+// provisioning this service's own mTLS client identity).
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 type cachedDecision struct {
 	deniedErr error
@@ -245,7 +251,21 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
+
+	// Material-path mTLS pilot rollout target (docs/original_doc/
+	// zoiko_suite_doc5.txt:76) — off by default, see AuthzMTLSEnabled's doc
+	// comment in internal/config.
+	authzBaseURL := cfg.AuthZServiceURL
+	httpClientForAuthz := &http.Client{Timeout: 5 * time.Second}
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "consolidation-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		httpClientForAuthz = mtlsHTTPClient
+		authzBaseURL = cfg.AuthzMTLSURL
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	domainClients := clients.New(cfg.LedgerServiceURL, cfg.IntercompanyServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

@@ -25,6 +25,17 @@ type Config struct {
 	// authorization-svc rejects an empty legal_entity_id outright.
 	AuthZPlatformScopeID string
 
+	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
+	// OFF by default — when false, nothing about the existing authz call
+	// changes.
+	AuthzMTLSEnabled bool
+	// AuthzMTLSURL is authorization-svc's mTLS listener, used only when
+	// AuthzMTLSEnabled is true.
+	AuthzMTLSURL string
+	// MTLSManagementServiceURL is where this service provisions its own
+	// client-side mTLS identity, used only when AuthzMTLSEnabled is true.
+	MTLSManagementServiceURL string
+
 	// PolicyServiceURL is the base URL of policy-svc. Used only by
 	// ReplayDecision to fetch the EXACT policy version a past decision
 	// used (backlog item 34) — never for authorization.
@@ -68,12 +79,15 @@ func (d DBConfig) DSN() string {
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
 	return &Config{
-		Env:                  env("ENV", "local"),
-		Port:                 envInt("PORT", 8083),
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
-		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
-		PolicyServiceURL:     env("POLICY_SERVICE_URL", "http://policy-svc:8085"),
+		Env:                      env("ENV", "local"),
+		Port:                     envInt("PORT", 8083),
+		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		AuthZPlatformScopeID:     env("AUTHZ_PLATFORM_SCOPE_ID", ""),
+		AuthzMTLSEnabled:         os.Getenv("AUTHZ_MTLS_ENABLED") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		PolicyServiceURL:         env("POLICY_SERVICE_URL", "http://policy-svc:8085"),
 		Kafka: KafkaConfig{
 			Brokers: envList("KAFKA_BROKERS", []string{"localhost:9092"}),
 			GroupID: env("KAFKA_GROUP_ID", "governance-decision-log-svc"),
