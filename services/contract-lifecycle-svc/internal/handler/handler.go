@@ -113,7 +113,11 @@ func (h *Handler) CreateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "contract.created", c.ContractID, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.created", ContractID: c.ContractID, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
+	})
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -201,7 +205,11 @@ func (h *Handler) UpdateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "contract.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.updated", ContractID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -237,7 +245,11 @@ func (h *Handler) SubmitForApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	existing.Status = domain.ContractStatusPendingApproval
-	_ = h.publisher.Publish(r.Context(), "contract.submitted_for_approval", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.submitted_for_approval", ContractID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -301,7 +313,11 @@ func (h *Handler) ActivateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "contract.activated", id, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.activated", ContractID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
+	})
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -351,7 +367,11 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "contract.terminated", id, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "contract.terminated", ContractID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: c,
+	})
 	writeJSON(w, http.StatusOK, c)
 }
 
