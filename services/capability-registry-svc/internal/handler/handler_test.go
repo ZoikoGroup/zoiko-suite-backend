@@ -149,7 +149,7 @@ func (s *stubStore) ResolveCapability(ctx context.Context, capabilityCode, marke
 
 type stubPublisher struct{}
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error { return nil }
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error { return nil }
 
 var _ events.Publisher = (*stubPublisher)(nil)
 

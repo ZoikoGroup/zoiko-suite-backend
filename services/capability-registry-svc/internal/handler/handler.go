@@ -126,7 +126,10 @@ func (h *Handler) CreateCapability(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create capability")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "capability.created", c.CapabilityID, "", c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "capability.created", EntityID: c.CapabilityID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+	})
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -309,7 +312,10 @@ func (h *Handler) SetReleaseState(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to set release state")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "capability_release.state_changed", capabilityID, "", rel)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "capability_release.state_changed", EntityID: capabilityID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rel,
+	})
 	writeJSON(w, http.StatusCreated, rel)
 }
 
