@@ -132,7 +132,10 @@ func (h *Handler) CreateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "corporate_action.created", a.ActionID, tenantID, a)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "corporate_action.created", ActionID: a.ActionID, TenantID: tenantID,
+		LegalEntityID: a.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: a,
+	})
 	writeJSON(w, http.StatusCreated, a)
 }
 
@@ -227,7 +230,10 @@ func (h *Handler) UpdateAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "corporate_action.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "corporate_action.updated", ActionID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -315,7 +321,10 @@ func (h *Handler) ExecuteAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "corporate_action.executed", id, tenantID, a)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "corporate_action.executed", ActionID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: correlationID, Payload: a,
+	})
 	writeJSON(w, http.StatusOK, a)
 }
 
