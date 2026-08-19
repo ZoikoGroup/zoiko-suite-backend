@@ -84,19 +84,19 @@ func (p *stubPublisher) PublishWorkflowStarted(_ context.Context, _ domain.Workf
 	p.startedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishApprovalGranted(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage) error {
+func (p *stubPublisher) PublishApprovalGranted(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage, _ string) error {
 	p.grantedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishApprovalRejected(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage) error {
+func (p *stubPublisher) PublishApprovalRejected(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage, _ string) error {
 	p.rejectedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishWorkflowEscalated(_ context.Context, _ domain.WorkflowInstance) error {
+func (p *stubPublisher) PublishWorkflowEscalated(_ context.Context, _ domain.WorkflowInstance, _ string) error {
 	p.escalatedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.WorkflowInstance) error {
+func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.WorkflowInstance, _ string) error {
 	p.completedCalls++
 	return nil
 }
