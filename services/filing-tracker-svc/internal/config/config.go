@@ -6,12 +6,15 @@ import (
 )
 
 type Config struct {
-	Port                 string
-	DatabaseURL          string
-	KafkaBrokers         string
-	KafkaEventsTopic     string
-	AuthzServiceURL      string
-	JurisdictionRulesURL string
+	Port                     string
+	DatabaseURL              string
+	KafkaBrokers             string
+	KafkaEventsTopic         string
+	AuthzServiceURL          string
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
+	JurisdictionRulesURL     string
 }
 
 func Load() (*Config, error) {
@@ -24,12 +27,15 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 	return &Config{
-		Port:                 port,
-		DatabaseURL:          dbURL,
-		KafkaBrokers:         getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
-		KafkaEventsTopic:     getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.filing-tracker.events"),
-		AuthzServiceURL:      getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		JurisdictionRulesURL: getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8081"),
+		Port:                     port,
+		DatabaseURL:              dbURL,
+		KafkaBrokers:             getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
+		KafkaEventsTopic:         getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.filing-tracker.events"),
+		AuthzServiceURL:          getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: getEnvOrDefault("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		JurisdictionRulesURL:     getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8081"),
 	}, nil
 }
 

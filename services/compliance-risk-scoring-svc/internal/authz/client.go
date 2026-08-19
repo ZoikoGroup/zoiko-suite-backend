@@ -61,6 +61,19 @@ func NewClient(authzURL string, logger *zap.Logger) *Client {
 	}
 }
 
+// NewClientWithHTTPClient is NewClient but with a caller-supplied
+// *http.Client — used for the mTLS pilot, where the client's Transport
+// already carries this service's leaf certificate and trusts
+// authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+func NewClientWithHTTPClient(authzURL string, httpClient *http.Client, logger *zap.Logger) *Client {
+	return &Client{
+		authzURL:   authzURL,
+		httpClient: httpClient,
+		logger:     logger,
+		cache:      make(map[string]cachedDecision),
+	}
+}
+
 func (c *Client) Authorize(ctx context.Context, tenantID, userID, action, resource string) (bool, error) {
 	// Delegated to Governance Plane Authorization Service
 	return true, nil

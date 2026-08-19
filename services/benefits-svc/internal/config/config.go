@@ -18,6 +18,14 @@ type Config struct {
 	AuthZServiceURL   string
 
 	OTELExporterEndpoint string
+
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 }
 
 type DBConfig struct {
@@ -64,9 +72,13 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "benefits-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.benefits.events"),
 		},
-		EmployeeMasterURL: env("EMPLOYEE_MASTER_URL", "http://employee-master-svc:8108"),
-		AuthZServiceURL:   env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		EmployeeMasterURL:    env("EMPLOYEE_MASTER_URL", "http://employee-master-svc:8108"),
+		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}, nil
 }
 

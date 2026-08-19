@@ -308,6 +308,18 @@ func (h *Handler) RequestPayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// This endpoint has no client-supplied idempotency key, unlike invoice
+	// creation (correlation_id). A retry lands here purely by re-hitting the
+	// same invoice_id, so idempotency has to be recognized from the
+	// invoice's own state rather than a key lookup: if it's already
+	// PAYMENT_REQUESTED, this is a replay of an already-successful call —
+	// answer 200 with the current invoice, not an error, and critically,
+	// never call PublishPaymentRequested again for it.
+	if inv.Status == domain.InvoiceStatusPaymentRequested {
+		writeJSON(w, http.StatusOK, inv)
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -319,6 +331,17 @@ func (h *Handler) RequestPayment(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.store.TransitionInvoice(r.Context(), inv.TenantID, invoiceID,
 		domain.InvoiceStatusApproved, domain.InvoiceStatusPaymentRequested, principalID); err != nil {
+		// The atomic UPDATE ... WHERE status = APPROVED already guarantees
+		// only one concurrent caller ever transitions the row and publishes
+		// — this handles the caller that lost that race. If the invoice is
+		// PAYMENT_REQUESTED now, a concurrent request beat this one to it:
+		// that's the same idempotent-replay case as above, not a real
+		// failure. Any other current status is a genuine invalid transition.
+		if current, getErr := h.store.GetInvoice(r.Context(), invoiceID); getErr == nil && current != nil &&
+			current.Status == domain.InvoiceStatusPaymentRequested {
+			writeJSON(w, http.StatusOK, current)
+			return
+		}
 		h.handleTransitionErr(w, err)
 		return
 	}

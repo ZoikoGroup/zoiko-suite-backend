@@ -105,7 +105,7 @@ services:
       - "8119:8119"
     environment:
       PORT: "8119"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/contract_lifecycle?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/contract_lifecycle?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
@@ -134,7 +134,7 @@ services:
       - "8120:8120"
     environment:
       PORT: "8120"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/clause_template?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/clause_template?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
@@ -163,7 +163,7 @@ services:
       - "8121:8121"
     environment:
       PORT: "8121"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/obligation_tracking?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/obligation_tracking?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.obligation-tracking.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
@@ -192,7 +192,7 @@ services:
       - "8122:8122"
     environment:
       PORT: "8122"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/board_resolutions?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/board_resolutions?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.board-resolutions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
@@ -221,7 +221,7 @@ services:
       - "8123:8123"
     environment:
       PORT: "8123"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_actions?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/corporate_actions?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
@@ -250,7 +250,7 @@ services:
       - "8124:8124"
     environment:
       PORT: "8124"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/counterparty_management?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
@@ -279,7 +279,7 @@ services:
       - "8125:8125"
     environment:
       PORT: "8125"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_rules?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/tax_rules?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:80"
@@ -308,7 +308,7 @@ services:
       - "8126:8126"
     environment:
       PORT: "8126"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_determination?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/tax_determination?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-determination.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -340,7 +340,7 @@ services:
       - "8127:8127"
     environment:
       PORT: "8127"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/vat_gst?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/vat_gst?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.vat-gst.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -372,7 +372,7 @@ services:
       - "8128:8128"
     environment:
       PORT: "8128"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_tax?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/corporate_tax?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-tax.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -405,7 +405,7 @@ services:
       - "8129:8129"
     environment:
       PORT: "8129"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/withholding_tax?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/withholding_tax?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.withholding-tax.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -437,7 +437,7 @@ services:
       - "8130:8130"
     environment:
       PORT: "8130"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/filing_preparation?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/filing_preparation?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.filing-prep.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -467,7 +467,7 @@ services:
       - "8131:8131"
     environment:
       PORT: "8131"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/filing_tracker?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/filing_tracker?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.filing-tracker.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -496,7 +496,7 @@ services:
       - "8132:8132"
     environment:
       PORT: "8132"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/compliance_status?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/compliance_status?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.compliance-status.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -525,7 +525,7 @@ services:
       - "8133:8133"
     environment:
       PORT: "8133"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/exception_escalation?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres:5432/exception_escalation?sslmode=disable"
       KAFKA_BROKERS: "kafka:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.exception-escalation.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"

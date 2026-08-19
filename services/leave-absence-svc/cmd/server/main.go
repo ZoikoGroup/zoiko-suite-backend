@@ -29,6 +29,7 @@ import (
 	"zoiko.io/leave-absence-svc/internal/handler"
 	"zoiko.io/leave-absence-svc/internal/health"
 	svcmiddleware "zoiko.io/leave-absence-svc/internal/middleware"
+	"zoiko.io/leave-absence-svc/internal/mtls"
 	"zoiko.io/leave-absence-svc/internal/store"
 	"zoiko.io/leave-absence-svc/internal/telemetry"
 )
@@ -244,7 +245,23 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
+
+	var httpClientForAuthz *http.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "leave-absence-svc", "00000000-0000-0000-0000-00000000f001")
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		httpClientForAuthz = mtlsHTTPClient
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+	} else {
+		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
+	}
+	authzBaseURL := cfg.AuthZServiceURL
+	if cfg.AuthzMTLSEnabled {
+		authzBaseURL = cfg.AuthzMTLSURL
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	employeeClient := employee.NewClient(cfg.EmployeeMasterURL, &http.Client{Timeout: 5 * time.Second})
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

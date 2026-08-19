@@ -511,15 +511,37 @@ func TestRequestPayment_FromApproved_Succeeds(t *testing.T) {
 	}
 }
 
-func TestRequestPayment_FromPaymentRequested_Rejected(t *testing.T) {
-	// Terminal state — cannot request payment twice.
+func TestRequestPayment_FromPaymentRequested_IsIdempotentReplay(t *testing.T) {
+	// This endpoint has no client-supplied idempotency key, so a retry is
+	// recognized from the invoice's own state: requesting payment again on
+	// an invoice already PAYMENT_REQUESTED must succeed as a replay of the
+	// original result, not fail — and, the important part, must not publish
+	// PublishPaymentRequested a second time.
 	s := newStubStore()
 	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusPaymentRequested}
+	pub := &stubPublisher{}
+
+	r := newRouter(s, pub, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/request-payment", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (idempotent replay) requesting payment twice on an already PAYMENT_REQUESTED invoice, got %d", rec.Code)
+	}
+	if pub.paymentRequested != 0 {
+		t.Fatalf("expected the replay to NOT publish PublishPaymentRequested again, got %d calls", pub.paymentRequested)
+	}
+}
+
+func TestRequestPayment_FromReceived_StillRejected(t *testing.T) {
+	// A genuinely wrong source status (not the idempotent-replay case) must
+	// still be rejected — the idempotency fix must not turn every status
+	// into a silent 200.
+	s := newStubStore()
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusReceived}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/request-payment", nil, "principal-1")
 	if rec.Code != http.StatusUnprocessableEntity {
-		t.Fatalf("expected 422 requesting payment twice on an already PAYMENT_REQUESTED invoice, got %d", rec.Code)
+		t.Fatalf("expected 422 requesting payment on a RECEIVED invoice, got %d", rec.Code)
 	}
 }
 

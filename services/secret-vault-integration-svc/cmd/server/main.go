@@ -40,10 +40,15 @@ import (
 	"zoiko.io/secret-vault-integration-svc/internal/events"
 	"zoiko.io/secret-vault-integration-svc/internal/handler"
 	"zoiko.io/secret-vault-integration-svc/internal/health"
+	"zoiko.io/secret-vault-integration-svc/internal/mtls"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
 	"zoiko.io/secret-vault-integration-svc/internal/telemetry"
 	"zoiko.io/secret-vault-integration-svc/internal/vault"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -124,9 +129,19 @@ func main() {
 
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.
-	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
-	if err != nil {
-		log.Fatal("authz client construction failed", zap.Error(err))
+	var authzClient authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "secret-vault-integration-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewHTTPClientWithHTTPClient(cfg.AuthzMTLSURL, log, mtlsHTTPClient)
+	} else {
+		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+		if err != nil {
+			log.Fatal("authz client construction failed", zap.Error(err))
+		}
 	}
 
 	// ── 7. Router + handler ───────────────────────────────────────────────────

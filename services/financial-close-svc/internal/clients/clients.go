@@ -50,6 +50,13 @@ type Clients struct {
 	http      *http.Client
 	log       *zap.Logger
 
+	// authzHTTP, when set, is used instead of http for calls to
+	// authorization-svc only — the mTLS pilot's Transport carries this
+	// service's leaf certificate and trusts authorization-svc's CA (see
+	// internal/mtls.NewClientHTTPClient). The GL/AP/AR/vault clients in
+	// this same struct keep using the plain http field.
+	authzHTTP *http.Client
+
 	cacheMu     sync.Mutex
 	cache       map[string]cachedDecision
 	cacheWrites int
@@ -63,6 +70,24 @@ func New(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger) *C
 		arURL:     arURL,
 		vaultURL:  vaultURL,
 		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		log:       log,
+		cache:     make(map[string]cachedDecision),
+	}
+}
+
+// NewWithAuthzHTTPClient is New but with a caller-supplied *http.Client used
+// solely for calls to authorization-svc — used for the mTLS pilot. Every
+// other outbound client (GL/AP/AR/vault) built here is unaffected and keeps
+// using the plain, non-mTLS http.Client.
+func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
+	return &Clients{
+		authzURL:  authzURL,
+		ledgerURL: ledgerURL,
+		apURL:     apURL,
+		arURL:     arURL,
+		vaultURL:  vaultURL,
+		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		authzHTTP: authzHTTPClient,
 		log:       log,
 		cache:     make(map[string]cachedDecision),
 	}
@@ -170,7 +195,12 @@ func (c *Clients) checkAllowedLive(ctx context.Context, principalID, legalEntity
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.http.Do(req)
+	httpClient := c.http
+	if c.authzHTTP != nil {
+		httpClient = c.authzHTTP
+	}
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		c.log.Error("failed to call authorization-svc", zap.Error(err))
 		return domain.ErrAuthzServiceUnavailable

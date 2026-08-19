@@ -21,9 +21,14 @@ import (
 	"zoiko.io/source-authority-svc/internal/handler"
 	"zoiko.io/source-authority-svc/internal/health"
 	"zoiko.io/source-authority-svc/internal/middleware"
+	"zoiko.io/source-authority-svc/internal/mtls"
 	"zoiko.io/source-authority-svc/internal/store"
 	"zoiko.io/source-authority-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	logger, err := telemetry.NewLogger("source-authority-svc")
@@ -60,7 +65,18 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "source-authority-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 
 	h := handler.New(pgStore, publisher, authzClient, logger)
 

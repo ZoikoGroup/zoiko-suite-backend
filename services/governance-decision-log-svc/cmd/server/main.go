@@ -36,10 +36,16 @@ import (
 	"zoiko.io/governance-decision-log-svc/internal/events"
 	"zoiko.io/governance-decision-log-svc/internal/handler"
 	"zoiko.io/governance-decision-log-svc/internal/health"
+	"zoiko.io/governance-decision-log-svc/internal/mtls"
 	"zoiko.io/governance-decision-log-svc/internal/policyclient"
 	"zoiko.io/governance-decision-log-svc/internal/store"
 	"zoiko.io/governance-decision-log-svc/internal/telemetry"
 )
+
+// platformScopeID is the legal_entity_id presented to mtls-management-svc
+// when provisioning this service's own client-side mTLS identity — the same
+// platform-wide scope tax-rules-svc's mTLS pilot uses.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -116,9 +122,19 @@ func main() {
 
 	// AuthZ client. Refuses to start in production/staging against a
 	// placeholder URL — no service may silently fall back to permit-all.
-	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
-	if err != nil {
-		log.Fatal("authz client construction failed", zap.Error(err))
+	var authzClient authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "governance-decision-log-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, log, mtlsHTTPClient)
+	} else {
+		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+		if err != nil {
+			log.Fatal("authz client construction failed", zap.Error(err))
+		}
 	}
 
 	// ── 6. Router + handler ───────────────────────────────────────────────────

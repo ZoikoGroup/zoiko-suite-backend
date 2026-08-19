@@ -22,6 +22,17 @@ type Config struct {
 	// rejects the action, see internal/authz.HTTPClient.
 	AuthZServiceURL string
 
+	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
+	// OFF by default — when false, nothing about the existing authz call
+	// changes.
+	AuthzMTLSEnabled bool
+	// AuthzMTLSURL is authorization-svc's mTLS listener, used only when
+	// AuthzMTLSEnabled is true.
+	AuthzMTLSURL string
+	// MTLSManagementServiceURL is where this service provisions its own
+	// client-side mTLS identity, used only when AuthzMTLSEnabled is true.
+	MTLSManagementServiceURL string
+
 	// CloseServiceURL is the base URL of financial-close-svc.
 	CloseServiceURL string
 
@@ -77,9 +88,12 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "general-ledger-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.general-ledger.events"),
 		},
-		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		CloseServiceURL:      env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:         os.Getenv("AUTHZ_MTLS_ENABLED") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		CloseServiceURL:          env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

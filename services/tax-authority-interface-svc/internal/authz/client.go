@@ -56,6 +56,18 @@ func NewClient(baseURL string) *Client {
 	}
 }
 
+// NewClientWithHTTPClient is NewClient but with a caller-supplied
+// *http.Client — used for the mTLS pilot, where the client's Transport
+// already carries this service's leaf certificate and trusts
+// authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
+	return &Client{
+		baseURL: baseURL,
+		client:  httpClient,
+		cache:   make(map[string]cachedDecision),
+	}
+}
+
 // Authorize is a legacy no-op stub retained for backward compatibility.
 // It is not used by any handler; CheckAllowed enforces the real fail-closed
 // authorization contract and should be used for all write actions.

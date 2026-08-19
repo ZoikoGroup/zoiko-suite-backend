@@ -8,6 +8,7 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 	"zoiko.io/key-management-svc/internal/domain"
+	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
 
@@ -21,10 +22,13 @@ func getTenant(r *http.Request) string {
 
 type Handler struct {
 	store  store.Store
+	siem   *siem.Client
 	logger *zap.Logger
 }
 
-func New(s store.Store, l *zap.Logger) *Handler { return &Handler{store: s, logger: l} }
+func New(s store.Store, siemClient *siem.Client, l *zap.Logger) *Handler {
+	return &Handler{store: s, siem: siemClient, logger: l}
+}
 
 func NewRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
@@ -89,20 +93,28 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenant(r)
-	key, err := h.store.RotateKey(r.Context(), tenantID, chi.URLParam(r, "id"))
+	id := chi.URLParam(r, "id")
+	key, err := h.store.RotateKey(r.Context(), tenantID, id)
 	if err != nil {
 		h.errJSON(w, 404, "key not found")
 		return
 	}
+	// Doc 05 §13.2 names "secret retrieval" and key lifecycle events as
+	// required SIEM signals — rotation is the one BYOK/HYOK lifecycle event
+	// this service can report with certainty (it happened, right now, to
+	// this specific key), unlike a bare GetKey which returns only metadata.
+	h.siem.Stream(r.Context(), tenantID, "key.rotated", siem.SeverityMedium, "Key rotated: "+id)
 	h.okJSON(w, 200, key)
 }
 
 func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenant(r)
-	if err := h.store.DisableKey(r.Context(), tenantID, chi.URLParam(r, "id")); err != nil {
+	id := chi.URLParam(r, "id")
+	if err := h.store.DisableKey(r.Context(), tenantID, id); err != nil {
 		h.errJSON(w, 404, "key not found")
 		return
 	}
+	h.siem.Stream(r.Context(), tenantID, "key.disabled", siem.SeverityHigh, "Key disabled: "+id)
 	h.okJSON(w, 200, map[string]string{"message": "key disabled"})
 }
 

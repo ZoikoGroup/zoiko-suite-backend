@@ -11,6 +11,14 @@ type Config struct {
 	KafkaEventsTopic     string
 	AuthzServiceURL      string
 	JurisdictionRulesURL string
+
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthzServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 }
 
 func Load() *Config {
@@ -21,6 +29,10 @@ func Load() *Config {
 		KafkaEventsTopic:     getEnv("KAFKA_EVENTS_TOPIC", "zoiko.anomaly-detection.events"),
 		AuthzServiceURL:      getEnv("AUTHZ_SERVICE_URL", "http://localhost:8089"),
 		JurisdictionRulesURL: getEnv("JURISDICTION_RULES_URL", "http://localhost:8125"),
+
+		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}
 }
 

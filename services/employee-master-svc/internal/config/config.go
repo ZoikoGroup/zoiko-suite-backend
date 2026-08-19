@@ -16,6 +16,13 @@ type Config struct {
 
 	AuthZServiceURL string
 
+	// AuthzMTLSEnabled opts this service into calling authorization-svc over
+	// mutual TLS instead of plain HTTP. OFF by default — see internal/mtls.
+	AuthzMTLSEnabled bool
+	AuthzMTLSURL     string
+
+	MTLSManagementServiceURL string
+
 	OTELExporterEndpoint string
 }
 
@@ -63,8 +70,11 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "employee-master-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.employee.events"),
 		},
-		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }
 

@@ -334,8 +334,33 @@ func (h *Handler) IssueOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updated, err := h.store.UpdateOrderIssued(r.Context(), caseID, order.PurchaseOrderID)
+	// The order now genuinely exists in purchase-order-svc — that side effect
+	// is not undoable from here, and shouldn't be: purchase-order-svc keys it
+	// on this case's ID as an idempotency key (see PurchaseOrderClient), so a
+	// second IssueOrder call for the same case resolves to the SAME order,
+	// never a duplicate. A transient failure recording that fact locally
+	// (below) must not be allowed to strand a real, externally-committed
+	// order behind a case that still reads APPROVED, so a short local retry
+	// is worth it before giving up. If every retry still fails, the case
+	// stays recoverable anyway: the caller retrying this endpoint re-issues
+	// against the same idempotency key and this local write gets another
+	// chance, cheaper than any compensating cancel-the-order call would be.
+	var updated *domain.ProcurementCase
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+		}
+		updated, err = h.store.UpdateOrderIssued(r.Context(), caseID, order.PurchaseOrderID)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
+		h.log.Error("purchase order issued but recording it against the case failed after retries — case remains APPROVED; retrying this endpoint will resolve it via purchase-order-svc's idempotent correlation_id",
+			zap.String("case_id", caseID),
+			zap.String("purchase_order_id", order.PurchaseOrderID),
+			zap.Error(err),
+		)
 		h.writeCaseErr(w, err)
 		return
 	}

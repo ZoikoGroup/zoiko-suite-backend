@@ -74,7 +74,7 @@ services:
         condition: service_healthy
     environment:
       PORT: "8144"
-      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_connectivity_api_bridge?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres-p7:5432/zoiko_connectivity_api_bridge?sslmode=disable"
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.connectivity.api.bridge.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
@@ -99,7 +99,7 @@ services:
         condition: service_healthy
     environment:
       PORT: "8145"
-      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_banking_connector?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres-p7:5432/zoiko_banking_connector?sslmode=disable"
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.banking.connector.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
@@ -124,7 +124,7 @@ services:
         condition: service_healthy
     environment:
       PORT: "8146"
-      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_hris_connector?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres-p7:5432/zoiko_hris_connector?sslmode=disable"
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.hris.connector.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
@@ -149,7 +149,7 @@ services:
         condition: service_healthy
     environment:
       PORT: "8147"
-      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_tax_authority_interface?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres-p7:5432/zoiko_tax_authority_interface?sslmode=disable"
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.tax.authority.interface.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
@@ -174,7 +174,7 @@ services:
         condition: service_healthy
     environment:
       PORT: "8148"
-      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_esignature_integration?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres-p7:5432/zoiko_esignature_integration?sslmode=disable"
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.esignature.integration.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"
@@ -199,7 +199,7 @@ services:
         condition: service_healthy
     environment:
       PORT: "8149"
-      DATABASE_URL: "postgres://postgres:postgres@postgres-p7:5432/zoiko_external_data_feed?sslmode=disable"
+      DATABASE_URL: "postgres://zoiko_app:zoiko_app_password@postgres-p7:5432/zoiko_external_data_feed?sslmode=disable"
       KAFKA_BROKERS: "kafka-p7:9092"
       KAFKA_EVENTS_TOPIC: "zoiko.external.data.feed.events"
       AUTHZ_SERVICE_URL: "http://host.docker.internal:8081"

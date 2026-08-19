@@ -110,7 +110,11 @@ func (h *Handler) CreateClause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "clause.created", c.ClauseID, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "clause.created", EntityID: c.ClauseID, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+	})
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -193,7 +197,11 @@ func (h *Handler) UpdateClause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "clause.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "clause.updated", EntityID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -241,7 +249,11 @@ func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "template.created", t.TemplateID, tenantID, t)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "template.created", EntityID: t.TemplateID, TenantID: tenantID,
+		LegalEntityID: t.LegalEntityID, Jurisdiction: t.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: t,
+	})
 	writeJSON(w, http.StatusCreated, t)
 }
 
@@ -327,7 +339,11 @@ func (h *Handler) UpdateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "template.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "template.updated", EntityID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 

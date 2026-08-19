@@ -46,6 +46,27 @@ apply_migration migration_integrity /migrations/migration-integrity/000001_initi
 
 echo "=== Phase 6 databases initialised successfully ==="
 
+# ── Runtime role: zoiko_app (least-privilege, RLS-respecting) ──────────────
+# See init-db.sh (main stack) for the full rationale — every service must
+# stop connecting as the Postgres superuser, which bypasses Row-Level
+# Security unconditionally regardless of how correct the policies are.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE ROLE zoiko_app WITH LOGIN PASSWORD 'zoiko_app_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+EOSQL
+
+for db in authorization_svc anomaly_detection forecasting compliance_risk_scoring \
+    reconciliation_intelligence reporting_orchestration migration_integrity; do
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" <<-EOSQL
+        GRANT CONNECT ON DATABASE $db TO zoiko_app;
+        GRANT USAGE ON SCHEMA public TO zoiko_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO zoiko_app;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zoiko_app;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO zoiko_app;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO zoiko_app;
+EOSQL
+done
+echo "zoiko_app role provisioned across Phase 6 databases."
+
 
 
 

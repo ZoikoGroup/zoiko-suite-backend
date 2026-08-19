@@ -25,6 +25,18 @@ type Config struct {
 	// purpose can't be replayed here.
 	ExpectedIssuer   string
 	ExpectedAudience string
+
+	// CartaServiceURL is carta-svc — continuous session-risk scoring
+	// (Doc 05 §3.11/§5.4's "authentication is not a one-time event").
+	// Empty disables the call: risk scoring degrades to "not evaluated",
+	// never to a fabricated ALLOW.
+	CartaServiceURL string
+
+	// SIEMServiceURL is siem-integration-svc. Empty disables streaming:
+	// security-event export is best-effort and tenant-opt-in (a tenant with
+	// no configured exporter is normal, not an error), so its absence must
+	// never affect whether a request is let through.
+	SIEMServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -43,6 +55,8 @@ func Load() (*Config, error) {
 		JWKSCacheTTL:     time.Duration(ttlSeconds) * time.Second,
 		ExpectedIssuer:   strEnv("EXPECTED_ISSUER", "identity-context-svc"),
 		ExpectedAudience: strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
+		CartaServiceURL:  strEnv("CARTA_SERVICE_URL", ""),
+		SIEMServiceURL:   strEnv("SIEM_SERVICE_URL", ""),
 	}, nil
 }
 

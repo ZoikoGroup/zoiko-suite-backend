@@ -74,8 +74,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: authorization_svc
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
       KAFKA_BROKERS: kafka:9092
     restart: on-failure
@@ -96,7 +96,7 @@ services:
       - "8134:8134"
     environment:
       PORT: "8134"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/anomaly_detection?sslmode=disable
+      DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/anomaly_detection?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.anomaly-detection.events
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
@@ -125,7 +125,7 @@ services:
       - "8135:8135"
     environment:
       PORT: "8135"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/forecasting?sslmode=disable
+      DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/forecasting?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.forecasting.events
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
@@ -154,7 +154,7 @@ services:
       - "8136:8136"
     environment:
       PORT: "8136"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/compliance_risk_scoring?sslmode=disable
+      DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/compliance_risk_scoring?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.compliance-risk-scoring.events
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
@@ -183,7 +183,7 @@ services:
       - "8137:8137"
     environment:
       PORT: "8137"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/reconciliation_intelligence?sslmode=disable
+      DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/reconciliation_intelligence?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.reconciliation-intelligence.events
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
@@ -212,7 +212,7 @@ services:
       - "8138:8138"
     environment:
       PORT: "8138"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/reporting_orchestration?sslmode=disable
+      DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/reporting_orchestration?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.reporting-orchestration.events
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
@@ -241,7 +241,7 @@ services:
       - "8139:8139"
     environment:
       PORT: "8139"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/migration_integrity?sslmode=disable
+      DATABASE_URL: postgres://zoiko_app:zoiko_app_password@postgres:5432/migration_integrity?sslmode=disable
       KAFKA_BROKERS: kafka:9092
       KAFKA_TOPIC: zoiko.migration-integrity.events
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
@@ -271,6 +271,7 @@ services:
     environment:
       PORT: "8140"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
+      SIEM_SERVICE_URL: http://siem-integration-svc:8141
     depends_on:
       authorization-svc:
         condition: service_healthy
@@ -337,6 +338,7 @@ services:
     environment:
       PORT: "8143"
       AUTHZ_SERVICE_URL: http://authorization-svc:8089
+      SIEM_SERVICE_URL: http://siem-integration-svc:8141
     depends_on:
       authorization-svc:
         condition: service_healthy

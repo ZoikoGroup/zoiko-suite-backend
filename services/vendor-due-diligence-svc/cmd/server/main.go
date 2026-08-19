@@ -29,6 +29,7 @@ import (
 	"zoiko.io/vendor-due-diligence-svc/internal/handler"
 	"zoiko.io/vendor-due-diligence-svc/internal/health"
 	svcmiddleware "zoiko.io/vendor-due-diligence-svc/internal/middleware"
+	"zoiko.io/vendor-due-diligence-svc/internal/mtls"
 	"zoiko.io/vendor-due-diligence-svc/internal/store"
 	"zoiko.io/vendor-due-diligence-svc/internal/telemetry"
 )
@@ -258,7 +259,23 @@ func main() {
 	}
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
+
+	var httpClientForAuthz *http.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "vendor-due-diligence-svc", "00000000-0000-0000-0000-00000000f001")
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		httpClientForAuthz = mtlsHTTPClient
+	} else {
+		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
+	}
+	authzBaseURL := cfg.AuthZServiceURL
+	if cfg.AuthzMTLSEnabled {
+		authzBaseURL = cfg.AuthzMTLSURL
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	counterpartyClient := clients.New(cfg.CounterpartyServiceURL)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

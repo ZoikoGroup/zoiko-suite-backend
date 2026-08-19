@@ -60,6 +60,14 @@ func NewClient(authzURL string, logger *zap.Logger) *Client {
 	return &Client{authzURL: authzURL, httpClient: &http.Client{Timeout: 5 * time.Second}, logger: logger, cache: make(map[string]cachedDecision)}
 }
 
+// NewClientWithHTTPClient is NewClient but with a caller-supplied
+// *http.Client — used for the mTLS pilot, where the client's Transport
+// already carries this service's leaf certificate and trusts
+// authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+func NewClientWithHTTPClient(authzURL string, httpClient *http.Client, logger *zap.Logger) *Client {
+	return &Client{authzURL: authzURL, httpClient: httpClient, logger: logger, cache: make(map[string]cachedDecision)}
+}
+
 // Authorize delegates to Governance Plane Authorization Service
 //
 // Deprecated: this is a legacy no-op stub retained for backward

@@ -15,9 +15,15 @@ import (
 	"zoiko.io/forecasting-svc/internal/config"
 	"zoiko.io/forecasting-svc/internal/events"
 	"zoiko.io/forecasting-svc/internal/handler"
+	"zoiko.io/forecasting-svc/internal/mtls"
 	"zoiko.io/forecasting-svc/internal/store"
 	"zoiko.io/forecasting-svc/internal/telemetry"
 )
+
+// platformScopeID is the legal_entity_id presented to mtls-management-svc
+// when provisioning this service's own client-side mTLS identity — the same
+// platform-wide scope tax-rules-svc's mTLS pilot uses.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	cfg := config.Load()
@@ -60,7 +66,17 @@ func main() {
 	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)
 	defer publisher.Close()
 
-	authzClient := authz.NewClient(cfg.AuthzURL, logger)
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "forecasting-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, logger, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzURL, logger)
+	}
 
 	h := handler.NewHandler(dataStore, publisher, authzClient, logger)
 	router := handler.NewRouter(h)
