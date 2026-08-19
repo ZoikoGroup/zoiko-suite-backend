@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
 	kafka "github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
@@ -43,7 +44,9 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 
 func (p *KafkaPublisher) Publish(ctx context.Context, eventType, obligationID, tenantID string, payload interface{}) error {
 	evt := Event{
-		EventID:      "evt-" + eventType + "-" + obligationID,
+		// A fresh UUID per publish, not a deterministic string — see
+		// docs/architecture/known-gaps.md's event_id collision writeup.
+		EventID:      "evt-" + uuid.New().String(),
 		EventType:    eventType,
 		ObligationID: obligationID,
 		TenantID:     tenantID,

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
 	kafka "github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
@@ -40,7 +41,13 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 
 func (p *KafkaPublisher) Publish(ctx context.Context, eventType string, entityID string, tenantID string, payload interface{}) error {
 	evt := Event{
-		EventID:    "evt-" + eventType + "-" + entityID,
+		// A fresh UUID per publish, not a deterministic string — the
+		// previous "evt-"+eventType+"-"+entityID form collides across every
+		// repeat occurrence of the same event type on the same entity,
+		// which a dedup consumer using ON CONFLICT (event_id) DO NOTHING
+		// would silently treat as a redelivery of the first, dropping a
+		// real second event.
+		EventID:    "evt-" + uuid.New().String(),
 		EventType:  eventType,
 		EntityID:   entityID,
 		TenantID:   tenantID,

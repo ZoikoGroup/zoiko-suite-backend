@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/google/uuid"
 	kafka "github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 )
@@ -12,12 +13,12 @@ import (
 // Event is the canonical fact emitted by exception-escalation-svc.
 // Events are facts, not commands — append-only, never mutating source truth.
 type Event struct {
-	EventID          string      `json:"event_id"`
-	EventType        string      `json:"event_type"`
-	ExceptionCaseID  string      `json:"exception_case_id"`
-	TenantID         string      `json:"tenant_id"`
-	OccurredAt       time.Time   `json:"occurred_at"`
-	Payload          interface{} `json:"payload"`
+	EventID         string      `json:"event_id"`
+	EventType       string      `json:"event_type"`
+	ExceptionCaseID string      `json:"exception_case_id"`
+	TenantID        string      `json:"tenant_id"`
+	OccurredAt      time.Time   `json:"occurred_at"`
+	Payload         interface{} `json:"payload"`
 }
 
 // Publisher is the interface for emitting domain events.
@@ -43,7 +44,9 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 
 func (p *KafkaPublisher) Publish(ctx context.Context, eventType, caseID, tenantID string, payload interface{}) error {
 	evt := Event{
-		EventID:         "evt-" + eventType + "-" + caseID,
+		// A fresh UUID per publish, not a deterministic string — see
+		// docs/architecture/known-gaps.md's event_id collision writeup.
+		EventID:         "evt-" + uuid.New().String(),
 		EventType:       eventType,
 		ExceptionCaseID: caseID,
 		TenantID:        tenantID,

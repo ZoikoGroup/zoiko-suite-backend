@@ -940,3 +940,31 @@ it, and no delete is blocked by it — there is no delete route at all.
 ErrRetentionActive is defined in the domain and never returned. A document
 marked for a seven-year hold is not held by anything in this vault; the label
 records an intention that some other system would have to honour.
+
+## Resolved: event_id collision across 21 services' Kafka publishers
+Found while standardizing event envelopes to Doc 03 §19 (2026-08-19).
+21 services (contract-lifecycle-svc, filing-tracker-svc, plus 19 more:
+ai-governance-svc, capability-registry-svc, clause-template-svc,
+commercial-account-svc, compliance-status-svc, corporate-actions-svc,
+corporate-tax-svc, counterparty-management-svc, exception-escalation-svc,
+filing-preparation-svc, kill-switch-registry-svc, metric-registry-svc,
+obligation-tracking-svc, retention-registry-svc, source-authority-svc,
+tax-determination-svc, tax-rules-svc, vat-gst-svc, withholding-tax-svc) all
+copy-pasted the same event-ID pattern from an early scaffold:
+`EventID: "evt-" + eventType + "-" + <someID>`. This is deterministic, not
+unique — every repeat occurrence of the same event type on the same
+aggregate (e.g. a contract updated twice, a filing requirement edited
+twice) produces the IDENTICAL event_id. Any consumer deduplicating via
+`INSERT ... ON CONFLICT (event_id) DO NOTHING` — the exact pattern this
+platform's own evidence/history consumers (audit-event-store-svc,
+workflow-history-svc) use — would silently drop the second, real event as
+if it were a broker redelivery of the first, not a new fact.
+
+Fixed in all 21 services: `EventID: "evt-" + uuid.New().String()`, a fresh
+UUID per publish call. contract-lifecycle-svc and filing-tracker-svc got a
+fuller envelope rewrite (event_version, correlation_id, legal_entity_id,
+actor_id added, per Doc 03 §19) with regression tests proving two real
+events now get distinct IDs; the other 19 got the same event_id fix as a
+standalone, minimal, mechanically-verified change (build+vet+test clean
+on every one) without the broader envelope rewrite, which still needs
+doing per service the same way the six Doc 03 §3.7 mandatory cases were.
