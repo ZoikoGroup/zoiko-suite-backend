@@ -89,8 +89,18 @@ else
 fi
 
 # ── 3. the schema is there ───────────────────────────────────────────────────
-schemas=$(run "SELECT count(*) FROM information_schema.schemata WHERE schema_name IN ('app','jurisdiction_rules','delegated_authority','accounts_payable','purchase_request','bank_reconciliation','notification','schema_registry','governance_decision_log','configuration_feature_flag','purchase_order','spend_controls','vendor_due_diligence','evidence_requirements','general_ledger','financial_close','board_resolutions','obligations','document_vault','secret_vault_integration','policy')")
-tables=$(run "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema','public','app')")
+# Scope every count to OUR schemas by name. Excluding a denylist of system
+# schemas is not good enough on a real Supabase project: auth, storage,
+# realtime, vault, extensions, graphql and supabase_migrations all carry tables
+# of their own, and counting them reported 76 tables where 42 were expected.
+# A check that miscounts is worse than no check — it reports a problem that
+# isn't there and trains you to ignore it.
+OURS="'app','jurisdiction_rules','delegated_authority','accounts_payable','purchase_request','bank_reconciliation','notification','schema_registry','governance_decision_log','configuration_feature_flag','purchase_order','spend_controls','vendor_due_diligence','evidence_requirements','general_ledger','financial_close','board_resolutions','obligations','document_vault','secret_vault_integration','policy'"
+
+schemas=$(run "SELECT count(*) FROM information_schema.schemata WHERE schema_name IN ($OURS)")
+# `app` holds helper functions and no tables, so it is in the schema list but
+# contributes nothing here.
+tables=$(run "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname IN ($OURS)")
 
 echo "  [$([ "$schemas" = 21 ] && echo ok || echo '!!')] schemas: $schemas/21"
 echo "  [$([ "$tables" = 42 ] && echo ok || echo '!!')] tables:  $tables/42"
@@ -102,8 +112,10 @@ fi
 # ── 4. RLS is forced, not merely enabled ─────────────────────────────────────
 # ENABLE without FORCE is the estate's recurring defect: a policy that reads as
 # a control and never executes, because the owner is exempt.
-unforced=$(run "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relrowsecurity AND NOT c.relforcerowsecurity AND n.nspname NOT IN ('pg_catalog','information_schema')")
-norls=$(run "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND NOT c.relrowsecurity AND n.nspname NOT IN ('pg_catalog','information_schema','public','app')")
+# Scoped to our schemas for the same reason as above — Supabase's own tables
+# make their own choices about row security and are not ours to judge.
+unforced=$(run "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND c.relrowsecurity AND NOT c.relforcerowsecurity AND n.nspname IN ($OURS)")
+norls=$(run "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND NOT c.relrowsecurity AND n.nspname IN ($OURS)")
 
 echo "  [$([ "$unforced" = 0 ] && echo ok || echo '!!')] tables ENABLE-but-not-FORCE: $unforced (must be 0)"
 echo "  [$([ "$norls" = 0 ] && echo ok || echo '!!')] tables with no RLS at all:   $norls (must be 0)"
