@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_workflow_instances_correlation_unique;

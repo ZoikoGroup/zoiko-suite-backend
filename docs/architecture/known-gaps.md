@@ -374,10 +374,19 @@ exists on the platform; screening_source is the field that will distinguish
 its results from the stub's, and every historical row stays honest about
 having been screened by the stub.
 
-## Open: authorization-svc role creation reports a duplicate as an outage
-Re-POSTing an existing role answers 503 `store_unavailable` rather than 200 or
-409. Recorded in seed-demo-rbac.ps1, which tolerates it and relies on its
-end-of-run verification instead.
+## Resolved: authorization-svc role creation reports a duplicate as an outage
+Was: re-POSTing an existing role answers 503 `store_unavailable` rather than
+200 or 409. Recorded in seed-demo-rbac.ps1, which tolerated it and relied on
+its end-of-run verification instead.
+
+By the time this was investigated for a fix (2026-08-18), `CreateRole` in
+`internal/store/pg_store.go` already did the right thing: `INSERT ... ON
+CONFLICT (tenant_id, role_code) DO NOTHING`, then a fallback `SELECT` on
+conflict, returning the existing row (200) when name/scope match or
+`domain.ErrConflict` (409) when they don't — never a store-unavailable 503
+for this case. `TestPgStore_CreateRole_IdempotencyAnd409` in the same
+package proves it. This entry predates that fix; seed-demo-rbac.ps1's
+tolerance workaround can be removed the next time that script is touched.
 
 ## Resolved: secret-vault-integration-svc's 000002 migration was never applied by init-db.sh
 `000002_add_data_classification.up.sql` existed in the repo but init-db.sh

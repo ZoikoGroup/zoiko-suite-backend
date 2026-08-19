@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,23 +28,33 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 }
 
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
 	ctx := context.Background()
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS workflow_transitions, workflow_stages, workflow_instances CASCADE;")
 
-	mig1, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
+	// Apply every *.up.sql in order, not two hardcoded filenames — a
+	// migration added later must not be silently skipped by these tests
+	// (this exact trap already bit jurisdiction-rules-svc once, see
+	// docs/architecture/known-gaps.md).
+	entries, err := os.ReadDir("../../deployments/migrations")
 	if err != nil {
-		t.Fatalf("failed to read migration 1: %v", err)
+		t.Fatalf("failed to read migrations dir: %v", err)
 	}
-	if _, err := pool.Exec(ctx, string(mig1)); err != nil {
-		t.Fatalf("failed to execute migration 1: %v", err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".up.sql") {
+			names = append(names, e.Name())
+		}
 	}
-
-	mig2, err := os.ReadFile("../../deployments/migrations/000002_add_transition_linkage_keys.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration 2: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(mig2)); err != nil {
-		t.Fatalf("failed to execute migration 2: %v", err)
+	sort.Strings(names)
+	for _, name := range names {
+		sql, err := os.ReadFile("../../deployments/migrations/" + name)
+		if err != nil {
+			t.Fatalf("failed to read migration %s: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to execute migration %s: %v", name, err)
+		}
 	}
 }
 
@@ -57,6 +69,53 @@ func twoStageParams() domain.CreateWorkflowParams {
 	}
 }
 
+// TestPgStore_CreateWorkflow_RetriedCorrelationID_IsIdempotent proves the
+// exact scenario a network-timeout-triggered client retry produces: it must
+// resolve to the original instance and stages, never create a duplicate
+// workflow with its own duplicate stage chain (migration 000003).
+func TestPgStore_CreateWorkflow_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	params := twoStageParams()
+	params.CorrelationID = "corr-retry-1"
+
+	instance1, stages1, created1, err := s.CreateWorkflow(ctx, params)
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if !created1 {
+		t.Fatalf("expected created=true on the first call")
+	}
+
+	instance2, stages2, created2, err := s.CreateWorkflow(ctx, params)
+	if err != nil {
+		t.Fatalf("retried create: %v", err)
+	}
+	if created2 {
+		t.Fatalf("expected created=false on the retried call — this is a duplicate-workflow bug if it's true")
+	}
+	if instance2.WorkflowInstanceID != instance1.WorkflowInstanceID {
+		t.Fatalf("retried call must resolve to the original workflow_instance_id, got a different one")
+	}
+	if len(stages2) != len(stages1) {
+		t.Fatalf("expected the same %d stages back, got %d", len(stages1), len(stages2))
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM workflow_instances WHERE tenant_id = $1 AND correlation_id = $2`,
+		params.TenantID, params.CorrelationID).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("DUPLICATE WORKFLOW: expected exactly 1 workflow_instances row for this correlation_id, got %d", count)
+	}
+}
+
 func TestPgStore_CreateWorkflow_NoStages(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()
@@ -65,7 +124,7 @@ func TestPgStore_CreateWorkflow_NoStages(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	params := twoStageParams()
 	params.Stages = nil
-	_, _, err := s.CreateWorkflow(context.Background(), params)
+	_, _, _, err := s.CreateWorkflow(context.Background(), params)
 	if !errors.Is(err, domain.ErrNoStages) {
 		t.Fatalf("expected ErrNoStages, got %v", err)
 	}
@@ -79,7 +138,7 @@ func TestPgStore_FullApprovalChain_CompletesWorkflow(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	instance, stages, err := s.CreateWorkflow(ctx, twoStageParams())
+	instance, stages, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -166,7 +225,7 @@ func TestPgStore_RejectionEndsWorkflowImmediately(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	instance, _, err := s.CreateWorkflow(ctx, twoStageParams())
+	instance, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -193,7 +252,7 @@ func TestPgStore_ConflictingResubmission_NotIdempotent(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	instance, _, err := s.CreateWorkflow(ctx, twoStageParams())
+	instance, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -224,7 +283,7 @@ func TestPgStore_EscalateAndCancel(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	instance, _, err := s.CreateWorkflow(ctx, twoStageParams())
+	instance, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -274,7 +333,7 @@ func TestPgStore_CancelApprovedWorkflow_Illegal(t *testing.T) {
 
 	params := twoStageParams()
 	params.Stages = []domain.CreateWorkflowStageInput{{ApproverPrincipalID: "approver-1"}}
-	instance, _, err := s.CreateWorkflow(ctx, params)
+	instance, _, _, err := s.CreateWorkflow(ctx, params)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}

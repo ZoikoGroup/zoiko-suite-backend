@@ -15,7 +15,7 @@ import (
 
 // WorkflowStore is the narrow interface the handler depends on.
 type WorkflowStore interface {
-	CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, error)
+	CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (instance *domain.WorkflowInstance, stages []*domain.WorkflowStage, created bool, err error)
 	FindWorkflowByID(ctx context.Context, workflowInstanceID string) (*domain.WorkflowInstance, error)
 	FindStagesByWorkflowID(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowStage, error)
 	FindCurrentStage(ctx context.Context, workflowInstanceID string) (*domain.WorkflowStage, error)
@@ -96,7 +96,8 @@ type workflowResponse struct {
 
 // CreateWorkflow handles POST /v1/workflows.
 //
-// Response: 201 created / 400 missing field or no stages / 503 unavailable.
+// Response: 201 created / 200 idempotent replay (same X-Correlation-ID as
+// an existing instance) / 400 missing field or no stages / 503 unavailable.
 func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -130,7 +131,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	instance, stages, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
+	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, WorkflowType: req.WorkflowType,
 		InitiatedBy: req.InitiatedBy, CorrelationID: correlationID, Stages: req.Stages,
 	})
@@ -144,17 +145,24 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if pubErr := h.publisher.PublishWorkflowStarted(r.Context(), *instance); pubErr != nil {
-		h.log.Error("CreateWorkflow: failed to publish workflow.started", zap.String("correlation_id", correlationID), zap.Error(pubErr))
+	// A retried call (created=false) resolves to the workflow the ORIGINAL
+	// call already started and already published workflow.started for —
+	// publishing it again here would be a duplicate business event for a
+	// workflow that was never actually re-initiated.
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+		if pubErr := h.publisher.PublishWorkflowStarted(r.Context(), *instance); pubErr != nil {
+			h.log.Error("CreateWorkflow: failed to publish workflow.started", zap.String("correlation_id", correlationID), zap.Error(pubErr))
+		}
+		h.log.Info("workflow started",
+			zap.String("workflow_instance_id", instance.WorkflowInstanceID),
+			zap.String("workflow_type", instance.WorkflowType),
+			zap.Int("stage_count", len(stages)),
+			zap.String("correlation_id", correlationID),
+		)
 	}
-
-	h.log.Info("workflow started",
-		zap.String("workflow_instance_id", instance.WorkflowInstanceID),
-		zap.String("workflow_type", instance.WorkflowType),
-		zap.Int("stage_count", len(stages)),
-		zap.String("correlation_id", correlationID),
-	)
-	writeJSON(w, http.StatusCreated, workflowResponse{WorkflowInstance: instance, Stages: stages})
+	writeJSON(w, status, workflowResponse{WorkflowInstance: instance, Stages: stages})
 }
 
 // ── GET /v1/workflows/{id} ───────────────────────────────────────────────────
