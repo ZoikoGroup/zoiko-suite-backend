@@ -27,38 +27,38 @@ const (
 // PurchaseOrder is one order moving through issuance -> (amendments) -> close.
 // Entity-bound (LegalEntityID), never hard-deleted.
 type PurchaseOrder struct {
-	PurchaseOrderID string      `json:"purchase_order_id"`
-	TenantID        string      `json:"tenant_id"`
-	LegalEntityID   string      `json:"legal_entity_id"`
-	PurchaseRequestID *string   `json:"purchase_request_id,omitempty"`
-	VendorProfileID   *string   `json:"vendor_profile_id,omitempty"`
-	PONumber        string      `json:"po_number"`
-	Status          OrderStatus `json:"po_status"`
-	TotalAmount     float64     `json:"total_amount"`
-	CurrencyCode    string      `json:"currency_code"`
-	Version         int         `json:"version"`
+	PurchaseOrderID   string      `json:"purchase_order_id"`
+	TenantID          string      `json:"tenant_id"`
+	LegalEntityID     string      `json:"legal_entity_id"`
+	PurchaseRequestID *string     `json:"purchase_request_id,omitempty"`
+	VendorProfileID   *string     `json:"vendor_profile_id,omitempty"`
+	PONumber          string      `json:"po_number"`
+	Status            OrderStatus `json:"po_status"`
+	TotalAmount       float64     `json:"total_amount"`
+	CurrencyCode      string      `json:"currency_code"`
+	Version           int         `json:"version"`
 
 	IssuedByPrincipalID string     `json:"issued_by_principal_id"`
 	ClosedByPrincipalID *string    `json:"closed_by_principal_id,omitempty"`
 	CorrelationID       string     `json:"correlation_id"`
 	CreatedAt           time.Time  `json:"created_at"`
-	IssuedAt             time.Time  `json:"issued_at"`
-	ClosedAt             *time.Time `json:"closed_at,omitempty"`
+	IssuedAt            time.Time  `json:"issued_at"`
+	ClosedAt            *time.Time `json:"closed_at,omitempty"`
 }
 
 // PurchaseOrderAmendment is an append-only record of a single amendment —
 // never mutated or deleted, matching doctrine's "no soft-delete, no
 // destructive overwrite of material history" rule.
 type PurchaseOrderAmendment struct {
-	AmendmentID         string    `json:"amendment_id"`
-	PurchaseOrderID     string    `json:"purchase_order_id"`
-	FromVersion         int       `json:"from_version"`
-	ToVersion           int       `json:"to_version"`
-	PreviousTotalAmount float64   `json:"previous_total_amount"`
-	NewTotalAmount      float64   `json:"new_total_amount"`
-	Reason              string    `json:"reason"`
-	AmendedByPrincipalID string   `json:"amended_by_principal_id"`
-	AmendedAt           time.Time `json:"amended_at"`
+	AmendmentID          string    `json:"amendment_id"`
+	PurchaseOrderID      string    `json:"purchase_order_id"`
+	FromVersion          int       `json:"from_version"`
+	ToVersion            int       `json:"to_version"`
+	PreviousTotalAmount  float64   `json:"previous_total_amount"`
+	NewTotalAmount       float64   `json:"new_total_amount"`
+	Reason               string    `json:"reason"`
+	AmendedByPrincipalID string    `json:"amended_by_principal_id"`
+	AmendedAt            time.Time `json:"amended_at"`
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -117,8 +117,8 @@ var (
 	// same posture as bank-reconciliation-svc's/accounts-receivable-svc's
 	// general-ledger-svc verification calls (never trust a caller-supplied
 	// purchase_request_id without checking it against the real record).
-	ErrPurchaseRequestNotFound        = errorString("referenced purchase request not found")
-	ErrPurchaseRequestNotApproved     = errorString("referenced purchase request is not APPROVED")
-	ErrPurchaseRequestMismatch        = errorString("referenced purchase request belongs to a different tenant or legal entity")
+	ErrPurchaseRequestNotFound           = errorString("referenced purchase request not found")
+	ErrPurchaseRequestNotApproved        = errorString("referenced purchase request is not APPROVED")
+	ErrPurchaseRequestMismatch           = errorString("referenced purchase request belongs to a different tenant or legal entity")
 	ErrPurchaseRequestServiceUnavailable = errorString("purchase-request-svc unavailable")
 )

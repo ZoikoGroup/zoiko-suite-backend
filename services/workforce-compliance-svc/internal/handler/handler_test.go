@@ -200,7 +200,7 @@ func (p *stubPublisher) PublishVisaExpirationFlagged(_ context.Context, _ string
 func (p *stubPublisher) PublishWorkingHoursBreach(_ context.Context, _ string, _ domain.WorkingHourLog) {
 	p.hoursBreached++
 }
-func (p *stubPublisher) PublishComplianceAlertRaised(_ context.Context, _ string, _ domain.ComplianceAlert) {
+func (p *stubPublisher) PublishComplianceAlertRaised(_ context.Context, _ string, _ string, _ domain.ComplianceAlert) {
 	p.alertRaised++
 }
 

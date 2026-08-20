@@ -108,13 +108,13 @@ type stubPublisher struct {
 	raised, resolved, blockerFlagged int
 }
 
-func (p *stubPublisher) PublishExceptionRaised(_ context.Context, _ string, _ domain.PayrollException) {
+func (p *stubPublisher) PublishExceptionRaised(_ context.Context, _, _, _ string, _ domain.PayrollException) {
 	p.raised++
 }
-func (p *stubPublisher) PublishExceptionResolved(_ context.Context, _ string, _ domain.PayrollException) {
+func (p *stubPublisher) PublishExceptionResolved(_ context.Context, _, _ string, _ domain.PayrollException) {
 	p.resolved++
 }
-func (p *stubPublisher) PublishBlockerFlagged(_ context.Context, _, _ string, _ int) {
+func (p *stubPublisher) PublishBlockerFlagged(_ context.Context, _, _, _, _, _ string, _ int) {
 	p.blockerFlagged++
 }
 

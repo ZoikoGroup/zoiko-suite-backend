@@ -114,13 +114,13 @@ type stubPublisher struct {
 	calculated, adjusted, exception int
 }
 
-func (p *stubPublisher) PublishTaxCalculated(_ context.Context, _ string, _ domain.TaxCalculationRecord) {
+func (p *stubPublisher) PublishTaxCalculated(_ context.Context, _, _, _ string, _ domain.TaxCalculationRecord) {
 	p.calculated++
 }
-func (p *stubPublisher) PublishTaxAdjusted(_ context.Context, _ string, _ domain.TaxCalculationRecord) {
+func (p *stubPublisher) PublishTaxAdjusted(_ context.Context, _, _, _ string, _ domain.TaxCalculationRecord) {
 	p.adjusted++
 }
-func (p *stubPublisher) PublishTaxException(_ context.Context, _, _, _ string) {
+func (p *stubPublisher) PublishTaxException(_ context.Context, _, _, _, _, _, _ string) {
 	p.exception++
 }
 

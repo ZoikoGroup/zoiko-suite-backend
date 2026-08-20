@@ -31,7 +31,7 @@ type Store interface {
 
 type Publisher interface {
 	PublishReviewCreated(ctx context.Context, r domain.ReviewRecord)
-	PublishReviewCompleted(ctx context.Context, r domain.ReviewRecord)
+	PublishReviewCompleted(ctx context.Context, actorID string, r domain.ReviewRecord)
 }
 
 type AuthZClient interface {
@@ -401,7 +401,7 @@ func (h *Handler) CompleteReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishReviewCompleted(r.Context(), *updated)
+	h.publisher.PublishReviewCompleted(r.Context(), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 

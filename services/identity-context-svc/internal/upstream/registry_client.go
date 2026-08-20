@@ -50,7 +50,7 @@ func (c *RegistryClient) IsTenantActive(ctx context.Context, tenantID string) (b
 // role assignment scoped to the requested legal entity.
 //
 // Endpoint (stub): GET {tenantRegistryURL}/v1/entities/{legalEntityID}
-//   + principal authorization check
+//   - principal authorization check
 func (c *RegistryClient) IsPrincipalAuthorizedForEntity(ctx context.Context, principalID, legalEntityID string) (bool, error) {
 	c.log.Debug("IsPrincipalAuthorizedForEntity stub",
 		zap.String("principal_id", principalID),
@@ -75,7 +75,8 @@ func (c *RegistryClient) ResolvePermissionBundles(ctx context.Context, roleIDs [
 // grants where principalID is the delegate, scoped to legalEntityID.
 //
 // Endpoint (stub):
-//   GET {delegatedAuthorityURL}/v1/delegations?delegate={principalID}&entity={legalEntityID}&at=<now>
+//
+//	GET {delegatedAuthorityURL}/v1/delegations?delegate={principalID}&entity={legalEntityID}&at=<now>
 func (c *RegistryClient) FetchActiveDelegations(ctx context.Context, principalID, legalEntityID string) ([]domain.DelegatedAuthority, error) {
 	c.log.Debug("FetchActiveDelegations stub",
 		zap.String("principal_id", principalID),

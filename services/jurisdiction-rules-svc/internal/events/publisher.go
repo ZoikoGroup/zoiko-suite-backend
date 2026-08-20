@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
@@ -48,15 +49,41 @@ type Publisher interface {
 	PublishLegalDriftDetected(ctx context.Context, r domain.JurisdictionRule, e domain.DriftEvent, correlationID string) error
 }
 
-// envelope is the standard event wrapper for all events published by this
-// service.
+// envelope is this platform's event contract (Doc 03 §19): every published
+// event must carry event name, event version, timestamp, tenant ID, legal
+// entity ID, jurisdiction context, actor ID, correlation ID, source
+// service, and payload schema version. domain.Jurisdiction and
+// domain.JurisdictionRule are platform-wide reference data — no
+// tenant_id or legal_entity_id field exists anywhere in this service, so
+// both stay correctly omitted. jurisdiction_id IS the genuine jurisdiction
+// context for these events, so it is surfaced at the envelope level
+// rather than left for the payload alone. Actor is CreatedByPrincipalID
+// for a first write, UpdatedByPrincipalID for a transition.
 type envelope struct {
-	EventType     string          `json:"event_type"`
-	EmittedAt     time.Time       `json:"emitted_at"`
-	SchemaVersion string          `json:"schema_version"`
-	SourceService string          `json:"source_service"`
-	CorrelationID string          `json:"correlation_id"`
-	Payload       json.RawMessage `json:"payload"`
+	EventID        string          `json:"event_id"`
+	EventType      string          `json:"event_type"`
+	EventVersion   string          `json:"event_version"`
+	EmittedAt      time.Time       `json:"emitted_at"`
+	SchemaVersion  string          `json:"schema_version"`
+	SourceService  string          `json:"source_service"`
+	JurisdictionID string          `json:"jurisdiction_id,omitempty"`
+	ActorID        string          `json:"actor_id,omitempty"`
+	CorrelationID  string          `json:"correlation_id"`
+	Payload        json.RawMessage `json:"payload"`
+}
+
+func effectiveActor(createdBy string, updatedBy *string) string {
+	if updatedBy != nil && *updatedBy != "" {
+		return *updatedBy
+	}
+	return createdBy
+}
+
+// MessageWriter is the one method KafkaPublisher needs from *kafka.Writer.
+// Narrowed to an interface purely so publisher_test.go can assert
+// envelope content without a live broker.
+type MessageWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
 }
 
 // KafkaPublisher implements Publisher against the Kafka event backbone.
@@ -64,7 +91,7 @@ type envelope struct {
 type KafkaPublisher struct {
 	log      *zap.Logger
 	topic    string
-	producer *kafka.Writer
+	producer MessageWriter
 }
 
 // NewPublisher constructs a KafkaPublisher bound to the given topic and writer.
@@ -72,11 +99,17 @@ func NewPublisher(log *zap.Logger, topic string, producer *kafka.Writer) *KafkaP
 	return &KafkaPublisher{log: log, topic: topic, producer: producer}
 }
 
+// NewPublisherWithWriter is NewPublisher but with a caller-supplied
+// MessageWriter — used by tests to substitute a fake.
+func NewPublisherWithWriter(log *zap.Logger, topic string, producer MessageWriter) *KafkaPublisher {
+	return &KafkaPublisher{log: log, topic: topic, producer: producer}
+}
+
 // PublishJurisdictionCreated announces a new jurisdiction in the registry.
 // Callers must only invoke this on a real insert (created=true) — an
 // idempotent replay must not re-emit.
 func (p *KafkaPublisher) PublishJurisdictionCreated(ctx context.Context, j domain.Jurisdiction, correlationID string) error {
-	return p.emit(ctx, EventJurisdictionCreated, correlationID, map[string]any{
+	return p.emit(ctx, EventJurisdictionCreated, correlationID, j.JurisdictionID, j.CreatedByPrincipalID, map[string]any{
 		"jurisdiction_id":         j.JurisdictionID,
 		"jurisdiction_code":       j.JurisdictionCode,
 		"jurisdiction_name":       j.JurisdictionName,
@@ -96,7 +129,7 @@ func (p *KafkaPublisher) PublishJurisdictionCreated(ctx context.Context, j domai
 // need to know without polling — this is the "jurisdiction.calendar.changed"
 // family of signal for the registry itself.
 func (p *KafkaPublisher) PublishJurisdictionDeactivated(ctx context.Context, j domain.Jurisdiction, correlationID string) error {
-	return p.emit(ctx, EventJurisdictionDeactivated, correlationID, map[string]any{
+	return p.emit(ctx, EventJurisdictionDeactivated, correlationID, j.JurisdictionID, effectiveActor(j.CreatedByPrincipalID, j.UpdatedByPrincipalID), map[string]any{
 		"jurisdiction_id":         j.JurisdictionID,
 		"jurisdiction_code":       j.JurisdictionCode,
 		"active_flag":             j.ActiveFlag,
@@ -110,21 +143,21 @@ func (p *KafkaPublisher) PublishJurisdictionDeactivated(ctx context.Context, j d
 // rule or any status transition other than the activation case below.
 // Callers must only invoke this on a real write, never on a replay.
 func (p *KafkaPublisher) PublishRuleUpdated(ctx context.Context, r domain.JurisdictionRule, correlationID string) error {
-	return p.emit(ctx, EventRuleUpdated, correlationID, rulePayload(r))
+	return p.emit(ctx, EventRuleUpdated, correlationID, r.JurisdictionID, effectiveActor(r.CreatedByPrincipalID, r.UpdatedByPrincipalID), rulePayload(r))
 }
 
 // PublishRuleActivated publishes jurisdiction.rule.activated — the signal
 // downstream rule engines act on, distinct from a generic update because
 // activation is the point a rule starts governing real actions.
 func (p *KafkaPublisher) PublishRuleActivated(ctx context.Context, r domain.JurisdictionRule, correlationID string) error {
-	return p.emit(ctx, EventRuleActivated, correlationID, rulePayload(r))
+	return p.emit(ctx, EventRuleActivated, correlationID, r.JurisdictionID, effectiveActor(r.CreatedByPrincipalID, r.UpdatedByPrincipalID), rulePayload(r))
 }
 
 // PublishLegalDriftDetected publishes legal.drift.detected — the Critical
 // Enhancement of §8.2: stored platform rules have diverged from applicable
 // legal reality and something must reconcile them.
 func (p *KafkaPublisher) PublishLegalDriftDetected(ctx context.Context, r domain.JurisdictionRule, e domain.DriftEvent, correlationID string) error {
-	return p.emit(ctx, EventLegalDriftDetected, correlationID, map[string]any{
+	return p.emit(ctx, EventLegalDriftDetected, correlationID, r.JurisdictionID, e.RecordedByPrincipalID, map[string]any{
 		"drift_event_id":           e.DriftEventID,
 		"jurisdiction_rule_id":     r.JurisdictionRuleID,
 		"jurisdiction_id":          r.JurisdictionID,
@@ -170,18 +203,24 @@ func rulePayload(r domain.JurisdictionRule) map[string]any {
 // one, so all events for the same record land on one partition and consumers
 // see them in order. Rule status is a state machine; out-of-order delivery
 // of updated/activated would let a consumer settle on the wrong state.
-func (p *KafkaPublisher) emit(ctx context.Context, eventType, correlationID string, payload map[string]any) error {
+func (p *KafkaPublisher) emit(ctx context.Context, eventType, correlationID, jurisdictionID, actorID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event %q: marshal payload: %w", eventType, err)
 	}
 	env := envelope{
-		EventType:     eventType,
-		EmittedAt:     time.Now().UTC(),
-		SchemaVersion: "1.0",
-		SourceService: "jurisdiction-rules-svc",
-		CorrelationID: correlationID,
-		Payload:       json.RawMessage(raw),
+		// A fresh UUID per publish, not a deterministic string — see
+		// docs/architecture/known-gaps.md's event_id collision writeup.
+		EventID:        "evt-" + uuid.New().String(),
+		EventType:      eventType,
+		EventVersion:   "1.0",
+		EmittedAt:      time.Now().UTC(),
+		SchemaVersion:  "1.0",
+		SourceService:  "jurisdiction-rules-svc",
+		JurisdictionID: jurisdictionID,
+		ActorID:        actorID,
+		CorrelationID:  correlationID,
+		Payload:        json.RawMessage(raw),
 	}
 	data, err := json.Marshal(env)
 	if err != nil {

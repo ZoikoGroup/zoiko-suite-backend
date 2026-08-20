@@ -97,19 +97,19 @@ type stubPublisher struct {
 	created, hired, updated, statusChanged, terminated int
 }
 
-func (p *stubPublisher) PublishEmployeeCreated(_ context.Context, _ string, _ domain.Employee) {
+func (p *stubPublisher) PublishEmployeeCreated(_ context.Context, _, _ string, _ domain.Employee) {
 	p.created++
 }
-func (p *stubPublisher) PublishEmployeeHired(_ context.Context, _ string, _ domain.Employee) {
+func (p *stubPublisher) PublishEmployeeHired(_ context.Context, _, _ string, _ domain.Employee) {
 	p.hired++
 }
-func (p *stubPublisher) PublishEmployeeUpdated(_ context.Context, _ string, _ domain.Employee) {
+func (p *stubPublisher) PublishEmployeeUpdated(_ context.Context, _, _ string, _ domain.Employee) {
 	p.updated++
 }
-func (p *stubPublisher) PublishStatusChanged(_ context.Context, _ string, _ domain.Employee, _ string) {
+func (p *stubPublisher) PublishStatusChanged(_ context.Context, _, _ string, _ domain.Employee, _ string) {
 	p.statusChanged++
 }
-func (p *stubPublisher) PublishEmployeeTerminated(_ context.Context, _ string, _ domain.Employee) {
+func (p *stubPublisher) PublishEmployeeTerminated(_ context.Context, _, _ string, _ domain.Employee) {
 	p.terminated++
 }
 

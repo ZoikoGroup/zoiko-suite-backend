@@ -4,8 +4,8 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
-	"net/http"
 	"math/big"
+	"net/http"
 )
 
 type jwk struct {

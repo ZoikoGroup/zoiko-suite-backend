@@ -136,7 +136,10 @@ func (h *Handler) CreateMetricDefinition(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "report_metric.created", d.MetricDefinitionID, "", d)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "report_metric.created", EntityID: d.MetricDefinitionID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
+	})
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -224,7 +227,10 @@ func (h *Handler) PublishNewVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "report_metric.version_published", next.MetricDefinitionID, "", next)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "report_metric.version_published", EntityID: next.MetricDefinitionID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: next,
+	})
 	writeJSON(w, http.StatusCreated, next)
 }
 

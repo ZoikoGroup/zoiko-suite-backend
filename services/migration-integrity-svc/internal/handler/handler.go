@@ -113,16 +113,26 @@ func (h *Handler) ValidateMigration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "migration.integrity_validated", tenantID, map[string]interface{}{
-		"job_id":          job.ID,
-		"integrity_score": score,
-		"status":          string(status),
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "migration.integrity_validated", SubjectID: job.ID, TenantID: tenantID,
+		LegalEntityID: job.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: map[string]interface{}{
+			"job_id":          job.ID,
+			"integrity_score": score,
+			"status":          string(status),
+		},
 	})
 
 	if invalidCount > 0 {
-		_ = h.publisher.Publish(r.Context(), "migration.integrity_violations_detected", tenantID, map[string]interface{}{
-			"job_id":        job.ID,
-			"invalid_count": invalidCount,
+		_ = h.publisher.Publish(r.Context(), events.PublishParams{
+			EventType: "migration.integrity_violations_detected", SubjectID: job.ID, TenantID: tenantID,
+			LegalEntityID: job.LegalEntityID, ActorID: principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"),
+			Payload: map[string]interface{}{
+				"job_id":        job.ID,
+				"invalid_count": invalidCount,
+			},
 		})
 	}
 
@@ -187,7 +197,11 @@ func (h *Handler) RemediateEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "migration.audit_entry_remediated", tenantID, entry)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "migration.audit_entry_remediated", SubjectID: entryID, TenantID: tenantID,
+		LegalEntityID: job.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: entry,
+	})
 	h.okJSON(w, http.StatusOK, entry)
 }
 
@@ -215,7 +229,12 @@ func (h *Handler) ArchiveJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "migration.job_archived", tenantID, map[string]string{"job_id": id})
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "migration.job_archived", SubjectID: id, TenantID: tenantID,
+		LegalEntityID: job.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload:       map[string]string{"job_id": id},
+	})
 	h.okJSON(w, http.StatusOK, map[string]string{"message": "migration job archived", "id": id})
 }
 

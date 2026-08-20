@@ -114,7 +114,11 @@ func (h *Handler) CreateBridge(w http.ResponseWriter, r *http.Request) {
 	}
 
 	populateAliases(bridge)
-	_ = h.publisher.Publish(r.Context(), "connectivity.bridge.created", bridge.BridgeID, tenantID, bridge)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "connectivity.bridge.created", AggregateID: bridge.BridgeID, TenantID: tenantID,
+		LegalEntityID: bridge.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: bridge,
+	})
 	writeJSON(w, http.StatusCreated, bridge)
 }
 
@@ -195,7 +199,11 @@ func (h *Handler) IngestPayload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "connectivity.bridge.ingested", log.LogID, tenantID, log)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "connectivity.bridge.ingested", AggregateID: log.LogID, TenantID: tenantID,
+		LegalEntityID: bridge.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: log,
+	})
 	writeJSON(w, http.StatusOK, log)
 }
 

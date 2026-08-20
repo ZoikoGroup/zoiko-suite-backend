@@ -30,15 +30,15 @@ type TaxInterface struct {
 }
 
 type TaxFilingSubmission struct {
-	SubmissionID   string    `json:"submission_id"`
-	InterfaceID    string    `json:"interface_id"`
-	TenantID       string    `json:"tenant_id"`
-	TaxPeriod      string    `json:"tax_period"`
-	FilingType     string    `json:"filing_type"`
-	TaxAmount      float64   `json:"tax_amount"`
-	Status         string    `json:"status"`
-	AckReference   string    `json:"ack_reference,omitempty"`
-	SubmittedAt    time.Time `json:"submitted_at"`
+	SubmissionID string    `json:"submission_id"`
+	InterfaceID  string    `json:"interface_id"`
+	TenantID     string    `json:"tenant_id"`
+	TaxPeriod    string    `json:"tax_period"`
+	FilingType   string    `json:"filing_type"`
+	TaxAmount    float64   `json:"tax_amount"`
+	Status       string    `json:"status"`
+	AckReference string    `json:"ack_reference,omitempty"`
+	SubmittedAt  time.Time `json:"submitted_at"`
 }
 
 type CreateInterfaceRequest struct {

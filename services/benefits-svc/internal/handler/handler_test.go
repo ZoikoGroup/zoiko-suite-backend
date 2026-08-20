@@ -133,13 +133,13 @@ type stubPublisher struct {
 	enrolled, changed, terminated int
 }
 
-func (p *stubPublisher) PublishBenefitEnrolled(_ context.Context, _ string, _ domain.BenefitElection) {
+func (p *stubPublisher) PublishBenefitEnrolled(_ context.Context, _, _, _ string, _ domain.BenefitElection) {
 	p.enrolled++
 }
-func (p *stubPublisher) PublishBenefitChanged(_ context.Context, _ string, _ domain.BenefitElection) {
+func (p *stubPublisher) PublishBenefitChanged(_ context.Context, _, _, _ string, _ domain.BenefitElection) {
 	p.changed++
 }
-func (p *stubPublisher) PublishBenefitTerminated(_ context.Context, _ string, _ domain.BenefitElection) {
+func (p *stubPublisher) PublishBenefitTerminated(_ context.Context, _, _, _ string, _ domain.BenefitElection) {
 	p.terminated++
 }
 

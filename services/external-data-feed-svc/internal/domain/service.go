@@ -34,12 +34,12 @@ type DataFeedSubscription struct {
 }
 
 type DataFeedEvent struct {
-	EventID   string                 `json:"event_id"`
-	FeedID    string                 `json:"feed_id"`
-	TenantID  string                 `json:"tenant_id"`
-	EventType string                 `json:"event_type"`
-	Payload   map[string]interface{} `json:"payload"`
-	ReceivedAt time.Time             `json:"received_at"`
+	EventID    string                 `json:"event_id"`
+	FeedID     string                 `json:"feed_id"`
+	TenantID   string                 `json:"tenant_id"`
+	EventType  string                 `json:"event_type"`
+	Payload    map[string]interface{} `json:"payload"`
+	ReceivedAt time.Time              `json:"received_at"`
 }
 
 type CreateSubscriptionRequest struct {

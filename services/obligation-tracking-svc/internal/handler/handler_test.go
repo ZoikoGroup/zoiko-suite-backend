@@ -71,7 +71,7 @@ func (s *stubStore) FulfillObligation(_ context.Context, id string, req *domain.
 
 type stubPublisher struct{}
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error {
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
 	return nil
 }
 

@@ -12,20 +12,20 @@ import (
 )
 
 type Clients struct {
-	apURL        string
-	arURL        string
+	apURL          string
+	arURL          string
 	obligationsURL string
-	http         *http.Client
-	log          *zap.Logger
+	http           *http.Client
+	log            *zap.Logger
 }
 
 func New(apURL, arURL, obligationsURL string, log *zap.Logger) *Clients {
 	return &Clients{
-		apURL:        apURL,
-		arURL:        arURL,
+		apURL:          apURL,
+		arURL:          arURL,
 		obligationsURL: obligationsURL,
-		http:         &http.Client{Timeout: 3 * time.Second, Transport: newRetryTransport()},
-		log:          log,
+		http:           &http.Client{Timeout: 3 * time.Second, Transport: newRetryTransport()},
+		log:            log,
 	}
 }
 

@@ -99,7 +99,7 @@ type EventPublisher interface {
 	PublishTenantCreated(ctx context.Context, tenant *domain.Tenant, correlationID string)
 	PublishEntityCreated(ctx context.Context, entity *domain.LegalEntity, correlationID string)
 	PublishEntityUpdated(ctx context.Context, entity *domain.LegalEntity, correlationID string)
-	PublishEntityStatusChanged(ctx context.Context, tenantID, legalEntityID string, previousStatus, newStatus domain.EntityStatus, correlationID string)
+	PublishEntityStatusChanged(ctx context.Context, tenantID, legalEntityID, actorID string, previousStatus, newStatus domain.EntityStatus, correlationID string)
 	PublishEntityHierarchyChanged(ctx context.Context, hierarchy *domain.EntityHierarchy, changeType string, correlationID string)
 	PublishEntityJurisdictionChanged(ctx context.Context, assignment *domain.EntityJurisdictionAssignment, changeType string, correlationID string)
 	PublishWorkspaceCreated(ctx context.Context, workspace *domain.Workspace, correlationID string)

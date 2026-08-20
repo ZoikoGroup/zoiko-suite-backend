@@ -117,7 +117,10 @@ func (h *Handler) CreateObligation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "obligation.created", o.ObligationID, tenantID, o)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "obligation.created", ObligationID: o.ObligationID, TenantID: tenantID,
+		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
+	})
 	writeJSON(w, http.StatusCreated, o)
 }
 
@@ -213,7 +216,10 @@ func (h *Handler) UpdateObligation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "obligation.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "obligation.updated", ObligationID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -263,7 +269,10 @@ func (h *Handler) FulfillObligation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "obligation.fulfilled", id, tenantID, o)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "obligation.fulfilled", ObligationID: id, TenantID: tenantID,
+		LegalEntityID: o.LegalEntityID, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
+	})
 	writeJSON(w, http.StatusOK, o)
 }
 

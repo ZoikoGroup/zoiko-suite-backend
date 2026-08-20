@@ -239,7 +239,7 @@ var (
 
 	// Document-vault verification errors. Fail closed on all of them: an
 	// artifact that cannot be confirmed to exist does not count as evidence.
-	ErrDocumentNotFound             = errorString("referenced document not found")
-	ErrDocumentMismatch             = errorString("referenced document belongs to a different tenant or legal entity")
-	ErrDocumentServiceUnavailable   = errorString("document-vault-svc unavailable")
+	ErrDocumentNotFound           = errorString("referenced document not found")
+	ErrDocumentMismatch           = errorString("referenced document belongs to a different tenant or legal entity")
+	ErrDocumentServiceUnavailable = errorString("document-vault-svc unavailable")
 )

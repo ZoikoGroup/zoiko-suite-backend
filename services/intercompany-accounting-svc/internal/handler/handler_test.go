@@ -21,7 +21,7 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStoreReal struct {
-	entries       map[string]*domain.IntercompanyEntry
+	entries         map[string]*domain.IntercompanyEntry
 	bySourceJournal map[string]string
 }
 
@@ -78,13 +78,13 @@ type stubPublisher struct {
 	created, posted, mismatched int
 }
 
-func (p *stubPublisher) PublishEntryCreated(_ context.Context, _ string, _ domain.IntercompanyEntry) {
+func (p *stubPublisher) PublishEntryCreated(_ context.Context, _, _ string, _ domain.IntercompanyEntry) {
 	p.created++
 }
-func (p *stubPublisher) PublishEntryPosted(_ context.Context, _ string, _ domain.IntercompanyEntry) {
+func (p *stubPublisher) PublishEntryPosted(_ context.Context, _, _ string, _ domain.IntercompanyEntry) {
 	p.posted++
 }
-func (p *stubPublisher) PublishMismatchDetected(_ context.Context, _ string, _ domain.IntercompanyEntry, _ string) {
+func (p *stubPublisher) PublishMismatchDetected(_ context.Context, _, _ string, _ domain.IntercompanyEntry, _ string) {
 	p.mismatched++
 }
 
@@ -144,9 +144,9 @@ func TestCreateEntry_MissingPrincipal(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/", map[string]any{
 		"source_legal_entity_id": "le-us",
 		"target_legal_entity_id": "le-uk",
-		"source_journal_id":     "j-001",
-		"amount":                5000.0,
-		"currency_code":         "USD",
+		"source_journal_id":      "j-001",
+		"amount":                 5000.0,
+		"currency_code":          "USD",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -158,9 +158,9 @@ func TestCreateEntry_SameEntityForbidden(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/", map[string]any{
 		"source_legal_entity_id": "le-same",
 		"target_legal_entity_id": "le-same",
-		"source_journal_id":     "j-001",
-		"amount":                5000.0,
-		"currency_code":         "USD",
+		"source_journal_id":      "j-001",
+		"amount":                 5000.0,
+		"currency_code":          "USD",
 	}, "principal-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d", rr.Code)
@@ -172,9 +172,9 @@ func TestCreateEntry_NegativeAmount(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/", map[string]any{
 		"source_legal_entity_id": "le-us",
 		"target_legal_entity_id": "le-uk",
-		"source_journal_id":     "j-001",
-		"amount":                -100.0,
-		"currency_code":         "USD",
+		"source_journal_id":      "j-001",
+		"amount":                 -100.0,
+		"currency_code":          "USD",
 	}, "principal-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d", rr.Code)
@@ -187,9 +187,9 @@ func TestCreateEntry_HappyPath(t *testing.T) {
 	rr := doReq(r, http.MethodPost, "/v1/intercompany/entries/", map[string]any{
 		"source_legal_entity_id": "le-us",
 		"target_legal_entity_id": "le-uk",
-		"source_journal_id":     "j-001",
-		"amount":                5000.0,
-		"currency_code":         "USD",
+		"source_journal_id":      "j-001",
+		"amount":                 5000.0,
+		"currency_code":          "USD",
 	}, "principal-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())

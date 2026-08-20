@@ -14,12 +14,12 @@ type RunStatus string
 type DefinitionStatus string
 
 const (
-	ReportTypeFinancialSummary    ReportType = "FINANCIAL_SUMMARY"
-	ReportTypePayrollSummary      ReportType = "PAYROLL_SUMMARY"
-	ReportTypeComplianceOverview  ReportType = "COMPLIANCE_OVERVIEW"
-	ReportTypeAuditTrail          ReportType = "AUDIT_TRAIL"
-	ReportTypeCashFlow            ReportType = "CASH_FLOW"
-	ReportTypeWorkforceAnalytics  ReportType = "WORKFORCE_ANALYTICS"
+	ReportTypeFinancialSummary   ReportType = "FINANCIAL_SUMMARY"
+	ReportTypePayrollSummary     ReportType = "PAYROLL_SUMMARY"
+	ReportTypeComplianceOverview ReportType = "COMPLIANCE_OVERVIEW"
+	ReportTypeAuditTrail         ReportType = "AUDIT_TRAIL"
+	ReportTypeCashFlow           ReportType = "CASH_FLOW"
+	ReportTypeWorkforceAnalytics ReportType = "WORKFORCE_ANALYTICS"
 )
 
 const (
@@ -65,19 +65,19 @@ type ReportDefinition struct {
 }
 
 type ReportRun struct {
-	ID              string        `json:"id"`
-	TenantID        string        `json:"tenant_id"`
-	DefinitionID    string        `json:"definition_id"`
-	TriggeredBy     TriggerSource `json:"triggered_by"`
-	PeriodStart     string        `json:"period_start,omitempty"` // ISO date YYYY-MM-DD
-	PeriodEnd       string        `json:"period_end,omitempty"`
-	Status          RunStatus     `json:"status"`
-	RowCount        int           `json:"row_count"`
-	OutputLocation  string        `json:"output_location,omitempty"`
-	ErrorMessage    string        `json:"error_message,omitempty"`
-	StartedAt       *time.Time    `json:"started_at,omitempty"`
-	CompletedAt     *time.Time    `json:"completed_at,omitempty"`
-	CreatedAt       time.Time     `json:"created_at"`
+	ID             string        `json:"id"`
+	TenantID       string        `json:"tenant_id"`
+	DefinitionID   string        `json:"definition_id"`
+	TriggeredBy    TriggerSource `json:"triggered_by"`
+	PeriodStart    string        `json:"period_start,omitempty"` // ISO date YYYY-MM-DD
+	PeriodEnd      string        `json:"period_end,omitempty"`
+	Status         RunStatus     `json:"status"`
+	RowCount       int           `json:"row_count"`
+	OutputLocation string        `json:"output_location,omitempty"`
+	ErrorMessage   string        `json:"error_message,omitempty"`
+	StartedAt      *time.Time    `json:"started_at,omitempty"`
+	CompletedAt    *time.Time    `json:"completed_at,omitempty"`
+	CreatedAt      time.Time     `json:"created_at"`
 }
 
 // ─── Request / Response DTOs ──────────────────────────────────────────────────

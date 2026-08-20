@@ -102,7 +102,11 @@ func (h *Handler) CreateIntegration(w http.ResponseWriter, r *http.Request) {
 	}
 
 	populateAliases(integ)
-	_ = h.publisher.Publish(r.Context(), "hris.integration.created", integ.IntegrationID, tenantID, integ)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "hris.integration.created", AggregateID: integ.IntegrationID, TenantID: tenantID,
+		LegalEntityID: integ.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: integ,
+	})
 	writeJSON(w, http.StatusCreated, integ)
 }
 
@@ -185,7 +189,11 @@ func (h *Handler) TriggerSync(w http.ResponseWriter, r *http.Request) {
 	}
 	job.SyncID = job.JobID
 
-	_ = h.publisher.Publish(r.Context(), "hris.sync.triggered", job.JobID, tenantID, job)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "hris.sync.triggered", AggregateID: job.JobID, TenantID: tenantID,
+		LegalEntityID: integ.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: job,
+	})
 	writeJSON(w, http.StatusCreated, job)
 }
 

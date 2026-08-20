@@ -86,10 +86,14 @@ type stubPublisher struct {
 	issued, sent, overdue, paymentReceived int
 }
 
-func (p *stubPublisher) PublishInvoiceIssued(_ context.Context, _ domain.CustomerInvoice)    { p.issued++ }
-func (p *stubPublisher) PublishInvoiceSent(_ context.Context, _ domain.CustomerInvoice)      { p.sent++ }
-func (p *stubPublisher) PublishReceivableOverdue(_ context.Context, _ domain.CustomerInvoice) { p.overdue++ }
-func (p *stubPublisher) PublishPaymentReceived(_ context.Context, _ domain.CustomerInvoice)   { p.paymentReceived++ }
+func (p *stubPublisher) PublishInvoiceIssued(_ context.Context, _ domain.CustomerInvoice) { p.issued++ }
+func (p *stubPublisher) PublishInvoiceSent(_ context.Context, _ domain.CustomerInvoice)   { p.sent++ }
+func (p *stubPublisher) PublishReceivableOverdue(_ context.Context, _ domain.CustomerInvoice) {
+	p.overdue++
+}
+func (p *stubPublisher) PublishPaymentReceived(_ context.Context, _ domain.CustomerInvoice) {
+	p.paymentReceived++
+}
 
 type stubAuthZ struct {
 	err error
@@ -313,4 +317,3 @@ func TestReceivePayment_LedgerService503_Returns503(t *testing.T) {
 		t.Fatalf("expected invoice status to remain SENT, got %s", s.invoices["i1"].Status)
 	}
 }
-

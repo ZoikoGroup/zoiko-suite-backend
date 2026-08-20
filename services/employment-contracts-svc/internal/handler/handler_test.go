@@ -121,13 +121,13 @@ type stubPublisher struct {
 	issued, amended, terminated int
 }
 
-func (p *stubPublisher) PublishContractIssued(_ context.Context, _ string, _ domain.EmploymentContract) {
+func (p *stubPublisher) PublishContractIssued(_ context.Context, _, _ string, _ domain.EmploymentContract) {
 	p.issued++
 }
 func (p *stubPublisher) PublishContractAmended(_ context.Context, _ string, _ domain.EmploymentContract, _ domain.ContractAmendment) {
 	p.amended++
 }
-func (p *stubPublisher) PublishContractTerminated(_ context.Context, _ string, _ domain.EmploymentContract) {
+func (p *stubPublisher) PublishContractTerminated(_ context.Context, _, _ string, _ domain.EmploymentContract) {
 	p.terminated++
 }
 

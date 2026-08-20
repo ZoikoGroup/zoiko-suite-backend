@@ -135,7 +135,10 @@ func (h *Handler) EngageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "kill_switch.engaged", e.KillSwitchEventID, req.TenantID, e)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "kill_switch.engaged", EntityID: e.KillSwitchEventID, TenantID: req.TenantID,
+		ActorID: principalID, CorrelationID: req.CorrelationID, Payload: e,
+	})
 	writeJSON(w, http.StatusCreated, e)
 }
 
@@ -195,7 +198,10 @@ func (h *Handler) DisengageKillSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "kill_switch.disengaged", e.KillSwitchEventID, req.TenantID, e)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "kill_switch.disengaged", EntityID: e.KillSwitchEventID, TenantID: req.TenantID,
+		ActorID: principalID, CorrelationID: req.CorrelationID, Payload: e,
+	})
 	writeJSON(w, http.StatusOK, e)
 }
 

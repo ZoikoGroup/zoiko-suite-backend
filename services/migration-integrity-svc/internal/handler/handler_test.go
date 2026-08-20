@@ -58,10 +58,10 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 
 	// 1. Validate a mixed dataset — some valid, some violating
 	validateReq := domain.ValidateMigrationRequest{
-		LegalEntityID: "LE-5005",
-		MigrationName: "Legacy ERP to Ledger Service Migration",
-		SourceSystem:  "LEGACY_ERP",
-		TargetService: "ledger-svc",
+		LegalEntityID:  "LE-5005",
+		MigrationName:  "Legacy ERP to Ledger Service Migration",
+		SourceSystem:   "LEGACY_ERP",
+		TargetService:  "ledger-svc",
 		RequiredFields: []string{"employee_id", "amount", "cost_centre"},
 		Records: []domain.MigrationRecord{
 			// Valid record

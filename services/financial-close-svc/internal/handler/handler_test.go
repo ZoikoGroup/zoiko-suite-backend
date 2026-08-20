@@ -114,13 +114,13 @@ func (s *stubStore) CreateCloseEvidence(_ context.Context, ev *domain.CloseEvide
 
 type stubPublisher struct{ started, blocked, closed int }
 
-func (p *stubPublisher) PublishCloseStarted(_ context.Context, _ string, _ domain.FiscalPeriod) {
+func (p *stubPublisher) PublishCloseStarted(_ context.Context, _, _ string, _ domain.FiscalPeriod) {
 	p.started++
 }
-func (p *stubPublisher) PublishCloseBlocked(_ context.Context, _ string, _ domain.FiscalPeriod, _ []string) {
+func (p *stubPublisher) PublishCloseBlocked(_ context.Context, _, _ string, _ domain.FiscalPeriod, _ []string) {
 	p.blocked++
 }
-func (p *stubPublisher) PublishClosed(_ context.Context, _ string, _ domain.FiscalPeriod, _ string) {
+func (p *stubPublisher) PublishClosed(_ context.Context, _, _ string, _ domain.FiscalPeriod, _ string) {
 	p.closed++
 }
 

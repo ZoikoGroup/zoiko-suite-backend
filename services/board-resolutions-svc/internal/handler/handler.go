@@ -260,7 +260,7 @@ func (h *Handler) CreateMeeting(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publish(r.Context(), "meeting.created", m.MeetingID, tenantID, m)
+	h.publish(r.Context(), "meeting.created", m.MeetingID, tenantID, m.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), m)
 	writeJSON(w, http.StatusCreated, m)
 }
 
@@ -371,7 +371,7 @@ func (h *Handler) CreateResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publish(r.Context(), "resolution.created", res.ResolutionID, tenantID, res)
+	h.publish(r.Context(), "resolution.created", res.ResolutionID, tenantID, res.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), res)
 	writeJSON(w, http.StatusCreated, res)
 }
 
@@ -461,7 +461,7 @@ func (h *Handler) RecordVotes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publish(r.Context(), "resolution.votes_recorded", id, tenantID, res)
+	h.publish(r.Context(), "resolution.votes_recorded", id, tenantID, res.LegalEntityID, principalID, r.Header.Get("X-Correlation-ID"), res)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -550,7 +550,7 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publish(r.Context(), "resolution.passed", id, tenantID, res)
+	h.publish(r.Context(), "resolution.passed", id, tenantID, res.LegalEntityID, principalID, correlationID, res)
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -562,10 +562,13 @@ func (h *Handler) PassResolution(w http.ResponseWriter, r *http.Request) {
 // The context is detached from the request: the event describes a write that
 // has already committed, and cancelling it because the caller hung up would
 // drop the record of something that definitively happened.
-func (h *Handler) publish(ctx context.Context, eventType, entityID, tenantID string, payload interface{}) {
+func (h *Handler) publish(ctx context.Context, eventType, entityID, tenantID, legalEntityID, actorID, correlationID string, payload interface{}) {
 	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := h.publisher.Publish(pubCtx, eventType, entityID, tenantID, payload); err != nil {
+	if err := h.publisher.Publish(pubCtx, events.PublishParams{
+		EventType: eventType, EntityID: entityID, TenantID: tenantID,
+		LegalEntityID: legalEntityID, ActorID: actorID, CorrelationID: correlationID, Payload: payload,
+	}); err != nil {
 		h.logger.Error("event publish failed — event dropped",
 			zap.String("event_type", eventType),
 			zap.String("entity_id", entityID),

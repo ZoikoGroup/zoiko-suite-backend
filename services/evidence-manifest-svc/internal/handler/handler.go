@@ -27,7 +27,7 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishManifestGenerated(ctx context.Context, m *domain.EvidenceManifest) error
+	PublishManifestGenerated(ctx context.Context, m *domain.EvidenceManifest, correlationID string) error
 }
 
 // GovernanceSource, AccessSource, WorkflowSource are the narrow interfaces the
@@ -145,7 +145,7 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if pubErr := h.publisher.PublishManifestGenerated(r.Context(), finalManifest); pubErr != nil {
+	if pubErr := h.publisher.PublishManifestGenerated(r.Context(), finalManifest, r.Header.Get("X-Correlation-ID")); pubErr != nil {
 		h.log.Error("GenerateManifest: failed to publish evidence.manifest.generated",
 			zap.String("manifest_id", finalManifest.ManifestID), zap.Error(pubErr))
 	}

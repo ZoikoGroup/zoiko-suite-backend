@@ -124,7 +124,9 @@ func (p *stubPublisher) PublishRequested(_ context.Context, _ domain.Procurement
 func (p *stubPublisher) PublishApprovalStarted(_ context.Context, _ domain.ProcurementCase) {
 	p.approvalStarted++
 }
-func (p *stubPublisher) PublishCompleted(_ context.Context, _ domain.ProcurementCase) { p.completed++ }
+func (p *stubPublisher) PublishCompleted(_ context.Context, _ string, _ domain.ProcurementCase) {
+	p.completed++
+}
 
 type stubAuthZ struct{ err error }
 

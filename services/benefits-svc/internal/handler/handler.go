@@ -28,9 +28,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishBenefitEnrolled(ctx context.Context, correlationID string, e domain.BenefitElection)
-	PublishBenefitChanged(ctx context.Context, correlationID string, e domain.BenefitElection)
-	PublishBenefitTerminated(ctx context.Context, correlationID string, e domain.BenefitElection)
+	PublishBenefitEnrolled(ctx context.Context, correlationID, legalEntityID, actorID string, e domain.BenefitElection)
+	PublishBenefitChanged(ctx context.Context, correlationID, legalEntityID, actorID string, e domain.BenefitElection)
+	PublishBenefitTerminated(ctx context.Context, correlationID, legalEntityID, actorID string, e domain.BenefitElection)
 }
 
 type AuthZClient interface {
@@ -266,7 +266,7 @@ func (h *Handler) EnrollBenefit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, election)
 		return
 	}
-	h.publisher.PublishBenefitEnrolled(r.Context(), correlationID, *election)
+	h.publisher.PublishBenefitEnrolled(r.Context(), correlationID, legalEntityID, principalID, *election)
 
 	writeJSON(w, http.StatusCreated, election)
 }
@@ -333,7 +333,7 @@ func (h *Handler) UpdateElection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishBenefitChanged(r.Context(), correlationID, *target)
+	h.publisher.PublishBenefitChanged(r.Context(), correlationID, legalEntityID, principalID, *target)
 
 	writeJSON(w, http.StatusOK, target)
 }
@@ -385,7 +385,7 @@ func (h *Handler) CancelElection(w http.ResponseWriter, r *http.Request) {
 	target.EffectiveTo = &cancelDate
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishBenefitTerminated(r.Context(), correlationID, *target)
+	h.publisher.PublishBenefitTerminated(r.Context(), correlationID, legalEntityID, principalID, *target)
 
 	writeJSON(w, http.StatusOK, target)
 }

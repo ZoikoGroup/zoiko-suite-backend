@@ -28,7 +28,7 @@ type Store interface {
 type Publisher interface {
 	PublishRequested(ctx context.Context, c domain.ProcurementCase)
 	PublishApprovalStarted(ctx context.Context, c domain.ProcurementCase)
-	PublishCompleted(ctx context.Context, c domain.ProcurementCase)
+	PublishCompleted(ctx context.Context, actorID string, c domain.ProcurementCase)
 }
 
 type AuthZClient interface {
@@ -365,7 +365,7 @@ func (h *Handler) IssueOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishCompleted(r.Context(), *updated)
+	h.publisher.PublishCompleted(r.Context(), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 

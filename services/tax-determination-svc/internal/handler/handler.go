@@ -113,7 +113,8 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, ok := h.authorize(w, r, req.LegalEntityID, ActionTaxDeterminationCreate); !ok {
+	principalID, ok := h.authorize(w, r, req.LegalEntityID, ActionTaxDeterminationCreate)
+	if !ok {
 		return
 	}
 
@@ -159,7 +160,11 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "tax_determination.calculated", det.DeterminationID, tenantID, det)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "tax_determination.calculated", DeterminationID: det.DeterminationID, TenantID: tenantID,
+		LegalEntityID: det.LegalEntityID, Jurisdiction: det.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: det,
+	})
 	writeJSON(w, http.StatusCreated, det)
 }
 
@@ -216,7 +221,8 @@ func (h *Handler) OverrideDetermination(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if _, ok := h.authorize(w, r, existing.LegalEntityID, ActionTaxDeterminationOverride); !ok {
+	principalID, ok := h.authorize(w, r, existing.LegalEntityID, ActionTaxDeterminationOverride)
+	if !ok {
 		return
 	}
 
@@ -233,7 +239,11 @@ func (h *Handler) OverrideDetermination(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "tax_determination.overridden", id, tenantID, det)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "tax_determination.overridden", DeterminationID: id, TenantID: tenantID,
+		LegalEntityID: det.LegalEntityID, Jurisdiction: det.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: det,
+	})
 	writeJSON(w, http.StatusOK, det)
 }
 

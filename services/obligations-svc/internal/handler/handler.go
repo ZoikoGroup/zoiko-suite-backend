@@ -38,9 +38,9 @@ type ObligationStore interface {
 // event backbone. Mirrors policy-svc's pattern.
 type EventPublisher interface {
 	PublishObligationCreated(ctx context.Context, o domain.Obligation, correlationID string) error
-	PublishObligationUpdated(ctx context.Context, o domain.Obligation, correlationID string) error
-	PublishObligationOverdue(ctx context.Context, o domain.Obligation, correlationID string) error
-	PublishObligationClosed(ctx context.Context, o domain.Obligation, correlationID string) error
+	PublishObligationUpdated(ctx context.Context, o domain.Obligation, actorID, correlationID string) error
+	PublishObligationOverdue(ctx context.Context, o domain.Obligation, actorID, correlationID string) error
+	PublishObligationClosed(ctx context.Context, o domain.Obligation, actorID, correlationID string) error
 }
 
 // Handler holds all HTTP handler methods.
@@ -552,7 +552,7 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 	}
 
 	if transitioned {
-		if pubErr := h.publisher.PublishObligationUpdated(r.Context(), *updated, correlationID); pubErr != nil {
+		if pubErr := h.publisher.PublishObligationUpdated(r.Context(), *updated, principalID, correlationID); pubErr != nil {
 			h.log.Error("UpdateObligationStatus: failed to publish obligation.updated",
 				zap.String("obligation_id", updated.ObligationID),
 				zap.String("correlation_id", correlationID),
@@ -561,7 +561,7 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 		}
 		switch updated.ObligationStatus {
 		case "OVERDUE":
-			if pubErr := h.publisher.PublishObligationOverdue(r.Context(), *updated, correlationID); pubErr != nil {
+			if pubErr := h.publisher.PublishObligationOverdue(r.Context(), *updated, principalID, correlationID); pubErr != nil {
 				h.log.Error("UpdateObligationStatus: failed to publish obligation.overdue",
 					zap.String("obligation_id", updated.ObligationID),
 					zap.String("correlation_id", correlationID),
@@ -569,7 +569,7 @@ func (h *Handler) UpdateObligationStatus(w http.ResponseWriter, r *http.Request)
 				)
 			}
 		case "CLOSED":
-			if pubErr := h.publisher.PublishObligationClosed(r.Context(), *updated, correlationID); pubErr != nil {
+			if pubErr := h.publisher.PublishObligationClosed(r.Context(), *updated, principalID, correlationID); pubErr != nil {
 				h.log.Error("UpdateObligationStatus: failed to publish obligation.closed",
 					zap.String("obligation_id", updated.ObligationID),
 					zap.String("correlation_id", correlationID),
