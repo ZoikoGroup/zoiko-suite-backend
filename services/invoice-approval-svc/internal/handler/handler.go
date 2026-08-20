@@ -26,8 +26,8 @@ type Store interface {
 
 type Publisher interface {
 	PublishApprovalStarted(ctx context.Context, correlationID string, req domain.InvoiceApprovalRequest)
-	PublishApproved(ctx context.Context, correlationID string, req domain.InvoiceApprovalRequest)
-	PublishRejected(ctx context.Context, correlationID string, req domain.InvoiceApprovalRequest, reason string)
+	PublishApproved(ctx context.Context, correlationID, actorID string, req domain.InvoiceApprovalRequest)
+	PublishRejected(ctx context.Context, correlationID, actorID string, req domain.InvoiceApprovalRequest, reason string)
 }
 
 type AuthZClient interface {
@@ -304,9 +304,9 @@ func (h *Handler) SubmitDecision(w http.ResponseWriter, r *http.Request) {
 	appReq.UpdatedAt = now
 
 	if newStatus == "APPROVED" {
-		h.publisher.PublishApproved(r.Context(), correlationID, *appReq)
+		h.publisher.PublishApproved(r.Context(), correlationID, principalID, *appReq)
 	} else if newStatus == "REJECTED" {
-		h.publisher.PublishRejected(r.Context(), correlationID, *appReq, req.DecisionReason)
+		h.publisher.PublishRejected(r.Context(), correlationID, principalID, *appReq, req.DecisionReason)
 	}
 
 	writeJSON(w, http.StatusOK, appReq)
