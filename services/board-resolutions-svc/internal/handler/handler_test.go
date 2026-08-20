@@ -120,8 +120,8 @@ func (s *stubStore) PassResolution(_ context.Context, id, passedBy string, req *
 
 type stubPublisher struct{ published []string }
 
-func (p *stubPublisher) Publish(_ context.Context, eventType, _, _ string, _ interface{}) error {
-	p.published = append(p.published, eventType)
+func (p *stubPublisher) Publish(_ context.Context, params events.PublishParams) error {
+	p.published = append(p.published, params.EventType)
 	return nil
 }
 
