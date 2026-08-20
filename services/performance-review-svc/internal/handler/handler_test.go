@@ -148,7 +148,7 @@ type stubPublisher struct {
 }
 
 func (p *stubPublisher) PublishReviewCreated(_ context.Context, _ domain.ReviewRecord) { p.created++ }
-func (p *stubPublisher) PublishReviewCompleted(_ context.Context, _ domain.ReviewRecord) {
+func (p *stubPublisher) PublishReviewCompleted(_ context.Context, _ string, _ domain.ReviewRecord) {
 	p.completed++
 }
 
