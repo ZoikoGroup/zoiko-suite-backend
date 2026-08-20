@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/withholding-tax-svc/internal/authz"
 	"zoiko.io/withholding-tax-svc/internal/domain"
+	"zoiko.io/withholding-tax-svc/internal/events"
 )
 
 type mockStore struct {
@@ -115,7 +116,7 @@ func (m *mockStore) Cancel(ctx context.Context, id string, req *domain.CancelObl
 
 type mockPublisher struct{}
 
-func (p *mockPublisher) Publish(ctx context.Context, eventType, obligationID, tenantID string, payload interface{}) error {
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
 	return nil
 }
 

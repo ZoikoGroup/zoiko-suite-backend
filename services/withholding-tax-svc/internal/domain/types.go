@@ -6,9 +6,9 @@ import (
 )
 
 var (
-	ErrObligationNotFound  = errors.New("withholding tax obligation not found")
-	ErrAlreadyRemitted     = errors.New("withholding tax obligation is already remitted")
-	ErrAlreadyCancelled    = errors.New("withholding tax obligation is already cancelled")
+	ErrObligationNotFound   = errors.New("withholding tax obligation not found")
+	ErrAlreadyRemitted      = errors.New("withholding tax obligation is already remitted")
+	ErrAlreadyCancelled     = errors.New("withholding tax obligation is already cancelled")
 	ErrInvalidPaymentAmount = errors.New("payment amount must be greater than zero")
 )
 
