@@ -25,9 +25,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishExceptionRaised(ctx context.Context, correlationID string, e domain.PayrollException)
-	PublishExceptionResolved(ctx context.Context, correlationID string, e domain.PayrollException)
-	PublishBlockerFlagged(ctx context.Context, correlationID, payrollRunID string, blockerCount int)
+	PublishExceptionRaised(ctx context.Context, correlationID, legalEntityID, actorID string, e domain.PayrollException)
+	PublishExceptionResolved(ctx context.Context, correlationID, legalEntityID string, e domain.PayrollException)
+	PublishBlockerFlagged(ctx context.Context, correlationID, tenantID, legalEntityID, actorID, payrollRunID string, blockerCount int)
 }
 
 type AuthZClient interface {
@@ -149,10 +149,14 @@ func (h *Handler) RaiseException(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishExceptionRaised(r.Context(), correlationID, *exc)
+	eventLegalEntityID := legalEntityID
+	if eventLegalEntityID == "GLOBAL" {
+		eventLegalEntityID = ""
+	}
+	h.publisher.PublishExceptionRaised(r.Context(), correlationID, eventLegalEntityID, principalID, *exc)
 
 	if exc.Severity == "BLOCKER" {
-		h.publisher.PublishBlockerFlagged(r.Context(), correlationID, exc.PayrollRunID, 1)
+		h.publisher.PublishBlockerFlagged(r.Context(), correlationID, tenantID, eventLegalEntityID, principalID, exc.PayrollRunID, 1)
 	}
 
 	writeJSON(w, http.StatusCreated, exc)
@@ -282,7 +286,11 @@ func (h *Handler) handleExceptionResolution(w http.ResponseWriter, r *http.Reque
 	exc.ResolvedAt = &now
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishExceptionResolved(r.Context(), correlationID, *exc)
+	eventLegalEntityID := legalEntityID
+	if eventLegalEntityID == "GLOBAL" {
+		eventLegalEntityID = ""
+	}
+	h.publisher.PublishExceptionResolved(r.Context(), correlationID, eventLegalEntityID, *exc)
 
 	writeJSON(w, http.StatusOK, exc)
 }
