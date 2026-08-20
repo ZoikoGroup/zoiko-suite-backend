@@ -179,16 +179,16 @@ type stubPublisher struct {
 	requested, approved, rejected, balanceUpdated int
 }
 
-func (p *stubPublisher) PublishLeaveRequested(_ context.Context, _ string, _ domain.LeaveRequest) {
+func (p *stubPublisher) PublishLeaveRequested(_ context.Context, _, _, _ string, _ domain.LeaveRequest) {
 	p.requested++
 }
-func (p *stubPublisher) PublishLeaveApproved(_ context.Context, _ string, _ domain.LeaveRequest) {
+func (p *stubPublisher) PublishLeaveApproved(_ context.Context, _, _ string, _ domain.LeaveRequest) {
 	p.approved++
 }
-func (p *stubPublisher) PublishLeaveRejected(_ context.Context, _ string, _ domain.LeaveRequest) {
+func (p *stubPublisher) PublishLeaveRejected(_ context.Context, _, _ string, _ domain.LeaveRequest) {
 	p.rejected++
 }
-func (p *stubPublisher) PublishBalanceUpdated(_ context.Context, _ string, _ domain.LeaveBalance) {
+func (p *stubPublisher) PublishBalanceUpdated(_ context.Context, _, _, _ string, _ domain.LeaveBalance) {
 	p.balanceUpdated++
 }
 

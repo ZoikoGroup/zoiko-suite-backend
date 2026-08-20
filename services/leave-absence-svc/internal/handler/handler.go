@@ -30,10 +30,10 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishLeaveRequested(ctx context.Context, correlationID string, r domain.LeaveRequest)
-	PublishLeaveApproved(ctx context.Context, correlationID string, r domain.LeaveRequest)
-	PublishLeaveRejected(ctx context.Context, correlationID string, r domain.LeaveRequest)
-	PublishBalanceUpdated(ctx context.Context, correlationID string, b domain.LeaveBalance)
+	PublishLeaveRequested(ctx context.Context, correlationID, legalEntityID, actorID string, r domain.LeaveRequest)
+	PublishLeaveApproved(ctx context.Context, correlationID, legalEntityID string, r domain.LeaveRequest)
+	PublishLeaveRejected(ctx context.Context, correlationID, legalEntityID string, r domain.LeaveRequest)
+	PublishBalanceUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, b domain.LeaveBalance)
 }
 
 type AuthZClient interface {
@@ -240,7 +240,7 @@ func (h *Handler) AccrueLeaveBalance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishBalanceUpdated(r.Context(), correlationID, *bal)
+	h.publisher.PublishBalanceUpdated(r.Context(), correlationID, legalEntityID, principalID, *bal)
 
 	writeJSON(w, http.StatusOK, bal)
 }
@@ -291,7 +291,7 @@ func (h *Handler) SubmitLeaveRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishLeaveRequested(r.Context(), correlationID, *lr)
+	h.publisher.PublishLeaveRequested(r.Context(), correlationID, legalEntityID, principalID, *lr)
 
 	writeJSON(w, http.StatusCreated, lr)
 }
@@ -419,9 +419,9 @@ func (h *Handler) handleLeaveReview(w http.ResponseWriter, r *http.Request, acti
 
 	correlationID := getCorrelationID(r)
 	if isApprove {
-		h.publisher.PublishLeaveApproved(r.Context(), correlationID, *lr)
+		h.publisher.PublishLeaveApproved(r.Context(), correlationID, legalEntityID, *lr)
 	} else {
-		h.publisher.PublishLeaveRejected(r.Context(), correlationID, *lr)
+		h.publisher.PublishLeaveRejected(r.Context(), correlationID, legalEntityID, *lr)
 	}
 
 	writeJSON(w, http.StatusOK, lr)
