@@ -157,13 +157,13 @@ type stubPublisher struct {
 	updated, bonusApproved, effectiveChanged int
 }
 
-func (p *stubPublisher) PublishCompensationUpdated(_ context.Context, _ string, _ domain.WageRevision) {
+func (p *stubPublisher) PublishCompensationUpdated(_ context.Context, _, _, _ string, _ domain.WageRevision) {
 	p.updated++
 }
-func (p *stubPublisher) PublishBonusApproved(_ context.Context, _ string, _ domain.BonusGrant) {
+func (p *stubPublisher) PublishBonusApproved(_ context.Context, _, _, _ string, _ domain.BonusGrant) {
 	p.bonusApproved++
 }
-func (p *stubPublisher) PublishEffectiveChanged(_ context.Context, _ string, _ domain.WageRevision) {
+func (p *stubPublisher) PublishEffectiveChanged(_ context.Context, _, _, _ string, _ domain.WageRevision) {
 	p.effectiveChanged++
 }
 
