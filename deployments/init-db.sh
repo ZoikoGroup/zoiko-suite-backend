@@ -1,483 +1,162 @@
 #!/bin/bash
-set -e
-
-# Create all 11 databases required by the services. configuration_feature_flag,
-# secret_vault_integration, and obligations were added alongside the
-# Observability Baseline retrofit (docs/architecture/observability-baseline-plan.md)
-# — those three services never had a compose entry or a database provisioned
-# here before, a pre-existing gap found and closed in the same pass.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
-    CREATE DATABASE audit_event_store;
-    CREATE DATABASE tenant_entity_registry;
-    CREATE DATABASE commercial_account;
-    CREATE DATABASE capability_registry;
-    CREATE DATABASE ai_governance;
-    CREATE DATABASE kill_switch_registry;
-    CREATE DATABASE retention_registry;
-    CREATE DATABASE metric_registry;
-    CREATE DATABASE source_authority;
-    CREATE DATABASE jurisdiction_rules;
-    CREATE DATABASE governance_decision_log;
-    CREATE DATABASE identity_context;
-    CREATE DATABASE policy;
-    CREATE DATABASE authorization_svc;
-    CREATE DATABASE workflow;
-    CREATE DATABASE configuration_feature_flag;
-    CREATE DATABASE secret_vault_integration;
-    CREATE DATABASE obligations;
-    CREATE DATABASE schema_registry;
-    CREATE DATABASE document_vault;
-    CREATE DATABASE evidence_manifest;
-    CREATE DATABASE workflow_history;
-    CREATE DATABASE general_ledger;
-    CREATE DATABASE accounts_payable;
-    CREATE DATABASE accounts_receivable;
-    CREATE DATABASE purchase_request;
-    CREATE DATABASE purchase_order;
-    CREATE DATABASE treasury;
-    CREATE DATABASE financial_close;
-    CREATE DATABASE bank_reconciliation;
-    CREATE DATABASE intercompany_accounting;
-    CREATE DATABASE consolidation_svc;
-    CREATE DATABASE invoice_approval;
-    CREATE DATABASE employee_master;
-    CREATE DATABASE employment_contracts;
-    CREATE DATABASE payroll_run;
-    CREATE DATABASE compensation;
-    CREATE DATABASE benefits;
-    CREATE DATABASE payroll_tax;
-    CREATE DATABASE payroll_exceptions;
-    CREATE DATABASE leave_absence;
-    CREATE DATABASE org_structure;
-    CREATE DATABASE offboarding_severance;
-    CREATE DATABASE workforce_compliance;
-    CREATE DATABASE spend_controls;
-    CREATE DATABASE vendor_due_diligence;
-    CREATE DATABASE notification;
-    CREATE DATABASE procurement_workflow;
-    CREATE DATABASE performance_review;
-    CREATE DATABASE delegated_authority;
-    CREATE DATABASE access_control;
-    CREATE DATABASE decision_support;
-EOSQL
-
-echo "Databases created successfully. Running migration scripts..."
-
-# Apply migrations for audit-event-store-svc
-echo "Applying migrations for audit_event_store..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "audit_event_store" -f /migrations/audit-event-store/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "audit_event_store" -f /migrations/audit-event-store/000002_add_hash_chain_fields.up.sql
-
-# Apply migrations for identity-context-svc
-echo "Applying migrations for identity_context..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "identity_context" -f /migrations/identity-context/000001_initial_schema.up.sql
-
-# Apply migrations for tenant-entity-registry-svc
-echo "Applying migrations for tenant_entity_registry..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000002_add_tenant_id_to_junction_tables.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000003_add_residency_region_to_policies.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000004_add_data_classification.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tenant_entity_registry" -f /migrations/tenant-entity-registry/000005_add_workspaces.up.sql
-# Apply migrations for commercial-account-svc
-echo "Applying migrations for commercial_account..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000002_add_plans_and_subscriptions.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000003_add_dunning_and_transfers.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "commercial_account" -f /migrations/commercial-account/000004_add_outbox_events.up.sql
-# Apply migrations for capability-registry-svc
-echo "Applying migrations for capability_registry..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "capability_registry" -f /migrations/capability-registry/000001_initial_schema.up.sql
-# Apply migrations for ai-governance-svc
-echo "Applying migrations for ai_governance..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "ai_governance" -f /migrations/ai-governance/000001_initial_schema.up.sql
-
-# Apply migrations for kill-switch-registry-svc
-echo "Applying migrations for kill_switch_registry..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "kill_switch_registry" -f /migrations/kill-switch-registry/000001_initial_schema.up.sql
-
-# Apply migrations for retention-registry-svc
-echo "Applying migrations for retention_registry..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "retention_registry" -f /migrations/retention-registry/000001_initial_schema.up.sql
-
-# Apply migrations for metric-registry-svc
-echo "Applying migrations for metric_registry..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "metric_registry" -f /migrations/metric-registry/000001_initial_schema.up.sql
-
-# Apply migrations for source-authority-svc
-echo "Applying migrations for source_authority..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "source_authority" -f /migrations/source-authority/000001_initial_schema.up.sql
-
-# Apply migrations for jurisdiction-rules-svc
-echo "Applying migrations for jurisdiction_rules..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000002_add_audit_columns.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000003_add_data_classification.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "jurisdiction_rules" -f /migrations/jurisdiction-rules/000004_add_rule_code_index.up.sql
-
-# Apply migrations for governance-decision-log-svc
-echo "Applying migrations for governance_decision_log..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000002_add_rls.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000003_enforce_immutability.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000004_add_event_linkage_keys.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "governance_decision_log" -f /migrations/governance-decision-log/000005_add_replay_manifests.up.sql
-# Apply migrations for policy-svc
-echo "Applying migrations for policy..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000002_add_activation_audit.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000003_add_explicit_scope_type.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "policy" -f /migrations/policy/000004_add_control_tests.up.sql
-
-# Apply migrations for authorization-svc
-echo "Applying migrations for authorization_svc..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc" -f /migrations/authorization/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc" -f /migrations/authorization/000002_add_sod_rule_tenant_scoping.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "authorization_svc" -f /migrations/authorization/000003_nullable_legal_entity_for_tenant_scope.up.sql
-
-# Apply migrations for workflow-svc
-echo "Applying migrations for workflow..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow" -f /migrations/workflow/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow" -f /migrations/workflow/000002_add_transition_linkage_keys.up.sql
-
-# Apply migrations for configuration-feature-flag-svc
-echo "Applying migrations for configuration_feature_flag..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "configuration_feature_flag" -f /migrations/configuration-feature-flag/000001_initial_schema.up.sql
-
-# Apply migrations for secret-vault-integration-svc
-echo "Applying migrations for secret_vault_integration..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integration" -f /migrations/secret-vault-integration/000001_initial_schema.up.sql
-# 000002 was never listed here. It adds secret_policies.data_classification,
-# which the store selects on every read -- so on a volume initialised from this
-# script alone the column did not exist and the service failed. It works on the
-# development machine only because the migration was applied by hand, the same
-# shape as schema-registry-svc's 000002 and bank-reconciliation-svc's 000003.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "secret_vault_integration" -f /migrations/secret-vault-integration/000002_add_data_classification.up.sql
-
-# Apply migrations for obligations-svc
-echo "Applying migrations for obligations..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000002_add_applicability_decisions.up.sql
-# Renumbered from 000002 to 000003 in the merge: main had independently taken
-# 000002 for applicability_decisions, and two migrations sharing a version is an
-# error to every migration runner that reads these files, even though init-db.sh
-# itself just runs psql in order.
 #
-# 000003 adds the tenant dimension this service shipped without — plus the
-# row-level security that depends on it, and the tenant-scoped dedup index that
-# stops one tenant's idempotent create from returning another tenant's
-# obligation. Not optional: the store selects and writes tenant_id on every
-# statement.
+# Postgres first-run initialization for the whole stack: one database per
+# service, then every migration that service has on disk.
 #
-# The two are independent — 000003 touches only obligations and
-# filing_requirements, and applicability_decisions needs nothing from it — so
-# the order here is the numbering's, not a dependency.
+# WHY THIS IS A LOOP AND NOT A LIST OF FILES.
 #
-# Worth knowing: applicability_decisions arrived without a tenant_id, so it is
-# NOT covered by the row-level security 000003 installs on its sibling tables,
-# and it is reachable only through an obligation_id that IS tenant-scoped.
-# Recorded in known-gaps rather than changed here — renumbering a merge is not
-# the place to redesign another branch's table.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligations" -f /migrations/obligations/000003_tenant_scoping_and_invariants.up.sql
+# This script used to name each migration explicitly -- 121 `psql -f` lines. A
+# migration was therefore applied only if somebody also remembered to edit this
+# file, and twelve had not been: every force_rls migration across the finance and
+# commercial-ops services, which is precisely the tenant isolation a fresh
+# environment most needs. Nothing failed; the databases simply came up without
+# them. Globbing the directory removes the class of defect rather than the twelve
+# instances of it.
+#
+# ORDERING. `sort` over the 000001_, 000002_ ... prefixes is the migration order,
+# and `LC_ALL=C` keeps that sort locale-independent. Only *.up.sql is applied;
+# the .down.sql files are the manual rollback path and are never run here.
+#
+# THIS RUNS ONLY ON AN EMPTY VOLUME. docker-entrypoint-initdb.d is skipped
+# entirely when PGDATA already exists, so adding a migration does NOT reach an
+# existing stack -- it has to be applied by hand there. That is a property of the
+# postgres image, not of this script, and it is why a migration added today may
+# be live in CI and absent locally.
+set -euo pipefail
 
-# Apply migrations for schema-registry-svc
-echo "Applying migrations for schema_registry..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000001_initial_schema.up.sql
-# 000002 was never listed here. Every SELECT this service makes names
-# compatibility_mode and owning_service, so on a volume initialised from this
-# script alone the column did not exist and every read and write failed. It
-# works on the development machine only because the migration was applied by
-# hand at some point -- the same shape as the SCHEMA_PUBLISH grant that existed
-# only in one developer's database.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000002_add_compatibility_mode.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "schema_registry" -f /migrations/schema-registry/000003_registry_invariants.up.sql
+DB_COUNT=0
+MIGRATION_COUNT=0
 
-# Apply migrations for document-vault-svc
-echo "Applying migrations for document_vault..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "document_vault" -f /migrations/document-vault/000001_initial_schema.up.sql
-# 000002 adds row-level security, which this service had NONE of -- not even the
-# ENABLE-without-FORCE that the rest of the estate had to be corrected for. It
-# also adds the invariants that stop the access log recording a reader as
-# 'unknown', which the handler used to substitute for an unidentified caller.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "document_vault" -f /migrations/document-vault/000002_force_rls_and_invariants.up.sql
+create_database() {
+    local db="$1"
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres \
+        -c "CREATE DATABASE $db"
+    DB_COUNT=$((DB_COUNT + 1))
+}
 
-# Apply migrations for evidence-manifest-svc
-echo "Applying migrations for evidence_manifest..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_manifest" -f /migrations/evidence-manifest/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_manifest" -f /migrations/evidence-manifest/000002_enforce_immutability.up.sql
+# apply_migrations applies every *.up.sql under /migrations/$dir to $db.
+#
+# A mounted directory with no *.up.sql, or a pair whose directory is not mounted
+# at all, is a FAILURE and not a quiet skip: both mean a service's schema was
+# never created, and the service will come up and answer 500 to every read. The
+# older form of that mistake took a whole day to find.
+apply_migrations() {
+    local db="$1" dir="$2" path="/migrations/$2" applied=0 f
 
-# Apply migrations for workflow-history-svc
-echo "Applying migrations for workflow_history..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000002_add_rls.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workflow_history" -f /migrations/workflow-history/000003_enforce_immutability.up.sql
+    if [ ! -d "$path" ]; then
+        echo "FATAL: $path is not mounted -- $db would have no schema" >&2
+        exit 1
+    fi
 
-# Apply migrations for general-ledger-svc
-echo "Applying migrations for general_ledger..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000002_add_idempotency_index.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "general_ledger" -f /migrations/general-ledger/000003_add_atomic_linking.up.sql
+    for f in $(LC_ALL=C ls "$path"/*.up.sql 2>/dev/null | LC_ALL=C sort); do
+        echo "    $db <- $(basename "$f")"
+        psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" -f "$f"
+        applied=$((applied + 1))
+    done
 
-# Apply migrations for accounts-payable-svc
-echo "Applying migrations for accounts_payable..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000002_add_idempotency_index.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_payable" -f /migrations/accounts-payable/000003_add_source_contract_id.up.sql
+    if [ "$applied" -eq 0 ]; then
+        echo "FATAL: $path is mounted but holds no *.up.sql -- $db would have no schema" >&2
+        exit 1
+    fi
+    MIGRATION_COUNT=$((MIGRATION_COUNT + applied))
+}
 
-# Apply migrations for accounts-receivable-svc
-echo "Applying migrations for accounts_receivable..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_receivable" -f /migrations/accounts-receivable/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "accounts_receivable" -f /migrations/accounts-receivable/000002_add_idempotency_index.up.sql
+# One entry per service: <database>:<directory under /migrations>. The two
+# spellings differ (underscores for the database, hyphens for the directory), and
+# both must match what docker-compose.yml mounts.
+SERVICES="
+audit_event_store:audit-event-store
+identity_context:identity-context
+tenant_entity_registry:tenant-entity-registry
+commercial_account:commercial-account
+capability_registry:capability-registry
+ai_governance:ai-governance
+kill_switch_registry:kill-switch-registry
+retention_registry:retention-registry
+metric_registry:metric-registry
+source_authority:source-authority
+jurisdiction_rules:jurisdiction-rules
+governance_decision_log:governance-decision-log
+policy:policy
+authorization_svc:authorization
+workflow:workflow
+configuration_feature_flag:configuration-feature-flag
+secret_vault_integration:secret-vault-integration
+obligations:obligations
+schema_registry:schema-registry
+document_vault:document-vault
+evidence_manifest:evidence-manifest
+workflow_history:workflow-history
+general_ledger:general-ledger
+accounts_payable:accounts-payable
+accounts_receivable:accounts-receivable
+purchase_request:purchase-request
+purchase_order:purchase-order
+spend_controls:spend-controls
+vendor_due_diligence:vendor-due-diligence
+notification:notification
+procurement_workflow:procurement-workflow
+performance_review:performance-review
+delegated_authority:delegated-authority
+access_control:access-control
+decision_support:decision-support
+treasury:treasury
+financial_close:financial-close
+bank_reconciliation:bank-reconciliation
+intercompany_accounting:intercompany-accounting
+consolidation_svc:consolidation
+invoice_approval:invoice-approval
+employee_master:employee-master
+employment_contracts:employment-contracts
+payroll_run:payroll-run
+compensation:compensation
+benefits:benefits
+payroll_tax:payroll-tax
+payroll_exceptions:payroll-exceptions
+leave_absence:leave-absence
+org_structure:org-structure
+offboarding_severance:offboarding-severance
+workforce_compliance:workforce-compliance
+contract_lifecycle:contract-lifecycle
+clause_template:clause-template
+obligation_tracking:obligation-tracking
+board_resolutions:board-resolutions
+corporate_actions:corporate-actions
+counterparty_management:counterparty-management
+tax_rules:tax-rules
+tax_determination:tax-determination
+vat_gst:vat-gst
+corporate_tax:corporate-tax
+evidence_requirements:evidence-requirements
+"
 
-# Apply migrations for purchase-request-svc
-echo "Applying migrations for purchase_request..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_request" -f /migrations/purchase-request/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_request" -f /migrations/purchase-request/000002_add_idempotency_index.up.sql
+echo "Creating databases..."
+for entry in $SERVICES; do
+    create_database "${entry%%:*}"
+done
+echo "Created $DB_COUNT databases."
 
-# Apply migrations for purchase-order-svc
-echo "Applying migrations for purchase_order..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "purchase_order" -f /migrations/purchase-order/000001_initial_schema.up.sql
+echo "Applying migrations..."
+for entry in $SERVICES; do
+    db="${entry%%:*}"
+    dir="${entry##*:}"
+    echo "  $db"
+    apply_migrations "$db" "$dir"
+done
 
-# Apply migrations for spend-controls-svc
-echo "Applying migrations for spend_controls..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "spend_controls" -f /migrations/spend-controls/000001_initial_schema.up.sql
+echo "All migrations applied: $MIGRATION_COUNT files across $DB_COUNT databases."
 
-# Apply migrations for vendor-due-diligence-svc
-echo "Applying migrations for vendor_due_diligence..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligence" -f /migrations/vendor-due-diligence/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vendor_due_diligence" -f /migrations/vendor-due-diligence/000002_screening_source.up.sql
-
-# Apply migrations for notification-svc
-echo "Applying migrations for notification..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "notification" -f /migrations/notification/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "notification" -f /migrations/notification/000002_force_rls_and_constraints.up.sql
-
-# Apply migrations for procurement-workflow-svc
-echo "Applying migrations for procurement_workflow..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "procurement_workflow" -f /migrations/procurement-workflow/000001_initial_schema.up.sql
-
-# Apply migrations for performance-review-svc
-echo "Applying migrations for performance_review..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "performance_review" -f /migrations/performance-review/000001_initial_schema.up.sql
-
-# Apply migrations for delegated-authority-svc
-echo "Applying migrations for delegated_authority..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "delegated_authority" -f /migrations/delegated-authority/000001_initial_schema.up.sql
-# 000002 FORCEs the row-level security 000001 only ENABLEd -- the policy it
-# wrote had never applied to a query, because the owner is exempt without
-# FORCE -- and adds the status/terminal-evidence invariants the domain
-# enforces in Go and nowhere else.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "delegated_authority" -f /migrations/delegated-authority/000002_force_rls_and_invariants.up.sql
-
-# Apply migrations for access-control-svc
-echo "Applying migrations for access_control..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "access_control" -f /migrations/access-control/000001_initial_schema.up.sql
-
-# Apply migrations for decision-support-svc
-echo "Applying migrations for decision_support..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "decision_support" -f /migrations/decision-support/000001_initial_schema.up.sql
-
-# Apply migrations for treasury-svc
-echo "Applying migrations for treasury..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "treasury" -f /migrations/treasury/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "treasury" -f /migrations/treasury/000002_add_idempotency_index.up.sql
-
-# Apply migrations for financial-close-svc
-echo "Applying migrations for financial_close..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "financial_close" -f /migrations/financial-close/000001_initial_schema.up.sql
-
-# Apply migrations for bank-reconciliation-svc
-echo "Applying migrations for bank_reconciliation..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliation" -f /migrations/bank-reconciliation/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliation" -f /migrations/bank-reconciliation/000002_add_idempotency_index.up.sql
-# 000003 was never listed here, and it is not cosmetic: gl_cash_account_code is
-# what lets a match verify DIRECTION. Without it, matching compares magnitudes,
-# so a statement line of -500.00 reconciles cleanly against a journal that moved
-# 500.00 the other way. On a fresh volume the column is absent entirely.
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "bank_reconciliation" -f /migrations/bank-reconciliation/000003_add_gl_cash_account_code.up.sql
-
-# Apply migrations for intercompany-accounting-svc
-echo "Applying migrations for intercompany_accounting..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "intercompany_accounting" -f /migrations/intercompany-accounting/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "intercompany_accounting" -f /migrations/intercompany-accounting/000002_add_idempotency_index.up.sql
-
-# Apply migrations for consolidation-svc
-echo "Applying migrations for consolidation..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "consolidation_svc" -f /migrations/consolidation/000001_initial_schema.up.sql
-
-# Apply migrations for invoice-approval-svc
-echo "Applying migrations for invoice_approval..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "invoice_approval" -f /migrations/invoice-approval/000001_initial_schema.up.sql
-
-# Apply migrations for employee-master-svc
-echo "Applying migrations for employee_master..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employee_master" -f /migrations/employee-master/000001_initial_schema.up.sql
-
-# Apply migrations for employment-contracts-svc
-echo "Applying migrations for employment_contracts..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contracts" -f /migrations/employment-contracts/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "employment_contracts" -f /migrations/employment-contracts/000002_add_idempotency.up.sql
-
-# Apply migrations for payroll-run-svc
-echo "Applying migrations for payroll_run..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000002_add_idempotency_index.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_run" -f /migrations/payroll-run/000003_add_finalization_linkage.up.sql
-
-# Apply migrations for compensation-svc
-echo "Applying migrations for compensation..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "compensation" -f /migrations/compensation/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "compensation" -f /migrations/compensation/000002_fix_race_and_idempotency.up.sql
-
-# Apply migrations for benefits-svc
-echo "Applying migrations for benefits..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "benefits" -f /migrations/benefits/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "benefits" -f /migrations/benefits/000002_fix_lookup_and_idempotency.up.sql
-
-# Apply migrations for payroll-tax-svc
-echo "Applying migrations for payroll_tax..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_tax" -f /migrations/payroll-tax/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_tax" -f /migrations/payroll-tax/000002_add_idempotency.up.sql
-
-# Apply migrations for payroll-exceptions-svc
-echo "Applying migrations for payroll_exceptions..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_exceptions" -f /migrations/payroll-exceptions/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "payroll_exceptions" -f /migrations/payroll-exceptions/000002_add_idempotency.up.sql
-
-# Apply migrations for leave-absence-svc
-echo "Applying migrations for leave_absence..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f /migrations/leave-absence/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "leave_absence" -f /migrations/leave-absence/000002_fix_race_and_idempotency.up.sql
-
-# Apply migrations for org-structure-svc
-echo "Applying migrations for org_structure..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f /migrations/org-structure/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "org_structure" -f /migrations/org-structure/000002_add_idempotency.up.sql
-
-# Apply migrations for offboarding-severance-svc
-echo "Applying migrations for offboarding_severance..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severance" -f /migrations/offboarding-severance/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "offboarding_severance" -f /migrations/offboarding-severance/000002_fix_tenant_isolation_and_idempotency.up.sql
-
-# Apply migrations for workforce-compliance-svc
-echo "Applying migrations for workforce_compliance..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "workforce_compliance" -f /migrations/workforce-compliance/000002_fix_tenant_isolation_and_idempotency.up.sql
-
-
-# ── Phase 5 ─────────────────────────────────────────────────────────────────
-
-# Create database for contract-lifecycle-svc
-echo "Creating database: contract_lifecycle..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE contract_lifecycle;
-EOSQL
-
-# Apply migrations for contract-lifecycle-svc
-echo "Applying migrations for contract_lifecycle..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "contract_lifecycle" -f /migrations/contract-lifecycle/000001_initial_schema.up.sql
-
-# Create database for clause-template-svc
-echo "Creating database: clause_template..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE clause_template;
-EOSQL
-
-# Apply migrations for clause-template-svc
-echo "Applying migrations for clause_template..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "clause_template" -f /migrations/clause-template/000001_initial_schema.up.sql
-
-# Create database for obligation-tracking-svc
-echo "Creating database: obligation_tracking..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE obligation_tracking;
-EOSQL
-
-# Apply migrations for obligation-tracking-svc
-echo "Applying migrations for obligation_tracking..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "obligation_tracking" -f /migrations/obligation-tracking/000001_initial_schema.up.sql
-
-# Create database for board-resolutions-svc
-echo "Creating database: board_resolutions..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE board_resolutions;
-EOSQL
-
-# Apply migrations for board-resolutions-svc
-echo "Applying migrations for board_resolutions..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "board_resolutions" -f /migrations/board-resolutions/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "board_resolutions" -f /migrations/board-resolutions/000002_force_rls_and_constraints.up.sql
-
-# Create database for corporate-actions-svc
-echo "Creating database: corporate_actions..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE corporate_actions;
-EOSQL
-
-# Apply migrations for corporate-actions-svc
-echo "Applying migrations for corporate_actions..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_actions" -f /migrations/corporate-actions/000001_initial_schema.up.sql
-
-# Create database for counterparty-management-svc
-echo "Creating database: counterparty_management..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE counterparty_management;
-EOSQL
-
-# Apply migrations for counterparty-management-svc
-echo "Applying migrations for counterparty_management..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "counterparty_management" -f /migrations/counterparty-management/000001_initial_schema.up.sql
-
-# Create database for tax-rules-svc
-echo "Creating database: tax_rules..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE tax_rules;
-EOSQL
-
-# Apply migrations for tax-rules-svc
-echo "Applying migrations for tax_rules..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_rules" -f /migrations/tax-rules/000001_initial_schema.up.sql
-
-# Create database for tax-determination-svc
-echo "Creating database: tax_determination..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE tax_determination;
-EOSQL
-
-# Apply migrations for tax-determination-svc
-echo "Applying migrations for tax_determination..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_determination" -f /migrations/tax-determination/000001_initial_schema.up.sql
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "tax_determination" -f /migrations/tax-determination/000002_add_tax_logic_snapshot.up.sql
-
-# Create database for vat-gst-svc
-echo "Creating database: vat_gst..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE vat_gst;
-EOSQL
-
-# Apply migrations for vat-gst-svc
-echo "Applying migrations for vat_gst..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "vat_gst" -f /migrations/vat-gst/000001_initial_schema.up.sql
-
-# Create database for corporate-tax-svc
-echo "Creating database: corporate_tax..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE corporate_tax;
-EOSQL
-
-# Apply migrations for corporate-tax-svc
-echo "Applying migrations for corporate_tax..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "corporate_tax" -f /migrations/corporate-tax/000001_initial_schema.up.sql
-
-# Create database for evidence-requirements-svc — the seventh and final
-# Governance Platform service (03-microservices.md §5.1, §8.6).
-echo "Creating database: evidence_requirements..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
-    CREATE DATABASE evidence_requirements;
-EOSQL
-
-# Apply migrations for evidence-requirements-svc
-echo "Applying migrations for evidence_requirements..."
-psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "evidence_requirements" -f /migrations/evidence-requirements/000001_initial_schema.up.sql
-
-echo "All migrations applied successfully."
+# Application roles, AFTER migrations: the grants cover the tables that now
+# exist, plus ALTER DEFAULT PRIVILEGES for the ones later migrations add. Run
+# last for that reason.
+#
+# Absent rather than fatal if unmounted: an older compose file that has not
+# added the mount should still bring a stack up, just without the roles (and
+# therefore with the policies still inert, as they were before).
+if [ -f /scripts/create-app-roles.sh ]; then
+    echo "Provisioning application roles..."
+    bash /scripts/create-app-roles.sh
+else
+    echo "NOTE: /scripts/create-app-roles.sh not mounted -- services will keep"
+    echo "      connecting as the superuser, and the RLS policies stay inert."
+fi
