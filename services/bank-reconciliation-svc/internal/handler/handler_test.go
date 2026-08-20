@@ -137,7 +137,7 @@ type stubPublisher struct {
 	ingested, matched, exceptionRaised, completed int
 }
 
-func (p *stubPublisher) PublishStatementIngested(_ context.Context, _ domain.StatementLine) {
+func (p *stubPublisher) PublishStatementIngested(_ context.Context, _ domain.StatementLine, _ string) {
 	p.ingested++
 }
 func (p *stubPublisher) PublishReconciliationMatched(_ context.Context, _ domain.StatementLine) {
@@ -146,7 +146,7 @@ func (p *stubPublisher) PublishReconciliationMatched(_ context.Context, _ domain
 func (p *stubPublisher) PublishReconciliationExceptionRaised(_ context.Context, _ domain.StatementLine) {
 	p.exceptionRaised++
 }
-func (p *stubPublisher) PublishReconciliationCompleted(_ context.Context, _, _, _, _ string) {
+func (p *stubPublisher) PublishReconciliationCompleted(_ context.Context, _, _, _, _, _ string) {
 	p.completed++
 }
 
