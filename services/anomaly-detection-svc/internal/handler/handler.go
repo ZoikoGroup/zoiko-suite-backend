@@ -94,7 +94,11 @@ func (h *Handler) Detect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "anomaly.detected", rec.AnomalyID, tenantID, rec)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "anomaly.detected", SubjectID: rec.AnomalyID, TenantID: tenantID,
+		LegalEntityID: rec.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rec,
+	})
 	writeJSON(w, http.StatusCreated, rec)
 }
 
@@ -179,7 +183,11 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	if rec.Status == domain.StatusResolved {
 		eventType = "anomaly.resolved"
 	}
-	_ = h.publisher.Publish(r.Context(), eventType, id, tenantID, rec)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: eventType, SubjectID: id, TenantID: tenantID,
+		LegalEntityID: rec.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rec,
+	})
 	writeJSON(w, http.StatusOK, rec)
 }
 

@@ -7,8 +7,8 @@ import (
 )
 
 var (
-	ErrAnomalyRecordNotFound = errors.New("anomaly record not found")
-	ErrAnomalyRuleNotFound   = errors.New("anomaly rule not found")
+	ErrAnomalyRecordNotFound   = errors.New("anomaly record not found")
+	ErrAnomalyRuleNotFound     = errors.New("anomaly rule not found")
 	ErrInvalidStatusTransition = errors.New("invalid status transition")
 )
 
