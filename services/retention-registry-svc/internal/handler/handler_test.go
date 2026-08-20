@@ -122,7 +122,7 @@ func (s *stubStore) Resolve(ctx context.Context, recordClass string, jurisdictio
 
 type stubPublisher struct{ calls int }
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error {
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
 	p.calls++
 	return nil
 }
