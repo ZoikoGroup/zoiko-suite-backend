@@ -124,9 +124,9 @@ const (
 type JurisdictionAssignmentType string
 
 const (
-	JurisdictionAssignmentPrimary  JurisdictionAssignmentType = "PRIMARY"
-	JurisdictionAssignmentSecondary JurisdictionAssignmentType = "SECONDARY"
-	JurisdictionAssignmentTaxOnly  JurisdictionAssignmentType = "TAX_ONLY"
+	JurisdictionAssignmentPrimary    JurisdictionAssignmentType = "PRIMARY"
+	JurisdictionAssignmentSecondary  JurisdictionAssignmentType = "SECONDARY"
+	JurisdictionAssignmentTaxOnly    JurisdictionAssignmentType = "TAX_ONLY"
 	JurisdictionAssignmentFilingOnly JurisdictionAssignmentType = "FILING_ONLY"
 )
 
@@ -134,9 +134,9 @@ const (
 type ResidencyMode string
 
 const (
-	ResidencyModeStrictRegion   ResidencyMode = "STRICT_REGION"
+	ResidencyModeStrictRegion    ResidencyMode = "STRICT_REGION"
 	ResidencyModePreferredRegion ResidencyMode = "PREFERRED_REGION"
-	ResidencyModeFollowEntity   ResidencyMode = "FOLLOW_ENTITY"
+	ResidencyModeFollowEntity    ResidencyMode = "FOLLOW_ENTITY"
 )
 
 // ConflictResolutionMode controls behavior when residency and jurisdiction obligations conflict.

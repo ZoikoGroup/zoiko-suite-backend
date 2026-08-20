@@ -147,7 +147,6 @@ func TestPgStore_CreateEntity_And_GetEntityByID(t *testing.T) {
 		t.Errorf("expected entity_code ACME-US, got %q", got.EntityCode)
 	}
 } // TestPgStore_RLS_TenantIsolation tests RLS tenant isolation using ListEntitiesByTenant.
-//
 // NOTE: This test originally passed even before the superuser bypass was fixed
 // because ListEntitiesByTenant happened to have an explicit 'WHERE tenant_id = $1'
 // filter in its SQL query. It did NOT catch leaks in methods that were missing

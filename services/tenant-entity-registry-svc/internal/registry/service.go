@@ -313,17 +313,17 @@ func (s *Service) CreateWorkspace(
 	}
 
 	w := &domain.Workspace{
-		WorkspaceID:            newID(),
-		TenantID:               req.TenantID,
-		LegalEntityID:          nullableString(req.LegalEntityID),
-		Name:                   req.Name,
-		BusinessUnit:           nullableString(req.BusinessUnit),
+		WorkspaceID:           newID(),
+		TenantID:              req.TenantID,
+		LegalEntityID:         nullableString(req.LegalEntityID),
+		Name:                  req.Name,
+		BusinessUnit:          nullableString(req.BusinessUnit),
 		BillingClassification: classification,
-		BillingSource:          billingSource,
-		CommercialAccountID:    nullableString(req.CommercialAccountID),
-		Status:                 domain.WorkspaceStatusActive,
-		CreatedAt:              time.Now().UTC(),
-		CreatedByPrincipalID:   domain.PrincipalFromContext(ctx),
+		BillingSource:         billingSource,
+		CommercialAccountID:   nullableString(req.CommercialAccountID),
+		Status:                domain.WorkspaceStatusActive,
+		CreatedAt:             time.Now().UTC(),
+		CreatedByPrincipalID:  domain.PrincipalFromContext(ctx),
 	}
 
 	if err := s.store.CreateWorkspace(ctx, w); err != nil {
@@ -500,6 +500,7 @@ func (s *Service) TransitionEntityStatus(
 		ctx,
 		tenantID,
 		legalEntityID,
+		domain.PrincipalFromContext(ctx),
 		domain.EntityStatus(""), // previous state not known without a read — omit
 		req.NewStatus,
 		req.CorrelationID,
