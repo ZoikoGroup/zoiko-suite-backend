@@ -30,9 +30,9 @@ type Store interface {
 
 // Publisher defines Kafka event publication contract.
 type Publisher interface {
-	PublishCashPositionUpdated(ctx context.Context, correlationID string, balance domain.CashBalance)
-	PublishEffectiveCashUpdated(ctx context.Context, correlationID string, resp domain.EffectiveCashResponse)
-	PublishLiquidityThresholdBreached(ctx context.Context, correlationID string, resp domain.EffectiveCashResponse)
+	PublishCashPositionUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, balance domain.CashBalance)
+	PublishEffectiveCashUpdated(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
+	PublishLiquidityThresholdBreached(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
 }
 
 // AuthZClient defines authorization plane contract.
@@ -49,10 +49,10 @@ type Clients interface {
 }
 
 const (
-	actionRegisterAccount = "TREASURY_ACCOUNT_REGISTER"
-	actionSetThreshold    = "TREASURY_THRESHOLD_SET"
+	actionRegisterAccount  = "TREASURY_ACCOUNT_REGISTER"
+	actionSetThreshold     = "TREASURY_THRESHOLD_SET"
 	actionInitiateTransfer = "TREASURY_TRANSFER_INITIATE"
-	actionViewPositions   = "TREASURY_POSITIONS_VIEW"
+	actionViewPositions    = "TREASURY_POSITIONS_VIEW"
 )
 
 type Handler struct {
@@ -337,10 +337,10 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if details != nil && details.IsBreached {
-		h.publisher.PublishLiquidityThresholdBreached(r.Context(), r.Header.Get("X-Correlation-ID"), resp)
+		h.publisher.PublishLiquidityThresholdBreached(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, resp)
 	}
 
-	h.publisher.PublishEffectiveCashUpdated(r.Context(), r.Header.Get("X-Correlation-ID"), resp)
+	h.publisher.PublishEffectiveCashUpdated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, resp)
 
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -443,10 +443,10 @@ func (h *Handler) InitiateTransfer(w http.ResponseWriter, r *http.Request) {
 
 	// Publish updated balances
 	if balSrc, err := h.store.GetLatestCashBalance(r.Context(), req.SourceBankAccountID); err == nil && balSrc != nil {
-		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, *balSrc)
+		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, srcAcct.LegalEntityID, principalID, *balSrc)
 	}
 	if balTgt, err := h.store.GetLatestCashBalance(r.Context(), req.TargetBankAccountID); err == nil && balTgt != nil {
-		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, *balTgt)
+		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, tgtAcct.LegalEntityID, principalID, *balTgt)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "transferred", "correlation_id": correlationID})
