@@ -70,7 +70,7 @@ func (s *stubStore) UpdateComplianceStatus(_ context.Context, id, complianceStat
 
 type stubPublisher struct{}
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error {
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
 	return nil
 }
 
