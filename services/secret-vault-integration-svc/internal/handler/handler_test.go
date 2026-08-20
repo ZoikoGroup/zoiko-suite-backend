@@ -162,7 +162,7 @@ func (p *stubPublisher) PublishAccessGranted(_ context.Context, _ domain.SecretL
 	p.grantedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishRotationCompleted(_ context.Context, _, _ string, _ int, _ string) error {
+func (p *stubPublisher) PublishRotationCompleted(_ context.Context, _, _, _ string, _ int, _ string) error {
 	p.rotationCalls++
 	return nil
 }
