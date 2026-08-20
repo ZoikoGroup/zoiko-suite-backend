@@ -16,19 +16,21 @@ import (
 // risk signal store.
 //
 // ARCHITECTURE INVARIANT (Q3 resolution — do not violate):
-//   This type exposes only reads. Resolve() reads from Redis here.
-//   Signals are written by a SEPARATE async consumer that subscribes
-//   to Kafka topics from a rules-based risk engine. That consumer is
-//   not part of the HTTP request lifecycle and may NOT be called
-//   synchronously from Resolve().
 //
-//   If the cache returns nil (empty or expired), the resolver defaults
-//   to STANDARD posture and emits session.risk.changed with
-//   signal_source: UNAVAILABLE. It never blocks or calls out.
+//	This type exposes only reads. Resolve() reads from Redis here.
+//	Signals are written by a SEPARATE async consumer that subscribes
+//	to Kafka topics from a rules-based risk engine. That consumer is
+//	not part of the HTTP request lifecycle and may NOT be called
+//	synchronously from Resolve().
+//
+//	If the cache returns nil (empty or expired), the resolver defaults
+//	to STANDARD posture and emits session.risk.changed with
+//	signal_source: UNAVAILABLE. It never blocks or calls out.
 //
 // Key schema:
-//   risk:composite:<principal_id>           → latest aggregated signal (TTL = signal.valid_to)
-//   risk:signal:<principal_id>:<signal_id>  → historical signal record (TTL = 24h)
+//
+//	risk:composite:<principal_id>           → latest aggregated signal (TTL = signal.valid_to)
+//	risk:signal:<principal_id>:<signal_id>  → historical signal record (TTL = 24h)
 type RiskSignalCache struct {
 	rdb *redis.Client
 }

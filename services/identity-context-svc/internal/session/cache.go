@@ -16,8 +16,9 @@ import (
 // Cache manages the Redis-backed session envelope store.
 //
 // Storage model:
-//   session:jwt:<session_context_id>  → signed envelope JWT (TTL = session TTL)
-//   session:ctx:<session_context_id>  → full SessionContext JSON (KEEPTTL on invalidation)
+//
+//	session:jwt:<session_context_id>  → signed envelope JWT (TTL = session TTL)
+//	session:ctx:<session_context_id>  → full SessionContext JSON (KEEPTTL on invalidation)
 //
 // Evidence obligation: SessionContext records are NEVER deleted.
 // Invalidation appends invalidated_at; the record persists for the duration

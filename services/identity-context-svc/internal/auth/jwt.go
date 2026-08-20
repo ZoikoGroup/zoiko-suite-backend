@@ -2,12 +2,12 @@
 package auth
 
 import (
-	"crypto/rsa"
-	"os"
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/golang-jwt/jwt/v5"
 
@@ -77,7 +77,7 @@ func (v *JWTVerifier) VerifyBearer(_ context.Context, token string) (*domain.Ver
 //	The public key must be published to a JWKS endpoint so downstream
 //	services can verify envelopes independently.
 type JWTSigner struct {
-	cfg *config.Config
+	cfg        *config.Config
 	privateKey *rsa.PrivateKey
 }
 
@@ -86,7 +86,7 @@ func NewJWTSigner(cfg *config.Config) (*JWTSigner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read private key: %w", err)
 	}
-	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(keyBytes) 
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(keyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
 	}

@@ -5,12 +5,13 @@ package domain
 // TrustPosture is the session-level trust state attested at resolution time.
 //
 // ARCHITECTURAL NOTE (Q4 resolution):
-//   This is a POINT-IN-TIME attestation produced by identity-context-svc.
-//   The Authorization Service decides whether a given posture is SUFFICIENT
-//   for a requested action and may return STEP_UP_REQUIRED. The client then
-//   triggers a fresh Resolve() after re-authentication, producing a new
-//   SessionContext with an elevated posture. No callback path into this
-//   service is required or permitted.
+//
+//	This is a POINT-IN-TIME attestation produced by identity-context-svc.
+//	The Authorization Service decides whether a given posture is SUFFICIENT
+//	for a requested action and may return STEP_UP_REQUIRED. The client then
+//	triggers a fresh Resolve() after re-authentication, producing a new
+//	SessionContext with an elevated posture. No callback path into this
+//	service is required or permitted.
 type TrustPosture string
 
 const (

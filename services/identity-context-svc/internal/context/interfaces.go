@@ -37,9 +37,10 @@ type SessionCache interface {
 // risk signals.
 //
 // ARCHITECTURAL INVARIANT (Q3 resolution):
-//   Resolve() must never call the Intelligence Plane or any Tier 2/3 service
-//   synchronously. Risk scores arrive via an async consumer that writes into
-//   Redis. This interface only exposes reads — writes are on a separate path.
+//
+//	Resolve() must never call the Intelligence Plane or any Tier 2/3 service
+//	synchronously. Risk scores arrive via an async consumer that writes into
+//	Redis. This interface only exposes reads — writes are on a separate path.
 type RiskSignalCache interface {
 	GetLatestSignal(ctx context.Context, principalID string) (*domain.RiskSignalCache, error)
 }
