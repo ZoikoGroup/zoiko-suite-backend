@@ -35,8 +35,8 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishThresholdBreached(ctx context.Context, correlationID string, check domain.SpendCheckRequest, policy domain.SpendPolicy, projected float64)
-	PublishBlockApplied(ctx context.Context, correlationID string, check domain.SpendCheckRequest, policy domain.SpendPolicy)
+	PublishThresholdBreached(ctx context.Context, correlationID, actorID string, check domain.SpendCheckRequest, policy domain.SpendPolicy, projected float64)
+	PublishBlockApplied(ctx context.Context, correlationID, actorID string, check domain.SpendCheckRequest, policy domain.SpendPolicy)
 }
 
 type AuthZClient interface {
@@ -373,8 +373,8 @@ func (h *Handler) SubmitCheck(w http.ResponseWriter, r *http.Request) {
 	// the caller merely retried the first one.
 	if decision.Outcome == "BLOCKED" && !decision.Replayed && decision.Policy != nil {
 		correlationID := getCorrelationID(r)
-		h.publisher.PublishThresholdBreached(r.Context(), correlationID, req, *decision.Policy, decision.ProjectedTotal)
-		h.publisher.PublishBlockApplied(r.Context(), correlationID, req, *decision.Policy)
+		h.publisher.PublishThresholdBreached(r.Context(), correlationID, principalID, req, *decision.Policy, decision.ProjectedTotal)
+		h.publisher.PublishBlockApplied(r.Context(), correlationID, principalID, req, *decision.Policy)
 	}
 
 	resp := domain.SpendCheckResponse{
