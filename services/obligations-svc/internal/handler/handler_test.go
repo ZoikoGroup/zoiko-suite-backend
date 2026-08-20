@@ -118,17 +118,17 @@ func (p *stubPublisher) PublishObligationCreated(_ context.Context, _ domain.Obl
 	return nil
 }
 
-func (p *stubPublisher) PublishObligationUpdated(_ context.Context, _ domain.Obligation, _ string) error {
+func (p *stubPublisher) PublishObligationUpdated(_ context.Context, _ domain.Obligation, _, _ string) error {
 	p.updatedCalls++
 	return nil
 }
 
-func (p *stubPublisher) PublishObligationOverdue(_ context.Context, _ domain.Obligation, _ string) error {
+func (p *stubPublisher) PublishObligationOverdue(_ context.Context, _ domain.Obligation, _, _ string) error {
 	p.overdueCalls++
 	return nil
 }
 
-func (p *stubPublisher) PublishObligationClosed(_ context.Context, _ domain.Obligation, _ string) error {
+func (p *stubPublisher) PublishObligationClosed(_ context.Context, _ domain.Obligation, _, _ string) error {
 	p.closedCalls++
 	return nil
 }
