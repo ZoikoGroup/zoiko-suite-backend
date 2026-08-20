@@ -30,13 +30,13 @@ var ValidRequestTransitions = map[RequestStatus][]RequestStatus{
 // Entity-bound (LegalEntityID), never hard-deleted.
 type PurchaseRequest struct {
 	RequestID              string        `json:"request_id"`
-	TenantID                string        `json:"tenant_id"`
-	LegalEntityID           string        `json:"legal_entity_id"`
-	RequestedByPrincipalID  string        `json:"requested_by_principal_id"`
-	Description             string        `json:"description"`
-	Amount                  float64       `json:"amount"`
-	CurrencyCode            string        `json:"currency_code"`
-	Status                  RequestStatus `json:"status"`
+	TenantID               string        `json:"tenant_id"`
+	LegalEntityID          string        `json:"legal_entity_id"`
+	RequestedByPrincipalID string        `json:"requested_by_principal_id"`
+	Description            string        `json:"description"`
+	Amount                 float64       `json:"amount"`
+	CurrencyCode           string        `json:"currency_code"`
+	Status                 RequestStatus `json:"status"`
 
 	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
 	RejectedByPrincipalID *string    `json:"rejected_by_principal_id,omitempty"`

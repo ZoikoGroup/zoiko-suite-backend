@@ -87,9 +87,15 @@ type stubPublisher struct {
 	created, approved, rejected int
 }
 
-func (p *stubPublisher) PublishRequestCreated(_ context.Context, _ domain.PurchaseRequest)  { p.created++ }
-func (p *stubPublisher) PublishRequestApproved(_ context.Context, _ domain.PurchaseRequest) { p.approved++ }
-func (p *stubPublisher) PublishRequestRejected(_ context.Context, _ domain.PurchaseRequest) { p.rejected++ }
+func (p *stubPublisher) PublishRequestCreated(_ context.Context, _ domain.PurchaseRequest) {
+	p.created++
+}
+func (p *stubPublisher) PublishRequestApproved(_ context.Context, _ domain.PurchaseRequest) {
+	p.approved++
+}
+func (p *stubPublisher) PublishRequestRejected(_ context.Context, _ domain.PurchaseRequest) {
+	p.rejected++
+}
 
 type stubAuthZ struct {
 	err error
