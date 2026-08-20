@@ -78,7 +78,11 @@ func (h *Handler) CreateSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "external.feed.subscribed", sub.FeedID, tenantID, sub)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "external.feed.subscribed", AggregateID: sub.FeedID, TenantID: tenantID,
+		LegalEntityID: sub.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: sub,
+	})
 	writeJSON(w, http.StatusCreated, sub)
 }
 
@@ -152,7 +156,11 @@ func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "external.feed.event.ingested", ev.EventID, tenantID, ev)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "external.feed.event.ingested", AggregateID: ev.EventID, TenantID: tenantID,
+		LegalEntityID: sub.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ev,
+	})
 	writeJSON(w, http.StatusCreated, ev)
 }
 
