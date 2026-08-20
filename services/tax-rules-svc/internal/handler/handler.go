@@ -76,7 +76,7 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 		RuleCode:           req.RuleCode,
 		Name:               req.Name,
 		Category:           req.Category,
-		TaxRatePercentage: req.TaxRatePercentage,
+		TaxRatePercentage:  req.TaxRatePercentage,
 		StandardDeductions: req.StandardDeductions,
 		ExemptionsJSON:     req.ExemptionsJSON,
 		EffectiveFrom:      req.EffectiveFrom,
@@ -90,7 +90,11 @@ func (h *Handler) CreateTaxRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "tax_rule.created", rule.RuleID, tenantID, rule)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "tax_rule.created", RuleID: rule.RuleID, TenantID: tenantID,
+		Jurisdiction: rule.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: rule,
+	})
 	writeJSON(w, http.StatusCreated, rule)
 }
 
@@ -184,7 +188,11 @@ func (h *Handler) UpdateTaxRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "tax_rule.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "tax_rule.updated", RuleID: id, TenantID: tenantID,
+		Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
