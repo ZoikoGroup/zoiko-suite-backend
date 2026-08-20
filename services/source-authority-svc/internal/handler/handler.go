@@ -121,7 +121,10 @@ func (h *Handler) CreateSourceAuthorityMap(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "source_authority_map.created", m.SourceAuthorityMapID, "", m)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "source_authority_map.created", EntityID: m.SourceAuthorityMapID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: m,
+	})
 	writeJSON(w, http.StatusCreated, m)
 }
 
@@ -207,7 +210,10 @@ func (h *Handler) RecordFact(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "normalized_fact.recorded", f.NormalizedFactID, "", f)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "normalized_fact.recorded", EntityID: f.NormalizedFactID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
+	})
 	writeJSON(w, http.StatusCreated, f)
 }
 
