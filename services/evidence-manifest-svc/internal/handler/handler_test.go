@@ -120,7 +120,7 @@ type stubPublisher struct {
 	err       error
 }
 
-func (p *stubPublisher) PublishManifestGenerated(_ context.Context, m *domain.EvidenceManifest) error {
+func (p *stubPublisher) PublishManifestGenerated(_ context.Context, m *domain.EvidenceManifest, _ string) error {
 	if p.err != nil {
 		return p.err
 	}
