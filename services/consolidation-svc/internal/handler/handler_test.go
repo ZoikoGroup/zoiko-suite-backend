@@ -89,13 +89,13 @@ type stubPublisher struct {
 	started, completed, exceptions int
 }
 
-func (p *stubPublisher) PublishRunStarted(_ context.Context, _ string, _ domain.ConsolidationRun) {
+func (p *stubPublisher) PublishRunStarted(_ context.Context, _, _ string, _ domain.ConsolidationRun) {
 	p.started++
 }
-func (p *stubPublisher) PublishCompleted(_ context.Context, _ string, _ domain.ConsolidationRun, _ int) {
+func (p *stubPublisher) PublishCompleted(_ context.Context, _, _ string, _ domain.ConsolidationRun, _ int) {
 	p.completed++
 }
-func (p *stubPublisher) PublishExceptionDetected(_ context.Context, _ string, _ domain.ConsolidationRun, _ []string) {
+func (p *stubPublisher) PublishExceptionDetected(_ context.Context, _, _ string, _ domain.ConsolidationRun, _ []string) {
 	p.exceptions++
 }
 
@@ -159,10 +159,10 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 func TestStartRun_MissingPrincipal(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
-		"group_legal_entity_id": "le-group",
+		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
-		"fiscal_period":         "2024-Q1",
-		"target_currency":       "USD",
+		"fiscal_period":          "2024-Q1",
+		"target_currency":        "USD",
 	}, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 got %d", rr.Code)
@@ -172,10 +172,10 @@ func TestStartRun_MissingPrincipal(t *testing.T) {
 func TestStartRun_AuthzDenied(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied}, &stubClients{})
 	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
-		"group_legal_entity_id": "le-group",
+		"group_legal_entity_id":  "le-group",
 		"child_legal_entity_ids": []string{"le-us", "le-uk"},
-		"fiscal_period":         "2024-Q1",
-		"target_currency":       "USD",
+		"fiscal_period":          "2024-Q1",
+		"target_currency":        "USD",
 	}, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d", rr.Code)
