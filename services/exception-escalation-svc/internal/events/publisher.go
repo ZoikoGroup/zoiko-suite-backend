@@ -1,3 +1,4 @@
+// Package events contains the domain event publisher for this service.
 package events
 
 import (
@@ -10,25 +11,55 @@ import (
 	"go.uber.org/zap"
 )
 
-// Event is the canonical fact emitted by exception-escalation-svc.
-// Events are facts, not commands — append-only, never mutating source truth.
+// Event is this platform's event contract (Doc 03 §19): every published
+// event must carry event name, event version, timestamp, tenant ID, legal
+// entity ID, jurisdiction context, actor ID, correlation ID, source
+// service, and payload schema version. domain.ExceptionCase carries real
+// LegalEntityID and JurisdictionID fields.
 type Event struct {
 	EventID         string      `json:"event_id"`
 	EventType       string      `json:"event_type"`
+	EventVersion    string      `json:"event_version"`
+	SchemaVersion   string      `json:"schema_version"`
+	SourceService   string      `json:"source_service"`
 	ExceptionCaseID string      `json:"exception_case_id"`
 	TenantID        string      `json:"tenant_id"`
+	LegalEntityID   string      `json:"legal_entity_id,omitempty"`
+	Jurisdiction    string      `json:"jurisdiction,omitempty"`
+	ActorID         string      `json:"actor_id,omitempty"`
+	CorrelationID   string      `json:"correlation_id,omitempty"`
 	OccurredAt      time.Time   `json:"occurred_at"`
 	Payload         interface{} `json:"payload"`
 }
 
+// PublishParams carries the envelope-level fields a call site supplies,
+// alongside the payload-level business object.
+type PublishParams struct {
+	EventType     string
+	CaseID        string
+	TenantID      string
+	LegalEntityID string
+	Jurisdiction  string
+	ActorID       string
+	CorrelationID string
+	Payload       interface{}
+}
+
 // Publisher is the interface for emitting domain events.
 type Publisher interface {
-	Publish(ctx context.Context, eventType, caseID, tenantID string, payload interface{}) error
+	Publish(ctx context.Context, params PublishParams) error
+}
+
+// MessageWriter is the one method KafkaPublisher needs from *kafka.Writer.
+// Narrowed to an interface purely so publisher_test.go can assert envelope
+// content without a live broker.
+type MessageWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
 }
 
 // KafkaPublisher is the Kafka-backed implementation.
 type KafkaPublisher struct {
-	writer *kafka.Writer
+	writer MessageWriter
 	logger *zap.Logger
 }
 
@@ -42,27 +73,40 @@ func NewKafkaPublisher(brokers []string, topic string, logger *zap.Logger) *Kafk
 	return &KafkaPublisher{writer: w, logger: logger}
 }
 
-func (p *KafkaPublisher) Publish(ctx context.Context, eventType, caseID, tenantID string, payload interface{}) error {
+// NewKafkaPublisherWithWriter is NewKafkaPublisher but with a
+// caller-supplied MessageWriter — used by tests to substitute a fake.
+func NewKafkaPublisherWithWriter(writer MessageWriter, logger *zap.Logger) *KafkaPublisher {
+	return &KafkaPublisher{writer: writer, logger: logger}
+}
+
+func (p *KafkaPublisher) Publish(ctx context.Context, params PublishParams) error {
 	evt := Event{
 		// A fresh UUID per publish, not a deterministic string — see
 		// docs/architecture/known-gaps.md's event_id collision writeup.
 		EventID:         "evt-" + uuid.New().String(),
-		EventType:       eventType,
-		ExceptionCaseID: caseID,
-		TenantID:        tenantID,
+		EventType:       params.EventType,
+		EventVersion:    "1.0",
+		SchemaVersion:   "1.0",
+		SourceService:   "exception-escalation-svc",
+		ExceptionCaseID: params.CaseID,
+		TenantID:        params.TenantID,
+		LegalEntityID:   params.LegalEntityID,
+		Jurisdiction:    params.Jurisdiction,
+		ActorID:         params.ActorID,
+		CorrelationID:   params.CorrelationID,
 		OccurredAt:      time.Now().UTC(),
-		Payload:         payload,
+		Payload:         params.Payload,
 	}
 	data, err := json.Marshal(evt)
 	if err != nil {
 		return err
 	}
 	if err := p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(caseID),
+		Key:   []byte(params.CaseID),
 		Value: data,
 	}); err != nil {
 		p.logger.Warn("kafka publish failed — event dropped",
-			zap.String("event_type", eventType),
+			zap.String("event_type", params.EventType),
 			zap.Error(err),
 		)
 	}

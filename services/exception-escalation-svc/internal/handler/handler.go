@@ -92,7 +92,11 @@ func (h *Handler) CreateException(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create exception case")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "exception.created", c.ExceptionCaseID, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "exception.created", CaseID: c.ExceptionCaseID, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+	})
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -174,9 +178,14 @@ func (h *Handler) EscalateException(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "exception.escalated", id, tenantID, map[string]interface{}{
-		"escalation_record": escRecord,
-		"exception_case":    updatedCase,
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "exception.escalated", CaseID: id, TenantID: tenantID,
+		LegalEntityID: updatedCase.LegalEntityID, Jurisdiction: updatedCase.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload: map[string]interface{}{
+			"escalation_record": escRecord,
+			"exception_case":    updatedCase,
+		},
 	})
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"escalation_record": escRecord,
@@ -236,7 +245,11 @@ func (h *Handler) ResolveException(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "exception.closed", id, tenantID, updatedCase)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "exception.closed", CaseID: id, TenantID: tenantID,
+		LegalEntityID: updatedCase.LegalEntityID, Jurisdiction: updatedCase.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updatedCase,
+	})
 	writeJSON(w, http.StatusOK, updatedCase)
 }
 
