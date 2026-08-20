@@ -46,11 +46,11 @@ func New(st store.Store, pub events.Publisher, az AuthzChecker, logger *zap.Logg
 // it against authorization-svc for the given action on the given legal
 // entity. It writes the appropriate error response and returns false if the
 // caller must not proceed.
-func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, legalEntityID, actionType string) bool {
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, legalEntityID, actionType string) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")
 	if principalID == "" {
 		writeError(w, http.StatusUnauthorized, "X-Principal-Id header is required")
-		return false
+		return "", false
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
@@ -58,9 +58,9 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, legalEntityI
 		} else {
 			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 		}
-		return false
+		return "", false
 	}
-	return true
+	return principalID, true
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -86,7 +86,8 @@ func (h *Handler) CreateVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.authorize(w, r, req.LegalEntityID, VATReturnCreate) {
+	principalID, ok := h.authorize(w, r, req.LegalEntityID, VATReturnCreate)
+	if !ok {
 		return
 	}
 
@@ -111,7 +112,11 @@ func (h *Handler) CreateVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "vat_return.created", vret.ReturnID, tenantID, vret)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "vat_return.created", ReturnID: vret.ReturnID, TenantID: tenantID,
+		LegalEntityID: vret.LegalEntityID, Jurisdiction: vret.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: vret,
+	})
 	writeJSON(w, http.StatusCreated, vret)
 }
 
@@ -164,7 +169,8 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.authorize(w, r, existing.LegalEntityID, VATReturnUpdate) {
+	principalID, ok := h.authorize(w, r, existing.LegalEntityID, VATReturnUpdate)
+	if !ok {
 		return
 	}
 
@@ -178,7 +184,11 @@ func (h *Handler) UpdateVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "vat_return.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "vat_return.updated", ReturnID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -206,7 +216,8 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !h.authorize(w, r, existing.LegalEntityID, VATReturnFile) {
+	principalID, ok := h.authorize(w, r, existing.LegalEntityID, VATReturnFile)
+	if !ok {
 		return
 	}
 
@@ -223,7 +234,11 @@ func (h *Handler) FileVATReturn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "vat_return.filed", id, tenantID, vret)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "vat_return.filed", ReturnID: id, TenantID: tenantID,
+		LegalEntityID: vret.LegalEntityID, Jurisdiction: vret.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: vret,
+	})
 	writeJSON(w, http.StatusOK, vret)
 }
 
