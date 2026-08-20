@@ -2,15 +2,24 @@
 
 // Package store_test contains cross-tenant isolation tests for PgStore.
 //
-// Services in this platform connect as the Postgres superuser
-// (DB_USER=postgres). Postgres superusers unconditionally bypass Row-Level
-// Security regardless of policy text — set_config('app.tenant_id', …) has no
-// effect because RLS never runs. The only real isolation guarantee is an
-// explicit AND tenant_id = $N in every query's WHERE clause — this file
-// proves that guarantee actually holds for every tenant-scoped method in
-// this service, mirroring general-ledger-svc's and
-// tenant-entity-registry-svc's isolation test suites (both found real,
+// This file proves the explicit `AND tenant_id = $N` predicate holds for every
+// tenant-scoped method in this service, mirroring general-ledger-svc's and
+// tenant-entity-registry-svc's isolation suites (both found real,
 // live-reproducible bugs this exact pattern was designed to catch).
+//
+// It used to say that predicate was the ONLY isolation guarantee, because every
+// service connected as the Postgres superuser and a superuser bypasses
+// row-level security unconditionally — so the policies were inert and
+// set_config('app.tenant_id', …) did nothing. That is no longer true: these
+// services now connect as an ordinary NOSUPERUSER NOBYPASSRLS role
+// (deployments/scripts/create-app-roles.sh) and the policy is enforced.
+//
+// The predicate is still the guarantee this file tests, and still worth
+// testing: it is the control that does not depend on the role being right.
+// But note what this suite CANNOT tell you — it runs an embedded Postgres as
+// that server's own superuser, so RLS never applies here no matter what the
+// deployment does. The policy is exercised instead by running the
+// TEST_DATABASE_URL suites against an ordinary role.
 //
 // Each subtest:
 //  1. Creates two independent tenants (A and B), each with their own request.

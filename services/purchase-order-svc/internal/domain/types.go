@@ -24,6 +24,18 @@ const (
 	OrderStatusClosed OrderStatus = "CLOSED"
 )
 
+// ValidOrderStatus reports whether s is a status this service can ever have
+// stored. An unrecognised ?status= filter matched no row and returned an empty
+// list, so a typo was indistinguishable from a tenant with no orders.
+func ValidOrderStatus(s string) bool {
+	switch OrderStatus(s) {
+	case OrderStatusIssued, OrderStatusClosed:
+		return true
+	default:
+		return false
+	}
+}
+
 // PurchaseOrder is one order moving through issuance -> (amendments) -> close.
 // Entity-bound (LegalEntityID), never hard-deleted.
 type PurchaseOrder struct {
@@ -80,6 +92,8 @@ type AmendOrderRequest struct {
 
 // ListOrdersFilter holds optional filters for querying purchase orders.
 type ListOrdersFilter struct {
+	// TenantID is the caller's VERIFIED scope, resolved from X-Tenant-Id by the
+	// handler — never a value the request chose for itself.
 	TenantID      string
 	LegalEntityID string
 	Status        string
@@ -121,4 +135,17 @@ var (
 	ErrPurchaseRequestNotApproved     = errorString("referenced purchase request is not APPROVED")
 	ErrPurchaseRequestMismatch        = errorString("referenced purchase request belongs to a different tenant or legal entity")
 	ErrPurchaseRequestServiceUnavailable = errorString("purchase-request-svc unavailable")
+
+	// ErrTenantScopeMissing is returned when a request carries no verified
+	// tenant scope (no X-Tenant-Id). Every order is tenant-owned, and a read
+	// with no scope has no honest answer — it must not quietly become
+	// "whatever tenant the caller named", which is what ListOrders did.
+	ErrTenantScopeMissing = errorString("caller tenant scope missing")
+
+	// ErrTenantScopeMismatch is returned when a request names a tenant other
+	// than the caller's verified scope — as ?tenant_id= when listing the
+	// register, or as tenant_id in an issue body. Both used to be BELIEVED in
+	// preference to the header (which was never read at all), which made the
+	// whole register readable, and writable, across tenants.
+	ErrTenantScopeMismatch = errorString("request tenant_id does not match the caller's verified tenant scope")
 )

@@ -177,11 +177,6 @@ func scanObligation(row pgx.Row) (*domain.Obligation, error) {
 
 // FindObligationByID looks up an obligation by its UUID primary key.
 func (s *PgStore) FindObligationByID(ctx context.Context, obligationID string) (*domain.Obligation, error) {
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	// Another tenant's obligation reads as not-found — the same answer as one
 	// that does not exist, deliberately, so a caller cannot probe for the
 	// existence of records they may not read.
@@ -190,8 +185,12 @@ func (s *PgStore) FindObligationByID(ctx context.Context, obligationID string) (
 		FROM obligations
 		WHERE obligation_id = $1 AND tenant_id = $2;`
 
-	row := s.pool.QueryRow(ctx, query, obligationID, tenantID)
-	o, err := scanObligation(row)
+	var o *domain.Obligation
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		o, scanErr = scanObligation(tx.QueryRow(ctx, query, obligationID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrObligationNotFound
@@ -214,11 +213,6 @@ func (s *PgStore) CreateObligation(ctx context.Context, params domain.CreateObli
 		params.ObligationID = uuid.New().String()
 	}
 
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-
 	// ON CONFLICT (tenant_id, obligation_code), not (obligation_code).
 	//
 	// The dedup key used to be global, and creation is idempotent on it —
@@ -239,24 +233,6 @@ func (s *PgStore) CreateObligation(ctx context.Context, params domain.CreateObli
 		DO NOTHING
 		RETURNING ` + obligationColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query,
-		params.ObligationID, tenantID, params.LegalEntityID, params.JurisdictionID, params.ObligationSourceType,
-		params.ObligationSourceID, params.ObligationCode, params.ObligationType, params.DueDate,
-		params.SeverityLevel, params.ResponsibleFunction, params.SourceReference, params.CreatedByPrincipalID,
-	)
-
-	o, err := scanObligation(row)
-	if err == nil {
-		return o, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
-			return nil, false, domain.ErrInvalidIdentifier
-		}
-		s.log.Error("pg CreateObligation failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
 	// Conflict on (tenant_id, obligation_code). Look the existing one up
 	// within THIS tenant — a lookup by code alone is what made the replay
 	// cross-tenant in the first place.
@@ -265,11 +241,47 @@ func (s *PgStore) CreateObligation(ctx context.Context, params domain.CreateObli
 		FROM obligations
 		WHERE obligation_code = $1 AND tenant_id = $2;`
 
-	row = s.pool.QueryRow(ctx, lookupQuery, params.ObligationCode, tenantID)
-	o, err = scanObligation(row)
+	// The insert and the on-conflict lookup share one transaction, which is
+	// also what installs app.tenant_id. Both matter: the two statements are one
+	// idempotency decision and should not straddle a commit, and every
+	// statement this store makes has to carry the tenant scope or the
+	// row-level security policy filters it to nothing once the service stops
+	// connecting as a superuser.
+	var (
+		o       *domain.Obligation
+		created bool
+	)
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		o, scanErr = scanObligation(tx.QueryRow(ctx, query,
+			params.ObligationID, tenantID, params.LegalEntityID, params.JurisdictionID, params.ObligationSourceType,
+			params.ObligationSourceID, params.ObligationCode, params.ObligationType, params.DueDate,
+			params.SeverityLevel, params.ResponsibleFunction, params.SourceReference, params.CreatedByPrincipalID,
+		))
+		if scanErr == nil {
+			created = true
+			return nil
+		}
+		if !errors.Is(scanErr, pgx.ErrNoRows) {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg CreateObligation failed", zap.Error(scanErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+
+		o, scanErr = scanObligation(tx.QueryRow(ctx, lookupQuery, params.ObligationCode, tenantID))
+		if scanErr != nil {
+			s.log.Error("pg CreateObligation lookup existing failed", zap.Error(scanErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+		}
+		return nil
+	})
 	if err != nil {
-		s.log.Error("pg CreateObligation lookup existing failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, false, err
+	}
+	if created {
+		return o, true, nil
 	}
 
 	if o.LegalEntityID != params.LegalEntityID ||
@@ -343,28 +355,39 @@ func (s *PgStore) ListObligations(ctx context.Context, filter domain.ListObligat
 	args = append(args, filter.Offset)
 	query += fmt.Sprintf(" OFFSET $%d;", len(args))
 
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
-			return nil, domain.ErrInvalidIdentifier
-		}
-		s.log.Error("pg ListObligations failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
+	// Executed inside the tenant-scoped transaction. The explicit
+	// `tenant_id = $1` predicate above is what isolates tenants today; this is
+	// what lets the row-level security policy do it as well, instead of the
+	// policy being filtered out of existence the moment the service connects as
+	// something other than a superuser.
 	var results []*domain.Obligation
-	for rows.Next() {
-		o, scanErr := scanObligation(rows)
-		if scanErr != nil {
-			s.log.Error("pg ListObligations scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+	err = s.withTenantTx(ctx, func(tx pgx.Tx, _ string) error {
+		rows, qErr := tx.Query(ctx, query, args...)
+		if qErr != nil {
+			if errors.Is(mapPgError(qErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg ListObligations failed", zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
 		}
-		results = append(results, o)
-	}
-	if err := rows.Err(); err != nil {
-		s.log.Error("pg ListObligations rows error", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		defer rows.Close()
+
+		for rows.Next() {
+			o, scanErr := scanObligation(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListObligations scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, o)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			s.log.Error("pg ListObligations rows error", zap.Error(rowsErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, rowsErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }
@@ -497,11 +520,6 @@ func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.Cre
 		params.FilingRequirementID = uuid.New().String()
 	}
 
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	// tenant_id is stored on the row rather than reached through the parent
 	// obligation, so row-level security applies to a bare SELECT here. A
 	// policy that has to join to find its tenant is a policy that does not run.
@@ -512,18 +530,24 @@ func (s *PgStore) CreateFilingRequirement(ctx context.Context, params domain.Cre
 		) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
 		RETURNING ` + filingRequirementColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query,
-		params.FilingRequirementID, tenantID, params.ObligationID, params.FilingType,
-		params.FilingAuthority, params.SubmissionChannel,
-	)
-
-	f, err := scanFilingRequirement(row)
-	if err != nil {
-		if errors.Is(mapPgError(err), domain.ErrInvalidIdentifier) {
-			return nil, domain.ErrInvalidIdentifier
+	var f *domain.FilingRequirement
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		var scanErr error
+		f, scanErr = scanFilingRequirement(tx.QueryRow(ctx, query,
+			params.FilingRequirementID, tenantID, params.ObligationID, params.FilingType,
+			params.FilingAuthority, params.SubmissionChannel,
+		))
+		if scanErr != nil {
+			if errors.Is(mapPgError(scanErr), domain.ErrInvalidIdentifier) {
+				return domain.ErrInvalidIdentifier
+			}
+			s.log.Error("pg CreateFilingRequirement failed", zap.Error(scanErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
 		}
-		s.log.Error("pg CreateFilingRequirement failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return f, nil
 }
@@ -534,36 +558,37 @@ func (s *PgStore) ListFilingRequirements(ctx context.Context, obligationID strin
 		return nil, err
 	}
 
-	tenantID, err := tenantOf(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	const query = `
 		SELECT ` + filingRequirementColumns + `
 		FROM filing_requirements
 		WHERE obligation_id = $1 AND tenant_id = $2
 		ORDER BY created_at DESC, filing_requirement_id DESC;`
 
-	rows, err := s.pool.Query(ctx, query, obligationID, tenantID)
-	if err != nil {
-		s.log.Error("pg ListFilingRequirements failed", zap.String("obligation_id", obligationID), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
 	var results []*domain.FilingRequirement
-	for rows.Next() {
-		f, scanErr := scanFilingRequirement(rows)
-		if scanErr != nil {
-			s.log.Error("pg ListFilingRequirements scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+	err := s.withTenantTx(ctx, func(tx pgx.Tx, tenantID string) error {
+		rows, qErr := tx.Query(ctx, query, obligationID, tenantID)
+		if qErr != nil {
+			s.log.Error("pg ListFilingRequirements failed", zap.String("obligation_id", obligationID), zap.Error(qErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, qErr)
 		}
-		results = append(results, f)
-	}
-	if err := rows.Err(); err != nil {
-		s.log.Error("pg ListFilingRequirements rows error", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		defer rows.Close()
+
+		for rows.Next() {
+			f, scanErr := scanFilingRequirement(rows)
+			if scanErr != nil {
+				s.log.Error("pg ListFilingRequirements scan failed", zap.Error(scanErr))
+				return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
+			}
+			results = append(results, f)
+		}
+		if rowsErr := rows.Err(); rowsErr != nil {
+			s.log.Error("pg ListFilingRequirements rows error", zap.Error(rowsErr))
+			return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, rowsErr)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return results, nil
 }

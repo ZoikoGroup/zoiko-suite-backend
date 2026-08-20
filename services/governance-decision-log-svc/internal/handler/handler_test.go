@@ -27,6 +27,9 @@ type stubStore struct {
 	created bool
 	err     error
 	got     *domain.GovernanceDecision
+	// inserts counts calls, so a test can assert that a refused request wrote
+	// nothing at all rather than only that it answered with an error.
+	inserts int
 
 	findByIDResult    *domain.GovernanceDecision
 	findByIDErr       error
@@ -44,6 +47,7 @@ type stubStore struct {
 
 func (s *stubStore) Insert(_ context.Context, d domain.GovernanceDecision) (bool, error) {
 	s.got = &d
+	s.inserts++
 	return s.created, s.err
 }
 
@@ -72,9 +76,14 @@ func (s *stubStore) ListReplayManifestsByDecision(_ context.Context, _ string) (
 type stubPolicyClient struct {
 	version *policyclient.PolicyVersion
 	err     error
+
+	// gotTenantID records the scope the version was fetched in, so a test can
+	// assert a replay stays inside the decision's own tenant.
+	gotTenantID string
 }
 
-func (c *stubPolicyClient) GetPolicyVersion(_ context.Context, _ string) (*policyclient.PolicyVersion, error) {
+func (c *stubPolicyClient) GetPolicyVersion(_ context.Context, tenantID, _ string) (*policyclient.PolicyVersion, error) {
+	c.gotTenantID = tenantID
 	return c.version, c.err
 }
 
@@ -482,6 +491,86 @@ const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
 // X-Principal-Id after verifying the caller identity envelope.
 const testPrincipal = "principal-test-admin"
 
+const (
+	testTenant  = "tenant-1"
+	otherTenant = "tenant-2"
+)
+
+// ── tenant scope ─────────────────────────────────────────────────────────────
+
+// TestCreateDecision_403_ForeignTenantBody is the regression test for a
+// cross-tenant WRITE: tenant_id in the body was the only source of both the
+// stored tenant and the RLS scope the insert ran in.
+func TestCreateDecision_403_ForeignTenantBody(t *testing.T) {
+	store := &stubStore{created: true}
+	h := newTestRouter(store, &stubPublisher{})
+	body := strings.Replace(validBody(), `"tenant_id": "tenant-1"`, `"tenant_id": "`+otherTenant+`"`, 1)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body)))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 recording into another tenant, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if store.inserts != 0 {
+		t.Fatalf("expected nothing written, got %d inserts", store.inserts)
+	}
+}
+
+func TestCreateDecision_401_NoTenantScope(t *testing.T) {
+	store := &stubStore{created: true}
+	h := newTestRouter(store, &stubPublisher{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody()))
+	req.Header.Set("X-Principal-Id", testPrincipal)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if store.inserts != 0 {
+		t.Fatalf("expected nothing written, got %d inserts", store.inserts)
+	}
+}
+
+// A body that omits tenant_id is fine — the tenant is the verified scope, and
+// that is the tenant the decision must be filed under.
+func TestCreateDecision_201_NoTenantInBody_UsesVerifiedScope(t *testing.T) {
+	store := &stubStore{created: true}
+	h := newTestRouter(store, &stubPublisher{})
+	body := strings.Replace(validBody(), `"tenant_id": "tenant-1",`, ``, 1)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(body)))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+	if store.got == nil || store.got.TenantID != testTenant {
+		t.Fatalf("expected the decision filed under the verified tenant %s, got %+v", testTenant, store.got)
+	}
+}
+
+// TestCreateDecision_409_DecisionIDTakenByAnotherTenant covers the other half of
+// the same defect: decision_id is client-supplied and the primary key is the id
+// alone, so ON CONFLICT DO NOTHING treated another tenant's id as an idempotent
+// replay — answering 200 "already recorded" while writing nothing.
+func TestCreateDecision_409_DecisionIDTakenByAnotherTenant(t *testing.T) {
+	store := &stubStore{err: domain.ErrDecisionIDConflict}
+	h := newTestRouter(store, &stubPublisher{})
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/decisions", strings.NewReader(validBody())))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for a decision_id already in use, got %d — body: %s", rr.Code, rr.Body.String())
+	}
+}
+
 // stubAuthz records what it was asked and answers with err.
 type stubAuthz struct {
 	err error
@@ -501,10 +590,15 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, 
 // testAuthz is the permit-all default used by every pre-existing test.
 func testAuthz() *stubAuthz { return &stubAuthz{} }
 
-// authed stamps the gateway-verified principal header onto a request.
-// Every mutating route now requires it.
+// authed stamps the gateway-verified identity headers onto a request. Both are
+// set by gateway-auth-svc, and both are required: X-Principal-Id says who is
+// acting, X-Tenant-Id says whose data they are acting on. Only the principal
+// used to be stamped here, so every mutating test ran with no verified tenant
+// scope and the handler fell back to the tenant_id in the body — the very
+// behaviour under test.
 func authed(req *http.Request) *http.Request {
 	req.Header.Set("X-Principal-Id", testPrincipal)
+	req.Header.Set("X-Tenant-Id", testTenant)
 	return req
 }
 
@@ -517,7 +611,7 @@ var gatedRoutes = []struct {
 	path string
 	body string
 }{
-	{name: "record decision", path: "/v1/decisions", body: `{"decision_id":"d-1","tenant_id":"t-1","legal_entity_id":"le-1","actor_id":"a-1","action_type":"APPROVE","outcome":"GRANTED","rule_basis":"policy:APPROVAL_5K","correlation_id":"corr-1"}`},
+	{name: "record decision", path: "/v1/decisions", body: `{"decision_id":"d-1","tenant_id":"` + testTenant + `","legal_entity_id":"le-1","actor_id":"a-1","action_type":"APPROVE","outcome":"GRANTED","rule_basis":"policy:APPROVAL_5K","correlation_id":"corr-1"}`},
 }
 
 // TestGatedRoutes_401_WithoutPrincipal — this service shipped with no gate of

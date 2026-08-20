@@ -142,6 +142,12 @@ func (c *HTTPClient) RecordDecision(ctx context.Context, params RecordDecisionPa
 	if params.ActorID != "" {
 		req.Header.Set("X-Principal-Id", params.ActorID)
 	}
+	// The tenant is forwarded in the header too, not only in the body.
+	// governance-decision-log-svc now files a decision under its VERIFIED tenant
+	// scope and refuses a body that names a different one — a body-only tenant
+	// used to be believed outright, which is what made its log cross-writable.
+	// The same value goes in both places, sentinel included, so they agree.
+	req.Header.Set("X-Tenant-Id", tenantID)
 	if params.CorrelationID != "" {
 		req.Header.Set("X-Correlation-ID", params.CorrelationID)
 	}

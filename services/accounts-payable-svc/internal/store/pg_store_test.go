@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -51,21 +53,59 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_invoices CASCADE;`)
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_idempotency_index.up.sql",
-		"000003_add_source_contract_id.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
+	// Every *.up.sql, sorted, rather than a list written out here.
+	//
+	// The list stopped at 000003, so this suite has been running against a
+	// schema no deployment has: 000004 is the one that FORCEs row-level
+	// security, which is the migration a store test most needs applied.
+	// Globbing means the next migration lands here too.
+	migrationDir := filepath.Join(base, "../../deployments/migrations")
+	migrations, err := filepath.Glob(filepath.Join(migrationDir, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to glob migrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatalf("no *.up.sql migrations found under %s", migrationDir)
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", migration, err)
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(migration), err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", migration, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(migration), err)
 		}
 	}
 
 	return pool
+}
+
+// scoped runs a verification query with app.tenant_id installed, exactly as the
+// store installs it for every statement it makes.
+//
+// The assertions here deliberately query the tables directly rather than
+// through the store: a write must not be verified by the code that performed
+// it. But a raw query carries no tenant scope, and once the row-level security
+// policy actually applies — which it does the moment the service connects as
+// something other than a superuser — an unscoped SELECT returns NO rows, and
+// the assertion reports "this row was never written" about a row that was.
+//
+// Transaction-local, so no stale tenant is left on the pooled connection to
+// silently scope a later query to the wrong tenant.
+func scoped(t *testing.T, pool *pgxpool.Pool, tenantID string, fn func(tx pgx.Tx)) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("verification tx begin failed: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("installing the verification tenant scope failed: %v", err)
+	}
+	fn(tx)
 }
 
 // requireThrowawayDatabase fails the test unless the DSN's database name marks
@@ -334,10 +374,12 @@ func TestPgStore_CreateInvoice_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	}
 
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM vendor_invoices WHERE tenant_id = $1 AND correlation_id = $2`,
-		tenantID, "corr-retry-1").Scan(&count); err != nil {
-		t.Fatalf("count query failed: %v", err)
-	}
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM vendor_invoices WHERE tenant_id = $1 AND correlation_id = $2`,
+			tenantID, "corr-retry-1").Scan(&count); err != nil {
+			t.Fatalf("count query failed: %v", err)
+		}
+	})
 	if count != 1 {
 		t.Fatalf("DUPLICATE LIABILITY: expected exactly 1 vendor_invoices row for this correlation_id, got %d", count)
 	}

@@ -9,6 +9,15 @@
     so writes from the console are refused. That is correct behaviour, not a bug
     -- but it means a fresh stack has a console that can read and write nothing.
 
+    RUN seed-demo-registry.ps1 AS WELL. This script answers "may the demo principal
+    act on the demo legal entity"; it does not answer "does that legal entity
+    exist". Nothing had ever registered the demo tenant or entity in
+    tenant-entity-registry-svc, and no service noticed until
+    accounts-receivable-svc started reconciling the legal entity on a write — at
+    which point every invoice is refused with legal_entity_not_in_tenant no matter
+    what this script grants. The two are separate scripts because they seed
+    different services, and a fresh stack needs both.
+
     This script creates the grant chain the console's demo identity expects:
 
         role (CONSOLE_DEMO_OPERATOR)
@@ -116,6 +125,26 @@ $BUNDLES = @(
         Code    = "GL_FULL"
         Service = "general-ledger-svc"
         Actions = @("GL_JOURNAL_CREATE", "GL_JOURNAL_VALIDATE", "GL_JOURNAL_POST", "GL_JOURNAL_REVERSE")
+    },
+    @{
+        # accounts-receivable-svc had NO bundle at all, so all four of its write
+        # routes answered 403 to every principal -- the fourth time this shape
+        # has turned up, after jurisdiction-rules-svc, delegated-authority-svc
+        # and document-vault-svc. The service has authorized every write since it
+        # was written; nothing had ever granted it, which is why the console's
+        # invoice form could only ever have appeared to work (and did appear to,
+        # because the frontend substituted mock data for the refusal).
+        #
+        # Each lifecycle hop is its own action, as in AP_FULL and GL_FULL:
+        # issuing an invoice, sending it, declaring it late and recording the
+        # money against it are four different authorities. Its two READ routes
+        # are deliberately not authorized -- they are scoped by the verified
+        # X-Tenant-Id instead, the same posture as general-ledger-svc (whose
+        # journals this service verifies a payment against) and
+        # bank-reconciliation-svc -- so there is no VIEW action to grant.
+        Code    = "AR_FULL"
+        Service = "accounts-receivable-svc"
+        Actions = @("AR_INVOICE_ISSUE", "AR_INVOICE_SEND", "AR_MARK_OVERDUE", "AR_PAYMENT_RECEIVE")
     },
     @{
         # bank-reconciliation-svc gates ingest, match, exception and statement
@@ -274,9 +303,19 @@ $BUNDLES = @(
         # the service shipped with a documented deferral ("Authorization
         # Service ... doesn't exist") that had gone stale, leaving an open
         # write surface on a compliance register.
+        #
+        # APPLICABILITY_DECISION_RECORD was added when the applicability write
+        # was gated. That route had been the one ungated write left in the
+        # service: its file's header still claimed obligations-svc had no authz
+        # client, which had been true when it was written and was not true after
+        # the other three were gated. Recording whether an obligation APPLIES is
+        # the strongest of the four -- filings, evidence and aging are all
+        # derived from that answer -- so it is a distinct action, not folded into
+        # OBLIGATION_CREATE.
         Code    = "OBLIGATION_FULL"
         Service = "obligations-svc"
-        Actions = @("OBLIGATION_CREATE", "OBLIGATION_STATUS_UPDATE", "FILING_REQUIREMENT_CREATE")
+        Actions = @("OBLIGATION_CREATE", "OBLIGATION_STATUS_UPDATE", "FILING_REQUIREMENT_CREATE",
+                    "APPLICABILITY_DECISION_RECORD")
     },
     @{
         # delegated-authority-svc had NO bundle at all, so every one of its

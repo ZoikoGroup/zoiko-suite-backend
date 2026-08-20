@@ -39,8 +39,14 @@ type LeaseListFilter struct {
 	Offset                 int
 }
 
-// AuditListFilter narrows ListAuditLog. All fields optional, compose with AND.
+// AuditListFilter narrows ListAuditLog. Every field except TenantID is
+// optional; they compose with AND.
 type AuditListFilter struct {
+	// TenantID is the caller's verified scope. This filter had no tenant field
+	// at all, so the secret-access audit log was readable across tenants — the
+	// handler now always sets it. A nil TenantID still means unfiltered, so it
+	// must not be left unset by a new caller.
+	TenantID               *string
 	RequestedByPrincipalID string
 	SecretPath             string
 	EventType              string
@@ -854,6 +860,9 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditListFilter) ([]*
 		argIdx++
 	}
 
+	if filter.TenantID != nil && *filter.TenantID != "" {
+		addCond("tenant_id = $%d", *filter.TenantID)
+	}
 	if filter.RequestedByPrincipalID != "" {
 		addCond("requested_by_principal_id = $%d", filter.RequestedByPrincipalID)
 	}

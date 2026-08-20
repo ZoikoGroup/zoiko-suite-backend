@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -51,13 +52,31 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS purchase_orders CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP SEQUENCE IF EXISTS purchase_order_number_seq CASCADE;`)
 
-	for _, migration := range []string{"000001_initial_schema.up.sql"} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
+	// Every *.up.sql, sorted, rather than a list written out here.
+	//
+	// The list here was hardcoded and had fallen behind the directory, so this
+	// suite was applying a schema no deployment has -- in particular without the
+	// FORCE row-level security migration, which is the one a store test most
+	// needs in place. Globbing means the next migration is picked up without
+	// anyone remembering to come back to this file. Same shape as
+	// accounts-receivable-svc.
+	migrationDir := filepath.Join(base, "../../deployments/migrations")
+	migrations, err := filepath.Glob(filepath.Join(migrationDir, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to glob migrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatalf("no *.up.sql migrations found under %s", migrationDir)
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", migration, err)
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(migration), err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", migration, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(migration), err)
 		}
 	}
 

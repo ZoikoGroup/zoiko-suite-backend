@@ -89,8 +89,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateJournalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := requiredJournalFieldMissing(req); missing != "" {
@@ -400,8 +399,7 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	journalID := chi.URLParam(r, "journal_id")
 
 	var req domain.ReverseJournalRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Reason == "" {
@@ -635,4 +633,27 @@ type errorResponse struct {
 
 func writeError(w http.ResponseWriter, status int, code, detail string) {
 	writeJSON(w, status, errorResponse{Error: code, Detail: detail})
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	return true
 }
