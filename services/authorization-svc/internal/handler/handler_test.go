@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/handler"
+	"zoiko.io/authorization-svc/internal/siem"
 )
 
 // ── stub store ────────────────────────────────────────────────────────────────
@@ -129,7 +130,7 @@ func newTestRouter(s *stubStore) chi.Router {
 
 func newTestRouterFull(s *stubStore, p *stubPublisher, v *stubValidator) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, v, zap.NewNop())
+	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }

@@ -132,16 +132,16 @@ type stubPublisher struct {
 	initiated, calculated, completed, blocked int
 }
 
-func (p *stubPublisher) PublishRunInitiated(_ context.Context, _ string, _ domain.PayrollRun) {
+func (p *stubPublisher) PublishRunInitiated(_ context.Context, _, _ string, _ domain.PayrollRun) {
 	p.initiated++
 }
-func (p *stubPublisher) PublishRunCalculated(_ context.Context, _ string, _ domain.PayrollRun) {
+func (p *stubPublisher) PublishRunCalculated(_ context.Context, _, _ string, _ domain.PayrollRun) {
 	p.calculated++
 }
-func (p *stubPublisher) PublishRunCompleted(_ context.Context, _ string, _ domain.PayrollRun) {
+func (p *stubPublisher) PublishRunCompleted(_ context.Context, _, _ string, _ domain.PayrollRun) {
 	p.completed++
 }
-func (p *stubPublisher) PublishRunBlocked(_ context.Context, _ string, _ domain.PayrollRun, _ string) {
+func (p *stubPublisher) PublishRunBlocked(_ context.Context, _, _ string, _ domain.PayrollRun, _ string) {
 	p.blocked++
 }
 

@@ -28,9 +28,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishTaxCalculated(ctx context.Context, correlationID string, calc domain.TaxCalculationRecord)
-	PublishTaxAdjusted(ctx context.Context, correlationID string, calc domain.TaxCalculationRecord)
-	PublishTaxException(ctx context.Context, correlationID, calcID, reason string)
+	PublishTaxCalculated(ctx context.Context, correlationID, legalEntityID, actorID string, calc domain.TaxCalculationRecord)
+	PublishTaxAdjusted(ctx context.Context, correlationID, legalEntityID, actorID string, calc domain.TaxCalculationRecord)
+	PublishTaxException(ctx context.Context, correlationID, tenantID, legalEntityID, actorID, calcID, reason string)
 }
 
 type AuthZClient interface {
@@ -270,7 +270,7 @@ func (h *Handler) CalculateTax(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishTaxCalculated(r.Context(), correlationID, *calc)
+	h.publisher.PublishTaxCalculated(r.Context(), correlationID, legalEntityID, principalID, *calc)
 
 	writeJSON(w, http.StatusCreated, calc)
 }
@@ -401,7 +401,7 @@ func (h *Handler) AdjustCalculation(w http.ResponseWriter, r *http.Request) {
 	calc.TaxBreakdown = req.NewTaxBreakdown
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishTaxAdjusted(r.Context(), correlationID, *calc)
+	h.publisher.PublishTaxAdjusted(r.Context(), correlationID, legalEntityID, principalID, *calc)
 
 	writeJSON(w, http.StatusOK, calc)
 }

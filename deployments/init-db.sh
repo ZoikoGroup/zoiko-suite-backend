@@ -160,3 +160,79 @@ else
     echo "NOTE: /scripts/create-app-roles.sh not mounted -- services will keep"
     echo "      connecting as the superuser, and the RLS policies stay inert."
 fi
+
+# ── Runtime role: zoiko_app (least-privilege, RLS-respecting) ──────────────
+#
+# Every service has, until now, connected to Postgres AS THE SUPERUSER
+# ($POSTGRES_USER, "postgres") for its normal runtime traffic, not just for
+# running the migrations above. A Postgres superuser bypasses Row-Level
+# Security unconditionally — regardless of how correct a service's RLS
+# policies are, they simply never execute for that connection. 55 of the
+# services provisioned by this script define real `CREATE POLICY` tenant-
+# isolation policies (tenant-entity-registry-svc, general-ledger-svc,
+# purchase-order-svc, and 52 others) — every one of them has been running
+# with that guarantee silently disabled. This is the single most-cited
+# critical gap against the original architecture spec's Doc 01 §11.2
+# ("Row-level authorization enforced at the data access layer" as a stated
+# minimum) and §17.1 ("least privilege" as a core security principle).
+#
+# The fix is the standard Postgres pattern: migrations continue to run as
+# the superuser (DDL, extensions, and initial seed data need that), but a
+# separate, non-superuser role is what every service actually connects as
+# at runtime. A non-superuser, non-owner role is automatically subject to
+# `ENABLE ROW LEVEL SECURITY` policies with no further action needed —
+# `FORCE ROW LEVEL SECURITY` is only required to additionally restrict the
+# table OWNER, which this role deliberately never is.
+#
+# zoiko_app_password is a throwaway local-dev value, exactly like
+# POSTGRES_PASSWORD above — never used in staging/production, where secrets
+# come from the secret vault / real KMS, not a plaintext compose file.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE ROLE zoiko_app WITH LOGIN PASSWORD 'zoiko_app_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+EOSQL
+
+# zoiko_app takes the databases that have NO per-service app_ role of their own --
+# everything create-app-roles.sh above did not claim.
+#
+# The skip below is what stops the two role designs cancelling each other out.
+# create-app-roles.sh REVOKEs CONNECT FROM PUBLIC on each of its 21 databases and
+# grants it back to that one role, and that revoke is the line doing the
+# isolating: without it any role could open a session on any service's database.
+# Granting zoiko_app CONNECT on those same 21 would hand exactly that reach to a
+# role shared by the other 42 services, undoing the revoke for every one of them.
+#
+# Membership is read from pg_roles rather than listed again here, so moving a
+# service from the shared role to its own needs no edit in this file -- adding it
+# to create-app-roles.sh is enough, and the two lists cannot drift apart.
+echo "Granting least-privilege runtime access to zoiko_app (databases with no per-service role)..."
+zoiko_app_granted=0
+zoiko_app_skipped=0
+for db in \
+    access_control accounts_payable accounts_receivable ai_governance audit_event_store \
+    authorization_svc bank_reconciliation benefits board_resolutions capability_registry \
+    clause_template commercial_account compensation configuration_feature_flag consolidation_svc \
+    contract_lifecycle corporate_actions corporate_tax counterparty_management decision_support \
+    delegated_authority document_vault employee_master employment_contracts evidence_manifest \
+    evidence_requirements financial_close general_ledger governance_decision_log identity_context \
+    intercompany_accounting invoice_approval jurisdiction_rules kill_switch_registry leave_absence \
+    metric_registry notification obligation_tracking obligations offboarding_severance org_structure \
+    payroll_exceptions payroll_run payroll_tax performance_review policy procurement_workflow \
+    purchase_order purchase_request retention_registry schema_registry secret_vault_integration \
+    source_authority spend_controls tax_determination tax_rules tenant_entity_registry treasury \
+    vat_gst vendor_due_diligence workflow workflow_history workforce_compliance; do
+    if [ "$(psql -tAX --username "$POSTGRES_USER" --dbname postgres \
+            -c "SELECT 1 FROM pg_roles WHERE rolname = 'app_${db}'")" = "1" ]; then
+        zoiko_app_skipped=$((zoiko_app_skipped + 1))
+        continue
+    fi
+    zoiko_app_granted=$((zoiko_app_granted + 1))
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" <<-EOSQL
+        GRANT CONNECT ON DATABASE $db TO zoiko_app;
+        GRANT USAGE ON SCHEMA public TO zoiko_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO zoiko_app;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zoiko_app;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO zoiko_app;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO zoiko_app;
+EOSQL
+done
+echo "zoiko_app granted on $zoiko_app_granted databases; skipped $zoiko_app_skipped that have their own app_ role."

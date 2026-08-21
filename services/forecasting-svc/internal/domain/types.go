@@ -20,8 +20,8 @@ const (
 )
 
 const (
-	ScenarioBaseline   ScenarioType = "BASELINE"
-	ScenarioOptimistic ScenarioType = "OPTIMISTIC"
+	ScenarioBaseline    ScenarioType = "BASELINE"
+	ScenarioOptimistic  ScenarioType = "OPTIMISTIC"
 	ScenarioPessimistic ScenarioType = "PESSIMISTIC"
 )
 
@@ -41,23 +41,23 @@ const (
 )
 
 type ForecastModel struct {
-	ID                   string               `json:"id"`
-	TenantID             string               `json:"tenant_id"`
-	LegalEntityID        string               `json:"legal_entity_id"`
-	ModelName            string               `json:"model_name"`
-	Domain               ForecastDomain       `json:"domain"`
-	ScenarioType         ScenarioType         `json:"scenario_type"`
-	AlgorithmType        AlgorithmType        `json:"algorithm_type"`
-	Granularity          Granularity          `json:"granularity"`
-	HorizonPeriods       int                  `json:"horizon_periods"`
-	HistoricalStartDate  string               `json:"historical_start_date"`
-	HistoricalEndDate    string               `json:"historical_end_date"`
-	Status               string               `json:"status"` // ACTIVE, ARCHIVED
-	ConfidenceLevel      float64              `json:"confidence_level"`
-	Metadata             map[string]interface{}`json:"metadata,omitempty"`
-	CreatedAt            time.Time            `json:"created_at"`
-	UpdatedAt            time.Time            `json:"updated_at"`
-	Projections          []ForecastProjection `json:"projections,omitempty"`
+	ID                  string                 `json:"id"`
+	TenantID            string                 `json:"tenant_id"`
+	LegalEntityID       string                 `json:"legal_entity_id"`
+	ModelName           string                 `json:"model_name"`
+	Domain              ForecastDomain         `json:"domain"`
+	ScenarioType        ScenarioType           `json:"scenario_type"`
+	AlgorithmType       AlgorithmType          `json:"algorithm_type"`
+	Granularity         Granularity            `json:"granularity"`
+	HorizonPeriods      int                    `json:"horizon_periods"`
+	HistoricalStartDate string                 `json:"historical_start_date"`
+	HistoricalEndDate   string                 `json:"historical_end_date"`
+	Status              string                 `json:"status"` // ACTIVE, ARCHIVED
+	ConfidenceLevel     float64                `json:"confidence_level"`
+	Metadata            map[string]interface{} `json:"metadata,omitempty"`
+	CreatedAt           time.Time              `json:"created_at"`
+	UpdatedAt           time.Time              `json:"updated_at"`
+	Projections         []ForecastProjection   `json:"projections,omitempty"`
 }
 
 type ForecastProjection struct {
@@ -88,7 +88,7 @@ type GenerateForecastRequest struct {
 }
 
 type RecalculateRequest struct {
-	GrowthRateAdjustment float64 `json:"growth_rate_adjustment"` // e.g. 0.05 for +5%
+	GrowthRateAdjustment float64      `json:"growth_rate_adjustment"` // e.g. 0.05 for +5%
 	ScenarioType         ScenarioType `json:"scenario_type,omitempty"`
 }
 
@@ -124,7 +124,7 @@ func (r *GenerateForecastRequest) Validate() error {
 func ComputeProjections(req *GenerateForecastRequest, modelID, tenantID string) []ForecastProjection {
 	data := req.HistoricalData
 	n := float64(len(data))
-	
+
 	// 1. Calculate Base Trend / Moving Average
 	var baseValue float64
 	var slope float64
@@ -195,7 +195,7 @@ func ComputeProjections(req *GenerateForecastRequest, modelID, tenantID string) 
 		if rawProjected < 0 {
 			rawProjected = 0 // Prevent negative financial projections unless allowed
 		}
-		
+
 		// Confidence Interval (+/- variance margin %)
 		marginAmount := rawProjected * (varianceMargin / 100.0)
 		confLow := math.Max(0, rawProjected-marginAmount)

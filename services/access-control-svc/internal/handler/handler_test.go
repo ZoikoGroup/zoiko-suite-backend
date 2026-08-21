@@ -99,13 +99,13 @@ type stubPublisher struct {
 	roleCreated, roleUpdated, bundleUpdated int
 }
 
-func (p *stubPublisher) PublishRoleCreated(_ context.Context, _ domain.RoleDefinition) {
+func (p *stubPublisher) PublishRoleCreated(_ context.Context, _ domain.RoleDefinition, _ string) {
 	p.roleCreated++
 }
-func (p *stubPublisher) PublishRoleUpdated(_ context.Context, _ domain.RoleDefinition) {
+func (p *stubPublisher) PublishRoleUpdated(_ context.Context, _ domain.RoleDefinition, _ string) {
 	p.roleUpdated++
 }
-func (p *stubPublisher) PublishBundleUpdated(_ context.Context, _ domain.PermissionBundleDef) {
+func (p *stubPublisher) PublishBundleUpdated(_ context.Context, _ domain.PermissionBundleDef, _ string) {
 	p.bundleUpdated++
 }
 

@@ -33,23 +33,29 @@ func (f *fakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) err
 }
 
 type envelope struct {
+	EventID       string          `json:"event_id"`
 	EventType     string          `json:"event_type"`
+	EventVersion  string          `json:"event_version"`
 	SchemaVersion string          `json:"schema_version"`
 	SourceService string          `json:"source_service"`
+	TenantID      string          `json:"tenant_id"`
+	LegalEntityID string          `json:"legal_entity_id"`
+	ActorID       string          `json:"actor_id"`
 	CorrelationID string          `json:"correlation_id"`
 	Payload       json.RawMessage `json:"payload"`
 }
 
 func evaluation(outcome domain.Outcome) domain.EvidenceEvaluation {
 	return domain.EvidenceEvaluation{
-		EvaluationID:  "eval-1",
-		TenantID:      "tenant-1",
-		LegalEntityID: "entity-1",
-		DomainCode:    "FINANCE",
-		ActionType:    "JOURNAL_POST",
-		Outcome:       outcome,
-		UnmetPayload:  json.RawMessage(`[{"evidence_requirement_id":"req-1","evidence_type":"SIGNATURE","reason":"missing"}]`),
-		CorrelationID: "corr-1",
+		EvaluationID:            "eval-1",
+		TenantID:                "tenant-1",
+		LegalEntityID:           "entity-1",
+		DomainCode:              "FINANCE",
+		ActionType:              "JOURNAL_POST",
+		Outcome:                 outcome,
+		UnmetPayload:            json.RawMessage(`[{"evidence_requirement_id":"req-1","evidence_type":"SIGNATURE","reason":"missing"}]`),
+		EvaluatedForPrincipalID: "principal-1",
+		CorrelationID:           "corr-1",
 	}
 }
 
@@ -71,7 +77,25 @@ func TestPublishEvaluation_Satisfied(t *testing.T) {
 	assert.Equal(t, "evidence.requirement.satisfied", env.EventType)
 	assert.Equal(t, "evidence-requirements-svc", env.SourceService)
 	assert.Equal(t, "1.0", env.SchemaVersion)
+	assert.Equal(t, "1.0", env.EventVersion)
+	assert.Equal(t, "tenant-1", env.TenantID)
+	assert.Equal(t, "entity-1", env.LegalEntityID)
+	assert.Equal(t, "principal-1", env.ActorID)
 	assert.Equal(t, "corr-1", env.CorrelationID)
+	assert.NotEmpty(t, env.EventID)
+}
+
+func TestPublishEvaluation_RepeatEventsOnSameEvaluation_GetDistinctEventIDs(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisher(zap.NewNop(), "zoiko.evidence-requirements.events", w)
+
+	p.PublishEvaluation(context.Background(), evaluation(domain.OutcomeSatisfied))
+	first := decodeOne(t, w)
+	w.msgs = nil
+	p.PublishEvaluation(context.Background(), evaluation(domain.OutcomeSatisfied))
+	second := decodeOne(t, w)
+
+	assert.NotEqual(t, first.EventID, second.EventID)
 }
 
 func TestPublishEvaluation_Missing_CarriesUnmetDetail(t *testing.T) {

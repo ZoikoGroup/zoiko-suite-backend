@@ -134,7 +134,10 @@ func (h *Handler) CreateRetentionPolicy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "retention_policy.created", p.RetentionPolicyID, req.TenantID, p)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "retention_policy.created", EntityID: p.RetentionPolicyID, TenantID: req.TenantID,
+		Jurisdiction: req.JurisdictionCode, ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: p,
+	})
 	writeJSON(w, http.StatusCreated, p)
 }
 
@@ -178,7 +181,10 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "legal_hold.engaged", hld.LegalHoldID, req.TenantID, hld)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "legal_hold.engaged", EntityID: hld.LegalHoldID, TenantID: req.TenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: hld,
+	})
 	writeJSON(w, http.StatusCreated, hld)
 }
 
@@ -250,7 +256,10 @@ func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 	if released.TenantID != nil {
 		tenantForEvent = *released.TenantID
 	}
-	_ = h.publisher.Publish(r.Context(), "legal_hold.released", released.LegalHoldID, tenantForEvent, released)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "legal_hold.released", EntityID: released.LegalHoldID, TenantID: tenantForEvent,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: released,
+	})
 	writeJSON(w, http.StatusOK, released)
 }
 

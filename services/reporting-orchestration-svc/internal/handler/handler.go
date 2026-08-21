@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	REPORT_DEFINITION_CREATE = "REPORT_DEFINITION_CREATE"
+	REPORT_DEFINITION_CREATE        = "REPORT_DEFINITION_CREATE"
 	REPORT_DEFINITION_STATUS_UPDATE = "REPORT_DEFINITION_STATUS_UPDATE"
-	REPORT_RUN_TRIGGER       = "REPORT_RUN_TRIGGER"
+	REPORT_RUN_TRIGGER              = "REPORT_RUN_TRIGGER"
 )
 
 type Handler struct {
@@ -99,7 +99,11 @@ func (h *Handler) CreateDefinition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "report.definition_created", tenantID, def)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "report.definition_created", SubjectID: def.ID, TenantID: tenantID,
+		LegalEntityID: def.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: def,
+	})
 	h.okJSON(w, http.StatusCreated, def)
 }
 
@@ -164,7 +168,12 @@ func (h *Handler) UpdateDefinitionStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "report.definition_status_updated", tenantID, map[string]string{"id": id, "status": string(body.Status)})
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "report.definition_status_updated", SubjectID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload:       map[string]string{"id": id, "status": string(body.Status)},
+	})
 	h.okJSON(w, http.StatusOK, map[string]string{"message": "status updated", "id": id, "status": string(body.Status)})
 }
 
@@ -216,7 +225,11 @@ func (h *Handler) TriggerRun(w http.ResponseWriter, r *http.Request) {
 	domain.OrchestratReportRun(def, run)
 	_ = h.store.UpdateRun(r.Context(), tenantID, run)
 
-	_ = h.publisher.Publish(r.Context(), "report.run_completed", tenantID, run)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "report.run_completed", SubjectID: run.ID, TenantID: tenantID,
+		LegalEntityID: def.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: run,
+	})
 	h.okJSON(w, http.StatusCreated, run)
 }
 

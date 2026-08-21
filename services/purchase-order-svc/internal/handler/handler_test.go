@@ -138,9 +138,11 @@ type stubPublisher struct {
 	issued, amended, closed int
 }
 
-func (p *stubPublisher) PublishOrderIssued(_ context.Context, _ domain.PurchaseOrder)  { p.issued++ }
-func (p *stubPublisher) PublishOrderAmended(_ context.Context, _ domain.PurchaseOrder) { p.amended++ }
-func (p *stubPublisher) PublishOrderClosed(_ context.Context, _ domain.PurchaseOrder)  { p.closed++ }
+func (p *stubPublisher) PublishOrderIssued(_ context.Context, _ domain.PurchaseOrder) { p.issued++ }
+func (p *stubPublisher) PublishOrderAmended(_ context.Context, _ string, _ domain.PurchaseOrder) {
+	p.amended++
+}
+func (p *stubPublisher) PublishOrderClosed(_ context.Context, _ domain.PurchaseOrder) { p.closed++ }
 
 type stubAuthZ struct {
 	err error

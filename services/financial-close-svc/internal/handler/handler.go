@@ -31,9 +31,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishCloseStarted(ctx context.Context, correlationID string, fp domain.FiscalPeriod)
-	PublishCloseBlocked(ctx context.Context, correlationID string, fp domain.FiscalPeriod, reasons []string)
-	PublishClosed(ctx context.Context, correlationID string, fp domain.FiscalPeriod, evidenceID string)
+	PublishCloseStarted(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod)
+	PublishCloseBlocked(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, reasons []string)
+	PublishClosed(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, evidenceID string)
 }
 
 type AuthZClient interface {
@@ -281,7 +281,7 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishCloseStarted(r.Context(), correlationID, *fp)
+	h.publisher.PublishCloseStarted(r.Context(), correlationID, principalID, *fp)
 
 	// Step 1: Run Readiness Checks (FAIL CLOSED on any dependency query error)
 	blockingIssues, err := h.checkReadiness(r.Context(), tenantID, fp)
@@ -291,7 +291,7 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(blockingIssues) > 0 {
-		h.publisher.PublishCloseBlocked(r.Context(), correlationID, *fp, blockingIssues)
+		h.publisher.PublishCloseBlocked(r.Context(), correlationID, principalID, *fp, blockingIssues)
 		h.log.Warn("period close blocked by outstanding items", zap.String("period_id", id), zap.Strings("reasons", blockingIssues))
 		writeJSON(w, http.StatusUnprocessableEntity, domain.ReadinessCheckResponse{
 			IsReady:        false,
@@ -394,7 +394,7 @@ func (h *Handler) LockPeriod(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishClosed(r.Context(), correlationID, *fp, docID)
+	h.publisher.PublishClosed(r.Context(), correlationID, principalID, *fp, docID)
 
 	writeJSON(w, http.StatusOK, domain.PeriodLockResponse{
 		FiscalPeriodID:     id,

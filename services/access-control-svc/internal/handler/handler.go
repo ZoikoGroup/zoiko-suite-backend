@@ -26,9 +26,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishRoleCreated(ctx context.Context, r domain.RoleDefinition)
-	PublishRoleUpdated(ctx context.Context, r domain.RoleDefinition)
-	PublishBundleUpdated(ctx context.Context, b domain.PermissionBundleDef)
+	PublishRoleCreated(ctx context.Context, r domain.RoleDefinition, actorID string)
+	PublishRoleUpdated(ctx context.Context, r domain.RoleDefinition, actorID string)
+	PublishBundleUpdated(ctx context.Context, b domain.PermissionBundleDef, actorID string)
 }
 
 type AuthZClient interface {
@@ -128,7 +128,7 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if created {
-		h.publisher.PublishRoleCreated(r.Context(), *role)
+		h.publisher.PublishRoleCreated(r.Context(), *role, principalID)
 	}
 
 	writeJSON(w, http.StatusCreated, role)
@@ -200,7 +200,7 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishRoleUpdated(r.Context(), *updated)
+	h.publisher.PublishRoleUpdated(r.Context(), *updated, principalID)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -264,7 +264,7 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if created {
-		h.publisher.PublishBundleUpdated(r.Context(), *bundle)
+		h.publisher.PublishBundleUpdated(r.Context(), *bundle, principalID)
 	}
 
 	writeJSON(w, http.StatusCreated, bundle)

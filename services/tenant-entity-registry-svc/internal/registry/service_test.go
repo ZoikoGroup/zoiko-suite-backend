@@ -198,11 +198,11 @@ func (m *memStore) TransitionTaxIdentityBundleStatus(_ context.Context, id strin
 
 type noopPublisher struct{}
 
-func (noopPublisher) PublishTenantCreated(_ context.Context, _ *domain.Tenant, _ string)      {}
-func (noopPublisher) PublishEntityCreated(_ context.Context, _ *domain.LegalEntity, _ string) {}
-func (noopPublisher) PublishEntityUpdated(_ context.Context, _ *domain.LegalEntity, _ string) {}
+func (noopPublisher) PublishTenantCreated(_ context.Context, _ *domain.Tenant, _ string)       {}
+func (noopPublisher) PublishEntityCreated(_ context.Context, _ *domain.LegalEntity, _ string)  {}
+func (noopPublisher) PublishEntityUpdated(_ context.Context, _ *domain.LegalEntity, _ string)  {}
 func (noopPublisher) PublishWorkspaceCreated(_ context.Context, _ *domain.Workspace, _ string) {}
-func (noopPublisher) PublishEntityStatusChanged(_ context.Context, _, _ string, _, _ domain.EntityStatus, _ string) {
+func (noopPublisher) PublishEntityStatusChanged(_ context.Context, _, _, _ string, _, _ domain.EntityStatus, _ string) {
 }
 func (noopPublisher) PublishEntityHierarchyChanged(_ context.Context, _ *domain.EntityHierarchy, _ string, _ string) {
 }

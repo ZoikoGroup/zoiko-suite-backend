@@ -35,10 +35,13 @@ import (
 	"zoiko.io/purchase-order-svc/internal/handler"
 	"zoiko.io/purchase-order-svc/internal/health"
 	svcmiddleware "zoiko.io/purchase-order-svc/internal/middleware"
+	"zoiko.io/purchase-order-svc/internal/mtls"
 	"zoiko.io/purchase-order-svc/internal/purchaserequest"
 	"zoiko.io/purchase-order-svc/internal/store"
 	"zoiko.io/purchase-order-svc/internal/telemetry"
 )
+
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -143,7 +146,18 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+
+	var authzClient authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "purchase-order-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewHTTPClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
+	} else {
+		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+	}
+
 	prClient := purchaserequest.NewHTTPClient(cfg.PurchaseRequestServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

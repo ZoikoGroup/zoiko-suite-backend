@@ -21,7 +21,10 @@ import (
 
 // Store is the interface consumed by the handler.
 type Store interface {
-	CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, error)
+	// CreateWorkflow returns created=false when params.CorrelationID matches
+	// an existing workflow instance for this tenant — the existing
+	// instance/stages are returned as-is, nothing new is inserted.
+	CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (instance *domain.WorkflowInstance, stages []*domain.WorkflowStage, created bool, err error)
 	FindWorkflowByID(ctx context.Context, workflowInstanceID string) (*domain.WorkflowInstance, error)
 	FindStagesByWorkflowID(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowStage, error)
 	FindCurrentStage(ctx context.Context, workflowInstanceID string) (*domain.WorkflowStage, error)
@@ -159,9 +162,9 @@ func (s *PgStore) FindCurrentStage(ctx context.Context, workflowInstanceID strin
 // CreateWorkflow inserts a new workflow instance plus its ordered stage
 // chain, and records the initial "" -> PENDING transition, all in one
 // transaction.
-func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, error) {
+func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
 	if len(params.Stages) == 0 {
-		return nil, nil, domain.ErrNoStages
+		return nil, nil, false, domain.ErrNoStages
 	}
 	if params.WorkflowInstanceID == "" {
 		params.WorkflowInstanceID = uuid.New().String()
@@ -170,19 +173,32 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.log.Error("pg CreateWorkflow: begin tx failed", zap.Error(err))
-		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	// Idempotent on (tenant_id, correlation_id): a retried call with the
+	// same correlation_id must resolve to the original instance, never
+	// create a second workflow (with its own duplicate stage chain) —
+	// see migration 000003. ON CONFLICT DO NOTHING here returns zero rows
+	// rather than erroring, which is how the conflict is detected below.
 	const insertInstance = `
 		INSERT INTO workflow_instances (workflow_instance_id, tenant_id, legal_entity_id, workflow_type, initiated_by, correlation_id)
 		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		RETURNING ` + instanceColumns + `;`
 	row := tx.QueryRow(ctx, insertInstance, params.WorkflowInstanceID, params.TenantID, params.LegalEntityID, params.WorkflowType, params.InitiatedBy, params.CorrelationID)
 	instance, err := scanInstance(row)
 	if err != nil {
-		s.log.Error("pg CreateWorkflow: insert instance failed", zap.Error(err))
-		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			s.log.Error("pg CreateWorkflow: insert instance failed", zap.Error(err))
+			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		// Conflict: an earlier call with this correlation_id already
+		// created the instance. Nothing to insert — fetch and return what
+		// already exists, in a fresh read (the failed INSERT already ended
+		// this transaction's usefulness; commit below is a no-op).
+		return s.findExistingByCorrelation(ctx, params.TenantID, params.CorrelationID)
 	}
 
 	stages := make([]*domain.WorkflowStage, 0, len(params.Stages))
@@ -195,7 +211,7 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 		st, err := scanStage(row)
 		if err != nil {
 			s.log.Error("pg CreateWorkflow: insert stage failed", zap.Error(err))
-			return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+			return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		stages = append(stages, st)
 	}
@@ -205,14 +221,32 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 		correlationID = &params.CorrelationID
 	}
 	if err := insertTransition(ctx, tx, params.WorkflowInstanceID, "", "PENDING", params.InitiatedBy, nil, correlationID, nil); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg CreateWorkflow: commit failed", zap.Error(err))
-		return nil, nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return instance, stages, nil
+	return instance, stages, true, nil
+}
+
+// findExistingByCorrelation resolves the instance+stages an idempotent
+// CreateWorkflow retry should return, in its own read against the
+// already-committed data from the original call.
+func (s *PgStore) findExistingByCorrelation(ctx context.Context, tenantID, correlationID string) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
+	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE tenant_id = $1 AND correlation_id = $2;`
+	row := s.pool.QueryRow(ctx, query, tenantID, correlationID)
+	instance, err := scanInstance(row)
+	if err != nil {
+		s.log.Error("pg CreateWorkflow: lookup existing by correlation_id failed", zap.Error(err))
+		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	stages, err := s.FindStagesByWorkflowID(ctx, instance.WorkflowInstanceID)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return instance, stages, false, nil
 }
 
 func insertTransition(ctx context.Context, tx pgx.Tx, workflowInstanceID, fromState, toState, actedBy string, rationale, correlationID, causationID *string) error {

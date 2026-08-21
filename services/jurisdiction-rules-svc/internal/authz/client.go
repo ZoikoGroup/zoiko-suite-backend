@@ -118,6 +118,19 @@ func NewHTTPAuthZClient(baseURL string, log *zap.Logger) *HTTPAuthZClient {
 	}
 }
 
+// NewHTTPAuthZClientWithHTTPClient is NewHTTPAuthZClient but with a
+// caller-supplied *http.Client — used for the mTLS pilot, where the
+// client's Transport already carries this service's leaf certificate and
+// trusts authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+func NewHTTPAuthZClientWithHTTPClient(baseURL string, httpClient *http.Client, log *zap.Logger) *HTTPAuthZClient {
+	return &HTTPAuthZClient{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		log:     log,
+		client:  httpClient,
+		cache:   make(map[string]cachedDecision),
+	}
+}
+
 // authorizeRequest matches authorization-svc's POST /v1/authorize body
 // (services/authorization-svc/internal/handler/handler.go). All three
 // fields are required — an empty one is answered with 400, which this

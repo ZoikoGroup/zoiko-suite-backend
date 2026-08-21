@@ -35,7 +35,9 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 	return &PgStore{pool: pool}
 }
 
-func (s *PgStore) setTenant(ctx context.Context, tx interface{ Exec(ctx context.Context, sql string, args ...interface{}) (interface{ RowsAffected() int64 }, error) }, tenantID string) error {
+func (s *PgStore) setTenant(ctx context.Context, tx interface {
+	Exec(ctx context.Context, sql string, args ...interface{}) (interface{ RowsAffected() int64 }, error)
+}, tenantID string) error {
 	_, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	return err
 }

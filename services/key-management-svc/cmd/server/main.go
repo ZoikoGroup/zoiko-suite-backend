@@ -10,6 +10,7 @@ import (
 
 	"go.uber.org/zap"
 	"zoiko.io/key-management-svc/internal/handler"
+	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
 
@@ -22,7 +23,8 @@ func main() {
 	}
 
 	s := store.NewMemoryStore()
-	h := handler.New(s, logger)
+	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "key-management-svc", logger)
+	h := handler.New(s, siemClient, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{Addr: ":" + port, Handler: router, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}

@@ -30,9 +30,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishPositionCreated(ctx context.Context, correlationID string, pos domain.Position)
-	PublishEmployeeAssigned(ctx context.Context, correlationID string, assign domain.OrgAssignment)
-	PublishOrgStructureChanged(ctx context.Context, correlationID string, eventType, entityID string)
+	PublishPositionCreated(ctx context.Context, correlationID, actorID string, pos domain.Position)
+	PublishEmployeeAssigned(ctx context.Context, correlationID, actorID string, assign domain.OrgAssignment)
+	PublishOrgStructureChanged(ctx context.Context, correlationID, tenantID, legalEntityID, actorID, eventType, entityID string)
 }
 
 type AuthZClient interface {
@@ -141,7 +141,7 @@ func (h *Handler) CreateDepartment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishOrgStructureChanged(r.Context(), correlationID, "DEPARTMENT_CREATED", dept.DepartmentID)
+	h.publisher.PublishOrgStructureChanged(r.Context(), correlationID, dept.TenantID, dept.LegalEntityID, principalID, "DEPARTMENT_CREATED", dept.DepartmentID)
 
 	writeJSON(w, http.StatusCreated, dept)
 }
@@ -266,7 +266,7 @@ func (h *Handler) CreatePosition(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishPositionCreated(r.Context(), correlationID, *pos)
+	h.publisher.PublishPositionCreated(r.Context(), correlationID, principalID, *pos)
 
 	writeJSON(w, http.StatusCreated, pos)
 }
@@ -396,7 +396,7 @@ func (h *Handler) AssignEmployee(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishEmployeeAssigned(r.Context(), correlationID, *oa)
+	h.publisher.PublishEmployeeAssigned(r.Context(), correlationID, principalID, *oa)
 
 	writeJSON(w, http.StatusCreated, oa)
 }

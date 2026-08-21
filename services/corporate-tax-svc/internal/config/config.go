@@ -14,6 +14,14 @@ type Config struct {
 	TaxRulesServiceURL   string
 	JurisdictionRulesURL string
 	GeneralLedgerURL     string
+
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthzServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -34,6 +42,10 @@ func Load() (*Config, error) {
 		TaxRulesServiceURL:   getEnvOrDefault("TAX_RULES_SERVICE_URL", "http://tax-rules-svc:8125"),
 		JurisdictionRulesURL: getEnvOrDefault("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8081"),
 		GeneralLedgerURL:     getEnvOrDefault("GENERAL_LEDGER_URL", "http://general-ledger-svc:8091"),
+
+		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: getEnvOrDefault("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}, nil
 }
 

@@ -61,7 +61,7 @@ func (s *stubStore) PublishNewVersion(_ context.Context, newVersion *domain.Repo
 
 type stubPublisher struct{ calls int }
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error {
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
 	p.calls++
 	return nil
 }

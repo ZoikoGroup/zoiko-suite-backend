@@ -11,15 +11,15 @@ import "time"
 // Principal is owned by this service. PII fields (Email, DisplayName) are
 // subject to the data_residency_policy_id of the owning tenant.
 type Principal struct {
-	PrincipalID              string          `json:"principal_id"`
-	TenantID                 string          `json:"tenant_id"`
-	PrincipalType            PrincipalType   `json:"principal_type"`
-	IdentityProviderSubject  string          `json:"identity_provider_subject"`
-	Email                    string          `json:"email"`        // PII
-	DisplayName              string          `json:"display_name"` // PII
-	Status                   PrincipalStatus `json:"status"`
-	CreatedAt                time.Time       `json:"created_at"`
-	DataClassification       string          `json:"data_classification"`
+	PrincipalID             string          `json:"principal_id"`
+	TenantID                string          `json:"tenant_id"`
+	PrincipalType           PrincipalType   `json:"principal_type"`
+	IdentityProviderSubject string          `json:"identity_provider_subject"`
+	Email                   string          `json:"email"`        // PII
+	DisplayName             string          `json:"display_name"` // PII
+	Status                  PrincipalStatus `json:"status"`
+	CreatedAt               time.Time       `json:"created_at"`
+	DataClassification      string          `json:"data_classification"`
 }
 
 // ---------------------------------------------------------------------------
@@ -27,13 +27,13 @@ type Principal struct {
 // ---------------------------------------------------------------------------
 
 type PrincipalRoleAssignment struct {
-	AssignmentID  string     `json:"assignment_id"`
-	PrincipalID   string     `json:"principal_id"`
-	RoleID        string     `json:"role_id"`
-	LegalEntityID *string    `json:"legal_entity_id"` // nullable — entity-scoped
-	EffectiveFrom time.Time  `json:"effective_from"`
-	EffectiveTo   time.Time  `json:"effective_to"`
-	AssignedBy    string     `json:"assigned_by"`
+	AssignmentID  string    `json:"assignment_id"`
+	PrincipalID   string    `json:"principal_id"`
+	RoleID        string    `json:"role_id"`
+	LegalEntityID *string   `json:"legal_entity_id"` // nullable — entity-scoped
+	EffectiveFrom time.Time `json:"effective_from"`
+	EffectiveTo   time.Time `json:"effective_to"`
+	AssignedBy    string    `json:"assigned_by"`
 }
 
 // ---------------------------------------------------------------------------
@@ -41,16 +41,16 @@ type PrincipalRoleAssignment struct {
 // ---------------------------------------------------------------------------
 
 type DelegatedAuthority struct {
-	DelegatedAuthorityID   string             `json:"delegated_authority_id"`
-	DelegatorPrincipalID   string             `json:"delegator_principal_id"`
-	DelegatePrincipalID    string             `json:"delegate_principal_id"`
-	ScopeType              ScopeType          `json:"scope_type"`
-	LegalEntityID          *string            `json:"legal_entity_id"` // nullable
-	AuthorityLimitType     AuthorityLimitType `json:"authority_limit_type"`
-	AuthorityLimitValue    float64            `json:"authority_limit_value"`
-	EffectiveFrom          time.Time          `json:"effective_from"`
-	EffectiveTo            time.Time          `json:"effective_to"`
-	RevocationStatus       RevocationStatus   `json:"revocation_status"`
+	DelegatedAuthorityID string             `json:"delegated_authority_id"`
+	DelegatorPrincipalID string             `json:"delegator_principal_id"`
+	DelegatePrincipalID  string             `json:"delegate_principal_id"`
+	ScopeType            ScopeType          `json:"scope_type"`
+	LegalEntityID        *string            `json:"legal_entity_id"` // nullable
+	AuthorityLimitType   AuthorityLimitType `json:"authority_limit_type"`
+	AuthorityLimitValue  float64            `json:"authority_limit_value"`
+	EffectiveFrom        time.Time          `json:"effective_from"`
+	EffectiveTo          time.Time          `json:"effective_to"`
+	RevocationStatus     RevocationStatus   `json:"revocation_status"`
 }
 
 // ---------------------------------------------------------------------------
@@ -63,31 +63,31 @@ type DelegatedAuthority struct {
 // ---------------------------------------------------------------------------
 
 type SessionContext struct {
-	SessionContextID     string             `json:"session_context_id"`
-	PrincipalID          string             `json:"principal_id"`
-	TenantID             string             `json:"tenant_id"`
-	LegalEntityID        string             `json:"legal_entity_id"`
-	CorrelationID        string             `json:"correlation_id"`
-	TrustPosture         TrustPosture       `json:"trust_posture"`
+	SessionContextID string       `json:"session_context_id"`
+	PrincipalID      string       `json:"principal_id"`
+	TenantID         string       `json:"tenant_id"`
+	LegalEntityID    string       `json:"legal_entity_id"`
+	CorrelationID    string       `json:"correlation_id"`
+	TrustPosture     TrustPosture `json:"trust_posture"`
 	// MFAVerified is a point-in-time attestation only.
 	// AuthZ Service evaluates sufficiency; no callback into this service required (Q4).
-	MFAVerified          bool               `json:"mfa_verified"`
-	DeviceTrustScore     int                `json:"device_trust_score"`
+	MFAVerified      bool `json:"mfa_verified"`
+	DeviceTrustScore int  `json:"device_trust_score"`
 	// AdaptiveRiskScore is sourced from RiskSignalCache ONLY.
 	// resolve() NEVER calls the Intelligence Plane or any Tier 2/3 service (Q3).
-	AdaptiveRiskScore    int                `json:"adaptive_risk_score"`
-	RiskSignalSource     string             `json:"risk_signal_source"`
+	AdaptiveRiskScore int    `json:"adaptive_risk_score"`
+	RiskSignalSource  string `json:"risk_signal_source"`
 	// EnvelopeJWTJTI is the JWT ID of the issued IdentityContextEnvelope.
-	EnvelopeJWTJTI       string             `json:"envelope_jwt_jti"`
-	IssuedAt             time.Time          `json:"issued_at"`
-	ExpiresAt            time.Time          `json:"expires_at"`
+	EnvelopeJWTJTI string    `json:"envelope_jwt_jti"`
+	IssuedAt       time.Time `json:"issued_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 	// InvalidatedAt is append-only. This record is NEVER deleted.
-	InvalidatedAt        *time.Time         `json:"invalidated_at"`
-	InvalidationReason   *InvalidationReason `json:"invalidation_reason"`
+	InvalidatedAt      *time.Time          `json:"invalidated_at"`
+	InvalidationReason *InvalidationReason `json:"invalidation_reason"`
 	// DataResidencyPolicyID is MANDATORY — PII fields are residency-constrained.
-	DataResidencyPolicyID string            `json:"data_residency_policy_id"`
-	SourceService        string             `json:"source_service"`
-	SchemaVersion        string             `json:"schema_version"`
+	DataResidencyPolicyID string `json:"data_residency_policy_id"`
+	SourceService         string `json:"source_service"`
+	SchemaVersion         string `json:"schema_version"`
 }
 
 // ---------------------------------------------------------------------------
@@ -99,16 +99,16 @@ type SessionContext struct {
 // ---------------------------------------------------------------------------
 
 type RiskSignalCache struct {
-	RiskSignalID  string     `json:"risk_signal_id"`
-	PrincipalID   string     `json:"principal_id"`
-	TenantID      string     `json:"tenant_id"`
-	SignalType    SignalType  `json:"signal_type"`
-	SignalValue   int        `json:"signal_value"`
-	SignalSource  string     `json:"signal_source"`
-	ValidFrom     time.Time  `json:"valid_from"`
-	ValidTo       time.Time  `json:"valid_to"`
-	SupersededBy  *string    `json:"superseded_by"` // FK to newer record
-	CreatedAt     time.Time  `json:"created_at"`
+	RiskSignalID string     `json:"risk_signal_id"`
+	PrincipalID  string     `json:"principal_id"`
+	TenantID     string     `json:"tenant_id"`
+	SignalType   SignalType `json:"signal_type"`
+	SignalValue  int        `json:"signal_value"`
+	SignalSource string     `json:"signal_source"`
+	ValidFrom    time.Time  `json:"valid_from"`
+	ValidTo      time.Time  `json:"valid_to"`
+	SupersededBy *string    `json:"superseded_by"` // FK to newer record
+	CreatedAt    time.Time  `json:"created_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +158,8 @@ type PrincipalClaims struct {
 }
 
 type RoleProfileClaims struct {
-	RoleAssignments    []RoleAssignmentClaim `json:"role_assignments"`
-	PermissionBundleIDs []string             `json:"permission_bundle_ids"`
+	RoleAssignments     []RoleAssignmentClaim `json:"role_assignments"`
+	PermissionBundleIDs []string              `json:"permission_bundle_ids"`
 }
 
 type RoleAssignmentClaim struct {

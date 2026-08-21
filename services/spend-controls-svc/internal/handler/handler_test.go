@@ -227,10 +227,10 @@ type stubPublisher struct {
 	breached, blocked int
 }
 
-func (p *stubPublisher) PublishThresholdBreached(_ context.Context, _ string, _ domain.SpendCheckRequest, _ domain.SpendPolicy, _ float64) {
+func (p *stubPublisher) PublishThresholdBreached(_ context.Context, _, _ string, _ domain.SpendCheckRequest, _ domain.SpendPolicy, _ float64) {
 	p.breached++
 }
-func (p *stubPublisher) PublishBlockApplied(_ context.Context, _ string, _ domain.SpendCheckRequest, _ domain.SpendPolicy) {
+func (p *stubPublisher) PublishBlockApplied(_ context.Context, _, _ string, _ domain.SpendCheckRequest, _ domain.SpendPolicy) {
 	p.blocked++
 }
 

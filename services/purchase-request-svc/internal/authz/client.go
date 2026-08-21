@@ -84,6 +84,22 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 	}
 }
 
+// NewHTTPClientWithHTTPClient is NewHTTPClient but with a caller-supplied
+// *http.Client — used for the mTLS pilot, where the client's Transport
+// already carries this service's leaf certificate and trusts
+// authorization-svc's CA (see internal/mtls.NewClientHTTPClient). Unlike
+// NewHTTPClient, it does not wrap httpClient in newRetryTransport(): the
+// caller-supplied Transport already carries the mTLS certificates, and
+// swapping it for the retry transport would silently drop them.
+func NewHTTPClientWithHTTPClient(baseURL string, httpClient *http.Client, log *zap.Logger) *HTTPClient {
+	return &HTTPClient{
+		baseURL: baseURL,
+		log:     log,
+		http:    httpClient,
+		cache:   make(map[string]cachedDecision),
+	}
+}
+
 type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`

@@ -51,8 +51,8 @@ func validClaims(expOffset time.Duration) idpClaims {
 		TenantID: "tenant-abc",
 		MFADone:  false,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:  "auth0|user-123",
-			IssuedAt: jwt.NewNumericDate(now),
+			Subject:   "auth0|user-123",
+			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(expOffset)),
 		},
 	}

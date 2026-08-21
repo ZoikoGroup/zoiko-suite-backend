@@ -23,9 +23,15 @@ import (
 	"zoiko.io/workforce-compliance-svc/internal/health"
 	"zoiko.io/workforce-compliance-svc/internal/jurisdiction"
 	"zoiko.io/workforce-compliance-svc/internal/middleware"
+	"zoiko.io/workforce-compliance-svc/internal/mtls"
 	"zoiko.io/workforce-compliance-svc/internal/store"
 	"zoiko.io/workforce-compliance-svc/internal/telemetry"
 )
+
+// platformScopeID is the legal_entity_id this service presents to
+// mtls-management-svc when provisioning its client identity for the
+// mTLS pilot (see internal/mtls).
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	logger, err := telemetry.NewLogger("workforce-compliance-svc")
@@ -63,7 +69,18 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "workforce-compliance-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 	empClient := employee.NewClient(cfg.EmployeeMasterURL)
 	jurisdictionClient := jurisdiction.NewClient(cfg.JurisdictionRulesURL)
 

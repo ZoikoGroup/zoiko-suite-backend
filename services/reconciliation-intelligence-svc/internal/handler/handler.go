@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	RECONCILIATION_ANALYZE      = "RECONCILIATION_ANALYZE"
+	RECONCILIATION_ANALYZE          = "RECONCILIATION_ANALYZE"
 	RECONCILIATION_APPLY_RESOLUTION = "RECONCILIATION_APPLY_RESOLUTION"
-	RECONCILIATION_ARCHIVE      = "RECONCILIATION_ARCHIVE"
+	RECONCILIATION_ARCHIVE          = "RECONCILIATION_ARCHIVE"
 )
 
 type Handler struct {
@@ -103,13 +103,22 @@ func (h *Handler) AnalyzeReconciliation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "reconciliation.analyzed", tenantID, job)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "reconciliation.analyzed", SubjectID: job.ID, TenantID: tenantID,
+		LegalEntityID: job.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: job,
+	})
 
 	if unmatched > 0 {
-		_ = h.publisher.Publish(r.Context(), "reconciliation.unmatched_flagged", tenantID, map[string]interface{}{
-			"job_id":          job.ID,
-			"unmatched_count": unmatched,
-			"rate":            rate,
+		_ = h.publisher.Publish(r.Context(), events.PublishParams{
+			EventType: "reconciliation.unmatched_flagged", SubjectID: job.ID, TenantID: tenantID,
+			LegalEntityID: job.LegalEntityID, ActorID: principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"),
+			Payload: map[string]interface{}{
+				"job_id":          job.ID,
+				"unmatched_count": unmatched,
+				"rate":            rate,
+			},
 		})
 	}
 
@@ -188,7 +197,11 @@ func (h *Handler) ApplyResolution(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "reconciliation.resolution_recommended", tenantID, item)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "reconciliation.resolution_recommended", SubjectID: itemID, TenantID: tenantID,
+		LegalEntityID: job.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: item,
+	})
 
 	h.respondJSON(w, http.StatusOK, item)
 }

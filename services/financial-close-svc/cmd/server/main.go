@@ -25,9 +25,15 @@ import (
 	"zoiko.io/financial-close-svc/internal/handler"
 	"zoiko.io/financial-close-svc/internal/health"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
+	"zoiko.io/financial-close-svc/internal/mtls"
 	"zoiko.io/financial-close-svc/internal/store"
 	"zoiko.io/financial-close-svc/internal/telemetry"
 )
+
+// platformScopeID is the legal_entity_id presented to mtls-management-svc
+// when provisioning this service's own client-side mTLS identity — the same
+// platform-wide scope tax-rules-svc's mTLS pilot uses.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -120,7 +126,18 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	clientsWrapper := clients.New(cfg.AuthZServiceURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log)
+
+	var clientsWrapper *clients.Clients
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "financial-close-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		clientsWrapper = clients.NewWithAuthzHTTPClient(cfg.AuthzMTLSURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log, mtlsHTTPClient)
+	} else {
+		clientsWrapper = clients.New(cfg.AuthZServiceURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log)
+	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()

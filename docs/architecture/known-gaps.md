@@ -1,5 +1,124 @@
 # Known Architecture & Test Coverage Gaps
 
+## Resolved (2026-08-17): no circuit breakers anywhere on the platform (03-microservices.md §17.7)
+
+7 services (10 packages: accounts-payable-svc, accounts-receivable-svc,
+bank-reconciliation-svc, financial-close-svc, general-ledger-svc,
+purchase-request-svc, treasury-svc) had retry-with-backoff
+(`retryTransport`) for their outbound HTTP calls, but retry and circuit
+breaking are different mechanisms — retry keeps trying a call that keeps
+failing; a breaker stops trying once it's clear the dependency is down.
+No service anywhere had the latter, and no other cross-service HTTP
+client on the platform had either.
+
+Added a closed/open/half-open state machine to the same `retryTransport`
+struct: 5 consecutive failures (any method) trips it open for 10s, during
+which every call fails fast without touching the network; the next call
+after the cooldown is let through as a probe, closing the breaker on
+success or reopening it on failure. Verified with new tests per package
+(breaker trips and short-circuits, a successful half-open probe recovers
+it) plus a full build/vet/test sweep.
+
+## Resolved (2026-08-17): no dead-letter routing anywhere (03-microservices.md §17.7)
+
+audit-event-store-svc and workflow-history-svc were the only two Kafka
+consumers that even acknowledged this in a TODO comment; neither, nor
+any other consumer, had it. Both left a failed message uncommitted
+forever, on the assumption that "the broker will re-deliver after a
+restart" — not actually true, since Kafka consumer group offsets are a
+single per-partition watermark: a *later* message succeeding and
+committing silently carries the offset past an earlier failed one,
+permanently dropping it. Until that happened, the failed message also
+head-of-line-blocked every other message on the partition.
+
+Both runners now retry a failed message a few times against the same
+handler call, and if it still fails, republish it unchanged to
+`<topic>.dlq` (original headers preserved, plus the failure reason,
+source offset, and timestamp) and only then commit past it. A failed DLQ
+publish falls back to the old uncommitted-and-retry behavior, so this
+never makes failure handling worse than before.
+
+## Resolved (2026-08-17): procurement-workflow-svc could strand a real purchase order behind a failed local write
+
+`IssueOrder` called purchase-order-svc, then recorded the resulting
+`purchase_order_id` locally; if that second, purely-local write failed,
+the case stayed APPROVED with no order_id even though the order now
+genuinely existed upstream. 03-microservices.md §17.8's saga-discipline
+mandate has no compensating-transaction mechanism anywhere on this
+platform to unwind that — and shouldn't gain one here, since
+purchase-order-svc keys the order on the case's own ID as an idempotency
+key, so a cancel-and-retry compensation would just race a legitimate
+retry.
+
+The local write is now retried up to 3 times with a short backoff before
+giving up — a transient blip right after a real external side effect is
+worth retrying locally rather than surfacing an error for something that
+already succeeded elsewhere. If every retry still fails, the system stays
+recoverable regardless: a caller retrying the same endpoint re-issues
+against the same idempotency key and gets another chance at the local
+write.
+
+## Resolved (2026-08-17): accounts-payable-svc's RequestPayment was non-duplicating but not idempotent
+
+03-microservices.md §3.7 requires every state-changing API to be
+idempotent. This endpoint had no client-supplied idempotency key (unlike
+invoice creation's `correlation_id`) and relied solely on the
+status-machine guard on `invoice_id`: a retry against an invoice already
+PAYMENT_REQUESTED correctly never published a duplicate event, but it
+also never succeeded — it returned 422, which is non-duplicating, not
+idempotent. A client retrying a timed-out-but-actually-successful call
+had no way to get back the success it already caused.
+
+Now recognizes the retry from the invoice's own state: requesting payment
+on an invoice already PAYMENT_REQUESTED returns 200 with the current
+invoice and does not publish again, whether it was already in that state
+before the call or a concurrent request won the same atomic transition
+first. Any other status is still a genuine invalid transition and still
+422s.
+
+## Resolved (2026-08-17): every service connected to Postgres as the superuser, which unconditionally bypasses Row-Level Security
+
+This was the single most-cited gap against the original architecture spec
+(Doc 01 §11.2, "Row-level authorization enforced at the data access layer"
+as a stated minimum; §17.1 "least privilege" as a core security principle;
+§18.3 lists the tenant/entity model among "Non-Negotiable Foundations").
+55 services define real `CREATE POLICY` tenant-isolation policies — every
+one of them was running with that guarantee silently disabled, because a
+Postgres superuser bypasses RLS regardless of how correct the policy text
+is. This was previously "carried forward" as an accepted, unfixed risk in
+this file (see the tenant-entity-registry-svc entry below) on the basis
+that it was "a separate, estate-wide change" — it has now been made.
+
+Fix: migrations still run as the superuser (DDL/extensions need that), but
+every service now connects at runtime as a new, non-superuser,
+non-owner role, `zoiko_app` (`NOSUPERUSER NOCREATEDB NOCREATEROLE
+NOBYPASSRLS`). A non-owner, non-superuser role is automatically subject to
+`ENABLE ROW LEVEL SECURITY` policies with no further schema change needed
+— `FORCE ROW LEVEL SECURITY` was not required because `zoiko_app` was
+deliberately never made the table owner. Applied to `deployments/init-db.sh`
+and `init-db-phase5/6/7.sh` (so it's automatic for a fresh volume) and to
+`deployments/docker-compose*.yml` (`DB_USER`/`DB_PASSWORD` and the
+`DATABASE_URL`-style services), across all 63 databases in the main stack
+plus the phase5/6/7 stacks.
+
+Live-verified against a running instance, not just reviewed: with
+`app.tenant_id` set to tenant A, a query against `tenants` as the
+superuser returned **both** tenant A's and tenant B's rows (reproducing
+the exact bug); the identical query as `zoiko_app` returned **only**
+tenant A's row. Also verified `zoiko_app` retains full INSERT/UPDATE/DELETE
+for its own tenant's rows (a write scoped to the wrong `tenant_id` is
+correctly rejected by the policy's `WITH CHECK`, not merely its `USING`
+clause), and that `tenant-entity-registry-svc` and `general-ledger-svc`
+both boot and connect cleanly under the new credentials with no
+application-level changes required.
+
+Not in scope for this pass: the ~30 services with tenant-scoped tables
+but no `CREATE POLICY` defined at all still have no RLS to make load-
+bearing — they rely solely on the application-level `WHERE tenant_id = ...`
+filtering that was always the case. Adding real RLS policies to those is a
+separate, larger effort (each needs its own policy design, not just a
+credential change).
+
 ## Resolved: tenant-entity-registry-svc trusted an unsigned JWT for tenant isolation
 
 Three defects that compounded, all closed 2026-08-05 and verified against
@@ -39,13 +158,13 @@ fails closed; and tenant-scoped reads assert the path tenant equals the
 caller's verified tenant, returning 404 rather than 403 so a probe cannot
 confirm a tenant's existence.
 
-Carried forward: the superuser RLS bypass itself is unchanged and affects
-every service in the estate that connects as `postgres`. The explicit scope
-check makes this service safe regardless, which is the same belt-and-braces
-posture purchase-order-svc and general-ledger-svc adopted after real CI
-failures. Running the services as a non-superuser role with FORCE ROW LEVEL
-SECURITY would make the policies load-bearing again and is a separate,
-estate-wide change.
+Formerly carried forward, now resolved: the superuser RLS bypass itself
+affected every service in the estate that connected as `postgres`. See
+"Resolved (2026-08-17)" at the top of this file — every service now
+connects at runtime as a non-superuser `zoiko_app` role, making this
+service's own RLS policies load-bearing again, not just the explicit
+application-level scope check described above (which remains in place as
+defense-in-depth).
 
 Also of note: `internal/store/tenant_isolation_test.go` already documented
 this exact superuser trap and covers the store methods that take a tenant
@@ -255,10 +374,60 @@ exists on the platform; screening_source is the field that will distinguish
 its results from the stub's, and every historical row stays honest about
 having been screened by the stub.
 
-## Open: authorization-svc role creation reports a duplicate as an outage
-Re-POSTing an existing role answers 503 `store_unavailable` rather than 200 or
-409. Recorded in seed-demo-rbac.ps1, which tolerates it and relies on its
-end-of-run verification instead.
+## Resolved: authorization-svc role creation reports a duplicate as an outage
+Was: re-POSTing an existing role answers 503 `store_unavailable` rather than
+200 or 409. Recorded in seed-demo-rbac.ps1, which tolerated it and relied on
+its end-of-run verification instead.
+
+By the time this was investigated for a fix (2026-08-18), `CreateRole` in
+`internal/store/pg_store.go` already did the right thing: `INSERT ... ON
+CONFLICT (tenant_id, role_code) DO NOTHING`, then a fallback `SELECT` on
+conflict, returning the existing row (200) when name/scope match or
+`domain.ErrConflict` (409) when they don't — never a store-unavailable 503
+for this case. `TestPgStore_CreateRole_IdempotencyAnd409` in the same
+package proves it. This entry predates that fix; seed-demo-rbac.ps1's
+tolerance workaround can be removed the next time that script is touched.
+
+## Resolved: secret-vault-integration-svc's 000002 migration was never applied by init-db.sh
+`000002_add_data_classification.up.sql` existed in the repo but init-db.sh
+only ever ran `000001_initial_schema.up.sql` for this service — the same
+class of gap as the "several databases... do not exist" entry below, but for
+a migration rather than a whole database. Found live: `CreateSecretPolicy`
+failed with `column "data_classification" of relation "secret_policies" does
+not exist`, reported to the caller as a generic `store_unavailable` (yet
+another instance of the platform-wide "driver error reported as an outage"
+pattern already documented elsewhere in this file). Fixed by adding the
+missing line to init-db.sh and applying the migration to the running
+container.
+
+## Open: secret-vault-integration-svc's broker never returns usable secret material
+Live-verified the full policy → version → activate → put-material → broker
+flow end-to-end for the first time anywhere on this platform. It works
+exactly as designed through every step — except the design itself is the
+gap: `vault.Backend.Get` (internal/vault/backend.go) deliberately returns an
+opaque lease token, never the raw secret value ("this service brokers
+access to secrets, it does not become a second copy of them"), and no other
+endpoint anywhere in the service exposes the underlying material either.
+
+That means there is currently no functional path — for a service or a
+human — to get a secret's actual value back out of this vault once it has
+been stored. The broker mechanism is fully real for *authorization and
+audit* (who requested what, when, whether they were on the
+allowed_workload_ids list, an immutable GRANTED/DENIED trail) but cannot
+yet serve its apparent purpose of letting a consuming service bootstrap a
+real credential (e.g. its own DB password) at startup.
+
+An initial attempt to wire general-ledger-svc's DB password through this
+path was built, live-tested against the real broker response, found to
+return `"local-lease:aGqKvDINXRJ8370wYH66VVI6Aau0LIKQ"` instead of the
+material that had actually been PUT, and reverted rather than shipped —
+setting DB.Password to that value would have broken the DB connection the
+moment SECRET_VAULT_SERVICE_URL was ever set to a non-empty value. This is
+upstream of what a "wire the existing pieces together" pass can fix: it
+needs a real design decision in secret-vault-integration-svc itself (e.g. a
+genuine material-exchange path scoped to the exact allowed workload, or the
+vault performing operations on the caller's behalf rather than ever handing
+back a value) before any consuming service can be wired to it for real.
 
 ## Open: several databases in deployments/init-db.sh do not exist on an
 ## existing postgres volume
@@ -771,3 +940,57 @@ it, and no delete is blocked by it — there is no delete route at all.
 ErrRetentionActive is defined in the domain and never returned. A document
 marked for a seven-year hold is not held by anything in this vault; the label
 records an intention that some other system would have to honour.
+
+## Resolved: event_id collision across 21 services' Kafka publishers
+Found while standardizing event envelopes to Doc 03 §19 (2026-08-19).
+21 services (contract-lifecycle-svc, filing-tracker-svc, plus 19 more:
+ai-governance-svc, capability-registry-svc, clause-template-svc,
+commercial-account-svc, compliance-status-svc, corporate-actions-svc,
+corporate-tax-svc, counterparty-management-svc, exception-escalation-svc,
+filing-preparation-svc, kill-switch-registry-svc, metric-registry-svc,
+obligation-tracking-svc, retention-registry-svc, source-authority-svc,
+tax-determination-svc, tax-rules-svc, vat-gst-svc, withholding-tax-svc) all
+copy-pasted the same event-ID pattern from an early scaffold:
+`EventID: "evt-" + eventType + "-" + <someID>`. This is deterministic, not
+unique — every repeat occurrence of the same event type on the same
+aggregate (e.g. a contract updated twice, a filing requirement edited
+twice) produces the IDENTICAL event_id. Any consumer deduplicating via
+`INSERT ... ON CONFLICT (event_id) DO NOTHING` — the exact pattern this
+platform's own evidence/history consumers (audit-event-store-svc,
+workflow-history-svc) use — would silently drop the second, real event as
+if it were a broker redelivery of the first, not a new fact.
+
+Fixed in all 21 services: `EventID: "evt-" + uuid.New().String()`, a fresh
+UUID per publish call. contract-lifecycle-svc and filing-tracker-svc got a
+fuller envelope rewrite (event_version, correlation_id, legal_entity_id,
+actor_id added, per Doc 03 §19) with regression tests proving two real
+events now get distinct IDs; the other 19 got the same event_id fix as a
+standalone, minimal, mechanically-verified change (build+vet+test clean
+on every one) without the broader envelope rewrite, which still needs
+doing per service the same way the six Doc 03 §3.7 mandatory cases were.
+
+## Open: commercial-account-svc's outbox-relayed events carry no actor/correlation
+While standardizing this service's event envelope (2026-08-19), the 6
+direct handler-published events (commercial_account.created,
+membership.created/deactivated, commercial_subscription.plan_changed/
+status_changed/billing_source_transferred) all got real actor_id and
+correlation_id, sourced from each handler's own requirePrincipal() call
+and X-Correlation-ID header.
+
+commercial_subscription.created is different: it's published via the
+transactional-outbox Relay (internal/outbox), not a direct handler call,
+and `outbox_events` has no actor_id/correlation_id column — only
+aggregate_type, aggregate_id, event_type, payload, tenant_id. The relayed
+event's envelope genuinely has neither to give, so PublishForOutbox (the
+adapter internal/outbox calls) leaves both empty rather than fabricating
+them.
+
+The real data exists — domain.CommercialSubscription already carries
+CreatedByPrincipalID at the moment outbox.Insert is called inside
+CreateSubscription's transaction (internal/store/subscription_store.go) —
+it just isn't threaded onto the outbox row. Closing this needs a small
+schema change (add actor_id/correlation_id columns to outbox_events) plus
+threading them through outbox.Event → the stored row → the Relay's
+publish call. Deliberately not done in this pass to keep the outbox
+pattern's own correctness (the actual point of today's change) isolated
+from a schema migration.

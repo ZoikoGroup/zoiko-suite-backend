@@ -92,7 +92,11 @@ func (h *Handler) Calculate(w http.ResponseWriter, r *http.Request) {
 		TaxTreatyApplied:       treatyApplied,
 	}
 
-	_ = h.publisher.Publish(r.Context(), "withholding_tax.calculated", req.PaymentReference, tenantID, res)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "withholding_tax.calculated", ObligationID: req.PaymentReference, TenantID: tenantID,
+		LegalEntityID: req.LegalEntityID, Jurisdiction: req.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: res,
+	})
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -146,7 +150,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create withholding tax obligation")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "withholding_tax.created", o.ObligationID, tenantID, o)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "withholding_tax.created", ObligationID: o.ObligationID, TenantID: tenantID,
+		LegalEntityID: o.LegalEntityID, Jurisdiction: o.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
+	})
 	writeJSON(w, http.StatusCreated, o)
 }
 
@@ -226,7 +234,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to update withholding tax obligation")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "withholding_tax.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "withholding_tax.updated", ObligationID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -277,7 +289,11 @@ func (h *Handler) Remit(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "withholding_tax.remitted", id, tenantID, o)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "withholding_tax.remitted", ObligationID: id, TenantID: tenantID,
+		LegalEntityID: o.LegalEntityID, Jurisdiction: o.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
+	})
 	writeJSON(w, http.StatusOK, o)
 }
 
@@ -324,7 +340,11 @@ func (h *Handler) Cancel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "withholding_tax.cancelled", id, tenantID, o)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "withholding_tax.cancelled", ObligationID: id, TenantID: tenantID,
+		LegalEntityID: o.LegalEntityID, Jurisdiction: o.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: o,
+	})
 	writeJSON(w, http.StatusOK, o)
 }
 

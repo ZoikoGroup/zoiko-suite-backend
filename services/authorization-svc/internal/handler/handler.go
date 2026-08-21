@@ -12,6 +12,7 @@ import (
 
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
+	"zoiko.io/authorization-svc/internal/siem"
 )
 
 // AuthorizationStore is the narrow interface the handler depends on.
@@ -41,11 +42,12 @@ type Handler struct {
 	store                 AuthorizationStore
 	publisher             EventPublisher
 	jurisdictionValidator jurisdiction.Validator
+	siem                  *siem.Client
 	log                   *zap.Logger
 }
 
-func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, jurisdictionValidator: jurisdictionValidator, log: log}
+func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, siemClient *siem.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, jurisdictionValidator: jurisdictionValidator, siem: siemClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -557,7 +559,19 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		if pubErr := h.publisher.PublishAuthorizationDenied(r.Context(), *decision); pubErr != nil {
 			h.log.Error("Authorize: failed to publish authorization.denied", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 		}
-		if len(basis) > len("sod:conflict_with=") && basis[:len("sod:conflict_with=")] == "sod:conflict_with=" {
+		// Doc 05 §13.2 names "authorization grants/denials" as a required
+		// SIEM signal. Only DENIED streams here — GRANTED is the overwhelming
+		// majority outcome on this endpoint (it's called on nearly every
+		// mutating request platform-wide), and streaming every success would
+		// bury the actionable signal in noise rather than surface it.
+		severity := siem.SeverityMedium
+		isSoD := len(basis) > len("sod:conflict_with=") && basis[:len("sod:conflict_with=")] == "sod:conflict_with="
+		if isSoD {
+			severity = siem.SeverityHigh
+		}
+		h.siem.Stream(r.Context(), req.TenantID, "authorization.denied", severity,
+			"Authorization denied for principal "+req.PrincipalID+", action "+req.ActionType+": "+basis)
+		if isSoD {
 			conflictingAction := basis[len("sod:conflict_with="):]
 			if pubErr := h.publisher.PublishSoDViolationDetected(r.Context(), *decision, conflictingAction); pubErr != nil {
 				h.log.Error("Authorize: failed to publish sod.violation.detected", zap.String("correlation_id", correlationID), zap.Error(pubErr))

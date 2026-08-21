@@ -532,4 +532,3 @@ func TestPgStore_TenantIsolation_TransitionTenantLifecycle(t *testing.T) {
 	require.NotNil(t, tenant)
 	assert.Equal(t, domain.TenantLifecycleOnboarding, tenant.LifecycleState, "ISOLATION FAILURE: tenant B transitioned tenant A's lifecycle state")
 }
-

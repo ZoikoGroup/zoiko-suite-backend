@@ -29,6 +29,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/session"
+	"zoiko.io/identity-context-svc/internal/siem"
 	"zoiko.io/identity-context-svc/internal/store"
 	"zoiko.io/identity-context-svc/internal/telemetry"
 	"zoiko.io/identity-context-svc/internal/upstream"
@@ -135,6 +136,8 @@ func main() {
 		log.Fatal("failed to initialise JWT signer", zap.Error(err))
 	}
 
+	siemClient := siem.New(cfg.SIEMServiceURL, "identity-context-svc", log)
+
 	// ── Resolver ──────────────────────────────────────────────────────────
 	resolver := identityctx.NewResolver(
 		cfg,
@@ -146,6 +149,7 @@ func main() {
 		publisher,
 		verifier,
 		signer,
+		siemClient,
 	)
 
 	// ── HTTP router ───────────────────────────────────────────────────────

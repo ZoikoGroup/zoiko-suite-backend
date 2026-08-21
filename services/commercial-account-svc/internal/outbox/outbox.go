@@ -61,11 +61,15 @@ type storedEvent struct {
 	Attempts      int
 }
 
-// Publisher is the narrow interface Relay depends on — matches
-// events.Publisher's shape without importing that package, so this file
-// stays copyable to any other service unchanged.
+// Publisher is the narrow interface Relay depends on. Named
+// PublishForOutbox (not Publish) because internal/events.KafkaPublisher's
+// real Publish signature now takes a PublishParams struct carrying
+// envelope fields (actor_id, correlation_id) that a relayed outbox row has
+// no source for — PublishForOutbox is the explicit, honestly-narrower
+// adapter method for exactly that case, kept separate so this file stays
+// copyable to any other service without importing internal/events.
 type Publisher interface {
-	Publish(ctx context.Context, eventType, entityID, tenantID string, payload interface{}) error
+	PublishForOutbox(ctx context.Context, eventType, entityID, tenantID string, payload interface{}) error
 }
 
 // Relay polls outbox_events for unpublished rows and publishes them.
@@ -145,7 +149,7 @@ func (r *Relay) relayOnce(ctx context.Context) {
 		var payload interface{}
 		_ = json.Unmarshal(e.Payload, &payload)
 
-		if pubErr := r.publisher.Publish(ctx, e.EventType, e.AggregateID, tenantID, payload); pubErr != nil {
+		if pubErr := r.publisher.PublishForOutbox(ctx, e.EventType, e.AggregateID, tenantID, payload); pubErr != nil {
 			r.markFailed(ctx, e.OutboxEventID, pubErr)
 			continue
 		}

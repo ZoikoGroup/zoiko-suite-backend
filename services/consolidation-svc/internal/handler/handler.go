@@ -31,9 +31,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishRunStarted(ctx context.Context, correlationID string, run domain.ConsolidationRun)
-	PublishCompleted(ctx context.Context, correlationID string, run domain.ConsolidationRun, snapshotCount int)
-	PublishExceptionDetected(ctx context.Context, correlationID string, run domain.ConsolidationRun, exceptions []string)
+	PublishRunStarted(ctx context.Context, correlationID, actorID string, run domain.ConsolidationRun)
+	PublishCompleted(ctx context.Context, correlationID, actorID string, run domain.ConsolidationRun, snapshotCount int)
+	PublishExceptionDetected(ctx context.Context, correlationID, actorID string, run domain.ConsolidationRun, exceptions []string)
 }
 
 type AuthZClient interface {
@@ -124,7 +124,7 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishRunStarted(r.Context(), correlationID, *run)
+	h.publisher.PublishRunStarted(r.Context(), correlationID, principalID, *run)
 
 	// Step 1: Query GL Trial Balances across all child legal entities
 	consolidatedBalances := make(map[string]float64)
@@ -193,7 +193,7 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	run.Status = "COMPLETED"
 	run.CompletedAt = &completedAt
 
-	h.publisher.PublishCompleted(r.Context(), correlationID, *run, len(snapshots))
+	h.publisher.PublishCompleted(r.Context(), correlationID, principalID, *run, len(snapshots))
 
 	writeJSON(w, http.StatusCreated, domain.ConsolidationRunResponse{
 		ConsolidationRunID: runID,

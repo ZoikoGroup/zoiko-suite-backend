@@ -142,8 +142,8 @@ type SecretAccessAuditLog struct {
 	// entries — see Store.Rotate's doc comment.
 	RequestID *string `json:"request_id"`
 
-	OutcomeDetail string `json:"outcome_detail"`
-	CorrelationID string `json:"correlation_id"`
+	OutcomeDetail string    `json:"outcome_detail"`
+	CorrelationID string    `json:"correlation_id"`
 	RecordedAt    time.Time `json:"recorded_at"`
 }
 
@@ -187,8 +187,8 @@ type BrokerParams struct {
 // whether granted or denied, so the handler can respond and log
 // consistently regardless of outcome.
 type BrokerResult struct {
-	Granted   bool
-	Lease     *SecretLease
+	Granted    bool
+	Lease      *SecretLease
 	LeaseToken string
 }
 

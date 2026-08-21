@@ -20,6 +20,7 @@ import (
 	"zoiko.io/connectivity-api-bridge-svc/internal/handler"
 	"zoiko.io/connectivity-api-bridge-svc/internal/health"
 	"zoiko.io/connectivity-api-bridge-svc/internal/middleware"
+	"zoiko.io/connectivity-api-bridge-svc/internal/mtls"
 	"zoiko.io/connectivity-api-bridge-svc/internal/store"
 	"zoiko.io/connectivity-api-bridge-svc/internal/telemetry"
 )
@@ -63,7 +64,16 @@ func main() {
 
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "connectivity-api-bridge-svc", "00000000-0000-0000-0000-00000000f001")
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 
 	h := handler.New(st, publisher, authzClient, logger)
 

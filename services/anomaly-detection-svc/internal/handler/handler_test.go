@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/anomaly-detection-svc/internal/authz"
 	"zoiko.io/anomaly-detection-svc/internal/domain"
+	"zoiko.io/anomaly-detection-svc/internal/events"
 )
 
 type mockStore struct {
@@ -105,7 +106,7 @@ func (m *mockStore) ListRules(ctx context.Context, domainName string) ([]domain.
 
 type mockPublisher struct{}
 
-func (p *mockPublisher) Publish(ctx context.Context, eventType, subjectID, tenantID string, payload interface{}) error {
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
 	return nil
 }
 

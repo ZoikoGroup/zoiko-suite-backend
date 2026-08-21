@@ -29,7 +29,7 @@ type Store interface {
 // Publisher is the event-publishing contract the handler depends on.
 type Publisher interface {
 	PublishOrderIssued(ctx context.Context, o domain.PurchaseOrder)
-	PublishOrderAmended(ctx context.Context, o domain.PurchaseOrder)
+	PublishOrderAmended(ctx context.Context, actorID string, o domain.PurchaseOrder)
 	PublishOrderClosed(ctx context.Context, o domain.PurchaseOrder)
 }
 
@@ -55,11 +55,11 @@ const (
 )
 
 type Handler struct {
-	store   Store
+	store     Store
 	publisher Publisher
-	authz   AuthZClient
-	prClient PurchaseRequestClient
-	log     *zap.Logger
+	authz     AuthZClient
+	prClient  PurchaseRequestClient
+	log       *zap.Logger
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, prClient PurchaseRequestClient, log *zap.Logger) *Handler {
@@ -307,7 +307,7 @@ func (h *Handler) AmendOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishOrderAmended(r.Context(), *updated)
+	h.publisher.PublishOrderAmended(r.Context(), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 

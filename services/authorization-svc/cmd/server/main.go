@@ -35,6 +35,7 @@ import (
 	"zoiko.io/authorization-svc/internal/health"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
 	"zoiko.io/authorization-svc/internal/mtls"
+	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
 	"zoiko.io/authorization-svc/internal/telemetry"
 )
@@ -131,7 +132,8 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, jurisdictionValidator, log)
+	siemClient := siem.New(cfg.SIEMServiceURL, "authorization-svc", log)
+	h := handler.New(pgStore, publisher, jurisdictionValidator, siemClient, log)
 	handler.RegisterRoutes(r, h)
 
 	healthH := health.New(pool, log)

@@ -31,10 +31,10 @@ type Store interface {
 
 // Publisher is the event-publishing contract the handler depends on.
 type Publisher interface {
-	PublishStatementIngested(ctx context.Context, l domain.StatementLine)
+	PublishStatementIngested(ctx context.Context, l domain.StatementLine, actorID string)
 	PublishReconciliationMatched(ctx context.Context, l domain.StatementLine)
 	PublishReconciliationExceptionRaised(ctx context.Context, l domain.StatementLine)
-	PublishReconciliationCompleted(ctx context.Context, correlationID, tenantID, bankAccountID, statementDate string)
+	PublishReconciliationCompleted(ctx context.Context, correlationID, tenantID, actorID, bankAccountID, statementDate string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -150,7 +150,7 @@ func (h *Handler) CreateStatementLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishStatementIngested(r.Context(), *l)
+	h.publisher.PublishStatementIngested(r.Context(), *l, principalID)
 	writeJSON(w, http.StatusCreated, l)
 }
 
@@ -457,7 +457,7 @@ func (h *Handler) CompleteStatement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishReconciliationCompleted(r.Context(), r.Header.Get("X-Correlation-ID"), tenantID, bankAccountID, statementDate)
+	h.publisher.PublishReconciliationCompleted(r.Context(), r.Header.Get("X-Correlation-ID"), tenantID, principalID, bankAccountID, statementDate)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"tenant_id":       tenantID,
 		"bank_account_id": bankAccountID,

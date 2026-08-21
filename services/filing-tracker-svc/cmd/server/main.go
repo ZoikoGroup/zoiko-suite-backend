@@ -21,6 +21,7 @@ import (
 	"zoiko.io/filing-tracker-svc/internal/handler"
 	"zoiko.io/filing-tracker-svc/internal/health"
 	"zoiko.io/filing-tracker-svc/internal/middleware"
+	"zoiko.io/filing-tracker-svc/internal/mtls"
 	"zoiko.io/filing-tracker-svc/internal/store"
 	"zoiko.io/filing-tracker-svc/internal/telemetry"
 )
@@ -61,7 +62,19 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+
+	const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "filing-tracker-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 
 	h := handler.New(pgStore, publisher, authzClient, logger)
 

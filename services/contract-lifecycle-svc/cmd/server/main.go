@@ -22,6 +22,7 @@ import (
 	"zoiko.io/contract-lifecycle-svc/internal/handler"
 	"zoiko.io/contract-lifecycle-svc/internal/health"
 	"zoiko.io/contract-lifecycle-svc/internal/middleware"
+	"zoiko.io/contract-lifecycle-svc/internal/mtls"
 	"zoiko.io/contract-lifecycle-svc/internal/store"
 	"zoiko.io/contract-lifecycle-svc/internal/telemetry"
 )
@@ -62,7 +63,16 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "contract-lifecycle-svc", "00000000-0000-0000-0000-00000000f001")
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 	governanceLogClient := governancelog.NewClient(cfg.GovernanceLogURL)
 
 	h := handler.New(pgStore, publisher, authzClient, governanceLogClient, logger)

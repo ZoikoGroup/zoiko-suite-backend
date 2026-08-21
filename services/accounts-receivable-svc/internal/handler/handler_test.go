@@ -138,10 +138,14 @@ type stubPublisher struct {
 	issued, sent, overdue, paymentReceived int
 }
 
-func (p *stubPublisher) PublishInvoiceIssued(_ context.Context, _ domain.CustomerInvoice)    { p.issued++ }
-func (p *stubPublisher) PublishInvoiceSent(_ context.Context, _ domain.CustomerInvoice)      { p.sent++ }
-func (p *stubPublisher) PublishReceivableOverdue(_ context.Context, _ domain.CustomerInvoice) { p.overdue++ }
-func (p *stubPublisher) PublishPaymentReceived(_ context.Context, _ domain.CustomerInvoice)   { p.paymentReceived++ }
+func (p *stubPublisher) PublishInvoiceIssued(_ context.Context, _ domain.CustomerInvoice) { p.issued++ }
+func (p *stubPublisher) PublishInvoiceSent(_ context.Context, _ domain.CustomerInvoice)   { p.sent++ }
+func (p *stubPublisher) PublishReceivableOverdue(_ context.Context, _ domain.CustomerInvoice) {
+	p.overdue++
+}
+func (p *stubPublisher) PublishPaymentReceived(_ context.Context, _ domain.CustomerInvoice) {
+	p.paymentReceived++
+}
 
 type stubAuthZ struct {
 	err error

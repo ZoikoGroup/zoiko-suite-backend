@@ -64,7 +64,7 @@ type VaultBackend interface {
 type EventPublisher interface {
 	PublishAccessRequested(ctx context.Context, secretPath, requestedByPrincipalID, correlationID string) error
 	PublishAccessGranted(ctx context.Context, lease domain.SecretLease, correlationID string) error
-	PublishRotationCompleted(ctx context.Context, secretPolicyID, secretPath string, revokedLeaseCount int, correlationID string) error
+	PublishRotationCompleted(ctx context.Context, secretPolicyID, secretPath, rotatedByPrincipalID string, revokedLeaseCount int, correlationID string) error
 }
 
 // Handler holds all HTTP handler methods.
@@ -1063,7 +1063,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.publisher.PublishRotationCompleted(r.Context(), secretPolicyID, policy.SecretPath, len(revokedLeases), correlationID); err != nil {
+	if err := h.publisher.PublishRotationCompleted(r.Context(), secretPolicyID, policy.SecretPath, req.RotatedByPrincipalID, len(revokedLeases), correlationID); err != nil {
 		h.log.Error("Rotate: failed to publish secret.rotation.completed", zap.Error(err))
 	}
 

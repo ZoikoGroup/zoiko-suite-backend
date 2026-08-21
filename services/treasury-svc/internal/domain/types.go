@@ -68,16 +68,16 @@ type CashPositionResponse struct {
 
 // EffectiveCashResponse output model.
 type EffectiveCashResponse struct {
-	TenantID                 string               `json:"tenant_id"`
-	LegalEntityID            string               `json:"legal_entity_id"`
-	CurrencyCode             string               `json:"currency_code"`
-	CurrentBankBalance       float64              `json:"current_bank_balance"`
-	PendingAPCommitments     float64              `json:"pending_ap_commitments"`
-	PayrollObligations       float64              `json:"payroll_obligations"`
-	TaxLiabilities           float64              `json:"tax_liabilities"`
-	ReservedPendingApprovals float64              `json:"reserved_pending_approvals"`
-	EffectiveAvailableCash   float64              `json:"effective_available_cash"`
-	AsOfTimestamp            time.Time            `json:"as_of_timestamp"`
+	TenantID                 string                `json:"tenant_id"`
+	LegalEntityID            string                `json:"legal_entity_id"`
+	CurrencyCode             string                `json:"currency_code"`
+	CurrentBankBalance       float64               `json:"current_bank_balance"`
+	PendingAPCommitments     float64               `json:"pending_ap_commitments"`
+	PayrollObligations       float64               `json:"payroll_obligations"`
+	TaxLiabilities           float64               `json:"tax_liabilities"`
+	ReservedPendingApprovals float64               `json:"reserved_pending_approvals"`
+	EffectiveAvailableCash   float64               `json:"effective_available_cash"`
+	AsOfTimestamp            time.Time             `json:"as_of_timestamp"`
 	ThresholdDetails         *ThresholdAlertDetail `json:"threshold_details,omitempty"`
 }
 

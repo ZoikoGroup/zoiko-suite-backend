@@ -125,7 +125,7 @@ func (s *stubStore) ListHistoryForScope(_ context.Context, plane, domainName, pr
 
 type stubPublisher struct{ calls int }
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error {
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
 	p.calls++
 	return nil
 }

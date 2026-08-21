@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/exception-escalation-svc/internal/domain"
+	"zoiko.io/exception-escalation-svc/internal/events"
 )
 
 // mockAuthzClient grants every request; used to exercise the happy path in
@@ -144,7 +145,7 @@ func (m *mockStore) ListEscalations(ctx context.Context, role, status string) ([
 
 type mockPublisher struct{}
 
-func (p *mockPublisher) Publish(ctx context.Context, eventType, caseID, tenantID string, payload interface{}) error {
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
 	return nil
 }
 

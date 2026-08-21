@@ -15,7 +15,7 @@ import (
 
 // WorkflowStore is the narrow interface the handler depends on.
 type WorkflowStore interface {
-	CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, error)
+	CreateWorkflow(ctx context.Context, params domain.CreateWorkflowParams) (instance *domain.WorkflowInstance, stages []*domain.WorkflowStage, created bool, err error)
 	FindWorkflowByID(ctx context.Context, workflowInstanceID string) (*domain.WorkflowInstance, error)
 	FindStagesByWorkflowID(ctx context.Context, workflowInstanceID string) ([]*domain.WorkflowStage, error)
 	FindCurrentStage(ctx context.Context, workflowInstanceID string) (*domain.WorkflowStage, error)
@@ -24,13 +24,19 @@ type WorkflowStore interface {
 	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
 }
 
-// EventPublisher is the narrow interface the handler depends on.
+// EventPublisher is the narrow interface the handler depends on. actorID on
+// every method except PublishWorkflowStarted (which already has
+// w.InitiatedBy) is the already-verified req.ActorPrincipalID from that
+// request — the real principal who took the action, not necessarily the
+// same as stage.ApproverPrincipalID (the stage's assigned approver, which
+// CheckApprovalAllowed already confirmed matches, but the envelope's actor
+// should name who the request says acted, per Doc 03 §19).
 type EventPublisher interface {
 	PublishWorkflowStarted(ctx context.Context, w domain.WorkflowInstance) error
-	PublishApprovalGranted(ctx context.Context, w domain.WorkflowInstance, stage domain.WorkflowStage) error
-	PublishApprovalRejected(ctx context.Context, w domain.WorkflowInstance, stage domain.WorkflowStage) error
-	PublishWorkflowEscalated(ctx context.Context, w domain.WorkflowInstance) error
-	PublishWorkflowCompleted(ctx context.Context, w domain.WorkflowInstance) error
+	PublishApprovalGranted(ctx context.Context, w domain.WorkflowInstance, stage domain.WorkflowStage, actorID string) error
+	PublishApprovalRejected(ctx context.Context, w domain.WorkflowInstance, stage domain.WorkflowStage, actorID string) error
+	PublishWorkflowEscalated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
+	PublishWorkflowCompleted(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 }
 
 type Handler struct {
@@ -96,7 +102,8 @@ type workflowResponse struct {
 
 // CreateWorkflow handles POST /v1/workflows.
 //
-// Response: 201 created / 400 missing field or no stages / 503 unavailable.
+// Response: 201 created / 200 idempotent replay (same X-Correlation-ID as
+// an existing instance) / 400 missing field or no stages / 503 unavailable.
 func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -130,7 +137,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	instance, stages, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
+	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, WorkflowType: req.WorkflowType,
 		InitiatedBy: req.InitiatedBy, CorrelationID: correlationID, Stages: req.Stages,
 	})
@@ -144,17 +151,24 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if pubErr := h.publisher.PublishWorkflowStarted(r.Context(), *instance); pubErr != nil {
-		h.log.Error("CreateWorkflow: failed to publish workflow.started", zap.String("correlation_id", correlationID), zap.Error(pubErr))
+	// A retried call (created=false) resolves to the workflow the ORIGINAL
+	// call already started and already published workflow.started for —
+	// publishing it again here would be a duplicate business event for a
+	// workflow that was never actually re-initiated.
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+		if pubErr := h.publisher.PublishWorkflowStarted(r.Context(), *instance); pubErr != nil {
+			h.log.Error("CreateWorkflow: failed to publish workflow.started", zap.String("correlation_id", correlationID), zap.Error(pubErr))
+		}
+		h.log.Info("workflow started",
+			zap.String("workflow_instance_id", instance.WorkflowInstanceID),
+			zap.String("workflow_type", instance.WorkflowType),
+			zap.Int("stage_count", len(stages)),
+			zap.String("correlation_id", correlationID),
+		)
 	}
-
-	h.log.Info("workflow started",
-		zap.String("workflow_instance_id", instance.WorkflowInstanceID),
-		zap.String("workflow_type", instance.WorkflowType),
-		zap.Int("stage_count", len(stages)),
-		zap.String("correlation_id", correlationID),
-	)
-	writeJSON(w, http.StatusCreated, workflowResponse{WorkflowInstance: instance, Stages: stages})
+	writeJSON(w, status, workflowResponse{WorkflowInstance: instance, Stages: stages})
 }
 
 // ── GET /v1/workflows/{id} ───────────────────────────────────────────────────
@@ -295,16 +309,16 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 
 	if transitioned {
 		if req.Action == "APPROVE" {
-			if pubErr := h.publisher.PublishApprovalGranted(r.Context(), *instance, *stage); pubErr != nil {
+			if pubErr := h.publisher.PublishApprovalGranted(r.Context(), *instance, *stage, req.ActorPrincipalID); pubErr != nil {
 				h.log.Error("SubmitAction: failed to publish approval.granted", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 			}
 		} else {
-			if pubErr := h.publisher.PublishApprovalRejected(r.Context(), *instance, *stage); pubErr != nil {
+			if pubErr := h.publisher.PublishApprovalRejected(r.Context(), *instance, *stage, req.ActorPrincipalID); pubErr != nil {
 				h.log.Error("SubmitAction: failed to publish approval.rejected", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 			}
 		}
 		if instance.WorkflowStatus == "APPROVED" || instance.WorkflowStatus == "REJECTED" {
-			if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance); pubErr != nil {
+			if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, req.ActorPrincipalID); pubErr != nil {
 				h.log.Error("SubmitAction: failed to publish workflow.completed", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 			}
 		}
@@ -349,7 +363,7 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if transitioned {
-		if pubErr := h.publisher.PublishWorkflowEscalated(r.Context(), *instance); pubErr != nil {
+		if pubErr := h.publisher.PublishWorkflowEscalated(r.Context(), *instance, req.ActorPrincipalID); pubErr != nil {
 			h.log.Error("EscalateWorkflow: failed to publish workflow.escalated", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 		}
 	}
@@ -385,7 +399,7 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if transitioned {
-		if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance); pubErr != nil {
+		if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, req.ActorPrincipalID); pubErr != nil {
 			h.log.Error("CancelWorkflow: failed to publish workflow.completed", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 		}
 	}

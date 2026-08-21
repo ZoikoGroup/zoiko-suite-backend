@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/compliance-status-svc/internal/domain"
+	"zoiko.io/compliance-status-svc/internal/events"
 )
 
 type mockStore struct {
@@ -126,7 +127,7 @@ func (m *mockStore) ResolveGap(ctx context.Context, id string, req *domain.Resol
 
 type mockPublisher struct{}
 
-func (p *mockPublisher) Publish(ctx context.Context, eventType, subjectID, tenantID string, payload interface{}) error {
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
 	return nil
 }
 

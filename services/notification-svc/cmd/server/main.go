@@ -25,9 +25,15 @@ import (
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — used as the legal_entity_id when this service provisions its own
+// mTLS client identity from mtls-management-svc.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -122,7 +128,17 @@ func main() {
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	// The decision cache main.go grew for this client now lives in the authz
 	// package alongside the client itself, so it is covered by client_test.go.
-	authzClient := authz.NewClient(cfg.AuthZServiceURL, log)
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "notification-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthZServiceURL, log)
+	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
