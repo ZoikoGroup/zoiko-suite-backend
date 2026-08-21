@@ -60,6 +60,11 @@ jobs:
           # or tested it at all -- it is wired into compose and Traefik but was
           # absent from this matrix, so nothing checked it on any PR.
           - access-control-svc
+          # retention-registry-svc answers "is it safe to delete this yet" for
+          # every service that owns deletable data, and an active legal hold
+          # overrides every retention policy. It was absent from this matrix, so
+          # nothing built or tested it on any PR.
+          - retention-registry-svc
           - workflow-svc
           - workflow-history-svc
           - gateway-auth-svc

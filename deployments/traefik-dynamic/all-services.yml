@@ -45,6 +45,14 @@ http:
             middlewares:
                 - strip-accounts-receivable-svc
             priority: 50
+        svc-ai-governance-svc:
+            rule: PathPrefix(`/ai-governance-svc`)
+            entryPoints:
+                - web
+            service: svc-ai-governance-svc
+            middlewares:
+                - strip-ai-governance-svc
+            priority: 50
         svc-audit-event-store-svc:
             rule: PathPrefix(`/audit-event-store-svc`)
             entryPoints:
@@ -85,6 +93,14 @@ http:
             middlewares:
                 - strip-board-resolutions-svc
             priority: 50
+        svc-capability-registry-svc:
+            rule: PathPrefix(`/capability-registry-svc`)
+            entryPoints:
+                - web
+            service: svc-capability-registry-svc
+            middlewares:
+                - strip-capability-registry-svc
+            priority: 50
         svc-clause-template-svc:
             rule: PathPrefix(`/clause-template-svc`)
             entryPoints:
@@ -92,6 +108,14 @@ http:
             service: svc-clause-template-svc
             middlewares:
                 - strip-clause-template-svc
+            priority: 50
+        svc-commercial-account-svc:
+            rule: PathPrefix(`/commercial-account-svc`)
+            entryPoints:
+                - web
+            service: svc-commercial-account-svc
+            middlewares:
+                - strip-commercial-account-svc
             priority: 50
         svc-compensation-svc:
             rule: PathPrefix(`/compensation-svc`)
@@ -269,6 +293,14 @@ http:
             middlewares:
                 - strip-jurisdiction-rules-svc
             priority: 50
+        svc-kill-switch-registry-svc:
+            rule: PathPrefix(`/kill-switch-registry-svc`)
+            entryPoints:
+                - web
+            service: svc-kill-switch-registry-svc
+            middlewares:
+                - strip-kill-switch-registry-svc
+            priority: 50
         svc-leave-absence-svc:
             rule: PathPrefix(`/leave-absence-svc`)
             entryPoints:
@@ -276,6 +308,14 @@ http:
             service: svc-leave-absence-svc
             middlewares:
                 - strip-leave-absence-svc
+            priority: 50
+        svc-metric-registry-svc:
+            rule: PathPrefix(`/metric-registry-svc`)
+            entryPoints:
+                - web
+            service: svc-metric-registry-svc
+            middlewares:
+                - strip-metric-registry-svc
             priority: 50
         svc-mtls-management-svc:
             rule: PathPrefix(`/mtls-management-svc`)
@@ -389,6 +429,14 @@ http:
             middlewares:
                 - strip-purchase-request-svc
             priority: 50
+        svc-retention-registry-svc:
+            rule: PathPrefix(`/retention-registry-svc`)
+            entryPoints:
+                - web
+            service: svc-retention-registry-svc
+            middlewares:
+                - strip-retention-registry-svc
+            priority: 50
         svc-schema-registry-svc:
             rule: PathPrefix(`/schema-registry-svc`)
             entryPoints:
@@ -412,6 +460,14 @@ http:
             service: svc-secret-vault-integration-svc
             middlewares:
                 - strip-secret-vault-integration-svc
+            priority: 50
+        svc-source-authority-svc:
+            rule: PathPrefix(`/source-authority-svc`)
+            entryPoints:
+                - web
+            service: svc-source-authority-svc
+            middlewares:
+                - strip-source-authority-svc
             priority: 50
         svc-spend-controls-svc:
             rule: PathPrefix(`/spend-controls-svc`)
@@ -506,6 +562,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /accounts-receivable-svc
+        strip-ai-governance-svc:
+            stripPrefix:
+                prefixes:
+                    - /ai-governance-svc
         strip-audit-event-store-svc:
             stripPrefix:
                 prefixes:
@@ -526,10 +586,18 @@ http:
             stripPrefix:
                 prefixes:
                     - /board-resolutions-svc
+        strip-capability-registry-svc:
+            stripPrefix:
+                prefixes:
+                    - /capability-registry-svc
         strip-clause-template-svc:
             stripPrefix:
                 prefixes:
                     - /clause-template-svc
+        strip-commercial-account-svc:
+            stripPrefix:
+                prefixes:
+                    - /commercial-account-svc
         strip-compensation-svc:
             stripPrefix:
                 prefixes:
@@ -618,10 +686,18 @@ http:
             stripPrefix:
                 prefixes:
                     - /jurisdiction-rules-svc
+        strip-kill-switch-registry-svc:
+            stripPrefix:
+                prefixes:
+                    - /kill-switch-registry-svc
         strip-leave-absence-svc:
             stripPrefix:
                 prefixes:
                     - /leave-absence-svc
+        strip-metric-registry-svc:
+            stripPrefix:
+                prefixes:
+                    - /metric-registry-svc
         strip-mtls-management-svc:
             stripPrefix:
                 prefixes:
@@ -678,6 +754,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /purchase-request-svc
+        strip-retention-registry-svc:
+            stripPrefix:
+                prefixes:
+                    - /retention-registry-svc
         strip-schema-registry-svc:
             stripPrefix:
                 prefixes:
@@ -690,6 +770,10 @@ http:
             stripPrefix:
                 prefixes:
                     - /secret-vault-integration-svc
+        strip-source-authority-svc:
+            stripPrefix:
+                prefixes:
+                    - /source-authority-svc
         strip-spend-controls-svc:
             stripPrefix:
                 prefixes:
@@ -743,6 +827,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://accounts-receivable-svc:8101
+        svc-ai-governance-svc:
+            loadBalancer:
+                servers:
+                    - url: http://ai-governance-svc:8146
         svc-audit-event-store-svc:
             loadBalancer:
                 servers:
@@ -763,10 +851,18 @@ http:
             loadBalancer:
                 servers:
                     - url: http://board-resolutions-svc:8122
+        svc-capability-registry-svc:
+            loadBalancer:
+                servers:
+                    - url: http://capability-registry-svc:8145
         svc-clause-template-svc:
             loadBalancer:
                 servers:
                     - url: http://clause-template-svc:8120
+        svc-commercial-account-svc:
+            loadBalancer:
+                servers:
+                    - url: http://commercial-account-svc:8144
         svc-compensation-svc:
             loadBalancer:
                 servers:
@@ -855,10 +951,18 @@ http:
             loadBalancer:
                 servers:
                     - url: http://jurisdiction-rules-svc:8082
+        svc-kill-switch-registry-svc:
+            loadBalancer:
+                servers:
+                    - url: http://kill-switch-registry-svc:8147
         svc-leave-absence-svc:
             loadBalancer:
                 servers:
                     - url: http://leave-absence-svc:8115
+        svc-metric-registry-svc:
+            loadBalancer:
+                servers:
+                    - url: http://metric-registry-svc:8149
         svc-mtls-management-svc:
             loadBalancer:
                 servers:
@@ -915,6 +1019,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://purchase-request-svc:8100
+        svc-retention-registry-svc:
+            loadBalancer:
+                servers:
+                    - url: http://retention-registry-svc:8148
         svc-schema-registry-svc:
             loadBalancer:
                 servers:
@@ -927,6 +1035,10 @@ http:
             loadBalancer:
                 servers:
                     - url: http://secret-vault-integration-svc:8087
+        svc-source-authority-svc:
+            loadBalancer:
+                servers:
+                    - url: http://source-authority-svc:8150
         svc-spend-controls-svc:
             loadBalancer:
                 servers:
@@ -954,7 +1066,7 @@ http:
         svc-vendor-due-diligence-svc:
             loadBalancer:
                 servers:
-                    - url: http://vendor-due-diligence-svc:8132
+                    - url: http://vendor-due-diligence-svc:8135
         svc-workflow-history-svc:
             loadBalancer:
                 servers:
