@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -41,7 +42,28 @@ const nilScopeUUID = "00000000-0000-0000-0000-000000000000"
 // Both empty/nil means "no filter on that dimension".
 type ListFilter struct {
 	Environment string
-	TenantID    *string
+
+	// TenantID is the caller's verified scope. A nil TenantID means NO tenant
+	// filter — every tenant's rows — which is what both list routes used to do
+	// whenever ?tenant_id= was omitted, so it must not be left unset.
+	TenantID *string
+
+	// IncludeGlobal also returns rows with a NULL tenant_id: the global default
+	// for that environment, which applies to the caller's tenant as well. Only
+	// meaningful when TenantID is set.
+	IncludeGlobal bool
+}
+
+// tenantCondition renders the tenant predicate for a ListFilter, or "" when the
+// filter names no tenant. Shared by both list queries so the two cannot drift.
+func tenantCondition(filter ListFilter, argIdx int) string {
+	if filter.TenantID == nil {
+		return ""
+	}
+	if filter.IncludeGlobal {
+		return fmt.Sprintf("(tenant_id = $%d OR tenant_id IS NULL)", argIdx)
+	}
+	return fmt.Sprintf("tenant_id = $%d", argIdx)
 }
 
 // Store is the persistence interface for config entries and feature flags.
@@ -193,9 +215,23 @@ func insertConfigEntry(ctx context.Context, tx pgx.Tx, params domain.UpsertConfi
 		params.Key, params.Value, params.Environment, params.TenantID, params.CreatedByPrincipalID,
 	))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, mapInsertError(err)
 	}
 	return entry, nil
+}
+
+// mapInsertError turns a unique-violation on the one-effective-row-per-scope
+// index into a distinct domain error.
+//
+// 23505 here is never a caller mistake about the DATA — the constraint is on the
+// scope, not on the value — so it means a concurrent writer got there first. It
+// used to be indistinguishable from the database being down.
+func mapInsertError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return domain.ErrScopeRaceConflict
+	}
+	return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 }
 
 // jsonEqual compares two JSON payloads structurally rather than
@@ -248,8 +284,8 @@ func (s *PgStore) ListCurrentConfigEntries(ctx context.Context, filter ListFilte
 		args = append(args, filter.Environment)
 		argIdx++
 	}
-	if filter.TenantID != nil {
-		conditions = append(conditions, fmt.Sprintf("tenant_id = $%d", argIdx))
+	if cond := tenantCondition(filter, argIdx); cond != "" {
+		conditions = append(conditions, cond)
 		args = append(args, *filter.TenantID)
 		argIdx++
 	}
@@ -385,7 +421,7 @@ func insertFeatureFlag(ctx context.Context, tx pgx.Tx, params domain.UpsertFeatu
 		params.Key, params.Enabled, params.Environment, params.TenantID, params.RolloutPercentage, params.CreatedByPrincipalID,
 	))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		return nil, mapInsertError(err)
 	}
 	return flag, nil
 }
@@ -422,8 +458,8 @@ func (s *PgStore) ListCurrentFeatureFlags(ctx context.Context, filter ListFilter
 		args = append(args, filter.Environment)
 		argIdx++
 	}
-	if filter.TenantID != nil {
-		conditions = append(conditions, fmt.Sprintf("tenant_id = $%d", argIdx))
+	if cond := tenantCondition(filter, argIdx); cond != "" {
+		conditions = append(conditions, cond)
 		args = append(args, *filter.TenantID)
 		argIdx++
 	}

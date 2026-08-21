@@ -95,6 +95,18 @@ var ErrFeatureFlagNotFound = errorString("feature flag not found")
 // Callers must fail-closed — treat as unavailable, not as "not found".
 var ErrStoreUnavailable = errorString("configuration store unavailable")
 
+// ErrScopeRaceConflict is returned when a concurrent writer created the
+// currently-effective row for this (key, environment, tenant) scope while this
+// request was inserting its own.
+//
+// The upsert takes FOR UPDATE on the current row, which serialises every write
+// to a scope that already has one. The FIRST write to a scope has no row to
+// lock, so two concurrent first writes both insert and one loses on the partial
+// unique index. That arrived as SQLSTATE 23505, fell through to the generic
+// store error, and answered 503 store_unavailable — a lost race reported as a
+// dead database, with no hint that retrying would now succeed.
+var ErrScopeRaceConflict = errorString("another writer created this scope concurrently")
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }

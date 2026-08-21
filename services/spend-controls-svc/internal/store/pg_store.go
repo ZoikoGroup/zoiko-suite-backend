@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/spend-controls-svc/internal/domain"
 	svcmiddleware "zoiko.io/spend-controls-svc/internal/middleware"
@@ -405,9 +406,65 @@ func (s *PgStore) EvaluateSpend(ctx context.Context, in domain.SpendEvaluation) 
 		`, consumptionID, tenantID, in.LegalEntityID, policy.SpendPolicyID, in.Amount,
 			in.CurrencyCode, nullIfEmpty(in.SourceReference), in.CorrelationID, decision.Outcome,
 			in.PrincipalID, time.Now().UTC()); err != nil {
+			// A concurrent call with the same correlation_id got here first: the
+			// replay read above found nothing because the winner had not
+			// committed yet. Named so the caller below can replay the winner
+			// rather than reporting a dead store.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrConcurrentCorrelation
+			}
 			return err
 		}
 		decision.ConsumptionID = consumptionID
+		return nil
+	})
+	// A concurrent call with the same correlation_id won the insert. Its decision
+	// is the one that counts — this call must report THAT, not an error: the
+	// spend was authorized exactly once, and the loser answering 503 is what made
+	// a duplicate submit indistinguishable from an outage. Read the winner in a
+	// fresh transaction (the failed one is aborted) and report it as a replay.
+	if errors.Is(err, domain.ErrConcurrentCorrelation) {
+		replayed, replayErr := s.replayConsumption(ctx, tenantID, in)
+		if replayErr != nil {
+			return nil, replayErr
+		}
+		return replayed, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return decision, nil
+}
+
+// replayConsumption re-reads the decision a concurrent caller recorded for this
+// correlation id and reports it exactly as a sequential retry would.
+//
+// It cannot loop: the unique index guarantees the row exists once the losing
+// insert has failed, so one read is enough. If it is somehow gone, that is a
+// real fault rather than a race, and it is reported as one.
+func (s *PgStore) replayConsumption(ctx context.Context, tenantID string, in domain.SpendEvaluation) (*domain.SpendDecision, error) {
+	decision := &domain.SpendDecision{}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		existing, err := findConsumptionTx(ctx, tx, tenantID, in.CorrelationID)
+		if err != nil {
+			return err
+		}
+		if existing == nil {
+			return fmt.Errorf("%w: concurrent correlation_id %q resolved to no consumption row",
+				domain.ErrStoreUnavailable, in.CorrelationID)
+		}
+		decision.Outcome = existing.DecisionOutcome
+		decision.Basis = "replayed_prior_decision"
+		decision.ConsumptionID = existing.ConsumptionID
+		decision.Replayed = true
+		decision.PriorConsumption = 0
+		decision.ProjectedTotal = existing.Amount
+		policy, err := findPolicyForUpdateTx(ctx, tx, tenantID, existing.LegalEntityID, in.Category, existing.SpendPolicyID)
+		if err != nil {
+			return err
+		}
+		decision.Policy = policy
 		return nil
 	})
 	if err != nil {

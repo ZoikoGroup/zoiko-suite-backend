@@ -100,8 +100,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 // finalization path may skip required evidence states").
 func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	var req domain.EvaluateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	switch {
@@ -375,17 +374,37 @@ func (h *Handler) GetEvaluation(w http.ResponseWriter, r *http.Request) {
 
 // ── GET /v1/evidence-requirements ──────────────────────────────────────────────
 
+// ListRequirements returns the caller's own tenant's requirement catalog.
+//
+// The scope comes from the verified X-Tenant-Id header. It used to come from
+// ?tenant_id=, which the store both filtered on AND set app.tenant_id from — so
+// `?tenant_id=<any-uuid>` returned that tenant's entire requirement catalog
+// while CreateRequirement, on the same service, had always insisted the body
+// agree with the header. The read side was the half nobody checked.
 func (h *Handler) ListRequirements(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
+		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+	// legal_entity_id is compared as `legal_entity_id::text = $n`, casting the
+	// COLUMN to text rather than the parameter to uuid — so a malformed value does
+	// not error, it silently matches nothing, and an empty catalog reads as "this
+	// entity has no requirements", which for an evidence gate reads as permission.
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID != "" && !isUUID(legalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
 	filter := domain.ListRequirementsFilter{
-		TenantID:      q.Get("tenant_id"),
-		LegalEntityID: q.Get("legal_entity_id"),
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
 		DomainCode:    q.Get("domain_code"),
 		ActionType:    q.Get("action_type"),
-	}
-	if filter.TenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "tenant_id")
-		return
 	}
 
 	// as_of=now is the common case (what is in force right now). Omitting it
@@ -406,9 +425,19 @@ func (h *Handler) ListRequirements(w http.ResponseWriter, r *http.Request) {
 
 	list, err := h.store.ListRequirements(r.Context(), filter)
 	if err != nil {
+		// legal_entity_id is compared as text, so the verified tenant is the only
+		// uuid comparison left here. A gateway that forwarded a non-UUID tenant
+		// scope is a fault worth naming rather than reporting as a dead store.
+		if errors.Is(err, domain.ErrInvalidIdentifier) {
+			writeError(w, http.StatusBadRequest, "invalid_field", "tenant scope must be a UUID")
+			return
+		}
 		h.log.Error("ListRequirements: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	if list == nil {
+		list = []domain.EvidenceRequirement{}
 	}
 	writeJSON(w, http.StatusOK, list)
 }
@@ -436,8 +465,7 @@ func (h *Handler) GetRequirement(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateRequirementRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	switch {
@@ -527,8 +555,7 @@ func (h *Handler) CreateRequirement(w http.ResponseWriter, r *http.Request) {
 // material objects).
 func (h *Handler) EndDateRequirement(w http.ResponseWriter, r *http.Request) {
 	var req domain.EndDateRequirementRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Reason == "" {
@@ -598,6 +625,11 @@ func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
 	}
 }
 
+func isUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return err == nil
+}
+
 // requireTenant reads the caller's verified tenant scope from context (set by
 // middleware.TenantContext from X-Tenant-Id). Absent scope is a 400 — never
 // substituted with a placeholder tenant, which is a live cross-tenant defect
@@ -638,4 +670,27 @@ type errorResponse struct {
 
 func writeError(w http.ResponseWriter, status int, code, detail string) {
 	writeJSON(w, status, errorResponse{Error: code, Detail: detail})
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	return true
 }

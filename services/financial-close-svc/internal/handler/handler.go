@@ -92,8 +92,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 func (h *Handler) CreateFiscalPeriod(w http.ResponseWriter, r *http.Request) {
 	var req domain.PeriodCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -621,4 +620,27 @@ func derefString(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	return true
 }

@@ -146,4 +146,15 @@ var (
 	// threshold and books it against that budget. A refusal the caller can see
 	// is the only honest answer.
 	ErrCurrencyMismatch = errorString("spend currency does not match the policy currency")
+
+	// ErrConcurrentCorrelation is returned when two requests carrying the SAME
+	// correlation_id are authorized concurrently.
+	//
+	// Authorize replays a prior decision by reading it first, which covers a
+	// sequential retry. Two concurrent calls both find nothing, both insert, and
+	// one loses on the (tenant_id, correlation_id) unique index — SQLSTATE 23505,
+	// which fell through to the generic store error and answered 503. A caller
+	// retrying a timed-out authorize therefore could not tell whether its spend
+	// had been booked. The store now resolves it by replaying the winner.
+	ErrConcurrentCorrelation = errorString("a concurrent request already recorded this correlation_id")
 )

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/board-resolutions-svc/internal/domain"
@@ -60,6 +61,64 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+// scoped runs a verification query with app.tenant_id installed, exactly as the
+// store installs it for every statement it makes.
+//
+// The assertions here deliberately query the tables directly rather than
+// through the store: a write must not be verified by the code that performed
+// it. But a raw query carries no tenant scope, and once the row-level security
+// policy actually applies -- which it does the moment the service connects as
+// something other than a superuser -- an unscoped statement matches NO rows.
+// A SELECT then reports "this row was never written" about a row that was, and
+// an UPDATE reports no error while changing nothing at all, which is worse: the
+// test proceeds against state it believes it arranged.
+//
+// Transaction-local, so no stale tenant is left on the pooled connection to
+// silently scope a later query to the wrong tenant.
+func scoped(t *testing.T, pool *pgxpool.Pool, tenantID string, fn func(tx pgx.Tx)) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("verification tx begin failed: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("installing the verification tenant scope failed: %v", err)
+	}
+	fn(tx)
+}
+
+// scopedWrite is scoped's committing sibling, for a scoped statement that is
+// test SETUP rather than verification.
+//
+// Keeping them separate rather than adding a bool: a rollback where a commit was
+// meant leaves the test running against state it believes it arranged, and the
+// failure surfaces as a wrong assertion about the SERVICE rather than about the
+// harness. That is precisely what happened here before this existed.
+func scopedWrite(t *testing.T, pool *pgxpool.Pool, tenantID string, fn func(tx pgx.Tx)) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("setup tx begin failed: %v", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("installing the setup tenant scope failed: %v", err)
+	}
+	fn(tx)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("setup tx commit failed: %v", err)
+	}
+	committed = true
 }
 
 // requireThrowawayDatabase refuses to run against anything not recognisably
@@ -232,10 +291,22 @@ func TestPgStore_PassResolution_RejectedCannotBePassed(t *testing.T) {
 	if err := s.CreateResolution(ctx, r); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := pool.Exec(context.Background(),
-		`UPDATE board_resolutions SET status='REJECTED' WHERE resolution_id=$1`, r.ResolutionID); err != nil {
-		t.Fatalf("set REJECTED: %v", err)
-	}
+	// scopedWrite, not scoped: this statement is test SETUP the assertion below
+	// depends on, so it has to commit. The read-only helper rolls back, which
+	// left the resolution PENDING and made PassResolution correct to allow it —
+	// the test then reported a service defect that did not exist. Unscoped it
+	// was worse still: the UPDATE matched no rows and returned no error at all.
+	// Hence the row count is asserted rather than assumed.
+	scopedWrite(t, pool, "tenant-a", func(tx pgx.Tx) {
+		tag, err := tx.Exec(context.Background(),
+			`UPDATE board_resolutions SET status='REJECTED' WHERE resolution_id=$1`, r.ResolutionID)
+		if err != nil {
+			t.Fatalf("set REJECTED: %v", err)
+		}
+		if tag.RowsAffected() != 1 {
+			t.Fatalf("set REJECTED changed %d rows, want 1", tag.RowsAffected())
+		}
+	})
 
 	_, err := s.PassResolution(ctx, r.ResolutionID, "chairperson-1", &domain.PassResolutionRequest{})
 	if !errors.Is(err, domain.ErrResolutionAlreadyFinalized) {

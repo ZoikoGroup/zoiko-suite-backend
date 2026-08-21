@@ -12,6 +12,7 @@ import (
 
 	"zoiko.io/configuration-feature-flag-svc/internal/authz"
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
+	svcmiddleware "zoiko.io/configuration-feature-flag-svc/internal/middleware"
 	"zoiko.io/configuration-feature-flag-svc/internal/store"
 )
 
@@ -137,11 +138,7 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req upsertConfigEntryRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -149,6 +146,17 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 			"error": "missing_field",
 			"field": missing,
 		})
+		return
+	}
+
+	// tenant_id in the body used to be written straight through, so a caller
+	// could overwrite another tenant's configuration value — and configuration is
+	// what other services read to decide how to behave.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -161,6 +169,18 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry, created, err := h.store.UpsertConfigEntry(r.Context(), params)
+	if errors.Is(err, domain.ErrScopeRaceConflict) {
+		// A concurrent writer created this scope first. Nothing is wrong with the
+		// request and nothing is wrong with the database — retrying now takes the
+		// ordinary compare-and-update path. This used to answer 503, which said
+		// the opposite.
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":   "scope_race_conflict",
+			"key":     req.Key,
+			"message": domain.ErrScopeRaceConflict.Error(),
+		})
+		return
+	}
 	if err != nil {
 		h.log.Error("UpsertConfigEntry: store unavailable",
 			zap.String("key", req.Key),
@@ -218,9 +238,18 @@ func (h *Handler) GetConfigEntry(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var tenantID *string
 	if v := q.Get("tenant_id"); v != "" {
 		tenantID = &v
+	}
+	// Omitting ?tenant_id= still asks for the GLOBAL default for this
+	// environment, which is a real scope. Naming another tenant is refused.
+	if h.refuseForeignTenant(w, tenantID, tenantScope) {
+		return
 	}
 
 	entry, err := h.store.FindCurrentConfigEntry(r.Context(), key, environment, tenantID)
@@ -259,9 +288,25 @@ func (h *Handler) ListConfigEntries(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
-	filter := store.ListFilter{Environment: q.Get("environment")}
-	if v := q.Get("tenant_id"); v != "" {
-		filter.TenantID = &v
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	// An absent tenant filter used to mean "no filter", i.e. every tenant's
+	// configuration. It now means the caller's own tenant plus the global
+	// defaults that apply to it — which is what "what applies to me" asks for,
+	// and never another tenant's rows.
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantScope {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": "request tenant_id does not match the caller's verified tenant scope",
+		})
+		return
+	}
+	filter := store.ListFilter{
+		Environment:   q.Get("environment"),
+		TenantID:      &tenantScope,
+		IncludeGlobal: true,
 	}
 
 	results, err := h.store.ListCurrentConfigEntries(r.Context(), filter)
@@ -332,11 +377,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req upsertFeatureFlagRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -360,6 +401,16 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Same as the config path: tenant_id in the body used to decide whose flag
+	// was flipped, so a caller could turn a feature on or off for another tenant.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		return
+	}
+
 	params := domain.UpsertFeatureFlagParams{
 		Key:                  req.Key,
 		Enabled:              *req.Enabled,
@@ -370,6 +421,18 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 	}
 
 	flag, created, err := h.store.UpsertFeatureFlag(r.Context(), params)
+	if errors.Is(err, domain.ErrScopeRaceConflict) {
+		// A concurrent writer created this scope first. Nothing is wrong with the
+		// request and nothing is wrong with the database — retrying now takes the
+		// ordinary compare-and-update path. This used to answer 503, which said
+		// the opposite.
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":   "scope_race_conflict",
+			"key":     req.Key,
+			"message": domain.ErrScopeRaceConflict.Error(),
+		})
+		return
+	}
 	if err != nil {
 		h.log.Error("UpsertFeatureFlag: store unavailable",
 			zap.String("key", req.Key),
@@ -423,9 +486,16 @@ func (h *Handler) GetFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var tenantID *string
 	if v := q.Get("tenant_id"); v != "" {
 		tenantID = &v
+	}
+	if h.refuseForeignTenant(w, tenantID, tenantScope) {
+		return
 	}
 
 	flag, err := h.store.FindCurrentFeatureFlag(r.Context(), key, environment, tenantID)
@@ -461,9 +531,21 @@ func (h *Handler) ListFeatureFlags(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
-	filter := store.ListFilter{Environment: q.Get("environment")}
-	if v := q.Get("tenant_id"); v != "" {
-		filter.TenantID = &v
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantScope {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": "request tenant_id does not match the caller's verified tenant scope",
+		})
+		return
+	}
+	filter := store.ListFilter{
+		Environment:   q.Get("environment"),
+		TenantID:      &tenantScope,
+		IncludeGlobal: true,
 	}
 
 	results, err := h.store.ListCurrentFeatureFlags(r.Context(), filter)
@@ -505,6 +587,39 @@ const (
 
 // requirePrincipal resolves the acting principal from the gateway-verified
 // X-Principal-Id header, writing 401 and returning false when absent.
+// requireTenant reads the caller's verified tenant scope from context (set by
+// middleware.TenantContext from X-Tenant-Id).
+//
+// Nothing in this service used to read that header. A tenant_id in a body chose
+// whose configuration to overwrite, and an ABSENT ?tenant_id= on a list route
+// was documented as "entries across all tenants" — a platform-wide read of every
+// tenant's configuration and feature-flag state.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if id := strings.TrimSpace(svcmiddleware.TenantFromContext(r.Context())); id != "" {
+		return id, true
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{
+		"error":   "tenant_scope_missing",
+		"message": "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
+	})
+	return "", false
+}
+
+// refuseForeignTenant reports whether claimed names a tenant other than the
+// caller's verified scope, answering 403 if so. A nil or empty claimed value is
+// not a disagreement: nil tenant_id means the GLOBAL default for that
+// environment, which is a deliberate scope rather than an omission.
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed *string, tenantID string) bool {
+	if claimed == nil || *claimed == "" || *claimed == tenantID {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{
+		"error":   "tenant_scope_mismatch",
+		"message": "request tenant_id does not match the caller's verified tenant scope",
+	})
+	return true
+}
+
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
 		return id, true
@@ -537,4 +652,27 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
 	}
 	return false
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return false
+	}
+	return true
 }

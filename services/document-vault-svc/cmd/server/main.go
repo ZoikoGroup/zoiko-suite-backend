@@ -82,12 +82,19 @@ func main() {
 	r.Get("/readyz", healthH.Readiness)
 	handler.RegisterRoutes(r, h)
 
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Port),
-		Handler:      r,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              fmt.Sprintf(":%d", cfg.Port),
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	quit := make(chan os.Signal, 1)

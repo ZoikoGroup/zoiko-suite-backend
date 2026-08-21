@@ -35,14 +35,21 @@ type Client interface {
 	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, correlationID string) error
 }
 
-// The three mutating actions this service exposes. One action per route rather
+// The four mutating actions this service exposes. One action per route rather
 // than a single blanket OBLIGATION_WRITE: closing an obligation and raising one
 // are different authorities, and a register that cannot tell them apart cannot
 // express "may record, may not close".
+//
+// ActionApplicabilityDecide is separate for the same reason and is the strongest
+// of the four in practice: an applicability decision is the record of WHETHER a
+// statutory obligation binds an entity at all, and everything downstream —
+// filings, evidence, aging — is derived from it. "May raise an obligation" and
+// "may decide it does not apply" are emphatically not the same authority.
 const (
 	ActionObligationCreate       = "OBLIGATION_CREATE"
 	ActionObligationStatusUpdate = "OBLIGATION_STATUS_UPDATE"
 	ActionFilingRequirementAdd   = "FILING_REQUIREMENT_CREATE"
+	ActionApplicabilityDecide    = "APPLICABILITY_DECISION_RECORD"
 )
 
 type HTTPClient struct {

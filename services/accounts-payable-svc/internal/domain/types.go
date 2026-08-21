@@ -33,6 +33,18 @@ const (
 	InvoiceStatusPaymentRequested InvoiceStatus = "PAYMENT_REQUESTED"
 )
 
+// ValidInvoiceStatus reports whether s is a status this service can ever have
+// stored. An unrecognised ?status= filter matched no row and returned an empty
+// list, so a typo was indistinguishable from a tenant with no payables.
+func ValidInvoiceStatus(s string) bool {
+	switch InvoiceStatus(s) {
+	case InvoiceStatusReceived, InvoiceStatusValidated, InvoiceStatusApproved, InvoiceStatusPaymentRequested:
+		return true
+	default:
+		return false
+	}
+}
+
 // ValidInvoiceTransitions enumerates the only legal status transitions.
 var ValidInvoiceTransitions = map[InvoiceStatus][]InvoiceStatus{
 	InvoiceStatusReceived:         {InvoiceStatusValidated},
@@ -183,4 +195,17 @@ var (
 	// who created a record may not be the same principal who approves,
 	// executes, or passes it.
 	ErrSelfApprovalNotAllowed = errorString("principal may not approve or decide on their own submission")
+
+	// ErrTenantScopeMissing is returned when a request carries no verified
+	// tenant scope (no X-Tenant-Id). Every invoice is tenant-owned, and a read
+	// with no scope has no honest answer — it must not quietly become "whatever
+	// tenant the caller named", which is what ListInvoices did.
+	ErrTenantScopeMissing = errorString("caller tenant scope missing")
+
+	// ErrTenantScopeMismatch is returned when a request names a tenant other
+	// than the caller's verified scope — as ?tenant_id= when listing the
+	// register, or as tenant_id in a create body. Both used to be BELIEVED in
+	// preference to the header (which was never read at all), which made the
+	// whole payables register readable, and writable, across tenants.
+	ErrTenantScopeMismatch = errorString("request tenant_id does not match the caller's verified tenant scope")
 )

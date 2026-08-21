@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/purchase-request-svc/internal/domain"
+	svcmiddleware "zoiko.io/purchase-request-svc/internal/middleware"
 )
 
 // Store is the persistence contract the handler depends on.
@@ -69,8 +70,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateRequestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := requiredFieldMissing(req); missing != "" {
@@ -79,6 +79,26 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Amount <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_field", "amount must be greater than zero")
+		return
+	}
+
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	// tenant_id in the body is accepted only when it agrees with the verified
+	// scope. It used to be the ONLY source of the stored tenant_id — and the
+	// store handed that same body value to set_config('app.tenant_id'), so the
+	// tenant the request named satisfied the RLS policy on the way past. A body
+	// naming another tenant filed the request in that tenant's register.
+	if req.TenantID != "" && req.TenantID != tenantID {
+		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+	// legal_entity_id reaches a uuid column on insert; a malformed one died
+	// inside the driver as 22P02 and surfaced as 503 store_unavailable.
+	if !isUUID(req.LegalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
 		return
 	}
 
@@ -93,7 +113,7 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 
 	pr := &domain.PurchaseRequest{
 		RequestID:              uuid.NewString(),
-		TenantID:               req.TenantID,
+		TenantID:               tenantID,
 		LegalEntityID:          req.LegalEntityID,
 		RequestedByPrincipalID: principalID,
 		Description:            req.Description,
@@ -138,22 +158,60 @@ func (h *Handler) GetRequest(w http.ResponseWriter, r *http.Request) {
 
 // ── GET /v1/purchase-requests ─────────────────────────────────────────────────
 
+// ListRequests returns the caller's own tenant's register.
+//
+// The scope comes from the verified X-Tenant-Id header. It used to come from
+// ?tenant_id=, which the store both filtered on AND set app.tenant_id from — so
+// the tenant the caller named satisfied the RLS policy on the way past, and
+// `?tenant_id=<any-uuid>` returned that tenant's entire purchase-request
+// register. Nothing consulted X-Tenant-Id at all.
+//
+// Reads are scoped rather than authorized, matching the services either side of
+// this one in the commercial-ops chain (purchase-order-svc, accounts-payable-svc):
+// there is deliberately no PR_REQUEST_VIEW action.
 func (h *Handler) ListRequests(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	filter := domain.ListRequestsFilter{
-		TenantID:      q.Get("tenant_id"),
-		LegalEntityID: q.Get("legal_entity_id"),
-		Status:        q.Get("status"),
-	}
-	if filter.TenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "tenant_id")
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
+	}
+	q := r.URL.Query()
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
+		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+	if status := q.Get("status"); status != "" && !domain.ValidRequestStatus(status) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "status is not a recognised purchase request status")
+		return
+	}
+	// legal_entity_id is compared as `legal_entity_id::text = $n`, casting the
+	// COLUMN to text rather than the parameter to uuid — so a malformed value does
+	// not error, it silently matches nothing, and an empty result reads as "this
+	// entity has raised no requests". Refused here instead.
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID != "" && !isUUID(legalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+	filter := domain.ListRequestsFilter{
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		Status:        q.Get("status"),
 	}
 	list, err := h.store.ListRequests(r.Context(), filter)
 	if err != nil {
+		// legal_entity_id is compared as text, so the verified tenant is the only
+		// uuid comparison left here. A gateway that forwarded a non-UUID tenant
+		// scope is a fault worth naming rather than reporting as a dead store.
+		if errors.Is(err, domain.ErrInvalidIdentifier) {
+			writeError(w, http.StatusBadRequest, "invalid_field", "tenant scope must be a UUID")
+			return
+		}
 		h.log.Error("ListRequests: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
+	}
+	if list == nil {
+		list = []domain.PurchaseRequest{}
 	}
 	writeJSON(w, http.StatusOK, list)
 }
@@ -207,8 +265,7 @@ func (h *Handler) ApproveRequest(w http.ResponseWriter, r *http.Request) {
 // stated reason isn't useful evidence.
 func (h *Handler) RejectRequest(w http.ResponseWriter, r *http.Request) {
 	var req domain.RejectRequestRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Reason == "" {
@@ -278,10 +335,11 @@ func (h *Handler) handleTransitionErr(w http.ResponseWriter, err error) {
 	}
 }
 
+// requiredFieldMissing deliberately does NOT require tenant_id: the tenant is
+// the caller's verified scope, so a body omitting it is fine and a body
+// disagreeing with it is a 403, not a missing field.
 func requiredFieldMissing(req domain.CreateRequestRequest) string {
 	switch {
-	case req.TenantID == "":
-		return "tenant_id"
 	case req.LegalEntityID == "":
 		return "legal_entity_id"
 	case req.Description == "":
@@ -293,6 +351,23 @@ func requiredFieldMissing(req domain.CreateRequestRequest) string {
 	default:
 		return ""
 	}
+}
+
+// requireTenant reads the caller's verified tenant scope from context (set by
+// middleware.TenantContext from X-Tenant-Id). A request with no scope is
+// refused — it must never fall back to a tenant the request itself named.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", domain.ErrTenantScopeMissing.Error())
+		return "", false
+	}
+	return tenantID, true
+}
+
+func isUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return err == nil
 }
 
 // requirePrincipal reads the caller's identity from X-Principal-Id — set by
@@ -323,4 +398,27 @@ type errorResponse struct {
 
 func writeError(w http.ResponseWriter, status int, code, detail string) {
 	writeJSON(w, status, errorResponse{Error: code, Detail: detail})
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return false
+	}
+	return true
 }

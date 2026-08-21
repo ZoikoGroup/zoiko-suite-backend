@@ -16,6 +16,7 @@ import (
 	"zoiko.io/secret-vault-integration-svc/internal/authz"
 	"zoiko.io/secret-vault-integration-svc/internal/domain"
 	"zoiko.io/secret-vault-integration-svc/internal/handler"
+	svcmiddleware "zoiko.io/secret-vault-integration-svc/internal/middleware"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
 )
 
@@ -47,6 +48,12 @@ type stubStore struct {
 
 	applicableByPath    *domain.ApplicableSecretPolicyVersion
 	applicableByPathErr error
+
+	// leaseFilter and auditFilter record what the store was actually asked for,
+	// so a test can prove a register was read in the caller's own tenant rather
+	// than merely that the call answered 200.
+	leaseFilter store.LeaseListFilter
+	auditFilter store.AuditListFilter
 
 	lease        *domain.SecretLease
 	leaseCreated bool
@@ -105,7 +112,8 @@ func (s *stubStore) CreateLease(_ context.Context, _ domain.CreateLeaseParams) (
 func (s *stubStore) FindLeaseByID(_ context.Context, _ string) (*domain.SecretLease, error) {
 	return s.findLeaseResult, s.findLeaseErr
 }
-func (s *stubStore) ListLeases(_ context.Context, _ store.LeaseListFilter) ([]*domain.SecretLease, error) {
+func (s *stubStore) ListLeases(_ context.Context, filter store.LeaseListFilter) ([]*domain.SecretLease, error) {
+	s.leaseFilter = filter
 	return s.listLeasesResult, s.listLeasesErr
 }
 func (s *stubStore) RevokeLease(_ context.Context, _ string) (*domain.SecretLease, bool, error) {
@@ -121,7 +129,8 @@ func (s *stubStore) RecordAuditEntry(_ context.Context, params domain.RecordAudi
 func (s *stubStore) FindAuditEntryByRotationRequestID(_ context.Context, _ string) (*domain.SecretAccessAuditLog, error) {
 	return s.rotationEntry, s.rotationEntryErr
 }
-func (s *stubStore) ListAuditLog(_ context.Context, _ store.AuditListFilter) ([]*domain.SecretAccessAuditLog, error) {
+func (s *stubStore) ListAuditLog(_ context.Context, filter store.AuditListFilter) ([]*domain.SecretAccessAuditLog, error) {
+	s.auditFilter = filter
 	return s.listAuditResult, s.listAuditErr
 }
 
@@ -167,8 +176,12 @@ func (p *stubPublisher) PublishRotationCompleted(_ context.Context, _, _, _ stri
 	return nil
 }
 
+// newTestRouter mounts TenantContext, which cmd/server/main.go mounts in front
+// of these same routes. This service had no tenant middleware at all until the
+// scope was closed, so nothing here ever exercised a scoped request.
 func newTestRouter(s *stubStore, v *stubVault, p *stubPublisher) chi.Router {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, v, p, testAuthz(), testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
@@ -358,7 +371,7 @@ func TestPutSecretMaterial_PolicyNotFound(t *testing.T) {
 
 func TestListVersionHistory_EmptyReturnsArray(t *testing.T) {
 	r := defaultRouter(&stubStore{history: nil})
-	req := httptest.NewRequest(http.MethodGet, "/v1/secret-policies/sp-1/versions", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secret-policies/sp-1/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
@@ -368,7 +381,7 @@ func TestListVersionHistory_EmptyReturnsArray(t *testing.T) {
 
 func TestListApplicableSecretPolicyVersions_MissingSecretClass(t *testing.T) {
 	r := defaultRouter(&stubStore{})
-	req := httptest.NewRequest(http.MethodGet, "/v1/secret-policies", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secret-policies", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -546,7 +559,7 @@ func TestBroker_VaultUnavailable(t *testing.T) {
 func TestGetLease_Found(t *testing.T) {
 	s := &stubStore{findLeaseResult: &domain.SecretLease{LeaseID: "lease-1"}}
 	r := defaultRouter(s)
-	req := httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/lease-1", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/lease-1", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -557,7 +570,7 @@ func TestGetLease_Found(t *testing.T) {
 func TestGetLease_NotFound(t *testing.T) {
 	s := &stubStore{findLeaseErr: domain.ErrLeaseNotFound}
 	r := defaultRouter(s)
-	req := httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/missing", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/missing", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -567,7 +580,7 @@ func TestGetLease_NotFound(t *testing.T) {
 
 func TestListLeases_EmptyReturnsArray(t *testing.T) {
 	r := defaultRouter(&stubStore{listLeasesResult: nil})
-	req := httptest.NewRequest(http.MethodGet, "/v1/secrets/leases", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
@@ -577,6 +590,9 @@ func TestListLeases_EmptyReturnsArray(t *testing.T) {
 
 func TestRevokeLease_Success(t *testing.T) {
 	s := &stubStore{
+		// The revoke path reads the lease first, so the scope can be checked
+		// before a transition that cannot be undone.
+		findLeaseResult:         &domain.SecretLease{LeaseID: "lease-1", Status: "ACTIVE"},
 		revokeLeaseResult:       &domain.SecretLease{LeaseID: "lease-1", Status: "REVOKED"},
 		revokeLeaseTransitioned: true,
 	}
@@ -593,7 +609,10 @@ func TestRevokeLease_Success(t *testing.T) {
 }
 
 func TestRevokeLease_InvalidTransition(t *testing.T) {
-	s := &stubStore{revokeLeaseErr: domain.ErrInvalidTransition}
+	s := &stubStore{
+		findLeaseResult: &domain.SecretLease{LeaseID: "lease-1", Status: "REVOKED"},
+		revokeLeaseErr:  domain.ErrInvalidTransition,
+	}
 	r := defaultRouter(s)
 	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil))
 	w := httptest.NewRecorder()
@@ -690,7 +709,7 @@ func TestRotate_PolicyNotFound(t *testing.T) {
 
 func TestListAuditLog_EmptyReturnsArray(t *testing.T) {
 	r := defaultRouter(&stubStore{listAuditResult: nil})
-	req := httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "[]" {
@@ -706,6 +725,13 @@ const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
 // testPrincipal is what the gateway ForwardAuth middleware sets in
 // X-Principal-Id after verifying the caller identity envelope.
 const testPrincipal = "principal-test-admin"
+
+// testTenant is the caller's verified tenant scope. A UUID because every
+// tenant_id column in this service's schema is one.
+const testTenant = "11111111-1111-1111-1111-111111111111"
+
+// otherTenant is a tenant the caller has no scope in.
+const otherTenant = "22222222-2222-2222-2222-222222222222"
 
 // stubAuthz records what it was asked and answers with err.
 type stubAuthz struct {
@@ -726,10 +752,19 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, 
 // testAuthz is the permit-all default used by every pre-existing test.
 func testAuthz() *stubAuthz { return &stubAuthz{} }
 
-// authed stamps the gateway-verified principal header onto a request.
-// Every mutating route now requires it.
+// authed stamps the gateway-verified identity headers onto a request — the
+// principal that is acting and the tenant whose data it is acting on. Only the
+// principal used to be stamped, and nothing in this service read a tenant
+// header at all.
 func authed(req *http.Request) *http.Request {
 	req.Header.Set("X-Principal-Id", testPrincipal)
+	req.Header.Set("X-Tenant-Id", testTenant)
+	return req
+}
+
+// scoped stamps only the tenant scope, for reads that need no principal.
+func scoped(req *http.Request) *http.Request {
+	req.Header.Set("X-Tenant-Id", testTenant)
 	return req
 }
 
@@ -755,6 +790,7 @@ var gatedRoutes = []struct {
 
 func gatedRouter(az *stubAuthz) http.Handler {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	handler.RegisterRoutes(r, handler.New(&stubStore{}, &stubVault{}, &stubPublisher{}, az, testAuthzScopeID, zap.NewNop()))
 	return r
 }
@@ -826,7 +862,7 @@ func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 // so a denied RBAC client must not turn into a refused broker call.
 func TestBroker_NotRBACGated(t *testing.T) {
 	az := &stubAuthz{err: authz.ErrDenied}
-	req := httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", bytes.NewBufferString(`{}`))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", bytes.NewBufferString(`{}`)))
 	w := httptest.NewRecorder()
 	gatedRouter(az).ServeHTTP(w, req)
 
@@ -835,5 +871,137 @@ func TestBroker_NotRBACGated(t *testing.T) {
 	}
 	if az.calls != 0 {
 		t.Errorf("broker should not call authorization-svc, got %d calls", az.calls)
+	}
+}
+
+// ── tenant scope ─────────────────────────────────────────────────────────────
+//
+// This service read no tenant header at all before these tests existed: which
+// secret policy applied, whose leases were listed, and whose access audit log
+// came back were decided by values the request supplied about itself.
+
+func TestListAuditLog_NoTenantScope_Refused(t *testing.T) {
+	r := defaultRouter(&stubStore{})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// The audit filter had no tenant field at all, so every tenant's REQUESTED,
+// GRANTED, DENIED and REVOKED events came back to any caller.
+func TestListAuditLog_ScopedToVerifiedTenant(t *testing.T) {
+	s := &stubStore{}
+	r := defaultRouter(s)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/audit", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.auditFilter.TenantID == nil || *s.auditFilter.TenantID != testTenant {
+		t.Fatalf("expected the audit log filtered to the verified tenant %s, got %v", testTenant, s.auditFilter.TenantID)
+	}
+}
+
+// Omitting ?tenant_id= used to list every tenant's live leases — who holds
+// access to which secret path, platform-wide.
+func TestListLeases_ScopedToVerifiedTenant(t *testing.T) {
+	s := &stubStore{}
+	r := defaultRouter(s)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.leaseFilter.TenantID == nil || *s.leaseFilter.TenantID != testTenant {
+		t.Fatalf("expected leases filtered to the verified tenant %s, got %v", testTenant, s.leaseFilter.TenantID)
+	}
+}
+
+func TestListLeases_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := defaultRouter(&stubStore{})
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases?tenant_id="+otherTenant, nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 listing another tenant's leases, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A lease names a principal and a secret path. Any id returned one, from any
+// tenant — answered as not-found now, so the route is not an existence oracle.
+func TestGetLease_AnotherTenantsLease_NotFound(t *testing.T) {
+	other := otherTenant
+	s := &stubStore{findLeaseResult: &domain.SecretLease{LeaseID: "lease-1", TenantID: &other}}
+	r := defaultRouter(s)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/secrets/leases/lease-1", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for another tenant's lease, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Revocation cannot be undone, so the scope check has to happen before the
+// transition rather than on the way out.
+func TestRevokeLease_AnotherTenantsLease_NotFoundAndNotRevoked(t *testing.T) {
+	other := otherTenant
+	s := &stubStore{
+		findLeaseResult:         &domain.SecretLease{LeaseID: "lease-1", TenantID: &other, Status: "GRANTED"},
+		revokeLeaseResult:       &domain.SecretLease{LeaseID: "lease-1", Status: "REVOKED"},
+		revokeLeaseTransitioned: true,
+	}
+	r := defaultRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/lease-1/revoke", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 revoking another tenant's lease, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.auditEntries) != 0 {
+		t.Fatalf("expected no audit entry for a refused revocation, got %+v", s.auditEntries)
+	}
+}
+
+// tenant_id in the broker body chose the policy scope that decided the request,
+// and was stamped on the lease and every audit entry it wrote.
+func TestBroker_ForeignTenantBody_Refused(t *testing.T) {
+	s := &stubStore{}
+	r := defaultRouter(s)
+	body := `{"secret_path":"kv/data/x","request_id":"req-1","requested_by_principal_id":"wl-1","tenant_id":"` + otherTenant + `"}`
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 brokering in another tenant's scope, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.auditEntries) != 0 {
+		t.Fatalf("expected no audit entry in the foreign tenant, got %+v", s.auditEntries)
+	}
+}
+
+func TestListApplicableSecretPolicyVersions_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := defaultRouter(&stubStore{})
+	req := scoped(httptest.NewRequest(http.MethodGet,
+		"/v1/secret-policies?secret_class=DATABASE_CREDENTIAL&tenant_id="+otherTenant, nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 reading another tenant's secret policies, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateSecretPolicyVersion_ForeignTenantBody_Refused(t *testing.T) {
+	s := &stubStore{}
+	r := defaultRouter(s)
+	body := `{"allowed_workload_ids":["wl-1"],"max_lease_duration_seconds":900,"effective_from":"2026-01-01T00:00:00Z","created_by_principal_id":"` + testPrincipal + `","tenant_id":"` + otherTenant + `"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/sp-1/versions", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 publishing a version into another tenant, got %d: %s", w.Code, w.Body.String())
 	}
 }

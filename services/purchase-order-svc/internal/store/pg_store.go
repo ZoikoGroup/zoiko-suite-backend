@@ -72,12 +72,13 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	return tx.Commit(ctx)
 }
 
-func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
-	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
-		return t
-	}
-	return fallback
-}
+// tenantFromCtxOrFallback used to live here, resolving the RLS scope from the
+// context but FALLING BACK to whatever the caller had supplied in the request
+// body. A request carrying no X-Tenant-Id therefore chose its own scope: the
+// body's tenant_id was handed to set_config('app.tenant_id') AND written into
+// the row, so the policy that should have refused the insert was satisfied by
+// the value under attack. The handler now resolves the tenant once from the
+// verified header; there is deliberately no fallback left to reach for.
 
 // CreateOrder inserts a purchase order in ISSUED status, generating its
 // po_number from purchase_order_number_seq. Idempotent on
@@ -85,7 +86,14 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 // overwritten with the EXISTING row's values and created=false is returned —
 // callers must not re-publish purchase.order.issued in that case.
 func (s *PgStore) CreateOrder(ctx context.Context, o *domain.PurchaseOrder) (created bool, err error) {
-	tenantID := tenantFromCtxOrFallback(ctx, o.TenantID)
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrTenantScopeMissing
+	}
+	// The row is filed under the verified scope, not under o.TenantID — which is
+	// what the INSERT used to write while app.tenant_id was set from the same
+	// unverified value.
+	o.TenantID = tenantID
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var seq int64

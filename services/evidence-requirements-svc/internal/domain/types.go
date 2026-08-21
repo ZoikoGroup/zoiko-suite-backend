@@ -237,6 +237,14 @@ var (
 	// which is a real cross-tenant defect.
 	ErrTenantMissing = errorString("tenant scope missing")
 
+	// ErrTenantScopeMismatch is returned when a request names a tenant other
+	// than the caller's verified scope. The create path has always refused a
+	// disagreeing body; ListRequirements did not, taking ?tenant_id= as the
+	// scope outright and handing it to the store, which set app.tenant_id from
+	// it — so the tenant the caller named satisfied the RLS policy on the way
+	// past and the whole catalog was readable across tenants.
+	ErrTenantScopeMismatch = errorString("request tenant_id does not match the caller's verified tenant scope")
+
 	// Document-vault verification errors. Fail closed on all of them: an
 	// artifact that cannot be confirmed to exist does not count as evidence.
 	ErrDocumentNotFound           = errorString("referenced document not found")

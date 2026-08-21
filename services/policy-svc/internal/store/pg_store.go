@@ -219,24 +219,41 @@ func scanPolicyVersion(row pgx.Row) (*domain.PolicyVersion, error) {
 }
 
 // FindPolicyVersionByID looks up a version by its UUID primary key, scoped to
-// the caller's tenant: visible if the version is global (tenant_id IS NULL)
-// or belongs to the caller's own tenant. An empty tenant in context (a caller
-// that predates the X-Tenant-Id header) falls back to unscoped lookup.
+// the caller's tenant: visible if the version is global (tenant_id IS NULL) or
+// belongs to the caller's own tenant.
+//
+// An empty tenant in context used to fall back to an UNSCOPED lookup, so a
+// request that simply omitted X-Tenant-Id read any tenant's version by id. The
+// handler now refuses such a request before it reaches here; the NULL parameter
+// path below remains only so this function cannot silently widen its own scope
+// if some future caller reaches it without one.
 func (s *PgStore) FindPolicyVersionByID(ctx context.Context, policyVersionID string) (*domain.PolicyVersion, error) {
 	// tenant_id is a UUID column — passing "" and comparing with a plain
 	// "$2 = '' OR ..." makes Postgres try to resolve $2 as both text and
 	// uuid in one prepared statement ("operator does not exist: uuid =
 	// text"). A nil *string sends an actual SQL NULL instead, so every
 	// usage below agrees $2 is uuid.
+	//
+	// The scope is only usable if it PARSES as a uuid. Callers upstream can
+	// legitimately carry a non-uuid tenant — governance-decision-log-svc's
+	// tenant_id is VARCHAR and holds the literal "GLOBAL" for a decision that
+	// was evaluated against global policy — and handing that to a uuid
+	// comparison dies in the driver as 22P02, reported as a dead store.
 	var tenantID *string
 	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
-		tenantID = &t
+		if _, err := uuid.Parse(t); err == nil {
+			tenantID = &t
+		}
 	}
+	// `$2::uuid IS NULL OR ...` used to lead this predicate, which made a NULL
+	// scope match EVERY row — so no tenant scope meant no filter at all. Without
+	// it, a NULL scope leaves only `tenant_id IS NULL`: global versions, which
+	// are the only ones a caller with no usable tenant is entitled to see.
 	const query = `
 		SELECT ` + policyVersionColumns + `
 		FROM policy_versions
 		WHERE policy_version_id = $1
-		  AND ($2::uuid IS NULL OR tenant_id IS NULL OR tenant_id = $2::uuid);`
+		  AND (tenant_id IS NULL OR tenant_id = $2::uuid);`
 
 	row := s.pool.QueryRow(ctx, query, policyVersionID, tenantID)
 	v, err := scanPolicyVersion(row)
