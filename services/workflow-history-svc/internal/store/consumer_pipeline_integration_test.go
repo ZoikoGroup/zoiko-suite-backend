@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -135,11 +136,20 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 		return pool.Ping(ctx) == nil
 	}, 10*time.Second, 200*time.Millisecond, "embedded postgres did not become ready")
 
-	for _, name := range []string{"000001_initial_schema.up.sql", "000002_add_rls.up.sql"} {
-		migrationSQL, err := os.ReadFile("../../deployments/migrations/" + name)
-		require.NoError(t, err, "could not read migration file %s", name)
+	// EVERY *.up.sql, BY GLOB — see the same change in cmd/server for why. This
+	// named two of three, omitting 000003_enforce_immutability, so the
+	// append-only triggers were absent from the schema this pipeline was tested
+	// against.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	require.NoError(t, err, "globbing migrations")
+	require.NotEmpty(t, migrations, "no *.up.sql found — this suite would run against an empty schema")
+	sort.Strings(migrations)
+
+	for _, path := range migrations {
+		migrationSQL, err := os.ReadFile(path)
+		require.NoError(t, err, "could not read migration %s", filepath.Base(path))
 		_, err = pool.Exec(ctx, string(migrationSQL))
-		require.NoError(t, err, "migration %s failed", name)
+		require.NoError(t, err, "migration %s failed", filepath.Base(path))
 	}
 
 	// ── Wire real PgStore + Consumer ─────────────────────────────────────────

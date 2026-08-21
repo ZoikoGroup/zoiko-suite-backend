@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -84,13 +85,23 @@ func TestIntegration(t *testing.T) {
 		return pool.Ping(ctx) == nil
 	}, 10*time.Second, 200*time.Millisecond, "embedded postgres did not become ready in time")
 
-	// Apply the migration SQL from the service's own migrations directory.
-	for _, name := range []string{"000001_initial_schema.up.sql", "000002_add_rls.up.sql"} {
-		migrationSQL, err := os.ReadFile("../../deployments/migrations/" + name)
-		require.NoError(t, err, "could not read migration file %s", name)
+	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
+	//
+	// This named two and the service has three: 000003_enforce_immutability was
+	// missing, so the append-only triggers this service's whole value rests on
+	// were absent from the schema these tests ran against. A named list only
+	// stays correct while somebody remembers to edit it, and nobody did.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	require.NoError(t, err, "globbing migrations")
+	require.NotEmpty(t, migrations, "no *.up.sql found — these tests would run against an empty schema")
+	sort.Strings(migrations)
+
+	for _, path := range migrations {
+		migrationSQL, err := os.ReadFile(path)
+		require.NoError(t, err, "could not read migration %s", filepath.Base(path))
 
 		_, err = pool.Exec(ctx, string(migrationSQL))
-		require.NoError(t, err, "migration %s failed", name)
+		require.NoError(t, err, "migration %s failed", filepath.Base(path))
 	}
 
 	// ── 2. Build test server once ────────────────────────────────────────────

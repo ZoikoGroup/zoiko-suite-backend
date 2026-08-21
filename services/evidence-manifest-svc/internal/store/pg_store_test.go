@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,10 +31,21 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	`)
 	require.NoError(t, err)
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	require.NoError(t, err)
-	_, err = pool.Exec(context.Background(), string(sql))
-	require.NoError(t, err)
+	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE. This applied 000001 alone and
+	// the service has two, so 000002_enforce_immutability was never present —
+	// the append-only triggers on an evidence manifest were absent from the
+	// schema these tests ran against, which is the one property a manifest has.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	require.NoError(t, err, "globbing migrations")
+	require.NotEmpty(t, migrations, "no *.up.sql found — these tests would run against an empty schema")
+	sort.Strings(migrations)
+
+	for _, path := range migrations {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, "reading %s", filepath.Base(path))
+		_, err = pool.Exec(context.Background(), string(sql))
+		require.NoError(t, err, "applying %s", filepath.Base(path))
+	}
 
 	return pool
 }
