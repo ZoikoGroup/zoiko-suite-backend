@@ -17,8 +17,8 @@ finding was discovered. This file exists to be worked top-to-bottom, one row at 
 3. Run the full verification loop: `gofmt -w .` → `go build ./...` → `go vet ./...` →
    `go test ./... -count=1` on every service touched.
 4. Write/extend a test that specifically proves the fix (not just that nothing broke).
-5. Commit + push to `dev` (no PR — per standing instruction, one consolidated PR happens
-   at the end of the whole tracker, not per row).
+5. Commit + push to `satyaprakash-changes` (no PR — per standing instruction, one
+   consolidated PR happens at the end of the whole tracker, not per row).
 6. Mark the row `Done`, with the commit hash and a one-line note on what was verified.
 7. Only then move to the next row.
 
@@ -39,7 +39,7 @@ by grepping every migration file, not inferred. Pattern to copy: `governance-dec
 
 | # | Service | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 1 | identity-context-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
+| 1 | identity-context-svc | Doc 03 §06, Doc 04 §2.2 | Done | `045ae84`. Also found & fixed a real cross-tenant hole: GET/PUT /v1/principals/{id} routes had no X-Tenant-Id check at all. RLS (ENABLE+FORCE+WITH CHECK) added on all 4 tables; 4 isolation tests + 2 handler tests live-verified against real Postgres 16. |
 | 2 | secret-vault-integration-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
 | 3 | policy-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
 | 4 | jurisdiction-rules-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
