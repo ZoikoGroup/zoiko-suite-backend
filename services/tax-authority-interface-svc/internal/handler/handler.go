@@ -86,7 +86,11 @@ func (h *Handler) CreateInterface(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "tax.interface.created", tf.InterfaceID, tenantID, tf)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "tax.interface.created", AggregateID: tf.InterfaceID, TenantID: tenantID,
+		LegalEntityID: tf.LegalEntityID, Jurisdiction: tf.Jurisdiction, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: tf,
+	})
 	writeJSON(w, http.StatusCreated, tf)
 }
 
@@ -171,7 +175,11 @@ func (h *Handler) SubmitTaxFiling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "tax.filing.submitted", sub.SubmissionID, tenantID, sub)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "tax.filing.submitted", AggregateID: sub.SubmissionID, TenantID: tenantID,
+		LegalEntityID: iface.LegalEntityID, Jurisdiction: iface.Jurisdiction, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: sub,
+	})
 	writeJSON(w, http.StatusCreated, sub)
 }
 

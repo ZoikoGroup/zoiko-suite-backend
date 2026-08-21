@@ -36,9 +36,15 @@ import (
 	"zoiko.io/general-ledger-svc/internal/handler"
 	"zoiko.io/general-ledger-svc/internal/health"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
+	"zoiko.io/general-ledger-svc/internal/mtls"
 	"zoiko.io/general-ledger-svc/internal/store"
 	"zoiko.io/general-ledger-svc/internal/telemetry"
 )
+
+// platformScopeID is the legal_entity_id presented to mtls-management-svc
+// when provisioning this service's own client-side mTLS identity — the same
+// platform-wide scope tax-rules-svc's mTLS pilot uses.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -117,16 +123,34 @@ func main() {
 	// metadata request, so every write to a not-yet-existing topic fails
 	// with "Unknown Topic Or Partition" regardless of the broker-side
 	// setting.
+	// BatchTimeout is 10ms, not the library default of 1s. Publishing here is
+	// synchronous on the request path — every journal create, validate, post
+	// and reverse waits for the write — so the default made each of those
+	// calls take about a second of pure batching delay. Same value, same
+	// reason, as every other producer in this estate.
 	kafkaWriter := &kafka.Writer{
 		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		BatchTimeout:           10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+
+	var authzClient *authz.HTTPClient
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "general-ledger-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, log, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+	}
+
 	closeClient := close.NewHTTPClient(cfg.CloseServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
@@ -155,12 +179,19 @@ func main() {
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)

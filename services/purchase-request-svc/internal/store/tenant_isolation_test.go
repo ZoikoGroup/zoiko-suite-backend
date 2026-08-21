@@ -2,15 +2,24 @@
 
 // Package store_test contains cross-tenant isolation tests for PgStore.
 //
-// Services in this platform connect as the Postgres superuser
-// (DB_USER=postgres). Postgres superusers unconditionally bypass Row-Level
-// Security regardless of policy text — set_config('app.tenant_id', …) has no
-// effect because RLS never runs. The only real isolation guarantee is an
-// explicit AND tenant_id = $N in every query's WHERE clause — this file
-// proves that guarantee actually holds for every tenant-scoped method in
-// this service, mirroring general-ledger-svc's and
-// tenant-entity-registry-svc's isolation test suites (both found real,
+// This file proves the explicit `AND tenant_id = $N` predicate holds for every
+// tenant-scoped method in this service, mirroring general-ledger-svc's and
+// tenant-entity-registry-svc's isolation suites (both found real,
 // live-reproducible bugs this exact pattern was designed to catch).
+//
+// It used to say that predicate was the ONLY isolation guarantee, because every
+// service connected as the Postgres superuser and a superuser bypasses
+// row-level security unconditionally — so the policies were inert and
+// set_config('app.tenant_id', …) did nothing. That is no longer true: these
+// services now connect as an ordinary NOSUPERUSER NOBYPASSRLS role
+// (deployments/scripts/create-app-roles.sh) and the policy is enforced.
+//
+// The predicate is still the guarantee this file tests, and still worth
+// testing: it is the control that does not depend on the role being right.
+// But note what this suite CANNOT tell you — it runs an embedded Postgres as
+// that server's own superuser, so RLS never applies here no matter what the
+// deployment does. The policy is exercised instead by running the
+// TEST_DATABASE_URL suites against an ordinary role.
 //
 // Each subtest:
 //  1. Creates two independent tenants (A and B), each with their own request.
@@ -52,6 +61,13 @@ func TestMain(m *testing.M) {
 	dbPort := uint32(15801 + uint32(os.Getpid()%499))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
+			// Version pinned explicitly — see the doc comment on
+			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+			// main_integration_test.go for why: the unpinned default floats
+			// to whatever major the library calls "latest," and that patch
+			// build can stop resolving from the remote binary repo with no
+			// code change on our side (this is what broke PR #105's CI).
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("pr_isolation_test").
 			Username("postgres").
@@ -151,11 +167,21 @@ func setupIsolationFixture(t *testing.T, tenantLabel string) requestFixture {
 	return f
 }
 
-// TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent proves the
+// TestPgStore_CreateRequest_RetriedCorrelationID_CreatesExactlyOneRow proves the
 // idempotency guarantee against a REAL Postgres unique index — this is the
 // exact scenario a network-timeout-triggered client retry produces, and it
 // must resolve to the original request, never a duplicate.
-func TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent(t *testing.T) {
+//
+// The sibling assertion lives in pg_store_test.go as
+// TestPgStore_CreateRequest_RetriedCorrelationID_IsIdempotent, which checks
+// that the replay's body does not overwrite the stored request. This one is
+// kept separate because only it counts the rows, and because the two run under
+// different harnesses: pg_store_test.go against TEST_DATABASE_URL, this file
+// against the embedded Postgres stood up by TestMain under the `integration`
+// tag. Do NOT give them the same name — untagged files compile in the tagged
+// build too, so a shared name is a redeclaration that breaks `go test
+// -tags=integration ./internal/store/`.
+func TestPgStore_CreateRequest_RetriedCorrelationID_CreatesExactlyOneRow(t *testing.T) {
 	tenantID := uuid.New().String()
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
@@ -221,7 +247,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 	// tenantID as the scope argument — exactly what a handler bug would look
 	// like if TenantID were taken from the request body instead of the
 	// caller's real context.
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", nil)
+	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusApproved, "attacker", time.Now().UTC(), nil)
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
 		"ISOLATION FAILURE: tenant B was able to approve tenant A's request")
 
@@ -234,7 +260,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Approve(t *testing.T) {
 		"ISOLATION FAILURE: tenant A's request status was mutated by tenant B")
 
 	// Sanity: tenant B can still approve its OWN request.
-	err = testStore.TransitionRequest(context.Background(), b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", nil)
+	err = testStore.TransitionRequest(context.Background(), b.tenantID, b.requestID, domain.RequestStatusApproved, "b-admin", time.Now().UTC(), nil)
 	require.NoError(t, err)
 	ctxB := svcmiddleware.WithTenant(context.Background(), b.tenantID)
 	gotB, err := testStore.GetRequest(ctxB, b.requestID)
@@ -247,7 +273,7 @@ func TestPgStore_TenantIsolation_TransitionRequest_Reject(t *testing.T) {
 	b := setupIsolationFixture(t, "B-Reject")
 
 	reason := "attacker-supplied reason"
-	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", &reason)
+	err := testStore.TransitionRequest(context.Background(), b.tenantID, a.requestID, domain.RequestStatusRejected, "attacker", time.Now().UTC(), &reason)
 	assert.ErrorIs(t, err, domain.ErrInvalidTransition,
 		"ISOLATION FAILURE: tenant B was able to reject tenant A's request")
 

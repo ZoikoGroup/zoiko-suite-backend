@@ -15,6 +15,7 @@ import (
 	"zoiko.io/compliance-risk-scoring-svc/internal/config"
 	"zoiko.io/compliance-risk-scoring-svc/internal/events"
 	"zoiko.io/compliance-risk-scoring-svc/internal/handler"
+	"zoiko.io/compliance-risk-scoring-svc/internal/mtls"
 	"zoiko.io/compliance-risk-scoring-svc/internal/store"
 	"zoiko.io/compliance-risk-scoring-svc/internal/telemetry"
 )
@@ -60,7 +61,16 @@ func main() {
 	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)
 	defer publisher.Close()
 
-	authzClient := authz.NewClient(cfg.AuthzURL, logger)
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "compliance-risk-scoring-svc", "00000000-0000-0000-0000-00000000f001")
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, logger)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzURL, logger)
+	}
 
 	h := handler.NewHandler(dataStore, publisher, authzClient, logger)
 	router := handler.NewRouter(h)

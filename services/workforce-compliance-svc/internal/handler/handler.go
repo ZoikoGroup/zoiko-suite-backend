@@ -304,7 +304,7 @@ func (h *Handler) FlagVisaExpiry(w http.ResponseWriter, r *http.Request) {
 		if err := h.store.CreateComplianceAlert(r.Context(), alert); err != nil {
 			h.logger.Error("failed to create compliance alert", zap.String("visa_id", visa.VisaID), zap.Error(err))
 		} else {
-			h.publisher.PublishComplianceAlertRaised(r.Context(), principalID, *alert)
+			h.publisher.PublishComplianceAlertRaised(r.Context(), principalID, visa.CorrelationID, *alert)
 		}
 
 		h.publisher.PublishVisaExpirationFlagged(r.Context(), principalID, *visa)
@@ -400,7 +400,7 @@ func (h *Handler) LogHours(w http.ResponseWriter, r *http.Request) {
 		if err := h.store.CreateComplianceAlert(r.Context(), alert); err != nil {
 			h.logger.Error("failed to create compliance alert", zap.String("employee_id", req.EmployeeID), zap.Error(err))
 		} else {
-			h.publisher.PublishComplianceAlertRaised(r.Context(), principalID, *alert)
+			h.publisher.PublishComplianceAlertRaised(r.Context(), principalID, logEntry.CorrelationID, *alert)
 		}
 
 		h.publisher.PublishWorkingHoursBreach(r.Context(), principalID, *logEntry)

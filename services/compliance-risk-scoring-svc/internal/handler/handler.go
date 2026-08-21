@@ -112,13 +112,22 @@ func (h *Handler) CalculateRiskScore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "risk_score.calculated", tenantID, assessment)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "risk_score.calculated", SubjectID: assessment.ID, TenantID: tenantID,
+		LegalEntityID: assessment.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: assessment,
+	})
 
 	if tier == domain.TierHigh || tier == domain.TierCritical {
-		_ = h.publisher.Publish(r.Context(), "risk_threshold.exceeded", tenantID, map[string]interface{}{
-			"assessment_id": assessment.ID,
-			"risk_tier":     tier,
-			"score":         compositeScore,
+		_ = h.publisher.Publish(r.Context(), events.PublishParams{
+			EventType: "risk_threshold.exceeded", SubjectID: assessment.ID, TenantID: tenantID,
+			LegalEntityID: assessment.LegalEntityID, ActorID: principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"),
+			Payload: map[string]interface{}{
+				"assessment_id": assessment.ID,
+				"risk_tier":     tier,
+				"score":         compositeScore,
+			},
 		})
 	}
 
@@ -255,7 +264,12 @@ func (h *Handler) ArchiveAssessment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "risk_assessment.archived", tenantID, map[string]string{"id": id, "status": "ARCHIVED"})
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "risk_assessment.archived", SubjectID: id, TenantID: tenantID,
+		LegalEntityID: assessment.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload:       map[string]string{"id": id, "status": "ARCHIVED"},
+	})
 
 	h.respondJSON(w, http.StatusOK, map[string]string{
 		"message": "risk assessment archived successfully",

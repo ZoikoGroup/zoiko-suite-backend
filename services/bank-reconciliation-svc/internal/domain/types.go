@@ -47,6 +47,13 @@ type StatementLine struct {
 	BankReference   string              `json:"bank_reference"`
 	Status          StatementLineStatus `json:"status"`
 
+	// GLCashAccountCode is the general-ledger account code representing this
+	// bank account — the piece of information that makes the DIRECTION of a
+	// match verifiable (a debit to it is money in, a credit is money out).
+	// Nil only for rows ingested before migration 000003; such a line cannot
+	// be matched at all rather than being matched on magnitude alone.
+	GLCashAccountCode *string `json:"gl_cash_account_code,omitempty"`
+
 	MatchedJournalID     *string    `json:"matched_journal_id,omitempty"`
 	MatchedByPrincipalID *string    `json:"matched_by_principal_id,omitempty"`
 	MatchedAt            *time.Time `json:"matched_at,omitempty"`
@@ -62,6 +69,12 @@ type StatementLine struct {
 // ── wire types ───────────────────────────────────────────────────────────────
 
 // CreateStatementLineRequest is the input for ingesting a bank statement line.
+//
+// TenantID is accepted but is NOT what the row is written under — the
+// verified X-Tenant-Id header is. It is kept so a caller that sends a tenant
+// disagreeing with its own verified scope is refused outright (403) rather
+// than silently having the header substituted, which would hide a real bug in
+// the caller. See handler.CreateStatementLine.
 type CreateStatementLineRequest struct {
 	TenantID      string    `json:"tenant_id"`
 	LegalEntityID string    `json:"legal_entity_id"`
@@ -70,7 +83,10 @@ type CreateStatementLineRequest struct {
 	Amount        float64   `json:"amount"`
 	CurrencyCode  string    `json:"currency_code"`
 	BankReference string    `json:"bank_reference"`
-	CorrelationID string    `json:"correlation_id"`
+	// GLCashAccountCode is required: without it the direction of any future
+	// match against this line is unverifiable. See migration 000003.
+	GLCashAccountCode string `json:"gl_cash_account_code"`
+	CorrelationID     string `json:"correlation_id"`
 }
 
 // MatchStatementLineRequest names the general-ledger-svc journal the caller
@@ -87,12 +103,26 @@ type FlagExceptionRequest struct {
 }
 
 // ListStatementLinesFilter contains filters for querying statement lines.
+//
+// TenantID is always the caller's VERIFIED scope, never a query parameter.
+// It used to be read from ?tenant_id, which made the explicit tenant filter
+// the store is careful about filter by a value the caller chose.
 type ListStatementLinesFilter struct {
 	TenantID      string
 	BankAccountID string
 	StatementDate string
 	Status        string
+	// Limit bounds the page. The register grows by one row per bank
+	// transaction, so an unbounded read is a full statement history in one
+	// response — and it was the default.
+	Limit int
 }
+
+// Page bounds for ListStatementLines.
+const (
+	DefaultListLimit = 200
+	MaxListLimit     = 1000
+)
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
@@ -126,4 +156,35 @@ var (
 	// ErrStatementIncomplete means at least one line for the given bank
 	// account + statement date is still UNMATCHED.
 	ErrStatementIncomplete = errorString("statement has unresolved (UNMATCHED) lines")
+
+	// ErrTenantScopeMissing is returned when a request carries no verified
+	// tenant scope. Distinguished from "not found" so it answers 401 rather
+	// than 404: a caller with no scope at all was being told the row does not
+	// exist, which is a different — and reassuring — thing to be told.
+	ErrTenantScopeMissing = errorString("caller tenant scope missing")
+
+	// ErrTenantScopeMismatch is returned when a request body names a tenant
+	// other than the caller's verified scope.
+	ErrTenantScopeMismatch = errorString("tenant_id does not match the caller's verified tenant scope")
+
+	// ErrInvalidIdentifier is returned when an identifier or date is
+	// malformed (SQLSTATE 22P02 / 22007 / 22001). Without this the driver
+	// error surfaced as 503 store_unavailable — reporting a database outage
+	// for what is a caller mistake, and sending the console's health display
+	// the wrong signal.
+	ErrInvalidIdentifier = errorString("malformed identifier or date")
+
+	// ErrCashAccountUnknown is returned when a statement line has no
+	// gl_cash_account_code, so the direction of a proposed match cannot be
+	// verified. Refusing is deliberate: the alternative is the magnitude-only
+	// comparison that migration 000003 exists to retire, which would accept a
+	// payment out as reconciling a receipt in.
+	ErrCashAccountUnknown = errorString("statement line has no gl_cash_account_code, so the direction of a match cannot be verified")
+
+	// ErrLegalEntityMismatch is returned when the legal entity a caller was
+	// authorized against is not the one the statement lines actually belong
+	// to. Without this check the authorization and the resource were
+	// independent: a caller could be authorized against an entity it holds
+	// rights over and then act on a bank account belonging to another.
+	ErrLegalEntityMismatch = errorString("bank account does not belong to the legal entity the caller was authorized against")
 )

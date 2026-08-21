@@ -17,6 +17,14 @@ type Config struct {
 	AuthZServiceURL   string
 	EmployeeMasterURL string
 
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
+
 	OTELExporterEndpoint string
 }
 
@@ -49,8 +57,11 @@ type KafkaConfig struct {
 
 func Load() (*Config, error) {
 	return &Config{
-		Env:  env("ENV", "local"),
-		Port: envInt("PORT", 8135),
+		Env: env("ENV", "local"),
+		// 8139: 8135 belongs to vendor-due-diligence-svc, which is wired into
+		// the console and routed there by Traefik. Both services published
+		// 8135, so they could never both start.
+		Port: envInt("PORT", 8139),
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),
@@ -66,6 +77,10 @@ func Load() (*Config, error) {
 		},
 		AuthZServiceURL:   env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		EmployeeMasterURL: env("EMPLOYEE_MASTER_URL", "http://employee-master-svc:8108"),
+
+		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil

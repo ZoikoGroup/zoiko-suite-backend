@@ -17,10 +17,12 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
+	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/handler"
 	"zoiko.io/gateway-auth-svc/internal/health"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
+	"zoiko.io/gateway-auth-svc/internal/siem"
 )
 
 func main() {
@@ -37,7 +39,9 @@ func main() {
 	}
 
 	jwksClient := jwks.NewClient(cfg.JWKSURL, cfg.JWKSCacheTTL)
-	h := handler.New(cfg, jwksClient, log)
+	cartaClient := carta.New(cfg.CartaServiceURL, log)
+	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)
+	h := handler.New(cfg, jwksClient, cartaClient, siemClient, log)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)

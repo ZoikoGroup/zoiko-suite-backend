@@ -84,7 +84,7 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, authzClient, log)
+	h := handler.New(pgStore, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)
 
 	healthH := health.New(pool, log)
@@ -92,12 +92,19 @@ func main() {
 	r.Get("/readyz", healthH.Readiness)
 
 	addr := ":" + strconv.Itoa(cfg.Port)
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)

@@ -36,6 +36,7 @@ import (
 	"zoiko.io/jurisdiction-rules-svc/internal/events"
 	"zoiko.io/jurisdiction-rules-svc/internal/handler"
 	"zoiko.io/jurisdiction-rules-svc/internal/health"
+	"zoiko.io/jurisdiction-rules-svc/internal/mtls"
 	"zoiko.io/jurisdiction-rules-svc/internal/store"
 	"zoiko.io/jurisdiction-rules-svc/internal/telemetry"
 )
@@ -112,9 +113,19 @@ func main() {
 	// AuthZ client. Fails fast at startup if ENV is production/staging and
 	// AuthZServiceURL is still empty or a dev placeholder — no domain
 	// service may silently fall back to a permit-all stub in production.
-	authzClient, err := authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
-	if err != nil {
-		log.Fatal("authz client construction failed", zap.Error(err))
+	var authzClient authz.AuthorizationClient
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "jurisdiction-rules-svc", cfg.AuthZPlatformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewHTTPAuthZClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
+	} else {
+		authzClient, err = authz.NewClient(cfg.Env, cfg.AuthZServiceURL, log)
+		if err != nil {
+			log.Fatal("authz client construction failed", zap.Error(err))
+		}
 	}
 
 	publisher, closeProducer := newPublisher(cfg, log)
@@ -141,6 +152,12 @@ func main() {
 
 	// ── 8. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           r,
@@ -209,6 +226,15 @@ func newPublisher(cfg *config.Config, log *zap.Logger) (events.Publisher, func()
 		// committed by the time an event is emitted; the caller should not
 		// wait on the event backbone to hear about it.
 		WriteTimeout: 5 * time.Second,
+		// Without this, every write to this service costs an extra second.
+		// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+		// WriteMessages of a single message waits for the batch to fill (100
+		// messages) or for that timer, whichever comes first. These events are
+		// emitted one per state transition, so the batch never fills and the
+		// timer always wins — and publishing is on the request path, so the
+		// caller pays for it. Ordering and synchronous delivery are unchanged;
+		// only the artificial wait goes away.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	return events.NewPublisher(log, cfg.Kafka.Topic, writer), func() { _ = writer.Close() }
 }

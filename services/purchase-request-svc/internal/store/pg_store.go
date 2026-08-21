@@ -20,12 +20,33 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/purchase-request-svc/internal/domain"
 	svcmiddleware "zoiko.io/purchase-request-svc/internal/middleware"
 )
+
+// mapPgError translates driver-level failures that are really caller mistakes
+// into domain errors, so they stop being reported as outages.
+//
+// 22P02 (invalid_text_representation) is the one that matters here: this
+// service's request_id, tenant_id and legal_entity_id are all uuid columns, so
+// a mistyped id fails inside the driver before any row is examined. Left
+// unmapped it surfaced as 503 store_unavailable — indistinguishable from the
+// database being unreachable, which sends whoever is reading the logs looking
+// for an outage that never happened.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	if pgErr.Code == "22P02" {
+		return domain.ErrInvalidIdentifier
+	}
+	return err
+}
 
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -52,12 +73,13 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	return tx.Commit(ctx)
 }
 
-func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
-	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
-		return t
-	}
-	return fallback
-}
+// tenantFromCtxOrFallback used to live here, resolving the RLS scope from the
+// context but FALLING BACK to whatever the caller had supplied in the request
+// body. A request carrying no X-Tenant-Id therefore chose its own scope: the
+// body's tenant_id was handed to set_config('app.tenant_id') AND written into
+// the row, so the policy that should have refused the insert was satisfied by
+// the value under attack. The handler now resolves the tenant once from the
+// verified header; there is deliberately no fallback left to reach for.
 
 // CreateRequest inserts a purchase request header in PENDING status.
 //
@@ -67,7 +89,16 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 // mutating *req in place to reflect it — rather than creating a duplicate.
 // Returns created=false when the row already existed.
 func (s *PgStore) CreateRequest(ctx context.Context, req *domain.PurchaseRequest) (created bool, err error) {
-	tenantID := tenantFromCtxOrFallback(ctx, req.TenantID)
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrTenantScopeMissing
+	}
+	// The row is filed under the verified scope, not under req.TenantID — which
+	// is what the INSERT used to write while app.tenant_id was set from the same
+	// unverified value. The handler already refuses a disagreeing body, so these
+	// agree; writing the verified one is what makes that a defence rather than a
+	// convention.
+	req.TenantID = tenantID
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
@@ -133,12 +164,19 @@ func (s *PgStore) GetRequest(ctx context.Context, requestID string) (*domain.Pur
 			&r.ApprovedByPrincipalID, &r.RejectedByPrincipalID, &r.RejectionReason,
 			&r.CorrelationID, &r.CreatedAt, &r.ApprovedAt, &r.RejectedAt,
 		); err != nil {
-			return err
+			return mapPgError(err)
 		}
 		r.Status = domain.RequestStatus(status)
 		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	// A malformed request_id or tenant scope cannot name an existing row, so it
+	// is absent — not an outage. Reported identically to a well-formed id that
+	// happens not to exist, and to another tenant's request, which is the point:
+	// none of the three should be distinguishable from outside.
+	if errors.Is(err, domain.ErrInvalidIdentifier) {
 		return nil, nil
 	}
 	if err != nil {
@@ -164,7 +202,7 @@ func (s *PgStore) ListRequests(ctx context.Context, filter domain.ListRequestsFi
 			ORDER BY created_at DESC
 		`, filter.TenantID, filter.LegalEntityID, filter.Status)
 		if err != nil {
-			return err
+			return mapPgError(err)
 		}
 		defer rows.Close()
 		for rows.Next() {
@@ -192,7 +230,7 @@ func (s *PgStore) ListRequests(ctx context.Context, filter domain.ListRequestsFi
 // statement — no separate read, no race window. Returns
 // domain.ErrInvalidTransition if zero rows were affected (the request
 // doesn't exist, wasn't PENDING, or belongs to a different tenant).
-func (s *PgStore) TransitionRequest(ctx context.Context, tenantID, requestID string, toStatus domain.RequestStatus, actorPrincipalID string, rejectionReason *string) error {
+func (s *PgStore) TransitionRequest(ctx context.Context, tenantID, requestID string, toStatus domain.RequestStatus, actorPrincipalID string, actedAt time.Time, rejectionReason *string) error {
 	var query string
 	var args []any
 	switch toStatus {
@@ -202,14 +240,14 @@ func (s *PgStore) TransitionRequest(ctx context.Context, tenantID, requestID str
 			SET status = $1, approved_by_principal_id = $2, approved_at = $3
 			WHERE request_id = $4 AND status = 'PENDING' AND tenant_id = $5
 		`
-		args = []any{string(toStatus), actorPrincipalID, time.Now().UTC(), requestID, tenantID}
+		args = []any{string(toStatus), actorPrincipalID, actedAt, requestID, tenantID}
 	case domain.RequestStatusRejected:
 		query = `
 			UPDATE purchase_requests
 			SET status = $1, rejected_by_principal_id = $2, rejected_at = $3, rejection_reason = $4
 			WHERE request_id = $5 AND status = 'PENDING' AND tenant_id = $6
 		`
-		args = []any{string(toStatus), actorPrincipalID, time.Now().UTC(), rejectionReason, requestID, tenantID}
+		args = []any{string(toStatus), actorPrincipalID, actedAt, rejectionReason, requestID, tenantID}
 	default:
 		return domain.ErrInvalidTransition
 	}
@@ -218,11 +256,17 @@ func (s *PgStore) TransitionRequest(ctx context.Context, tenantID, requestID str
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, query, args...)
 		if err != nil {
-			return err
+			return mapPgError(err)
 		}
 		affected = tag.RowsAffected()
 		return nil
 	})
+	// A malformed id names no request, so this is a not-found rather than an
+	// illegal transition: answering 422 would assert the request exists and is
+	// in the wrong state, which is a different and untrue claim.
+	if errors.Is(err, domain.ErrInvalidIdentifier) {
+		return domain.ErrRequestNotFound
+	}
 	if err != nil {
 		return err
 	}

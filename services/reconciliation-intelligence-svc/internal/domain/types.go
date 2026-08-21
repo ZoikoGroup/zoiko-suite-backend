@@ -12,8 +12,8 @@ type ResolutionRecommendation string
 type ResolutionStatus string
 
 const (
-	SourceGeneralLedger SourceSystem = "GENERAL_LEDGER"
-	SourceBankStatement SourceSystem = "BANK_STATEMENTS"
+	SourceGeneralLedger  SourceSystem = "GENERAL_LEDGER"
+	SourceBankStatement  SourceSystem = "BANK_STATEMENTS"
 	SourceInvoices       SourceSystem = "INVOICES"
 	SourcePayrollJournal SourceSystem = "PAYROLL_JOURNAL"
 )
@@ -40,27 +40,27 @@ const (
 )
 
 type TransactionItem struct {
-	RefID     string    `json:"ref_id"`
-	Amount    float64   `json:"amount"`
-	Date      string    `json:"date"`
-	Narrative string    `json:"narrative,omitempty"`
+	RefID     string  `json:"ref_id"`
+	Amount    float64 `json:"amount"`
+	Date      string  `json:"date"`
+	Narrative string  `json:"narrative,omitempty"`
 }
 
 type ReconciliationJob struct {
-	ID                  string           `json:"id"`
-	TenantID            string           `json:"tenant_id"`
-	LegalEntityID       string           `json:"legal_entity_id"`
-	JobName             string           `json:"job_name"`
-	SourceSystemA       SourceSystem     `json:"source_system_a"`
-	SourceSystemB       SourceSystem     `json:"source_system_b"`
-	TotalProcessedCount int              `json:"total_processed_count"`
-	MatchedCount        int              `json:"matched_count"`
-	UnmatchedCount      int              `json:"unmatched_count"`
-	ReconciliationRate  float64          `json:"reconciliation_rate"` // 0.00 to 100.00%
-	Status              string           `json:"status"`              // COMPLETED, ARCHIVED
-	AnalyzedAt          time.Time        `json:"analyzed_at"`
-	CreatedAt           time.Time        `json:"created_at"`
-	UnmatchedItems      []UnmatchedItem  `json:"unmatched_items,omitempty"`
+	ID                  string          `json:"id"`
+	TenantID            string          `json:"tenant_id"`
+	LegalEntityID       string          `json:"legal_entity_id"`
+	JobName             string          `json:"job_name"`
+	SourceSystemA       SourceSystem    `json:"source_system_a"`
+	SourceSystemB       SourceSystem    `json:"source_system_b"`
+	TotalProcessedCount int             `json:"total_processed_count"`
+	MatchedCount        int             `json:"matched_count"`
+	UnmatchedCount      int             `json:"unmatched_count"`
+	ReconciliationRate  float64         `json:"reconciliation_rate"` // 0.00 to 100.00%
+	Status              string          `json:"status"`              // COMPLETED, ARCHIVED
+	AnalyzedAt          time.Time       `json:"analyzed_at"`
+	CreatedAt           time.Time       `json:"created_at"`
+	UnmatchedItems      []UnmatchedItem `json:"unmatched_items,omitempty"`
 }
 
 type UnmatchedItem struct {

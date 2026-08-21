@@ -17,10 +17,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -70,11 +72,39 @@ func (c *StubAuthZClient) Authorize(_ context.Context, principalID, _, resource,
 	return nil
 }
 
+// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
+// authorization-svc may be reused locally before it is asked again.
+//
+// Doc 05 (Security Architecture Specification) §6.5 anticipates exactly
+// this cost: "For Tier 0 and latency-sensitive services, policy and
+// authorization evaluation may use high-speed distributed enforcement
+// patterns, including local policy caches... provided policy source
+// remains centralized, policy provenance is auditable, stale decision
+// risk is bounded, fail-safe behavior is defined." This constant is that
+// bound — short enough that a permission revocation or role change
+// propagates within one cache generation, long enough to absorb the
+// repeat checks a single user action or request burst produces.
+//
+// Only real GRANTED/DENIED decisions are ever cached. An unreachable or
+// misbehaving authorization-svc is never cached — that would turn one
+// transient outage into a standing permit-or-deny for every subsequent
+// caller on this instance, which defeats fail-closed.
+const decisionCacheTTL = 5 * time.Second
+
+type cachedDecision struct {
+	deniedErr error
+	expiresAt time.Time
+}
+
 // HTTPAuthZClient is the production implementation against authorization-svc.
 type HTTPAuthZClient struct {
 	baseURL string
 	client  *http.Client
 	log     *zap.Logger
+
+	cacheMu     sync.Mutex
+	cache       map[string]cachedDecision
+	cacheWrites int
 }
 
 func NewHTTPAuthZClient(baseURL string, log *zap.Logger) *HTTPAuthZClient {
@@ -84,6 +114,20 @@ func NewHTTPAuthZClient(baseURL string, log *zap.Logger) *HTTPAuthZClient {
 		client: &http.Client{
 			Timeout: 2 * time.Second, // strict timeout — authz must not block the hot path
 		},
+		cache: make(map[string]cachedDecision),
+	}
+}
+
+// NewHTTPAuthZClientWithHTTPClient is NewHTTPAuthZClient but with a
+// caller-supplied *http.Client — used for the mTLS pilot, where the
+// client's Transport already carries this service's leaf certificate and
+// trusts authorization-svc's CA (see internal/mtls.NewClientHTTPClient).
+func NewHTTPAuthZClientWithHTTPClient(baseURL string, httpClient *http.Client, log *zap.Logger) *HTTPAuthZClient {
+	return &HTTPAuthZClient{
+		baseURL: strings.TrimRight(baseURL, "/"),
+		log:     log,
+		client:  httpClient,
+		cache:   make(map[string]cachedDecision),
 	}
 }
 
@@ -114,6 +158,61 @@ func ActionType(resource, action string) string {
 }
 
 func (c *HTTPAuthZClient) Authorize(ctx context.Context, principalID, scopeID, resource, action string) error {
+	key := principalID + "|" + scopeID + "|" + resource + "|" + action
+
+	if decision, hit := c.lookupCache(key); hit {
+		return decision
+	}
+
+	err := c.authorizeLive(ctx, principalID, scopeID, resource, action)
+
+	if err == nil || errors.Is(err, ErrUnauthorized) {
+		c.storeCache(key, err)
+	}
+
+	return err
+}
+
+// lookupCache returns the cached decision for key and whether it is still
+// within decisionCacheTTL. An expired entry is evicted on read.
+func (c *HTTPAuthZClient) lookupCache(key string) (error, bool) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	d, ok := c.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(d.expiresAt) {
+		delete(c.cache, key)
+		return nil, false
+	}
+	return d.deniedErr, true
+}
+
+// storeCache records a real GRANTED/DENIED decision. Every 1000th write
+// sweeps expired entries so a long-lived instance with many distinct
+// combinations doesn't grow the map unboundedly between reads of the same
+// key.
+func (c *HTTPAuthZClient) storeCache(key string, decision error) {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	c.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
+
+	c.cacheWrites++
+	if c.cacheWrites%1000 == 0 {
+		now := time.Now()
+		for k, v := range c.cache {
+			if now.After(v.expiresAt) {
+				delete(c.cache, k)
+			}
+		}
+	}
+}
+
+// authorizeLive is the real, uncached call to authorization-svc.
+func (c *HTTPAuthZClient) authorizeLive(ctx context.Context, principalID, scopeID, resource, action string) error {
 	actionType := ActionType(resource, action)
 
 	body, err := json.Marshal(authorizeRequest{

@@ -15,6 +15,7 @@ import (
 	"zoiko.io/configuration-feature-flag-svc/internal/authz"
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
 	"zoiko.io/configuration-feature-flag-svc/internal/handler"
+	svcmiddleware "zoiko.io/configuration-feature-flag-svc/internal/middleware"
 	"zoiko.io/configuration-feature-flag-svc/internal/store"
 )
 
@@ -95,8 +96,12 @@ func (p *stubPublisher) PublishFeatureFlagUpdated(_ context.Context, _ domain.Fe
 	return p.err
 }
 
+// newTestRouter mounts TenantContext, which cmd/server/main.go mounts in front
+// of these same routes. This service had no tenant middleware at all until the
+// scope was closed, so nothing here ever exercised a scoped request.
 func newTestRouter(s *stubStore, p *stubPublisher) chi.Router {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, p, testAuthz(), testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
@@ -218,7 +223,7 @@ func TestGetConfigEntry_Found(t *testing.T) {
 	store := &stubStore{findConfigResult: &domain.ConfigEntry{ConfigID: "cfg-1", Key: "k", Value: []byte(`100`)}}
 	r := newTestRouter(store, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config/k?environment=staging", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config/k?environment=staging", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -230,7 +235,7 @@ func TestGetConfigEntry_Found(t *testing.T) {
 func TestGetConfigEntry_MissingEnvironment(t *testing.T) {
 	r := newTestRouter(&stubStore{}, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config/k", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config/k", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -243,7 +248,7 @@ func TestGetConfigEntry_NotFound(t *testing.T) {
 	store := &stubStore{findConfigErr: domain.ErrConfigEntryNotFound}
 	r := newTestRouter(store, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config/missing?environment=staging", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config/missing?environment=staging", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -256,7 +261,7 @@ func TestGetConfigEntry_StoreUnavailable(t *testing.T) {
 	store := &stubStore{findConfigErr: domain.ErrStoreUnavailable}
 	r := newTestRouter(store, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config/k?environment=staging", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config/k?environment=staging", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -270,7 +275,7 @@ func TestGetConfigEntry_StoreUnavailable(t *testing.T) {
 func TestListConfigEntries_EmptyReturnsArray(t *testing.T) {
 	r := newTestRouter(&stubStore{listConfigResult: nil}, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -286,7 +291,7 @@ func TestListConfigEntries_FiltersForwarded(t *testing.T) {
 	s := &stubStore{}
 	r := newTestRouter(s, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config?environment=staging&tenant_id=t-1", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config?environment=staging&tenant_id="+testTenant, nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -296,15 +301,15 @@ func TestListConfigEntries_FiltersForwarded(t *testing.T) {
 	if s.gotListConfigFilter.Environment != "staging" {
 		t.Errorf("expected environment=staging forwarded, got %q", s.gotListConfigFilter.Environment)
 	}
-	if s.gotListConfigFilter.TenantID == nil || *s.gotListConfigFilter.TenantID != "t-1" {
-		t.Errorf("expected tenant_id=t-1 forwarded, got %v", s.gotListConfigFilter.TenantID)
+	if s.gotListConfigFilter.TenantID == nil || *s.gotListConfigFilter.TenantID != testTenant {
+		t.Errorf("expected the verified tenant %s forwarded, got %v", testTenant, s.gotListConfigFilter.TenantID)
 	}
 }
 
 func TestListConfigEntries_StoreUnavailable(t *testing.T) {
 	r := newTestRouter(&stubStore{listConfigErr: domain.ErrStoreUnavailable}, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/config", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -433,7 +438,7 @@ func TestGetFeatureFlag_Found(t *testing.T) {
 	store := &stubStore{findFlagResult: &domain.FeatureFlag{FlagID: "flag-1", Key: "new_ui"}}
 	r := newTestRouter(store, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/flags/new_ui?environment=staging", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/flags/new_ui?environment=staging", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -445,7 +450,7 @@ func TestGetFeatureFlag_Found(t *testing.T) {
 func TestGetFeatureFlag_MissingEnvironment(t *testing.T) {
 	r := newTestRouter(&stubStore{}, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/flags/new_ui", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/flags/new_ui", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -458,7 +463,7 @@ func TestGetFeatureFlag_NotFound(t *testing.T) {
 	store := &stubStore{findFlagErr: domain.ErrFeatureFlagNotFound}
 	r := newTestRouter(store, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/flags/missing?environment=staging", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/flags/missing?environment=staging", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -472,7 +477,7 @@ func TestGetFeatureFlag_NotFound(t *testing.T) {
 func TestListFeatureFlags_EmptyReturnsArray(t *testing.T) {
 	r := newTestRouter(&stubStore{listFlagResult: nil}, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/flags", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/flags", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -487,7 +492,7 @@ func TestListFeatureFlags_EmptyReturnsArray(t *testing.T) {
 func TestListFeatureFlags_StoreUnavailable(t *testing.T) {
 	r := newTestRouter(&stubStore{listFlagErr: domain.ErrStoreUnavailable}, &stubPublisher{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/flags", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/flags", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -504,6 +509,12 @@ const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
 // testPrincipal is what the gateway ForwardAuth middleware sets in
 // X-Principal-Id after verifying the caller identity envelope.
 const testPrincipal = "principal-test-admin"
+
+// testTenant is the caller's verified tenant scope; tenant_id is a uuid column.
+const testTenant = "11111111-1111-1111-1111-111111111111"
+
+// otherTenant is a tenant the caller has no scope in.
+const otherTenant = "22222222-2222-2222-2222-222222222222"
 
 // stubAuthz records what it was asked and answers with err.
 type stubAuthz struct {
@@ -528,6 +539,13 @@ func testAuthz() *stubAuthz { return &stubAuthz{} }
 // Every mutating route now requires it.
 func authed(req *http.Request) *http.Request {
 	req.Header.Set("X-Principal-Id", testPrincipal)
+	req.Header.Set("X-Tenant-Id", testTenant)
+	return req
+}
+
+// scoped stamps only the tenant scope, for reads that need no principal.
+func scoped(req *http.Request) *http.Request {
+	req.Header.Set("X-Tenant-Id", testTenant)
 	return req
 }
 
@@ -616,5 +634,96 @@ func TestGatedRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 				t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// ── tenant scope ─────────────────────────────────────────────────────────────
+//
+// This service read no tenant header at all before these tests existed: a
+// tenant_id in a body chose whose configuration to overwrite, and an ABSENT
+// ?tenant_id= on a list route was documented as "entries across all tenants".
+
+func TestListConfigEntries_NoTenantScope_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{}, &stubPublisher{})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/config", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// The list used to be unfiltered when ?tenant_id= was omitted. It is now the
+// caller's own tenant plus the global defaults that apply to it.
+func TestListConfigEntries_ScopedToVerifiedTenantPlusGlobal(t *testing.T) {
+	s := &stubStore{}
+	r := newTestRouter(s, &stubPublisher{})
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config?environment=staging", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if s.gotListConfigFilter.TenantID == nil || *s.gotListConfigFilter.TenantID != testTenant {
+		t.Fatalf("expected the list scoped to the verified tenant %s, got %v", testTenant, s.gotListConfigFilter.TenantID)
+	}
+	if !s.gotListConfigFilter.IncludeGlobal {
+		t.Fatal("expected global defaults included — they apply to this tenant too")
+	}
+}
+
+func TestListConfigEntries_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{}, &stubPublisher{})
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/config?tenant_id="+otherTenant, nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 listing another tenant's configuration, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListFeatureFlags_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{}, &stubPublisher{})
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/flags?tenant_id="+otherTenant, nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 listing another tenant's flags, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Configuration is what other services read to decide how to behave, so a
+// cross-tenant write here changes another tenant's runtime behaviour.
+func TestUpsertConfigEntry_ForeignTenantBody_Refused(t *testing.T) {
+	s := &stubStore{}
+	r := newTestRouter(s, &stubPublisher{})
+	body := `{"key":"k","value":"v","environment":"staging","tenant_id":"` + otherTenant + `","created_by_principal_id":"` + testPrincipal + `"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/config", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 writing into another tenant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUpsertFeatureFlag_ForeignTenantBody_Refused(t *testing.T) {
+	s := &stubStore{}
+	r := newTestRouter(s, &stubPublisher{})
+	body := `{"key":"new_ui","enabled":true,"environment":"staging","tenant_id":"` + otherTenant + `","created_by_principal_id":"` + testPrincipal + `"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/flags", strings.NewReader(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 flipping another tenant's flag, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestGetConfigEntry_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{}, &stubPublisher{})
+	req := scoped(httptest.NewRequest(http.MethodGet,
+		"/v1/config/k?environment=staging&tenant_id="+otherTenant, nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 reading another tenant's config entry, got %d: %s", w.Code, w.Body.String())
 	}
 }

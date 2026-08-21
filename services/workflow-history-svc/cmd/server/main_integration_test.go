@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -47,10 +48,23 @@ func TestIntegration(t *testing.T) {
 	dbPort := uint32(freePort(t))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
+			// Version pinned explicitly — see the doc comment on
+			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+			// main_integration_test.go for why: the unpinned default floats
+			// to whatever major the library calls "latest," and that patch
+			// build can stop resolving from the remote binary repo with no
+			// code change on our side (this is what broke PR #105's CI).
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("workflow_history_test").
 			Username("postgres").
-			Password("postgres"),
+			Password("postgres").
+			// Isolate the extracted runtime -- the other half of the same fix
+			// applied in internal/store/consumer_pipeline_integration_test.go,
+			// which carries the full explanation. CI runs embedded Postgres twice
+			// in this service's job and nowhere else, and unset both runs share
+			// ~/.embedded-postgres-go/extracted.
+			RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-wfh-server-%d", dbPort))),
 	)
 	require.NoError(t, pg.Start(), "embedded postgres failed to start")
 	defer func() { _ = pg.Stop() }()

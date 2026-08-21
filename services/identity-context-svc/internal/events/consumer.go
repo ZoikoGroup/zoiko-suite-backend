@@ -17,13 +17,14 @@ import (
 // before any side-effect (doctrine §3.7).
 //
 // Consumed events (per spec):
-//   topic: zoiko.identity.events (inbound — subscribed from upstream services)
-//   - tenant.created          → pre-warm tenant cache
-//   - entity.updated          → invalidate entity scope cache for affected principals
-//   - authority.delegated     → invalidate delegation cache for delegate
-//   - authority.revoked       → immediately invalidate ALL sessions for delegate (hard evict)
-//   - authority.expired       → invalidate delegation; next resolve() picks up expiry
-//   - role.updated            → invalidate role-profile cache for affected principals
+//
+//	topic: zoiko.identity.events (inbound — subscribed from upstream services)
+//	- tenant.created          → pre-warm tenant cache
+//	- entity.updated          → invalidate entity scope cache for affected principals
+//	- authority.delegated     → invalidate delegation cache for delegate
+//	- authority.revoked       → immediately invalidate ALL sessions for delegate (hard evict)
+//	- authority.expired       → invalidate delegation; next resolve() picks up expiry
+//	- role.updated            → invalidate role-profile cache for affected principals
 type Consumer struct {
 	log         *zap.Logger
 	sessions    *session.Cache

@@ -16,6 +16,7 @@ package domain
 import (
 	"encoding/json"
 	"errors"
+	"regexp"
 	"time"
 )
 
@@ -62,6 +63,97 @@ func ValidCompatibilityMode(mode string) bool {
 	return mode == CompatibilityBackward || mode == CompatibilityNone
 }
 
+// MaxEventNameLen and MaxOwningServiceLen mirror the VARCHAR(255) columns.
+//
+// Neither was checked. An over-long value reached Postgres, died there as
+// SQLSTATE 22001 (string_data_right_truncation), and came back as 503 "schema
+// store unavailable" — an outage status for a name that was simply too long,
+// and one that sends a reader to look at the database.
+const (
+	MaxEventNameLen     = 255
+	MaxOwningServiceLen = 255
+)
+
+// eventNameRE is the naming convention every publisher on this platform
+// already follows: dotted, lowercase, at least two segments —
+// `jurisdiction.rule.updated`, `entity.status.changed`.
+//
+// The service used to accept ANY non-empty string, and the console carried
+// this same regex client-side with a comment saying so. That is the wrong
+// place for it: the console is one caller of a registry whose entire purpose
+// is being canonical, and a name that matches nothing anyone publishes is a
+// contract for an event that does not exist. Worse, the path segment is
+// echoed back in responses and stored as the key, so accepting arbitrary
+// bytes made the registry's primary key a free-text field.
+var eventNameRE = regexp.MustCompile(`^[a-z][a-z0-9]*(\.[a-z0-9]+)+$`)
+
+// ValidEventName reports whether name is a well-formed event name.
+func ValidEventName(name string) bool {
+	return len(name) <= MaxEventNameLen && eventNameRE.MatchString(name)
+}
+
+// ValidateJSONSchema checks that raw is something this registry can actually
+// hold as a contract, and returns nil when it is.
+//
+// The service used to check only `json.Valid`, whose contract is "is this
+// well-formed JSON" — so `123`, `"a string"`, `null` and `[]` all passed, and
+// were stored as event contracts, under an error message that claimed
+// json_schema "must be a valid JSON object".
+//
+// That was not merely untidy. A first version stored as `123` can never be
+// evolved: the next registration runs the compatibility check, compat.Check
+// fails to parse the stored baseline into a shape, and every future version of
+// that event answers 400 forever. The registry accepted a value that
+// permanently bricked the contract it was recording.
+func ValidateJSONSchema(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		return ErrSchemaRequired
+	}
+	if !json.Valid(raw) {
+		return ErrSchemaMalformed
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		// Well-formed JSON, but not an object.
+		return ErrSchemaMalformed
+	}
+	if len(probe) == 0 {
+		// `{}` constrains nothing. A contract that permits every payload is
+		// not a contract, and recording one would let a producer claim its
+		// events are governed when nothing about them is specified.
+		return ErrSchemaEmpty
+	}
+	// `properties` and `required` are the two members the compatibility
+	// checker reads. If either is present but the wrong shape, every future
+	// version of this event would fail its compatibility check — so the
+	// registration that introduces it is refused now, while there is still a
+	// caller to tell.
+	if _, err := ShapeOf(raw); err != nil {
+		return ErrSchemaShapeInvalid
+	}
+	return nil
+}
+
+// Shape is the part of a JSON Schema this registry understands: the top-level
+// property types and the required list.
+type Shape struct {
+	Properties map[string]struct {
+		Type string `json:"type"`
+	} `json:"properties"`
+	Required []string `json:"required"`
+}
+
+// ShapeOf parses the analysable part of a schema. It lives in domain rather
+// than in compat so the write path can reject an unparseable shape at
+// registration time, using the same parse the checker will later depend on.
+func ShapeOf(raw json.RawMessage) (Shape, error) {
+	var s Shape
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return Shape{}, err
+	}
+	return s, nil
+}
+
 // RegisterSchemaRequest is the wire request for POST /v1/schemas/{eventName}/versions.
 type RegisterSchemaRequest struct {
 	JSONSchema json.RawMessage `json:"json_schema"`
@@ -77,10 +169,29 @@ type RegisterSchemaRequest struct {
 var (
 	// ErrEventNameRequired is returned when the event name path segment is empty.
 	ErrEventNameRequired = errors.New("event name is required")
+	// ErrEventNameInvalid is returned when the event name is not a dotted
+	// lowercase token (jurisdiction.rule.updated), the convention every
+	// publisher on this platform follows.
+	ErrEventNameInvalid = errors.New("event name must be dotted lowercase, e.g. entity.status.changed, and at most 255 characters")
 	// ErrSchemaRequired is returned when the request body has no json_schema.
 	ErrSchemaRequired = errors.New("json_schema is required")
 	// ErrSchemaMalformed is returned when json_schema isn't a valid JSON object.
 	ErrSchemaMalformed = errors.New("json_schema must be a valid JSON object")
+	// ErrSchemaEmpty is returned for `{}` — well-formed, an object, and
+	// constraining nothing. A contract that permits every payload is not a
+	// contract.
+	ErrSchemaEmpty = errors.New("json_schema must declare at least one member; {} constrains nothing")
+	// ErrSchemaShapeInvalid is returned when `properties` or `required` are
+	// present but not the shape the compatibility checker reads. Refused at
+	// registration because otherwise every FUTURE version of the event would
+	// fail its compatibility check against this one.
+	ErrSchemaShapeInvalid = errors.New("json_schema has a properties/required member the compatibility checker cannot read")
+	// ErrOwningServiceTooLong is returned when owning_service exceeds the
+	// column width, which used to reach Postgres and answer 503.
+	ErrOwningServiceTooLong = errors.New("owning_service must be at most 255 characters")
+	// ErrFieldTooLong is what a Postgres 22001 becomes — a caller's value was
+	// wider than its column. A 400, not the 503 it used to produce.
+	ErrFieldTooLong = errors.New("a submitted field is too long for its column")
 	// ErrEventNotFound is returned when no version exists for an event name.
 	ErrEventNotFound = errors.New("event schema not found")
 	// ErrVersionNotFound is returned when a specific version doesn't exist.

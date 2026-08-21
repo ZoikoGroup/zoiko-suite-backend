@@ -35,6 +35,10 @@ type Config struct {
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 }
 
 // KafkaConfig holds event-backbone connection parameters. Per
@@ -88,6 +92,10 @@ func Load() (*Config, error) {
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}
 
 	if err := cfg.validate(); err != nil {

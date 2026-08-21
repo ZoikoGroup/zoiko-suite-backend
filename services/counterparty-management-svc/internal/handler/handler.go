@@ -114,7 +114,11 @@ func (h *Handler) CreateCounterparty(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "counterparty.created", c.CounterpartyID, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "counterparty.created", CounterpartyID: c.CounterpartyID, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+	})
 	writeJSON(w, http.StatusCreated, c)
 }
 
@@ -215,7 +219,11 @@ func (h *Handler) UpdateCounterparty(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "counterparty.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "counterparty.updated", CounterpartyID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -262,7 +270,11 @@ func (h *Handler) UpdateComplianceStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "counterparty.compliance_updated", id, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "counterparty.compliance_updated", CounterpartyID: id, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+	})
 	writeJSON(w, http.StatusOK, c)
 }
 

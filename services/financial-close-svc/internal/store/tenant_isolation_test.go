@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -39,13 +40,35 @@ var (
 
 func TestMain(m *testing.M) {
 	dbPort := uint32(16101 + uint32(os.Getpid()%499))
+
+	// V16, not PostgresVersion("16.1.0").
+	//
+	// This was the only hardcoded patch version in the estate; the other ten
+	// embedded-postgres suites all use the V16 constant, which in
+	// embedded-postgres v1.34.0 resolves to 16.9.0. A hardcoded patch is a
+	// standing bet that that exact build stays published for every platform the
+	// suite runs on -- and the binaries come from a remote Maven repository, so
+	// losing the bet is a CI failure with no code change on our side. That is
+	// the same class of breakage recorded against PR #105 and described in
+	// workflow-history-svc's main_integration_test.go.
+	//
+	// It survived this long because 16.1.0 does still publish a windows-amd64
+	// artifact, so the suite passes on a developer machine and fails only on
+	// the linux-amd64 runner. Tracking the constant means the version moves
+	// with the library, which is the only thing that can promise the artifact
+	// exists.
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
-			Version(embeddedpostgres.PostgresVersion("16.1.0")).
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("financial_close_isolation_test").
 			Username("postgres").
-			Password("postgres"),
+			Password("postgres").
+			// Isolate the extracted runtime. Left at the default, every suite in
+			// the estate shares ~/.embedded-postgres-go/extracted, and the
+			// library's own extraction error tells you to set this. See the same
+			// change in workflow-history-svc for the failure it produces.
+			RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-financial-close-%d", dbPort))),
 	)
 	if err := pg.Start(); err != nil {
 		fmt.Printf("failed to start embedded postgres: %v\n", err)

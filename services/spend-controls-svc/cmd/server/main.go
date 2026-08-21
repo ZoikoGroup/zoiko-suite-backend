@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,20 +28,111 @@ import (
 	"zoiko.io/spend-controls-svc/internal/handler"
 	"zoiko.io/spend-controls-svc/internal/health"
 	svcmiddleware "zoiko.io/spend-controls-svc/internal/middleware"
+	"zoiko.io/spend-controls-svc/internal/mtls"
 	"zoiko.io/spend-controls-svc/internal/store"
 	"zoiko.io/spend-controls-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+
+// decisionCacheTTL bounds how long a GRANTED/DENIED decision from
+// authorization-svc may be reused locally before it is asked again.
+//
+// Doc 05 (Security Architecture Specification) §6.5 anticipates exactly
+// this cost: "For Tier 0 and latency-sensitive services, policy and
+// authorization evaluation may use high-speed distributed enforcement
+// patterns, including local policy caches... provided policy source
+// remains centralized, policy provenance is auditable, stale decision
+// risk is bounded, fail-safe behavior is defined." This constant is that
+// bound — short enough that a permission revocation or role change
+// propagates within one cache generation, long enough to absorb the
+// repeat checks a single user action or request burst produces.
+//
+// Only real GRANTED/DENIED decisions are ever cached. An unreachable or
+// misbehaving authorization-svc is never cached — that would turn one
+// transient outage into a standing permit-or-deny for every subsequent
+// caller on this instance, which defeats fail-closed.
+const decisionCacheTTL = 5 * time.Second
+
+type cachedDecision struct {
+	deniedErr error
+	expiresAt time.Time
+}
 
 type httpAuthzClient struct {
 	baseURL string
 	client  *http.Client
 	log     *zap.Logger
+
+	cacheMu     sync.Mutex
+	cache       map[string]cachedDecision
+	cacheWrites int
 }
 
+func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType
+
+	if decision, hit := a.lookupCache(key); hit {
+		return decision
+	}
+
+	err := a.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+
+	// Cache the decision itself (GRANTED or DENIED), never an unavailable
+	// outcome — see the doc comment on decisionCacheTTL.
+	if err == nil || errors.Is(err, domain.ErrAuthorizationDenied) {
+		a.storeCache(key, err)
+	}
+
+	return err
+}
+
+// lookupCache returns the cached decision for key and whether it is still
+// within decisionCacheTTL. An expired entry is evicted on read.
+func (a *httpAuthzClient) lookupCache(key string) (error, bool) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	d, ok := a.cache[key]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(d.expiresAt) {
+		delete(a.cache, key)
+		return nil, false
+	}
+	return d.deniedErr, true
+}
+
+// storeCache records a real GRANTED/DENIED decision. Every 1000th write
+// sweeps expired entries so a long-lived instance with many distinct
+// (principal, entity, action) combinations doesn't grow the map
+// unboundedly between reads of the same key.
+func (a *httpAuthzClient) storeCache(key string, decision error) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
+	a.cache[key] = cachedDecision{deniedErr: decision, expiresAt: time.Now().Add(decisionCacheTTL)}
+
+	a.cacheWrites++
+	if a.cacheWrites%1000 == 0 {
+		now := time.Now()
+		for k, v := range a.cache {
+			if now.After(v.expiresAt) {
+				delete(a.cache, k)
+			}
+		}
+	}
+}
+
+// checkAllowedLive is the real, uncached call to authorization-svc.
+//
 // authorization-svc's /v1/authorize always responds 200, and signals the
 // actual decision via decision_outcome: "GRANTED" | "DENIED" — there is no
 // "allowed" boolean field in its response.
-func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
 	reqBody, _ := json.Marshal(map[string]string{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
@@ -141,21 +233,54 @@ func main() {
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
 	pgStore := store.New(pool)
 
-	kafkaWriter := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:    cfg.Kafka.Topic,
-		Balancer: &kafka.LeastBytes{},
-		// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
-		// Writer refuses to produce to a topic it doesn't already know about
-		// unless this is also set client-side — without it, every publish to
-		// a not-yet-existing topic fails with "Unknown Topic Or Partition"
-		// even though the broker would have created it.
-		AllowAutoTopicCreation: true,
+	// An explicitly empty KAFKA_BROKERS selects the publisher's existing dry mode
+	// (a nil producer logs instead of publishing). config.validate permits that
+	// for ENV=local and refuses it everywhere else, so a production deployment
+	// cannot reach it and silently stop publishing breach events.
+	var kafkaWriter *kafka.Writer
+	if len(cfg.Kafka.Brokers) > 0 {
+		kafkaWriter = &kafka.Writer{
+			Addr:     kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:    cfg.Kafka.Topic,
+			Balancer: &kafka.LeastBytes{},
+			// The broker has KAFKA_AUTO_CREATE_TOPICS_ENABLE=true, but kafka-go's
+			// Writer refuses to produce to a topic it doesn't already know about
+			// unless this is also set client-side — without it, every publish to
+			// a not-yet-existing topic fails with "Unknown Topic Or Partition"
+			// even though the broker would have created it.
+			AllowAutoTopicCreation: true,
+			// Without this, every blocked spend check costs an extra second.
+			// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+			// write of a single message waits for the batch to fill (100 messages)
+			// or for that timer, whichever comes first. These events fire one per
+			// breach, so the batch never fills and the timer always wins — and
+			// publishing happens on the request path, so the caller pays for it.
+			BatchTimeout: 10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+	} else {
+		log.Warn("no Kafka brokers configured — breach events will be logged, not published",
+			zap.String("consequence", "spend.threshold.breached and spend.block.applied reach no consumer"))
 	}
-	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log}
+
+	var httpClientForAuthz *http.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "spend-controls-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		httpClientForAuthz = mtlsHTTPClient
+	} else {
+		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
+	}
+	authzBaseURL := cfg.AuthZServiceURL
+	if cfg.AuthzMTLSEnabled {
+		authzBaseURL = cfg.AuthzMTLSURL
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -179,12 +304,19 @@ func main() {
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)

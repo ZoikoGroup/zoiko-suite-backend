@@ -16,13 +16,24 @@
 //
 //   - Error handling:
 //       • Validation errors (Handler returns nil)  → commit & continue.
-//       • Store errors (Handler returns non-nil)   → log & do NOT commit;
-//         the broker will re-deliver after the consumer restarts.
+//       • Store errors (Handler returns non-nil)   → retried a bounded
+//         number of times against the SAME message; if every retry still
+//         fails, the message is published to "<topic>.dlq" and only then
+//         committed, so the partition advances instead of head-of-line
+//         blocking on it forever. This matters because Kafka consumer
+//         group offsets are a single per-partition watermark, not a
+//         sparse per-message ack list: without a DLQ, a later message
+//         that succeeds and commits would silently carry the offset past
+//         an earlier failed one, permanently and invisibly dropping it —
+//         exactly the silent-loss failure mode 03-microservices.md §19
+//         and Doc 01 §2.10 ("no silent state change") both prohibit.
+//         If the DLQ publish itself fails, the original message is left
+//         uncommitted (old behavior) so a restart gets another chance.
 //       • Context cancelled (shutdown)             → exit cleanly.
 //
 //   - TODO (production): TLS/SASL broker auth, StartOffset configuration,
-//     per-topic DLQ routing, consumer group lag Prometheus metrics, and
-//     configurable MinBytes/MaxBytes/MaxWait before production cutover.
+//     consumer group lag Prometheus metrics, and configurable
+//     MinBytes/MaxBytes/MaxWait before production cutover.
 package kafka
 
 import (
@@ -38,13 +49,22 @@ import (
 	"zoiko.io/audit-event-store-svc/internal/telemetry"
 )
 
+// dlqRetryAttempts bounds how many times the SAME message is retried
+// against the handler within one fetch iteration before it's dead-lettered.
+// This is deliberately small and fast — it exists to absorb a transient DB
+// blip, not to wait out an extended outage; an outage-length failure still
+// exhausts these quickly and correctly falls back to the old "leave
+// uncommitted, let a restart retry" behavior via the DLQ-publish-failure path.
+const dlqRetryAttempts = 3
+
 // Runner manages the lifecycle of one kafka.Reader goroutine for one topic.
 type Runner struct {
-	reader  *kafka.Reader
-	handler *consumer.Consumer
-	topic   string
-	log     *zap.Logger
-	metrics *telemetry.Metrics
+	reader    *kafka.Reader
+	dlqWriter *kafka.Writer
+	handler   *consumer.Consumer
+	topic     string
+	log       *zap.Logger
+	metrics   *telemetry.Metrics
 }
 
 // NewRunner constructs a Runner for a single topic. metrics records one
@@ -71,12 +91,20 @@ func NewRunner(brokers []string, groupID, topic string, h *consumer.Consumer, me
 		// TODO (production): set Dialer with TLS + SASL credentials.
 	})
 
+	dlqWriter := &kafka.Writer{
+		Addr:                   kafka.TCP(brokers...),
+		Topic:                  topic + ".dlq",
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
+	}
+
 	return &Runner{
-		reader:  r,
-		handler: h,
-		topic:   topic,
-		log:     log.With(zap.String("kafka_topic", topic)),
-		metrics: metrics,
+		reader:    r,
+		dlqWriter: dlqWriter,
+		handler:   h,
+		topic:     topic,
+		log:       log.With(zap.String("kafka_topic", topic)),
+		metrics:   metrics,
 	}
 }
 
@@ -117,6 +145,10 @@ func (r *Runner) Run(ctx context.Context) {
 
 		spanCtx, span := telemetry.StartConsumeSpan(ctx, r.topic, eventID)
 		err = r.handler.Handle(spanCtx, eventID, msg.Value)
+		for attempt := 1; err != nil && attempt < dlqRetryAttempts; attempt++ {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+			err = r.handler.Handle(spanCtx, eventID, msg.Value)
+		}
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
@@ -124,17 +156,31 @@ func (r *Runner) Run(ctx context.Context) {
 		span.End()
 
 		if err != nil {
-			r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "store_error").Inc()
-			// A non-nil error from Handle means a store (DB) failure.
-			// Do NOT commit so the broker re-delivers after restart.
-			r.log.Error("handler returned store error — not committing offset",
+			// A non-nil error from Handle after dlqRetryAttempts tries means
+			// a store (DB) failure that isn't self-resolving within a few
+			// hundred milliseconds. Route the message to the DLQ topic and
+			// commit past it — see the package doc comment for why leaving
+			// it uncommitted is NOT safe here (a later message's commit
+			// would silently drop it anyway).
+			if dlqErr := r.publishToDLQ(ctx, msg, err); dlqErr != nil {
+				r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "store_error").Inc()
+				r.log.Error("handler failed and DLQ publish also failed — not committing offset, a restart will retry",
+					zap.String("event_id", eventID),
+					zap.Int64("offset", msg.Offset),
+					zap.Error(err),
+					zap.Error(dlqErr),
+				)
+				continue
+			}
+			r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "dead_lettered").Inc()
+			r.log.Error("handler failed after retries — dead-lettered and committing to unblock the partition",
 				zap.String("event_id", eventID),
 				zap.Int64("offset", msg.Offset),
 				zap.Error(err),
 			)
-			continue
+		} else {
+			r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "ok").Inc()
 		}
-		r.metrics.MessagesConsumedTotal.WithLabelValues(r.topic, "ok").Inc()
 
 		// Commit after successful handling (or validated-rejection).
 		// CommitMessages is a synchronous, exactly-once commit for the
@@ -152,12 +198,37 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 }
 
-// Close shuts down the underlying kafka.Reader gracefully.
+// Close shuts down the underlying kafka.Reader and DLQ writer gracefully.
 // It should be deferred after Run() has returned.
 func (r *Runner) Close() {
 	if err := r.reader.Close(); err != nil {
 		r.log.Error("kafka reader close error", zap.Error(err))
 	}
+	if err := r.dlqWriter.Close(); err != nil {
+		r.log.Error("kafka DLQ writer close error", zap.Error(err))
+	}
+}
+
+// publishToDLQ republishes msg, unchanged, to "<topic>.dlq" with two added
+// headers recording why and when it was dead-lettered — the original
+// headers (including X-Event-ID) are preserved so the DLQ record stays
+// correlatable back to its source. The original partition/offset are not
+// preserved (a DLQ topic has its own, unrelated partitioning) but are
+// captured as headers for operator visibility.
+func (r *Runner) publishToDLQ(ctx context.Context, msg kafka.Message, handleErr error) error {
+	headers := append([]kafka.Header{}, msg.Headers...)
+	headers = append(headers,
+		kafka.Header{Key: "X-DLQ-Reason", Value: []byte(handleErr.Error())},
+		kafka.Header{Key: "X-DLQ-Source-Topic", Value: []byte(msg.Topic)},
+		kafka.Header{Key: "X-DLQ-Source-Partition", Value: []byte(fmt.Sprintf("%d", msg.Partition))},
+		kafka.Header{Key: "X-DLQ-Source-Offset", Value: []byte(fmt.Sprintf("%d", msg.Offset))},
+		kafka.Header{Key: "X-DLQ-Dead-Lettered-At", Value: []byte(time.Now().UTC().Format(time.RFC3339Nano))},
+	)
+	return r.dlqWriter.WriteMessages(ctx, kafka.Message{
+		Key:     msg.Key,
+		Value:   msg.Value,
+		Headers: headers,
+	})
 }
 
 // extractEventID pulls the event_id from the "X-Event-ID" Kafka header.

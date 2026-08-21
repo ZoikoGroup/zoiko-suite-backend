@@ -79,3 +79,26 @@ create_db exception_escalation
 apply_migration exception_escalation /migrations/exception-escalation/000001_initial_schema.up.sql
 
 echo "=== Phase 5 databases initialised successfully ==="
+
+# ── Runtime role: zoiko_app (least-privilege, RLS-respecting) ──────────────
+# See init-db.sh (main stack) for the full rationale — every service must
+# stop connecting as the Postgres superuser, which bypasses Row-Level
+# Security unconditionally regardless of how correct the policies are.
+psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "postgres" <<-EOSQL
+    CREATE ROLE zoiko_app WITH LOGIN PASSWORD 'zoiko_app_password' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+EOSQL
+
+for db in contract_lifecycle clause_template obligation_tracking board_resolutions \
+    corporate_actions counterparty_management tax_rules tax_determination vat_gst \
+    corporate_tax withholding_tax filing_preparation filing_tracker compliance_status \
+    exception_escalation; do
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$db" <<-EOSQL
+        GRANT CONNECT ON DATABASE $db TO zoiko_app;
+        GRANT USAGE ON SCHEMA public TO zoiko_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO zoiko_app;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zoiko_app;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO zoiko_app;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO zoiko_app;
+EOSQL
+done
+echo "zoiko_app role provisioned across Phase 5 databases."

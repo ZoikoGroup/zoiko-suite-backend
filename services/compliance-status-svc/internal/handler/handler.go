@@ -118,7 +118,11 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to evaluate compliance status")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "compliance.status.changed", c.StatusID, tenantID, c)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "compliance.status.changed", SubjectID: c.StatusID, TenantID: tenantID,
+		LegalEntityID: c.LegalEntityID, Jurisdiction: c.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: c,
+	})
 	writeJSON(w, http.StatusOK, c)
 }
 
@@ -195,7 +199,11 @@ func (h *Handler) CreateGap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to log compliance gap")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "compliance.gap.detected", g.GapID, tenantID, g)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "compliance.gap.detected", SubjectID: g.GapID, TenantID: tenantID,
+		LegalEntityID: g.LegalEntityID, Jurisdiction: g.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: g,
+	})
 	writeJSON(w, http.StatusCreated, g)
 }
 
@@ -261,7 +269,11 @@ func (h *Handler) ResolveGap(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "compliance.gap.resolved", id, tenantID, g)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "compliance.gap.resolved", SubjectID: id, TenantID: tenantID,
+		LegalEntityID: g.LegalEntityID, Jurisdiction: g.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: g,
+	})
 	writeJSON(w, http.StatusOK, g)
 }
 

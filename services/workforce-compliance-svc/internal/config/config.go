@@ -16,8 +16,12 @@ type Config struct {
 	KafkaBrokers         string
 	KafkaEventsTopic     string
 	EmployeeMasterURL    string
-	JurisdictionRulesURL  string
+	JurisdictionRulesURL string
 	AuthzServiceURL      string
+
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -34,6 +38,10 @@ func Load() (*Config, error) {
 		EmployeeMasterURL:    getEnv("EMPLOYEE_MASTER_URL", "http://localhost:8108"),
 		JurisdictionRulesURL: getEnv("JURISDICTION_RULES_URL", "http://localhost:8081"),
 		AuthzServiceURL:      getEnv("AUTHZ_SERVICE_URL", "http://localhost:8089"),
+
+		AuthzMTLSEnabled:         getEnv("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             getEnv("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: getEnv("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 	}
 
 	return cfg, nil

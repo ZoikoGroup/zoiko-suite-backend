@@ -36,12 +36,12 @@ type Client interface {
 // Summary is the subset of purchase-request-svc's PurchaseRequest this
 // service actually needs.
 type Summary struct {
-	RequestID    string  `json:"request_id"`
-	TenantID     string  `json:"tenant_id"`
-	LegalEntityID string `json:"legal_entity_id"`
-	Status       string  `json:"status"`
-	Amount       float64 `json:"amount"`
-	CurrencyCode string  `json:"currency_code"`
+	RequestID     string  `json:"request_id"`
+	TenantID      string  `json:"tenant_id"`
+	LegalEntityID string  `json:"legal_entity_id"`
+	Status        string  `json:"status"`
+	Amount        float64 `json:"amount"`
+	CurrencyCode  string  `json:"currency_code"`
 }
 
 // HTTPClient implements Client against a real purchase-request-svc instance.

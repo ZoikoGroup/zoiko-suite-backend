@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -15,6 +17,14 @@ type Config struct {
 	Kafka KafkaConfig
 
 	AuthZServiceURL string
+
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
 
 	OTELExporterEndpoint string
 }
@@ -46,8 +56,17 @@ type KafkaConfig struct {
 	Topic   string
 }
 
+// Load reads configuration from the environment, then refuses to start on a
+// combination that would be unsafe outside local development.
+//
+// This used to end in `return cfg, nil` unconditionally — an error return that
+// could never fire, which reads like validation while performing none. The
+// dangerous values are all defaults that are correct locally and quietly wrong in
+// production: an empty DB_PASSWORD, sslmode=disable, and an authz URL pointing at
+// localhost. Each would deploy successfully and fail as a security property
+// rather than as a crash.
 func Load() (*Config, error) {
-	return &Config{
+	cfg := &Config{
 		Env:  env("ENV", "local"),
 		Port: envInt("PORT", 8131),
 		DB: DBConfig{
@@ -59,20 +78,83 @@ func Load() (*Config, error) {
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
 		Kafka: KafkaConfig{
-			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			Brokers: splitBrokers(env("KAFKA_BROKERS", "localhost:9092")),
 			GroupID: env("KAFKA_GROUP_ID", "spend-controls-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.spend-controls.events"),
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-	}, nil
+
+		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+	}
+
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
+// validate enforces the invariants that only matter away from a developer
+// machine. Local keeps every convenience; anything else has to be explicit.
+func (c *Config) validate() error {
+	if c.Port <= 0 || c.Port > 65535 {
+		return fmt.Errorf("PORT must be between 1 and 65535, got %d", c.Port)
+	}
+	if c.DB.Name == "" {
+		return errors.New("DB_NAME must not be empty")
+	}
+	if c.AuthZServiceURL == "" {
+		// Every mutation and every read is gated on this call and fails closed, so
+		// an empty URL does not silently permit anything — it refuses everything,
+		// which is a service that starts healthy and cannot do its job.
+		return errors.New("AUTHZ_SERVICE_URL must be set: every spend action is authorized through it")
+	}
+
+	if c.Env == "local" || c.Env == "test" {
+		return nil
+	}
+
+	if c.DB.Password == "" {
+		return fmt.Errorf("DB_PASSWORD must not be empty when ENV=%s", c.Env)
+	}
+	if c.DB.SSLMode == "disable" {
+		return fmt.Errorf("DB_SSLMODE must not be 'disable' when ENV=%s: this connection carries spend limits and consumption history", c.Env)
+	}
+	if strings.Contains(c.AuthZServiceURL, "localhost") || strings.Contains(c.AuthZServiceURL, "127.0.0.1") {
+		return fmt.Errorf("AUTHZ_SERVICE_URL points at %s when ENV=%s, which cannot be the real authorization-svc", c.AuthZServiceURL, c.Env)
+	}
+	if len(c.Kafka.Brokers) == 0 {
+		// Locally an empty broker list selects the log-only path deliberately. In
+		// production it would mean silently publishing none of the breach events,
+		// with nothing downstream to notice a control had fired.
+		return fmt.Errorf("KAFKA_BROKERS must not be empty when ENV=%s: spend.threshold.breached and spend.block.applied would never be published", c.Env)
+	}
+	return nil
+}
+
+// env reads a variable, treating "set but empty" as a real value. os.Getenv
+// cannot distinguish unset from empty, so `KAFKA_BROKERS=` was replaced by the
+// default and there was no way to ask for no brokers at all.
 func env(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def
+}
+
+// splitBrokers turns a comma-separated list into addresses, dropping blanks.
+// strings.Split("", ",") returns one broker whose address is the empty string,
+// which the writer accepts and then fails to dial on every publish.
+func splitBrokers(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func envInt(key string, def int) int {

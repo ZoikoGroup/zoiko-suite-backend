@@ -33,6 +33,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -86,10 +87,36 @@ func TestConsumerPipelineIntegration(t *testing.T) {
 	dbPort := uint32(15433 + uint32(os.Getpid()%500))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
+			// Version pinned explicitly — see the doc comment on
+			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+			// main_integration_test.go for why: the unpinned default floats
+			// to whatever major the library calls "latest," and that patch
+			// build can stop resolving from the remote binary repo with no
+			// code change on our side (this is what broke PR #105's CI).
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("workflow_history_consumer_test").
 			Username("postgres").
-			Password("postgres"),
+			Password("postgres").
+			// ISOLATE THE EXTRACTED RUNTIME, or this suite fights the one in
+			// cmd/server for a directory.
+			//
+			// Left unset, the library puts the extracted binaries AND the data
+			// directory under a single shared ~/.embedded-postgres-go/extracted,
+			// and its own extraction error says to set this when suites can
+			// overlap. This service is the only one CI runs embedded Postgres
+			// for TWICE in the same job -- `-tags=integration ./cmd/server/` and
+			// then `-tags=integration ./internal/store/` -- so the two share that
+			// path where every other service has it to itself.
+			//
+			// Sequential steps should mean no overlap, but only if the first
+			// instance's Stop() fully tears the directory down. If it does not,
+			// the second Start() finds a populated data dir with a stale
+			// postmaster.pid and fails -- and it fails at pg.Start(), reported as
+			// "embedded postgres failed to start" with nothing about the real
+			// cause. Distinct paths make the two runs independent instead of
+			// relying on the first one's cleanup.
+			RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-wfh-store-%d", dbPort))),
 	)
 	require.NoError(t, pg.Start(), "embedded postgres failed to start")
 	defer func() { _ = pg.Stop() }()

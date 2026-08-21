@@ -18,17 +18,17 @@ import (
 )
 
 type mockStore struct {
-	bankAccounts  map[string]*domain.BankAccount
-	cashBalances  map[string]*domain.CashBalance
-	thresholds    map[string]*domain.LiquidityThreshold
-	transfers     map[string]bool
-	createErr     error
-	getErr        error
-	listErr       error
-	updateErr     error
-	balErr        error
-	threshErr     error
-	transferErr   error
+	bankAccounts map[string]*domain.BankAccount
+	cashBalances map[string]*domain.CashBalance
+	thresholds   map[string]*domain.LiquidityThreshold
+	transfers    map[string]bool
+	createErr    error
+	getErr       error
+	listErr      error
+	updateErr    error
+	balErr       error
+	threshErr    error
+	transferErr  error
 }
 
 func newMockStore() *mockStore {
@@ -130,15 +130,15 @@ type mockPublisher struct {
 	breaches      []domain.EffectiveCashResponse
 }
 
-func (m *mockPublisher) PublishCashPositionUpdated(ctx context.Context, correlationID string, balance domain.CashBalance) {
+func (m *mockPublisher) PublishCashPositionUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, balance domain.CashBalance) {
 	m.cashPositions = append(m.cashPositions, balance)
 }
 
-func (m *mockPublisher) PublishEffectiveCashUpdated(ctx context.Context, correlationID string, resp domain.EffectiveCashResponse) {
+func (m *mockPublisher) PublishEffectiveCashUpdated(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse) {
 	m.effectiveCash = append(m.effectiveCash, resp)
 }
 
-func (m *mockPublisher) PublishLiquidityThresholdBreached(ctx context.Context, correlationID string, resp domain.EffectiveCashResponse) {
+func (m *mockPublisher) PublishLiquidityThresholdBreached(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse) {
 	m.breaches = append(m.breaches, resp)
 }
 
@@ -452,8 +452,8 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 			{Amount: 2000.0, DueDate: now.AddDate(0, 0, 60), Category: "RECEIVABLE"}, // in 90-day
 		},
 		outflowsData: []domain.ExpectedCashFlow{
-			{Amount: 100.0, DueDate: now.AddDate(0, 0, 4), Category: "PAYABLE"},   // in 7-day
-			{Amount: 300.0, DueDate: now.AddDate(0, 0, 15), Category: "PAYABLE"},   // in 30-day
+			{Amount: 100.0, DueDate: now.AddDate(0, 0, 4), Category: "PAYABLE"},     // in 7-day
+			{Amount: 300.0, DueDate: now.AddDate(0, 0, 15), Category: "PAYABLE"},    // in 30-day
 			{Amount: 600.0, DueDate: now.AddDate(0, 0, 45), Category: "OBLIGATION"}, // in 90-day
 		},
 	}

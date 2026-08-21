@@ -18,9 +18,11 @@ import (
 // ── stub store ────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	instance  *domain.WorkflowInstance
-	stages    []*domain.WorkflowStage
-	createErr error
+	instance         *domain.WorkflowInstance
+	stages           []*domain.WorkflowStage
+	createErr        error
+	createCreated    bool
+	createCreatedSet bool
 
 	findInstance *domain.WorkflowInstance
 	findErr      error
@@ -42,8 +44,12 @@ type stubStore struct {
 	cancelErr          error
 }
 
-func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, error) {
-	return s.instance, s.stages, s.createErr
+func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
+	created := s.createCreated
+	if !s.createCreatedSet {
+		created = true // default: existing tests expect the "newly created" (201) path
+	}
+	return s.instance, s.stages, created, s.createErr
 }
 func (s *stubStore) FindWorkflowByID(_ context.Context, _ string) (*domain.WorkflowInstance, error) {
 	return s.findInstance, s.findErr
@@ -78,19 +84,19 @@ func (p *stubPublisher) PublishWorkflowStarted(_ context.Context, _ domain.Workf
 	p.startedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishApprovalGranted(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage) error {
+func (p *stubPublisher) PublishApprovalGranted(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage, _ string) error {
 	p.grantedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishApprovalRejected(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage) error {
+func (p *stubPublisher) PublishApprovalRejected(_ context.Context, _ domain.WorkflowInstance, _ domain.WorkflowStage, _ string) error {
 	p.rejectedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishWorkflowEscalated(_ context.Context, _ domain.WorkflowInstance) error {
+func (p *stubPublisher) PublishWorkflowEscalated(_ context.Context, _ domain.WorkflowInstance, _ string) error {
 	p.escalatedCalls++
 	return nil
 }
-func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.WorkflowInstance) error {
+func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.WorkflowInstance, _ string) error {
 	p.completedCalls++
 	return nil
 }

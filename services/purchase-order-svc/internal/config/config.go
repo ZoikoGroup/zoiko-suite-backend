@@ -21,6 +21,20 @@ type Config struct {
 	// unreachable authorization-svc rejects the action, see internal/authz.
 	AuthZServiceURL string
 
+	// AuthzMTLSEnabled opts this service into the mTLS pilot for calls to
+	// authorization-svc (see internal/mtls). OFF by default — must not
+	// change default runtime behavior when unset.
+	AuthzMTLSEnabled bool
+
+	// AuthzMTLSURL is authorization-svc's mTLS listener, used instead of
+	// AuthZServiceURL when AuthzMTLSEnabled is true.
+	AuthzMTLSURL string
+
+	// MTLSManagementServiceURL is mtls-management-svc's base URL, used to
+	// provision this service's client-side mTLS identity when
+	// AuthzMTLSEnabled is true.
+	MTLSManagementServiceURL string
+
 	// PurchaseRequestServiceURL is purchase-request-svc's base URL. When a
 	// caller supplies purchase_request_id on Issue, this service verifies —
 	// synchronously, fail-closed — that the referenced request is real,
@@ -80,6 +94,9 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.purchase-order.events"),
 		},
 		AuthZServiceURL:           env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzMTLSEnabled:          env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:              env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL:  env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		PurchaseRequestServiceURL: env("PURCHASE_REQUEST_SERVICE_URL", "http://purchase-request-svc:8100"),
 		OTELExporterEndpoint:      env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil

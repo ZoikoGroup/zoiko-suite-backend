@@ -19,6 +19,18 @@ const (
 	RequestStatusRejected RequestStatus = "REJECTED"
 )
 
+// ValidRequestStatus reports whether s is a status this service can ever have
+// stored. An unrecognised ?status= filter matched no row and returned an empty
+// list, so a typo was indistinguishable from a tenant with no requests.
+func ValidRequestStatus(s string) bool {
+	switch RequestStatus(s) {
+	case RequestStatusPending, RequestStatusApproved, RequestStatusRejected:
+		return true
+	default:
+		return false
+	}
+}
+
 // ValidRequestTransitions enumerates the only legal status transitions.
 var ValidRequestTransitions = map[RequestStatus][]RequestStatus{
 	RequestStatusPending:  {RequestStatusApproved, RequestStatusRejected},
@@ -30,13 +42,13 @@ var ValidRequestTransitions = map[RequestStatus][]RequestStatus{
 // Entity-bound (LegalEntityID), never hard-deleted.
 type PurchaseRequest struct {
 	RequestID              string        `json:"request_id"`
-	TenantID                string        `json:"tenant_id"`
-	LegalEntityID           string        `json:"legal_entity_id"`
-	RequestedByPrincipalID  string        `json:"requested_by_principal_id"`
-	Description             string        `json:"description"`
-	Amount                  float64       `json:"amount"`
-	CurrencyCode            string        `json:"currency_code"`
-	Status                  RequestStatus `json:"status"`
+	TenantID               string        `json:"tenant_id"`
+	LegalEntityID          string        `json:"legal_entity_id"`
+	RequestedByPrincipalID string        `json:"requested_by_principal_id"`
+	Description            string        `json:"description"`
+	Amount                 float64       `json:"amount"`
+	CurrencyCode           string        `json:"currency_code"`
+	Status                 RequestStatus `json:"status"`
 
 	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
 	RejectedByPrincipalID *string    `json:"rejected_by_principal_id,omitempty"`
@@ -65,6 +77,8 @@ type RejectRequestRequest struct {
 
 // ListRequestsFilter holds optional filters for querying purchase requests.
 type ListRequestsFilter struct {
+	// TenantID is the caller's VERIFIED scope, resolved from X-Tenant-Id by the
+	// handler — never a value the request chose for itself.
 	TenantID      string
 	LegalEntityID string
 	Status        string
@@ -81,6 +95,14 @@ var (
 	ErrInvalidTransition = errorString("invalid purchase request status transition")
 	ErrStoreUnavailable  = errorString("purchase request store unavailable")
 
+	// ErrInvalidIdentifier is a non-UUID value compared against a uuid column.
+	// It dies inside the pg driver as SQLSTATE 22P02 before any row is
+	// examined, and without this it reached the caller as a generic store
+	// failure — a 503 store_unavailable, i.e. a typo wearing an outage's
+	// clothes. A malformed id cannot name an existing request, so callers
+	// treat this as absent rather than as the database being down.
+	ErrInvalidIdentifier = errorString("identifier is not a valid UUID")
+
 	ErrAuthorizationDenied             = errorString("authorization denied for this purchase request action")
 	ErrAuthorizationServiceUnavailable = errorString("authorization-svc unavailable")
 
@@ -95,4 +117,17 @@ var (
 	// who created a record may not be the same principal who approves or
 	// rejects it.
 	ErrSelfApprovalNotAllowed = errorString("principal may not approve or reject their own submission")
+
+	// ErrTenantScopeMissing is returned when a request carries no verified
+	// tenant scope (no X-Tenant-Id). Every row here is tenant-owned, and a
+	// read with no scope has no honest answer — it must not quietly become
+	// "whatever tenant the caller named", which is what ListRequests did.
+	ErrTenantScopeMissing = errorString("caller tenant scope missing")
+
+	// ErrTenantScopeMismatch is returned when a request names a tenant other
+	// than the caller's verified scope — as ?tenant_id= when listing the
+	// register, or as tenant_id in a create body. Both used to be BELIEVED in
+	// preference to the header (which was never read at all), which made the
+	// whole register readable, and writable, across tenants.
+	ErrTenantScopeMismatch = errorString("request tenant_id does not match the caller's verified tenant scope")
 )

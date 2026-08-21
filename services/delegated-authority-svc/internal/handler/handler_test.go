@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -63,10 +64,43 @@ func (s *stubStore) GetDelegation(_ context.Context, delegationID string) (*doma
 	return &cp, nil
 }
 
-func (s *stubStore) ListDelegations(_ context.Context, legalEntityID, delegatorPrincipalID, delegatePrincipalID, status string) ([]domain.DelegationGrant, error) {
+// ListDelegations applies the filter for real.
+//
+// It deliberately does NOT just return everything. The defect this service
+// had was an unscoped read returning the whole tenant's register, and the fix
+// is a filter the handler populates -- so a stub that ignored the filter would
+// make the test for that fix pass without the fix being present.
+func (s *stubStore) ListDelegations(_ context.Context, f domain.ListDelegationsFilter) ([]domain.DelegationGrant, error) {
 	var out []domain.DelegationGrant
 	for _, d := range s.byID {
+		if f.LegalEntityID != "" && d.LegalEntityID != f.LegalEntityID {
+			continue
+		}
+		if f.DelegatorPrincipalID != "" && d.DelegatorPrincipalID != f.DelegatorPrincipalID {
+			continue
+		}
+		if f.DelegatePrincipalID != "" && d.DelegatePrincipalID != f.DelegatePrincipalID {
+			continue
+		}
+		if f.Status != "" && string(d.Status) != f.Status {
+			continue
+		}
+		if f.SelfPrincipalID != "" &&
+			d.DelegatorPrincipalID != f.SelfPrincipalID && d.DelegatePrincipalID != f.SelfPrincipalID {
+			continue
+		}
 		out = append(out, *d)
+	}
+	// Deterministic order so paging assertions mean something.
+	sort.Slice(out, func(i, j int) bool { return out[i].DelegationID > out[j].DelegationID })
+	if f.Offset > 0 {
+		if f.Offset >= len(out) {
+			return nil, nil
+		}
+		out = out[f.Offset:]
+	}
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
 	}
 	return out, nil
 }

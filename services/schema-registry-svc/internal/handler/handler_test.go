@@ -39,6 +39,10 @@ type stubStore struct {
 	// handler passed down, so tests can prove the compatibility baseline and
 	// the write guard are the same version.
 	insertedExpectedVersion int
+
+	// gotLimit/gotOffset record the paging bounds the handler applied, so a
+	// test can prove the reads are bounded rather than assuming it.
+	gotLimit, gotOffset int
 }
 
 func (s *stubStore) LatestVersion(_ context.Context, _ string) (*domain.EventSchema, error) {
@@ -47,10 +51,12 @@ func (s *stubStore) LatestVersion(_ context.Context, _ string) (*domain.EventSch
 func (s *stubStore) Version(_ context.Context, _ string, _ int) (*domain.EventSchema, error) {
 	return s.version, s.versionErr
 }
-func (s *stubStore) Versions(_ context.Context, _ string) ([]*domain.EventSchema, error) {
+func (s *stubStore) Versions(_ context.Context, _ string, limit, offset int) ([]*domain.EventSchema, error) {
+	s.gotLimit, s.gotOffset = limit, offset
 	return s.versions, s.versionsErr
 }
-func (s *stubStore) EventNames(_ context.Context) ([]string, error) {
+func (s *stubStore) EventNames(_ context.Context, limit, offset int) ([]string, error) {
+	s.gotLimit, s.gotOffset = limit, offset
 	return s.names, s.namesErr
 }
 func (s *stubStore) Insert(_ context.Context, sch *domain.EventSchema, expectedVersion int) (*domain.EventSchema, error) {
@@ -71,10 +77,15 @@ func (s *stubStore) Insert(_ context.Context, sch *domain.EventSchema, expectedV
 type stubAuthz struct {
 	err          error
 	gotPrincipal string
+	// gotScope records the legal entity the handler authorized against, so a
+	// test can prove an entity-less registration falls back to the platform
+	// scope rather than sending "" (which authorization-svc rejects outright).
+	gotScope string
 }
 
-func (a *stubAuthz) CheckSchemaPublishAllowed(_ context.Context, principalID, _, _ string) error {
+func (a *stubAuthz) CheckSchemaPublishAllowed(_ context.Context, principalID, legalEntityID, _ string) error {
 	a.gotPrincipal = principalID
+	a.gotScope = legalEntityID
 	return a.err
 }
 
@@ -85,11 +96,21 @@ func newRouter(s *stubStore) chi.Router {
 	return newRouterWithAuthz(s, &stubAuthz{})
 }
 
+// testPlatformScope stands in for AUTHZ_PLATFORM_SCOPE_ID.
+const testPlatformScope = "00000000-0000-0000-0000-00000000f001"
+
 func newRouterWithAuthz(s *stubStore, a *stubAuthz) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, a, zap.NewNop())
+	h := handler.New(s, a, testPlatformScope, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
+}
+
+// getWithIdentity is a GET carrying the identity headers the gateway sets.
+// Reads used to require none at all — anything that could reach the port could
+// enumerate the platform's entire event-contract catalogue.
+func getWithIdentity(path string) *http.Request {
+	return withIdentity(httptest.NewRequest(http.MethodGet, path, nil))
 }
 
 // withIdentity stamps the identity headers gateway-auth-svc sets on a
@@ -172,7 +193,7 @@ func TestRegisterVersion_MissingSchema_Returns400(t *testing.T) {
 	s := &stubStore{}
 	r := newRouter(s)
 
-	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(`{}`)))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/probe.event.name/versions", bytes.NewBufferString(`{}`)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -183,7 +204,7 @@ func TestRegisterVersion_MalformedJSONSchema_Returns400(t *testing.T) {
 	s := &stubStore{}
 	r := newRouter(s)
 
-	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(`{"json_schema": not-json}`)))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/probe.event.name/versions", bytes.NewBufferString(`{"json_schema": not-json}`)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -195,7 +216,7 @@ func TestRegisterVersion_StoreUnavailable_Returns503(t *testing.T) {
 	r := newRouter(s)
 
 	body := `{"json_schema":{"properties":{},"required":[]}}`
-	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body)))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/probe.event.name/versions", bytes.NewBufferString(body)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -210,7 +231,7 @@ func TestRegisterVersion_NoIdentityHeader_Returns401(t *testing.T) {
 
 	body := `{"json_schema":{"properties":{},"required":[]}}`
 	// No withIdentity — simulates a request that never passed the gateway.
-	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body))
+	req := httptest.NewRequest(http.MethodPost, "/v1/schemas/probe.event.name/versions", bytes.NewBufferString(body))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -224,7 +245,7 @@ func TestRegisterVersion_AuthorizationDenied_Returns403(t *testing.T) {
 	r := newRouterWithAuthz(s, a)
 
 	body := `{"json_schema":{"properties":{},"required":[]}}`
-	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body)))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/probe.event.name/versions", bytes.NewBufferString(body)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -239,7 +260,7 @@ func TestRegisterVersion_AuthorizationServiceUnavailable_Returns503FailClosed(t 
 	r := newRouterWithAuthz(s, a)
 
 	body := `{"json_schema":{"properties":{},"required":[]}}`
-	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/foo/versions", bytes.NewBufferString(body)))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/schemas/probe.event.name/versions", bytes.NewBufferString(body)))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -250,10 +271,10 @@ func TestRegisterVersion_AuthorizationServiceUnavailable_Returns503FailClosed(t 
 // ── GetLatest / GetVersion / ListVersions / ListEventNames ──────────────────
 
 func TestGetLatest_Found_Returns200(t *testing.T) {
-	s := &stubStore{latest: &domain.EventSchema{EventName: "foo", Version: 3, JSONSchema: json.RawMessage(`{}`)}}
+	s := &stubStore{latest: &domain.EventSchema{EventName: "probe.event.read", Version: 3, JSONSchema: json.RawMessage(`{}`)}}
 	r := newRouter(s)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/schemas/foo/versions/latest", nil)
+	req := getWithIdentity("/v1/schemas/probe.event.read/versions/latest")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -264,7 +285,7 @@ func TestGetLatest_NotFound_Returns404(t *testing.T) {
 	s := &stubStore{latest: nil}
 	r := newRouter(s)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/schemas/foo/versions/latest", nil)
+	req := getWithIdentity("/v1/schemas/probe.event.read/versions/latest")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -275,7 +296,7 @@ func TestGetVersion_NonIntegerVersion_Returns400(t *testing.T) {
 	s := &stubStore{}
 	r := newRouter(s)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/schemas/foo/versions/abc", nil)
+	req := getWithIdentity("/v1/schemas/probe.event.read/versions/abc")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -286,7 +307,7 @@ func TestListVersions_None_Returns404(t *testing.T) {
 	s := &stubStore{versions: nil}
 	r := newRouter(s)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/schemas/foo/versions", nil)
+	req := getWithIdentity("/v1/schemas/probe.event.read/versions")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -297,7 +318,7 @@ func TestListEventNames_Returns200(t *testing.T) {
 	s := &stubStore{names: []string{"a", "b"}}
 	r := newRouter(s)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/schemas/", nil)
+	req := getWithIdentity("/v1/schemas/")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 

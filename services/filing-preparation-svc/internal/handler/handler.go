@@ -121,7 +121,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create filing draft")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "filing.draft.created", d.DraftID, tenantID, d)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "filing.draft.created", DraftID: d.DraftID, TenantID: tenantID,
+		LegalEntityID: d.LegalEntityID, Jurisdiction: d.JurisdictionID, ActorID: principal,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
+	})
 	writeJSON(w, http.StatusCreated, d)
 }
 
@@ -202,7 +206,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to update filing draft")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "filing.draft.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "filing.draft.updated", DraftID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principal,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -286,7 +294,11 @@ func (h *Handler) Validate(w http.ResponseWriter, r *http.Request) {
 	if d.ValidationStatus == domain.StatusBlocked {
 		eventType = "filing.blocked"
 	}
-	_ = h.publisher.Publish(r.Context(), eventType, id, tenantID, d)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: eventType, DraftID: id, TenantID: tenantID,
+		LegalEntityID: d.LegalEntityID, Jurisdiction: d.JurisdictionID, ActorID: principal,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
+	})
 	writeJSON(w, http.StatusOK, d)
 }
 
@@ -334,7 +346,11 @@ func (h *Handler) Finalize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "filing.ready.for.submission", id, tenantID, d)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "filing.ready.for.submission", DraftID: id, TenantID: tenantID,
+		LegalEntityID: d.LegalEntityID, Jurisdiction: d.JurisdictionID, ActorID: principal,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: d,
+	})
 	writeJSON(w, http.StatusOK, d)
 }
 

@@ -29,11 +29,13 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/obligations-svc/internal/authz"
 	"zoiko.io/obligations-svc/internal/config"
 	"zoiko.io/obligations-svc/internal/events"
 	"zoiko.io/obligations-svc/internal/handler"
 	"zoiko.io/obligations-svc/internal/health"
 	"zoiko.io/obligations-svc/internal/jurisdiction"
+	svcmiddleware "zoiko.io/obligations-svc/internal/middleware"
 	"zoiko.io/obligations-svc/internal/store"
 	"zoiko.io/obligations-svc/internal/telemetry"
 )
@@ -120,11 +122,17 @@ func main() {
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		// kafka-go's default is 1s, and WriteMessages is synchronous — so
+		// every obligation write paid a wasted second inside the request,
+		// waiting out a batch window for a single message. Platform-wide
+		// value, same as the other gap-closed services.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	jurisdictionValidator := jurisdiction.NewHTTPValidator(cfg.JurisdictionRulesURL, log)
+	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -134,9 +142,10 @@ func main() {
 	r.Use(otelchi.Middleware("obligations-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 	r.Use(correlationIDMiddleware)
+	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, jurisdictionValidator, log)
+	h := handler.New(pgStore, publisher, jurisdictionValidator, authzClient, log)
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 
@@ -148,12 +157,19 @@ func main() {
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)

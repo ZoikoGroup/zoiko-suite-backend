@@ -12,9 +12,9 @@ import (
 )
 
 type status struct {
-	Status     string            `json:"status"`
-	Checks     map[string]string `json:"checks"`
-	CheckedAt  time.Time         `json:"checked_at"`
+	Status    string            `json:"status"`
+	Checks    map[string]string `json:"checks"`
+	CheckedAt time.Time         `json:"checked_at"`
 }
 
 // Handler returns HTTP 200 when all critical dependencies are reachable,

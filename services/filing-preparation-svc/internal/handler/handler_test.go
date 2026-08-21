@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/filing-preparation-svc/internal/authz"
 	"zoiko.io/filing-preparation-svc/internal/domain"
+	"zoiko.io/filing-preparation-svc/internal/events"
 	"zoiko.io/filing-preparation-svc/internal/evidencereq"
 )
 
@@ -100,7 +101,7 @@ func (m *mockStore) Finalize(ctx context.Context, id string, req *domain.Finaliz
 
 type mockPublisher struct{}
 
-func (p *mockPublisher) Publish(ctx context.Context, eventType, draftID, tenantID string, payload interface{}) error {
+func (p *mockPublisher) Publish(ctx context.Context, params events.PublishParams) error {
 	return nil
 }
 

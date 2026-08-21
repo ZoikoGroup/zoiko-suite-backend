@@ -120,7 +120,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create corporate tax return")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "corporate_tax_return.created", ret.ReturnID, tenantID, ret)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "corporate_tax_return.created", ReturnID: ret.ReturnID, TenantID: tenantID,
+		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ret,
+	})
 	writeJSON(w, http.StatusCreated, ret)
 }
 
@@ -200,7 +204,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to update corporate tax return")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "corporate_tax_return.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "corporate_tax_return.updated", ReturnID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -249,7 +257,11 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "corporate_tax_return.submitted", id, tenantID, ret)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "corporate_tax_return.submitted", ReturnID: id, TenantID: tenantID,
+		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ret,
+	})
 	writeJSON(w, http.StatusOK, ret)
 }
 
@@ -295,7 +307,11 @@ func (h *Handler) Assess(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to record assessment")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "corporate_tax_return.assessed", id, tenantID, ret)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "corporate_tax_return.assessed", ReturnID: id, TenantID: tenantID,
+		LegalEntityID: ret.LegalEntityID, Jurisdiction: ret.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: ret,
+	})
 	writeJSON(w, http.StatusOK, ret)
 }
 

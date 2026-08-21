@@ -1,0 +1,11 @@
+-- Migration: 000004_invariants.down.sql
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_overdue_after_due_date;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_paid_stamped;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_overdue_stamped;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_sent_before_later_states;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_payment_attribution_paired;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_overdue_attribution_paired;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_sent_attribution_paired;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_currency_code_shape;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_amount_positive;
+ALTER TABLE customer_invoices DROP CONSTRAINT IF EXISTS customer_invoices_status_valid;

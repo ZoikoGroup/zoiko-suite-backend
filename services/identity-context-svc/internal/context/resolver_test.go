@@ -11,9 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
-	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/config"
+	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/domain"
+	"zoiko.io/identity-context-svc/internal/siem"
 )
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -51,8 +52,8 @@ var testCfg = &config.Config{
 
 // mockPrincipalStore
 type mockPrincipalStore struct {
-	principal  *domain.Principal
-	findErr    error
+	principal   *domain.Principal
+	findErr     error
 	assignments []domain.PrincipalRoleAssignment
 	delegations []domain.DelegatedAuthority
 }
@@ -322,6 +323,7 @@ func (f *resolverFixture) build() *identityctx.Resolver {
 		f.events,
 		f.verifier,
 		f.signer,
+		siem.New("", "identity-context-svc", zap.NewNop()),
 	)
 }
 

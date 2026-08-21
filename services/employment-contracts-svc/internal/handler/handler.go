@@ -29,9 +29,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishContractIssued(ctx context.Context, correlationID string, c domain.EmploymentContract)
+	PublishContractIssued(ctx context.Context, correlationID, actorID string, c domain.EmploymentContract)
 	PublishContractAmended(ctx context.Context, correlationID string, c domain.EmploymentContract, amd domain.ContractAmendment)
-	PublishContractTerminated(ctx context.Context, correlationID string, c domain.EmploymentContract)
+	PublishContractTerminated(ctx context.Context, correlationID, actorID string, c domain.EmploymentContract)
 }
 
 type AuthZClient interface {
@@ -163,7 +163,7 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishContractIssued(r.Context(), correlationID, *contract)
+	h.publisher.PublishContractIssued(r.Context(), correlationID, principalID, *contract)
 
 	writeJSON(w, http.StatusCreated, contract)
 }
@@ -418,7 +418,7 @@ func (h *Handler) TerminateContract(w http.ResponseWriter, r *http.Request) {
 	oldContract.UpdatedAt = time.Now().UTC()
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishContractTerminated(r.Context(), correlationID, *oldContract)
+	h.publisher.PublishContractTerminated(r.Context(), correlationID, principalID, *oldContract)
 
 	writeJSON(w, http.StatusOK, oldContract)
 }

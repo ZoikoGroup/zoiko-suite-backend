@@ -25,6 +25,14 @@ type Config struct {
 	// authorization-svc rejects an empty legal_entity_id outright.
 	AuthZPlatformScopeID string
 
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
+	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
+	// unless explicitly turned on.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
+
 	// VaultKeyPath is where the v1 LocalFileVaultBackend persists its
 	// encrypted-at-rest secret material. Production replaces this whole
 	// backend with a real HashiCorp Vault / cloud KMS client — see
@@ -87,6 +95,10 @@ func Load() (*Config, error) {
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
+
+		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		Kafka: KafkaConfig{
 			Brokers: envList("KAFKA_BROKERS", []string{"localhost:9092"}),
 			GroupID: env("KAFKA_GROUP_ID", "secret-vault-integration-svc"),

@@ -89,10 +89,10 @@ type stubPublisher struct {
 func (p *stubPublisher) PublishApprovalStarted(_ context.Context, _ string, _ domain.InvoiceApprovalRequest) {
 	p.started++
 }
-func (p *stubPublisher) PublishApproved(_ context.Context, _ string, _ domain.InvoiceApprovalRequest) {
+func (p *stubPublisher) PublishApproved(_ context.Context, _, _ string, _ domain.InvoiceApprovalRequest) {
 	p.approved++
 }
-func (p *stubPublisher) PublishRejected(_ context.Context, _ string, _ domain.InvoiceApprovalRequest, _ string) {
+func (p *stubPublisher) PublishRejected(_ context.Context, _, _ string, _ domain.InvoiceApprovalRequest, _ string) {
 	p.rejected++
 }
 

@@ -2,7 +2,6 @@
 package handler
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"time"
@@ -82,8 +81,7 @@ func (h *Handler) CreateControlTestDefinition(w http.ResponseWriter, r *http.Req
 	}
 
 	var req createControlTestDefinitionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -192,8 +190,7 @@ func (h *Handler) CreateControlTestExecution(w http.ResponseWriter, r *http.Requ
 	}
 
 	var req createControlTestExecutionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -320,8 +317,7 @@ func (h *Handler) CreateAttestation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createAttestationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -397,8 +393,7 @@ func (h *Handler) RevokeAttestation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req revokeAttestationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 

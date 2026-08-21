@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	FORECAST_CREATE     = "FORECAST_CREATE"
+	FORECAST_CREATE      = "FORECAST_CREATE"
 	FORECAST_RECALCULATE = "FORECAST_RECALCULATE"
-	FORECAST_ARCHIVE    = "FORECAST_ARCHIVE"
+	FORECAST_ARCHIVE     = "FORECAST_ARCHIVE"
 )
 
 type Handler struct {
@@ -105,7 +105,11 @@ func (h *Handler) GenerateForecast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "forecast.generated", tenantID, model)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "forecast.generated", SubjectID: model.ID, TenantID: tenantID,
+		LegalEntityID: model.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: model,
+	})
 
 	h.respondJSON(w, http.StatusCreated, model)
 }
@@ -177,7 +181,11 @@ func (h *Handler) RecalculateForecast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "forecast.updated", tenantID, updated)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "forecast.updated", SubjectID: id, TenantID: tenantID,
+		LegalEntityID: updated.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
+	})
 
 	h.respondJSON(w, http.StatusOK, updated)
 }
@@ -206,7 +214,12 @@ func (h *Handler) ArchiveForecast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "forecast.archived", tenantID, map[string]string{"id": id, "status": "ARCHIVED"})
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "forecast.archived", SubjectID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload:       map[string]string{"id": id, "status": "ARCHIVED"},
+	})
 
 	h.respondJSON(w, http.StatusOK, map[string]string{
 		"message": "forecast model archived successfully",

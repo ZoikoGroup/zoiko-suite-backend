@@ -21,6 +21,7 @@ import (
 	"zoiko.io/counterparty-management-svc/internal/handler"
 	"zoiko.io/counterparty-management-svc/internal/health"
 	"zoiko.io/counterparty-management-svc/internal/middleware"
+	"zoiko.io/counterparty-management-svc/internal/mtls"
 	"zoiko.io/counterparty-management-svc/internal/store"
 	"zoiko.io/counterparty-management-svc/internal/telemetry"
 )
@@ -61,7 +62,16 @@ func main() {
 	pgStore := store.NewPgStore(pool)
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "counterparty-management-svc", "00000000-0000-0000-0000-00000000f001")
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 
 	h := handler.New(pgStore, publisher, authzClient, logger)
 

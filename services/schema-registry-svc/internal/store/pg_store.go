@@ -24,11 +24,12 @@ type Store interface {
 	// Version returns a specific version of eventName's schema, or nil if
 	// that version doesn't exist.
 	Version(ctx context.Context, eventName string, version int) (*domain.EventSchema, error)
-	// Versions returns every registered version of eventName, oldest first.
-	Versions(ctx context.Context, eventName string) ([]*domain.EventSchema, error)
-	// EventNames returns every distinct event name with at least one
-	// registered version.
-	EventNames(ctx context.Context) ([]string, error)
+	// Versions returns one page of eventName's registered versions, oldest
+	// first.
+	Versions(ctx context.Context, eventName string, limit, offset int) ([]*domain.EventSchema, error)
+	// EventNames returns one page of the distinct event names with at least
+	// one registered version.
+	EventNames(ctx context.Context, limit, offset int) ([]string, error)
 	// Insert appends a new version row, assigning the version number
 	// atomically from the current maximum and returning the stored row.
 	//
@@ -109,14 +110,17 @@ func (s *PgStore) Version(ctx context.Context, eventName string, version int) (*
 	return schema, nil
 }
 
-func (s *PgStore) Versions(ctx context.Context, eventName string) ([]*domain.EventSchema, error) {
+func (s *PgStore) Versions(ctx context.Context, eventName string, limit, offset int) ([]*domain.EventSchema, error) {
+	// (event_name, version) is the primary key, so ordering by version is
+	// already a total order — no tiebreaker is needed for stable paging here.
 	rows, err := s.pool.Query(ctx, `
 		SELECT `+schemaColumns+`
 		FROM event_schemas
 		WHERE event_name = $1
-		ORDER BY version ASC`, eventName)
+		ORDER BY version ASC
+		LIMIT $2 OFFSET $3`, eventName, limit, offset)
 	if err != nil {
-		return nil, fmt.Errorf("query versions: %w", err)
+		return nil, fmt.Errorf("query versions: %w", mapPgError(err))
 	}
 	defer rows.Close()
 
@@ -131,10 +135,12 @@ func (s *PgStore) Versions(ctx context.Context, eventName string) ([]*domain.Eve
 	return out, rows.Err()
 }
 
-func (s *PgStore) EventNames(ctx context.Context) ([]string, error) {
-	rows, err := s.pool.Query(ctx, `SELECT DISTINCT event_name FROM event_schemas ORDER BY event_name ASC`)
+func (s *PgStore) EventNames(ctx context.Context, limit, offset int) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT DISTINCT event_name FROM event_schemas ORDER BY event_name ASC LIMIT $1 OFFSET $2`,
+		limit, offset)
 	if err != nil {
-		return nil, fmt.Errorf("query event names: %w", err)
+		return nil, fmt.Errorf("query event names: %w", mapPgError(err))
 	}
 	defer rows.Close()
 
@@ -192,7 +198,7 @@ func (s *PgStore) Insert(ctx context.Context, sch *domain.EventSchema, expectedV
 			// specifically not reported as a store outage.
 			return nil, domain.ErrVersionRaced
 		}
-		return nil, fmt.Errorf("insert schema version: %w", err)
+		return nil, fmt.Errorf("insert schema version: %w", mapPgError(err))
 	}
 	return stored, nil
 }
@@ -204,4 +210,20 @@ func (s *PgStore) Insert(ctx context.Context, sch *domain.EventSchema, expectedV
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// mapPgError turns the Postgres failures that are really caller mistakes into
+// domain errors, so they stop arriving at the handler as "the store is
+// unavailable".
+//
+// 22001 is string_data_right_truncation: a value wider than its VARCHAR(255).
+// event_name and owning_service are both validated at the boundary now, so
+// this is the backstop — and the reason it matters is that the previous
+// behaviour was a 503, an outage status for a name that was simply too long.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22001" {
+		return domain.ErrFieldTooLong
+	}
+	return err
 }

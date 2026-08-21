@@ -35,9 +35,15 @@ import (
 	"zoiko.io/purchase-request-svc/internal/handler"
 	"zoiko.io/purchase-request-svc/internal/health"
 	svcmiddleware "zoiko.io/purchase-request-svc/internal/middleware"
+	"zoiko.io/purchase-request-svc/internal/mtls"
 	"zoiko.io/purchase-request-svc/internal/store"
 	"zoiko.io/purchase-request-svc/internal/telemetry"
 )
+
+// platformScopeID is the legal-entity scope used when this service
+// provisions its own mTLS client identity from mtls-management-svc — see
+// internal/mtls.NewClientHTTPClient.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -121,11 +127,30 @@ func main() {
 		Topic:                  cfg.Kafka.Topic,
 		Balancer:               &kafka.LeastBytes{},
 		AllowAutoTopicCreation: true,
+		// Without this, every write to this service costs an extra second.
+		// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+		// WriteMessages of a single message waits for the batch to fill (100
+		// messages) or for that timer, whichever comes first. These events are
+		// emitted one per state transition, so the batch never fills and the
+		// timer always wins — and publishing is on the request path, so the
+		// caller pays for it. Ordering and synchronous delivery are unchanged;
+		// only the artificial wait goes away.
+		BatchTimeout: 10 * time.Millisecond,
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+
+	var authzClient authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "purchase-request-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewHTTPClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, log)
+	} else {
+		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -153,12 +178,19 @@ func main() {
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)

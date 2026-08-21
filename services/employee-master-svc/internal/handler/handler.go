@@ -25,11 +25,11 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishEmployeeCreated(ctx context.Context, correlationID string, emp domain.Employee)
-	PublishEmployeeHired(ctx context.Context, correlationID string, emp domain.Employee)
-	PublishEmployeeUpdated(ctx context.Context, correlationID string, emp domain.Employee)
-	PublishStatusChanged(ctx context.Context, correlationID string, emp domain.Employee, oldStatus string)
-	PublishEmployeeTerminated(ctx context.Context, correlationID string, emp domain.Employee)
+	PublishEmployeeCreated(ctx context.Context, correlationID, actorID string, emp domain.Employee)
+	PublishEmployeeHired(ctx context.Context, correlationID, actorID string, emp domain.Employee)
+	PublishEmployeeUpdated(ctx context.Context, correlationID, actorID string, emp domain.Employee)
+	PublishStatusChanged(ctx context.Context, correlationID, actorID string, emp domain.Employee, oldStatus string)
+	PublishEmployeeTerminated(ctx context.Context, correlationID, actorID string, emp domain.Employee)
 }
 
 type AuthZClient interface {
@@ -144,8 +144,8 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishEmployeeCreated(r.Context(), correlationID, *emp)
-	h.publisher.PublishEmployeeHired(r.Context(), correlationID, *emp)
+	h.publisher.PublishEmployeeCreated(r.Context(), correlationID, principalID, *emp)
+	h.publisher.PublishEmployeeHired(r.Context(), correlationID, principalID, *emp)
 
 	writeJSON(w, http.StatusCreated, emp)
 }
@@ -283,7 +283,7 @@ func (h *Handler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishEmployeeUpdated(r.Context(), correlationID, *emp)
+	h.publisher.PublishEmployeeUpdated(r.Context(), correlationID, principalID, *emp)
 
 	writeJSON(w, http.StatusOK, emp)
 }
@@ -346,10 +346,10 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishStatusChanged(r.Context(), correlationID, *emp, oldStatus)
+	h.publisher.PublishStatusChanged(r.Context(), correlationID, principalID, *emp, oldStatus)
 
 	if req.Status == "TERMINATED" {
-		h.publisher.PublishEmployeeTerminated(r.Context(), correlationID, *emp)
+		h.publisher.PublishEmployeeTerminated(r.Context(), correlationID, principalID, *emp)
 	}
 
 	writeJSON(w, http.StatusOK, emp)

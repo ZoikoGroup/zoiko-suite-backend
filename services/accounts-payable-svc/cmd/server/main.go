@@ -35,9 +35,14 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/handler"
 	"zoiko.io/accounts-payable-svc/internal/health"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
+	"zoiko.io/accounts-payable-svc/internal/mtls"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
@@ -116,16 +121,50 @@ func main() {
 	// metadata request, so every write to a not-yet-existing topic fails
 	// with "Unknown Topic Or Partition" regardless of the broker-side
 	// setting.
-	kafkaWriter := &kafka.Writer{
-		Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
-		Topic:                  cfg.Kafka.Topic,
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
+	//
+	// An explicitly empty KAFKA_BROKERS selects the log-only publisher instead.
+	// config.validate permits that for ENV=local and refuses it everywhere else,
+	// so a production deployment cannot reach this branch and silently stop
+	// publishing.
+	var publisher handler.Publisher
+	if len(cfg.Kafka.Brokers) == 0 {
+		publisher = events.NewLogOnlyPublisher(log)
+	} else {
+		kafkaWriter := &kafka.Writer{
+			Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:                  cfg.Kafka.Topic,
+			Balancer:               &kafka.LeastBytes{},
+			AllowAutoTopicCreation: true,
+			// Without this, every write to this service costs an extra second.
+			//
+			// kafka-go batches, and BatchTimeout defaults to 1s: a synchronous
+			// WriteMessages of a single message waits for the batch to fill (100
+			// messages) or for that timer to expire, whichever comes first. These
+			// events are emitted one per state transition, so the batch never
+			// fills and the timer always wins — and because publishing happens on
+			// the request path, the caller pays for it. Measured: 2.0s per
+			// create, of which ~1s was this timer (the other ~1s is
+			// authorization-svc's /v1/authorize, which is not ours to fix here).
+			//
+			// The events stay ordered and still publish synchronously; only the
+			// artificial wait goes away. Async: true would also remove it, but it
+			// makes publish failures invisible to the request that caused them.
+			BatchTimeout: 10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+		publisher = events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	}
-	defer func() { _ = kafkaWriter.Close() }()
-
-	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+	var authzClient *authz.HTTPClient
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "accounts-payable-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, log, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
+	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -153,12 +192,19 @@ func main() {
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              addr,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	serverErr := make(chan error, 1)

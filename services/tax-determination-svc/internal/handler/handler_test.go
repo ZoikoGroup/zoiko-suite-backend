@@ -72,7 +72,7 @@ func (s *stubStore) OverrideDetermination(_ context.Context, id string, req *dom
 
 type stubPublisher struct{}
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error {
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
 	return nil
 }
 

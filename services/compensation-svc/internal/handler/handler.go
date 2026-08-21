@@ -29,9 +29,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishCompensationUpdated(ctx context.Context, correlationID string, rev domain.WageRevision)
-	PublishBonusApproved(ctx context.Context, correlationID string, b domain.BonusGrant)
-	PublishEffectiveChanged(ctx context.Context, correlationID string, rev domain.WageRevision)
+	PublishCompensationUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, rev domain.WageRevision)
+	PublishBonusApproved(ctx context.Context, correlationID, legalEntityID, actorID string, b domain.BonusGrant)
+	PublishEffectiveChanged(ctx context.Context, correlationID, legalEntityID, actorID string, rev domain.WageRevision)
 }
 
 type AuthZClient interface {
@@ -248,8 +248,8 @@ func (h *Handler) ReviseWage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, rev)
 		return
 	}
-	h.publisher.PublishCompensationUpdated(r.Context(), correlationID, *rev)
-	h.publisher.PublishEffectiveChanged(r.Context(), correlationID, *rev)
+	h.publisher.PublishCompensationUpdated(r.Context(), correlationID, legalEntityID, principalID, *rev)
+	h.publisher.PublishEffectiveChanged(r.Context(), correlationID, legalEntityID, principalID, *rev)
 
 	writeJSON(w, http.StatusCreated, rev)
 }
@@ -429,7 +429,7 @@ func (h *Handler) ApproveBonus(w http.ResponseWriter, r *http.Request) {
 	target.ApprovedBy = &principalID
 
 	correlationID := getCorrelationID(r)
-	h.publisher.PublishBonusApproved(r.Context(), correlationID, *target)
+	h.publisher.PublishBonusApproved(r.Context(), correlationID, legalEntityID, principalID, *target)
 
 	writeJSON(w, http.StatusOK, target)
 }

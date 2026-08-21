@@ -122,7 +122,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create filing requirement")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "filing.due", f.FilingID, tenantID, f)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "filing.due", FilingID: f.FilingID, TenantID: tenantID,
+		LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
+	})
 	writeJSON(w, http.StatusCreated, f)
 }
 
@@ -197,7 +201,11 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to update filing requirement")
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "filing.requirement.updated", id, tenantID, existing)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "filing.requirement.updated", FilingID: id, TenantID: tenantID,
+		LegalEntityID: existing.LegalEntityID, Jurisdiction: existing.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: existing,
+	})
 	writeJSON(w, http.StatusOK, existing)
 }
 
@@ -246,7 +254,11 @@ func (h *Handler) Submit(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "filing.submitted", id, tenantID, f)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "filing.submitted", FilingID: id, TenantID: tenantID,
+		LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
+	})
 	writeJSON(w, http.StatusOK, f)
 }
 
@@ -295,7 +307,11 @@ func (h *Handler) Confirm(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	_ = h.publisher.Publish(r.Context(), "filing.confirmed", id, tenantID, f)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "filing.confirmed", FilingID: id, TenantID: tenantID,
+		LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
+	})
 	writeJSON(w, http.StatusOK, f)
 }
 
@@ -334,7 +350,11 @@ func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if f.Status == domain.StatusOverdue {
-		_ = h.publisher.Publish(r.Context(), "filing.overdue", id, tenantID, f)
+		_ = h.publisher.Publish(r.Context(), events.PublishParams{
+			EventType: "filing.overdue", FilingID: id, TenantID: tenantID,
+			LegalEntityID: f.LegalEntityID, Jurisdiction: f.JurisdictionID, ActorID: principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: f,
+		})
 	}
 	writeJSON(w, http.StatusOK, f)
 }

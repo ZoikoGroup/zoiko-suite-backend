@@ -168,7 +168,7 @@ var _ store.Store = (*stubStore)(nil)
 
 type stubPublisher struct{}
 
-func (p *stubPublisher) Publish(_ context.Context, _, _, _ string, _ interface{}) error { return nil }
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error { return nil }
 
 var _ events.Publisher = (*stubPublisher)(nil)
 

@@ -31,6 +31,18 @@ type SendNotificationRequest struct {
 	CorrelationID        string `json:"correlation_id"`
 }
 
+// ListFilter carries every constraint on a register read, including the
+// paging bounds. Grouped into one struct rather than a growing parameter list
+// so a caller cannot transpose two adjacent string arguments — the filters are
+// all strings, and the compiler would not notice.
+type ListFilter struct {
+	LegalEntityID        string
+	RecipientPrincipalID string
+	Status               string
+	Limit                int
+	Offset               int
+}
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }

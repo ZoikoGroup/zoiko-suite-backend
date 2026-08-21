@@ -15,9 +15,14 @@ import (
 	"zoiko.io/migration-integrity-svc/internal/config"
 	"zoiko.io/migration-integrity-svc/internal/events"
 	"zoiko.io/migration-integrity-svc/internal/handler"
+	"zoiko.io/migration-integrity-svc/internal/mtls"
 	"zoiko.io/migration-integrity-svc/internal/store"
 	"zoiko.io/migration-integrity-svc/internal/telemetry"
 )
+
+// platformScopeID is the platform-wide legal-entity scope used when this
+// service provisions its own mTLS client identity from mtls-management-svc.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	cfg := config.Load()
@@ -57,7 +62,16 @@ func main() {
 	publisher := events.NewPublisher(brokers, cfg.KafkaTopic, logger)
 	defer publisher.Close()
 
-	authzClient := authz.NewClient(cfg.AuthzURL, logger)
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "migration-integrity-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient, logger)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzURL, logger)
+	}
 	h := handler.NewHandler(dataStore, publisher, authzClient, logger)
 	router := handler.NewRouter(h)
 

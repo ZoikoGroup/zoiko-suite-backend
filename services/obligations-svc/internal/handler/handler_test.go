@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/obligations-svc/internal/domain"
 	"zoiko.io/obligations-svc/internal/handler"
+	svcmiddleware "zoiko.io/obligations-svc/internal/middleware"
 )
 
 // ── stub store ────────────────────────────────────────────────────────────────
@@ -53,7 +54,24 @@ func (s *stubStore) CreateObligation(_ context.Context, _ domain.CreateObligatio
 }
 
 func (s *stubStore) FindObligationByID(_ context.Context, _ string) (*domain.Obligation, error) {
-	return s.findObligation, s.findErr
+	if s.findErr != nil {
+		return nil, s.findErr
+	}
+	if s.findObligation != nil {
+		return s.findObligation, nil
+	}
+	// The mutating handlers now look the obligation up before authorizing —
+	// the parent carries the legal entity, which is the authorization scope.
+	// Tests written before that only configured the RESULT of the write, so
+	// fall back to it rather than making every one of them restate the same
+	// fixture twice. A test that genuinely wants "not found" sets findErr.
+	if s.updated != nil {
+		return s.updated, nil
+	}
+	if s.obligation != nil {
+		return s.obligation, nil
+	}
+	return &domain.Obligation{ObligationID: "o-stub", LegalEntityID: "le-1"}, nil
 }
 
 func (s *stubStore) ListObligations(_ context.Context, _ domain.ListObligationsFilter) ([]*domain.Obligation, error) {
@@ -100,17 +118,17 @@ func (p *stubPublisher) PublishObligationCreated(_ context.Context, _ domain.Obl
 	return nil
 }
 
-func (p *stubPublisher) PublishObligationUpdated(_ context.Context, _ domain.Obligation, _ string) error {
+func (p *stubPublisher) PublishObligationUpdated(_ context.Context, _ domain.Obligation, _, _ string) error {
 	p.updatedCalls++
 	return nil
 }
 
-func (p *stubPublisher) PublishObligationOverdue(_ context.Context, _ domain.Obligation, _ string) error {
+func (p *stubPublisher) PublishObligationOverdue(_ context.Context, _ domain.Obligation, _, _ string) error {
 	p.overdueCalls++
 	return nil
 }
 
-func (p *stubPublisher) PublishObligationClosed(_ context.Context, _ domain.Obligation, _ string) error {
+func (p *stubPublisher) PublishObligationClosed(_ context.Context, _ domain.Obligation, _, _ string) error {
 	p.closedCalls++
 	return nil
 }
@@ -133,19 +151,69 @@ func newTestRouterWithPublisher(s *stubStore, p *stubPublisher) chi.Router {
 	return newTestRouterFull(s, p, &stubValidator{})
 }
 
+// stubAuthz GRANTS by default. Tests that care about the gate set err.
+type stubAuthz struct {
+	err   error
+	calls []string // action types, in order
+}
+
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, actionType, _ string) error {
+	a.calls = append(a.calls, actionType)
+	return a.err
+}
+
 func newTestRouterFull(s *stubStore, p *stubPublisher, v *stubValidator) chi.Router {
+	return newTestRouterAuthz(s, p, v, &stubAuthz{})
+}
+
+// newTestRouterAuthz wires the SAME middleware chain the server does.
+//
+// TenantContext is not optional here: the handlers read the tenant from the
+// request CONTEXT, and only that middleware puts it there. A harness that sets
+// the X-Tenant-Id header but skips the middleware runs every test with no
+// tenant at all — which is precisely the class of bug this service had, so a
+// harness blind to it would be worse than useless.
+func newTestRouterAuthz(s *stubStore, p *stubPublisher, v *stubValidator, a *stubAuthz) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, v, zap.NewNop())
+	r.Use(svcmiddleware.TenantContext())
+	h := handler.New(s, p, v, a, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
+}
+
+const (
+	testTenant    = "11111111-1111-1111-1111-111111111111"
+	testPrincipal = "admin-1"
+)
+
+// withIdentity stamps the headers the gateway sets on a verified request.
+func withIdentity(req *http.Request) *http.Request {
+	req.Header.Set("X-Tenant-Id", testTenant)
+	req.Header.Set("X-Principal-Id", testPrincipal)
+	return req
 }
 
 // newApplicabilityTestRouter wires a router with applicability-decision
 // routes included — the base newTestRouter* helpers above only register
 // handler.RegisterRoutes.
+//
+// Merge note: this arrived from main built on the 4-argument handler.New and a
+// bare chi router. It now passes a GRANTING stubAuthz and installs
+// TenantContext, matching newTestRouterAuthz — without the middleware every
+// request through it would carry no tenant, which this service's store now
+// refuses outright.
 func newApplicabilityTestRouter(s *stubStore) chi.Router {
+	return newApplicabilityTestRouterAuthz(s, &stubAuthz{})
+}
+
+// newApplicabilityTestRouterAuthz lets a test supply the authz stub, which the
+// applicability routes need now that recording a decision is gated. Without a
+// way to inject a DENY, the gate could only ever be tested in its allowing
+// direction — and a gate is only proven by the request it refuses.
+func newApplicabilityTestRouterAuthz(s *stubStore, a *stubAuthz) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, &stubPublisher{}, &stubValidator{}, zap.NewNop())
+	r.Use(svcmiddleware.TenantContext())
+	h := handler.New(s, &stubPublisher{}, &stubValidator{}, a, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 	return r
@@ -182,7 +250,7 @@ func TestCreateObligation_Created(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterWithPublisher(store, pub)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody()))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody())))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -209,7 +277,7 @@ func TestCreateObligation_IdempotentReplay(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterWithPublisher(store, pub)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody()))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody())))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -237,7 +305,7 @@ func TestCreateObligation_MissingSourceReference(t *testing.T) {
 		"responsible_function": "Tax",
 		"created_by_principal_id": "admin-1"
 	}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(body))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -254,7 +322,7 @@ func TestCreateObligation_MissingSourceReference(t *testing.T) {
 func TestCreateObligation_JurisdictionNotFound(t *testing.T) {
 	r := newTestRouterFull(&stubStore{}, &stubPublisher{}, &stubValidator{err: domain.ErrJurisdictionNotFound})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody()))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody())))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -266,7 +334,7 @@ func TestCreateObligation_JurisdictionNotFound(t *testing.T) {
 func TestCreateObligation_JurisdictionServiceUnavailable_FailsClosed(t *testing.T) {
 	r := newTestRouterFull(&stubStore{}, &stubPublisher{}, &stubValidator{err: domain.ErrJurisdictionServiceUnavailable})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody()))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody())))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -279,7 +347,7 @@ func TestCreateObligation_Conflict(t *testing.T) {
 	store := &stubStore{createErr: domain.ErrConflict}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody()))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody())))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -292,7 +360,7 @@ func TestCreateObligation_StoreUnavailable(t *testing.T) {
 	store := &stubStore{createErr: domain.ErrStoreUnavailable}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody()))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations", bytes.NewBufferString(validCreateBody())))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -307,7 +375,7 @@ func TestGetObligation_Found(t *testing.T) {
 	store := &stubStore{findObligation: &domain.Obligation{ObligationID: "o-1"}}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/obligations/o-1", nil)
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations/o-1", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -320,7 +388,7 @@ func TestGetObligation_NotFound(t *testing.T) {
 	store := &stubStore{findErr: domain.ErrObligationNotFound}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/obligations/missing", nil)
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations/missing", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -334,7 +402,7 @@ func TestGetObligation_NotFound(t *testing.T) {
 func TestListObligations_EmptyReturnsArray(t *testing.T) {
 	r := newTestRouter(&stubStore{list: nil})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/obligations", nil)
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -349,7 +417,7 @@ func TestListObligations_EmptyReturnsArray(t *testing.T) {
 func TestListObligations_InvalidDueBefore(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/obligations?due_before=not-a-date", nil)
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations?due_before=not-a-date", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -368,7 +436,7 @@ func TestUpdateObligationStatus_TransitionToOverdue_PublishesBoth(t *testing.T) 
 	pub := &stubPublisher{}
 	r := newTestRouterWithPublisher(store, pub)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"OVERDUE"}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"OVERDUE"}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -394,7 +462,7 @@ func TestUpdateObligationStatus_TransitionToClosed_PublishesBoth(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterWithPublisher(store, pub)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"CLOSED"}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"CLOSED"}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -414,7 +482,7 @@ func TestUpdateObligationStatus_IdempotentNoOp_DoesNotRepublish(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterWithPublisher(store, pub)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"OPEN"}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"OPEN"}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -430,7 +498,7 @@ func TestUpdateObligationStatus_InvalidTransition(t *testing.T) {
 	store := &stubStore{updateErr: domain.ErrInvalidTransition}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"OPEN"}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{"obligation_status":"OPEN"}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -442,7 +510,7 @@ func TestUpdateObligationStatus_InvalidTransition(t *testing.T) {
 func TestUpdateObligationStatus_MissingField(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/status", bytes.NewBufferString(`{}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -455,7 +523,7 @@ func TestUpdateObligationStatus_NotFound(t *testing.T) {
 	store := &stubStore{updateErr: domain.ErrObligationNotFound}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/missing/status", bytes.NewBufferString(`{"obligation_status":"CLOSED"}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/missing/status", bytes.NewBufferString(`{"obligation_status":"CLOSED"}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -471,7 +539,7 @@ func TestCreateFilingRequirement_Created(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"filing_type":"ANNUAL_RETURN","filing_authority":"IRS","submission_channel":"E_FILE"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/filing-requirements", bytes.NewBufferString(body))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/filing-requirements", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -485,7 +553,7 @@ func TestCreateFilingRequirement_ObligationNotFound(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"filing_type":"ANNUAL_RETURN","filing_authority":"IRS","submission_channel":"E_FILE"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/missing/filing-requirements", bytes.NewBufferString(body))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/missing/filing-requirements", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -497,7 +565,7 @@ func TestCreateFilingRequirement_ObligationNotFound(t *testing.T) {
 func TestCreateFilingRequirement_MissingField(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/filing-requirements", bytes.NewBufferString(`{}`))
+	req := withIdentity(httptest.NewRequest(http.MethodPost, "/v1/obligations/o-1/filing-requirements", bytes.NewBufferString(`{}`)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -511,7 +579,7 @@ func TestCreateFilingRequirement_MissingField(t *testing.T) {
 func TestListFilingRequirements_EmptyReturnsArray(t *testing.T) {
 	r := newTestRouter(&stubStore{filingList: nil})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/obligations/o-1/filing-requirements", nil)
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations/o-1/filing-requirements", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -527,7 +595,7 @@ func TestListFilingRequirements_ObligationNotFound(t *testing.T) {
 	store := &stubStore{filingListErr: domain.ErrObligationNotFound}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/obligations/missing/filing-requirements", nil)
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v1/obligations/missing/filing-requirements", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

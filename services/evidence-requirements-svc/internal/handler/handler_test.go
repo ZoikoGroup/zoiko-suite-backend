@@ -41,6 +41,7 @@ const (
 	testTenant    = "11111111-1111-1111-1111-111111111111"
 	testEntity    = "22222222-2222-2222-2222-222222222222"
 	testPrincipal = "principal-abc"
+	otherTenant   = "99999999-9999-9999-9999-999999999999"
 )
 
 // ── stubs ────────────────────────────────────────────────────────────────────
@@ -59,6 +60,11 @@ type stubStore struct {
 	recordEvalErr  error
 	recordedEvals  []domain.EvidenceEvaluation
 	getRequirement *domain.EvidenceRequirement
+
+	// listFilter records what ListRequirements was actually called with, so a
+	// test can assert the catalog was read in the caller's verified tenant
+	// rather than in whatever ?tenant_id= named.
+	listFilter domain.ListRequirementsFilter
 }
 
 func (s *stubStore) CreateRequirement(_ context.Context, r *domain.EvidenceRequirement) (bool, error) {
@@ -75,7 +81,8 @@ func (s *stubStore) GetRequirement(_ context.Context, _ string) (*domain.Evidenc
 	return s.getRequirement, nil
 }
 
-func (s *stubStore) ListRequirements(_ context.Context, _ domain.ListRequirementsFilter) ([]domain.EvidenceRequirement, error) {
+func (s *stubStore) ListRequirements(_ context.Context, filter domain.ListRequirementsFilter) ([]domain.EvidenceRequirement, error) {
+	s.listFilter = filter
 	return s.effective, nil
 }
 
@@ -567,9 +574,41 @@ func TestEndDate_CallsAuthorization(t *testing.T) {
 
 // ── reads ────────────────────────────────────────────────────────────────────
 
-func TestListRequirements_RequiresTenantID(t *testing.T) {
+// TestListRequirements_NoTenantScope_Refused replaces a test that asserted a 400
+// when ?tenant_id= was absent — which documented the vulnerability as correct,
+// since supplying the parameter was exactly how a caller read another tenant's
+// catalog. The scope now comes from the header, so its absence is the failure and
+// its presence is no longer required.
+func TestListRequirements_NoTenantScope_Refused(t *testing.T) {
 	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
+	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements", nil, "", testPrincipal)
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestListRequirements_NoQueryParam_UsesVerifiedScope(t *testing.T) {
+	st := &stubStore{}
+	h := newRouter(st, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
 	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements", nil, testTenant, testPrincipal)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, testTenant, st.listFilter.TenantID,
+		"the catalog must be read in the caller's verified tenant, not in whatever the query named")
+}
+
+// TestListRequirements_ForeignTenantQueryParam_Refused is the regression test for
+// the read half of this service's tenant scoping: ?tenant_id= was handed straight
+// to the store, which both filtered on it and set app.tenant_id from it.
+func TestListRequirements_ForeignTenantQueryParam_Refused(t *testing.T) {
+	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
+	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements?tenant_id="+otherTenant, nil, testTenant, testPrincipal)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// A malformed legal_entity_id is compared as text against a cast column, so it
+// matched nothing — and for an evidence gate, "no requirements" reads as
+// permission to proceed.
+func TestListRequirements_MalformedLegalEntityFilter_Refused(t *testing.T) {
+	h := newRouter(&stubStore{}, &stubPublisher{}, &stubAuthz{}, &stubDocs{})
+	rec := do(t, h, http.MethodGet, "/v1/evidence-requirements?legal_entity_id=not-a-uuid", nil, testTenant, testPrincipal)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 

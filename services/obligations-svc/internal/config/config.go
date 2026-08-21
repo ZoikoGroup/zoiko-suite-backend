@@ -8,10 +8,17 @@ import (
 
 // Config holds all runtime configuration for obligations-svc.
 //
-// No AuthZServiceURL field: admin writes do not call Authorization Service
-// yet — it doesn't exist. Deliberate, documented deferral matching
-// policy-svc's and governance-decision-log-svc's precedent of shipping
-// without it.
+// AuthZServiceURL exists now. It used not to, under this comment:
+//
+//	"No AuthZServiceURL field: admin writes do not call Authorization Service
+//	 yet — it doesn't exist. Deliberate, documented deferral matching
+//	 policy-svc's and governance-decision-log-svc's precedent."
+//
+// Both halves of that had gone stale. authorization-svc is live on :8089 and
+// fifteen other services call it, and both services cited as precedent have
+// since been wired to it. What the deferral actually left behind was an open
+// write surface on a statutory compliance register: anything that could reach
+// the port could raise an obligation, close one, or file against one.
 type Config struct {
 	Env  string
 	Port int
@@ -25,6 +32,10 @@ type Config struct {
 	// (critical constraint: every obligation must be jurisdiction-bound) —
 	// see internal/jurisdiction.HTTPValidator.
 	JurisdictionRulesURL string
+
+	// AuthZServiceURL is authorization-svc's base URL. Every mutation is
+	// gated through it, fail-closed.
+	AuthZServiceURL string
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
@@ -81,6 +92,7 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.obligations.events"),
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
+		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

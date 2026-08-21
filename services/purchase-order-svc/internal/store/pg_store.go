@@ -20,12 +20,32 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/purchase-order-svc/internal/domain"
 	svcmiddleware "zoiko.io/purchase-order-svc/internal/middleware"
 )
+
+// mapPgError translates driver-level failures that are really caller mistakes
+// into domain errors, so they stop being reported as outages.
+//
+// 22P02 (invalid_text_representation) is the one that matters here:
+// purchase_order_id, tenant_id and legal_entity_id are all uuid columns, so a
+// mistyped id fails inside the driver before any row is examined. Left unmapped
+// it surfaced as 503 store_unavailable — indistinguishable from the database
+// being unreachable.
+func mapPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return err
+	}
+	if pgErr.Code == "22P02" {
+		return domain.ErrInvalidIdentifier
+	}
+	return err
+}
 
 type PgStore struct {
 	pool *pgxpool.Pool
@@ -52,12 +72,13 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 	return tx.Commit(ctx)
 }
 
-func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
-	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
-		return t
-	}
-	return fallback
-}
+// tenantFromCtxOrFallback used to live here, resolving the RLS scope from the
+// context but FALLING BACK to whatever the caller had supplied in the request
+// body. A request carrying no X-Tenant-Id therefore chose its own scope: the
+// body's tenant_id was handed to set_config('app.tenant_id') AND written into
+// the row, so the policy that should have refused the insert was satisfied by
+// the value under attack. The handler now resolves the tenant once from the
+// verified header; there is deliberately no fallback left to reach for.
 
 // CreateOrder inserts a purchase order in ISSUED status, generating its
 // po_number from purchase_order_number_seq. Idempotent on
@@ -65,7 +86,14 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 // overwritten with the EXISTING row's values and created=false is returned —
 // callers must not re-publish purchase.order.issued in that case.
 func (s *PgStore) CreateOrder(ctx context.Context, o *domain.PurchaseOrder) (created bool, err error) {
-	tenantID := tenantFromCtxOrFallback(ctx, o.TenantID)
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return false, domain.ErrTenantScopeMissing
+	}
+	// The row is filed under the verified scope, not under o.TenantID — which is
+	// what the INSERT used to write while app.tenant_id was set from the same
+	// unverified value.
+	o.TenantID = tenantID
 
 	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		var seq int64
@@ -149,12 +177,18 @@ func (s *PgStore) GetOrder(ctx context.Context, orderID string) (*domain.Purchas
 			&o.IssuedByPrincipalID, &o.ClosedByPrincipalID, &o.CorrelationID,
 			&o.CreatedAt, &o.IssuedAt, &o.ClosedAt,
 		); err != nil {
-			return err
+			return mapPgError(err)
 		}
 		o.Status = domain.OrderStatus(status)
 		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	// A malformed purchase_order_id or tenant scope cannot name an existing row,
+	// so it is absent — not an outage. Reported identically to a well-formed id
+	// that happens not to exist, and to another tenant's order.
+	if errors.Is(err, domain.ErrInvalidIdentifier) {
 		return nil, nil
 	}
 	if err != nil {
@@ -227,7 +261,7 @@ func (s *PgStore) ListAmendments(ctx context.Context, orderID string) ([]domain.
 			ORDER BY from_version ASC, amended_at ASC
 		`, orderID, tenantID)
 		if err != nil {
-			return err
+			return mapPgError(err)
 		}
 		defer rows.Close()
 		for rows.Next() {
@@ -284,7 +318,7 @@ func (s *PgStore) AmendOrder(ctx context.Context, tenantID, orderID string, newT
 			&updated.ClosedByPrincipalID, &updated.CorrelationID,
 			&updated.CreatedAt, &updated.IssuedAt, &updated.ClosedAt,
 		); err != nil {
-			return err
+			return mapPgError(err)
 		}
 		updated.Status = domain.OrderStatus(status)
 		updated.Version = toVersion
@@ -301,6 +335,12 @@ func (s *PgStore) AmendOrder(ctx context.Context, tenantID, orderID string, newT
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrInvalidTransition
+	}
+	// A malformed id names no order, so this is a not-found rather than an
+	// illegal transition: answering invalid_transition would assert the order
+	// exists and is in the wrong state, which is a different and untrue claim.
+	if errors.Is(err, domain.ErrInvalidIdentifier) {
+		return nil, domain.ErrOrderNotFound
 	}
 	if err != nil {
 		return nil, err
@@ -325,15 +365,20 @@ func (s *PgStore) CloseOrder(ctx context.Context, tenantID, orderID, actorPrinci
 			          issued_by_principal_id, closed_by_principal_id, correlation_id,
 			          created_at, issued_at, closed_at
 		`, actorPrincipalID, time.Now().UTC(), orderID, tenantID)
-		return row.Scan(
+		return mapPgError(row.Scan(
 			&o.PurchaseOrderID, &o.TenantID, &o.LegalEntityID, &o.PurchaseRequestID, &o.VendorProfileID,
 			&o.PONumber, &status, &o.TotalAmount, &o.CurrencyCode, &o.Version,
 			&o.IssuedByPrincipalID, &o.ClosedByPrincipalID, &o.CorrelationID,
 			&o.CreatedAt, &o.IssuedAt, &o.ClosedAt,
-		)
+		))
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrInvalidTransition
+	}
+	// As in AmendOrder: a malformed id names no order, so not-found rather than
+	// a claim about its state.
+	if errors.Is(err, domain.ErrInvalidIdentifier) {
+		return nil, domain.ErrOrderNotFound
 	}
 	if err != nil {
 		return nil, err

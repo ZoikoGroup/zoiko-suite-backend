@@ -26,9 +26,9 @@ type Store interface {
 }
 
 type Publisher interface {
-	PublishEntryCreated(ctx context.Context, correlationID string, entry domain.IntercompanyEntry)
-	PublishEntryPosted(ctx context.Context, correlationID string, entry domain.IntercompanyEntry)
-	PublishMismatchDetected(ctx context.Context, correlationID string, entry domain.IntercompanyEntry, reason string)
+	PublishEntryCreated(ctx context.Context, correlationID, actorID string, entry domain.IntercompanyEntry)
+	PublishEntryPosted(ctx context.Context, correlationID, actorID string, entry domain.IntercompanyEntry)
+	PublishMismatchDetected(ctx context.Context, correlationID, actorID string, entry domain.IntercompanyEntry, reason string)
 }
 
 type AuthZClient interface {
@@ -136,7 +136,7 @@ func (h *Handler) CreateEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishEntryCreated(r.Context(), correlationID, *entry)
+	h.publisher.PublishEntryCreated(r.Context(), correlationID, principalID, *entry)
 	writeJSON(w, http.StatusCreated, entry)
 }
 
@@ -265,7 +265,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		entry.TargetJournalID = &req.TargetJournalID
 		entry.MatchStatus = "MISMATCH"
 		entry.MismatchReason = &reason
-		h.publisher.PublishMismatchDetected(r.Context(), correlationID, *entry, reason)
+		h.publisher.PublishMismatchDetected(r.Context(), correlationID, principalID, *entry, reason)
 		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
 			IntercompanyEntryID: id,
 			MatchStatus:         "MISMATCH",
@@ -281,7 +281,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		entry.TargetJournalID = &req.TargetJournalID
 		entry.MatchStatus = "MISMATCH"
 		entry.MismatchReason = &reason
-		h.publisher.PublishMismatchDetected(r.Context(), correlationID, *entry, reason)
+		h.publisher.PublishMismatchDetected(r.Context(), correlationID, principalID, *entry, reason)
 		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
 			IntercompanyEntryID: id,
 			MatchStatus:         "MISMATCH",
@@ -307,7 +307,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		entry.TargetJournalID = &req.TargetJournalID
 		entry.MatchStatus = "MISMATCH"
 		entry.MismatchReason = &reason
-		h.publisher.PublishMismatchDetected(r.Context(), correlationID, *entry, reason)
+		h.publisher.PublishMismatchDetected(r.Context(), correlationID, principalID, *entry, reason)
 		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
 			IntercompanyEntryID: id,
 			MatchStatus:         "MISMATCH",
@@ -327,7 +327,7 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 	entry.MatchStatus = "MATCHED"
 	entry.MismatchReason = nil
 
-	h.publisher.PublishEntryPosted(r.Context(), correlationID, *entry)
+	h.publisher.PublishEntryPosted(r.Context(), correlationID, principalID, *entry)
 	writeJSON(w, http.StatusOK, domain.MatchEntryResponse{
 		IntercompanyEntryID: id,
 		MatchStatus:         "MATCHED",

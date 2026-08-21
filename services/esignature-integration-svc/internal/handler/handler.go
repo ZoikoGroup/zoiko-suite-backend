@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	ENVELOPE_CREATE = "ENVELOPE_CREATE"
+	ENVELOPE_CREATE        = "ENVELOPE_CREATE"
 	ENVELOPE_STATUS_UPDATE = "ENVELOPE_STATUS_UPDATE"
 )
 
@@ -79,7 +79,11 @@ func (h *Handler) CreateEnvelope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "esignature.envelope.sent", env.EnvelopeID, tenantID, env)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "esignature.envelope.sent", AggregateID: env.EnvelopeID, TenantID: tenantID,
+		LegalEntityID: env.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: env,
+	})
 	writeJSON(w, http.StatusCreated, env)
 }
 
@@ -150,7 +154,11 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "esignature.envelope."+req.Status, id, tenantID, env)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "esignature.envelope." + req.Status, AggregateID: id, TenantID: tenantID,
+		LegalEntityID: env.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: env,
+	})
 	writeJSON(w, http.StatusOK, env)
 }
 

@@ -106,7 +106,7 @@ func (s *stubStore) ListContractVersions(_ context.Context, contractID string) (
 
 type stubPublisher struct{}
 
-func (p *stubPublisher) Publish(_ context.Context, _ string, _ string, _ string, _ interface{}) error {
+func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
 	return nil
 }
 

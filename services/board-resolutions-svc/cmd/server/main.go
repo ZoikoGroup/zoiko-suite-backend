@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -22,9 +21,14 @@ import (
 	"zoiko.io/board-resolutions-svc/internal/handler"
 	"zoiko.io/board-resolutions-svc/internal/health"
 	"zoiko.io/board-resolutions-svc/internal/middleware"
+	"zoiko.io/board-resolutions-svc/internal/mtls"
 	"zoiko.io/board-resolutions-svc/internal/store"
 	"zoiko.io/board-resolutions-svc/internal/telemetry"
 )
+
+// platformScopeID mirrors authorization-svc's own constant of the same
+// name — this service's mTLS identity is infrastructure, not tenant data.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 func main() {
 	logger, err := telemetry.NewLogger("board-resolutions-svc")
@@ -42,7 +46,6 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	var pool *pgxpool.Pool
 	poolCfg, err := pgxpool.ParseConfig(cfg.DSN())
 	if err != nil {
 		logger.Fatal("failed to parse db pool config", zap.Error(err))
@@ -52,17 +55,36 @@ func main() {
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 1 * time.Minute
-	pool, err = pgxpool.NewWithConfig(ctx, poolCfg)
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	// An unreachable database used to be a Warn: the service started anyway,
+	// reported itself as up, and answered every request with a store failure
+	// until someone read the logs. A service that cannot reach its own
+	// database has not started.
 	if err != nil {
-		logger.Warn("unable to connect to database on startup", zap.Error(err))
-	} else {
-		logger.Info("connected to postgres database")
+		logger.Fatal("failed to create db pool", zap.Error(err))
 	}
+	pingCtx, pingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pingCancel()
+	if err := pool.Ping(pingCtx); err != nil {
+		logger.Fatal("db unreachable at startup", zap.Error(err))
+	}
+	logger.Info("connected to postgres database")
 
 	pgStore := store.NewPgStore(pool)
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
-	authzClient := authz.NewClient(cfg.AuthzServiceURL)
+	publisher := events.NewKafkaPublisher(cfg.KafkaBrokers, cfg.KafkaEventsTopic, logger)
+	defer func() { _ = publisher.Close() }()
+
+	var authzClient *authz.Client
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "board-resolutions-svc", platformScopeID)
+		if err != nil {
+			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		logger.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		authzClient = authz.NewClientWithHTTPClient(cfg.AuthzMTLSURL, mtlsHTTPClient)
+	} else {
+		authzClient = authz.NewClient(cfg.AuthzServiceURL)
+	}
 	evidenceReqClient := evidencereq.NewClient(cfg.EvidenceReqURL)
 
 	h := handler.New(pgStore, publisher, authzClient, evidenceReqClient, logger)
@@ -71,6 +93,7 @@ func main() {
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
+	r.Use(correlationIDMiddleware)
 	r.Use(middleware.TenantContextMiddleware)
 
 	r.Get("/healthz", health.HealthzHandler)
@@ -78,12 +101,19 @@ func main() {
 
 	handler.RegisterRoutes(r, h)
 
+	// ReadHeaderTimeout is the one that is easy to miss, and the reason all four
+	// are stated together. ReadTimeout bounds a whole request, so a client that
+	// dribbles a BODY is already cut off -- but a connection that sends a partial
+	// HEADER and then stalls holds a goroutine and a descriptor for that entire
+	// window without ever becoming a request. Enough of those exhaust the process
+	// while every metric still reads healthy.
 	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      r,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -104,8 +134,24 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown forced", zap.Error(err))
 	}
-	if pool != nil {
-		pool.Close()
-	}
+	pool.Close()
 	logger.Info("server stopped cleanly")
+}
+
+// correlationIDMiddleware makes every request carry a correlation id, echoing
+// the caller's own when they supply one.
+//
+// It matters more here than the boilerplate suggests: PassResolution uses
+// X-Correlation-ID as the idempotency key for the evidence evaluation, so a
+// request that arrives without one takes a fresh-attempt path. Echoing it on
+// the response is what lets a caller correlate a refusal with the evaluation
+// that produced it.
+func correlationIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Correlation-ID") == "" {
+			r.Header.Set("X-Correlation-ID", chimiddleware.GetReqID(r.Context()))
+		}
+		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
+		next.ServeHTTP(w, r)
+	})
 }

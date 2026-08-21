@@ -111,7 +111,11 @@ func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
 	}
 
 	populateAliases(conn)
-	_ = h.publisher.Publish(r.Context(), "banking.connection.created", conn.ConnectionID, tenantID, conn)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "banking.connection.created", AggregateID: conn.ConnectionID, TenantID: tenantID,
+		LegalEntityID: conn.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: conn,
+	})
 	writeJSON(w, http.StatusCreated, conn)
 }
 
@@ -194,7 +198,11 @@ func (h *Handler) IngestStatement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = h.publisher.Publish(r.Context(), "banking.statement.ingested", stmt.StatementID, tenantID, stmt)
+	_ = h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "banking.statement.ingested", AggregateID: stmt.StatementID, TenantID: tenantID,
+		LegalEntityID: conn.LegalEntityID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: stmt,
+	})
 	writeJSON(w, http.StatusCreated, stmt)
 }
 

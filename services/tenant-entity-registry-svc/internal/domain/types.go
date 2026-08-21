@@ -9,20 +9,20 @@ import "time"
 // ---------------------------------------------------------------------------
 
 type Tenant struct {
-	TenantID                  string               `json:"tenant_id"`
-	TenantCode                string               `json:"tenant_code"`
-	LegalName                 string               `json:"legal_name"`
-	TradingName               *string              `json:"trading_name"`
-	Status                    TenantStatus         `json:"status"`
-	DefaultCurrencyCode       string               `json:"default_currency_code"`
-	PrimaryTimezone           string               `json:"primary_timezone"`
-	PrimaryLocale             string               `json:"primary_locale"`
-	DefaultDataResidencyPolicyID string            `json:"default_data_residency_policy_id"`
-	LifecycleState            TenantLifecycleState `json:"lifecycle_state"`
-	CreatedAt                 time.Time            `json:"created_at"`
-	UpdatedAt                 time.Time            `json:"updated_at"`
-	CreatedByPrincipalID      string               `json:"created_by_principal_id"`
-	UpdatedByPrincipalID      string               `json:"updated_by_principal_id"`
+	TenantID                     string               `json:"tenant_id"`
+	TenantCode                   string               `json:"tenant_code"`
+	LegalName                    string               `json:"legal_name"`
+	TradingName                  *string              `json:"trading_name"`
+	Status                       TenantStatus         `json:"status"`
+	DefaultCurrencyCode          string               `json:"default_currency_code"`
+	PrimaryTimezone              string               `json:"primary_timezone"`
+	PrimaryLocale                string               `json:"primary_locale"`
+	DefaultDataResidencyPolicyID string               `json:"default_data_residency_policy_id"`
+	LifecycleState               TenantLifecycleState `json:"lifecycle_state"`
+	CreatedAt                    time.Time            `json:"created_at"`
+	UpdatedAt                    time.Time            `json:"updated_at"`
+	CreatedByPrincipalID         string               `json:"created_by_principal_id"`
+	UpdatedByPrincipalID         string               `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -30,29 +30,29 @@ type Tenant struct {
 // ---------------------------------------------------------------------------
 
 type LegalEntity struct {
-	LegalEntityID          string       `json:"legal_entity_id"`
-	TenantID               string       `json:"tenant_id"`
-	EntityCode             string       `json:"entity_code"`
-	LegalName              string       `json:"legal_name"`
-	TradingName            *string      `json:"trading_name"`
-	RegistrationNumber     *string      `json:"registration_number"`
+	LegalEntityID      string  `json:"legal_entity_id"`
+	TenantID           string  `json:"tenant_id"`
+	EntityCode         string  `json:"entity_code"`
+	LegalName          string  `json:"legal_name"`
+	TradingName        *string `json:"trading_name"`
+	RegistrationNumber *string `json:"registration_number"`
 	// tax_registration_number INTENTIONALLY ABSENT — per Q3 resolution.
 	// Actual tax identifier values reside in Tax Service to keep regulated PII in one place.
-	TaxIdentityBundleID    *string      `json:"tax_identity_bundle_id"`
-	EntityType             EntityType   `json:"entity_type"`
-	IncorporationDate      *time.Time   `json:"incorporation_date"`
-	DefaultCurrencyCode    string       `json:"default_currency_code"`
-	FiscalCalendarID       string       `json:"fiscal_calendar_id"`
-	ParentLegalEntityID    *string      `json:"parent_legal_entity_id"`
-	EntityStatus           EntityStatus `json:"entity_status"`
-	PrimaryJurisdictionID  string       `json:"primary_jurisdiction_id"`
+	TaxIdentityBundleID   *string      `json:"tax_identity_bundle_id"`
+	EntityType            EntityType   `json:"entity_type"`
+	IncorporationDate     *time.Time   `json:"incorporation_date"`
+	DefaultCurrencyCode   string       `json:"default_currency_code"`
+	FiscalCalendarID      string       `json:"fiscal_calendar_id"`
+	ParentLegalEntityID   *string      `json:"parent_legal_entity_id"`
+	EntityStatus          EntityStatus `json:"entity_status"`
+	PrimaryJurisdictionID string       `json:"primary_jurisdiction_id"`
 	// DataResidencyPolicyID is MANDATORY per data-model §05.3 modeling rule 2.
 	// No LegalEntity may be created without a valid residency policy.
-	DataResidencyPolicyID  string       `json:"data_residency_policy_id"`
-	CreatedAt              time.Time    `json:"created_at"`
-	UpdatedAt              time.Time    `json:"updated_at"`
-	CreatedByPrincipalID   string       `json:"created_by_principal_id"`
-	UpdatedByPrincipalID   string       `json:"updated_by_principal_id"`
+	DataResidencyPolicyID string    `json:"data_residency_policy_id"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
+	CreatedByPrincipalID  string    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID  string    `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -64,19 +64,19 @@ type LegalEntity struct {
 // ---------------------------------------------------------------------------
 
 type Workspace struct {
-	WorkspaceID           string              `json:"workspace_id"`
-	TenantID              string              `json:"tenant_id"`
-	LegalEntityID         *string             `json:"legal_entity_id"`
-	Name                  string              `json:"name"`
-	BusinessUnit          *string             `json:"business_unit"`
+	WorkspaceID           string                `json:"workspace_id"`
+	TenantID              string                `json:"tenant_id"`
+	LegalEntityID         *string               `json:"legal_entity_id"`
+	Name                  string                `json:"name"`
+	BusinessUnit          *string               `json:"business_unit"`
 	BillingClassification BillingClassification `json:"billing_classification"`
-	BillingSource         BillingSource       `json:"billing_source"`
-	CommercialAccountID   *string             `json:"commercial_account_id"`
-	Status                WorkspaceStatus     `json:"status"`
-	CreatedAt             time.Time           `json:"created_at"`
-	UpdatedAt             time.Time           `json:"updated_at"`
-	CreatedByPrincipalID  string              `json:"created_by_principal_id"`
-	UpdatedByPrincipalID  string              `json:"updated_by_principal_id"`
+	BillingSource         BillingSource         `json:"billing_source"`
+	CommercialAccountID   *string               `json:"commercial_account_id"`
+	Status                WorkspaceStatus       `json:"status"`
+	CreatedAt             time.Time             `json:"created_at"`
+	UpdatedAt             time.Time             `json:"updated_at"`
+	CreatedByPrincipalID  string                `json:"created_by_principal_id"`
+	UpdatedByPrincipalID  string                `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -104,18 +104,18 @@ type EntityHierarchy struct {
 // ---------------------------------------------------------------------------
 
 type EntityJurisdictionAssignment struct {
-	AssignmentID    string                     `json:"assignment_id"`
-	TenantID        string                     `json:"tenant_id"`
-	LegalEntityID   string                     `json:"legal_entity_id"`
-	JurisdictionID  string                     `json:"jurisdiction_id"`
-	AssignmentType  JurisdictionAssignmentType `json:"assignment_type"`
-	EffectiveFrom   time.Time                  `json:"effective_from"`
-	EffectiveTo     *time.Time                 `json:"effective_to"` // nil = open-ended
-	SourceBasis     string                     `json:"source_basis"`
-	CreatedAt       time.Time                  `json:"created_at"`
-	UpdatedAt       time.Time                  `json:"updated_at"`
-	CreatedByPrincipalID string                `json:"created_by_principal_id"`
-	UpdatedByPrincipalID string                `json:"updated_by_principal_id"`
+	AssignmentID         string                     `json:"assignment_id"`
+	TenantID             string                     `json:"tenant_id"`
+	LegalEntityID        string                     `json:"legal_entity_id"`
+	JurisdictionID       string                     `json:"jurisdiction_id"`
+	AssignmentType       JurisdictionAssignmentType `json:"assignment_type"`
+	EffectiveFrom        time.Time                  `json:"effective_from"`
+	EffectiveTo          *time.Time                 `json:"effective_to"` // nil = open-ended
+	SourceBasis          string                     `json:"source_basis"`
+	CreatedAt            time.Time                  `json:"created_at"`
+	UpdatedAt            time.Time                  `json:"updated_at"`
+	CreatedByPrincipalID string                     `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string                     `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -134,12 +134,12 @@ type DataResidencyPolicy struct {
 	// region to yet. Added to close a real gap found while implementing
 	// the Global Traffic & Residency Manager: ResidencyMode says HOW
 	// STRICTLY to enforce residency, this says WHICH region.
-	ResidencyRegionID      *string                `json:"residency_region_id"`
-	ActiveFlag             bool                   `json:"active_flag"`
-	CreatedAt              time.Time              `json:"created_at"`
-	UpdatedAt              time.Time              `json:"updated_at"`
-	CreatedByPrincipalID   string                 `json:"created_by_principal_id"`
-	UpdatedByPrincipalID   string                 `json:"updated_by_principal_id"`
+	ResidencyRegionID    *string   `json:"residency_region_id"`
+	ActiveFlag           bool      `json:"active_flag"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -148,17 +148,17 @@ type DataResidencyPolicy struct {
 // ---------------------------------------------------------------------------
 
 type ResidencyRegion struct {
-	ResidencyRegionID string `json:"residency_region_id"`
-	RegionCode        string `json:"region_code"`
-	RegionName        string `json:"region_name"`
-	CloudProvider     string `json:"cloud_provider"`
-	CountryCode       string `json:"country_code"`
-	SovereignFlag     bool   `json:"sovereign_flag"`
-	ActiveFlag        bool   `json:"active_flag"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
-	CreatedByPrincipalID string `json:"created_by_principal_id"`
-	UpdatedByPrincipalID string `json:"updated_by_principal_id"`
+	ResidencyRegionID    string    `json:"residency_region_id"`
+	RegionCode           string    `json:"region_code"`
+	RegionName           string    `json:"region_name"`
+	CloudProvider        string    `json:"cloud_provider"`
+	CountryCode          string    `json:"country_code"`
+	SovereignFlag        bool      `json:"sovereign_flag"`
+	ActiveFlag           bool      `json:"active_flag"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -170,18 +170,18 @@ type ResidencyRegion struct {
 // ---------------------------------------------------------------------------
 
 type TaxIdentityBundle struct {
-	TaxIdentityBundleID string                  `json:"tax_identity_bundle_id"`
-	TenantID            string                  `json:"tenant_id"`
-	LegalEntityID       string                  `json:"legal_entity_id"`
+	TaxIdentityBundleID string `json:"tax_identity_bundle_id"`
+	TenantID            string `json:"tenant_id"`
+	LegalEntityID       string `json:"legal_entity_id"`
 	// JurisdictionID validated against Jurisdiction Rules Service at creation time.
-	JurisdictionID      string                  `json:"jurisdiction_id"`
-	Status              TaxIdentityBundleStatus `json:"status"`
-	EffectiveFrom       time.Time               `json:"effective_from"`
-	EffectiveTo         *time.Time              `json:"effective_to"`
-	CreatedAt           time.Time               `json:"created_at"`
-	UpdatedAt           time.Time               `json:"updated_at"`
-	CreatedByPrincipalID string                 `json:"created_by_principal_id"`
-	UpdatedByPrincipalID string                 `json:"updated_by_principal_id"`
+	JurisdictionID       string                  `json:"jurisdiction_id"`
+	Status               TaxIdentityBundleStatus `json:"status"`
+	EffectiveFrom        time.Time               `json:"effective_from"`
+	EffectiveTo          *time.Time              `json:"effective_to"`
+	CreatedAt            time.Time               `json:"created_at"`
+	UpdatedAt            time.Time               `json:"updated_at"`
+	CreatedByPrincipalID string                  `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string                  `json:"updated_by_principal_id"`
 	DataClassification   string                  `json:"data_classification"`
 }
 
@@ -223,14 +223,14 @@ type CreateEntityRequest struct {
 }
 
 type CreateWorkspaceRequest struct {
-	TenantID               string `json:"tenant_id"`
-	LegalEntityID          string `json:"legal_entity_id,omitempty"`
-	Name                   string `json:"name"`
-	BusinessUnit           string `json:"business_unit,omitempty"`
-	BillingClassification  string `json:"billing_classification"`
-	BillingSource          string `json:"billing_source,omitempty"`
-	CommercialAccountID    string `json:"commercial_account_id,omitempty"`
-	CorrelationID          string `json:"correlation_id"`
+	TenantID              string `json:"tenant_id"`
+	LegalEntityID         string `json:"legal_entity_id,omitempty"`
+	Name                  string `json:"name"`
+	BusinessUnit          string `json:"business_unit,omitempty"`
+	BillingClassification string `json:"billing_classification"`
+	BillingSource         string `json:"billing_source,omitempty"`
+	CommercialAccountID   string `json:"commercial_account_id,omitempty"`
+	CorrelationID         string `json:"correlation_id"`
 }
 
 type UpdateEntityRequest struct {
@@ -241,7 +241,7 @@ type UpdateEntityRequest struct {
 	// ActorPrincipalID is populated server-side from the envelope JWT by the
 	// service layer before passing to the store. It is never accepted from the
 	// HTTP request body (json:"-") to prevent client-side privilege injection.
-	ActorPrincipalID    string  `json:"-"`
+	ActorPrincipalID string `json:"-"`
 }
 
 type TransitionEntityStatusRequest struct {
@@ -250,9 +250,9 @@ type TransitionEntityStatusRequest struct {
 }
 
 type EntityStatusResponse struct {
-	EntityID      string       `json:"entity_id"`
-	TenantID      string       `json:"tenant_id"`
-	EntityStatus  EntityStatus `json:"entity_status"`
+	EntityID     string       `json:"entity_id"`
+	TenantID     string       `json:"tenant_id"`
+	EntityStatus EntityStatus `json:"entity_status"`
 }
 
 type AssignJurisdictionRequest struct {
@@ -281,8 +281,8 @@ type CreateResidencyPolicyRequest struct {
 	// ResidencyRegionID is optional — omit it for a policy that doesn't
 	// yet have a concrete region assigned (see DataResidencyPolicy's
 	// field comment).
-	ResidencyRegionID      *string                `json:"residency_region_id,omitempty"`
-	CorrelationID          string                 `json:"correlation_id"`
+	ResidencyRegionID *string `json:"residency_region_id,omitempty"`
+	CorrelationID     string  `json:"correlation_id"`
 }
 
 // ResolvedTenantRegion is the response shape for GET

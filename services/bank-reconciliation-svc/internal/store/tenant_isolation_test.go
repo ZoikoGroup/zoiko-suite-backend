@@ -54,6 +54,13 @@ func TestMain(m *testing.M) {
 	dbPort := uint32(15901 + uint32(os.Getpid()%499))
 	pg := embeddedpostgres.NewDatabase(
 		embeddedpostgres.DefaultConfig().
+			// Version pinned explicitly — see the doc comment on
+			// embeddedpostgres.DefaultConfig() in audit-event-store-svc's
+			// main_integration_test.go for why: the unpinned default floats
+			// to whatever major the library calls "latest," and that patch
+			// build can stop resolving from the remote binary repo with no
+			// code change on our side (this is what broke PR #105's CI).
+			Version(embeddedpostgres.V16).
 			Port(dbPort).
 			Database("bankrec_isolation_test").
 			Username("postgres").
@@ -94,6 +101,7 @@ func TestMain(m *testing.M) {
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_idempotency_index.up.sql",
+		"000003_add_gl_cash_account_code.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {
@@ -201,6 +209,121 @@ func TestPgStore_CreateStatementLine_RetriedCorrelationID_IsIdempotent(t *testin
 	require.NoError(t, testPool.QueryRow(ctx, `SELECT COUNT(*) FROM statement_lines WHERE tenant_id = $1 AND correlation_id = $2`,
 		tenantID, "corr-retry-1").Scan(&count))
 	assert.Equal(t, 1, count, "DUPLICATE LINE: expected exactly 1 statement_lines row for this correlation_id")
+}
+
+// TestPgStore_CreateStatementLine_WritesContextTenantNotStructTenant proves
+// the cross-tenant WRITE is closed.
+//
+// The INSERT used to take its tenant_id from the struct — which the handler
+// filled from the request body — while only the RLS scope came from the
+// verified context. This pool connects as a superuser, so RLS never runs and
+// nothing else stood in the way: a caller could put a row in another tenant's
+// register. The assertion is on the DATABASE, not the returned struct, since
+// the struct is exactly what was trusted before.
+func TestPgStore_CreateStatementLine_WritesContextTenantNotStructTenant(t *testing.T) {
+	verified := uuid.New().String()
+	victim := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), verified)
+
+	lineID := uuid.New().String()
+	_, err := testStore.CreateStatementLine(ctx, &domain.StatementLine{
+		StatementLineID: lineID,
+		TenantID:        victim, // what a hostile body would carry
+		LegalEntityID:   uuid.New().String(),
+		BankAccountID:   uuid.New().String(),
+		StatementDate:   time.Now().UTC().Truncate(24 * time.Hour),
+		Amount:          1000,
+		CurrencyCode:    "USD",
+		BankReference:   "ACH-crosstenant",
+		Status:          domain.StatementLineStatusUnmatched,
+		CorrelationID:   "corr-crosstenant-" + lineID,
+	})
+	require.NoError(t, err)
+
+	var stored string
+	require.NoError(t, testPool.QueryRow(context.Background(),
+		`SELECT tenant_id::text FROM statement_lines WHERE statement_line_id = $1`, lineID).Scan(&stored))
+	assert.Equal(t, verified, stored,
+		"CROSS-TENANT WRITE: the row landed in the tenant named by the caller's data, not the caller's verified scope")
+
+	var victimRows int
+	require.NoError(t, testPool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM statement_lines WHERE tenant_id = $1`, victim).Scan(&victimRows))
+	assert.Zero(t, victimRows, "a row was planted in another tenant's register")
+}
+
+// StatementLegalEntities is what binds CompleteStatement's authorization
+// check to the resource it authorizes, so it must not see across tenants
+// either.
+func TestPgStore_TenantIsolation_StatementLegalEntities(t *testing.T) {
+	a := setupIsolationFixture(t, "A-LegalEntities")
+	b := setupIsolationFixture(t, "B-LegalEntities")
+
+	date := time.Now().UTC().Truncate(24 * time.Hour).Format("2006-01-02")
+	bctx := svcmiddleware.WithTenant(context.Background(), b.tenantID)
+
+	// Tenant B asking about tenant A's bank account learns nothing.
+	got, err := testStore.StatementLegalEntities(bctx, b.tenantID, a.bankAccountID, date)
+	require.NoError(t, err)
+	assert.Empty(t, got, "CROSS-TENANT READ: another tenant's legal entities were returned")
+
+	// ...but B can still see its own.
+	own, err := testStore.StatementLegalEntities(bctx, b.tenantID, b.bankAccountID, date)
+	require.NoError(t, err)
+	assert.Equal(t, []string{b.entityID}, own, "the fix must not over-restrict")
+}
+
+// A malformed uuid or date is the caller's mistake, not an outage. Without
+// the 22P02/22007 mapping these surfaced as 503 store_unavailable.
+func TestPgStore_MalformedIdentifiers_MapToInvalidIdentifier(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	_, err := testStore.GetStatementLine(ctx, "not-a-uuid")
+	assert.ErrorIs(t, err, domain.ErrInvalidIdentifier, "a malformed statement_line_id must not read as a store outage")
+
+	_, err = testStore.CountUnmatched(ctx, tenantID, "not-a-uuid", "2026-07-01")
+	assert.ErrorIs(t, err, domain.ErrInvalidIdentifier, "a malformed bank_account_id must not read as a store outage")
+
+	_, err = testStore.CountUnmatched(ctx, tenantID, uuid.New().String(), "not-a-date")
+	assert.ErrorIs(t, err, domain.ErrInvalidIdentifier, "a malformed statement_date must not read as a store outage")
+}
+
+// The register was unbounded. Reads are also capped at MaxListLimit so a
+// caller cannot ask for the whole history by naming a large number.
+func TestPgStore_ListStatementLines_IsBounded(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	entityID := uuid.New().String()
+	bankAccountID := uuid.New().String()
+
+	for i := 0; i < 5; i++ {
+		id := uuid.New().String()
+		_, err := testStore.CreateStatementLine(ctx, &domain.StatementLine{
+			StatementLineID: id,
+			TenantID:        tenantID,
+			LegalEntityID:   entityID,
+			BankAccountID:   bankAccountID,
+			StatementDate:   time.Now().UTC().Truncate(24 * time.Hour),
+			Amount:          float64(100 + i),
+			CurrencyCode:    "USD",
+			BankReference:   "ACH-bounded",
+			Status:          domain.StatementLineStatusUnmatched,
+			CorrelationID:   "corr-bounded-" + id,
+		})
+		require.NoError(t, err)
+	}
+
+	got, err := testStore.ListStatementLines(ctx, domain.ListStatementLinesFilter{TenantID: tenantID, Limit: 2})
+	require.NoError(t, err)
+	assert.Len(t, got, 2, "LIMIT was not applied")
+
+	// An empty result is an empty slice, never nil — otherwise it encodes as
+	// JSON null and every consumer has to special-case it.
+	empty, err := testStore.ListStatementLines(ctx, domain.ListStatementLinesFilter{TenantID: uuid.New().String()})
+	require.NoError(t, err)
+	assert.NotNil(t, empty, "an empty register must be [] and not JSON null")
+	assert.Empty(t, empty)
 }
 
 func TestPgStore_TenantIsolation_GetStatementLine(t *testing.T) {

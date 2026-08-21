@@ -12,6 +12,7 @@ import (
 	"time"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/handler"
+	"zoiko.io/mtls-management-svc/internal/siem"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
 
@@ -37,7 +38,8 @@ func main() {
 	logger.Info("internal CA ready", zap.String("ca_data_dir", caDir))
 
 	s := store.NewMemoryStore()
-	h := handler.New(s, internalCA, logger)
+	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "mtls-management-svc", logger)
+	h := handler.New(s, internalCA, siemClient, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{Addr: ":" + port, Handler: router, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}

@@ -153,13 +153,15 @@ type stubPublisher struct {
 	posCreated, empAssigned, orgChanged int
 }
 
-func (p *stubPublisher) PublishPositionCreated(_ context.Context, _ string, _ domain.Position) {
+func (p *stubPublisher) PublishPositionCreated(_ context.Context, _, _ string, _ domain.Position) {
 	p.posCreated++
 }
-func (p *stubPublisher) PublishEmployeeAssigned(_ context.Context, _ string, _ domain.OrgAssignment) {
+func (p *stubPublisher) PublishEmployeeAssigned(_ context.Context, _, _ string, _ domain.OrgAssignment) {
 	p.empAssigned++
 }
-func (p *stubPublisher) PublishOrgStructureChanged(_ context.Context, _ string, _, _ string) {
+
+// correlationID, tenantID, legalEntityID, actorID, eventType, entityID
+func (p *stubPublisher) PublishOrgStructureChanged(_ context.Context, _, _, _, _, _, _ string) {
 	p.orgChanged++
 }
 
