@@ -55,6 +55,11 @@ jobs:
           - obligations-svc
           - secret-vault-integration-svc
           - authorization-svc
+          # access-control-svc is the governed authoring layer in front of
+          # authorization-svc's admin API, and until now CI never built, vetted
+          # or tested it at all -- it is wired into compose and Traefik but was
+          # absent from this matrix, so nothing checked it on any PR.
+          - access-control-svc
           - workflow-svc
           - workflow-history-svc
           - gateway-auth-svc
@@ -156,7 +161,7 @@ jobs:
         run: go test -v -tags=integration -count=1 -timeout=120s ./cmd/server/
 
       - name: Integration test — store isolation/pipeline (PgStore → DB)
-        if: matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc'
+        if: matrix.service == 'access-control-svc' || matrix.service == 'workflow-history-svc' || matrix.service == 'tenant-entity-registry-svc' || matrix.service == 'accounts-receivable-svc' || matrix.service == 'purchase-request-svc' || matrix.service == 'purchase-order-svc' || matrix.service == 'treasury-svc' || matrix.service == 'financial-close-svc' || matrix.service == 'bank-reconciliation-svc' || matrix.service == 'intercompany-accounting-svc' || matrix.service == 'consolidation-svc' || matrix.service == 'invoice-approval-svc' || matrix.service == 'employee-master-svc' || matrix.service == 'employment-contracts-svc' || matrix.service == 'payroll-run-svc' || matrix.service == 'compensation-svc' || matrix.service == 'benefits-svc' || matrix.service == 'payroll-tax-svc' || matrix.service == 'payroll-exceptions-svc' || matrix.service == 'leave-absence-svc' || matrix.service == 'org-structure-svc' || matrix.service == 'offboarding-severance-svc' || matrix.service == 'workforce-compliance-svc' || matrix.service == 'evidence-requirements-svc'
         working-directory: services/${{ matrix.service }}
         # Runs integration tests under internal/store to verify isolation or the consumer pipeline.
         # Uses embedded-postgres (downloads real Postgres binaries automatically).

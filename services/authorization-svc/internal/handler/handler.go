@@ -18,6 +18,7 @@ import (
 // AuthorizationStore is the narrow interface the handler depends on.
 type AuthorizationStore interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
+	SetRoleActive(ctx context.Context, roleID string, active bool) (*domain.Role, error)
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID string) (*domain.PrincipalRoleAssignment, error)
@@ -54,6 +55,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Use(correlationIDMiddleware)
 
 	r.Post("/v1/admin/roles", h.CreateRole)
+	r.Post("/v1/admin/roles/{role_id}/retire", h.RetireRole)
+	r.Post("/v1/admin/roles/{role_id}/reactivate", h.ReactivateRole)
 	r.Post("/v1/admin/roles/{role_id}/permission-bundles", h.CreatePermissionBundle)
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
@@ -137,6 +140,65 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, role)
+}
+
+// ── POST /v1/admin/roles/{role_id}/retire | /reactivate ──────────────────────
+
+// RetireRole handles POST /v1/admin/roles/{role_id}/retire.
+//
+// Sets active_flag false, which is what actually stops the role granting
+// anything: FindGrantedActions joins through `roles.active_flag`, so every
+// action this role conferred disappears from the next /v1/authorize decision
+// for every principal holding it. Assignments are left intact so the effect is
+// reversible — see SetRoleActive for why cascading revocation is a separate
+// decision.
+//
+// Idempotent: retiring an already-retired role is 200, not 409. The caller
+// asked for a state, and that state holds.
+//
+// Response: 200 retired / 404 role not found / 503 unavailable.
+func (h *Handler) RetireRole(w http.ResponseWriter, r *http.Request) {
+	h.setRoleActive(w, r, false)
+}
+
+// ReactivateRole handles POST /v1/admin/roles/{role_id}/reactivate.
+//
+// Restores exactly the access the retirement suspended, because the
+// assignments were never removed. Response shape matches RetireRole.
+func (h *Handler) ReactivateRole(w http.ResponseWriter, r *http.Request) {
+	h.setRoleActive(w, r, true)
+}
+
+func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active bool) {
+	roleID := chi.URLParam(r, "role_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	role, err := h.store.SetRoleActive(r.Context(), roleID, active)
+	if err != nil {
+		if errors.Is(err, domain.ErrRoleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found"})
+			return
+		}
+		h.log.Error("setRoleActive: store unavailable",
+			zap.String("correlation_id", correlationID),
+			zap.String("role_id", roleID),
+			zap.Bool("active", active),
+			zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	// Logged at info because this is a change to what the platform will
+	// enforce, not a read. A retirement that nobody can account for later is
+	// the same problem as one that never happened.
+	h.log.Info("role active_flag changed",
+		zap.String("correlation_id", correlationID),
+		zap.String("role_id", role.RoleID),
+		zap.String("role_code", role.RoleCode),
+		zap.String("tenant_id", role.TenantID),
+		zap.Bool("active_flag", role.ActiveFlag))
+
+	writeJSON(w, http.StatusOK, role)
 }
 
 // ── POST /v1/admin/roles/{role_id}/permission-bundles ───────────────────────

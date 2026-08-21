@@ -23,6 +23,14 @@ type stubStore struct {
 	roleCreated bool
 	roleErr     error
 
+	// setActive records what SetRoleActive was asked for, so a test can assert
+	// that /retire asks for false and /reactivate for true rather than only
+	// that the call happened.
+	setActiveRole   *domain.Role
+	setActiveErr    error
+	setActiveCalls  int
+	setActiveWanted []bool
+
 	bundle    *domain.PermissionBundle
 	bundleErr error
 
@@ -59,6 +67,11 @@ type stubStore struct {
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
 	return s.role, s.roleCreated, s.roleErr
+}
+func (s *stubStore) SetRoleActive(_ context.Context, _ string, active bool) (*domain.Role, error) {
+	s.setActiveCalls++
+	s.setActiveWanted = append(s.setActiveWanted, active)
+	return s.setActiveRole, s.setActiveErr
 }
 func (s *stubStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
 	return s.bundle, s.bundleErr
@@ -301,6 +314,76 @@ func TestCreateRole_MissingField(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// ── RetireRole / ReactivateRole ───────────────────────────────────────────────
+//
+// active_flag is the only thing that stops a role granting anything --
+// FindGrantedActions joins through it -- so what these assert is not "the
+// handler returned 200" but "the handler asked for the flag the route name
+// promises". A /retire that set the flag true would still answer 200.
+
+func TestRetireRole_SetsActiveFalse(t *testing.T) {
+	store := &stubStore{setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: false}}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.setActiveCalls != 1 {
+		t.Fatalf("expected exactly one SetRoleActive call, got %d", store.setActiveCalls)
+	}
+	if store.setActiveWanted[0] != false {
+		t.Fatalf("/retire asked for active_flag=%v; retiring a role must set it false, or the role keeps granting every action it grants today", store.setActiveWanted[0])
+	}
+}
+
+func TestReactivateRole_SetsActiveTrue(t *testing.T) {
+	store := &stubStore{setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: true}}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/reactivate", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.setActiveWanted[0] != true {
+		t.Fatalf("/reactivate asked for active_flag=%v, expected true", store.setActiveWanted[0])
+	}
+}
+
+func TestRetireRole_UnknownRoleIs404(t *testing.T) {
+	// 404 and not 503: the store reached the database and answered. Collapsing
+	// the two would make a typo'd role id look like an outage.
+	store := &stubStore{setActiveErr: domain.ErrRoleNotFound}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/does-not-exist/retire", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRetireRole_StoreDownIs503(t *testing.T) {
+	store := &stubStore{setActiveErr: domain.ErrStoreUnavailable}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

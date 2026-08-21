@@ -92,6 +92,46 @@ func (s *PgStore) FindRoleByID(ctx context.Context, roleID string) (*domain.Role
 	return r, nil
 }
 
+// SetRoleActive flips a role's active_flag and returns the role as it now
+// stands. This is the ONLY way to stop a role being enforced.
+//
+// WHY THIS EXISTS. active_flag has been on the roles table since the initial
+// schema, and FindGrantedActions has always joined through it
+// (`JOIN roles r ON ... AND r.active_flag`), so a false flag genuinely removes
+// every action the role granted. What was missing was any route that could set
+// it: this service could create a role and revoke an ASSIGNMENT, but never
+// retire the role itself. access-control-svc, the governed authoring layer in
+// front of this admin API, could therefore mark a role RETIRED in its own
+// catalogue while every principal holding it kept the access — a retirement
+// that was a label and not a control.
+//
+// Idempotent: retiring an already-retired role returns it unchanged with no
+// error, because the caller's intent (this role must not grant anything) is
+// already satisfied and a 409 would make a safe retry look like a failure.
+// A missing role is still ErrRoleNotFound — that is a different fact.
+//
+// Deliberately does not touch principal_role_assignments. The assignments
+// remain, and reactivating restores exactly the access that was suspended;
+// cascading revocation would be irreversible and is a separate decision from
+// "stop enforcing this role for now".
+func (s *PgStore) SetRoleActive(ctx context.Context, roleID string, active bool) (*domain.Role, error) {
+	const query = `
+		UPDATE roles SET active_flag = $2
+		WHERE role_id = $1
+		RETURNING ` + roleColumns + `;`
+
+	row := s.pool.QueryRow(ctx, query, roleID, active)
+	r, err := scanRole(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrRoleNotFound
+		}
+		s.log.Error("pg SetRoleActive failed", zap.Error(err), zap.String("role_id", roleID), zap.Bool("active", active))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
+}
+
 func (s *PgStore) CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error) {
 	if params.RoleID == "" {
 		params.RoleID = uuid.New().String()

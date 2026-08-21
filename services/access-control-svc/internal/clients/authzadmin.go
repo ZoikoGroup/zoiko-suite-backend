@@ -37,6 +37,24 @@ func (c *AuthzAdminClient) CreateRole(ctx context.Context, roleID, tenantID, rol
 	return c.post(ctx, "/v1/admin/roles", body)
 }
 
+// SetRoleActive calls POST /v1/admin/roles/{roleID}/retire or /reactivate.
+//
+// This is the call that makes a status change here mean something. Retiring a
+// role in this catalogue used to update one row in one database and nothing
+// else: authorization-svc kept the role active, FindGrantedActions kept joining
+// through it, and every principal holding the role kept every action it granted.
+// The catalogue said RETIRED and the platform enforced ACTIVE.
+//
+// Idempotent server-side — retiring an already-retired role is 200, so a retry
+// after a timeout is safe and does not need distinguishing from the first call.
+func (c *AuthzAdminClient) SetRoleActive(ctx context.Context, roleID string, active bool) error {
+	action := "retire"
+	if active {
+		action = "reactivate"
+	}
+	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/%s", roleID, action), []byte(`{}`))
+}
+
 // CreatePermissionBundle calls POST /v1/admin/roles/{roleID}/permission-bundles.
 func (c *AuthzAdminClient) CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string) error {
 	body, _ := json.Marshal(map[string]any{

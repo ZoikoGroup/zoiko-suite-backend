@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -116,6 +117,12 @@ func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { retu
 type stubAuthzAdmin struct {
 	createRoleErr   error
 	createBundleErr error
+
+	// setRoleActiveErr simulates authorization-svc being unreachable on the
+	// propagation path, which must fail the PATCH rather than record a
+	// retirement the platform is not enforcing.
+	setRoleActiveErr  error
+	setRoleActiveWant []bool
 }
 
 func (a *stubAuthzAdmin) CreateRole(_ context.Context, _, _, _, _, _, _ string) error {
@@ -123,6 +130,10 @@ func (a *stubAuthzAdmin) CreateRole(_ context.Context, _, _, _, _, _, _ string) 
 }
 func (a *stubAuthzAdmin) CreatePermissionBundle(_ context.Context, _, _ string, _ []string) error {
 	return a.createBundleErr
+}
+func (a *stubAuthzAdmin) SetRoleActive(_ context.Context, _ string, active bool) error {
+	a.setRoleActiveWant = append(a.setRoleActiveWant, active)
+	return a.setRoleActiveErr
 }
 
 // ── router factory ─────────────────────────────────────────────────────────────
@@ -293,5 +304,131 @@ func TestUpdateRole_HappyPath(t *testing.T) {
 	}
 	if pub.roleUpdated != 1 {
 		t.Errorf("expected 1 role.updated event, got %d", pub.roleUpdated)
+	}
+}
+
+// TestUpdateRole_RetirementReachesAuthorizationSvc is the test that matters
+// most in this file.
+//
+// Status here is a label on a row; active_flag in authorization-svc is what
+// FindGrantedActions joins through, and therefore the only thing that stops a
+// role granting anything. Before this, PATCH status=RETIRED wrote the label and
+// made no remote call, so every principal holding the role kept every action it
+// granted while this register displayed RETIRED. Asserting the 200 alone would
+// not have caught that -- the 200 was always there.
+func TestUpdateRole_RetirementReachesAuthorizationSvc(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	role := createRole(t, r)
+
+	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
+		map[string]any{"legal_entity_id": "le-us", "status": "RETIRED"}, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setRoleActiveWant) != 1 {
+		t.Fatalf("retiring a role made %d SetRoleActive calls, expected 1 -- without it the role stays enforceable", len(admin.setRoleActiveWant))
+	}
+	if admin.setRoleActiveWant[0] != false {
+		t.Fatalf("retirement asked authorization-svc for active=%v, expected false", admin.setRoleActiveWant[0])
+	}
+}
+
+func TestUpdateRole_ReactivationAsksForActiveTrue(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	role := createRole(t, r)
+
+	// ACTIVE -> RETIRED -> ACTIVE. The second transition must ask for true.
+	_ = doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
+		map[string]any{"legal_entity_id": "le-us", "status": "RETIRED"}, "admin-1")
+	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
+		map[string]any{"legal_entity_id": "le-us", "status": "ACTIVE"}, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setRoleActiveWant) != 2 {
+		t.Fatalf("expected 2 propagation calls across two transitions, got %d", len(admin.setRoleActiveWant))
+	}
+	if admin.setRoleActiveWant[1] != true {
+		t.Fatalf("reactivation asked for active=%v, expected true", admin.setRoleActiveWant[1])
+	}
+}
+
+// TestUpdateRole_AuthzAdminDown_RefusesTheStatusChange is the fail-closed case.
+// An unreachable authorization-svc must NOT leave the catalogue claiming a
+// retirement the platform is still not enforcing.
+func TestUpdateRole_AuthzAdminDown_RefusesTheStatusChange(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	store := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(store, pub, &stubAuthZ{}, admin)
+	role := createRole(t, r)
+
+	admin.setRoleActiveErr = errors.New("authorization-svc admin API unreachable")
+
+	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
+		map[string]any{"legal_entity_id": "le-us", "status": "RETIRED"}, "admin-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when the status change could not be propagated, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// The label must not have moved, and nothing may have been announced.
+	if got := store.rolesByID[role.RoleDefinitionID].Status; got != domain.RoleStatusActive {
+		t.Errorf("status is %q after a refused retirement; the catalogue now disagrees with what is enforced", got)
+	}
+	if pub.roleUpdated != 0 {
+		t.Errorf("published %d role.updated events for a retirement that did not happen", pub.roleUpdated)
+	}
+}
+
+// TestUpdateRole_RenameOnlyDoesNotTouchAuthorizationSvc -- a rename changes no
+// enforcement, so it must not make a remote call that could fail and block it.
+func TestUpdateRole_RenameOnlyDoesNotTouchAuthorizationSvc(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	role := createRole(t, r)
+
+	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
+		map[string]any{"legal_entity_id": "le-us", "role_name": "Renamed Officer"}, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setRoleActiveWant) != 0 {
+		t.Fatalf("a rename made %d SetRoleActive calls, expected none", len(admin.setRoleActiveWant))
+	}
+}
+
+// TestUpdateRole_NoOpStatusIsNotPropagated -- PATCHing the status a role
+// already has changes nothing to enforce.
+func TestUpdateRole_NoOpStatusIsNotPropagated(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	role := createRole(t, r) // created ACTIVE
+
+	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
+		map[string]any{"legal_entity_id": "le-us", "status": "ACTIVE"}, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setRoleActiveWant) != 0 {
+		t.Fatalf("a no-op status change made %d SetRoleActive calls, expected none", len(admin.setRoleActiveWant))
+	}
+}
+
+// TestUpdateRole_UnknownStatusRejected -- status was a bare VARCHAR(20) with the
+// vocabulary only in a comment, so any string persisted and then read back as
+// neither ACTIVE nor RETIRED.
+func TestUpdateRole_UnknownStatusRejected(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	role := createRole(t, r)
+
+	rr := doReq(r, http.MethodPatch, "/v1/role-definitions/"+role.RoleDefinitionID,
+		map[string]any{"legal_entity_id": "le-us", "status": "BANANA"}, "admin-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown status, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setRoleActiveWant) != 0 {
+		t.Fatalf("an invalid status still reached authorization-svc (%d calls)", len(admin.setRoleActiveWant))
 	}
 }

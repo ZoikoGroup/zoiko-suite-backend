@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -40,6 +41,7 @@ type AuthZClient interface {
 type AuthzAdmin interface {
 	CreateRole(ctx context.Context, roleID, tenantID, roleCode, roleName, roleScopeType, createdByPrincipalID string) error
 	CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string) error
+	SetRoleActive(ctx context.Context, roleID string, active bool) error
 }
 
 const (
@@ -192,6 +194,52 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionRoleManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
+	}
+
+	// Reject an unknown status instead of storing it.
+	//
+	// This used to pass req.Status straight to the store, and the column is a
+	// bare VARCHAR(20) with the vocabulary only in a comment -- so
+	// {"status":"BANANA"} persisted, and ListRoles(?status=ACTIVE) then omitted
+	// a role that was neither active nor retired but simply unreadable. The
+	// CHECK constraint added in 000002 is the backstop; this is the error the
+	// caller can act on.
+	if req.Status != "" && req.Status != string(domain.RoleStatusActive) && req.Status != string(domain.RoleStatusRetired) {
+		writeError(w, http.StatusBadRequest, "invalid_status",
+			fmt.Sprintf("status must be %s or %s, got %q", domain.RoleStatusActive, domain.RoleStatusRetired, req.Status))
+		return
+	}
+
+	// PROPAGATE THE STATUS CHANGE BEFORE RECORDING IT, and fail closed.
+	//
+	// This is the same ordering CreateRole uses, for the same reason: the
+	// catalogue must never claim a state the platform is not actually
+	// enforcing. Retiring here without telling authorization-svc left the role
+	// fully live -- FindGrantedActions joins through roles.active_flag, so
+	// every principal holding it kept every action, while this service's
+	// register displayed RETIRED. A governance record that disagrees with the
+	// enforcement it describes is worse than no record.
+	//
+	// Only a real transition is propagated. An empty status means "rename
+	// only", and PATCHing the status it already has is a no-op here rather than
+	// a redundant call -- though the remote is idempotent either way.
+	if req.Status != "" {
+		current, err := h.store.GetRole(r.Context(), roleDefinitionID)
+		if err != nil {
+			h.writeStoreErr(w, err)
+			return
+		}
+		if req.Status != string(current.Status) {
+			active := req.Status == string(domain.RoleStatusActive)
+			if err := h.authzAdmin.SetRoleActive(r.Context(), roleDefinitionID, active); err != nil {
+				h.log.Error("failed to propagate role status to authorization-svc",
+					zap.String("role_definition_id", roleDefinitionID),
+					zap.String("status", req.Status),
+					zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+				return
+			}
+		}
 	}
 
 	updated, err := h.store.UpdateRole(r.Context(), roleDefinitionID, req.RoleName, req.Status)
