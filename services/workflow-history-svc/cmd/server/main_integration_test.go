@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -57,7 +58,13 @@ func TestIntegration(t *testing.T) {
 			Port(dbPort).
 			Database("workflow_history_test").
 			Username("postgres").
-			Password("postgres"),
+			Password("postgres").
+			// Isolate the extracted runtime -- the other half of the same fix
+			// applied in internal/store/consumer_pipeline_integration_test.go,
+			// which carries the full explanation. CI runs embedded Postgres twice
+			// in this service's job and nowhere else, and unset both runs share
+			// ~/.embedded-postgres-go/extracted.
+			RuntimePath(filepath.Join(os.TempDir(), fmt.Sprintf("epg-wfh-server-%d", dbPort))),
 	)
 	require.NoError(t, pg.Start(), "embedded postgres failed to start")
 	defer func() { _ = pg.Stop() }()
