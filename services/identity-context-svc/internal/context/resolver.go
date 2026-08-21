@@ -162,7 +162,7 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	}
 
 	// ── Dimension 4: Role profile ───────────────────────────────────────────
-	roleAssignments, err := r.principals.FindActiveRoleAssignments(ctx, principal.PrincipalID, &req.LegalEntityID)
+	roleAssignments, err := r.principals.FindActiveRoleAssignments(ctx, principal.PrincipalID, principal.TenantID, &req.LegalEntityID)
 	if err != nil {
 		return "", fmt.Errorf("%w: role assignments: %v", ErrUpstreamUnavailable, err)
 	}

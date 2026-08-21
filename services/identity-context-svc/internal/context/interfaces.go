@@ -14,10 +14,10 @@ import (
 // Owned by this service per the authoritative data boundary in the spec.
 type PrincipalStore interface {
 	FindByIDPSubject(ctx context.Context, subject, tenantID string) (*domain.Principal, error)
-	FindByID(ctx context.Context, principalID string) (*domain.Principal, error)
-	FindActiveRoleAssignments(ctx context.Context, principalID string, legalEntityID *string) ([]domain.PrincipalRoleAssignment, error)
-	FindActiveDelegations(ctx context.Context, principalID string) ([]domain.DelegatedAuthority, error)
-	UpdateStatus(ctx context.Context, principalID string, newStatus domain.PrincipalStatus, actorID, correlationID string) error
+	FindByID(ctx context.Context, principalID, tenantID string) (*domain.Principal, error)
+	FindActiveRoleAssignments(ctx context.Context, principalID, tenantID string, legalEntityID *string) ([]domain.PrincipalRoleAssignment, error)
+	FindActiveDelegations(ctx context.Context, principalID, tenantID string) ([]domain.DelegatedAuthority, error)
+	UpdateStatus(ctx context.Context, principalID, tenantID string, newStatus domain.PrincipalStatus, actorID, correlationID string) error
 }
 
 // SessionCache manages the Redis-backed session envelope store.
