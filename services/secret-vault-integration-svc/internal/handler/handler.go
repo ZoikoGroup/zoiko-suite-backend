@@ -29,15 +29,15 @@ type SecretVaultStore interface {
 	CreateSecretPolicyVersion(ctx context.Context, params domain.CreateSecretPolicyVersionParams) (*domain.SecretPolicyVersion, bool, error)
 	FindSecretPolicyVersionByID(ctx context.Context, secretPolicyVersionID string) (*domain.SecretPolicyVersion, error)
 	ActivateVersion(ctx context.Context, secretPolicyVersionID, actorID string) (*domain.SecretPolicyVersion, []*domain.SecretPolicyVersion, bool, error)
-	ListVersionHistory(ctx context.Context, secretPolicyID string) ([]*domain.SecretPolicyVersion, error)
+	ListVersionHistory(ctx context.Context, secretPolicyID, tenantID string) ([]*domain.SecretPolicyVersion, error)
 
 	FindApplicableVersions(ctx context.Context, secretClass string, tenantID, legalEntityID *string) ([]*domain.ApplicableSecretPolicyVersion, error)
 	FindApplicableVersionByPath(ctx context.Context, secretPath string, tenantID, legalEntityID *string) (*domain.ApplicableSecretPolicyVersion, error)
 
 	CreateLease(ctx context.Context, params domain.CreateLeaseParams) (*domain.SecretLease, bool, error)
-	FindLeaseByID(ctx context.Context, leaseID string) (*domain.SecretLease, error)
+	FindLeaseByID(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, error)
 	ListLeases(ctx context.Context, filter store.LeaseListFilter) ([]*domain.SecretLease, error)
-	RevokeLease(ctx context.Context, leaseID string) (*domain.SecretLease, bool, error)
+	RevokeLease(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, bool, error)
 	RevokeLeasesBySecretPath(ctx context.Context, secretPath string) ([]*domain.SecretLease, error)
 
 	RecordAuditEntry(ctx context.Context, params domain.RecordAuditEntryParams) (*domain.SecretAccessAuditLog, error)
@@ -475,11 +475,23 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/secret-policies/{id}/versions ───────────────────────────────────
 
 // ListVersionHistory handles GET /v1/secret-policies/{secret_policy_id}/versions.
+//
+// Had no tenant scoping at all until now: any authenticated caller could
+// list every tenant's allowed_workload_ids and lease-duration limits for
+// a policy — provisioning data about who may broker the secret, not
+// something a read endpoint should hand out platform-wide by default.
+// Now requires X-Tenant-Id, same as its sibling read endpoints
+// (GetLease, ListLeases).
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	secretPolicyID := chi.URLParam(r, "secret_policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	results, err := h.store.ListVersionHistory(r.Context(), secretPolicyID)
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	results, err := h.store.ListVersionHistory(r.Context(), secretPolicyID, tenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
@@ -758,7 +770,7 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lease, err := h.store.FindLeaseByID(r.Context(), leaseID)
+	lease, err := h.store.FindLeaseByID(r.Context(), leaseID, tenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
@@ -770,7 +782,8 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A lease says which principal holds live access to which secret path. Any id
-	// returned one, from any tenant.
+	// returned one, from any tenant. FindLeaseByID's own predicate is now the
+	// primary control; this stays as the belt-and-suspenders check it always was.
 	if h.refuseForeignRow(w, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
 		return
 	}
@@ -862,7 +875,7 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	existing, err := h.store.FindLeaseByID(r.Context(), leaseID)
+	existing, err := h.store.FindLeaseByID(r.Context(), leaseID, tenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
@@ -886,7 +899,7 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lease, transitioned, err := h.store.RevokeLease(r.Context(), leaseID)
+	lease, transitioned, err := h.store.RevokeLease(r.Context(), leaseID, tenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):

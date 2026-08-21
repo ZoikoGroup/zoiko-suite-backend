@@ -50,6 +50,27 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// withRLS runs fn inside a transaction with app.tenant_id set for the
+// session, so workflow_instances' tenant_isolation_policy has a value to
+// enforce against. Mirrors tenant-entity-registry-svc's PgStore.withRLS.
+// An empty tenantID is valid — it means "no tenant scope known" and
+// matches nothing, same posture as FindWorkflowByID's existing fallback.
+func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ── workflow_instances ───────────────────────────────────────────────────────
 
 const instanceColumns = `workflow_instance_id, tenant_id, legal_entity_id, workflow_type, workflow_status, current_stage, initiated_by, correlation_id, started_at, completed_at`
@@ -72,13 +93,18 @@ func (s *PgStore) FindWorkflowByID(ctx context.Context, workflowInstanceID strin
 	// text and uuid in one prepared statement ("operator does not exist:
 	// uuid = text"). A nil *string sends an actual SQL NULL instead, so both
 	// usages below agree $2 is uuid.
+	tenantCtx := svcmiddleware.TenantFromContext(ctx)
 	var tenantID *string
-	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
-		tenantID = &t
+	if tenantCtx != "" {
+		tenantID = &tenantCtx
 	}
 	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE workflow_instance_id = $1 AND ($2::uuid IS NULL OR tenant_id = $2::uuid);`
-	row := s.pool.QueryRow(ctx, query, workflowInstanceID, tenantID)
-	w, err := scanInstance(row)
+	var w *domain.WorkflowInstance
+	err := s.withRLS(ctx, tenantCtx, func(tx pgx.Tx) error {
+		var scanErr error
+		w, scanErr = scanInstance(tx.QueryRow(ctx, query, workflowInstanceID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrWorkflowNotFound
@@ -177,6 +203,10 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", params.TenantID); err != nil {
+		return nil, nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+
 	// Idempotent on (tenant_id, correlation_id): a retried call with the
 	// same correlation_id must resolve to the original instance, never
 	// create a second workflow (with its own duplicate stage chain) —
@@ -236,8 +266,12 @@ func (s *PgStore) CreateWorkflow(ctx context.Context, params domain.CreateWorkfl
 // already-committed data from the original call.
 func (s *PgStore) findExistingByCorrelation(ctx context.Context, tenantID, correlationID string) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
 	const query = `SELECT ` + instanceColumns + ` FROM workflow_instances WHERE tenant_id = $1 AND correlation_id = $2;`
-	row := s.pool.QueryRow(ctx, query, tenantID, correlationID)
-	instance, err := scanInstance(row)
+	var instance *domain.WorkflowInstance
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		instance, scanErr = scanInstance(tx.QueryRow(ctx, query, tenantID, correlationID))
+		return scanErr
+	})
 	if err != nil {
 		s.log.Error("pg CreateWorkflow: lookup existing by correlation_id failed", zap.Error(err))
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -313,6 +347,10 @@ func (s *PgStore) SubmitAction(ctx context.Context, params domain.SubmitActionPa
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
+		return nil, nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
 
 	const updateStage = `
 		UPDATE workflow_stages
@@ -418,6 +456,10 @@ func (s *PgStore) transitionInstanceStatus(ctx context.Context, workflowInstance
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx)); err != nil {
+		return nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
 
 	const query = `
 		UPDATE workflow_instances

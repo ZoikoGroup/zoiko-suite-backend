@@ -1,0 +1,9 @@
+-- Migration: 000004_add_rls.down.sql
+
+DROP POLICY IF EXISTS tenant_isolation_policy ON sod_rules;
+ALTER TABLE sod_rules NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE sod_rules DISABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS tenant_isolation_policy ON roles;
+ALTER TABLE roles NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE roles DISABLE ROW LEVEL SECURITY;

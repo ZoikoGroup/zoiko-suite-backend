@@ -30,7 +30,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS secret_access_audit_log, secret_leases, secret_policy_versions, secret_policies CASCADE;`)
 
-	for _, migFile := range []string{"000001_initial_schema.up.sql", "000002_add_data_classification.up.sql"} {
+	for _, migFile := range []string{"000001_initial_schema.up.sql", "000002_add_data_classification.up.sql", "000003_add_rls.up.sql"} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migFile)
 		if err != nil {
 			t.Fatalf("failed to read migration file %s: %v", migFile, err)
@@ -266,12 +266,12 @@ func TestPgStore_RevokeLease_TransitionAndIdempotency(t *testing.T) {
 		t.Fatalf("failed to create lease: %v", err)
 	}
 
-	revoked, transitioned, err := s.RevokeLease(ctx, lease.LeaseID)
+	revoked, transitioned, err := s.RevokeLease(ctx, lease.LeaseID, "")
 	if err != nil || !transitioned || revoked.Status != "REVOKED" {
 		t.Fatalf("expected revoke to succeed, got status=%v transitioned=%v err=%v", revoked, transitioned, err)
 	}
 
-	retryRevoked, retryTransitioned, err := s.RevokeLease(ctx, lease.LeaseID)
+	retryRevoked, retryTransitioned, err := s.RevokeLease(ctx, lease.LeaseID, "")
 	if err != nil || retryTransitioned || retryRevoked.Status != "REVOKED" {
 		t.Fatalf("expected idempotent no-op re-revoking, got transitioned=%v err=%v", retryTransitioned, err)
 	}
@@ -307,7 +307,7 @@ func TestPgStore_LeaseStatus_ExpiredIsComputedNotStored(t *testing.T) {
 		t.Fatalf("expected the stored column to remain GRANTED, got %q", storedStatus)
 	}
 
-	got, err := s.FindLeaseByID(ctx, lease.LeaseID)
+	got, err := s.FindLeaseByID(ctx, lease.LeaseID, "")
 	if err != nil || got.Status != "EXPIRED" {
 		t.Fatalf("expected FindLeaseByID to report computed status EXPIRED, got %+v err=%v", got, err)
 	}
@@ -319,7 +319,7 @@ func TestPgStore_LeaseStatus_ExpiredIsComputedNotStored(t *testing.T) {
 
 	// Revoking an already-expired lease is not a valid transition — there
 	// is nothing left to revoke.
-	if _, _, err := s.RevokeLease(ctx, lease.LeaseID); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, _, err := s.RevokeLease(ctx, lease.LeaseID, ""); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("expected ErrInvalidTransition revoking an EXPIRED lease, got %v", err)
 	}
 }
@@ -353,7 +353,7 @@ func TestPgStore_RevokeLeasesBySecretPath_MassRevokeForRotation(t *testing.T) {
 	}
 
 	for _, id := range []string{lease1.LeaseID, lease2.LeaseID} {
-		l, err := s.FindLeaseByID(ctx, id)
+		l, err := s.FindLeaseByID(ctx, id, "")
 		if err != nil || l.Status != "REVOKED" {
 			t.Errorf("expected lease %s to be REVOKED, got %+v err=%v", id, l, err)
 		}
@@ -452,5 +452,192 @@ func TestPgStore_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 	}
 	if _, err := s.FindSecretPolicyByID(ctx, "00000000-0000-0000-0000-000000000001"); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("FindSecretPolicyByID: expected ErrStoreUnavailable, got %v", err)
+	}
+}
+
+// ── row-level security ───────────────────────────────────────────────────────
+
+// TestPgStore_TenantIsolation_ListVersionHistory proves the fix for the
+// real gap found in this row: ListVersionHistory previously took no
+// tenant at all, so any caller could list every tenant's
+// allowed_workload_ids and lease-duration limits for a policy. Tenant B
+// must see the global version but not tenant A's.
+func TestPgStore_TenantIsolation_ListVersionHistory(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	p := createTestPolicy(t, ctx, s, "DATABASE_CREDENTIAL", "kv/payroll/db")
+	tenantA := "11111111-1111-1111-1111-111111111111"
+	tenantB := "22222222-2222-2222-2222-222222222222"
+
+	globalV, _, err := s.CreateSecretPolicyVersion(ctx, domain.CreateSecretPolicyVersionParams{
+		SecretPolicyID: p.SecretPolicyID, AllowedWorkloadIDs: []byte(`["svc-global"]`),
+		MaxLeaseDurationSeconds: 300, EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create global version: %v", err)
+	}
+	tenantAV, _, err := s.CreateSecretPolicyVersion(ctx, domain.CreateSecretPolicyVersionParams{
+		SecretPolicyID: p.SecretPolicyID, TenantID: strPtr(tenantA), AllowedWorkloadIDs: []byte(`["svc-a"]`),
+		MaxLeaseDurationSeconds: 300, EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond).Add(time.Second), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create tenant A version: %v", err)
+	}
+
+	// Probe: tenant B's context, listing the same policy tenant A has a version on.
+	resultsB, err := s.ListVersionHistory(ctx, p.SecretPolicyID, tenantB)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, v := range resultsB {
+		if v.SecretPolicyVersionID == tenantAV.SecretPolicyVersionID {
+			t.Fatalf("ISOLATION FAILURE: ListVersionHistory returned tenant A's version under tenant B's context: %+v", v)
+		}
+	}
+	foundGlobal := false
+	for _, v := range resultsB {
+		if v.SecretPolicyVersionID == globalV.SecretPolicyVersionID {
+			foundGlobal = true
+		}
+	}
+	if !foundGlobal {
+		t.Fatalf("expected tenant B to see the global version, got %+v", resultsB)
+	}
+
+	// Sanity: tenant A can see both its own version and the global one.
+	resultsA, err := s.ListVersionHistory(ctx, p.SecretPolicyID, tenantA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resultsA) != 2 {
+		t.Fatalf("expected tenant A to see 2 versions (its own + global), got %d: %+v", len(resultsA), resultsA)
+	}
+}
+
+// TestPgStore_TenantIsolation_FindLeaseByID_RevokeLease proves tenant B
+// cannot read or revoke tenant A's lease by ID alone, at the DB layer
+// (independent of the handler's own refuseForeignRow check).
+func TestPgStore_TenantIsolation_FindLeaseByID_RevokeLease(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantA := "11111111-1111-1111-1111-111111111111"
+	tenantB := "22222222-2222-2222-2222-222222222222"
+
+	p := createTestPolicy(t, ctx, s, "DATABASE_CREDENTIAL", "kv/payroll/db")
+	v, _, _ := s.CreateSecretPolicyVersion(ctx, domain.CreateSecretPolicyVersionParams{
+		SecretPolicyID: p.SecretPolicyID, TenantID: strPtr(tenantA), AllowedWorkloadIDs: []byte(`["svc-a"]`),
+		MaxLeaseDurationSeconds: 300, EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+	lease, _, err := s.CreateLease(ctx, domain.CreateLeaseParams{
+		RequestID: "req-tenant-a", SecretPolicyVersionID: v.SecretPolicyVersionID,
+		SecretClass: "DATABASE_CREDENTIAL", SecretPath: "kv/payroll/db", TenantID: strPtr(tenantA),
+		RequestedByPrincipalID: "svc-a", ExpiresAt: time.Now().UTC().Add(5 * time.Minute).Truncate(time.Microsecond),
+	})
+	if err != nil {
+		t.Fatalf("failed to create tenant A's lease: %v", err)
+	}
+
+	// Probe: tenant B's context, tenant A's lease ID.
+	if got, err := s.FindLeaseByID(ctx, lease.LeaseID, tenantB); !errors.Is(err, domain.ErrLeaseNotFound) {
+		t.Fatalf("ISOLATION FAILURE: FindLeaseByID returned tenant A's lease under tenant B's context: %+v (err=%v)", got, err)
+	}
+	if _, _, err := s.RevokeLease(ctx, lease.LeaseID, tenantB); !errors.Is(err, domain.ErrLeaseNotFound) {
+		t.Fatalf("ISOLATION FAILURE: RevokeLease succeeded on tenant A's lease under tenant B's context: err=%v", err)
+	}
+
+	// Verify tenant A's lease is genuinely still GRANTED.
+	stillGranted, err := s.FindLeaseByID(ctx, lease.LeaseID, tenantA)
+	if err != nil || stillGranted.Status != "GRANTED" {
+		t.Fatalf("expected tenant A's lease to remain GRANTED and readable by tenant A, got %+v err=%v", stillGranted, err)
+	}
+}
+
+// TestPgStore_PlatformScope_ActivateVersionAcrossTenants proves the
+// platform-scope RLS bypass actually works: ActivateVersion must be able
+// to supersede/activate a TENANT-scoped version, not just global ones,
+// since SECRET_POLICY_VERSION_ACTIVATE is a platform-authorized action by
+// design. Without this test, a broken bypass would silently make
+// activation only ever work for global-scope versions in production.
+func TestPgStore_PlatformScope_ActivateVersionAcrossTenants(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantA := "11111111-1111-1111-1111-111111111111"
+	p := createTestPolicy(t, ctx, s, "DATABASE_CREDENTIAL", "kv/payroll/db")
+
+	first, _, err := s.CreateSecretPolicyVersion(ctx, domain.CreateSecretPolicyVersionParams{
+		SecretPolicyID: p.SecretPolicyID, TenantID: strPtr(tenantA), AllowedWorkloadIDs: []byte(`["svc-a"]`),
+		MaxLeaseDurationSeconds: 300, EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create tenant A's first version: %v", err)
+	}
+	activated, _, transitioned, err := s.ActivateVersion(ctx, first.SecretPolicyVersionID, "platform-admin")
+	if err != nil || !transitioned || activated.VersionStatus != "ACTIVE" {
+		t.Fatalf("expected platform-scoped activation of a tenant-scoped version to succeed, got %+v transitioned=%v err=%v", activated, transitioned, err)
+	}
+
+	second, _, err := s.CreateSecretPolicyVersion(ctx, domain.CreateSecretPolicyVersionParams{
+		SecretPolicyID: p.SecretPolicyID, TenantID: strPtr(tenantA), AllowedWorkloadIDs: []byte(`["svc-a2"]`),
+		MaxLeaseDurationSeconds: 600, EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond).Add(time.Second), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create tenant A's second version: %v", err)
+	}
+	_, superseded, transitioned, err := s.ActivateVersion(ctx, second.SecretPolicyVersionID, "platform-admin")
+	if err != nil || !transitioned {
+		t.Fatalf("expected second activation to succeed, err=%v", err)
+	}
+	if len(superseded) != 1 || superseded[0].SecretPolicyVersionID != first.SecretPolicyVersionID {
+		t.Fatalf("expected activating the second tenant-scoped version to supersede the first, got %+v", superseded)
+	}
+}
+
+// TestPgStore_PlatformScope_RevokeLeasesBySecretPath_AcrossTenants proves
+// the platform-scope bypass lets secret rotation revoke every tenant's
+// leases on a path, not just one — the whole point of the fix (context.md
+// §7.2: rotating a secret must invalidate leases across the board).
+func TestPgStore_PlatformScope_RevokeLeasesBySecretPath_AcrossTenants(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenantA := "11111111-1111-1111-1111-111111111111"
+	tenantB := "22222222-2222-2222-2222-222222222222"
+	p := createTestPolicy(t, ctx, s, "DATABASE_CREDENTIAL", "kv/payroll/db")
+	v, _, _ := s.CreateSecretPolicyVersion(ctx, domain.CreateSecretPolicyVersionParams{
+		SecretPolicyID: p.SecretPolicyID, AllowedWorkloadIDs: []byte(`["svc-a","svc-b"]`),
+		MaxLeaseDurationSeconds: 300, EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+
+	leaseA, _, _ := s.CreateLease(ctx, domain.CreateLeaseParams{
+		RequestID: "req-a", SecretPolicyVersionID: v.SecretPolicyVersionID, SecretClass: "DATABASE_CREDENTIAL",
+		SecretPath: "kv/payroll/db", TenantID: strPtr(tenantA), RequestedByPrincipalID: "svc-a",
+		ExpiresAt: time.Now().UTC().Add(5 * time.Minute).Truncate(time.Microsecond),
+	})
+	leaseB, _, _ := s.CreateLease(ctx, domain.CreateLeaseParams{
+		RequestID: "req-b", SecretPolicyVersionID: v.SecretPolicyVersionID, SecretClass: "DATABASE_CREDENTIAL",
+		SecretPath: "kv/payroll/db", TenantID: strPtr(tenantB), RequestedByPrincipalID: "svc-b",
+		ExpiresAt: time.Now().UTC().Add(5 * time.Minute).Truncate(time.Microsecond),
+	})
+
+	revoked, err := s.RevokeLeasesBySecretPath(ctx, "kv/payroll/db")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(revoked) != 2 {
+		t.Fatalf("expected rotation to revoke both tenants' leases, got %d: %+v", len(revoked), revoked)
+	}
+
+	for _, tc := range []struct{ tenant, leaseID string }{{tenantA, leaseA.LeaseID}, {tenantB, leaseB.LeaseID}} {
+		got, err := s.FindLeaseByID(ctx, tc.leaseID, tc.tenant)
+		if err != nil || got.Status != "REVOKED" {
+			t.Errorf("expected lease %s (tenant %s) to be REVOKED after rotation, got %+v err=%v", tc.leaseID, tc.tenant, got, err)
+		}
 	}
 }

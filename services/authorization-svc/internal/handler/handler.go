@@ -18,10 +18,12 @@ import (
 // AuthorizationStore is the narrow interface the handler depends on.
 type AuthorizationStore interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
+	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
-	RevokeRoleAssignment(ctx context.Context, assignmentID string) (*domain.PrincipalRoleAssignment, error)
+	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
+	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 	FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
@@ -65,6 +67,58 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Get("/v1/access-decisions/{access_decision_id}", h.GetAccessDecision)
 }
 
+// requirePrincipal reads the caller's verified principal from the
+// X-Principal-Id header the gateway sets from a verified identity
+// envelope, rejecting the request if absent.
+//
+// Before this fix, none of the /v1/admin/* routes checked this at all:
+// created_by_principal_id / assigned_by / delegator_principal_id all came
+// straight from the request body, on the platform's own authorization
+// engine — the same "attribution taken from the request body defeats
+// segregation of duties" shape already found and fixed in
+// board-resolutions-svc.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "missing_principal",
+			"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
+	}
+	return principalID, true
+}
+
+// requireTenant reads the caller's verified tenant scope from the
+// X-Tenant-Id header, rejecting the request if absent.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
+	}
+	return tenantID, true
+}
+
+// refuseForeignTenant reports whether claimed names a tenant other than
+// verifiedTenant, writing a 403 if so. Before this fix, every /v1/admin/*
+// route trusted whatever tenant_id the request body supplied outright —
+// any caller could create a role, grant a permission bundle, or write a
+// SoD rule into any tenant, purely by naming it in the JSON body.
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTenant string) bool {
+	if claimed != "" && claimed != verifiedTenant {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": "request tenant_id does not match the caller's verified tenant scope",
+		})
+		return true
+	}
+	return false
+}
+
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if id := r.Header.Get("X-Correlation-ID"); id != "" {
@@ -77,12 +131,11 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 // ── POST /v1/admin/roles ─────────────────────────────────────────────────────
 
 type createRoleRequest struct {
-	RoleID               string `json:"role_id,omitempty"`
-	TenantID             string `json:"tenant_id"`
-	RoleCode             string `json:"role_code"`
-	RoleName             string `json:"role_name"`
-	RoleScopeType        string `json:"role_scope_type"`
-	CreatedByPrincipalID string `json:"created_by_principal_id"`
+	RoleID        string `json:"role_id,omitempty"`
+	TenantID      string `json:"tenant_id"`
+	RoleCode      string `json:"role_code"`
+	RoleName      string `json:"role_name"`
+	RoleScopeType string `json:"role_scope_type"`
 }
 
 func (req createRoleRequest) missingField() string {
@@ -95,8 +148,6 @@ func (req createRoleRequest) missingField() string {
 		return "role_name"
 	case req.RoleScopeType == "":
 		return "role_scope_type"
-	case req.CreatedByPrincipalID == "":
-		return "created_by_principal_id"
 	default:
 		return ""
 	}
@@ -108,6 +159,15 @@ func (req createRoleRequest) missingField() string {
 func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
 	var req createRoleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -117,10 +177,15 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
 	}
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		return
+	}
 
 	role, created, err := h.store.CreateRole(r.Context(), domain.CreateRoleParams{
+		// created_by_principal_id is always the verified caller, never the
+		// request body — see requirePrincipal's doc comment.
 		RoleID: req.RoleID, TenantID: req.TenantID, RoleCode: req.RoleCode,
-		RoleName: req.RoleName, RoleScopeType: req.RoleScopeType, CreatedByPrincipalID: req.CreatedByPrincipalID,
+		RoleName: req.RoleName, RoleScopeType: req.RoleScopeType, CreatedByPrincipalID: principalID,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrConflict) {
@@ -153,6 +218,14 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 	roleID := chi.URLParam(r, "role_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
 	var req createBundleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -164,6 +237,27 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 	}
 	if len(req.PermittedActions) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "permitted_actions"})
+		return
+	}
+
+	// The role's OWN tenant decides scope here, not anything the body
+	// supplies (there is no tenant_id in this request at all) — before
+	// this fix, any caller could grant a permission bundle onto any
+	// tenant's role just by naming its role_id, since nothing checked
+	// which tenant owns it. 404 rather than 403 so a probe against
+	// another tenant's role_id cannot confirm it exists.
+	role, err := h.store.FindRoleByID(r.Context(), roleID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRoleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": roleID})
+			return
+		}
+		h.log.Error("CreatePermissionBundle: role lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if role.TenantID != tenantScope {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": roleID})
 		return
 	}
 
@@ -193,7 +287,6 @@ type createAssignmentRequest struct {
 	// domain.ErrLegalEntityRequiredForRoleScope).
 	LegalEntityID string    `json:"legal_entity_id,omitempty"`
 	EffectiveFrom time.Time `json:"effective_from"`
-	AssignedBy    string    `json:"assigned_by"`
 }
 
 func (req createAssignmentRequest) missingField() string {
@@ -204,8 +297,6 @@ func (req createAssignmentRequest) missingField() string {
 		return "role_id"
 	case req.EffectiveFrom.IsZero():
 		return "effective_from"
-	case req.AssignedBy == "":
-		return "assigned_by"
 	default:
 		return ""
 	}
@@ -217,6 +308,15 @@ func (req createAssignmentRequest) missingField() string {
 func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
 	var req createAssignmentRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -227,14 +327,34 @@ func (h *Handler) CreateRoleAssignment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Same doctrine as CreatePermissionBundle: the role being assigned
+	// decides the tenant, and it must be the caller's own — before this
+	// fix, any caller could hand out a role from any tenant to any
+	// principal, in any legal entity, just by naming role_id.
+	role, err := h.store.FindRoleByID(r.Context(), req.RoleID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRoleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": req.RoleID})
+			return
+		}
+		h.log.Error("CreateRoleAssignment: role lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if role.TenantID != tenantScope {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": req.RoleID})
+		return
+	}
+
 	var legalEntityID *string
 	if req.LegalEntityID != "" {
 		legalEntityID = &req.LegalEntityID
 	}
 
 	assignment, err := h.store.CreateRoleAssignment(r.Context(), domain.CreateRoleAssignmentParams{
+		// assigned_by is always the verified caller, never the request body.
 		PrincipalRoleAssignmentID: req.PrincipalRoleAssignmentID, PrincipalID: req.PrincipalID, RoleID: req.RoleID,
-		LegalEntityID: legalEntityID, EffectiveFrom: req.EffectiveFrom, AssignedBy: req.AssignedBy,
+		LegalEntityID: legalEntityID, EffectiveFrom: req.EffectiveFrom, AssignedBy: principalID,
 	})
 	if err != nil {
 		switch {
@@ -258,7 +378,19 @@ func (h *Handler) RevokeRoleAssignment(w http.ResponseWriter, r *http.Request) {
 	assignmentID := chi.URLParam(r, "assignment_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	assignment, err := h.store.RevokeRoleAssignment(r.Context(), assignmentID)
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	// The store's own query now carries the tenant predicate through the
+	// assignment's role, so a cross-tenant revoke attempt reports
+	// role_assignment_not_found rather than revoking (or even confirming
+	// the existence of) another tenant's assignment.
+	assignment, err := h.store.RevokeRoleAssignment(r.Context(), assignmentID, tenantScope)
 	if err != nil {
 		if errors.Is(err, domain.ErrRoleAssignmentNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_assignment_not_found"})
@@ -308,6 +440,11 @@ func (req createDelegationRequest) missingField() string {
 func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
 	var req createDelegationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -315,6 +452,23 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		return
+	}
+	// delegated_authorities carries no tenant_id at all (only
+	// legal_entity_id — see 000001's schema), so the one check this
+	// service CAN make without inventing a column is the one that
+	// matters most: this table had no ownership check whatsoever, so any
+	// caller could delegate ANY principal's authority to ANY other
+	// principal, purely by naming them in the body. A principal may only
+	// give away authority that is theirs to give — the same doctrine
+	// already enforced in delegated-authority-svc (a separate service
+	// with its own copy of this concept — see docs/architecture/
+	// full-architecture-gap-analysis.md item 12 on the duplication).
+	if req.DelegatorPrincipalID != principalID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "delegator_must_be_caller",
+			"message": "a principal may only delegate authority that is their own",
+		})
 		return
 	}
 
@@ -343,6 +497,33 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Request) {
 	delegationID := chi.URLParam(r, "delegation_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	// Fetched and checked BEFORE revoking, same doctrine as
+	// secret-vault-integration-svc's RevokeLease: only the delegator may
+	// take back authority they gave away — this had no check of any kind
+	// before, so any caller could revoke any principal's delegation.
+	existing, err := h.store.FindDelegatedAuthorityByID(r.Context(), delegationID)
+	if err != nil {
+		if errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "delegated_authority_not_found"})
+			return
+		}
+		h.log.Error("RevokeDelegatedAuthority: lookup failed", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if existing.DelegatorPrincipalID != principalID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "only_delegator_may_revoke",
+			"message": "only the principal who granted this delegation may revoke it",
+		})
+		return
+	}
 
 	d, err := h.store.RevokeDelegatedAuthority(r.Context(), delegationID)
 	if err != nil {
@@ -396,6 +577,10 @@ func (req createSoDRuleRequest) missingField() string {
 func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+
 	var req createSoDRuleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -404,6 +589,19 @@ func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
+	}
+	// TenantID is optional (nil = globally-applicable rule, same doctrine
+	// as JurisdictionID). When present, it must be the caller's own tenant
+	// — before this fix nothing checked this, so any caller could write a
+	// segregation-of-duties rule into any tenant.
+	if req.TenantID != nil && *req.TenantID != "" {
+		tenantScope, ok := h.requireTenant(w, r)
+		if !ok {
+			return
+		}
+		if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
+			return
+		}
 	}
 
 	if req.JurisdictionID != nil && *req.JurisdictionID != "" {

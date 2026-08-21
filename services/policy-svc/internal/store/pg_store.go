@@ -26,6 +26,50 @@ import (
 // mirrors jurisdiction-rules-svc's handling of nullable parent_jurisdiction_id.
 const nilScopeUUID = "00000000-0000-0000-0000-000000000000"
 
+// contextTenantID mirrors FindPolicyVersionByID's existing validation:
+// the context tenant is only usable if it parses as a UUID (a caller
+// upstream can legitimately carry a non-UUID tenant, e.g. the literal
+// "GLOBAL" — handing that to a uuid comparison dies in the driver, not
+// as a clean empty scope).
+func contextTenantID(ctx context.Context) string {
+	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
+		if _, err := uuid.Parse(t); err == nil {
+			return t
+		}
+	}
+	return ""
+}
+
+// derefOrEmpty is used when passing a nullable tenant_id into withRLS: nil
+// (global scope) becomes "", which app.tenant_id being set to never
+// matches a real tenant_id, so it only ever satisfies a policy's
+// "tenant_id IS NULL" branch — never grants access to a real tenant's row.
+func derefOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// withRLS runs fn inside a transaction with app.tenant_id set for the
+// session, so policy_versions' tenant_isolation_policy has a value to
+// enforce against. Mirrors tenant-entity-registry-svc's PgStore.withRLS.
+func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // Store is the interface consumed by the handler for policy/version CRUD.
 type Store interface {
 	// CreatePolicy inserts a new policy idempotently.
@@ -234,16 +278,12 @@ func (s *PgStore) FindPolicyVersionByID(ctx context.Context, policyVersionID str
 	// text"). A nil *string sends an actual SQL NULL instead, so every
 	// usage below agrees $2 is uuid.
 	//
-	// The scope is only usable if it PARSES as a uuid. Callers upstream can
-	// legitimately carry a non-uuid tenant — governance-decision-log-svc's
-	// tenant_id is VARCHAR and holds the literal "GLOBAL" for a decision that
-	// was evaluated against global policy — and handing that to a uuid
-	// comparison dies in the driver as 22P02, reported as a dead store.
-	var tenantID *string
-	if t := svcmiddleware.TenantFromContext(ctx); t != "" {
-		if _, err := uuid.Parse(t); err == nil {
-			tenantID = &t
-		}
+	// The scope is only usable if it PARSES as a uuid (contextTenantID
+	// handles this — see its doc comment for why).
+	tenantID := contextTenantID(ctx)
+	var tenantParam *string
+	if tenantID != "" {
+		tenantParam = &tenantID
 	}
 	// `$2::uuid IS NULL OR ...` used to lead this predicate, which made a NULL
 	// scope match EVERY row — so no tenant scope meant no filter at all. Without
@@ -255,8 +295,12 @@ func (s *PgStore) FindPolicyVersionByID(ctx context.Context, policyVersionID str
 		WHERE policy_version_id = $1
 		  AND (tenant_id IS NULL OR tenant_id = $2::uuid);`
 
-	row := s.pool.QueryRow(ctx, query, policyVersionID, tenantID)
-	v, err := scanPolicyVersion(row)
+	var v *domain.PolicyVersion
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		v, scanErr = scanPolicyVersion(tx.QueryRow(ctx, query, policyVersionID, tenantParam))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrPolicyVersionNotFound
@@ -300,21 +344,6 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 		DO NOTHING
 		RETURNING ` + policyVersionColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query,
-		params.PolicyVersionID, params.PolicyID, params.TenantID, params.LegalEntityID, params.RulePayload,
-		params.EffectiveFrom, params.EffectiveTo, params.CreatedByPrincipalID, scopeType,
-	)
-
-	v, err := scanPolicyVersion(row)
-	if err == nil {
-		return v, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		s.log.Error("pg CreatePolicyVersion failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
-	// Conflict occurred on the dedup key. Lookup existing record.
 	const lookupQuery = `
 		SELECT ` + policyVersionColumns + `
 		FROM policy_versions
@@ -323,22 +352,44 @@ func (s *PgStore) CreatePolicyVersion(ctx context.Context, params domain.CreateP
 		  AND COALESCE(legal_entity_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
 		  AND effective_from = $4;`
 
-	row = s.pool.QueryRow(ctx, lookupQuery, params.PolicyID, params.TenantID, params.LegalEntityID, params.EffectiveFrom)
-	v, err = scanPolicyVersion(row)
+	var result *domain.PolicyVersion
+	var created bool
+	err := s.withRLS(ctx, derefOrEmpty(params.TenantID), func(tx pgx.Tx) error {
+		v, err := scanPolicyVersion(tx.QueryRow(ctx, query,
+			params.PolicyVersionID, params.PolicyID, params.TenantID, params.LegalEntityID, params.RulePayload,
+			params.EffectiveFrom, params.EffectiveTo, params.CreatedByPrincipalID, scopeType,
+		))
+		if err == nil {
+			result, created = v, true
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		// Conflict occurred on the dedup key. Lookup existing record.
+		existing, err := scanPolicyVersion(tx.QueryRow(ctx, lookupQuery, params.PolicyID, params.TenantID, params.LegalEntityID, params.EffectiveFrom))
+		if err != nil {
+			return err
+		}
+		if !jsonEqual(existing.RulePayload, params.RulePayload) {
+			s.log.Warn("policy version dedup match but payload mismatch (409 conflict)",
+				zap.String("existing_id", existing.PolicyVersionID),
+				zap.String("req_id", params.PolicyVersionID),
+			)
+			return domain.ErrConflict
+		}
+		result, created = existing, false
+		return nil
+	})
 	if err != nil {
-		s.log.Error("pg CreatePolicyVersion lookup existing failed", zap.Error(err))
+		if errors.Is(err, domain.ErrConflict) {
+			return nil, false, domain.ErrConflict
+		}
+		s.log.Error("pg CreatePolicyVersion failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-
-	if !jsonEqual(v.RulePayload, params.RulePayload) {
-		s.log.Warn("policy version dedup match but payload mismatch (409 conflict)",
-			zap.String("existing_id", v.PolicyVersionID),
-			zap.String("req_id", params.PolicyVersionID),
-		)
-		return nil, false, domain.ErrConflict
-	}
-
-	return v, false, nil
+	return result, created, nil
 }
 
 // jsonEqual compares two JSON payloads structurally rather than
@@ -360,36 +411,49 @@ func jsonEqual(a, b []byte) bool {
 	return reflect.DeepEqual(av, bv)
 }
 
-// ListVersionHistory returns all versions for a policy, newest first.
+// ListVersionHistory returns all versions for a policy visible to the
+// caller's tenant (global versions plus that tenant's own), newest
+// first. Previously took no tenant at all: any authenticated caller
+// could list every tenant's policy versions for a given policy_id —
+// approval thresholds, spend limits, SoD rules, and who activated them —
+// the same shape as the bug fixed in secret-vault-integration-svc's
+// ListVersionHistory.
 func (s *PgStore) ListVersionHistory(ctx context.Context, policyID string) ([]*domain.PolicyVersion, error) {
 	if _, err := s.FindPolicyByID(ctx, policyID); err != nil {
 		return nil, err
 	}
 
+	tenantID := contextTenantID(ctx)
+	var tenantParam *string
+	if tenantID != "" {
+		tenantParam = &tenantID
+	}
 	const query = `
 		SELECT ` + policyVersionColumns + `
 		FROM policy_versions
 		WHERE policy_id = $1
+		  AND (tenant_id IS NULL OR tenant_id = $2::uuid)
 		ORDER BY effective_from DESC, created_at DESC;`
 
-	rows, err := s.pool.Query(ctx, query, policyID)
+	var results []*domain.PolicyVersion
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, policyID, tenantParam)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			v, scanErr := scanPolicyVersion(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, v)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg ListVersionHistory failed", zap.String("policy_id", policyID), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.PolicyVersion
-	for rows.Next() {
-		v, scanErr := scanPolicyVersion(rows)
-		if scanErr != nil {
-			s.log.Error("pg ListVersionHistory scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, v)
-	}
-	if err := rows.Err(); err != nil {
-		s.log.Error("pg ListVersionHistory rows error", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
@@ -456,6 +520,17 @@ func (s *PgStore) ActivateVersion(ctx context.Context, policyVersionID, actorID 
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
+
+	// target was already fetched under this same request's tenant scope
+	// (FindPolicyVersionByID above), so re-asserting that scope here keeps
+	// the supersede/activate queries inside it too — there is no
+	// platform-scope admin path here, unlike secret-vault-integration-svc's
+	// ActivateVersion: this service authorizes activation against the
+	// version's OWN legal_entity_id (handler.go), never a blanket platform
+	// scope, so activation is always within the caller's own tenant.
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", contextTenantID(ctx)); err != nil {
+		return nil, nil, false, fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
 
 	// 1. Supersede whatever is currently ACTIVE in the same scope. Must run
 	// BEFORE activating the target so the one-active-per-scope unique index
@@ -551,30 +626,31 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, policyType string,
 			 + CASE WHEN pv.legal_entity_id IS NOT NULL THEN 1 ELSE 0 END) DESC,
 			pv.effective_from DESC;`
 
-	rows, err := s.pool.Query(ctx, query, policyType, tenantID, legalEntityID)
+	var results []*domain.ApplicablePolicyVersion
+	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, policyType, tenantID, legalEntityID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			v := &domain.ApplicablePolicyVersion{}
+			if scanErr := rows.Scan(
+				&v.PolicyVersionID, &v.PolicyID, &v.TenantID, &v.LegalEntityID,
+				&v.RulePayload, &v.EffectiveFrom, &v.EffectiveTo, &v.VersionStatus,
+				&v.ActivatedByPrincipalID, &v.ActivatedAt,
+				&v.CreatedAt, &v.CreatedByPrincipalID, &v.PolicyCode,
+			); scanErr != nil {
+				return scanErr
+			}
+			v.ScopeType = domain.DeriveScopeType(v.TenantID, v.LegalEntityID)
+			results = append(results, v)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg FindApplicableVersions failed", zap.String("policy_type", policyType), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.ApplicablePolicyVersion
-	for rows.Next() {
-		v := &domain.ApplicablePolicyVersion{}
-		if scanErr := rows.Scan(
-			&v.PolicyVersionID, &v.PolicyID, &v.TenantID, &v.LegalEntityID,
-			&v.RulePayload, &v.EffectiveFrom, &v.EffectiveTo, &v.VersionStatus,
-			&v.ActivatedByPrincipalID, &v.ActivatedAt,
-			&v.CreatedAt, &v.CreatedByPrincipalID, &v.PolicyCode,
-		); scanErr != nil {
-			s.log.Error("pg FindApplicableVersions scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		v.ScopeType = domain.DeriveScopeType(v.TenantID, v.LegalEntityID)
-		results = append(results, v)
-	}
-	if err := rows.Err(); err != nil {
-		s.log.Error("pg FindApplicableVersions rows error", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
