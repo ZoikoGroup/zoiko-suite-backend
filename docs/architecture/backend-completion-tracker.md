@@ -42,11 +42,11 @@ by grepping every migration file, not inferred. Pattern to copy: `governance-dec
 | 1 | identity-context-svc | Doc 03 §06, Doc 04 §2.2 | Done | `045ae84`. Also found & fixed a real cross-tenant hole: GET/PUT /v1/principals/{id} routes had no X-Tenant-Id check at all. RLS (ENABLE+FORCE+WITH CHECK) added on all 4 tables; 4 isolation tests + 2 handler tests live-verified against real Postgres 16. |
 | 2 | secret-vault-integration-svc | Doc 03 §06, Doc 04 §2.2 | Done | `6343434`. Real bug: ListVersionHistory had zero tenant scoping. RLS added with a documented `app.platform_scope` bypass for the 2 genuinely cross-tenant admin actions (ActivateVersion, Rotate). 9 tests live-verified against real Postgres 16, including 2 proving the bypass itself works. |
 | 3 | policy-svc | Doc 03 §06, Doc 04 §2.2 | Done | `14602c6`. Real bug: ListVersionHistory had zero tenant scoping (same shape as row 2's fix). RLS on policy_versions only (other 4 tables are platform-wide, no tenant_id). No platform-scope bypass needed — ActivateVersion here is genuinely tenant-scoped. 7 tests live-verified against real Postgres 16. |
-| 4 | jurisdiction-rules-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 5 | authorization-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 6 | workflow-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 7 | audit-event-store-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
+| 4 | jurisdiction-rules-svc | Doc 03 §06 | **Not applicable** | False positive in the original audit — the only "tenant_id" hit in its migrations is a comment ("...reference data, not per-tenant data. No tenant_id column."), not a real column. This service is genuinely platform-wide reference data (matches Doc 03's own design — jurisdiction-rules-svc *is* the jurisdiction concept). No RLS is possible or correct here; fabricating a tenant boundary would violate the "never fabricate a signal with nothing real to populate it" doctrine. Removed from the count of 8 — real Tier-0 count is 7. |
+| 5 | authorization-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: `tenant_id UUID NOT NULL` in 000001_initial_schema.up.sql |
+| 6 | workflow-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: `tenant_id UUID NOT NULL` in 000001_initial_schema.up.sql |
+| 7 | audit-event-store-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: `tenant_id TEXT NOT NULL` in 000001_initial_schema.up.sql |
+| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: nullable `tenant_id` (NULL = global default), same doctrine as policy-svc/secret-vault-integration-svc |
 
 **Verification method per row**: add a `TestPgStore_RLS_TenantIsolation`-style test (same
 pattern as tenant-entity-registry-svc's) that creates two tenants and proves a query scoped
@@ -55,21 +55,24 @@ to tenant A cannot see tenant B's rows, against a real Postgres instance.
 ## Priority 2 — Remaining non-Tier-0 services with zero row-level security
 
 Same defect, lower severity (not on the governance critical path), still a real gap.
+Re-verified individually (2026-08-21) — 6 of these use `NNN_init.sql` naming rather than
+golang-migrate's `NNNNNN_name.up.sql`, which the original audit's glob pattern would have
+missed if re-run naively; checked their actual file contents directly instead.
 
 | # | Service | Status | Notes |
 |---|---|---|---|
 | 9 | ai-governance-svc | Not Started | |
-| 10 | banking-connector-svc | Not Started | |
+| 10 | banking-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 11 | commercial-account-svc | Not Started | |
-| 12 | connectivity-api-bridge-svc | Not Started | |
-| 13 | esignature-integration-svc | Not Started | |
+| 12 | connectivity-api-bridge-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 13 | esignature-integration-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 14 | evidence-manifest-svc | Not Started | |
-| 15 | external-data-feed-svc | Not Started | |
-| 16 | hris-connector-svc | Not Started | |
+| 15 | external-data-feed-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 16 | hris-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 17 | kill-switch-registry-svc | Not Started | |
 | 18 | retention-registry-svc | Not Started | |
-| 19 | source-authority-svc | Not Started | |
-| 20 | tax-authority-interface-svc | Not Started | |
+| 19 | source-authority-svc | **Not applicable** | False positive — its only "tenant_id" mention is a comment comparing its real column (`entity_ref`, free-text, no tenant dimension) to kill-switch-registry-svc's design. Genuinely platform-wide reference data; no fix needed. |
+| 20 | tax-authority-interface-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 
 ## Priority 3 — RLS enabled but not FORCEd (defense-in-depth only)
 
