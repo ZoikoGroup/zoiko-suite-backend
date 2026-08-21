@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -154,30 +155,56 @@ func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 
-	// Idempotent: the role survives across tests in the same container.
-	_, _ = admin.Exec(ctx, `DO $$ BEGIN
-		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'zoiko_app_test') THEN
-			CREATE ROLE zoiko_app_test LOGIN PASSWORD 'test' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+	// The DSN is rebuilt via net/url rather than string-replaced, and the
+	// role's password is (re)set to a constant this test owns. An earlier
+	// version of this helper hardcoded the role's password while replacing
+	// only the USERNAME in the DSN, so it inherited whatever password
+	// TEST_DATABASE_URL happened to carry. That passed locally purely
+	// because the throwaway container's password matched the hardcoded one
+	// by coincidence, and failed in CI where the password differs — the
+	// "works on my machine" shape known-gaps.md documents repeatedly.
+	// ALTER (not just CREATE) so a role left over from an earlier run with
+	// a different password is corrected rather than reused.
+	const appRole = "zoiko_app_test"
+	const appPassword = "zoiko_app_test_pw"
+	if _, err := admin.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+appRole+`') THEN
+			CREATE ROLE `+appRole+` LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
 		END IF;
-	END $$;`)
+	END $do$;`); err != nil {
+		t.Fatalf("create role %s: %v", appRole, err)
+	}
 	for _, stmt := range []string{
-		`GRANT USAGE ON SCHEMA public TO zoiko_app_test`,
-		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO zoiko_app_test`,
-		`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zoiko_app_test`,
+		`ALTER ROLE ` + appRole + ` WITH LOGIN PASSWORD '` + appPassword + `' NOSUPERUSER NOBYPASSRLS`,
+		`GRANT USAGE ON SCHEMA public TO ` + appRole,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ` + appRole,
+		`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ` + appRole,
 	} {
 		if _, err := admin.Exec(ctx, stmt); err != nil {
-			t.Fatalf("grant to zoiko_app_test (%s): %v", stmt, err)
+			t.Fatalf("grant to %s (%s): %v", appRole, stmt, err)
 		}
 	}
 
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	appDSN := strings.Replace(dsn, "postgres://postgres:", "postgres://zoiko_app_test:", 1)
-	if appDSN == dsn {
-		t.Skip("cannot derive a non-superuser DSN from TEST_DATABASE_URL — skipping the RLS-enforcement assertion")
-	}
-	pool, err := pgxpool.New(ctx, appDSN)
+	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
 	if err != nil {
-		t.Fatalf("connect as zoiko_app_test: %v", err)
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.User = url.UserPassword(appRole, appPassword)
+	pool, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("connect as %s: %v", appRole, err)
+	}
+	// Prove the role really is RLS-bound before relying on it — a
+	// misconfigured role that silently retained BYPASSRLS would make the
+	// isolation assertion below pass for the wrong reason.
+	var isSuper, bypassRLS bool
+	if err := pool.QueryRow(ctx,
+		`SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`,
+	).Scan(&isSuper, &bypassRLS); err != nil {
+		t.Fatalf("verify %s privileges: %v", appRole, err)
+	}
+	if isSuper || bypassRLS {
+		t.Fatalf("%s must be NOSUPERUSER and NOBYPASSRLS for this assertion to mean anything, got rolsuper=%v rolbypassrls=%v", appRole, isSuper, bypassRLS)
 	}
 	t.Cleanup(pool.Close)
 	return pool
