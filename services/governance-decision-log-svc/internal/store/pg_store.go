@@ -144,12 +144,49 @@ ON CONFLICT (decision_id) DO NOTHING`
 	}
 
 	created := tag.RowsAffected() == 1
+	if !created {
+		// DO NOTHING fired. The conflict target is decision_id ALONE — the
+		// table's primary key — so this is not necessarily an idempotent replay
+		// of the caller's own decision: it is equally an id another tenant has
+		// already used. Distinguishing the two is the difference between a
+		// truthful 200 and a write that vanished. Only a row in the caller's own
+		// tenant is a replay.
+		mine, checkErr := s.existsInTenant(ctx, d.TenantID, d.DecisionID)
+		if checkErr != nil {
+			return false, checkErr
+		}
+		if !mine {
+			s.log.Warn("governance decision insert refused: decision_id belongs to another tenant",
+				zap.String("decision_id", d.DecisionID),
+				zap.String("tenant_id", d.TenantID),
+			)
+			return false, domain.ErrDecisionIDConflict
+		}
+	}
 	s.log.Debug("governance decision insert",
 		zap.String("decision_id", d.DecisionID),
 		zap.String("tenant_id", d.TenantID),
 		zap.Bool("created", created),
 	)
 	return created, nil
+}
+
+// existsInTenant reports whether decision_id names a row in this tenant. Used
+// only to interpret an ON CONFLICT DO NOTHING that changed nothing: same tenant
+// means idempotent replay, another tenant means the id is taken.
+func (s *PgStore) existsInTenant(ctx context.Context, tenantID, decisionID string) (bool, error) {
+	var found bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM governance_decisions WHERE decision_id = $1 AND tenant_id = $2)`,
+			decisionID, tenantID,
+		).Scan(&found)
+	})
+	if err != nil {
+		s.log.Error("pg existsInTenant failed", zap.String("decision_id", decisionID), zap.Error(err))
+		return false, fmt.Errorf("%w: check governance decision %q: %v", domain.ErrStoreUnavailable, decisionID, err)
+	}
+	return found, nil
 }
 
 // decisionColumns is the standard SELECT column list shared by all queries.

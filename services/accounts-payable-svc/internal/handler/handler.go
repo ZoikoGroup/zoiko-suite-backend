@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/accounts-payable-svc/internal/domain"
+	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
 )
 
 // Store is the persistence contract the handler depends on.
@@ -85,6 +86,26 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	// tenant_id in the body is accepted only when it agrees with the verified
+	// scope. It used to be the ONLY source of the stored tenant_id — and the
+	// store handed that same body value to set_config('app.tenant_id'), so the
+	// tenant the request named satisfied the RLS policy on the way past. A body
+	// naming another tenant filed the payable in that tenant's ledger, where the
+	// duplicate-invoice-number constraint is also scoped, so it could not even
+	// collide with the real register it was hiding in.
+	if req.TenantID != "" && req.TenantID != tenantID {
+		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+	if !isUUID(req.LegalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -96,7 +117,7 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 
 	inv := &domain.VendorInvoice{
 		InvoiceID:            uuid.NewString(),
-		TenantID:             req.TenantID,
+		TenantID:             tenantID,
 		LegalEntityID:        req.LegalEntityID,
 		VendorID:             req.VendorID,
 		InvoiceNumber:        req.InvoiceNumber,
@@ -158,25 +179,53 @@ func (h *Handler) GetInvoice(w http.ResponseWriter, r *http.Request) {
 
 // ── GET /v1/invoices ──────────────────────────────────────────────────────────
 
+// ListInvoices returns the caller's own tenant's payables register.
+//
+// The scope comes from the verified X-Tenant-Id header. It used to come from
+// ?tenant_id=, which the store both filtered on AND set app.tenant_id from — so
+// the tenant the caller named satisfied the RLS policy on the way past and
+// `?tenant_id=<any-uuid>` returned that tenant's entire payables register,
+// vendor names and amounts included. Nothing consulted X-Tenant-Id at all.
+//
+// Reads are scoped rather than authorized, matching general-ledger-svc and
+// accounts-receivable-svc either side of it: there is deliberately no
+// AP_INVOICE_VIEW action.
 func (h *Handler) ListInvoices(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
+	if claimed := q.Get("tenant_id"); claimed != "" && claimed != tenantID {
+		writeError(w, http.StatusForbidden, "tenant_scope_mismatch", domain.ErrTenantScopeMismatch.Error())
+		return
+	}
+	if status := q.Get("status"); status != "" && !domain.ValidInvoiceStatus(status) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "status is not a recognised invoice status")
+		return
+	}
+	// legal_entity_id is compared as `legal_entity_id::text = $n`, casting the
+	// COLUMN to text rather than the parameter to uuid — so a malformed value does
+	// not error, it silently matches nothing, and an empty register reads as "this
+	// entity has no payables". Refused here instead.
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID != "" && !isUUID(legalEntityID) {
+		writeError(w, http.StatusBadRequest, "invalid_field", "legal_entity_id must be a UUID")
+		return
+	}
 	filter := domain.ListInvoicesFilter{
-		TenantID:      q.Get("tenant_id"),
-		LegalEntityID: q.Get("legal_entity_id"),
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
 		VendorID:      q.Get("vendor_id"),
 		Status:        q.Get("status"),
 	}
-	if filter.TenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "tenant_id")
-		return
-	}
 	invoices, err := h.store.ListInvoices(r.Context(), filter)
 	if err != nil {
-		// tenant_id is compared against a uuid column, so a non-UUID is a bad
-		// query parameter — a 400 naming the field, not a 503 implying the
-		// register is down.
+		// The verified tenant is compared against a uuid column, so a non-UUID
+		// here is a gateway that forwarded a malformed scope — a fault worth
+		// naming, not a 503 implying the register is down.
 		if errors.Is(err, domain.ErrInvalidIdentifier) {
-			writeError(w, http.StatusBadRequest, "invalid_field", "tenant_id must be a UUID")
+			writeError(w, http.StatusBadRequest, "invalid_field", "tenant scope must be a UUID")
 			return
 		}
 		h.log.Error("ListInvoices: store unavailable", zap.Error(err))
@@ -428,10 +477,11 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return true
 }
 
+// requiredInvoiceFieldMissing deliberately does NOT require tenant_id: the
+// tenant is the caller's verified scope, so a body omitting it is fine and a
+// body disagreeing with it is a 403, not a missing field.
 func requiredInvoiceFieldMissing(req domain.CreateVendorInvoiceRequest) string {
 	switch {
-	case req.TenantID == "":
-		return "tenant_id"
 	case req.LegalEntityID == "":
 		return "legal_entity_id"
 	case req.VendorID == "":
@@ -447,6 +497,23 @@ func requiredInvoiceFieldMissing(req domain.CreateVendorInvoiceRequest) string {
 	default:
 		return ""
 	}
+}
+
+// requireTenant reads the caller's verified tenant scope from context (set by
+// middleware.TenantContext from X-Tenant-Id). A request with no scope is
+// refused — it must never fall back to a tenant the request itself named.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "tenant_scope_missing", domain.ErrTenantScopeMissing.Error())
+		return "", false
+	}
+	return tenantID, true
+}
+
+func isUUID(s string) bool {
+	_, err := uuid.Parse(s)
+	return err == nil
 }
 
 // requirePrincipal reads the caller's identity from X-Principal-Id — set by

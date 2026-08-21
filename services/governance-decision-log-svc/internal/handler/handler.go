@@ -157,8 +157,9 @@ func (req createDecisionRequest) missingField() string {
 	switch {
 	case req.DecisionID == "":
 		return "decision_id"
-	case req.TenantID == "":
-		return "tenant_id"
+	// tenant_id is deliberately NOT required: the tenant is the caller's
+	// verified scope, so a body omitting it is fine and a body disagreeing with
+	// it is a 403, not a missing field.
 	case req.LegalEntityID == "":
 		return "legal_entity_id"
 	case req.ActorID == "":
@@ -197,11 +198,7 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createDecisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -209,6 +206,28 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": missing,
+		})
+		return
+	}
+
+	// The decision is filed under the caller's VERIFIED tenant. tenant_id in the
+	// body used to be the only source of both the stored tenant and the RLS scope
+	// the insert ran in — so a body naming another tenant wrote into that
+	// tenant's decision log, and the policy that should have refused it was
+	// satisfied by the value under attack. A body may still carry tenant_id, but
+	// only in agreement.
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "tenant_scope_missing",
+			"message": domain.ErrTenantScopeMissing.Error(),
+		})
+		return
+	}
+	if req.TenantID != "" && req.TenantID != tenantID {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": domain.ErrTenantScopeMismatch.Error(),
 		})
 		return
 	}
@@ -224,7 +243,7 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 
 	d := domain.GovernanceDecision{
 		DecisionID:         req.DecisionID,
-		TenantID:           req.TenantID,
+		TenantID:           tenantID,
 		LegalEntityID:      req.LegalEntityID,
 		ActorID:            req.ActorID,
 		ActionType:         req.ActionType,
@@ -238,6 +257,22 @@ func (h *Handler) CreateDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	created, err := h.store.Insert(r.Context(), d)
+	if errors.Is(err, domain.ErrDecisionIDConflict) {
+		// decision_id is client-supplied and the primary key is the id alone, so
+		// it can already be taken by another tenant. This used to answer 200
+		// "already recorded" and drop the write — the worst outcome for an
+		// immutable governance log, since the caller is told their decision is
+		// filed when nothing was written. A 409 discloses only that this id
+		// string is in use, which any client-supplied unique key discloses; it
+		// does not say whose. GetDecision still refuses to distinguish
+		// another tenant's decision from a nonexistent one.
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":       "decision_id_conflict",
+			"decision_id": d.DecisionID,
+			"message":     "decision_id is already in use",
+		})
+		return
+	}
 	if err != nil {
 		h.log.Error("CreateDecision: store unavailable",
 			zap.String("decision_id", d.DecisionID),
@@ -352,8 +387,7 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req replayDecisionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.ReplayedByPrincipalID == "" {
@@ -389,7 +423,9 @@ func (h *Handler) ReplayDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	version, err := h.policyClient.GetPolicyVersion(r.Context(), policyVersionID)
+	// Replayed in the decision's own tenant scope — the same tenant the decision
+	// was read under, so a replay cannot reach a version outside it.
+	version, err := h.policyClient.GetPolicyVersion(r.Context(), tenantID, policyVersionID)
 	if err != nil {
 		if errors.Is(err, policyclient.ErrPolicyVersionNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{
@@ -567,4 +603,27 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		_ = err
 	}
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return false
+	}
+	return true
 }

@@ -21,6 +21,24 @@ var ErrDecisionNotFound = errors.New("governance decision not found")
 // differently — see jurisdiction-rules-svc's fail-closed precedent.
 var ErrStoreUnavailable = errors.New("governance decision store unavailable")
 
+// ErrTenantScopeMissing is returned when a request carries no verified tenant
+// scope (no X-Tenant-Id). Every decision is tenant-owned; a write with no scope
+// must not fall back to the tenant_id the body named, which is what it did.
+var ErrTenantScopeMissing = errors.New("caller tenant scope missing")
+
+// ErrTenantScopeMismatch is returned when a body names a tenant other than the
+// caller's verified scope. tenant_id in the body used to be the ONLY source of
+// the stored tenant AND of the RLS scope, so a body naming another tenant filed
+// the decision in that tenant's log.
+var ErrTenantScopeMismatch = errors.New("request tenant_id does not match the caller's verified tenant scope")
+
+// ErrDecisionIDConflict is returned when decision_id already exists in ANOTHER
+// tenant. decision_id is client-supplied and the table's primary key is the id
+// alone, so the idempotency conflict target was global: a repeat POST of an id
+// another tenant had used answered 200 "already recorded" and silently dropped
+// the write, which made the endpoint both an existence oracle and a black hole.
+var ErrDecisionIDConflict = errors.New("decision_id already exists in another tenant")
+
 // GovernanceDecision is the durable record of one governance evaluation.
 //
 // This is the MVP schema (see CONTEXT.md "FINALIZED — MVP schema"): a

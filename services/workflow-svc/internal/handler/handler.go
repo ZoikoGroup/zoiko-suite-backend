@@ -11,6 +11,7 @@ import (
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/domain"
+	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
 
 // WorkflowStore is the narrow interface the handler depends on.
@@ -61,6 +62,62 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/workflows/{workflow_instance_id}/cancel", h.CancelWorkflow)
 }
 
+// requireTenant reads the caller's verified tenant scope, set into
+// context by svcmiddleware.TenantContext from X-Tenant-Id, rejecting the
+// request if absent.
+//
+// Before this fix, every method routing through FindWorkflowByID (which
+// is all of them) fell back to an UNSCOPED lookup when the header was
+// simply omitted — the exact "filter that disables itself when absent"
+// shape already found in document-vault-svc. Omitting the header, the
+// easier request to make, was strictly more permissive than supplying a
+// real one.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
+	}
+	return tenantID, true
+}
+
+// requirePrincipal reads the caller's verified principal from the
+// X-Principal-Id header the gateway sets from a verified identity
+// envelope, rejecting the request if absent.
+//
+// Before this fix, initiated_by / actor_principal_id came straight from
+// the request body on every route — any caller could submit an approval
+// or rejection as any principal_id, and if that principal happened to
+// hold the right role, authorization-svc's CheckApprovalAllowed would
+// have no way to tell the claim was forged.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "missing_principal",
+			"message": "X-Principal-Id is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
+	}
+	return principalID, true
+}
+
+// refuseForeignTenant reports whether claimed names a tenant other than
+// verifiedTenant, writing a 403 if so.
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTenant string) bool {
+	if claimed != "" && claimed != verifiedTenant {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": "request tenant_id does not match the caller's verified tenant scope",
+		})
+		return true
+	}
+	return false
+}
+
 func correlationIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if id := r.Header.Get("X-Correlation-ID"); id != "" {
@@ -76,7 +133,6 @@ type createWorkflowRequest struct {
 	TenantID      string                            `json:"tenant_id"`
 	LegalEntityID string                            `json:"legal_entity_id"`
 	WorkflowType  string                            `json:"workflow_type"`
-	InitiatedBy   string                            `json:"initiated_by"`
 	Stages        []domain.CreateWorkflowStageInput `json:"stages"`
 }
 
@@ -88,8 +144,6 @@ func (req createWorkflowRequest) missingField() string {
 		return "legal_entity_id"
 	case req.WorkflowType == "":
 		return "workflow_type"
-	case req.InitiatedBy == "":
-		return "initiated_by"
 	default:
 		return ""
 	}
@@ -107,6 +161,15 @@ type workflowResponse struct {
 func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
 	var req createWorkflowRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
@@ -114,6 +177,9 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		return
+	}
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
 		return
 	}
 	if len(req.Stages) == 0 {
@@ -131,15 +197,17 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	// of its own stages. This is a validation error on the caller-supplied
 	// workflow definition, not an authz decision.
 	for _, st := range req.Stages {
-		if st.ApproverPrincipalID == req.InitiatedBy {
+		if st.ApproverPrincipalID == principalID {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "initiator_cannot_be_approver", "field": "stages[].approver_principal_id"})
 			return
 		}
 	}
 
 	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
+		// initiated_by is always the verified caller, never the request
+		// body — see requirePrincipal's doc comment.
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, WorkflowType: req.WorkflowType,
-		InitiatedBy: req.InitiatedBy, CorrelationID: correlationID, Stages: req.Stages,
+		InitiatedBy: principalID, CorrelationID: correlationID, Stages: req.Stages,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
@@ -180,6 +248,10 @@ func (h *Handler) GetWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
 	instance, err := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "GetWorkflow")
@@ -203,6 +275,10 @@ func (h *Handler) GetNextApprover(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
 	stage, err := h.store.FindCurrentStage(r.Context(), workflowInstanceID)
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "GetNextApprover")
@@ -214,9 +290,8 @@ func (h *Handler) GetNextApprover(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/workflows/{id}/actions ──────────────────────────────────────────
 
 type submitActionRequest struct {
-	ActorPrincipalID string  `json:"actor_principal_id"`
-	Action           string  `json:"action"`
-	Rationale        *string `json:"rationale,omitempty"`
+	Action    string  `json:"action"`
+	Rationale *string `json:"rationale,omitempty"`
 	// CausationID is optional: the event/decision that caused this specific
 	// action, when the caller knows it.
 	CausationID *string `json:"causation_id,omitempty"`
@@ -245,13 +320,22 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
+	// actor_principal_id used to come straight from the request body: any
+	// caller could submit an approval as any principal, and if that
+	// principal happened to hold the right role, CheckApprovalAllowed
+	// below had no way to tell the claim was forged. It is now always the
+	// verified caller.
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
 	var req submitActionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
-		return
-	}
-	if req.ActorPrincipalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "actor_principal_id"})
 		return
 	}
 	if req.Action != "APPROVE" && req.Action != "REJECT" {
@@ -271,12 +355,12 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	// (incorrectly) recorded as an assigned approver for the current stage.
 	// This covers instances created before CreateWorkflow's validation
 	// existed, or via any path that bypasses it.
-	if req.ActorPrincipalID == instanceForAuthzCheck.InitiatedBy {
+	if principalID == instanceForAuthzCheck.InitiatedBy {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "self_approval_not_allowed", "message": domain.ErrSelfApprovalNotAllowed.Error()})
 		return
 	}
 
-	if err := h.authz.CheckApprovalAllowed(r.Context(), req.ActorPrincipalID, instanceForAuthzCheck.LegalEntityID); err != nil {
+	if err := h.authz.CheckApprovalAllowed(r.Context(), principalID, instanceForAuthzCheck.LegalEntityID); err != nil {
 		switch {
 		case errors.Is(err, domain.ErrAuthorizationDenied):
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
@@ -289,7 +373,7 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
-		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: req.ActorPrincipalID, Action: req.Action,
+		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
 		Rationale: req.Rationale, CausationID: req.CausationID,
 	})
 	if err != nil {
@@ -309,16 +393,16 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 
 	if transitioned {
 		if req.Action == "APPROVE" {
-			if pubErr := h.publisher.PublishApprovalGranted(r.Context(), *instance, *stage, req.ActorPrincipalID); pubErr != nil {
+			if pubErr := h.publisher.PublishApprovalGranted(r.Context(), *instance, *stage, principalID); pubErr != nil {
 				h.log.Error("SubmitAction: failed to publish approval.granted", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 			}
 		} else {
-			if pubErr := h.publisher.PublishApprovalRejected(r.Context(), *instance, *stage, req.ActorPrincipalID); pubErr != nil {
+			if pubErr := h.publisher.PublishApprovalRejected(r.Context(), *instance, *stage, principalID); pubErr != nil {
 				h.log.Error("SubmitAction: failed to publish approval.rejected", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 			}
 		}
 		if instance.WorkflowStatus == "APPROVED" || instance.WorkflowStatus == "REJECTED" {
-			if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, req.ActorPrincipalID); pubErr != nil {
+			if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, principalID); pubErr != nil {
 				h.log.Error("SubmitAction: failed to publish workflow.completed", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 			}
 		}
@@ -336,34 +420,28 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 
 // ── POST /v1/workflows/{id}/escalate ─────────────────────────────────────────
 
-type escalateRequest struct {
-	ActorPrincipalID string `json:"actor_principal_id"`
-}
-
 // EscalateWorkflow handles POST /v1/workflows/{workflow_instance_id}/escalate.
 //
-// Response: 200 escalated (or idempotent no-op) / 400 missing field / 404 not found / 409 illegal transition / 503 unavailable.
+// Response: 200 escalated (or idempotent no-op) / 401 no verified principal or tenant / 404 not found / 409 illegal transition / 503 unavailable.
 func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	var req escalateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	if req.ActorPrincipalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "actor_principal_id"})
+	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
 
-	instance, transitioned, err := h.store.EscalateWorkflow(r.Context(), workflowInstanceID, req.ActorPrincipalID)
+	instance, transitioned, err := h.store.EscalateWorkflow(r.Context(), workflowInstanceID, principalID)
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "EscalateWorkflow")
 		return
 	}
 	if transitioned {
-		if pubErr := h.publisher.PublishWorkflowEscalated(r.Context(), *instance, req.ActorPrincipalID); pubErr != nil {
+		if pubErr := h.publisher.PublishWorkflowEscalated(r.Context(), *instance, principalID); pubErr != nil {
 			h.log.Error("EscalateWorkflow: failed to publish workflow.escalated", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 		}
 	}
@@ -372,34 +450,28 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 
 // ── POST /v1/workflows/{id}/cancel ───────────────────────────────────────────
 
-type cancelRequest struct {
-	ActorPrincipalID string `json:"actor_principal_id"`
-}
-
 // CancelWorkflow handles POST /v1/workflows/{workflow_instance_id}/cancel.
 //
-// Response: 200 cancelled (or idempotent no-op) / 400 missing field / 404 not found / 409 illegal transition (already terminal) / 503 unavailable.
+// Response: 200 cancelled (or idempotent no-op) / 401 no verified principal or tenant / 404 not found / 409 illegal transition (already terminal) / 503 unavailable.
 func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	var req cancelRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	if req.ActorPrincipalID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "actor_principal_id"})
+	if _, ok := h.requireTenant(w, r); !ok {
 		return
 	}
 
-	instance, transitioned, err := h.store.CancelWorkflow(r.Context(), workflowInstanceID, req.ActorPrincipalID)
+	instance, transitioned, err := h.store.CancelWorkflow(r.Context(), workflowInstanceID, principalID)
 	if err != nil {
 		writeStoreErr(w, h.log, err, correlationID, "CancelWorkflow")
 		return
 	}
 	if transitioned {
-		if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, req.ActorPrincipalID); pubErr != nil {
+		if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, principalID); pubErr != nil {
 			h.log.Error("CancelWorkflow: failed to publish workflow.completed", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 		}
 	}

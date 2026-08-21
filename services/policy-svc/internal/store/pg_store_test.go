@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/policy-svc/internal/domain"
+	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 	"zoiko.io/policy-svc/internal/store"
 )
 
@@ -29,30 +32,44 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS policy_versions, policies CASCADE;")
 
-	mig1, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration 1: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(mig1)); err != nil {
-		t.Fatalf("failed to execute migration 1: %v", err)
+	// Drop whatever is in the schema, discovered rather than named. The list
+	// here was "policy_versions, policies", which was every table migration
+	// 000003 created — and 000004 added control_test_definitions and
+	// control_test_executions, so a second run in the same database hit
+	// "relation already exists". A DROP list and a migration list are the same
+	// maintenance burden written twice.
+	if _, err := pool.Exec(ctx, `
+		DO $$
+		DECLARE r record;
+		BEGIN
+			FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+				EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
+			END LOOP;
+		END $$;`); err != nil {
+		t.Fatalf("failed to drop existing tables: %v", err)
 	}
 
-	mig2, err := os.ReadFile("../../deployments/migrations/000002_add_activation_audit.up.sql")
+	// Every *.up.sql in order, rather than three reads written out by hand.
+	// 000004_add_control_tests was on disk and absent here, so the control-test
+	// tables this suite's own service owns were never created for it.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
 	if err != nil {
-		t.Fatalf("failed to read migration 2: %v", err)
+		t.Fatalf("failed to glob migrations: %v", err)
 	}
-	if _, err := pool.Exec(ctx, string(mig2)); err != nil {
-		t.Fatalf("failed to execute migration 2: %v", err)
+	if len(migrations) == 0 {
+		t.Fatal("no *.up.sql migrations found")
 	}
+	sort.Strings(migrations)
 
-	mig3, err := os.ReadFile("../../deployments/migrations/000003_add_explicit_scope_type.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration 3: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(mig3)); err != nil {
-		t.Fatalf("failed to execute migration 3: %v", err)
+	for _, migration := range migrations {
+		sql, readErr := os.ReadFile(migration)
+		if readErr != nil {
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(migration), readErr)
+		}
+		if _, execErr := pool.Exec(ctx, string(sql)); execErr != nil {
+			t.Fatalf("failed to execute migration %s: %v", filepath.Base(migration), execErr)
+		}
 	}
 }
 
@@ -203,6 +220,14 @@ func TestPgStore_ActivateVersion_SupersedesPreviousActiveAndIsIdempotent(t *test
 	}
 
 	tenantID := strPtr(uuid.New().String())
+	// Every version in this test is scoped to this one tenant, and
+	// ActivateVersion resolves its target through FindPolicyVersionByID, which
+	// narrows to `tenant_id IS NULL OR tenant_id = <the context's tenant>`. With
+	// context.Background() carrying no tenant, only GLOBAL versions were
+	// reachable and the first activation below failed with "policy version not
+	// found" for a version created moments earlier. The scope belongs in the
+	// context because that is where the store reads it from in production too.
+	ctx = svcmiddleware.WithTenant(ctx, *tenantID)
 
 	v1, _, err := s.CreatePolicyVersion(ctx, domain.CreatePolicyVersionParams{
 		PolicyID:             p.PolicyID,
@@ -368,6 +393,74 @@ func TestPgStore_ListVersionHistory_NewestFirstIncludesSuperseded(t *testing.T) 
 	}
 }
 
+// TestPgStore_TenantIsolation_ListVersionHistory proves the fix for the
+// real gap found in this row: ListVersionHistory previously took no
+// tenant at all, so any caller could list every tenant's policy
+// versions for a policy_id — approval thresholds, spend limits, SoD
+// rules, and who activated them. Tenant B must see the global version
+// but not tenant A's.
+func TestPgStore_TenantIsolation_ListVersionHistory(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	p, _, err := s.CreatePolicy(ctx, domain.CreatePolicyParams{
+		PolicyCode:           "APPROVAL_5K",
+		PolicyName:           "5K Approval Threshold",
+		PolicyType:           "APPROVAL_THRESHOLD",
+		CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create policy: %v", err)
+	}
+
+	tenantA := strPtr(uuid.New().String())
+	tenantB := strPtr(uuid.New().String())
+	ctxA := svcmiddleware.WithTenant(ctx, *tenantA)
+	ctxB := svcmiddleware.WithTenant(ctx, *tenantB)
+
+	global, _, err := s.CreatePolicyVersion(ctx, domain.CreatePolicyVersionParams{
+		PolicyID: p.PolicyID, RulePayload: []byte(`{"threshold_amount":1000}`),
+		EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create global version: %v", err)
+	}
+	tenantAV, _, err := s.CreatePolicyVersion(ctxA, domain.CreatePolicyVersionParams{
+		PolicyID: p.PolicyID, TenantID: tenantA, RulePayload: []byte(`{"threshold_amount":9000}`),
+		EffectiveFrom: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create tenant A's version: %v", err)
+	}
+
+	// Probe: tenant B's context, listing the same policy tenant A has a version on.
+	resultsB, err := s.ListVersionHistory(ctxB, p.PolicyID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, v := range resultsB {
+		if v.PolicyVersionID == tenantAV.PolicyVersionID {
+			t.Fatalf("ISOLATION FAILURE: ListVersionHistory returned tenant A's version under tenant B's context: %+v", v)
+		}
+	}
+	if len(resultsB) != 1 || resultsB[0].PolicyVersionID != global.PolicyVersionID {
+		t.Fatalf("expected tenant B to see only the global version, got %+v", resultsB)
+	}
+
+	// Sanity: tenant A sees both its own version and the global one.
+	resultsA, err := s.ListVersionHistory(ctxA, p.PolicyID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resultsA) != 2 {
+		t.Fatalf("expected tenant A to see 2 versions (its own + global), got %d: %+v", len(resultsA), resultsA)
+	}
+}
+
 func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()
@@ -414,7 +507,17 @@ func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T
 	if err != nil {
 		t.Fatalf("failed to create tenant-specific version: %v", err)
 	}
-	if _, _, _, err := s.ActivateVersion(ctx, tenantSpecific.PolicyVersionID, "actor-1"); err != nil {
+	// Activated through a context SCOPED TO TENANT A, not the bare context used
+	// for the global version. ActivateVersion resolves the version through
+	// FindPolicyVersionByID, which narrows to `tenant_id IS NULL OR tenant_id =
+	// <the context's tenant>` — so with no tenant in the context only GLOBAL
+	// versions are reachable, and this line failed with "policy version not
+	// found" for a version that had just been created two statements earlier.
+	// The store is right to scope the lookup; the harness was wrong not to carry
+	// a scope. FindApplicableVersions below takes its tenant as an argument and
+	// is unaffected, which is why the rest of the test keeps the bare context.
+	ctxA := svcmiddleware.WithTenant(ctx, *tenantA)
+	if _, _, _, err := s.ActivateVersion(ctxA, tenantSpecific.PolicyVersionID, "actor-1"); err != nil {
 		t.Fatalf("failed to activate tenant-specific version: %v", err)
 	}
 

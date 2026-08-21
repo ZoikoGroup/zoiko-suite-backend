@@ -12,11 +12,15 @@ services:
       - "5432:5432"
     environment:
       POSTGRES_DB: postgres
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
     volumes:
       # Mount the database initialization script and all migrations
       - ./init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+      # Mounted OUTSIDE docker-entrypoint-initdb.d on purpose: everything in
+      # that directory is executed in filename order, and this has to run after
+      # init-db.sh has created the tables it grants on. init-db.sh calls it.
+      - ./scripts/create-app-roles.sh:/scripts/create-app-roles.sh:ro
       - ../services/audit-event-store-svc/deployments/migrations:/migrations/audit-event-store:ro
       - ../services/identity-context-svc/deployments/migrations:/migrations/identity-context:ro
       - ../services/tenant-entity-registry-svc/deployments/migrations:/migrations/tenant-entity-registry:ro
@@ -584,8 +588,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: jurisdiction_rules
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_JURISDICTION_RULES:-app_jurisdiction_rules}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       # Points at the real Authorization Service. This used to point back at
       # jurisdiction-svc itself ("mock stub authz points back"), which was
@@ -611,7 +615,9 @@ services:
       otel-collector:
         condition: service_started
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8082/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8082/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -656,8 +662,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: governance_decision_log
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_GOVERNANCE_DECISION_LOG:-app_governance_decision_log}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # Authorization gate. These services previously had none at all, so
@@ -679,7 +685,9 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8083/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8083/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -736,8 +744,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: policy
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_POLICY:-app_policy}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
       # Authorization gate. policy-svc had none: anyone able to reach the
@@ -757,7 +765,9 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8085/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8085/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -782,8 +792,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: configuration_feature_flag
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_CONFIGURATION_FEATURE_FLAG:-app_configuration_feature_flag}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # Authorization gate. These services previously had none at all, so
@@ -801,7 +811,9 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8086/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8086/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -829,8 +841,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: secret_vault_integration
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_SECRET_VAULT_INTEGRATION:-app_secret_vault_integration}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       VAULT_MASTER_KEY_HEX: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       VAULT_LOCAL_STORE_PATH: "/tmp/secret_store.local"
@@ -850,7 +862,9 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8087/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8087/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -874,8 +888,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: obligations
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_OBLIGATIONS:-app_obligations}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
       # This service had no authorization at all — every write was open to
@@ -894,7 +908,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8088/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8088/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -994,8 +1010,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: schema_registry
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_SCHEMA_REGISTRY:-app_schema_registry}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
       # An event contract belongs to the platform, not to a legal entity, so a
@@ -1011,7 +1027,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8093/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8093/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1055,8 +1073,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: document_vault
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_DOCUMENT_VAULT:-app_document_vault}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       STORAGE_DIR: "/data/documents"
       # Throwaway local-dev key — never used in staging/production, same
@@ -1079,7 +1097,9 @@ services:
       document-vault-storage-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8094/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8094/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1230,8 +1250,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: general_ledger
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_GENERAL_LEDGER:-app_general_ledger}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.general-ledger.events"
@@ -1244,7 +1264,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8098/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8098/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1273,8 +1295,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: accounts_payable
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_ACCOUNTS_PAYABLE:-app_accounts_payable}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.accounts-payable.events"
@@ -1287,7 +1309,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8099/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8099/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1308,8 +1332,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_request
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_PURCHASE_REQUEST:-app_purchase_request}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-request.events"
@@ -1322,7 +1346,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8100/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8100/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1351,8 +1377,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: purchase_order
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_PURCHASE_ORDER:-app_purchase_order}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.purchase-order.events"
@@ -1368,7 +1394,9 @@ services:
       purchase-request-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8129/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8129/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1393,8 +1421,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: spend_controls
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_SPEND_CONTROLS:-app_spend_controls}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.spend-controls.events"
@@ -1407,7 +1435,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8131/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8131/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1435,8 +1465,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: vendor_due_diligence
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_VENDOR_DUE_DILIGENCE:-app_vendor_due_diligence}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.vendor-due-diligence.events"
@@ -1452,7 +1482,9 @@ services:
       counterparty-management-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8135/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8135/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1480,8 +1512,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: notification
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_NOTIFICATION:-app_notification}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.notification.events"
@@ -1494,7 +1526,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8133/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8133/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1591,7 +1625,10 @@ services:
       employee-master-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8135/healthz"]
+      # 8139, not 8135: this probed vendor-due-diligence-svc's port, left behind
+      # when the published port was corrected. Nothing in this container listens
+      # on 8135, so the check could only ever fail.
+      test: ["CMD", "/healthcheck", "http://localhost:8139/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1618,8 +1655,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: delegated_authority
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_DELEGATED_AUTHORITY:-app_delegated_authority}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.delegated-authority.events"
@@ -1632,7 +1669,9 @@ services:
       authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8136/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8136/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1780,8 +1819,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: evidence_requirements
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_EVIDENCE_REQUIREMENTS:-app_evidence_requirements}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.evidence-requirements.events"
@@ -1797,7 +1836,9 @@ services:
       document-vault-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8130/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8130/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1818,13 +1859,16 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: accounts_receivable
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_ACCOUNTS_RECEIVABLE:-app_accounts_receivable}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.accounts-receivable.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      # Every write reconciles its legal_entity_id against the caller's verified
+      # tenant here, and fails closed if this is unreachable.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1834,8 +1878,24 @@ services:
         condition: service_healthy
       general-ledger-svc:
         condition: service_healthy
+      # The compose KEY is `tenant-svc`; `tenant-entity-registry-svc` is only its
+      # container_name. depends_on takes the key, while TENANT_REGISTRY_URL above
+      # takes the container name because that is what resolves in DNS — so the two
+      # spellings are both correct and are not interchangeable. Same trap as
+      # jurisdiction-svc / jurisdiction-rules-svc.
+      tenant-svc:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8101/healthz"]
+      # readyz, not healthz. Liveness answers 200 whenever the process is up, so a
+      # service whose database is gone reports healthy to `docker ps` and to every
+      # depends_on waiting on it — the shape that had clause-template-svc,
+      # obligation-tracking-svc and corporate-actions-svc all looking healthy while
+      # returning 500 to every read. Readiness checks the pool.
+      #
+      # Every gap-closed service in this file now points at /readyz. The rest still
+      # point at /healthz: changing those is a platform-wide decision and belongs
+      # with whoever owns them.
+      test: ["CMD", "/healthcheck", "http://localhost:8101/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1903,8 +1963,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: financial_close
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_FINANCIAL_CLOSE:-app_financial_close}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.close.events"
@@ -1941,7 +2001,9 @@ services:
       document-vault-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8104/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8104/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1968,8 +2030,8 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: bank_reconciliation
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      DB_USER: "${DB_USER_BANK_RECONCILIATION:-app_bank_reconciliation}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.bank-reconciliation.events"
@@ -1985,7 +2047,9 @@ services:
       general-ledger-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8102/healthz"]
+      # readyz, not healthz: liveness answers 200 whenever the process is up, so a
+      # dead database pool reads as healthy while every read returns 500.
+      test: ["CMD", "/healthcheck", "http://localhost:8102/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -2548,7 +2612,7 @@ services:
       - "8119:8119"
     environment:
       PORT: "8119"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/contract_lifecycle?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/contract_lifecycle?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2582,7 +2646,7 @@ services:
       - "8120:8120"
     environment:
       PORT: "8120"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/clause_template?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/clause_template?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2613,7 +2677,7 @@ services:
       - "8121:8121"
     environment:
       PORT: "8121"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/obligation_tracking?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/obligation_tracking?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.obligation-tracking.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2644,7 +2708,7 @@ services:
       - "8122:8122"
     environment:
       PORT: "8122"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/board_resolutions?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER_BOARD_RESOLUTIONS:-app_board_resolutions}:${DB_PASSWORD:-postgres}@postgres:5432/board_resolutions?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.board-resolutions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2680,7 +2744,7 @@ services:
       - "8123:8123"
     environment:
       PORT: "8123"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_actions?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/corporate_actions?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2714,7 +2778,7 @@ services:
       - "8124:8124"
     environment:
       PORT: "8124"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/counterparty_management?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/counterparty_management?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2745,7 +2809,7 @@ services:
       - "8125:8125"
     environment:
       PORT: "8125"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_rules?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/tax_rules?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2776,7 +2840,7 @@ services:
       - "8126:8126"
     environment:
       PORT: "8126"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/tax_determination?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/tax_determination?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-determination.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2810,7 +2874,7 @@ services:
       - "8127:8127"
     environment:
       PORT: "8127"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/vat_gst?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/vat_gst?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.vat-gst.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2844,7 +2908,7 @@ services:
       - "8128:8128"
     environment:
       PORT: "8128"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/corporate_tax?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/corporate_tax?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-tax.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2883,7 +2947,7 @@ services:
       - "8144:8144"
     environment:
       PORT: "8144"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/commercial_account?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/commercial_account?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.commercial-account.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2918,7 +2982,7 @@ services:
       - "8145:8145"
     environment:
       PORT: "8145"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/capability_registry?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/capability_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.capability-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2954,7 +3018,7 @@ services:
       - "8146:8146"
     environment:
       PORT: "8146"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/ai_governance?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/ai_governance?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -2991,7 +3055,7 @@ services:
       - "8147:8147"
     environment:
       PORT: "8147"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/kill_switch_registry?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/kill_switch_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.kill-switch-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3026,7 +3090,7 @@ services:
       - "8148:8148"
     environment:
       PORT: "8148"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/retention_registry?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/retention_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.retention-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3060,7 +3124,7 @@ services:
       - "8149:8149"
     environment:
       PORT: "8149"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/metric_registry?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/metric_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.metric-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
@@ -3095,7 +3159,7 @@ services:
       - "8150:8150"
     environment:
       PORT: "8150"
-      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/source_authority?sslmode=disable"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/source_authority?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.source-authority.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"

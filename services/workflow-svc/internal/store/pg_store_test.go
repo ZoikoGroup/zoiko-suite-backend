@@ -12,8 +12,20 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/store"
 )
+
+// tenantCtx returns a context carrying the tenant scope the store reads
+// from in production (set by svcmiddleware.TenantContext from
+// X-Tenant-Id). Required for every store call now that
+// workflow_instances carries FORCE ROW LEVEL SECURITY — a bare
+// context.Background() correctly matches no rows.
+func tenantCtx(tenantID string) context.Context {
+	return svcmiddleware.WithTenant(context.Background(), tenantID)
+}
+
+const testTenantID = "00000000-0000-0000-0000-000000000001"
 
 func getTestPool(t *testing.T) *pgxpool.Pool {
 	dsn := os.Getenv("TEST_DATABASE_URL")
@@ -79,7 +91,7 @@ func TestPgStore_CreateWorkflow_RetriedCorrelationID_IsIdempotent(t *testing.T) 
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	params := twoStageParams()
 	params.CorrelationID = "corr-retry-1"
@@ -124,9 +136,136 @@ func TestPgStore_CreateWorkflow_NoStages(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	params := twoStageParams()
 	params.Stages = nil
-	_, _, _, err := s.CreateWorkflow(context.Background(), params)
+	_, _, _, err := s.CreateWorkflow(tenantCtx(testTenantID), params)
 	if !errors.Is(err, domain.ErrNoStages) {
 		t.Fatalf("expected ErrNoStages, got %v", err)
+	}
+}
+
+// appRolePool returns a pool connected as a genuine NOSUPERUSER
+// NOBYPASSRLS role, mirroring the platform's real runtime role
+// (zoiko_app — see docs/architecture/known-gaps.md's superuser-RLS-bypass
+// writeup). This matters: TEST_DATABASE_URL normally points at
+// `postgres`, and a SUPERUSER bypasses row-level security
+// unconditionally, FORCE or not. A test that asserts isolation while
+// connected as the superuser proves only that the application-level
+// predicate works, never that the RLS policy does.
+func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+
+	// Idempotent: the role survives across tests in the same container.
+	_, _ = admin.Exec(ctx, `DO $$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'zoiko_app_test') THEN
+			CREATE ROLE zoiko_app_test LOGIN PASSWORD 'test' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $$;`)
+	for _, stmt := range []string{
+		`GRANT USAGE ON SCHEMA public TO zoiko_app_test`,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO zoiko_app_test`,
+		`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO zoiko_app_test`,
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("grant to zoiko_app_test (%s): %v", stmt, err)
+		}
+	}
+
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	appDSN := strings.Replace(dsn, "postgres://postgres:", "postgres://zoiko_app_test:", 1)
+	if appDSN == dsn {
+		t.Skip("cannot derive a non-superuser DSN from TEST_DATABASE_URL — skipping the RLS-enforcement assertion")
+	}
+	pool, err := pgxpool.New(ctx, appDSN)
+	if err != nil {
+		t.Fatalf("connect as zoiko_app_test: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// TestPgStore_TenantIsolation_FindWorkflowByID proves the real fix in
+// this row: FindWorkflowByID is the choke point every other Store method
+// routes through, and it previously fell back to an UNSCOPED lookup when
+// no tenant was in context — so omitting X-Tenant-Id, the easier request
+// to make, was strictly more permissive than supplying a real one (the
+// document-vault-svc "filter that disables itself" shape).
+//
+// The no-tenant probe runs as a NOSUPERUSER NOBYPASSRLS role on purpose:
+// as the superuser it passes for the wrong reason (RLS is skipped
+// entirely), so it would prove nothing about the policy this row adds.
+func TestPgStore_TenantIsolation_FindWorkflowByID(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	tenantA := testTenantID
+	tenantB := "00000000-0000-0000-0000-0000000000b1"
+
+	instance, _, _, err := s.CreateWorkflow(tenantCtx(tenantA), twoStageParams())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Probe: tenant B's context, tenant A's workflow ID. The application
+	// predicate alone covers this one, so the superuser pool is fine here.
+	if got, err := s.FindWorkflowByID(tenantCtx(tenantB), instance.WorkflowInstanceID); !errors.Is(err, domain.ErrWorkflowNotFound) {
+		t.Fatalf("ISOLATION FAILURE: FindWorkflowByID returned tenant A's workflow under tenant B's context: %+v (err=%v)", got, err)
+	}
+
+	// Probe: NO tenant in context at all — the old unscoped-fallback path,
+	// which the application predicate deliberately leaves open ($2 IS NULL)
+	// and only the RLS policy closes. Must run as a non-superuser.
+	appStore := store.New(appRolePool(t, pool), zap.NewNop())
+	if got, err := appStore.FindWorkflowByID(context.Background(), instance.WorkflowInstanceID); !errors.Is(err, domain.ErrWorkflowNotFound) {
+		t.Fatalf("ISOLATION FAILURE: FindWorkflowByID returned a workflow with no tenant scope in context: %+v (err=%v)", got, err)
+	}
+
+	// Sanity: the same non-superuser role CAN read tenant A's workflow when
+	// the tenant scope is present — the policy must not over-restrict.
+	own, err := appStore.FindWorkflowByID(tenantCtx(tenantA), instance.WorkflowInstanceID)
+	if err != nil || own.WorkflowInstanceID != instance.WorkflowInstanceID {
+		t.Fatalf("expected zoiko_app_test to read tenant A's workflow with the scope set, got %+v err=%v", own, err)
+	}
+}
+
+// TestPgStore_TenantIsolation_MutationsRefuseForeignTenant proves the
+// same boundary holds for every mutating path, all of which route
+// through FindWorkflowByID first.
+func TestPgStore_TenantIsolation_MutationsRefuseForeignTenant(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	tenantA := testTenantID
+	tenantB := "00000000-0000-0000-0000-0000000000b1"
+	ctxB := tenantCtx(tenantB)
+
+	instance, _, _, err := s.CreateWorkflow(tenantCtx(tenantA), twoStageParams())
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	if _, _, _, err := s.SubmitAction(ctxB, domain.SubmitActionParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID, ActorPrincipalID: "approver-1", Action: "APPROVE",
+	}); !errors.Is(err, domain.ErrWorkflowNotFound) {
+		t.Errorf("ISOLATION FAILURE: SubmitAction acted on tenant A's workflow under tenant B, err=%v", err)
+	}
+	if _, _, err := s.EscalateWorkflow(ctxB, instance.WorkflowInstanceID, "admin-b"); !errors.Is(err, domain.ErrWorkflowNotFound) {
+		t.Errorf("ISOLATION FAILURE: EscalateWorkflow acted on tenant A's workflow under tenant B, err=%v", err)
+	}
+	if _, _, err := s.CancelWorkflow(ctxB, instance.WorkflowInstanceID, "admin-b"); !errors.Is(err, domain.ErrWorkflowNotFound) {
+		t.Errorf("ISOLATION FAILURE: CancelWorkflow acted on tenant A's workflow under tenant B, err=%v", err)
+	}
+
+	// Verify tenant A's workflow is genuinely untouched: still PENDING at stage 1.
+	own, err := s.FindWorkflowByID(tenantCtx(tenantA), instance.WorkflowInstanceID)
+	if err != nil {
+		t.Fatalf("reload tenant A's workflow: %v", err)
+	}
+	if own.WorkflowStatus != "PENDING" || own.CurrentStage != 1 {
+		t.Fatalf("ISOLATION FAILURE: tenant B mutated tenant A's workflow — status=%s stage=%d", own.WorkflowStatus, own.CurrentStage)
 	}
 }
 
@@ -136,7 +275,7 @@ func TestPgStore_FullApprovalChain_CompletesWorkflow(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	instance, stages, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
@@ -223,7 +362,7 @@ func TestPgStore_RejectionEndsWorkflowImmediately(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	instance, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
@@ -250,7 +389,7 @@ func TestPgStore_ConflictingResubmission_NotIdempotent(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	instance, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
@@ -281,7 +420,7 @@ func TestPgStore_EscalateAndCancel(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	instance, _, _, err := s.CreateWorkflow(ctx, twoStageParams())
 	if err != nil {
@@ -329,7 +468,7 @@ func TestPgStore_CancelApprovedWorkflow_Illegal(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	ctx := context.Background()
+	ctx := tenantCtx(testTenantID)
 
 	params := twoStageParams()
 	params.Stages = []domain.CreateWorkflowStageInput{{ApproverPrincipalID: "approver-1"}}

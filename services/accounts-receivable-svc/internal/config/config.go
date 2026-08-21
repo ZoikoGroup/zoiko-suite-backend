@@ -19,6 +19,10 @@ type Config struct {
 	// are checked synchronously.
 	AuthZServiceURL string
 
+	// TenantRegistryURL is the base URL of tenant-entity-registry-svc. Every write
+	// reconciles its legal_entity_id against the caller's verified tenant there,
+	// and fails closed if it cannot — see internal/entity.
+	TenantRegistryURL string
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
 	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
@@ -81,6 +85,7 @@ func Load() (*Config, error) {
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		LedgerServiceURL:     env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		TenantRegistryURL:    env("TENANT_REGISTRY_URL", "http://tenant-entity-registry-svc:8081"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",

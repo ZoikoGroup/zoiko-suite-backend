@@ -120,8 +120,13 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/principals/:principalID ─────────────────────────────────────────
 
 func (h *Handler) GetPrincipal(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
+		return
+	}
 	principalID := chi.URLParam(r, "principalID")
-	p, err := h.principals.FindByID(r.Context(), principalID)
+	p, err := h.principals.FindByID(r.Context(), principalID, tenantID)
 	if err != nil || p == nil {
 		writeError(w, http.StatusNotFound, "principal not found")
 		return
@@ -132,8 +137,13 @@ func (h *Handler) GetPrincipal(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/principals/:principalID/roles ────────────────────────────────────
 
 func (h *Handler) GetPrincipalRoles(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
+		return
+	}
 	principalID := chi.URLParam(r, "principalID")
-	assignments, err := h.principals.FindActiveRoleAssignments(r.Context(), principalID, nil)
+	assignments, err := h.principals.FindActiveRoleAssignments(r.Context(), principalID, tenantID, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to retrieve role assignments")
 		return
@@ -144,8 +154,13 @@ func (h *Handler) GetPrincipalRoles(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/principals/:principalID/delegations ──────────────────────────────
 
 func (h *Handler) GetPrincipalDelegations(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
+		return
+	}
 	principalID := chi.URLParam(r, "principalID")
-	delegations, err := h.principals.FindActiveDelegations(r.Context(), principalID)
+	delegations, err := h.principals.FindActiveDelegations(r.Context(), principalID, tenantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to retrieve delegations")
 		return
@@ -158,6 +173,11 @@ func (h *Handler) GetPrincipalDelegations(w http.ResponseWriter, r *http.Request
 // Idempotent — re-applying same status is a no-op at the DB level.
 
 func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
+		return
+	}
 	principalID := chi.URLParam(r, "principalID")
 	correlationID := r.Header.Get("X-Correlation-ID")
 	actorPrincipalID := r.Header.Get("X-Actor-Principal-ID")
@@ -169,7 +189,7 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := h.principals.UpdateStatus(
-		r.Context(), principalID, req.Status, actorPrincipalID, correlationID,
+		r.Context(), principalID, tenantID, req.Status, actorPrincipalID, correlationID,
 	); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to update status")
 		return

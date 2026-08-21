@@ -14,6 +14,16 @@ import (
 
 	"zoiko.io/purchase-request-svc/internal/domain"
 	"zoiko.io/purchase-request-svc/internal/handler"
+	svcmiddleware "zoiko.io/purchase-request-svc/internal/middleware"
+)
+
+// tenant_id and legal_entity_id are uuid columns, so the fixtures are UUIDs —
+// "t1"/"e1" would be refused by the handler's own identifier checks now that a
+// malformed id is a 400 rather than a 503 from the driver.
+const (
+	tenantA = "11111111-1111-1111-1111-111111111111"
+	tenantB = "22222222-2222-2222-2222-222222222222"
+	entityA = "33333333-3333-3333-3333-333333333333"
 )
 
 // ── stubs ────────────────────────────────────────────────────────────────────
@@ -103,14 +113,28 @@ type stubAuthZ struct {
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+// newRouter mounts TenantContext, which the real server mounts in
+// cmd/server/main.go. It used to be omitted, so every handler under test saw an
+// empty tenant scope and fell back to the query parameter or the body — the very
+// behaviour these tests are supposed to be checking. A handler harness must
+// mount the middleware the handler depends on.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, p, a, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
 
+// doRequest sends a request in tenantA's scope, which is the ordinary case.
 func doRequest(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	return doRequestAs(r, method, path, body, principalID, tenantA)
+}
+
+// doRequestAs sends a request in an explicit tenant scope; tenantID "" omits the
+// X-Tenant-Id header entirely, which is how a request with no verified scope is
+// simulated.
+func doRequestAs(r chi.Router, method, path string, body any, principalID, tenantID string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -119,6 +143,9 @@ func doRequest(r chi.Router, method, path string, body any, principalID string) 
 	req.Header.Set("Content-Type", "application/json")
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -129,8 +156,8 @@ func doRequest(r chi.Router, method, path string, body any, principalID string) 
 
 func validCreateReq() domain.CreateRequestRequest {
 	return domain.CreateRequestRequest{
-		TenantID:      "t1",
-		LegalEntityID: "e1",
+		TenantID:      tenantA,
+		LegalEntityID: entityA,
 		Description:   "50 laptops",
 		Amount:        50000,
 		CurrencyCode:  "USD",
@@ -220,7 +247,7 @@ func TestCreateRequest_ZeroAmount_Rejected(t *testing.T) {
 
 func TestApproveRequest_FromPending_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", Status: domain.RequestStatusPending}
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.RequestStatusPending}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -252,7 +279,7 @@ func TestApproveRequest_AlreadyApproved_Rejected(t *testing.T) {
 	// Both fork branches are terminal — approving an already-APPROVED
 	// request must be rejected, not silently re-approved.
 	s := newStubStore()
-	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", Status: domain.RequestStatusApproved}
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.RequestStatusApproved}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/r1/approve", nil, "principal-1")
@@ -263,7 +290,7 @@ func TestApproveRequest_AlreadyApproved_Rejected(t *testing.T) {
 
 func TestRejectRequest_RequiresReason(t *testing.T) {
 	s := newStubStore()
-	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", Status: domain.RequestStatusPending}
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.RequestStatusPending}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/r1/reject", domain.RejectRequestRequest{}, "principal-1")
@@ -274,7 +301,7 @@ func TestRejectRequest_RequiresReason(t *testing.T) {
 
 func TestRejectRequest_FromPending_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", Status: domain.RequestStatusPending}
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.RequestStatusPending}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -307,7 +334,7 @@ func TestRejectRequest_FromPending_Succeeds(t *testing.T) {
 // it.
 func TestApproveRequest_SelfApproval_Rejected(t *testing.T) {
 	s := newStubStore()
-	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", RequestedByPrincipalID: "principal-1", Status: domain.RequestStatusPending}
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: tenantA, LegalEntityID: entityA, RequestedByPrincipalID: "principal-1", Status: domain.RequestStatusPending}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/r1/approve", nil, "principal-1")
@@ -324,7 +351,7 @@ func TestApproveRequest_SelfApproval_Rejected(t *testing.T) {
 // both decision outcomes.
 func TestRejectRequest_SelfApproval_Rejected(t *testing.T) {
 	s := newStubStore()
-	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", RequestedByPrincipalID: "principal-1", Status: domain.RequestStatusPending}
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: tenantA, LegalEntityID: entityA, RequestedByPrincipalID: "principal-1", Status: domain.RequestStatusPending}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/r1/reject",
@@ -339,7 +366,7 @@ func TestRejectRequest_SelfApproval_Rejected(t *testing.T) {
 
 func TestRejectRequest_AlreadyRejected_Rejected(t *testing.T) {
 	s := newStubStore()
-	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: "t1", LegalEntityID: "e1", Status: domain.RequestStatusRejected}
+	s.requests["r1"] = &domain.PurchaseRequest{RequestID: "r1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.RequestStatusRejected}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/r1/reject",
@@ -359,10 +386,112 @@ func TestGetRequest_NotFound(t *testing.T) {
 	}
 }
 
-func TestListRequests_RequiresTenantID(t *testing.T) {
+// TestListRequests_NoTenantScope_Refused replaces a test that asserted a 400
+// when ?tenant_id= was absent — which documented the vulnerability as correct,
+// since supplying the parameter was exactly how a caller read another tenant's
+// register. The scope now comes from the header, so its absence is the failure.
+func TestListRequests_NoTenantScope_Refused(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
-	rec := doRequest(r, http.MethodGet, "/v1/purchase-requests/", nil, "")
+	rec := doRequestAs(r, http.MethodGet, "/v1/purchase-requests/", nil, "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── tenant scope ─────────────────────────────────────────────────────────────
+
+// TestListRequests_ForeignTenantQueryParam_Refused is the regression test for
+// the headline defect: ?tenant_id= was handed straight to the store, which both
+// filtered on it and set app.tenant_id from it, so the tenant the caller named
+// satisfied the RLS policy on the way past.
+func TestListRequests_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequestAs(r, http.MethodGet, "/v1/purchase-requests/?tenant_id="+tenantB, nil, "", tenantA)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 listing another tenant's register, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListRequests_OwnTenantQueryParam_Allowed(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequestAs(r, http.MethodGet, "/v1/purchase-requests/?tenant_id="+tenantA, nil, "", tenantA)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 when the query param agrees with the verified scope, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListRequests_UnknownStatusFilter_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/purchase-requests/?status=PENDNIG", nil, "")
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 without tenant_id query param, got %d", rec.Code)
+		t.Fatalf("expected 400 for an unrecognised status filter, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A malformed legal_entity_id is compared as text against a cast column, so it
+// matched nothing and read as "this entity has raised no requests".
+func TestListRequests_MalformedLegalEntityFilter_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/purchase-requests/?legal_entity_id=not-a-uuid", nil, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed legal_entity_id filter, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateRequest_ForeignTenantBody_Refused is the write half of the same
+// defect: tenant_id in the body was the only source of the stored tenant.
+func TestCreateRequest_ForeignTenantBody_Refused(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.TenantID = tenantB
+	rec := doRequestAs(r, http.MethodPost, "/v1/purchase-requests/", req, "principal-1", tenantA)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 creating into another tenant, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.requests) != 0 {
+		t.Fatalf("expected nothing written, got %d rows", len(s.requests))
+	}
+}
+
+// A body that omits tenant_id is fine — the tenant is the verified scope, and
+// that is the tenant the row must be filed under.
+func TestCreateRequest_NoTenantInBody_UsesVerifiedScope(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.TenantID = ""
+	rec := doRequestAs(r, http.MethodPost, "/v1/purchase-requests/", req, "principal-1", tenantA)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got domain.PurchaseRequest
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if got.TenantID != tenantA {
+		t.Fatalf("expected the request filed under the verified tenant %s, got %s", tenantA, got.TenantID)
+	}
+}
+
+func TestCreateRequest_NoTenantScope_Refused(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequestAs(r, http.MethodPost, "/v1/purchase-requests/", validCreateReq(), "principal-1", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.requests) != 0 {
+		t.Fatalf("expected nothing written, got %d rows", len(s.requests))
+	}
+}
+
+func TestCreateRequest_MalformedLegalEntityID_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.LegalEntityID = "e1"
+	rec := doRequest(r, http.MethodPost, "/v1/purchase-requests/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a non-UUID legal_entity_id, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

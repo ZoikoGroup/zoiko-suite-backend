@@ -28,6 +28,17 @@ import (
 // mirrors policy-svc's handling of nullable scope columns.
 const nilScopeUUID = "00000000-0000-0000-0000-000000000000"
 
+// derefOrEmpty is used when passing a nullable tenant_id into withRLS: nil
+// (global scope) becomes "", which app.tenant_id being set to never
+// matches a real tenant_id, so it only ever satisfies a policy's
+// "tenant_id IS NULL" branch — never grants access to a real tenant's row.
+func derefOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
 // LeaseListFilter narrows ListLeases. All fields optional, compose with AND.
 type LeaseListFilter struct {
 	RequestedByPrincipalID string
@@ -39,8 +50,14 @@ type LeaseListFilter struct {
 	Offset                 int
 }
 
-// AuditListFilter narrows ListAuditLog. All fields optional, compose with AND.
+// AuditListFilter narrows ListAuditLog. Every field except TenantID is
+// optional; they compose with AND.
 type AuditListFilter struct {
+	// TenantID is the caller's verified scope. This filter had no tenant field
+	// at all, so the secret-access audit log was readable across tenants — the
+	// handler now always sets it. A nil TenantID still means unfiltered, so it
+	// must not be left unset by a new caller.
+	TenantID               *string
 	RequestedByPrincipalID string
 	SecretPath             string
 	EventType              string
@@ -59,15 +76,15 @@ type Store interface {
 	CreateSecretPolicyVersion(ctx context.Context, params domain.CreateSecretPolicyVersionParams) (*domain.SecretPolicyVersion, bool, error)
 	FindSecretPolicyVersionByID(ctx context.Context, secretPolicyVersionID string) (*domain.SecretPolicyVersion, error)
 	ActivateVersion(ctx context.Context, secretPolicyVersionID, actorID string) (*domain.SecretPolicyVersion, []*domain.SecretPolicyVersion, bool, error)
-	ListVersionHistory(ctx context.Context, secretPolicyID string) ([]*domain.SecretPolicyVersion, error)
+	ListVersionHistory(ctx context.Context, secretPolicyID, tenantID string) ([]*domain.SecretPolicyVersion, error)
 
 	FindApplicableVersions(ctx context.Context, secretClass string, tenantID, legalEntityID *string) ([]*domain.ApplicableSecretPolicyVersion, error)
 	FindApplicableVersionByPath(ctx context.Context, secretPath string, tenantID, legalEntityID *string) (*domain.ApplicableSecretPolicyVersion, error)
 
 	CreateLease(ctx context.Context, params domain.CreateLeaseParams) (*domain.SecretLease, bool, error)
-	FindLeaseByID(ctx context.Context, leaseID string) (*domain.SecretLease, error)
+	FindLeaseByID(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, error)
 	ListLeases(ctx context.Context, filter LeaseListFilter) ([]*domain.SecretLease, error)
-	RevokeLease(ctx context.Context, leaseID string) (*domain.SecretLease, bool, error)
+	RevokeLease(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, bool, error)
 	RevokeLeasesBySecretPath(ctx context.Context, secretPath string) ([]*domain.SecretLease, error)
 
 	RecordAuditEntry(ctx context.Context, params domain.RecordAuditEntryParams) (*domain.SecretAccessAuditLog, error)
@@ -84,6 +101,56 @@ type PgStore struct {
 // New returns an open PgStore. Caller must call pool.Close() when done.
 func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
+}
+
+// withRLS runs fn inside a transaction with app.tenant_id set for the
+// session, so the tenant_isolation_policy on secret_policy_versions,
+// secret_leases, and secret_access_audit_log has a value to enforce
+// against. Mirrors tenant-entity-registry-svc's PgStore.withRLS. An empty
+// tenantID is valid — it means "no specific tenant" and only ever matches
+// rows whose own tenant_id is NULL (global scope), never a real tenant's
+// rows, which is the correct behavior for a write recording no tenant.
+func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// withPlatformScope runs fn inside a transaction flagged as platform-scope,
+// which the RLS policy treats as visible/writable regardless of tenant_id.
+// This is NOT a superuser-style universal bypass: it is only ever set by
+// handler code paths that have already required platform-level
+// authorization for the action being performed (SECRET_POLICY_VERSION_
+// ACTIVATE, SECRET_ROTATE — both checked with an empty entity, which
+// resolves to platform scope, per PutSecretMaterial's documented
+// reasoning). A caller who is only tenant-authorized never reaches this
+// path. Kept as an explicit, auditable session flag rather than a
+// role-level RLS exemption, so "this connection is acting with platform
+// authority right now" is never silent.
+func (s *PgStore) withPlatformScope(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+		return fmt.Errorf("set_config app.platform_scope: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // ── secret_policies ──────────────────────────────────────────────────────────
@@ -199,9 +266,17 @@ func scanSecretPolicyVersion(row pgx.Row) (*domain.SecretPolicyVersion, error) {
 }
 
 // FindSecretPolicyVersionByID looks up a version by its UUID primary key.
+// Only ever called from ActivateVersion's handler, which requires
+// SECRET_POLICY_VERSION_ACTIVATE — a platform-scoped action — so this
+// deliberately looks across every tenant's versions, not just one.
 func (s *PgStore) FindSecretPolicyVersionByID(ctx context.Context, secretPolicyVersionID string) (*domain.SecretPolicyVersion, error) {
 	const query = `SELECT ` + secretPolicyVersionColumns + ` FROM secret_policy_versions WHERE secret_policy_version_id = $1;`
-	v, err := scanSecretPolicyVersion(s.pool.QueryRow(ctx, query, secretPolicyVersionID))
+	var v *domain.SecretPolicyVersion
+	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		v, scanErr = scanSecretPolicyVersion(tx.QueryRow(ctx, query, secretPolicyVersionID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrSecretPolicyVersionNotFound
@@ -243,19 +318,6 @@ func (s *PgStore) CreateSecretPolicyVersion(ctx context.Context, params domain.C
 		DO NOTHING
 		RETURNING ` + secretPolicyVersionColumns + `;`
 
-	v, err := scanSecretPolicyVersion(s.pool.QueryRow(ctx, query,
-		params.SecretPolicyID, params.TenantID, params.LegalEntityID,
-		params.AllowedWorkloadIDs, params.MaxLeaseDurationSeconds, params.EffectiveFrom, params.EffectiveTo,
-		params.CreatedByPrincipalID,
-	))
-	if err == nil {
-		return v, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		s.log.Error("pg CreateSecretPolicyVersion failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-
 	const lookupQuery = `
 		SELECT ` + secretPolicyVersionColumns + `
 		FROM secret_policy_versions
@@ -264,23 +326,52 @@ func (s *PgStore) CreateSecretPolicyVersion(ctx context.Context, params domain.C
 		  AND COALESCE(legal_entity_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
 		  AND effective_from = $4;`
 
-	existing, err := scanSecretPolicyVersion(s.pool.QueryRow(ctx, lookupQuery, params.SecretPolicyID, params.TenantID, params.LegalEntityID, params.EffectiveFrom))
+	var result *domain.SecretPolicyVersion
+	var created bool
+	err := s.withRLS(ctx, derefOrEmpty(params.TenantID), func(tx pgx.Tx) error {
+		v, err := scanSecretPolicyVersion(tx.QueryRow(ctx, query,
+			params.SecretPolicyID, params.TenantID, params.LegalEntityID,
+			params.AllowedWorkloadIDs, params.MaxLeaseDurationSeconds, params.EffectiveFrom, params.EffectiveTo,
+			params.CreatedByPrincipalID,
+		))
+		if err == nil {
+			result, created = v, true
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		existing, err := scanSecretPolicyVersion(tx.QueryRow(ctx, lookupQuery, params.SecretPolicyID, params.TenantID, params.LegalEntityID, params.EffectiveFrom))
+		if err != nil {
+			return err
+		}
+		if !jsonEqual(existing.AllowedWorkloadIDs, params.AllowedWorkloadIDs) || existing.MaxLeaseDurationSeconds != params.MaxLeaseDurationSeconds {
+			s.log.Warn("secret policy version dedup match but payload mismatch (409 conflict)",
+				zap.String("existing_id", existing.SecretPolicyVersionID),
+			)
+			return domain.ErrConflict
+		}
+		result, created = existing, false
+		return nil
+	})
 	if err != nil {
-		s.log.Error("pg CreateSecretPolicyVersion lookup existing failed", zap.Error(err))
+		if errors.Is(err, domain.ErrConflict) {
+			return nil, false, domain.ErrConflict
+		}
+		s.log.Error("pg CreateSecretPolicyVersion failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-
-	if !jsonEqual(existing.AllowedWorkloadIDs, params.AllowedWorkloadIDs) || existing.MaxLeaseDurationSeconds != params.MaxLeaseDurationSeconds {
-		s.log.Warn("secret policy version dedup match but payload mismatch (409 conflict)",
-			zap.String("existing_id", existing.SecretPolicyVersionID),
-		)
-		return nil, false, domain.ErrConflict
-	}
-	return existing, false, nil
+	return result, created, nil
 }
 
-// ListVersionHistory returns all versions for a secret policy, newest first.
-func (s *PgStore) ListVersionHistory(ctx context.Context, secretPolicyID string) ([]*domain.SecretPolicyVersion, error) {
+// ListVersionHistory returns all versions for a secret policy visible to
+// the caller's tenant (global versions plus that tenant's own), newest
+// first. Previously took no tenant at all: any authenticated caller could
+// list every tenant's allowed_workload_ids and lease-duration limits for
+// a policy, which is provisioning data about who may broker the secret,
+// not something a read endpoint should hand out platform-wide by default.
+func (s *PgStore) ListVersionHistory(ctx context.Context, secretPolicyID, tenantID string) ([]*domain.SecretPolicyVersion, error) {
 	if _, err := s.FindSecretPolicyByID(ctx, secretPolicyID); err != nil {
 		return nil, err
 	}
@@ -289,25 +380,28 @@ func (s *PgStore) ListVersionHistory(ctx context.Context, secretPolicyID string)
 		SELECT ` + secretPolicyVersionColumns + `
 		FROM secret_policy_versions
 		WHERE secret_policy_id = $1
+		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)
 		ORDER BY effective_from DESC, created_at DESC;`
 
-	rows, err := s.pool.Query(ctx, query, secretPolicyID)
+	var results []*domain.SecretPolicyVersion
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, secretPolicyID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			v, scanErr := scanSecretPolicyVersion(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, v)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg ListVersionHistory failed", zap.String("secret_policy_id", secretPolicyID), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.SecretPolicyVersion
-	for rows.Next() {
-		v, scanErr := scanSecretPolicyVersion(rows)
-		if scanErr != nil {
-			s.log.Error("pg ListVersionHistory scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, v)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
@@ -346,12 +440,20 @@ func (s *PgStore) ActivateVersion(ctx context.Context, secretPolicyVersionID, ac
 		return target, nil, false, nil
 	}
 
-	tx, err := s.pool.Begin(ctx)
+	var tx pgx.Tx
+	tx, err = s.pool.Begin(ctx)
 	if err != nil {
 		s.log.Error("pg ActivateVersion: begin tx failed", zap.Error(err))
 		return nil, nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	// Platform-scoped, same reasoning as FindSecretPolicyVersionByID above:
+	// activation may supersede a version in ANY tenant's scope, not just
+	// the caller's own (there usually isn't one — this is an admin action).
+	if _, err = tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+		return nil, nil, false, fmt.Errorf("set_config app.platform_scope: %w", err)
+	}
 
 	const supersedeQuery = `
 		UPDATE secret_policy_versions
@@ -434,22 +536,25 @@ func (s *PgStore) FindApplicableVersions(ctx context.Context, secretClass string
 			 + CASE WHEN spv.legal_entity_id IS NOT NULL THEN 1 ELSE 0 END) DESC,
 			spv.effective_from DESC;`
 
-	rows, err := s.pool.Query(ctx, query, secretClass, tenantID, legalEntityID)
+	var results []*domain.ApplicableSecretPolicyVersion
+	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, secretClass, tenantID, legalEntityID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			v, scanErr := scanApplicableVersion(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, v)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg FindApplicableVersions failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.ApplicableSecretPolicyVersion
-	for rows.Next() {
-		v, scanErr := scanApplicableVersion(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, v)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
@@ -482,7 +587,12 @@ func (s *PgStore) FindApplicableVersionByPath(ctx context.Context, secretPath st
 			spv.effective_from DESC
 		LIMIT 1;`
 
-	v, err := scanApplicableVersion(s.pool.QueryRow(ctx, query, secretPath, tenantID, legalEntityID))
+	var v *domain.ApplicableSecretPolicyVersion
+	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
+		var scanErr error
+		v, scanErr = scanApplicableVersion(tx.QueryRow(ctx, query, secretPath, tenantID, legalEntityID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrSecretPolicyVersionNotFound
@@ -570,42 +680,56 @@ func (s *PgStore) CreateLease(ctx context.Context, params domain.CreateLeasePara
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (request_id) DO NOTHING
 		RETURNING ` + secretLeaseColumns + `;`
+	const lookupQuery = `SELECT ` + secretLeaseReadColumns + ` FROM secret_leases WHERE request_id = $1;`
 
-	l, err := scanSecretLease(s.pool.QueryRow(ctx, insertQuery,
-		params.RequestID, params.SecretPolicyVersionID, params.SecretClass, params.SecretPath,
-		params.RequestedByPrincipalID, params.TenantID, params.LegalEntityID, params.ExpiresAt, params.CorrelationID,
-	))
-	if err == nil {
-		return l, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	var result *domain.SecretLease
+	var created bool
+	err := s.withRLS(ctx, derefOrEmpty(params.TenantID), func(tx pgx.Tx) error {
+		l, err := scanSecretLease(tx.QueryRow(ctx, insertQuery,
+			params.RequestID, params.SecretPolicyVersionID, params.SecretClass, params.SecretPath,
+			params.RequestedByPrincipalID, params.TenantID, params.LegalEntityID, params.ExpiresAt, params.CorrelationID,
+		))
+		if err == nil {
+			result, created = l, true
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		existing, err := scanSecretLease(tx.QueryRow(ctx, lookupQuery, params.RequestID))
+		if err != nil {
+			return err
+		}
+		result, created = existing, false
+		return nil
+	})
+	if err != nil {
 		s.log.Error("pg CreateLease failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-
-	existing, err := s.findLeaseByRequestID(ctx, params.RequestID)
-	if err != nil {
-		return nil, false, err
-	}
-	return existing, false, nil
+	return result, created, nil
 }
 
-func (s *PgStore) findLeaseByRequestID(ctx context.Context, requestID string) (*domain.SecretLease, error) {
-	const query = `SELECT ` + secretLeaseReadColumns + ` FROM secret_leases WHERE request_id = $1;`
-	l, err := scanSecretLease(s.pool.QueryRow(ctx, query, requestID))
-	if err != nil {
-		s.log.Error("pg findLeaseByRequestID failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	return l, nil
-}
-
-// FindLeaseByID retrieves a single lease record. Status reflects the
-// computed EXPIRED read (secretLeaseReadColumns), not just the stored
-// GRANTED/REVOKED value.
-func (s *PgStore) FindLeaseByID(ctx context.Context, leaseID string) (*domain.SecretLease, error) {
-	const query = `SELECT ` + secretLeaseReadColumns + ` FROM secret_leases WHERE lease_id = $1;`
-	l, err := scanSecretLease(s.pool.QueryRow(ctx, query, leaseID))
+// FindLeaseByID retrieves a single lease record, scoped to the caller's
+// tenant (global-scope leases, if any, are always visible too). Status
+// reflects the computed EXPIRED read (secretLeaseReadColumns), not just
+// the stored GRANTED/REVOKED value. Callers already re-check
+// lease.TenantID against their verified scope before acting (see
+// handler.refuseForeignRow) — this predicate is the DB-level backstop for
+// that same check, not a replacement for it.
+func (s *PgStore) FindLeaseByID(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, error) {
+	const query = `
+		SELECT ` + secretLeaseReadColumns + `
+		FROM secret_leases
+		WHERE lease_id = $1
+		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)`
+	var l *domain.SecretLease
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		l, scanErr = scanSecretLease(tx.QueryRow(ctx, query, leaseID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrLeaseNotFound
@@ -668,22 +792,25 @@ func (s *PgStore) ListLeases(ctx context.Context, filter LeaseListFilter) ([]*do
 	)
 	args = append(args, limit, filter.Offset)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	var results []*domain.SecretLease
+	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			l, scanErr := scanSecretLease(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, l)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg ListLeases failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.SecretLease
-	for rows.Next() {
-		l, scanErr := scanSecretLease(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, l)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
@@ -693,8 +820,8 @@ func (s *PgStore) ListLeases(ctx context.Context, filter LeaseListFilter) ([]*do
 // revoking an already-REVOKED lease returns it unchanged with
 // transitioned=false. Returns domain.ErrInvalidTransition for any other
 // status (EXPIRED — nothing to revoke).
-func (s *PgStore) RevokeLease(ctx context.Context, leaseID string) (*domain.SecretLease, bool, error) {
-	current, err := s.FindLeaseByID(ctx, leaseID)
+func (s *PgStore) RevokeLease(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, bool, error) {
+	current, err := s.FindLeaseByID(ctx, leaseID, tenantID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -709,9 +836,15 @@ func (s *PgStore) RevokeLease(ctx context.Context, leaseID string) (*domain.Secr
 		UPDATE secret_leases
 		SET status = 'REVOKED', revoked_at = NOW()
 		WHERE lease_id = $1 AND status = 'GRANTED'
+		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)
 		RETURNING ` + secretLeaseColumns + `;`
 
-	revoked, err := scanSecretLease(s.pool.QueryRow(ctx, query, leaseID))
+	var revoked *domain.SecretLease
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		revoked, scanErr = scanSecretLease(tx.QueryRow(ctx, query, leaseID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, domain.ErrInvalidTransition
@@ -723,10 +856,14 @@ func (s *PgStore) RevokeLease(ctx context.Context, leaseID string) (*domain.Secr
 }
 
 // RevokeLeasesBySecretPath mass-revokes every currently GRANTED lease for
-// a secret_path — called by Rotate (context.md §7.2's fix: rotating a
-// secret must invalidate leases pointing at the now-stale material, not
-// just record that a rotation happened). Returns every lease actually
-// revoked so the caller can emit one audit entry per lease.
+// a secret_path, across every tenant — called by Rotate (context.md
+// §7.2's fix: rotating a secret must invalidate leases pointing at the
+// now-stale material, not just record that a rotation happened).
+// Platform-scoped like FindSecretPolicyVersionByID above: rotating a
+// secret invalidates it for every tenant that held a lease on it, not
+// just one, and Rotate's handler already requires SECRET_ROTATE (a
+// platform-scoped action). Returns every lease actually revoked so the
+// caller can emit one audit entry per lease.
 func (s *PgStore) RevokeLeasesBySecretPath(ctx context.Context, secretPath string) ([]*domain.SecretLease, error) {
 	const query = `
 		UPDATE secret_leases
@@ -734,22 +871,25 @@ func (s *PgStore) RevokeLeasesBySecretPath(ctx context.Context, secretPath strin
 		WHERE secret_path = $1 AND status = 'GRANTED'
 		RETURNING ` + secretLeaseColumns + `;`
 
-	rows, err := s.pool.Query(ctx, query, secretPath)
+	var revoked []*domain.SecretLease
+	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, secretPath)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			l, scanErr := scanSecretLease(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			revoked = append(revoked, l)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg RevokeLeasesBySecretPath failed", zap.String("secret_path", secretPath), zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var revoked []*domain.SecretLease
-	for rows.Next() {
-		l, scanErr := scanSecretLease(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		revoked = append(revoked, l)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return revoked, nil
@@ -799,11 +939,16 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING ` + auditLogColumns + `;`
 
-	a, err := scanAuditEntry(s.pool.QueryRow(ctx, query,
-		params.EventType, params.SecretClass, params.SecretPath, params.RequestedByPrincipalID,
-		params.TenantID, params.LegalEntityID, params.LeaseID, params.SecretPolicyVersionID,
-		params.RequestID, params.OutcomeDetail, params.CorrelationID,
-	))
+	var a *domain.SecretAccessAuditLog
+	err := s.withRLS(ctx, derefOrEmpty(params.TenantID), func(tx pgx.Tx) error {
+		var scanErr error
+		a, scanErr = scanAuditEntry(tx.QueryRow(ctx, query,
+			params.EventType, params.SecretClass, params.SecretPath, params.RequestedByPrincipalID,
+			params.TenantID, params.LegalEntityID, params.LeaseID, params.SecretPolicyVersionID,
+			params.RequestID, params.OutcomeDetail, params.CorrelationID,
+		))
+		return scanErr
+	})
 	if err != nil {
 		s.log.Error("pg RecordAuditEntry failed", zap.String("event_type", params.EventType), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -817,6 +962,12 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 // partial unique index instead of returning the original outcome.
 // Returns domain.ErrLeaseNotFound-shaped semantics via a plain nil,nil on
 // no match (not found is a valid, expected outcome here, not an error).
+//
+// No withRLS/withPlatformScope wrapping needed: Rotate's handler never
+// sets TenantID on a ROTATED RecordAuditEntry call (rotation is a
+// property of the secret path, not any one tenant), so every ROTATED row
+// has tenant_id = NULL and always satisfies the policy's "tenant_id IS
+// NULL" branch regardless of session state.
 func (s *PgStore) FindAuditEntryByRotationRequestID(ctx context.Context, requestID string) (*domain.SecretAccessAuditLog, error) {
 	const query = `
 		SELECT ` + auditLogColumns + `
@@ -854,6 +1005,9 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditListFilter) ([]*
 		argIdx++
 	}
 
+	if filter.TenantID != nil && *filter.TenantID != "" {
+		addCond("tenant_id = $%d", *filter.TenantID)
+	}
 	if filter.RequestedByPrincipalID != "" {
 		addCond("requested_by_principal_id = $%d", filter.RequestedByPrincipalID)
 	}
@@ -885,22 +1039,25 @@ func (s *PgStore) ListAuditLog(ctx context.Context, filter AuditListFilter) ([]*
 	)
 	args = append(args, limit, filter.Offset)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	var results []*domain.SecretAccessAuditLog
+	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			a, scanErr := scanAuditEntry(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, a)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg ListAuditLog failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.SecretAccessAuditLog
-	for rows.Next() {
-		a, scanErr := scanAuditEntry(rows)
-		if scanErr != nil {
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, a)
-	}
-	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil

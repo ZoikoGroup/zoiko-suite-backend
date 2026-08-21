@@ -16,6 +16,16 @@ import (
 
 	"zoiko.io/accounts-payable-svc/internal/domain"
 	"zoiko.io/accounts-payable-svc/internal/handler"
+	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
+)
+
+// tenant_id and legal_entity_id are uuid columns, so the fixtures are UUIDs —
+// "t1"/"e1" would be refused by the handler's own identifier checks now that a
+// malformed id is a 400 rather than a 503 from the driver.
+const (
+	tenantA = "11111111-1111-1111-1111-111111111111"
+	tenantB = "22222222-2222-2222-2222-222222222222"
+	entityA = "33333333-3333-3333-3333-333333333333"
 )
 
 // ── stubs ────────────────────────────────────────────────────────────────────
@@ -107,14 +117,28 @@ type stubAuthZ struct {
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+// newRouter mounts TenantContext, which the real server mounts in
+// cmd/server/main.go. It used to be omitted, so every handler under test saw an
+// empty tenant scope and fell back to the query parameter or the body — the very
+// behaviour these tests are supposed to be checking. A handler harness must
+// mount the middleware the handler depends on.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, p, a, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
 
+// doRequest sends a request in tenantA's scope, which is the ordinary case.
 func doRequest(r chi.Router, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	return doRequestAs(r, method, path, body, principalID, tenantA)
+}
+
+// doRequestAs sends a request in an explicit tenant scope; tenantID "" omits the
+// X-Tenant-Id header entirely, which is how a request with no verified scope is
+// simulated.
+func doRequestAs(r chi.Router, method, path string, body any, principalID, tenantID string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -123,6 +147,9 @@ func doRequest(r chi.Router, method, path string, body any, principalID string) 
 	req.Header.Set("Content-Type", "application/json")
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
 	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -133,8 +160,8 @@ func doRequest(r chi.Router, method, path string, body any, principalID string) 
 
 func validCreateReq() domain.CreateVendorInvoiceRequest {
 	return domain.CreateVendorInvoiceRequest{
-		TenantID:      "t1",
-		LegalEntityID: "e1",
+		TenantID:      tenantA,
+		LegalEntityID: entityA,
 		VendorID:      "v1",
 		InvoiceNumber: "INV-001",
 		Amount:        1000,
@@ -146,9 +173,13 @@ func validCreateReq() domain.CreateVendorInvoiceRequest {
 
 // doRawRequest posts a body verbatim, so a test can send JSON that no Go struct
 // would produce — a misspelled key, a bare date, an oversized payload.
+// doRawRequest sends a hand-written body in tenantA's scope. The tenant header
+// is set here too — a raw-body test is about the body's SHAPE, and leaving the
+// scope off would make every one of them fail on identity instead.
 func doRawRequest(r chi.Router, method, path, body, principalID string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantA)
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
@@ -241,7 +272,7 @@ func TestCreateInvoice_DueDate_AcceptsBareCalendarDateAndRFC3339(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
-			body := `{"tenant_id":"t1","legal_entity_id":"e1","vendor_id":"v1","invoice_number":"INV-1",
+			body := `{"tenant_id":"` + tenantA + `","legal_entity_id":"` + entityA + `","vendor_id":"v1","invoice_number":"INV-1",
 			          "amount":10,"currency_code":"USD","due_date":` + tc.dueDate + `,"correlation_id":"c1"}`
 
 			rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", body, "principal-1")
@@ -284,7 +315,7 @@ func TestCreateInvoice_DueDate_GarbageRejectedAsInvalidJSON(t *testing.T) {
 // "the store is unavailable".
 func TestTransition_InvoiceNotFound_Returns404(t *testing.T) {
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusReceived}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusReceived}
 	// The handler reads the invoice first, so the store must be reachable for the
 	// read and only fail on the write — which is exactly the 22P02 case, where
 	// the id is well-formed enough to look up but not to compare.
@@ -301,12 +332,15 @@ func TestTransition_InvoiceNotFound_Returns404(t *testing.T) {
 	}
 }
 
-func TestListInvoices_MalformedTenantID_Returns400(t *testing.T) {
+func TestListInvoices_MalformedTenantScope_Returns400(t *testing.T) {
 	store := newStubStore()
 	store.listErr = domain.ErrInvalidIdentifier
 	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
 
-	rec := doRequest(r, http.MethodGet, "/v1/invoices/?tenant_id=not-a-uuid", nil, "principal-1")
+	// A non-UUID can no longer arrive as ?tenant_id= — that is refused as a
+	// scope mismatch before the store is reached — so this is the gateway
+	// forwarding a malformed X-Tenant-Id.
+	rec := doRequestAs(r, http.MethodGet, "/v1/invoices/", nil, "principal-1", "not-a-uuid")
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a non-UUID tenant_id, got %d: %s", rec.Code, rec.Body.String())
@@ -321,7 +355,7 @@ func TestListInvoices_MalformedTenantID_Returns400(t *testing.T) {
 func TestListInvoices_Empty_ReturnsEmptyArrayNotNull(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 
-	rec := doRequest(r, http.MethodGet, "/v1/invoices/?tenant_id=t1", nil, "principal-1")
+	rec := doRequest(r, http.MethodGet, "/v1/invoices/?tenant_id="+tenantA, nil, "principal-1")
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
@@ -415,7 +449,7 @@ func TestApproveInvoice_FromReceived_Rejected(t *testing.T) {
 	// State machine must be sequential: RECEIVED -> APPROVED directly
 	// (skipping VALIDATED) is not a legal transition.
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusReceived}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusReceived}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/approve", nil, "principal-1")
@@ -426,7 +460,7 @@ func TestApproveInvoice_FromReceived_Rejected(t *testing.T) {
 
 func TestValidateInvoice_FromReceived_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusReceived}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusReceived}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -444,7 +478,7 @@ func TestValidateInvoice_FromReceived_Succeeds(t *testing.T) {
 
 func TestApproveInvoice_FromValidated_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator"}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator"}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -464,7 +498,7 @@ func TestApproveInvoice_BySameCreator_Returns403(t *testing.T) {
 	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
 	// the principal who created the invoice may not be the one approving it.
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-1"}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-1"}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -484,7 +518,7 @@ func TestRequestPayment_FromReceived_Rejected(t *testing.T) {
 	// Critical constraint: payment initiation requires having passed through
 	// both VALIDATED and APPROVED — a RECEIVED invoice must be rejected.
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusReceived}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusReceived}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/request-payment", nil, "principal-1")
@@ -495,7 +529,7 @@ func TestRequestPayment_FromReceived_Rejected(t *testing.T) {
 
 func TestRequestPayment_FromApproved_Succeeds(t *testing.T) {
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusApproved}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusApproved}
 
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -518,7 +552,7 @@ func TestRequestPayment_FromPaymentRequested_IsIdempotentReplay(t *testing.T) {
 	// original result, not fail — and, the important part, must not publish
 	// PublishPaymentRequested a second time.
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusPaymentRequested}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusPaymentRequested}
 	pub := &stubPublisher{}
 
 	r := newRouter(s, pub, &stubAuthZ{})
@@ -536,7 +570,7 @@ func TestRequestPayment_FromReceived_StillRejected(t *testing.T) {
 	// still be rejected — the idempotency fix must not turn every status
 	// into a silent 200.
 	s := newStubStore()
-	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: "t1", LegalEntityID: "e1", Status: domain.InvoiceStatusReceived}
+	s.invoices["i1"] = &domain.VendorInvoice{InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, Status: domain.InvoiceStatusReceived}
 
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/request-payment", nil, "principal-1")
@@ -555,10 +589,102 @@ func TestGetInvoice_NotFound(t *testing.T) {
 	}
 }
 
-func TestListInvoices_RequiresTenantID(t *testing.T) {
+// TestListInvoices_NoTenantScope_Refused replaces a test that asserted a 400
+// when ?tenant_id= was absent — which documented the vulnerability as correct,
+// since supplying the parameter was exactly how a caller read another tenant's
+// payables register. The scope now comes from the header, so its absence is the
+// failure.
+func TestListInvoices_NoTenantScope_Refused(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
-	rec := doRequest(r, http.MethodGet, "/v1/invoices/", nil, "")
+	rec := doRequestAs(r, http.MethodGet, "/v1/invoices/", nil, "", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── tenant scope ─────────────────────────────────────────────────────────────
+
+// TestListInvoices_ForeignTenantQueryParam_Refused is the regression test for
+// the headline defect: ?tenant_id= was handed straight to the store, which both
+// filtered on it and set app.tenant_id from it, so the tenant the caller named
+// satisfied the RLS policy on the way past — vendor names and amounts included.
+func TestListInvoices_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequestAs(r, http.MethodGet, "/v1/invoices/?tenant_id="+tenantB, nil, "", tenantA)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 listing another tenant's register, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListInvoices_UnknownStatusFilter_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/invoices/?status=APROVED", nil, "")
 	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 without tenant_id query param, got %d", rec.Code)
+		t.Fatalf("expected 400 for an unrecognised status filter, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListInvoices_MalformedLegalEntityFilter_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/invoices/?legal_entity_id=not-a-uuid", nil, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed legal_entity_id filter, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateInvoice_ForeignTenantBody_Refused is the write half: tenant_id in the
+// body was the only source of the stored tenant, so a payable could be filed in
+// another tenant's ledger — where the duplicate-invoice-number constraint is also
+// scoped, so it could not even collide with the register it was hiding in.
+func TestCreateInvoice_ForeignTenantBody_Refused(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.TenantID = tenantB
+	rec := doRequestAs(r, http.MethodPost, "/v1/invoices/", req, "principal-1", tenantA)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 creating into another tenant, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.invoices) != 0 {
+		t.Fatalf("expected nothing written, got %d rows", len(s.invoices))
+	}
+}
+
+func TestCreateInvoice_NoTenantInBody_UsesVerifiedScope(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.TenantID = ""
+	rec := doRequestAs(r, http.MethodPost, "/v1/invoices/", req, "principal-1", tenantA)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got domain.VendorInvoice
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if got.TenantID != tenantA {
+		t.Fatalf("expected the invoice filed under the verified tenant %s, got %s", tenantA, got.TenantID)
+	}
+}
+
+func TestCreateInvoice_NoTenantScope_Refused(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	rec := doRequestAs(r, http.MethodPost, "/v1/invoices/", validCreateReq(), "principal-1", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(s.invoices) != 0 {
+		t.Fatalf("expected nothing written, got %d rows", len(s.invoices))
+	}
+}
+
+func TestCreateInvoice_MalformedLegalEntityID_Refused(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	req := validCreateReq()
+	req.LegalEntityID = "e1"
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a non-UUID legal_entity_id, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

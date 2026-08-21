@@ -35,7 +35,16 @@ type PolicyVersion struct {
 }
 
 type Client interface {
-	GetPolicyVersion(ctx context.Context, policyVersionID string) (*PolicyVersion, error)
+	// GetPolicyVersion fetches one version in the given tenant's scope.
+	//
+	// tenantID is forwarded as X-Tenant-Id. policy-svc scopes the lookup to it
+	// (a version is visible if it is global or belongs to that tenant) and now
+	// REFUSES a request that carries no scope at all — an omitted header used to
+	// fall back to an unscoped lookup there, so any tenant's version could be
+	// read by id. A non-uuid tenant such as this service's "GLOBAL" sentinel
+	// narrows the lookup to global versions, which is what a globally-evaluated
+	// decision was replayed against anyway.
+	GetPolicyVersion(ctx context.Context, tenantID, policyVersionID string) (*PolicyVersion, error)
 }
 
 type HTTPClient struct {
@@ -50,11 +59,12 @@ func NewHTTPClient(baseURL string) *HTTPClient {
 	}
 }
 
-func (c *HTTPClient) GetPolicyVersion(ctx context.Context, policyVersionID string) (*PolicyVersion, error) {
+func (c *HTTPClient) GetPolicyVersion(ctx context.Context, tenantID, policyVersionID string) (*PolicyVersion, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/policy-versions/"+policyVersionID, nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPolicyServiceUnavailable, err)
 	}
+	req.Header.Set("X-Tenant-Id", tenantID)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrPolicyServiceUnavailable, err)

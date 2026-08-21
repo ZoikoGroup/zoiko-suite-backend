@@ -16,6 +16,7 @@ import (
 	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/domain"
 	"zoiko.io/policy-svc/internal/handler"
+	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 )
 
 // ── stub store ────────────────────────────────────────────────────────────────
@@ -234,8 +235,14 @@ func newTestRouterFull(s *stubStore, p *stubPublisher, d *stubDecisionLog) chi.R
 
 // newTestRouterWithAuthz is the same wiring with an explicit authz client —
 // used by the tests that exercise the 403 and fail-closed 503 paths.
+// newTestRouterWithAuthz mounts TenantContext, which cmd/server/main.go mounts
+// in front of these same routes. It used to be omitted here, so every handler
+// under test saw an empty tenant scope — and the store's lookup, which widens
+// itself to every tenant when the scope is empty, was exercised in exactly the
+// configuration the tests were meant to rule out.
 func newTestRouterWithAuthz(s *stubStore, p *stubPublisher, d *stubDecisionLog, az *stubAuthz) chi.Router {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, p, d, az, testAuthzScopeID, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
@@ -276,10 +283,27 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, 
 	return a.err
 }
 
-// authed stamps the gateway-verified principal header onto a request. Every
-// mutating route now requires it.
+// testTenant is the caller's verified tenant scope, as the gateway would set it
+// in X-Tenant-Id. It is a UUID because policy_versions.tenant_id is a uuid
+// column, and a non-uuid scope can only ever see global versions.
+const testTenant = "11111111-1111-1111-1111-111111111111"
+
+// otherTenant is a tenant the caller has no scope in.
+const otherTenant = "22222222-2222-2222-2222-222222222222"
+
+// authed stamps the gateway-verified identity headers onto a request. Every
+// mutating route requires the principal, and every tenant-scoped route requires
+// the tenant — only the principal used to be stamped, so the scope-related
+// behaviour of every one of these tests was the no-scope fallback path.
 func authed(req *http.Request) *http.Request {
 	req.Header.Set("X-Principal-Id", testPrincipal)
+	req.Header.Set("X-Tenant-Id", testTenant)
+	return req
+}
+
+// scoped stamps only the tenant scope, for reads that need no principal.
+func scoped(req *http.Request) *http.Request {
+	req.Header.Set("X-Tenant-Id", testTenant)
 	return req
 }
 
@@ -476,7 +500,7 @@ func TestGetPolicyVersionByID_Found(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/pv-1", nil))
+	r.ServeHTTP(w, scoped(httptest.NewRequest(http.MethodGet, "/v1/policy-versions/pv-1", nil)))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -497,7 +521,7 @@ func TestGetPolicyVersionByID_NotFound(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/does-not-exist", nil))
+	r.ServeHTTP(w, scoped(httptest.NewRequest(http.MethodGet, "/v1/policy-versions/does-not-exist", nil)))
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
@@ -704,7 +728,7 @@ func TestEvaluate_NotGated(t *testing.T) {
 	r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_amount":100,"evaluated_by_principal_id":"caller-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -756,7 +780,7 @@ func TestListVersionHistory_EmptyReturnsArray(t *testing.T) {
 	store := &stubStore{history: nil}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -772,7 +796,7 @@ func TestListVersionHistory_NotFound(t *testing.T) {
 	store := &stubStore{historyErr: domain.ErrPolicyNotFound}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies/missing/versions", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/missing/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -791,7 +815,7 @@ func TestListVersionHistory_NewestFirst(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -821,7 +845,7 @@ func TestListApplicablePolicyVersions_MissingPolicyType(t *testing.T) {
 func TestListApplicablePolicyVersions_EmptyReturnsArray(t *testing.T) {
 	r := newTestRouter(&stubStore{applicable: nil})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies?policy_type=APPROVAL_THRESHOLD", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies?policy_type=APPROVAL_THRESHOLD", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -844,7 +868,7 @@ func TestListApplicablePolicyVersions_Success(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies?policy_type=APPROVAL_THRESHOLD&tenant_id=t-1", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies?policy_type=APPROVAL_THRESHOLD&tenant_id="+testTenant, nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -863,7 +887,7 @@ func TestListApplicablePolicyVersions_Success(t *testing.T) {
 func TestListApplicablePolicyVersions_StoreUnavailable(t *testing.T) {
 	r := newTestRouter(&stubStore{applicableErr: domain.ErrStoreUnavailable})
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies?policy_type=APPROVAL_THRESHOLD", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies?policy_type=APPROVAL_THRESHOLD", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -890,9 +914,9 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 	decisionLog := &stubDecisionLog{}
 	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
-	tenantID := "t-1"
-	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"t-1","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	tenantID := testTenant
+	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"` + testTenant + `","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -936,7 +960,7 @@ func TestEvaluate_ApprovalRequired(t *testing.T) {
 		t.Errorf("expected RuleBasis APPROVAL_5K:pv-1, got %s", decisionLog.last.RuleBasis)
 	}
 	if decisionLog.last.TenantID == nil || *decisionLog.last.TenantID != tenantID {
-		t.Errorf("expected TenantID t-1 forwarded, got %v", decisionLog.last.TenantID)
+		t.Errorf("expected TenantID %s forwarded, got %v", tenantID, decisionLog.last.TenantID)
 	}
 	if decisionLog.last.DecisionID != "dec-1" {
 		t.Errorf("expected DecisionID dec-1 forwarded as-is, got %s", decisionLog.last.DecisionID)
@@ -947,7 +971,7 @@ func TestEvaluate_MissingEvaluatedByPrincipalID(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -960,7 +984,7 @@ func TestEvaluate_MissingDecisionID(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -985,7 +1009,7 @@ func TestEvaluate_DecisionLogFailure_StillReturns200(t *testing.T) {
 	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1014,7 +1038,7 @@ func TestEvaluate_WithinThreshold(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1048,7 +1072,7 @@ func TestEvaluate_AmountEqualsThreshold_IsWithinThreshold(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":5000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1084,7 +1108,7 @@ func TestEvaluate_WithinThreshold_RecordsGrantedOutcome(t *testing.T) {
 	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1116,7 +1140,7 @@ func TestEvaluate_MissingPolicyType(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	body := `{"action_context":{"amount":1000}}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1139,7 +1163,7 @@ func TestEvaluate_MissingActionContextAmount(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1153,7 +1177,7 @@ func TestEvaluate_NoApplicablePolicy(t *testing.T) {
 	r := newTestRouterFull(&stubStore{applicable: nil}, &stubPublisher{}, decisionLog)
 
 	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1175,7 +1199,7 @@ func TestEvaluate_PolicyTypeNotImplemented(t *testing.T) {
 	r := newTestRouterFull(store, &stubPublisher{}, decisionLog)
 
 	body := `{"policy_type":"SPEND_CONTROL","action_context":{"amount":1000},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body))
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1184,5 +1208,84 @@ func TestEvaluate_PolicyTypeNotImplemented(t *testing.T) {
 	}
 	if decisionLog.calls != 0 {
 		t.Errorf("expected no decision recorded for an unimplemented policy_type, got %d calls", decisionLog.calls)
+	}
+}
+
+// ── tenant scope ─────────────────────────────────────────────────────────────
+
+// TestGetPolicyVersionByID_NoTenantScope_Refused covers the store's
+// self-disabling filter: with an empty tenant in context its lookup fell back to
+// UNSCOPED, so a request that simply omitted X-Tenant-Id read any tenant's
+// policy version by id.
+func TestGetPolicyVersionByID_NoTenantScope_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{findVersion: &domain.PolicyVersion{PolicyVersionID: "pv-1"}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/pv-1", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ListVersionHistory had no tenant scoping at all until this fix — any
+// authenticated caller could list every tenant's policy versions for a
+// policy_id. This proves the missing-header case is now refused, same
+// as its sibling GetPolicyVersionByID above.
+func TestListVersionHistory_NoTenantScope_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{history: []*domain.PolicyVersion{{PolicyVersionID: "pv-1"}}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestListApplicablePolicyVersions_ForeignTenantQueryParam_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	req := scoped(httptest.NewRequest(http.MethodGet,
+		"/v1/policies?policy_type=APPROVAL_THRESHOLD&tenant_id="+otherTenant, nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 reading another tenant's policy set, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A policy version decides what the platform enforces, so publishing one into
+// another tenant is the most consequential write this service has.
+func TestCreatePolicyVersion_ForeignTenantBody_Refused(t *testing.T) {
+	store := &stubStore{policy: &domain.Policy{PolicyID: "p-1"}}
+	r := newTestRouter(store)
+	body := `{"tenant_id":"` + otherTenant + `","rule_payload":{"threshold_amount":5000},"effective_from":"2026-01-01T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 publishing into another tenant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A global version (no tenant_id) bound to one legal entity is an incoherent
+// scope — and it used to be the way to reach global scope while authorizing only
+// against an entity the caller already held.
+func TestCreatePolicyVersion_GlobalScopeWithLegalEntity_Refused(t *testing.T) {
+	store := &stubStore{policy: &domain.Policy{PolicyID: "p-1"}}
+	r := newTestRouter(store)
+	body := `{"legal_entity_id":"33333333-3333-3333-3333-333333333333","rule_payload":{"threshold_amount":5000},"effective_from":"2026-01-01T00:00:00Z"}`
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/policies/p-1/versions", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a global version naming a legal entity, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEvaluate_ForeignTenantBody_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+	body := `{"policy_type":"APPROVAL_THRESHOLD","tenant_id":"` + otherTenant + `","action_context":{"amount":7500},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 evaluating against another tenant's policy set, got %d: %s", w.Code, w.Body.String())
 	}
 }

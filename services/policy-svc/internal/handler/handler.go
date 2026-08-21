@@ -15,6 +15,7 @@ import (
 	"zoiko.io/policy-svc/internal/authz"
 	"zoiko.io/policy-svc/internal/decisionlog"
 	"zoiko.io/policy-svc/internal/domain"
+	svcmiddleware "zoiko.io/policy-svc/internal/middleware"
 )
 
 // PolicyStore is the narrow interface the handler depends on.
@@ -98,6 +99,37 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 // authorize asks authorization-svc whether principalID may perform
 // actionType in the given scope, and writes the fail-closed response itself
 // when the answer is anything other than GRANTED.
+// requireTenant reads the caller's verified tenant scope from context (set by
+// middleware.TenantContext from X-Tenant-Id). Policies are what the platform
+// enforces, so a request that cannot say whose scope it is acting in has no
+// business publishing one or reading one back.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{
+			"error":   "tenant_scope_missing",
+			"message": "caller tenant scope missing",
+		})
+		return "", false
+	}
+	return tenantID, true
+}
+
+// refuseForeignTenant reports whether claimed names a tenant other than the
+// caller's verified scope, answering 403 if so. A nil or empty claimed value is
+// not a disagreement: for this service nil means GLOBAL scope, which is a
+// deliberate request rather than an omission, and is left to authorization.
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed *string, tenantID string) bool {
+	if claimed == nil || *claimed == "" || *claimed == tenantID {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{
+		"error":   "tenant_scope_mismatch",
+		"message": "request tenant_id does not match the caller's verified tenant scope",
+	})
+	return true
+}
+
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, actionType string, legalEntityID *string) bool {
 	scope := h.authzPlatformScopeID
 	if legalEntityID != nil && *legalEntityID != "" {
@@ -213,11 +245,7 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createPolicyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -326,17 +354,38 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createPolicyVersionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": missing,
+		})
+		return
+	}
+
+	// A version's tenant scope is the caller's VERIFIED tenant. tenant_id in the
+	// body used to be written straight through, so a principal holding
+	// POLICY_VERSION_CREATE on one legal entity could publish a version bound to
+	// another tenant entirely — and what a policy version binds is what the
+	// platform then enforces.
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if h.refuseForeignTenant(w, req.TenantID, tenantID) {
+		return
+	}
+	// tenant_id nil means GLOBAL (see domain.DeriveScopeType), and a global
+	// version bound to one legal entity is an incoherent scope: it would apply to
+	// every tenant while naming an entity in one of them. It also used to be the
+	// way to reach global scope while authorizing only against an entity the
+	// caller already held — refused rather than silently reinterpreted.
+	if req.TenantID == nil && req.LegalEntityID != nil && *req.LegalEntityID != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_scope",
+			"message": "a global version (no tenant_id) cannot name a legal_entity_id",
 		})
 		return
 	}
@@ -348,6 +397,8 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// req.TenantID is either nil (GLOBAL, deliberately) or equal to the verified
+	// tenant — refuseForeignTenant has already rejected anything else.
 	params := domain.CreatePolicyVersionParams{
 		PolicyVersionID:      req.PolicyVersionID,
 		PolicyID:             policyID,
@@ -440,11 +491,7 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req activateVersionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 
@@ -545,8 +592,14 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/policies/{policy_id}/versions ───────────────────────────────────
 
 // ListVersionHistory handles GET /v1/policies/{policy_id}/versions.
-// Returns the full version history for a policy, newest first
+// Returns the version history for a policy visible to the caller's
+// tenant (global versions plus that tenant's own), newest first
 // (by effective_from, then created_at, descending).
+//
+// Had no tenant scoping at all until now: any authenticated caller
+// could list every tenant's policy versions for a policy_id — approval
+// thresholds, spend limits, SoD rules. Now requires X-Tenant-Id, same as
+// GetPolicyVersionByID.
 //
 // Response:
 //
@@ -556,6 +609,10 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	policyID := chi.URLParam(r, "policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 
 	results, err := h.store.ListVersionHistory(r.Context(), policyID)
 	if err != nil {
@@ -601,6 +658,15 @@ func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetPolicyVersionByID(w http.ResponseWriter, r *http.Request) {
 	versionID := chi.URLParam(r, "version_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	// The store scopes this lookup to the tenant in context — but with an empty
+	// tenant it fell back to an UNSCOPED lookup, so a request with no
+	// X-Tenant-Id could read any tenant's policy version by id. That is the
+	// "filter that disables itself when the header is absent" shape; the header
+	// is required here so the store never sees an empty scope.
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 
 	v, err := h.store.FindPolicyVersionByID(r.Context(), versionID)
 	if err != nil {
@@ -656,12 +722,24 @@ func (h *Handler) ListApplicablePolicyVersions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	verifiedTenant, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var tenantID, legalEntityID *string
 	if v := q.Get("tenant_id"); v != "" {
 		tenantID = &v
 	}
 	if v := q.Get("legal_entity_id"); v != "" {
 		legalEntityID = &v
+	}
+	// ?tenant_id= used to be taken as the scope outright, so any caller could
+	// read the policy set another tenant is governed by — approval thresholds
+	// and segregation rules included. Omitting it still means "global versions
+	// only", which is a deliberate narrowing rather than an omission, so it is
+	// left alone; naming a DIFFERENT tenant is refused.
+	if h.refuseForeignTenant(w, tenantID, verifiedTenant) {
+		return
 	}
 
 	results, err := h.store.FindApplicableVersions(r.Context(), policyType, tenantID, legalEntityID)
@@ -748,11 +826,7 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	var req evaluateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "invalid_json",
-			"message": err.Error(),
-		})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.PolicyType == "" {
@@ -774,6 +848,18 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 			"error": "missing_field",
 			"field": "decision_id",
 		})
+		return
+	}
+
+	// tenant_id in the body selects which policy set decides the action AND is
+	// the tenant the resulting decision is recorded under. Naming another
+	// tenant therefore both borrowed their rules and filed the evidence in
+	// their log. Omitting it still means "evaluate against global policy only".
+	verifiedTenant, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if h.refuseForeignTenant(w, req.TenantID, verifiedTenant) {
 		return
 	}
 
@@ -919,4 +1005,27 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		// At this point headers are already sent — log only.
 		_ = err
 	}
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return false
+	}
+	return true
 }

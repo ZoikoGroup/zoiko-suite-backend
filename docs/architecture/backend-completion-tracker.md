@@ -17,8 +17,8 @@ finding was discovered. This file exists to be worked top-to-bottom, one row at 
 3. Run the full verification loop: `gofmt -w .` → `go build ./...` → `go vet ./...` →
    `go test ./... -count=1` on every service touched.
 4. Write/extend a test that specifically proves the fix (not just that nothing broke).
-5. Commit + push to `dev` (no PR — per standing instruction, one consolidated PR happens
-   at the end of the whole tracker, not per row).
+5. Commit + push to `satyaprakash-changes` (no PR — per standing instruction, one
+   consolidated PR happens at the end of the whole tracker, not per row).
 6. Mark the row `Done`, with the commit hash and a one-line note on what was verified.
 7. Only then move to the next row.
 
@@ -39,37 +39,56 @@ by grepping every migration file, not inferred. Pattern to copy: `governance-dec
 
 | # | Service | Spec ref | Status | Notes |
 |---|---|---|---|---|
-| 1 | identity-context-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 2 | secret-vault-integration-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 3 | policy-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 4 | jurisdiction-rules-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 5 | authorization-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 6 | workflow-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 7 | audit-event-store-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
-| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
+| 1 | identity-context-svc | Doc 03 §06, Doc 04 §2.2 | Done | `045ae84`. Also found & fixed a real cross-tenant hole: GET/PUT /v1/principals/{id} routes had no X-Tenant-Id check at all. RLS (ENABLE+FORCE+WITH CHECK) added on all 4 tables; 4 isolation tests + 2 handler tests live-verified against real Postgres 16. |
+| 2 | secret-vault-integration-svc | Doc 03 §06, Doc 04 §2.2 | Done | `6343434`. Real bug: ListVersionHistory had zero tenant scoping. RLS added with a documented `app.platform_scope` bypass for the 2 genuinely cross-tenant admin actions (ActivateVersion, Rotate). 9 tests live-verified against real Postgres 16, including 2 proving the bypass itself works. |
+| 3 | policy-svc | Doc 03 §06, Doc 04 §2.2 | Done | `14602c6`. Real bug: ListVersionHistory had zero tenant scoping (same shape as row 2's fix). RLS on policy_versions only (other 4 tables are platform-wide, no tenant_id). No platform-scope bypass needed — ActivateVersion here is genuinely tenant-scoped. 7 tests live-verified against real Postgres 16. |
+| 4 | jurisdiction-rules-svc | Doc 03 §06 | **Not applicable** | False positive in the original audit — the only "tenant_id" hit in its migrations is a comment ("...reference data, not per-tenant data. No tenant_id column."), not a real column. This service is genuinely platform-wide reference data (matches Doc 03's own design — jurisdiction-rules-svc *is* the jurisdiction concept). No RLS is possible or correct here; fabricating a tenant boundary would violate the "never fabricate a signal with nothing real to populate it" doctrine. Removed from the count of 8 — real Tier-0 count is 7. |
+| 5 | authorization-svc | Doc 03 §06, Doc 04 §2.2 | Done | `de2dfc9`. Real, severe bug found beyond the RLS gap: all 7 `/v1/admin/*` write routes had NO authentication at all — tenant_id and actor attribution came straight from the request body. Fixed all 7 (tenant verification, actor from X-Principal-Id, delegator-must-be-caller). RLS added on `roles`/`sod_rules` only (the only 2 tables with a real tenant_id). Two reads (`FindRoleByID`, `FindGrantedActions`) needed a deliberate platform-scope bypass — `FindGrantedActions` is the core `/v1/authorize` path called on nearly every request platform-wide; scoping it by tenant would have silently broken all authorization. 37 tests live-verified against real Postgres 16. |
+| 6 | workflow-svc | Doc 03 §06, Doc 04 §2.2 | Done | `9a5f748`. Two real bugs beyond RLS: (1) `FindWorkflowByID` — the choke point all Store methods route through — fell back to an UNSCOPED lookup when X-Tenant-Id was omitted (document-vault-svc's "filter that disables itself" shape); (2) `initiated_by`/`actor_principal_id` came from the request body on every route, making the existing SoD checks self-declared rather than load-bearing. RLS on `workflow_instances`. 31 tests live-verified against real Postgres 16 — including a purpose-created NOSUPERUSER NOBYPASSRLS role for the no-tenant probe (a superuser bypasses RLS unconditionally, so the first version of that test passed for the wrong reason) plus an explicit negative-control run with the migration removed. |
+| 7 | audit-event-store-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: `tenant_id TEXT NOT NULL` in 000001_initial_schema.up.sql |
+| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: nullable `tenant_id` (NULL = global default), same doctrine as policy-svc/secret-vault-integration-svc |
 
 **Verification method per row**: add a `TestPgStore_RLS_TenantIsolation`-style test (same
 pattern as tenant-entity-registry-svc's) that creates two tenants and proves a query scoped
 to tenant A cannot see tenant B's rows, against a real Postgres instance.
 
+⚠️ **Two ways an RLS test passes for the wrong reason** — both hit during row 6, both worth
+checking before marking any row Done:
+
+1. **Connected as a superuser.** `TEST_DATABASE_URL` normally points at `postgres`, and a
+   SUPERUSER bypasses row-level security *unconditionally* — `FORCE` does not change this.
+   A test asserting isolation while connected as the superuser proves only that the
+   application-level `WHERE tenant_id = $n` predicate works, and nothing at all about the
+   policy the row adds. For any assertion that the *policy itself* closes a gap (e.g. a
+   missing-tenant fallback the app predicate deliberately leaves open), connect as a
+   purpose-created `NOSUPERUSER NOBYPASSRLS` role — see workflow-svc's `appRolePool` helper
+   for the pattern. This mirrors the platform's real runtime role (`zoiko_app`).
+2. **The app predicate already covered it.** If the test would pass with the migration
+   deleted, it is testing the handler/store code, not the RLS policy. Run the negative
+   control explicitly: temporarily remove the `_add_rls.up.sql` file, confirm the test
+   fails, restore it, confirm it passes.
+
 ## Priority 2 — Remaining non-Tier-0 services with zero row-level security
 
 Same defect, lower severity (not on the governance critical path), still a real gap.
+Re-verified individually (2026-08-21) — 6 of these use `NNN_init.sql` naming rather than
+golang-migrate's `NNNNNN_name.up.sql`, which the original audit's glob pattern would have
+missed if re-run naively; checked their actual file contents directly instead.
 
 | # | Service | Status | Notes |
 |---|---|---|---|
 | 9 | ai-governance-svc | Not Started | |
-| 10 | banking-connector-svc | Not Started | |
+| 10 | banking-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 11 | commercial-account-svc | Not Started | |
-| 12 | connectivity-api-bridge-svc | Not Started | |
-| 13 | esignature-integration-svc | Not Started | |
+| 12 | connectivity-api-bridge-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 13 | esignature-integration-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 14 | evidence-manifest-svc | Not Started | |
-| 15 | external-data-feed-svc | Not Started | |
-| 16 | hris-connector-svc | Not Started | |
+| 15 | external-data-feed-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 16 | hris-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 17 | kill-switch-registry-svc | Not Started | |
 | 18 | retention-registry-svc | Not Started | |
-| 19 | source-authority-svc | Not Started | |
-| 20 | tax-authority-interface-svc | Not Started | |
+| 19 | source-authority-svc | **Not applicable** | False positive — its only "tenant_id" mention is a comment comparing its real column (`entity_ref`, free-text, no tenant dimension) to kill-switch-registry-svc's design. Genuinely platform-wide reference data; no fix needed. |
+| 20 | tax-authority-interface-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 
 ## Priority 3 — RLS enabled but not FORCEd (defense-in-depth only)
 
@@ -155,6 +174,8 @@ as the table owner (a future regression, manual psql access, etc). Worth doing, 
 | 78 | Obligation tracking duplicated across 3 services with non-identical schemas — violates §2.1 single-owner doctrine | Doc 04 §2.1 | Not Started | Verified: obligations-svc, obligation-tracking-svc, and filing-tracker-svc each have their OWN separate `obligations`/`filing_requirements` table |
 | 79 | Identity/role assignment duplicated across authorization-svc and identity-context-svc | Not Started | |
 | 80 | No field-level encryption/classification tagging on tax ID / bank reference / payroll columns anywhere outside document-vault-svc | Doc 04 §2.8, §20 | Not Started | |
+| 81 | authorization-svc owns its own `delegated_authorities` table, duplicating delegated-authority-svc's ownership of the same concept (Doc 03 §9.3 names Delegated Authority Service as the authoritative owner — a separate service) | Doc 04 §2.1 | Not Started | Found while fixing row 5's auth gap (2026-08-21). Not addressed there — this is a cross-service consolidation decision, same class as item 78, not a quick fix |
+| 82 | authorization-svc's `permission_bundles`, `principal_role_assignments`, `delegated_authorities`, and `access_decision_log` carry no `tenant_id` column at all — only `legal_entity_id` (and `delegated_authorities` not always that). RLS was only possible on `roles`/`sod_rules`, the 2 tables that actually have the column | Doc 04 §2.2 | Not Started | Found during row 5. Fabricating a `tenant_id` column on tables that were never given one is a data-model change, not an RLS migration — deliberately not done in that row |
 
 ## Priority 7 — Security (Doc 05) — capability exists, incomplete
 

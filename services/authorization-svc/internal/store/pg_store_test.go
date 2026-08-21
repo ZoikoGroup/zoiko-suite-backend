@@ -53,6 +53,14 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, string(mig3)); err != nil {
 		t.Fatalf("failed to execute migration 3: %v", err)
 	}
+
+	mig4, err := os.ReadFile("../../deployments/migrations/000004_add_rls.up.sql")
+	if err != nil {
+		t.Fatalf("failed to read migration 4: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(mig4)); err != nil {
+		t.Fatalf("failed to execute migration 4: %v", err)
+	}
 }
 
 // setupRoleWithGrant creates a role + bundle + active assignment for
@@ -219,7 +227,7 @@ func TestPgStore_RevokeRoleAssignment_EndsGrant(t *testing.T) {
 		t.Fatalf("expected grant before revoke, got %v", actions)
 	}
 
-	if _, err := s.RevokeRoleAssignment(ctx, assignment.PrincipalRoleAssignmentID); err != nil {
+	if _, err := s.RevokeRoleAssignment(ctx, assignment.PrincipalRoleAssignmentID, tenantID); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 
@@ -229,8 +237,97 @@ func TestPgStore_RevokeRoleAssignment_EndsGrant(t *testing.T) {
 	}
 
 	// Revoking again should 404, not silently succeed twice.
-	if _, err := s.RevokeRoleAssignment(ctx, assignment.PrincipalRoleAssignmentID); !errors.Is(err, domain.ErrRoleAssignmentNotFound) {
+	if _, err := s.RevokeRoleAssignment(ctx, assignment.PrincipalRoleAssignmentID, tenantID); !errors.Is(err, domain.ErrRoleAssignmentNotFound) {
 		t.Fatalf("expected ErrRoleAssignmentNotFound on double-revoke, got %v", err)
+	}
+}
+
+// TestPgStore_TenantIsolation_RevokeRoleAssignment proves the real fix
+// in this row: tenant B must not be able to revoke tenant A's role
+// assignment by ID alone, at the DB layer — RevokeRoleAssignment's own
+// tenant-via-role-join predicate, not just the handler's app-level check.
+func TestPgStore_TenantIsolation_RevokeRoleAssignment(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	tenantA := "00000000-0000-0000-0000-0000000000a1"
+	tenantB := "00000000-0000-0000-0000-0000000000b1"
+	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
+
+	role, _, err := s.CreateRole(ctx, domain.CreateRoleParams{TenantID: tenantA, RoleCode: "R1", RoleName: "R1", RoleScopeType: "LEGAL_ENTITY", CreatedByPrincipalID: "admin-1"})
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}}); err != nil {
+		t.Fatalf("create bundle: %v", err)
+	}
+	assignment, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
+		PrincipalID: "principal-1", RoleID: role.RoleID, LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("create assignment: %v", err)
+	}
+
+	// Probe: tenant B's context, tenant A's assignment ID.
+	if _, err := s.RevokeRoleAssignment(ctx, assignment.PrincipalRoleAssignmentID, tenantB); !errors.Is(err, domain.ErrRoleAssignmentNotFound) {
+		t.Fatalf("ISOLATION FAILURE: expected ErrRoleAssignmentNotFound revoking tenant A's assignment under tenant B, got %v", err)
+	}
+
+	// Verify tenant A's grant is genuinely still active.
+	actions, _, err := s.FindGrantedActions(ctx, "principal-1", legalEntityID)
+	if err != nil || len(actions) == 0 {
+		t.Fatalf("ISOLATION FAILURE: tenant A's grant was revoked by tenant B's attempt, actions=%v err=%v", actions, err)
+	}
+
+	// Sanity: tenant A can still revoke its own assignment.
+	if _, err := s.RevokeRoleAssignment(ctx, assignment.PrincipalRoleAssignmentID, tenantA); err != nil {
+		t.Fatalf("expected tenant A to revoke its own assignment, got %v", err)
+	}
+}
+
+// TestPgStore_PlatformScope_FindGrantedActionsAcrossTenants proves the
+// platform-scope bypass on FindGrantedActions actually works: this is
+// the core /v1/authorize evaluation path, called without any reliable
+// tenant context, and it must still resolve a real grant for a role that
+// belongs to a real, specific tenant. Without this test, a broken bypass
+// would silently deny every authorization check platform-wide the moment
+// zoiko_app (a genuine non-owner role) enforces FORCE ROW LEVEL SECURITY
+// for real.
+func TestPgStore_PlatformScope_FindGrantedActionsAcrossTenants(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	tenantA := "00000000-0000-0000-0000-0000000000a1"
+	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
+	role, _, err := s.CreateRole(ctx, domain.CreateRoleParams{TenantID: tenantA, RoleCode: "R1", RoleName: "R1", RoleScopeType: "LEGAL_ENTITY", CreatedByPrincipalID: "admin-1"})
+	if err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}}); err != nil {
+		t.Fatalf("create bundle: %v", err)
+	}
+	if _, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
+		PrincipalID: "principal-1", RoleID: role.RoleID, LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
+	}); err != nil {
+		t.Fatalf("create assignment: %v", err)
+	}
+
+	// No tenant is passed here at all — exactly how /v1/authorize's
+	// handler actually calls this today.
+	actions, basis, err := s.FindGrantedActions(context.Background(), "principal-1", legalEntityID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 || actions[0] != "ACTION_X" {
+		t.Fatalf("expected the tenant A role's grant to resolve with no tenant context supplied, got %v (basis=%s)", actions, basis)
 	}
 }
 

@@ -203,9 +203,17 @@ func withIdentity(req *http.Request) *http.Request {
 // request through it would carry no tenant, which this service's store now
 // refuses outright.
 func newApplicabilityTestRouter(s *stubStore) chi.Router {
+	return newApplicabilityTestRouterAuthz(s, &stubAuthz{})
+}
+
+// newApplicabilityTestRouterAuthz lets a test supply the authz stub, which the
+// applicability routes need now that recording a decision is gated. Without a
+// way to inject a DENY, the gate could only ever be tested in its allowing
+// direction — and a gate is only proven by the request it refuses.
+func newApplicabilityTestRouterAuthz(s *stubStore, a *stubAuthz) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, &stubPublisher{}, &stubValidator{}, &stubAuthz{}, zap.NewNop())
+	h := handler.New(s, &stubPublisher{}, &stubValidator{}, a, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	handler.RegisterApplicabilityRoutes(r, h)
 	return r

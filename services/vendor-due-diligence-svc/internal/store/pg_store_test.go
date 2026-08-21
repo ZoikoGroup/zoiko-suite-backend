@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/vendor-due-diligence-svc/internal/domain"
@@ -53,13 +55,23 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_dd_evidence CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS vendor_dd_checks CASCADE;`)
 
-	// Both migrations, in order. Applying only 000001 would leave
-	// screening_source and the outcome CHECK constraint absent and quietly pass
-	// the tests that exist to prove them.
-	for _, name := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_screening_source.up.sql",
-	} {
+	// Globbed, not listed: this list had fallen behind the directory, so the suite
+	// applied a schema no deployment has -- notably without the FORCE row-level
+	// security migration, the one a store test most needs in place. Sorted because
+	// the 000001_, 000002_ prefixes ARE the order.
+	migrationFiles, err := filepath.Glob(filepath.Join(migrations, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to glob migrations: %v", err)
+	}
+	if len(migrationFiles) == 0 {
+		t.Fatalf("no *.up.sql migrations found under %s", migrations)
+	}
+	sort.Strings(migrationFiles)
+	var migrationFilesNames []string
+	for _, p := range migrationFiles {
+		migrationFilesNames = append(migrationFilesNames, filepath.Base(p))
+	}
+	for _, name := range migrationFilesNames {
 		sql, err := os.ReadFile(filepath.Join(migrations, name))
 		if err != nil {
 			t.Fatalf("failed to read migration %s: %v", name, err)
@@ -70,6 +82,34 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+// scoped runs a verification query with app.tenant_id installed, exactly as the
+// store installs it for every statement it makes.
+//
+// The assertions here deliberately query the tables directly rather than
+// through the store: a write must not be verified by the code that performed
+// it. But a raw query carries no tenant scope, and once the row-level security
+// policy actually applies -- which it does the moment the service connects as
+// something other than a superuser -- an unscoped statement matches NO rows.
+// A SELECT then reports "this row was never written" about a row that was, and
+// an UPDATE reports no error while changing nothing at all, which is worse: the
+// test proceeds against state it believes it arranged.
+//
+// Transaction-local, so no stale tenant is left on the pooled connection to
+// silently scope a later query to the wrong tenant.
+func scoped(t *testing.T, pool *pgxpool.Pool, tenantID string, fn func(tx pgx.Tx)) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("verification tx begin failed: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("installing the verification tenant scope failed: %v", err)
+	}
+	fn(tx)
 }
 
 // requireThrowawayDatabase fails the test unless the DSN's database name marks
@@ -530,12 +570,14 @@ func TestConcludeCheck_DocumentReferenceIsNullWhenAbsent(t *testing.T) {
 	}
 
 	var nulls int
-	if err := pool.QueryRow(context.Background(), `
-		SELECT COUNT(*) FROM vendor_dd_evidence
-		WHERE check_id = $1 AND document_reference IS NULL
-	`, without.CheckID).Scan(&nulls); err != nil {
-		t.Fatalf("count: %v", err)
-	}
+	scoped(t, pool, testTenant, func(tx pgx.Tx) {
+		if err := tx.QueryRow(context.Background(), `
+			SELECT COUNT(*) FROM vendor_dd_evidence
+			WHERE check_id = $1 AND document_reference IS NULL
+		`, without.CheckID).Scan(&nulls); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+	})
 	if nulls != 1 {
 		t.Errorf("an absent document reference must be stored as NULL, not \"\": got %d NULL rows", nulls)
 	}

@@ -61,16 +61,16 @@ type mockPrincipalStore struct {
 func (m *mockPrincipalStore) FindByIDPSubject(_ context.Context, _, _ string) (*domain.Principal, error) {
 	return m.principal, m.findErr
 }
-func (m *mockPrincipalStore) FindByID(_ context.Context, _ string) (*domain.Principal, error) {
+func (m *mockPrincipalStore) FindByID(_ context.Context, _, _ string) (*domain.Principal, error) {
 	return m.principal, m.findErr
 }
-func (m *mockPrincipalStore) FindActiveRoleAssignments(_ context.Context, _ string, _ *string) ([]domain.PrincipalRoleAssignment, error) {
+func (m *mockPrincipalStore) FindActiveRoleAssignments(_ context.Context, _, _ string, _ *string) ([]domain.PrincipalRoleAssignment, error) {
 	return m.assignments, nil
 }
-func (m *mockPrincipalStore) FindActiveDelegations(_ context.Context, _ string) ([]domain.DelegatedAuthority, error) {
+func (m *mockPrincipalStore) FindActiveDelegations(_ context.Context, _, _ string) ([]domain.DelegatedAuthority, error) {
 	return m.delegations, nil
 }
-func (m *mockPrincipalStore) UpdateStatus(_ context.Context, _ string, _ domain.PrincipalStatus, _, _ string) error {
+func (m *mockPrincipalStore) UpdateStatus(_ context.Context, _, _ string, _ domain.PrincipalStatus, _, _ string) error {
 	return nil
 }
 

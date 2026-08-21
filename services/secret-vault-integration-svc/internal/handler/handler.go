@@ -16,6 +16,7 @@ import (
 	"zoiko.io/secret-vault-integration-svc/internal/authz"
 	"zoiko.io/secret-vault-integration-svc/internal/classification"
 	"zoiko.io/secret-vault-integration-svc/internal/domain"
+	svcmiddleware "zoiko.io/secret-vault-integration-svc/internal/middleware"
 	"zoiko.io/secret-vault-integration-svc/internal/store"
 )
 
@@ -28,15 +29,15 @@ type SecretVaultStore interface {
 	CreateSecretPolicyVersion(ctx context.Context, params domain.CreateSecretPolicyVersionParams) (*domain.SecretPolicyVersion, bool, error)
 	FindSecretPolicyVersionByID(ctx context.Context, secretPolicyVersionID string) (*domain.SecretPolicyVersion, error)
 	ActivateVersion(ctx context.Context, secretPolicyVersionID, actorID string) (*domain.SecretPolicyVersion, []*domain.SecretPolicyVersion, bool, error)
-	ListVersionHistory(ctx context.Context, secretPolicyID string) ([]*domain.SecretPolicyVersion, error)
+	ListVersionHistory(ctx context.Context, secretPolicyID, tenantID string) ([]*domain.SecretPolicyVersion, error)
 
 	FindApplicableVersions(ctx context.Context, secretClass string, tenantID, legalEntityID *string) ([]*domain.ApplicableSecretPolicyVersion, error)
 	FindApplicableVersionByPath(ctx context.Context, secretPath string, tenantID, legalEntityID *string) (*domain.ApplicableSecretPolicyVersion, error)
 
 	CreateLease(ctx context.Context, params domain.CreateLeaseParams) (*domain.SecretLease, bool, error)
-	FindLeaseByID(ctx context.Context, leaseID string) (*domain.SecretLease, error)
+	FindLeaseByID(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, error)
 	ListLeases(ctx context.Context, filter store.LeaseListFilter) ([]*domain.SecretLease, error)
-	RevokeLease(ctx context.Context, leaseID string) (*domain.SecretLease, bool, error)
+	RevokeLease(ctx context.Context, leaseID, tenantID string) (*domain.SecretLease, bool, error)
 	RevokeLeasesBySecretPath(ctx context.Context, secretPath string) ([]*domain.SecretLease, error)
 
 	RecordAuditEntry(ctx context.Context, params domain.RecordAuditEntryParams) (*domain.SecretAccessAuditLog, error)
@@ -157,8 +158,7 @@ func (h *Handler) CreateSecretPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createSecretPolicyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -238,8 +238,7 @@ func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Reque
 	}
 
 	var req createSecretPolicyVersionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
@@ -249,6 +248,27 @@ func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Reque
 	if req.MaxLeaseDurationSeconds <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "invalid_field", "field": "max_lease_duration_seconds", "message": "must be greater than 0",
+		})
+		return
+	}
+	// tenant_id in the body used to be written straight through, so a caller
+	// could publish the secret policy version that governs another tenant's
+	// secret path — including the allowed_workload_ids list that decides who may
+	// broker it.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		return
+	}
+	// tenant_id nil means GLOBAL, and a global version bound to one legal entity
+	// is an incoherent scope: it would govern every tenant while naming an entity
+	// inside one of them.
+	if req.TenantID == nil && req.LegalEntityID != nil && *req.LegalEntityID != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_scope",
+			"message": "a global version (no tenant_id) cannot name a legal_entity_id",
 		})
 		return
 	}
@@ -323,8 +343,7 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req activateVersionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.ActivatedByPrincipalID == "" {
@@ -391,13 +410,16 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	if !h.authorize(w, r, principalID, "", ActionSecretMaterialWrite) {
 		return
 	}
 
 	var req putSecretMaterialRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.MaterialBase64 == "" {
@@ -421,6 +443,25 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// There is deliberately no tenant comparison on the policy row: a
+	// secret_policies row has no tenant_id at all — tenancy lives on its
+	// versions, as in policy-svc — so a material write cannot be scoped by
+	// reading the policy.
+	//
+	// What bounds this write is the authorization above: SECRET_MATERIAL_WRITE is
+	// checked with an empty entity, which resolves to the PLATFORM scope, so only
+	// a platform-level principal can store material at all. A per-tenant check
+	// via the applicable version was considered and rejected: material is
+	// legitimately written before any version is active (create policy, store
+	// material, then publish a version), so requiring one would break the
+	// bootstrap order rather than close a hole. The caller's tenant is required
+	// for attribution and logged with the write.
+	h.log.Info("secret material stored",
+		zap.String("secret_policy_id", secretPolicyID),
+		zap.String("principal_id", principalID),
+		zap.String("caller_tenant_id", tenantScope),
+		zap.String("correlation_id", correlationID),
+	)
 
 	if err := h.vault.Put(r.Context(), policy.SecretPath, material); err != nil {
 		h.log.Error("PutSecretMaterial: vault backend put failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
@@ -434,11 +475,23 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/secret-policies/{id}/versions ───────────────────────────────────
 
 // ListVersionHistory handles GET /v1/secret-policies/{secret_policy_id}/versions.
+//
+// Had no tenant scoping at all until now: any authenticated caller could
+// list every tenant's allowed_workload_ids and lease-duration limits for
+// a policy — provisioning data about who may broker the secret, not
+// something a read endpoint should hand out platform-wide by default.
+// Now requires X-Tenant-Id, same as its sibling read endpoints
+// (GetLease, ListLeases).
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	secretPolicyID := chi.URLParam(r, "secret_policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	results, err := h.store.ListVersionHistory(r.Context(), secretPolicyID)
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	results, err := h.store.ListVersionHistory(r.Context(), secretPolicyID, tenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrSecretPolicyNotFound):
@@ -469,12 +522,22 @@ func (h *Handler) ListApplicableSecretPolicyVersions(w http.ResponseWriter, r *h
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "secret_class"})
 		return
 	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var tenantID, legalEntityID *string
 	if v := q.Get("tenant_id"); v != "" {
 		tenantID = &v
 	}
 	if v := q.Get("legal_entity_id"); v != "" {
 		legalEntityID = &v
+	}
+	// ?tenant_id= used to be taken as the scope outright, so any caller could read
+	// the secret policies governing another tenant's paths. Omitting it still
+	// means "global versions only".
+	if h.refuseForeignTenant(w, tenantID, tenantScope) {
+		return
 	}
 
 	results, err := h.store.FindApplicableVersions(r.Context(), secretClass, tenantID, legalEntityID)
@@ -541,12 +604,23 @@ type brokerResponse struct {
 // required.
 func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	var req brokerRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		return
+	}
+
+	// tenant_id in the body chose which policy scope governed the request, and
+	// was stamped on the lease and on every audit entry — so a request could be
+	// decided by another tenant's secret policy and then recorded in their access
+	// log. Omitting it still means the global policy set.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
 		return
 	}
 
@@ -691,7 +765,12 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 	leaseID := chi.URLParam(r, "lease_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	lease, err := h.store.FindLeaseByID(r.Context(), leaseID)
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	lease, err := h.store.FindLeaseByID(r.Context(), leaseID, tenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
@@ -700,6 +779,12 @@ func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
 			h.log.Error("GetLease: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		}
+		return
+	}
+	// A lease says which principal holds live access to which secret path. Any id
+	// returned one, from any tenant. FindLeaseByID's own predicate is now the
+	// primary control; this stays as the belt-and-suspenders check it always was.
+	if h.refuseForeignRow(w, lease.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
 		return
 	}
 	writeJSON(w, http.StatusOK, lease)
@@ -711,13 +796,26 @@ func (h *Handler) ListLeases(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	filter := store.LeaseListFilter{
 		RequestedByPrincipalID: q.Get("principal"),
 		SecretClass:            q.Get("secret_class"),
 	}
-	if v := q.Get("tenant_id"); v != "" {
-		filter.TenantID = &v
+	// The tenant filter was OPTIONAL, so omitting it listed every tenant's live
+	// leases — who currently holds access to which secret path, platform-wide.
+	// It is now the caller's verified scope, and a query parameter naming another
+	// tenant is refused rather than ignored.
+	if v := q.Get("tenant_id"); v != "" && v != tenantScope {
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "tenant_scope_mismatch",
+			"message": "request tenant_id does not match the caller's verified tenant scope",
+		})
+		return
 	}
+	filter.TenantID = &tenantScope
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
@@ -770,8 +868,38 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r, principalID, "", ActionSecretLeaseRevoke) {
 		return
 	}
+	// Read the lease before revoking it: any lease id could be revoked from any
+	// tenant, and a revocation cannot be undone, so the scope check has to happen
+	// BEFORE the transition rather than on the way out.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	existing, err := h.store.FindLeaseByID(r.Context(), leaseID, tenantScope)
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrLeaseNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+		default:
+			h.log.Error("RevokeLease: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+	if existing == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "lease_not_found", "lease_id": leaseID})
+		return
+	}
+	if h.refuseForeignRow(w, existing.TenantID, tenantScope, "lease_not_found", "lease_id", leaseID) {
+		h.log.Warn("RevokeLease refused: lease belongs to another tenant",
+			zap.String("lease_id", leaseID),
+			zap.String("caller_tenant_id", tenantScope),
+			zap.String("correlation_id", correlationID),
+		)
+		return
+	}
 
-	lease, transitioned, err := h.store.RevokeLease(r.Context(), leaseID)
+	lease, transitioned, err := h.store.RevokeLease(r.Context(), leaseID, tenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLeaseNotFound):
@@ -862,8 +990,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req rotateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+	if !decodeJSON(w, r, &req) {
 		return
 	}
 	if req.RequestID == "" {
@@ -967,10 +1094,19 @@ func (h *Handler) ListAuditLog(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	q := r.URL.Query()
 
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	// This filter had NO tenant field at all, so the secret-access audit log —
+	// every REQUESTED, GRANTED, DENIED and REVOKED event, with principal and
+	// secret path — was readable across every tenant by anything that could reach
+	// the port.
 	filter := store.AuditListFilter{
 		RequestedByPrincipalID: q.Get("principal"),
 		SecretPath:             q.Get("secret_path"),
 		EventType:              q.Get("event_type"),
+		TenantID:               &tenantScope,
 	}
 	if v := q.Get("from"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
@@ -1040,6 +1176,50 @@ const (
 
 // requirePrincipal resolves the acting principal from the gateway-verified
 // X-Principal-Id header, writing 401 and returning false when absent.
+// requireTenant reads the caller's verified tenant scope from context (set by
+// middleware.TenantContext from X-Tenant-Id).
+//
+// Nothing in this service used to read that header. Which secret policy applied,
+// whose leases were listed, and whose secret-access audit log came back were all
+// decided by values the request supplied about itself.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if id := strings.TrimSpace(svcmiddleware.TenantFromContext(r.Context())); id != "" {
+		return id, true
+	}
+	writeJSON(w, http.StatusUnauthorized, map[string]string{
+		"error":   "tenant_scope_missing",
+		"message": "X-Tenant-Id is required — the gateway sets it from a verified identity envelope",
+	})
+	return "", false
+}
+
+// refuseForeignTenant reports whether claimed names a tenant other than the
+// caller's verified scope, answering 403 if so. A nil or empty claimed value is
+// not a disagreement: for secret policies nil means GLOBAL scope, a deliberate
+// request that authorization rather than scoping decides on.
+func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed *string, tenantID string) bool {
+	if claimed == nil || *claimed == "" || *claimed == tenantID {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{
+		"error":   "tenant_scope_mismatch",
+		"message": "request tenant_id does not match the caller's verified tenant scope",
+	})
+	return true
+}
+
+// refuseForeignRow reports whether a row this service found by id belongs to
+// another tenant, answering 404 if so — the same answer as a row that does not
+// exist, so an id-addressed route cannot be used to probe for another tenant's
+// leases or policies. A row with no tenant at all is global and stays visible.
+func (h *Handler) refuseForeignRow(w http.ResponseWriter, rowTenantID *string, tenantID string, notFoundError, idField, idValue string) bool {
+	if rowTenantID == nil || *rowTenantID == "" || *rowTenantID == tenantID {
+		return false
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": notFoundError, idField: idValue})
+	return true
+}
+
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if id := strings.TrimSpace(r.Header.Get("X-Principal-Id")); id != "" {
 		return id, true
@@ -1072,4 +1252,27 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authz_unavailable"})
 	}
 	return false
+}
+
+// maxRequestBytes caps a JSON request body. A bare json.Decoder reads until EOF,
+// so without this a single request can make the service allocate whatever the
+// client is willing to send -- no auth needed, and nothing in the metrics to
+// distinguish it from load.
+const maxRequestBytes = 256 << 10 // 256 KiB
+
+// decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
+// the cap is what stopped it: "too large" and "malformed" are different faults
+// and a caller can only act on the difference.
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
+			return false
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return false
+	}
+	return true
 }

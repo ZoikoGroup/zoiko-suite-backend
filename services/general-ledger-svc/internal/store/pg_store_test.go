@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -43,21 +45,63 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS journal_lines, journal_headers CASCADE;`)
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_idempotency_index.up.sql",
-		"000003_add_atomic_linking.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
+	// Every *.up.sql, sorted, rather than a list written out here.
+	//
+	// The list stopped at 000003, so this suite has been running against a
+	// schema no deployment has: 000004 is the one that FORCEs row-level
+	// security, which is the migration a store test most needs applied — the
+	// tests could not have caught the policy being wrong because the policy was
+	// never in force. Globbing means the next migration lands here too.
+	migrationDir := filepath.Join(base, "../../deployments/migrations")
+	migrations, err := filepath.Glob(filepath.Join(migrationDir, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to glob migrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatalf("no *.up.sql migrations found under %s", migrationDir)
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", migration, err)
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(migration), err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", migration, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(migration), err)
 		}
 	}
 
 	return pool
+}
+
+// scoped runs a verification query with app.tenant_id installed, exactly as the
+// store installs it for every statement it makes.
+//
+// The assertions below deliberately query the tables directly rather than
+// through the store: a write must not be verified by the code that performed
+// it. But a raw query carries no tenant scope, and once the row-level security
+// policy actually applies — which it does the moment the service connects as
+// something other than a superuser — an unscoped SELECT returns NO rows. The
+// assertion then reports "this row was never written" about a row that was,
+// which is a false alarm on the most alarming subject in the ledger.
+//
+// The scope is transaction-local, so nothing leaks back onto the pooled
+// connection. That matters: a custom GUC set non-locally survives on the
+// connection, and a stale tenant there would silently scope a later query to
+// the wrong tenant.
+func scoped(t *testing.T, pool *pgxpool.Pool, tenantID string, fn func(tx pgx.Tx)) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("verification tx begin failed: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("installing the verification tenant scope failed: %v", err)
+	}
+	fn(tx)
 }
 
 // requireThrowawayDatabase refuses to run against anything not recognisably
@@ -184,10 +228,12 @@ func TestPgStore_CreateJournal_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	// Confirm only ONE journal actually exists in the database for this
 	// correlation_id — the real assertion this test exists to make.
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM journal_headers WHERE tenant_id = $1 AND correlation_id = $2`,
-		tenantID, "corr-retry-1").Scan(&count); err != nil {
-		t.Fatalf("count query failed: %v", err)
-	}
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM journal_headers WHERE tenant_id = $1 AND correlation_id = $2`,
+			tenantID, "corr-retry-1").Scan(&count); err != nil {
+			t.Fatalf("count query failed: %v", err)
+		}
+	})
 	if count != 1 {
 		t.Fatalf("DUPLICATE POSTING: expected exactly 1 journal_headers row for this correlation_id, got %d", count)
 	}
@@ -383,12 +429,14 @@ func TestPgStore_ReverseJournal_PersistsReversalLink(t *testing.T) {
 		postedBy   *string
 		postedAt   *time.Time
 	)
-	if err := pool.QueryRow(ctx, `
-		SELECT reversal_of_journal_id::text, status, posted_by_principal_id, posted_at
-		FROM journal_headers WHERE journal_id = $1`, reversing.JournalID).
-		Scan(&reversalOf, &status, &postedBy, &postedAt); err != nil {
-		t.Fatalf("reading back the reversing journal failed: %v", err)
-	}
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `
+			SELECT reversal_of_journal_id::text, status, posted_by_principal_id, posted_at
+			FROM journal_headers WHERE journal_id = $1`, reversing.JournalID).
+			Scan(&reversalOf, &status, &postedBy, &postedAt); err != nil {
+			t.Fatalf("reading back the reversing journal failed: %v", err)
+		}
+	})
 
 	if reversalOf == nil || *reversalOf != original.JournalID {
 		t.Fatalf("STORED reversing journal has reversal_of_journal_id = %v, expected %s — the link was dropped on insert",
@@ -407,11 +455,13 @@ func TestPgStore_ReverseJournal_PersistsReversalLink(t *testing.T) {
 	// And the original must now be REVERSED, with its actor recorded.
 	var originalStatus string
 	var reversedBy *string
-	if err := pool.QueryRow(ctx, `
-		SELECT status, reversed_by_principal_id FROM journal_headers WHERE journal_id = $1`,
-		original.JournalID).Scan(&originalStatus, &reversedBy); err != nil {
-		t.Fatalf("reading back the original failed: %v", err)
-	}
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `
+			SELECT status, reversed_by_principal_id FROM journal_headers WHERE journal_id = $1`,
+			original.JournalID).Scan(&originalStatus, &reversedBy); err != nil {
+			t.Fatalf("reading back the original failed: %v", err)
+		}
+	})
 	if originalStatus != string(domain.JournalStatusReversed) {
 		t.Fatalf("expected the original to be REVERSED, got %s", originalStatus)
 	}
@@ -469,19 +519,23 @@ func TestPgStore_ReverseJournal_NotFinalized_RollsBackBothHalves(t *testing.T) {
 
 	// The whole point: the reversing journal must not exist.
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM journal_headers WHERE journal_id = $1`,
-		reversing.JournalID).Scan(&count); err != nil {
-		t.Fatalf("count query failed: %v", err)
-	}
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM journal_headers WHERE journal_id = $1`,
+			reversing.JournalID).Scan(&count); err != nil {
+			t.Fatalf("count query failed: %v", err)
+		}
+	})
 	if count != 0 {
 		t.Fatal("ORPHAN REVERSAL: a refused reversal left a FINALIZED reversing journal in the ledger, " +
 			"which is a double-counted book no later request reconciles")
 	}
 	var lineCount int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM journal_lines WHERE journal_id = $1`,
-		reversing.JournalID).Scan(&lineCount); err != nil {
-		t.Fatalf("line count query failed: %v", err)
-	}
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM journal_lines WHERE journal_id = $1`,
+			reversing.JournalID).Scan(&lineCount); err != nil {
+			t.Fatalf("line count query failed: %v", err)
+		}
+	})
 	if lineCount != 0 {
 		t.Fatalf("expected the reversing journal's lines to roll back too, found %d", lineCount)
 	}
@@ -562,10 +616,12 @@ func TestPgStore_CreateJournal_Retry_ResolvesFullStoredHeader(t *testing.T) {
 	}
 
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM journal_headers WHERE tenant_id = $1 AND correlation_id = $2`,
-		tenantID, correlationID).Scan(&count); err != nil {
-		t.Fatalf("count query failed: %v", err)
-	}
+	scoped(t, pool, tenantID, func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM journal_headers WHERE tenant_id = $1 AND correlation_id = $2`,
+			tenantID, correlationID).Scan(&count); err != nil {
+			t.Fatalf("count query failed: %v", err)
+		}
+	})
 	if count != 1 {
 		t.Fatalf("DUPLICATE POSTING: expected 1 journal for this correlation_id, got %d", count)
 	}
