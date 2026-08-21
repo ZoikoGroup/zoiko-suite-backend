@@ -97,7 +97,7 @@ func (s *stubStore) FindSecretPolicyVersionByID(_ context.Context, _ string) (*d
 func (s *stubStore) ActivateVersion(_ context.Context, _, _ string) (*domain.SecretPolicyVersion, []*domain.SecretPolicyVersion, bool, error) {
 	return s.activated, nil, s.activated != nil, s.activateErr
 }
-func (s *stubStore) ListVersionHistory(_ context.Context, _ string) ([]*domain.SecretPolicyVersion, error) {
+func (s *stubStore) ListVersionHistory(_ context.Context, _, _ string) ([]*domain.SecretPolicyVersion, error) {
 	return s.history, s.historyErr
 }
 func (s *stubStore) FindApplicableVersions(_ context.Context, _ string, _, _ *string) ([]*domain.ApplicableSecretPolicyVersion, error) {
@@ -109,14 +109,14 @@ func (s *stubStore) FindApplicableVersionByPath(_ context.Context, _ string, _, 
 func (s *stubStore) CreateLease(_ context.Context, _ domain.CreateLeaseParams) (*domain.SecretLease, bool, error) {
 	return s.lease, s.leaseCreated, s.leaseErr
 }
-func (s *stubStore) FindLeaseByID(_ context.Context, _ string) (*domain.SecretLease, error) {
+func (s *stubStore) FindLeaseByID(_ context.Context, _, _ string) (*domain.SecretLease, error) {
 	return s.findLeaseResult, s.findLeaseErr
 }
 func (s *stubStore) ListLeases(_ context.Context, filter store.LeaseListFilter) ([]*domain.SecretLease, error) {
 	s.leaseFilter = filter
 	return s.listLeasesResult, s.listLeasesErr
 }
-func (s *stubStore) RevokeLease(_ context.Context, _ string) (*domain.SecretLease, bool, error) {
+func (s *stubStore) RevokeLease(_ context.Context, _, _ string) (*domain.SecretLease, bool, error) {
 	return s.revokeLeaseResult, s.revokeLeaseTransitioned, s.revokeLeaseErr
 }
 func (s *stubStore) RevokeLeasesBySecretPath(_ context.Context, _ string) ([]*domain.SecretLease, error) {
