@@ -41,7 +41,7 @@ by grepping every migration file, not inferred. Pattern to copy: `governance-dec
 |---|---|---|---|---|
 | 1 | identity-context-svc | Doc 03 §06, Doc 04 §2.2 | Done | `045ae84`. Also found & fixed a real cross-tenant hole: GET/PUT /v1/principals/{id} routes had no X-Tenant-Id check at all. RLS (ENABLE+FORCE+WITH CHECK) added on all 4 tables; 4 isolation tests + 2 handler tests live-verified against real Postgres 16. |
 | 2 | secret-vault-integration-svc | Doc 03 §06, Doc 04 §2.2 | Done | `6343434`. Real bug: ListVersionHistory had zero tenant scoping. RLS added with a documented `app.platform_scope` bypass for the 2 genuinely cross-tenant admin actions (ActivateVersion, Rotate). 9 tests live-verified against real Postgres 16, including 2 proving the bypass itself works. |
-| 3 | policy-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
+| 3 | policy-svc | Doc 03 §06, Doc 04 §2.2 | Done | `14602c6`. Real bug: ListVersionHistory had zero tenant scoping (same shape as row 2's fix). RLS on policy_versions only (other 4 tables are platform-wide, no tenant_id). No platform-scope bypass needed — ActivateVersion here is genuinely tenant-scoped. 7 tests live-verified against real Postgres 16. |
 | 4 | jurisdiction-rules-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
 | 5 | authorization-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
 | 6 | workflow-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | |
