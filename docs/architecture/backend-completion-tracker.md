@@ -140,8 +140,8 @@ either one keeps the hole.
 | # | Service | In Priority 2? | Status |
 |---|---|---|---|
 | 8a | banking-connector-svc | yes (row 10) | **Done** `02421f7` — fixed together with row 10 |
-| 8b | connectivity-api-bridge-svc | yes (row 12) | Not Started |
-| 8c | esignature-integration-svc | yes (row 13) | Not Started |
+| 8b | connectivity-api-bridge-svc | yes (row 12) | **Done** — fixed together with row 12 |
+| 8c | esignature-integration-svc | yes (row 13) | **Done** — fixed together with row 13 |
 | 8d | external-data-feed-svc | yes (row 15) | Not Started |
 | 8e | hris-connector-svc | yes (row 16) | Not Started |
 | 8f | tax-authority-interface-svc | yes (row 20) | Not Started |
@@ -173,8 +173,8 @@ missed if re-run naively; checked their actual file contents directly instead.
 | 9 | ai-governance-svc | Not Started | |
 | 10 | banking-connector-svc | Done | `02421f7`. **Three defects, done together with row 8a** — RLS here is only load-bearing once the fabricated identity is gone. (1) `default-tenant` fabrication → now 401. (2) **Cross-tenant leak of bank data**, the worst of the three: all 3 reads had no tenant predicate — `GetConnectionByID`/`ListStatements` filtered on id alone (exposing `bank_name`, `bic`, `account_number`, balances), and `ListConnections`' only filter disabled itself when `legal_entity_id` was omitted. (3) RLS added (ENABLE+FORCE+WITH CHECK, no exemption needed). Also fixed `MemoryStore`, which had the identical unscoped reads — the handler tests run against it, so isolation assertions were passing against a fake that could not fail. Verified against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role with negative controls on all three. |
 | 11 | commercial-account-svc | Not Started | |
-| 12 | connectivity-api-bridge-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
-| 13 | esignature-integration-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 12 | connectivity-api-bridge-svc | Done | Same three defects as row 10, done with row 8b. Unscoped reads exposed another tenant's `endpoint_url`/`auth_type` (`GetBridgeByID`), and `ListIngestionLogs` exposed payload summaries + error messages — the contents flowing through their integration. `ListBridges`' only filter disabled itself. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
+| 13 | esignature-integration-svc | Done | **Worst variant found so far: an unscoped WRITE.** `UpdateEnvelopeStatus` was `WHERE envelope_id = $4` alone, so any caller holding another tenant's envelope_id could mark that tenant's document SIGNED/COMPLETED and set `external_ref`. Doc 03 §16.5 makes this the governed execution path for contracts, board resolutions and legal artifacts, so a forged transition is a legal-integrity issue. Reads also exposed `signer_email`/`signer_name` (personal data). Negative control established RLS alone is sufficient AND that with both controls removed the forged mutation really lands — my first attempt at that control was invalid (a `sed` left `$5` bound, so Postgres errored on parameter count and the test passed for the wrong reason); redone correctly. |
 | 14 | evidence-manifest-svc | Not Started | |
 | 15 | external-data-feed-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 16 | hris-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
