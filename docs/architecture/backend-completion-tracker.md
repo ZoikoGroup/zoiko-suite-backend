@@ -93,6 +93,74 @@ checking before marking any row Done:
    control explicitly: temporarily remove the `_add_rls.up.sql` file, confirm the test
    fails, restore it, confirm it passes.
 
+## Priority 1b — Fabricated tenant identity: the `"default-tenant"` fallback (16 services)
+
+**Found 2026-08-22 during Priority 2 reconnaissance. This blocks meaningful RLS on 6 of
+Priority 2's rows, so it is sequenced ahead of them.**
+
+16 services silently substitute the literal string `"default-tenant"` when `X-Tenant-ID` is
+absent, in request-path middleware (`internal/middleware/tenant.go`) or directly in a handler
+— not in dev seeding. Verified in each:
+
+```go
+tenantID := r.Header.Get("X-Tenant-ID")
+if tenantID == "" {
+    tenantID = "default-tenant"     // ← fabricated identity
+}
+...
+func GetTenantID(ctx context.Context) string {
+    if val, ok := ctx.Value(TenantIDKey).(string); ok && val != "" { return val }
+    return "default-tenant"          // ← and again, as a getter default
+}
+```
+
+**Why this is worse than a missing tenant check.** A header-less request does not fail — it
+succeeds, attributed to a tenant that does not exist. Every header-less request from every
+caller lands in the *same* `"default-tenant"` bucket, so those rows are co-mingled, and any
+caller can read another's data by simply *omitting* the header. Omitting it is the easier
+request to make, which makes the insecure path the path of least resistance — the same shape
+as document-vault-svc's "filter that disables itself" and payroll-exceptions-svc's `"GLOBAL"`
+sentinel, and a direct violation of the platform's own "never fabricate a signal with nothing
+real to populate it" doctrine.
+
+**Why it must be fixed before/with RLS on the affected services, not after.** RLS compares
+`tenant_id = app.tenant_id`. The application would set `app.tenant_id = 'default-tenant'`, so
+every header-less caller would still read and write each other's rows — inside the policy,
+legitimately. Tests that pass a real tenant would go green. Adding RLS alone there produces a
+control that *looks* like tenant isolation and is not one: security theater, which is worse
+than a known gap because it stops anyone looking.
+
+Not a bug: the header is spelled `X-Tenant-ID` here vs the platform's `X-Tenant-Id`. Go
+canonicalises header keys, so `Header.Get` matches either — checked before reporting.
+
+Fix per service: fail closed (401, as `requireTenant` does in the Tier-0 services) instead of
+inventing an identity. Both the middleware default and the getter default must go — leaving
+either one keeps the hole.
+
+| # | Service | In Priority 2? | Status |
+|---|---|---|---|
+| 8a | banking-connector-svc | yes (row 10) | Not Started |
+| 8b | connectivity-api-bridge-svc | yes (row 12) | Not Started |
+| 8c | esignature-integration-svc | yes (row 13) | Not Started |
+| 8d | external-data-feed-svc | yes (row 15) | Not Started |
+| 8e | hris-connector-svc | yes (row 16) | Not Started |
+| 8f | tax-authority-interface-svc | yes (row 20) | Not Started |
+| 8g | carta-svc | no | Not Started |
+| 8h | compliance-risk-scoring-svc | no | Not Started |
+| 8i | evidence-requirements-svc | no | Not Started |
+| 8j | forecasting-svc | no | Not Started |
+| 8k | key-management-svc | no | Not Started |
+| 8l | migration-integrity-svc | no | Not Started |
+| 8m | mtls-management-svc | no | Not Started |
+| 8n | reconciliation-intelligence-svc | no | Not Started |
+| 8o | reporting-orchestration-svc | no | Not Started |
+| 8p | siem-integration-svc | no | Not Started |
+
+Note 8k/8m/8p (key-management, mtls-management, siem-integration) are **security** services —
+a fabricated tenant on key material, certificate issuance, or the security-event pipeline is
+the worst placement of this defect in the estate. Worth doing those even though they are
+outside Priority 2.
+
 ## Priority 2 — Remaining non-Tier-0 services with zero row-level security
 
 Same defect, lower severity (not on the governance critical path), still a real gap.
