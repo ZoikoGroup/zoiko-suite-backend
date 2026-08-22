@@ -161,6 +161,43 @@ a fabricated tenant on key material, certificate issuance, or the security-event
 the worst placement of this defect in the estate. Worth doing those even though they are
 outside Priority 2.
 
+## Priority 1c — Caller-declared tenant identity (candidate sweep, NOT yet a confirmed count)
+
+Surfaced by row 9 (ai-governance-svc), and it is a **different, more severe defect class** than
+Priority 1b. Priority 1b was a *fabricated* tenant: a header-less request landed in a shared
+synthetic `"default-tenant"` bucket. This one is a *declared* tenant: the handler reads
+`tenant_id` from the caller's own request body or query string, so the caller chooses which
+tenant it operates on. No leak or guessed id is needed — you just type the value. On
+ai-governance-svc that meant naming the tenant whose **autonomy allowlist** you were creating
+or resolving against, which doc7 §G7 rules out in as many words ("not broad delegated
+authority").
+
+A sweep for `req.TenantID` / `q.Get("tenant_id")` in non-test handler code returns these
+services, ordered by hit count:
+
+```
+10  secret-vault-integration-svc      4  evidence-requirements-svc     2  purchase-order-svc
+ 8  policy-svc                        4  document-vault-svc            2  evidence-manifest-svc
+ 8  kill-switch-registry-svc          3  workflow-svc                  2  accounts-receivable-svc
+ 8  configuration-feature-flag-svc    3  ai-governance-svc             2  accounts-payable-svc
+ 8  authorization-svc                 2  workflow-history-svc          1  governance-decision-log-svc
+ 7  retention-registry-svc            2  purchase-request-svc          1  bank-reconciliation-svc
+ 5  general-ledger-svc
+```
+
+**This is a candidate list, not a verdict** — the grep cannot tell "trusted" from "checked", and
+two spot-checks already prove both directions:
+
+- **ai-governance-svc still shows 3 hits after being fixed.** `req.TenantID` is now passed
+  *into* `requireTenant` to be compared against the verified header, not trusted. A fixed
+  service still matches.
+- **secret-vault-integration-svc (10 hits) is already clean.** It has `refuseForeignTenant`
+  and rejects `?tenant_id=` that disagrees with the verified scope — done as part of Priority 1.
+
+So each service needs reading, not counting. Do not convert this table into a defect count.
+Rows 11/14/17/18 below get this check as part of their own work, since they are already queued;
+the rest need a pass of their own once Priority 2 closes.
+
 ## Priority 2 — Remaining non-Tier-0 services with zero row-level security
 
 Same defect, lower severity (not on the governance critical path), still a real gap.
@@ -170,7 +207,8 @@ missed if re-run naively; checked their actual file contents directly instead.
 
 | # | Service | Status | Notes |
 |---|---|---|---|
-| 9 | ai-governance-svc | Not Started | |
+| 9 | ai-governance-svc | Done | `95a5832`. **A different and more severe defect class than the connectors: caller-declared tenant identity.** Three routes took `tenant_id` from the caller's own request body or `?tenant_id=` query string — `POST /v1/automation-policies` (create an autonomy allowlist entry in *a tenant you name*), `GET /v1/automation-policies/resolve` (the may-this-run decision, which also reports `kill_switch_engaged`), and `POST /v1/automation-actions`. Not a leak reachable through a missing predicate: the caller simply declares the tenant. Doc7 §G7 makes allowlists "per tenant, role, risk class and tool" so agentic execution is "a controlled execution model, **not broad delegated authority**" — caller-declared tenant is that delegation. Now bound to the verified `X-Tenant-Id`; the body/query field survives for compatibility but may only *agree* (403 on disagreement, not a silent reinterpretation). Also `DecideAutomationAction` was an unscoped **write** on the human-authority gate — a caller with another tenant's action id could approve their pending autonomous action, i.e. grant agentic execution authority inside someone else's tenant; worse than esignature row 13, which forged a record rather than authorizing an action to run. Plus unscoped `GetAIRun` (exposing `source_refs`/`evidence_refs`/`recommended_action` — how a governed decision was reached) and `GetAutomationAction`. **Enforcement is in the handlers, not blanket middleware** — see row 9a. Migration `000002` covers only the three tenant tables. Four negative controls on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role, including one at the handler layer: with the stub store's tenant checks stripped the new isolation tests fail, so they are not passing vacuously. |
+| 9a | ai-governance-svc — platform-scope tables | **Not applicable (verified against the doc)** | `action_risk_classifications`, `model_provider_registrations` and `policy_change_approvals` carry **no** `tenant_id`, and that is correct. Doc7 §G2 makes the risk taxonomy one shared taxonomy, §G6 the provider registry platform-wide, and §G3 is explicit that policy changes "alter governance truth **across tenants** and historical evaluation" — so approving one is platform administration. Adding a tenant column to make the schema look uniform would invent a boundary the doc rules out (same trap as row 19 source-authority-svc). The controls that *do* belong on `policy_change_approvals` are authorization plus doc7 §H2/§H3's self-approval block, and the handler already enforces both. A test (`TestRLS_PlatformTablesHaveNoPolicy`) pins the asymmetry so a later uniformity change has to argue with a failing test rather than land quietly. This is also why the connectors' blanket-401 middleware was **not** reused here: it would have broken these routes. |
 | 10 | banking-connector-svc | Done | `02421f7`. **Three defects, done together with row 8a** — RLS here is only load-bearing once the fabricated identity is gone. (1) `default-tenant` fabrication → now 401. (2) **Cross-tenant leak of bank data**, the worst of the three: all 3 reads had no tenant predicate — `GetConnectionByID`/`ListStatements` filtered on id alone (exposing `bank_name`, `bic`, `account_number`, balances), and `ListConnections`' only filter disabled itself when `legal_entity_id` was omitted. (3) RLS added (ENABLE+FORCE+WITH CHECK, no exemption needed). Also fixed `MemoryStore`, which had the identical unscoped reads — the handler tests run against it, so isolation assertions were passing against a fake that could not fail. Verified against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role with negative controls on all three. |
 | 11 | commercial-account-svc | Not Started | |
 | 12 | connectivity-api-bridge-svc | Done | Same three defects as row 10, done with row 8b. Unscoped reads exposed another tenant's `endpoint_url`/`auth_type` (`GetBridgeByID`), and `ListIngestionLogs` exposed payload summaries + error messages — the contents flowing through their integration. `ListBridges`' only filter disabled itself. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
