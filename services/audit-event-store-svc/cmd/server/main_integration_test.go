@@ -26,6 +26,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -50,29 +53,38 @@ func freePort(t *testing.T) int {
 	return port
 }
 
-// schema is the minimal DDL needed to satisfy the service's DB expectations.
-// Mirrors deployments/migrations/000001_initial_schema.up.sql and
-// 000002_add_hash_chain_fields.up.sql.
-const schema = `
-CREATE TABLE IF NOT EXISTS audit_events (
-    event_id             TEXT        NOT NULL,
-    event_type           TEXT        NOT NULL,
-    tenant_id            TEXT        NOT NULL,
-    legal_entity_id      TEXT        NOT NULL,
-    principal_id         TEXT,
-    source_service       TEXT        NOT NULL,
-    schema_version       TEXT        NOT NULL,
-    payload              JSONB       NOT NULL,
-    stored_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    correlation_id       TEXT,
-    causation_id         TEXT,
-    sequence_number      BIGINT,
-    payload_hash         TEXT,
-    previous_event_hash  TEXT,
-    CONSTRAINT audit_events_pkey PRIMARY KEY (event_id)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS audit_events_sequence_number_idx ON audit_events (sequence_number);
-`
+// applyMigrations runs every *.up.sql in deployments/migrations, in
+// filename order, against pool.
+//
+// This used to be a hand-maintained `const schema` string that "mirrors"
+// the migration files. That is the same drift trap known-gaps.md records
+// for jurisdiction-rules-svc ("a migration added later cannot be silently
+// skipped by the tests the way one was silently skipped by the running
+// dev volume") — a copy of the schema means a new migration is invisible
+// here, so the very thing a migration changes goes untested. Reading the
+// real files means adding a migration cannot silently bypass this suite.
+func applyMigrations(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
+	t.Helper()
+	const migDir = "../../deployments/migrations"
+	entries, err := os.ReadDir(migDir)
+	require.NoError(t, err, "read migrations dir")
+
+	var ups []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".up.sql") {
+			ups = append(ups, e.Name())
+		}
+	}
+	require.NotEmpty(t, ups, "expected at least one .up.sql migration")
+	sort.Strings(ups)
+
+	for _, name := range ups {
+		sqlBytes, err := os.ReadFile(filepath.Join(migDir, name))
+		require.NoErrorf(t, err, "read migration %s", name)
+		_, err = pool.Exec(ctx, string(sqlBytes))
+		require.NoErrorf(t, err, "apply migration %s", name)
+	}
+}
 
 // TestServerHealthProbes is the integration smoke test.
 // It starts an embedded Postgres, runs the schema, boots the HTTP server,
@@ -123,8 +135,7 @@ func TestServerHealthProbes(t *testing.T) {
 		return pool.Ping(ctx) == nil
 	}, 10*time.Second, 200*time.Millisecond, "embedded postgres did not become ready in time")
 
-	_, err = pool.Exec(ctx, schema)
-	require.NoError(t, err, "schema migration must succeed")
+	applyMigrations(t, ctx, pool)
 
 	// ── Build and start HTTP server (same wiring as main()) ───────────────
 	log, _ := zap.NewDevelopment()
@@ -251,8 +262,7 @@ func TestPgStore_HashChain_RealPostgres(t *testing.T) {
 		return pool.Ping(ctx) == nil
 	}, 10*time.Second, 200*time.Millisecond, "embedded postgres did not become ready in time")
 
-	_, err = pool.Exec(ctx, schema)
-	require.NoError(t, err, "schema migration must succeed")
+	applyMigrations(t, ctx, pool)
 
 	log, _ := zap.NewDevelopment()
 	defer func() { _ = log.Sync() }()
