@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/ai-governance-svc/internal/domain"
 	"zoiko.io/ai-governance-svc/internal/events"
+	"zoiko.io/ai-governance-svc/internal/middleware"
 	"zoiko.io/ai-governance-svc/internal/store"
 )
 
@@ -38,13 +39,20 @@ func newStubStore() *stubStore {
 	}
 }
 
+// The tenant-scoped methods below honour the context tenant exactly as
+// PgStore does. That is not gold-plating a fake: a stub that ignores the
+// tenant cannot fail an isolation assertion, so every handler test made
+// against it would pass no matter what the handlers did. The platform-scope
+// methods (classifications, providers, policy changes) correctly ignore it,
+// because those tables carry no tenant_id.
+
 func (s *stubStore) CreateAIRun(_ context.Context, a *domain.AIRun) error {
 	s.aiRuns[a.AIRunID] = a
 	return nil
 }
 
-func (s *stubStore) GetAIRun(_ context.Context, id string) (*domain.AIRun, error) {
-	if a, ok := s.aiRuns[id]; ok {
+func (s *stubStore) GetAIRun(ctx context.Context, id string) (*domain.AIRun, error) {
+	if a, ok := s.aiRuns[id]; ok && a.TenantID == middleware.TenantFromContext(ctx) {
 		return a, nil
 	}
 	return nil, domain.ErrAIRunNotFound
@@ -75,7 +83,14 @@ func (s *stubStore) CreateAutomationPolicy(_ context.Context, p *domain.Automati
 	return nil
 }
 
-func (s *stubStore) ResolveAutomationPolicy(_ context.Context, tenantID, role, riskCategory, tool, actionType string) (*domain.AutomationPolicyResolution, error) {
+// ResolveAutomationPolicy resolves against the CONTEXT tenant, ignoring
+// the tenantID argument if it disagrees — mirroring RLS, which is what
+// stops a foreign tenant id in this parameter from resolving against
+// someone else's allowlist.
+func (s *stubStore) ResolveAutomationPolicy(ctx context.Context, tenantID, role, riskCategory, tool, actionType string) (*domain.AutomationPolicyResolution, error) {
+	if ctxTenant := middleware.TenantFromContext(ctx); ctxTenant != "" {
+		tenantID = ctxTenant
+	}
 	p, ok := s.policies[policyKey(tenantID, role, riskCategory, tool, actionType)]
 	if !ok {
 		return &domain.AutomationPolicyResolution{Allowed: false, ReasonCode: "NOT_ALLOWLISTED"}, nil
@@ -96,16 +111,16 @@ func (s *stubStore) ProposeAutomationAction(_ context.Context, a *domain.Automat
 	return nil
 }
 
-func (s *stubStore) GetAutomationAction(_ context.Context, id string) (*domain.AutomationAction, error) {
-	if a, ok := s.actions[id]; ok {
+func (s *stubStore) GetAutomationAction(ctx context.Context, id string) (*domain.AutomationAction, error) {
+	if a, ok := s.actions[id]; ok && a.TenantID == middleware.TenantFromContext(ctx) {
 		return a, nil
 	}
 	return nil, domain.ErrAutomationActionNotFound
 }
 
-func (s *stubStore) DecideAutomationAction(_ context.Context, id, decision, deciderPrincipalID string) (*domain.AutomationAction, error) {
+func (s *stubStore) DecideAutomationAction(ctx context.Context, id, decision, deciderPrincipalID string) (*domain.AutomationAction, error) {
 	a, ok := s.actions[id]
-	if !ok {
+	if !ok || a.TenantID != middleware.TenantFromContext(ctx) {
 		return nil, domain.ErrAutomationActionNotFound
 	}
 	if a.ApprovalStatus != domain.ApprovalPending {
@@ -185,11 +200,28 @@ func newTestHandler() *Handler {
 
 func newTestRouter(h *Handler) *chi.Mux {
 	r := chi.NewRouter()
+	// The real server wires this in cmd/server. Without it the handlers see
+	// no verified tenant and every tenant-scoped route 401s — which is also
+	// what the whole suite used to prove nothing about, since it sent
+	// tenant_id in the body instead of the header.
+	r.Use(middleware.TenantContext())
 	RegisterRoutes(r, h)
 	return r
 }
 
+const (
+	testTenantA = "11111111-1111-1111-1111-111111111111"
+	testTenantB = "22222222-2222-2222-2222-222222222222"
+)
+
 func buildRequest(method, path string, body interface{}) *http.Request {
+	return buildRequestAs(method, path, body, testTenantA)
+}
+
+// buildRequestAs builds a request as a named tenant. Passing "" omits
+// X-Tenant-Id entirely, which is what the platform-scope routes
+// legitimately do and what the tenant-scoped routes must refuse.
+func buildRequestAs(method, path string, body interface{}, tenantID string) *http.Request {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -197,6 +229,9 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	r := httptest.NewRequest(method, path, &buf)
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("X-Principal-Id", "principal-test-01")
+	if tenantID != "" {
+		r.Header.Set("X-Tenant-Id", tenantID)
+	}
 	return r
 }
 
@@ -236,7 +271,7 @@ func TestProposeAutomationAction_BlockedWhenNotAllowlisted(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/automation-actions", domain.ProposeAutomationActionRequest{
-		TenantID:       "tenant-1",
+		TenantID:       testTenantA,
 		ActionType:     "SEND_REFUND",
 		Role:           "billing-agent",
 		Tool:           "stripe-refund-tool",
@@ -266,7 +301,7 @@ func TestProposeAutomationAction_AllowedThenMakerCheckerBlocksSelfApproval(t *te
 	// Allowlist it for tenant-1/billing-agent/stripe-refund-tool.
 	wPolicy := httptest.NewRecorder()
 	r.ServeHTTP(wPolicy, buildRequest(http.MethodPost, "/v1/automation-policies", domain.CreateAutomationPolicyRequest{
-		TenantID:          "tenant-1",
+		TenantID:          testTenantA,
 		Role:              "billing-agent",
 		RiskCategory:      "MONEY",
 		Tool:              "stripe-refund-tool",
@@ -279,7 +314,7 @@ func TestProposeAutomationAction_AllowedThenMakerCheckerBlocksSelfApproval(t *te
 
 	wPropose := httptest.NewRecorder()
 	r.ServeHTTP(wPropose, buildRequest(http.MethodPost, "/v1/automation-actions", domain.ProposeAutomationActionRequest{
-		TenantID:       "tenant-1",
+		TenantID:       testTenantA,
 		ActionType:     "SEND_REFUND",
 		Role:           "billing-agent",
 		Tool:           "stripe-refund-tool",

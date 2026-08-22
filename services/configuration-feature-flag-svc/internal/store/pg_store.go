@@ -38,6 +38,53 @@ import (
 // of nullable tenant_id/legal_entity_id.
 const nilScopeUUID = "00000000-0000-0000-0000-000000000000"
 
+// derefOrEmpty renders a nullable tenant scope for withRLS. nil means
+// "global scope" — the caller is operating on a NULL-tenant_id row — and
+// becomes "", which app.tenant_id being set to never equals a real
+// tenant_id. Such a session therefore only ever satisfies the policy's
+// `tenant_id IS NULL` branch, which is exactly right: a global write
+// touches global rows and nothing else.
+func derefOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// setTenantScope declares the caller's tenant on tx for the duration of
+// the transaction, so config_entries/feature_flags' tenant_isolation_policy
+// (migration 000002) has a value to enforce against.
+//
+// Unlike policy-svc and workflow-svc, this store never reads the tenant
+// from context — every method already receives it explicitly as a
+// parameter, so the scope declared here is always the same value the
+// query's own predicate uses. That is deliberate: the session variable and
+// the SQL predicate cannot silently disagree.
+func setTenantScope(ctx context.Context, tx pgx.Tx, tenantID string) error {
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+	return nil
+}
+
+// withRLS runs fn inside a transaction with app.tenant_id set, for the
+// read paths that would otherwise run as bare pool queries.
+func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if err := setTenantScope(ctx, tx, tenantID); err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ListFilter narrows a List query by optional environment/tenant_id.
 // Both empty/nil means "no filter on that dimension".
 type ListFilter struct {
@@ -144,6 +191,10 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
+
+	if err := setTenantScope(ctx, tx, derefOrEmpty(params.TenantID)); err != nil {
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
 
 	const findCurrentQuery = `
 		SELECT ` + configColumns + `
@@ -259,7 +310,12 @@ func (s *PgStore) FindCurrentConfigEntry(ctx context.Context, key, environment s
 		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
 		  AND effective_to IS NULL;`
 
-	entry, err := scanConfigEntry(s.pool.QueryRow(ctx, query, key, environment, tenantID))
+	var entry *domain.ConfigEntry
+	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
+		var scanErr error
+		entry, scanErr = scanConfigEntry(tx.QueryRow(ctx, query, key, environment, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrConfigEntryNotFound
@@ -298,24 +354,25 @@ func (s *PgStore) ListCurrentConfigEntries(ctx context.Context, filter ListFilte
 		configColumns, strings.Join(conditions, " AND "),
 	)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	var results []*domain.ConfigEntry
+	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			c, scanErr := scanConfigEntry(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, c)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg ListCurrentConfigEntries failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.ConfigEntry
-	for rows.Next() {
-		c, scanErr := scanConfigEntry(rows)
-		if scanErr != nil {
-			s.log.Error("pg ListCurrentConfigEntries scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, c)
-	}
-	if err := rows.Err(); err != nil {
-		s.log.Error("pg ListCurrentConfigEntries rows error", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
@@ -362,6 +419,10 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := setTenantScope(ctx, tx, derefOrEmpty(params.TenantID)); err != nil {
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
 
 	const findCurrentQuery = `
 		SELECT ` + flagColumns + `
@@ -436,7 +497,12 @@ func (s *PgStore) FindCurrentFeatureFlag(ctx context.Context, key, environment s
 		  AND COALESCE(tenant_id, '` + nilScopeUUID + `'::UUID) = COALESCE($3::uuid, '` + nilScopeUUID + `'::UUID)
 		  AND effective_to IS NULL;`
 
-	flag, err := scanFeatureFlag(s.pool.QueryRow(ctx, query, key, environment, tenantID))
+	var flag *domain.FeatureFlag
+	err := s.withRLS(ctx, derefOrEmpty(tenantID), func(tx pgx.Tx) error {
+		var scanErr error
+		flag, scanErr = scanFeatureFlag(tx.QueryRow(ctx, query, key, environment, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrFeatureFlagNotFound
@@ -472,24 +538,25 @@ func (s *PgStore) ListCurrentFeatureFlags(ctx context.Context, filter ListFilter
 		flagColumns, strings.Join(conditions, " AND "),
 	)
 
-	rows, err := s.pool.Query(ctx, query, args...)
+	var results []*domain.FeatureFlag
+	err := s.withRLS(ctx, derefOrEmpty(filter.TenantID), func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			f, scanErr := scanFeatureFlag(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			results = append(results, f)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		s.log.Error("pg ListCurrentFeatureFlags failed", zap.Error(err))
-		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
-	var results []*domain.FeatureFlag
-	for rows.Next() {
-		f, scanErr := scanFeatureFlag(rows)
-		if scanErr != nil {
-			s.log.Error("pg ListCurrentFeatureFlags scan failed", zap.Error(scanErr))
-			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, scanErr)
-		}
-		results = append(results, f)
-	}
-	if err := rows.Err(); err != nil {
-		s.log.Error("pg ListCurrentFeatureFlags rows error", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil

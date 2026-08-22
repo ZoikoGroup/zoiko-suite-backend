@@ -30,12 +30,37 @@ into one commit.
 
 ---
 
-## Priority 1 — Tier-0 governance services with zero row-level security
+## Priority 1 — Tier-0 governance services with zero row-level security — ✅ COMPLETE
 
-The 8 of 11 Doc 03 §06 "must exist before broad functional expansion" services that have a
+The Doc 03 §06 "must exist before broad functional expansion" services that had a
 `tenant_id` column and **no `CREATE POLICY` / `ENABLE ROW LEVEL SECURITY` at all** — verified
 by grepping every migration file, not inferred. Pattern to copy: `governance-decision-log-svc`'s
 `000002_add_rls.up.sql` + `000006_force_rls.up.sql`.
+
+**Closed 2026-08-22.** 7 real services fixed (row 4 was a false positive — genuinely
+platform-wide reference data). All 7 verified against a real Postgres 16 as a purpose-created
+`NOSUPERUSER NOBYPASSRLS` role, each with a negative control.
+
+### What this tier actually taught us — read before starting Priority 2
+
+Four lessons that cost real time here and will recur:
+
+1. **A superuser bypasses RLS unconditionally, `FORCE` included.** `TEST_DATABASE_URL` points
+   at `postgres`. An isolation test over that connection proves only that the application
+   predicate works — it never touches the policy. Every row here needed a purpose-created
+   ordinary role. The first version of row 6's test passed for exactly this wrong reason.
+2. **Always run a negative control.** Remove the migration; the test must fail. Row 8 also
+   showed the *reverse* control matters: an over-restrictive policy is a real failure mode
+   too (it hid global defaults), and only a test that checks for it will catch it.
+3. **Three services needed a deliberate exemption, and getting it wrong is an outage, not a
+   tightening.** audit-event-store-svc (Kafka writer, global hash chain — a naive policy
+   stops the evidence store accepting events *silently*), authorization-svc
+   (`FindGrantedActions` is the core `/v1/authorize` path — scoping it breaks all
+   authorization platform-wide), secret-vault-integration-svc (cross-tenant admin actions).
+   Check for a legitimate cross-tenant caller *before* writing the policy, not after.
+4. **Test harnesses that name migrations individually silently skip new ones.** Rows 7 and 8
+   both had this: the migration under test would not have been applied at all. Check the
+   suite globs `*.up.sql` before trusting a green run.
 
 | # | Service | Spec ref | Status | Notes |
 |---|---|---|---|---|
@@ -45,8 +70,8 @@ by grepping every migration file, not inferred. Pattern to copy: `governance-dec
 | 4 | jurisdiction-rules-svc | Doc 03 §06 | **Not applicable** | False positive in the original audit — the only "tenant_id" hit in its migrations is a comment ("...reference data, not per-tenant data. No tenant_id column."), not a real column. This service is genuinely platform-wide reference data (matches Doc 03's own design — jurisdiction-rules-svc *is* the jurisdiction concept). No RLS is possible or correct here; fabricating a tenant boundary would violate the "never fabricate a signal with nothing real to populate it" doctrine. Removed from the count of 8 — real Tier-0 count is 7. |
 | 5 | authorization-svc | Doc 03 §06, Doc 04 §2.2 | Done | `de2dfc9`. Real, severe bug found beyond the RLS gap: all 7 `/v1/admin/*` write routes had NO authentication at all — tenant_id and actor attribution came straight from the request body. Fixed all 7 (tenant verification, actor from X-Principal-Id, delegator-must-be-caller). RLS added on `roles`/`sod_rules` only (the only 2 tables with a real tenant_id). Two reads (`FindRoleByID`, `FindGrantedActions`) needed a deliberate platform-scope bypass — `FindGrantedActions` is the core `/v1/authorize` path called on nearly every request platform-wide; scoping it by tenant would have silently broken all authorization. 37 tests live-verified against real Postgres 16. |
 | 6 | workflow-svc | Doc 03 §06, Doc 04 §2.2 | Done | `9a5f748`. Two real bugs beyond RLS: (1) `FindWorkflowByID` — the choke point all Store methods route through — fell back to an UNSCOPED lookup when X-Tenant-Id was omitted (document-vault-svc's "filter that disables itself" shape); (2) `initiated_by`/`actor_principal_id` came from the request body on every route, making the existing SoD checks self-declared rather than load-bearing. RLS on `workflow_instances`. 31 tests live-verified against real Postgres 16 — including a purpose-created NOSUPERUSER NOBYPASSRLS role for the no-tenant probe (a superuser bypasses RLS unconditionally, so the first version of that test passed for the wrong reason) plus an explicit negative-control run with the migration removed. |
-| 7 | audit-event-store-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: `tenant_id TEXT NOT NULL` in 000001_initial_schema.up.sql |
-| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: nullable `tenant_id` (NULL = global default), same doctrine as policy-svc/secret-vault-integration-svc |
+| 7 | audit-event-store-svc | Doc 03 §06, Doc 04 §2.2 | Done | `f02b270`. Different shape from rows 1–6: a naive tenant-only FORCE policy here would have taken the platform's append-only evidence store **offline** — no tenant-context plumbing exists (Kafka consumer, no X-Tenant-Id), the hash chain is deliberately global (Doc 04 §15.4), and `sequence_number` is UNIQUE, so the chain-tip SELECT would match zero rows and WITH CHECK would reject every insert, silently (DLQ absorbs a consumer's error). Proven by negative control, not assumed. RLS added with an explicit `app.platform_scope` exemption set only by `PgStore.Store`. Also replaced the test suite's hand-maintained `const schema` copy with `applyMigrations()` reading the real files — the copy would have made this very migration untested. 4 integration tests live-verified against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
+| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Done | `7058337`. Simplest row — the app layer was already correct (all 6 handlers call `requireTenant`, every store method already takes the tenant, list routes already refuse a foreign `?tenant_id=`), so this was purely the DB backstop with no application bug alongside. RLS on both tables, keeping NULL-tenant_id global defaults readable by everyone — a plain `tenant_id = app.tenant_id` policy would hide every global default and turn applicable config into "not found". No platform-scope bypass needed (no legitimate cross-tenant caller exists). Also fixed the suite's setup naming only `000001`, which would have left this migration untested. 16/16 tests pass against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role, with negative controls in **both** directions (missing policy → leak; over-restrictive policy → global defaults hidden). |
 
 **Verification method per row**: add a `TestPgStore_RLS_TenantIsolation`-style test (same
 pattern as tenant-entity-registry-svc's) that creates two tenants and proves a query scoped
@@ -68,6 +93,111 @@ checking before marking any row Done:
    control explicitly: temporarily remove the `_add_rls.up.sql` file, confirm the test
    fails, restore it, confirm it passes.
 
+## Priority 1b — Fabricated tenant identity: the `"default-tenant"` fallback (16 services)
+
+**Found 2026-08-22 during Priority 2 reconnaissance. This blocks meaningful RLS on 6 of
+Priority 2's rows, so it is sequenced ahead of them.**
+
+16 services silently substitute the literal string `"default-tenant"` when `X-Tenant-ID` is
+absent, in request-path middleware (`internal/middleware/tenant.go`) or directly in a handler
+— not in dev seeding. Verified in each:
+
+```go
+tenantID := r.Header.Get("X-Tenant-ID")
+if tenantID == "" {
+    tenantID = "default-tenant"     // ← fabricated identity
+}
+...
+func GetTenantID(ctx context.Context) string {
+    if val, ok := ctx.Value(TenantIDKey).(string); ok && val != "" { return val }
+    return "default-tenant"          // ← and again, as a getter default
+}
+```
+
+**Why this is worse than a missing tenant check.** A header-less request does not fail — it
+succeeds, attributed to a tenant that does not exist. Every header-less request from every
+caller lands in the *same* `"default-tenant"` bucket, so those rows are co-mingled, and any
+caller can read another's data by simply *omitting* the header. Omitting it is the easier
+request to make, which makes the insecure path the path of least resistance — the same shape
+as document-vault-svc's "filter that disables itself" and payroll-exceptions-svc's `"GLOBAL"`
+sentinel, and a direct violation of the platform's own "never fabricate a signal with nothing
+real to populate it" doctrine.
+
+**Why it must be fixed before/with RLS on the affected services, not after.** RLS compares
+`tenant_id = app.tenant_id`. The application would set `app.tenant_id = 'default-tenant'`, so
+every header-less caller would still read and write each other's rows — inside the policy,
+legitimately. Tests that pass a real tenant would go green. Adding RLS alone there produces a
+control that *looks* like tenant isolation and is not one: security theater, which is worse
+than a known gap because it stops anyone looking.
+
+Not a bug: the header is spelled `X-Tenant-ID` here vs the platform's `X-Tenant-Id`. Go
+canonicalises header keys, so `Header.Get` matches either — checked before reporting.
+
+Fix per service: fail closed (401, as `requireTenant` does in the Tier-0 services) instead of
+inventing an identity. Both the middleware default and the getter default must go — leaving
+either one keeps the hole.
+
+| # | Service | In Priority 2? | Status |
+|---|---|---|---|
+| 8a | banking-connector-svc | yes (row 10) | **Done** `02421f7` — fixed together with row 10 |
+| 8b | connectivity-api-bridge-svc | yes (row 12) | **Done** — fixed together with row 12 |
+| 8c | esignature-integration-svc | yes (row 13) | **Done** — fixed together with row 13 |
+| 8d | external-data-feed-svc | yes (row 15) | **Done** `5b3bb97` — fixed together with row 15 |
+| 8e | hris-connector-svc | yes (row 16) | **Done** `3c97c3e` — fixed together with row 16 |
+| 8f | tax-authority-interface-svc | yes (row 20) | **Done** `f7da196` — fixed together with row 20 |
+| 8g | carta-svc | no | Not Started |
+| 8h | compliance-risk-scoring-svc | no | Not Started |
+| 8i | evidence-requirements-svc | no | Not Started |
+| 8j | forecasting-svc | no | Not Started |
+| 8k | key-management-svc | no | Not Started |
+| 8l | migration-integrity-svc | no | Not Started |
+| 8m | mtls-management-svc | no | Not Started |
+| 8n | reconciliation-intelligence-svc | no | Not Started |
+| 8o | reporting-orchestration-svc | no | Not Started |
+| 8p | siem-integration-svc | no | Not Started |
+
+Note 8k/8m/8p (key-management, mtls-management, siem-integration) are **security** services —
+a fabricated tenant on key material, certificate issuance, or the security-event pipeline is
+the worst placement of this defect in the estate. Worth doing those even though they are
+outside Priority 2.
+
+## Priority 1c — Caller-declared tenant identity (candidate sweep, NOT yet a confirmed count)
+
+Surfaced by row 9 (ai-governance-svc), and it is a **different, more severe defect class** than
+Priority 1b. Priority 1b was a *fabricated* tenant: a header-less request landed in a shared
+synthetic `"default-tenant"` bucket. This one is a *declared* tenant: the handler reads
+`tenant_id` from the caller's own request body or query string, so the caller chooses which
+tenant it operates on. No leak or guessed id is needed — you just type the value. On
+ai-governance-svc that meant naming the tenant whose **autonomy allowlist** you were creating
+or resolving against, which doc7 §G7 rules out in as many words ("not broad delegated
+authority").
+
+A sweep for `req.TenantID` / `q.Get("tenant_id")` in non-test handler code returns these
+services, ordered by hit count:
+
+```
+10  secret-vault-integration-svc      4  evidence-requirements-svc     2  purchase-order-svc
+ 8  policy-svc                        4  document-vault-svc            2  evidence-manifest-svc
+ 8  kill-switch-registry-svc          3  workflow-svc                  2  accounts-receivable-svc
+ 8  configuration-feature-flag-svc    3  ai-governance-svc             2  accounts-payable-svc
+ 8  authorization-svc                 2  workflow-history-svc          1  governance-decision-log-svc
+ 7  retention-registry-svc            2  purchase-request-svc          1  bank-reconciliation-svc
+ 5  general-ledger-svc
+```
+
+**This is a candidate list, not a verdict** — the grep cannot tell "trusted" from "checked", and
+two spot-checks already prove both directions:
+
+- **ai-governance-svc still shows 3 hits after being fixed.** `req.TenantID` is now passed
+  *into* `requireTenant` to be compared against the verified header, not trusted. A fixed
+  service still matches.
+- **secret-vault-integration-svc (10 hits) is already clean.** It has `refuseForeignTenant`
+  and rejects `?tenant_id=` that disagrees with the verified scope — done as part of Priority 1.
+
+So each service needs reading, not counting. Do not convert this table into a defect count.
+Rows 11/14/17/18 below get this check as part of their own work, since they are already queued;
+the rest need a pass of their own once Priority 2 closes.
+
 ## Priority 2 — Remaining non-Tier-0 services with zero row-level security
 
 Same defect, lower severity (not on the governance critical path), still a real gap.
@@ -77,18 +207,19 @@ missed if re-run naively; checked their actual file contents directly instead.
 
 | # | Service | Status | Notes |
 |---|---|---|---|
-| 9 | ai-governance-svc | Not Started | |
-| 10 | banking-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 9 | ai-governance-svc | Done | `95a5832`. **A different and more severe defect class than the connectors: caller-declared tenant identity.** Three routes took `tenant_id` from the caller's own request body or `?tenant_id=` query string — `POST /v1/automation-policies` (create an autonomy allowlist entry in *a tenant you name*), `GET /v1/automation-policies/resolve` (the may-this-run decision, which also reports `kill_switch_engaged`), and `POST /v1/automation-actions`. Not a leak reachable through a missing predicate: the caller simply declares the tenant. Doc7 §G7 makes allowlists "per tenant, role, risk class and tool" so agentic execution is "a controlled execution model, **not broad delegated authority**" — caller-declared tenant is that delegation. Now bound to the verified `X-Tenant-Id`; the body/query field survives for compatibility but may only *agree* (403 on disagreement, not a silent reinterpretation). Also `DecideAutomationAction` was an unscoped **write** on the human-authority gate — a caller with another tenant's action id could approve their pending autonomous action, i.e. grant agentic execution authority inside someone else's tenant; worse than esignature row 13, which forged a record rather than authorizing an action to run. Plus unscoped `GetAIRun` (exposing `source_refs`/`evidence_refs`/`recommended_action` — how a governed decision was reached) and `GetAutomationAction`. **Enforcement is in the handlers, not blanket middleware** — see row 9a. Migration `000002` covers only the three tenant tables. Four negative controls on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role, including one at the handler layer: with the stub store's tenant checks stripped the new isolation tests fail, so they are not passing vacuously. |
+| 9a | ai-governance-svc — platform-scope tables | **Not applicable (verified against the doc)** | `action_risk_classifications`, `model_provider_registrations` and `policy_change_approvals` carry **no** `tenant_id`, and that is correct. Doc7 §G2 makes the risk taxonomy one shared taxonomy, §G6 the provider registry platform-wide, and §G3 is explicit that policy changes "alter governance truth **across tenants** and historical evaluation" — so approving one is platform administration. Adding a tenant column to make the schema look uniform would invent a boundary the doc rules out (same trap as row 19 source-authority-svc). The controls that *do* belong on `policy_change_approvals` are authorization plus doc7 §H2/§H3's self-approval block, and the handler already enforces both. A test (`TestRLS_PlatformTablesHaveNoPolicy`) pins the asymmetry so a later uniformity change has to argue with a failing test rather than land quietly. This is also why the connectors' blanket-401 middleware was **not** reused here: it would have broken these routes. |
+| 10 | banking-connector-svc | Done | `02421f7`. **Three defects, done together with row 8a** — RLS here is only load-bearing once the fabricated identity is gone. (1) `default-tenant` fabrication → now 401. (2) **Cross-tenant leak of bank data**, the worst of the three: all 3 reads had no tenant predicate — `GetConnectionByID`/`ListStatements` filtered on id alone (exposing `bank_name`, `bic`, `account_number`, balances), and `ListConnections`' only filter disabled itself when `legal_entity_id` was omitted. (3) RLS added (ENABLE+FORCE+WITH CHECK, no exemption needed). Also fixed `MemoryStore`, which had the identical unscoped reads — the handler tests run against it, so isolation assertions were passing against a fake that could not fail. Verified against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role with negative controls on all three. |
 | 11 | commercial-account-svc | Not Started | |
-| 12 | connectivity-api-bridge-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
-| 13 | esignature-integration-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 12 | connectivity-api-bridge-svc | Done | Same three defects as row 10, done with row 8b. Unscoped reads exposed another tenant's `endpoint_url`/`auth_type` (`GetBridgeByID`), and `ListIngestionLogs` exposed payload summaries + error messages — the contents flowing through their integration. `ListBridges`' only filter disabled itself. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
+| 13 | esignature-integration-svc | Done | **Worst variant found so far: an unscoped WRITE.** `UpdateEnvelopeStatus` was `WHERE envelope_id = $4` alone, so any caller holding another tenant's envelope_id could mark that tenant's document SIGNED/COMPLETED and set `external_ref`. Doc 03 §16.5 makes this the governed execution path for contracts, board resolutions and legal artifacts, so a forged transition is a legal-integrity issue. Reads also exposed `signer_email`/`signer_name` (personal data). Negative control established RLS alone is sufficient AND that with both controls removed the forged mutation really lands — my first attempt at that control was invalid (a `sed` left `$5` bound, so Postgres errored on parameter count and the test passed for the wrong reason); redone correctly. |
 | 14 | evidence-manifest-svc | Not Started | |
-| 15 | external-data-feed-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
-| 16 | hris-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 15 | external-data-feed-svc | Done | `5b3bb97` (+ `3b14878` comment reword). Same three defects, done with row 8d. Worst leak was `ListEvents`: its only predicate was `feed_id`, self-disabling, so calling it with no `feed_id` returned up to 500 of **every** tenant's feed events **including the payload** — the actual market/reference data flowing through their subscriptions, not just metadata. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. Follow-up commit only reworded two doc comments: gofmt's doc-comment formatter rewrites `''` into a curly quote, mangling the SQL snippet. |
+| 16 | hris-connector-svc | Done | `3c97c3e`. Same three defects, done with row 8e. Unscoped reads exposed another tenant's `provider_name` + `api_endpoint` — the address of the system of record for their workforce data — and `GetSyncJobByID`'s `error_message`, which can carry provider detail. `ListSyncJobs`' only filter disabled itself, returning every tenant's sync history. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
 | 17 | kill-switch-registry-svc | Not Started | |
 | 18 | retention-registry-svc | Not Started | |
 | 19 | source-authority-svc | **Not applicable** | False positive — its only "tenant_id" mention is a comment comparing its real column (`entity_ref`, free-text, no tenant dimension) to kill-switch-registry-svc's design. Genuinely platform-wide reference data; no fix needed. |
-| 20 | tax-authority-interface-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 20 | tax-authority-interface-svc | Done | `f7da196`. Same three defects, done with row 8f — last of the six connectors. Most sensitive read in the tier: `GetSubmissionByID` filtered on `submission_id` alone, exposing another tenant's `tax_amount`, `tax_period`, `filing_type` and the authority's `ack_reference` — their actual filed tax figures. `ListSubmissions`' only predicate was `interface_id`, self-disabling, so omitting it returned every tenant's filings. MemoryStore fixed too. **Three** negative controls this time, on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role: migration removed → ENABLE/FORCE + WITH CHECK fail; Go predicate removed with migration present → isolation still holds (RLS is load-bearing alone); both removed → tenant B really reads tenant A's filing amount and ack_reference, so the test detects the leak rather than passing vacuously. |
 
 ## Priority 3 — RLS enabled but not FORCEd (defense-in-depth only)
 
@@ -157,6 +288,7 @@ as the table owner (a future regression, manual psql access, etc). Worth doing, 
 | 66 | jurisdiction-rules-svc has no compliance calendar entity; `jurisdiction.calendar.changed` is declared but unemittable | Doc 03 §8.2 | Not Started | |
 | 67 | authorization-svc has no platform-scoped, non-entity resource concept — services fake a synthetic `legal_entity_id` as a workaround | Doc 03 (spec silence, not a violation) | Not Started | |
 | 68 | A DENIED governance decision doesn't auto-convert to an approval workflow except where explicitly wired per-service | Doc 02 Diagram 2 | Not Started | |
+| 68a | **audit-event-store-svc has no query API at all.** Doc 03 §14.1 requires its records to be "immutable and **queryable** by actor, entity, action, workflow, or time range". The service has exactly one store method (`Store`) and only `/healthz` + `/readyz` routes — evidence goes in and cannot be got out. Found while doing row 7. The RLS policy added there is deliberately shaped so this API inherits tenant scoping by default when built. | Doc 03 §14.1 | Not Started | Real missing feature, not just missing RLS. Note the evidence is genuinely durable and hash-chained — it is only unreadable, which makes this a retrieval gap rather than a data-loss one. |
 
 ## Priority 6 — Data model (Doc 04)
 
