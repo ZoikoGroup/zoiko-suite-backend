@@ -139,7 +139,7 @@ either one keeps the hole.
 
 | # | Service | In Priority 2? | Status |
 |---|---|---|---|
-| 8a | banking-connector-svc | yes (row 10) | Not Started |
+| 8a | banking-connector-svc | yes (row 10) | **Done** `02421f7` — fixed together with row 10 |
 | 8b | connectivity-api-bridge-svc | yes (row 12) | Not Started |
 | 8c | esignature-integration-svc | yes (row 13) | Not Started |
 | 8d | external-data-feed-svc | yes (row 15) | Not Started |
@@ -171,7 +171,7 @@ missed if re-run naively; checked their actual file contents directly instead.
 | # | Service | Status | Notes |
 |---|---|---|---|
 | 9 | ai-governance-svc | Not Started | |
-| 10 | banking-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 10 | banking-connector-svc | Done | `02421f7`. **Three defects, done together with row 8a** — RLS here is only load-bearing once the fabricated identity is gone. (1) `default-tenant` fabrication → now 401. (2) **Cross-tenant leak of bank data**, the worst of the three: all 3 reads had no tenant predicate — `GetConnectionByID`/`ListStatements` filtered on id alone (exposing `bank_name`, `bic`, `account_number`, balances), and `ListConnections`' only filter disabled itself when `legal_entity_id` was omitted. (3) RLS added (ENABLE+FORCE+WITH CHECK, no exemption needed). Also fixed `MemoryStore`, which had the identical unscoped reads — the handler tests run against it, so isolation assertions were passing against a fake that could not fail. Verified against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role with negative controls on all three. |
 | 11 | commercial-account-svc | Not Started | |
 | 12 | connectivity-api-bridge-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
 | 13 | esignature-integration-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
