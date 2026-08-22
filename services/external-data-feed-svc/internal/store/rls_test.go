@@ -184,10 +184,11 @@ func TestRLS_PgStore_TenantIsolation(t *testing.T) {
 }
 
 // TestRLS_PgStore_ListEvents_NoFeedFilter_DoesNotLeak covers this
-// service's worst self-disabling filter: ListEvents' ONLY predicate was
-// `($1 = '' OR feed_id = $1)` on feed_id itself, so calling it with no
-// feed_id returned up to 500 of EVERY tenant's feed events — including the
-// payload, i.e. the actual data flowing through their subscriptions.
+// service's worst self-disabling filter: ListEvents' ONLY predicate
+// matched when the feed_id parameter was the empty string OR equalled the
+// column, so calling it with no feed_id returned up to 500 of EVERY
+// tenant's feed events — including the payload, i.e. the actual data
+// flowing through their subscriptions.
 func TestRLS_PgStore_ListEvents_NoFeedFilter_DoesNotLeak(t *testing.T) {
 	admin := openAdminPool(t)
 	appPool := appRolePool(t, admin)

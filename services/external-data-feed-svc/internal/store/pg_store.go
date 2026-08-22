@@ -162,11 +162,12 @@ func (p *PgStore) IngestEvent(ctx context.Context, event *domain.DataFeedEvent) 
 // narrowed to one feed.
 //
 // The tenant predicate is new, and this method's self-disabling filter was
-// the worst of the three: the ONLY predicate was `($1 = '' OR feed_id =
-// $1)` on feed_id itself, so calling it with no feed_id returned up to 500
-// of EVERY tenant's feed events — including the payload JSONB, i.e. the
-// actual market/credit/company data flowing through their subscriptions.
-// The feed_id dimension stays optional; the tenant dimension never is.
+// the worst of the three: the ONLY predicate matched when the feed_id
+// parameter was the empty string OR equalled the column, so calling it
+// with no feed_id returned up to 500 of EVERY tenant's feed events —
+// including the payload JSONB, i.e. the actual market/credit/company data
+// flowing through their subscriptions. The feed_id dimension stays
+// optional; the tenant dimension never is.
 func (p *PgStore) ListEvents(ctx context.Context, feedID string) ([]domain.DataFeedEvent, error) {
 	query := `
 		SELECT event_id, feed_id, tenant_id, event_type, payload, received_at
