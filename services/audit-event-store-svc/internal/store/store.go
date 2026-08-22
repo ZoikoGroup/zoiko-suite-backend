@@ -151,6 +151,27 @@ func (s *PgStore) Store(ctx context.Context, e *AuditEvent) error {
 			return fmt.Errorf("acquire chain lock: %w", err)
 		}
 
+		// Declare platform scope for audit_events' row-level security
+		// policy (migration 000003). This writer is exempt from tenant
+		// scoping for two structural reasons, not for convenience:
+		//
+		//   - It writes on behalf of EVERY tenant. This is a Kafka
+		//     consumer; there is no X-Tenant-Id to scope it to, and no
+		//     app.tenant_id is ever set on this path.
+		//   - The hash chain below is deliberately global (Doc 04 §15.4).
+		//     The chain-tip SELECT must see the highest sequence_number
+		//     across all tenants; scoped to one tenant it would read the
+		//     wrong tip, fork the chain per tenant, and — because
+		//     sequence_number is UNIQUE — collide on the second insert.
+		//
+		// Without this, a FORCE policy makes the chain-tip read match
+		// zero rows and the INSERT's WITH CHECK reject every event: the
+		// evidence store stops accepting events, quietly. See migration
+		// 000003's header for the full reasoning.
+		if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+			return fmt.Errorf("set platform scope: %w", err)
+		}
+
 		// Both the previous hash AND the next sequence_number are computed
 		// here, explicitly, under the advisory lock — deliberately NOT via a
 		// BIGSERIAL/IDENTITY default on the column. A Postgres sequence's
