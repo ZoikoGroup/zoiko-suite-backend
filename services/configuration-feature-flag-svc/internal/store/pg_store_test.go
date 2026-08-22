@@ -3,9 +3,12 @@ package store_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,18 +32,98 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, filename, _, _ := runtime.Caller(0)
-	migPath := filepath.Join(filepath.Dir(filename), "../../deployments/migrations/000001_initial_schema.up.sql")
-	migSQL, err := os.ReadFile(migPath)
-	if err != nil {
-		t.Fatalf("failed to read migration file %s: %v", migPath, err)
-	}
-
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS feature_flags, config_entries CASCADE;`)
-	if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
-		t.Fatalf("failed to execute migration: %v", err)
+
+	// Every *.up.sql in filename order, not one hardcoded filename. This
+	// used to name 000001_initial_schema.up.sql alone, which meant a
+	// migration added later was invisible to this suite — the drift trap
+	// known-gaps.md records for jurisdiction-rules-svc, and the reason
+	// 000002's RLS policy would otherwise have gone completely untested.
+	_, filename, _, _ := runtime.Caller(0)
+	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
+	entries, err := os.ReadDir(migDir)
+	if err != nil {
+		t.Fatalf("failed to read migrations dir %s: %v", migDir, err)
+	}
+	var ups []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".up.sql") {
+			ups = append(ups, e.Name())
+		}
+	}
+	if len(ups) == 0 {
+		t.Fatalf("no .up.sql migrations found in %s", migDir)
+	}
+	sort.Strings(ups)
+	for _, name := range ups {
+		migSQL, err := os.ReadFile(filepath.Join(migDir, name))
+		if err != nil {
+			t.Fatalf("failed to read migration %s: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
+			t.Fatalf("failed to execute migration %s: %v", name, err)
+		}
 	}
 
+	return pool
+}
+
+// appRolePool returns a pool connected as a genuine NOSUPERUSER
+// NOBYPASSRLS role, mirroring the platform's real runtime role
+// (zoiko_app). TEST_DATABASE_URL normally points at `postgres`, and a
+// SUPERUSER bypasses row-level security unconditionally — FORCE included
+// — so an isolation assertion made over that connection proves only that
+// the application-level predicate works, never that the policy does.
+//
+// Both user and password are set on a URL-built DSN rather than
+// string-patched (a helper that patched only the username silently
+// inherited the ambient password and broke in CI), and the role's
+// privileges are asserted before use.
+func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+
+	const appRole = "zoiko_app_test"
+	const appPassword = "zoiko_app_test_pw"
+
+	if _, err := admin.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+appRole+`') THEN
+			CREATE ROLE `+appRole+` LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $do$;`); err != nil {
+		t.Fatalf("create role %s: %v", appRole, err)
+	}
+	for _, stmt := range []string{
+		`ALTER ROLE ` + appRole + ` WITH LOGIN PASSWORD '` + appPassword + `' NOSUPERUSER NOBYPASSRLS`,
+		`GRANT USAGE ON SCHEMA public TO ` + appRole,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ` + appRole,
+		`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ` + appRole,
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("grant to %s (%s): %v", appRole, stmt, err)
+		}
+	}
+
+	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.User = url.UserPassword(appRole, appPassword)
+	pool, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("connect as %s: %v", appRole, err)
+	}
+	t.Cleanup(pool.Close)
+
+	var isSuper, bypassRLS bool
+	if err := pool.QueryRow(ctx,
+		`SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user`,
+	).Scan(&isSuper, &bypassRLS); err != nil {
+		t.Fatalf("verify %s privileges: %v", appRole, err)
+	}
+	if isSuper || bypassRLS {
+		t.Fatalf("%s must be NOSUPERUSER and NOBYPASSRLS for RLS assertions to mean anything, got rolsuper=%v rolbypassrls=%v", appRole, isSuper, bypassRLS)
+	}
 	return pool
 }
 
