@@ -30,12 +30,37 @@ into one commit.
 
 ---
 
-## Priority 1 — Tier-0 governance services with zero row-level security
+## Priority 1 — Tier-0 governance services with zero row-level security — ✅ COMPLETE
 
-The 8 of 11 Doc 03 §06 "must exist before broad functional expansion" services that have a
+The Doc 03 §06 "must exist before broad functional expansion" services that had a
 `tenant_id` column and **no `CREATE POLICY` / `ENABLE ROW LEVEL SECURITY` at all** — verified
 by grepping every migration file, not inferred. Pattern to copy: `governance-decision-log-svc`'s
 `000002_add_rls.up.sql` + `000006_force_rls.up.sql`.
+
+**Closed 2026-08-22.** 7 real services fixed (row 4 was a false positive — genuinely
+platform-wide reference data). All 7 verified against a real Postgres 16 as a purpose-created
+`NOSUPERUSER NOBYPASSRLS` role, each with a negative control.
+
+### What this tier actually taught us — read before starting Priority 2
+
+Four lessons that cost real time here and will recur:
+
+1. **A superuser bypasses RLS unconditionally, `FORCE` included.** `TEST_DATABASE_URL` points
+   at `postgres`. An isolation test over that connection proves only that the application
+   predicate works — it never touches the policy. Every row here needed a purpose-created
+   ordinary role. The first version of row 6's test passed for exactly this wrong reason.
+2. **Always run a negative control.** Remove the migration; the test must fail. Row 8 also
+   showed the *reverse* control matters: an over-restrictive policy is a real failure mode
+   too (it hid global defaults), and only a test that checks for it will catch it.
+3. **Three services needed a deliberate exemption, and getting it wrong is an outage, not a
+   tightening.** audit-event-store-svc (Kafka writer, global hash chain — a naive policy
+   stops the evidence store accepting events *silently*), authorization-svc
+   (`FindGrantedActions` is the core `/v1/authorize` path — scoping it breaks all
+   authorization platform-wide), secret-vault-integration-svc (cross-tenant admin actions).
+   Check for a legitimate cross-tenant caller *before* writing the policy, not after.
+4. **Test harnesses that name migrations individually silently skip new ones.** Rows 7 and 8
+   both had this: the migration under test would not have been applied at all. Check the
+   suite globs `*.up.sql` before trusting a green run.
 
 | # | Service | Spec ref | Status | Notes |
 |---|---|---|---|---|
@@ -46,7 +71,7 @@ by grepping every migration file, not inferred. Pattern to copy: `governance-dec
 | 5 | authorization-svc | Doc 03 §06, Doc 04 §2.2 | Done | `de2dfc9`. Real, severe bug found beyond the RLS gap: all 7 `/v1/admin/*` write routes had NO authentication at all — tenant_id and actor attribution came straight from the request body. Fixed all 7 (tenant verification, actor from X-Principal-Id, delegator-must-be-caller). RLS added on `roles`/`sod_rules` only (the only 2 tables with a real tenant_id). Two reads (`FindRoleByID`, `FindGrantedActions`) needed a deliberate platform-scope bypass — `FindGrantedActions` is the core `/v1/authorize` path called on nearly every request platform-wide; scoping it by tenant would have silently broken all authorization. 37 tests live-verified against real Postgres 16. |
 | 6 | workflow-svc | Doc 03 §06, Doc 04 §2.2 | Done | `9a5f748`. Two real bugs beyond RLS: (1) `FindWorkflowByID` — the choke point all Store methods route through — fell back to an UNSCOPED lookup when X-Tenant-Id was omitted (document-vault-svc's "filter that disables itself" shape); (2) `initiated_by`/`actor_principal_id` came from the request body on every route, making the existing SoD checks self-declared rather than load-bearing. RLS on `workflow_instances`. 31 tests live-verified against real Postgres 16 — including a purpose-created NOSUPERUSER NOBYPASSRLS role for the no-tenant probe (a superuser bypasses RLS unconditionally, so the first version of that test passed for the wrong reason) plus an explicit negative-control run with the migration removed. |
 | 7 | audit-event-store-svc | Doc 03 §06, Doc 04 §2.2 | Done | `f02b270`. Different shape from rows 1–6: a naive tenant-only FORCE policy here would have taken the platform's append-only evidence store **offline** — no tenant-context plumbing exists (Kafka consumer, no X-Tenant-Id), the hash chain is deliberately global (Doc 04 §15.4), and `sequence_number` is UNIQUE, so the chain-tip SELECT would match zero rows and WITH CHECK would reject every insert, silently (DLQ absorbs a consumer's error). Proven by negative control, not assumed. RLS added with an explicit `app.platform_scope` exemption set only by `PgStore.Store`. Also replaced the test suite's hand-maintained `const schema` copy with `applyMigrations()` reading the real files — the copy would have made this very migration untested. 4 integration tests live-verified against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
-| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Not Started | Verified real: nullable `tenant_id` (NULL = global default), same doctrine as policy-svc/secret-vault-integration-svc |
+| 8 | configuration-feature-flag-svc | Doc 03 §06, Doc 04 §2.2 | Done | `7058337`. Simplest row — the app layer was already correct (all 6 handlers call `requireTenant`, every store method already takes the tenant, list routes already refuse a foreign `?tenant_id=`), so this was purely the DB backstop with no application bug alongside. RLS on both tables, keeping NULL-tenant_id global defaults readable by everyone — a plain `tenant_id = app.tenant_id` policy would hide every global default and turn applicable config into "not found". No platform-scope bypass needed (no legitimate cross-tenant caller exists). Also fixed the suite's setup naming only `000001`, which would have left this migration untested. 16/16 tests pass against real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role, with negative controls in **both** directions (missing policy → leak; over-restrictive policy → global defaults hidden). |
 
 **Verification method per row**: add a `TestPgStore_RLS_TenantIsolation`-style test (same
 pattern as tenant-entity-registry-svc's) that creates two tenants and proves a query scoped
