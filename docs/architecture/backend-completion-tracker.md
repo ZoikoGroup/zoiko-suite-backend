@@ -142,9 +142,9 @@ either one keeps the hole.
 | 8a | banking-connector-svc | yes (row 10) | **Done** `02421f7` — fixed together with row 10 |
 | 8b | connectivity-api-bridge-svc | yes (row 12) | **Done** — fixed together with row 12 |
 | 8c | esignature-integration-svc | yes (row 13) | **Done** — fixed together with row 13 |
-| 8d | external-data-feed-svc | yes (row 15) | Not Started |
-| 8e | hris-connector-svc | yes (row 16) | Not Started |
-| 8f | tax-authority-interface-svc | yes (row 20) | Not Started |
+| 8d | external-data-feed-svc | yes (row 15) | **Done** `5b3bb97` — fixed together with row 15 |
+| 8e | hris-connector-svc | yes (row 16) | **Done** `3c97c3e` — fixed together with row 16 |
+| 8f | tax-authority-interface-svc | yes (row 20) | **Done** `f7da196` — fixed together with row 20 |
 | 8g | carta-svc | no | Not Started |
 | 8h | compliance-risk-scoring-svc | no | Not Started |
 | 8i | evidence-requirements-svc | no | Not Started |
@@ -176,12 +176,12 @@ missed if re-run naively; checked their actual file contents directly instead.
 | 12 | connectivity-api-bridge-svc | Done | Same three defects as row 10, done with row 8b. Unscoped reads exposed another tenant's `endpoint_url`/`auth_type` (`GetBridgeByID`), and `ListIngestionLogs` exposed payload summaries + error messages — the contents flowing through their integration. `ListBridges`' only filter disabled itself. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
 | 13 | esignature-integration-svc | Done | **Worst variant found so far: an unscoped WRITE.** `UpdateEnvelopeStatus` was `WHERE envelope_id = $4` alone, so any caller holding another tenant's envelope_id could mark that tenant's document SIGNED/COMPLETED and set `external_ref`. Doc 03 §16.5 makes this the governed execution path for contracts, board resolutions and legal artifacts, so a forged transition is a legal-integrity issue. Reads also exposed `signer_email`/`signer_name` (personal data). Negative control established RLS alone is sufficient AND that with both controls removed the forged mutation really lands — my first attempt at that control was invalid (a `sed` left `$5` bound, so Postgres errored on parameter count and the test passed for the wrong reason); redone correctly. |
 | 14 | evidence-manifest-svc | Not Started | |
-| 15 | external-data-feed-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
-| 16 | hris-connector-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 15 | external-data-feed-svc | Done | `5b3bb97` (+ `3b14878` comment reword). Same three defects, done with row 8d. Worst leak was `ListEvents`: its only predicate was `feed_id`, self-disabling, so calling it with no `feed_id` returned up to 500 of **every** tenant's feed events **including the payload** — the actual market/reference data flowing through their subscriptions, not just metadata. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. Follow-up commit only reworded two doc comments: gofmt's doc-comment formatter rewrites `''` into a curly quote, mangling the SQL snippet. |
+| 16 | hris-connector-svc | Done | `3c97c3e`. Same three defects, done with row 8e. Unscoped reads exposed another tenant's `provider_name` + `api_endpoint` — the address of the system of record for their workforce data — and `GetSyncJobByID`'s `error_message`, which can carry provider detail. `ListSyncJobs`' only filter disabled itself, returning every tenant's sync history. MemoryStore fixed too. RLS + negative control verified on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role. |
 | 17 | kill-switch-registry-svc | Not Started | |
 | 18 | retention-registry-svc | Not Started | |
 | 19 | source-authority-svc | **Not applicable** | False positive — its only "tenant_id" mention is a comment comparing its real column (`entity_ref`, free-text, no tenant dimension) to kill-switch-registry-svc's design. Genuinely platform-wide reference data; no fix needed. |
-| 20 | tax-authority-interface-svc | Not Started | Verified real: `tenant_id VARCHAR(64) NOT NULL` in `001_init.sql` |
+| 20 | tax-authority-interface-svc | Done | `f7da196`. Same three defects, done with row 8f — last of the six connectors. Most sensitive read in the tier: `GetSubmissionByID` filtered on `submission_id` alone, exposing another tenant's `tax_amount`, `tax_period`, `filing_type` and the authority's `ack_reference` — their actual filed tax figures. `ListSubmissions`' only predicate was `interface_id`, self-disabling, so omitting it returned every tenant's filings. MemoryStore fixed too. **Three** negative controls this time, on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role: migration removed → ENABLE/FORCE + WITH CHECK fail; Go predicate removed with migration present → isolation still holds (RLS is load-bearing alone); both removed → tenant B really reads tenant A's filing amount and ack_reference, so the test detects the leak rather than passing vacuously. |
 
 ## Priority 3 — RLS enabled but not FORCEd (defense-in-depth only)
 
