@@ -14,6 +14,7 @@ import (
 	authzpkg "zoiko.io/ai-governance-svc/internal/authz"
 	"zoiko.io/ai-governance-svc/internal/domain"
 	"zoiko.io/ai-governance-svc/internal/events"
+	"zoiko.io/ai-governance-svc/internal/middleware"
 	"zoiko.io/ai-governance-svc/internal/store"
 )
 
@@ -57,6 +58,39 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireTenant returns the gateway-verified tenant for the routes that
+// touch tenant-scoped tables (ai_runs, automation_policies,
+// automation_actions), and refuses the request when there is none.
+//
+// This is the enforcement point for tenant identity in this service —
+// middleware.TenantContext cannot refuse, because the platform-scope
+// routes legitimately carry no tenant (see its doc comment).
+//
+// declared is the tenant_id the caller put in its own request body or
+// query string, if any. Before this change the handlers used that value
+// directly, so a caller chose which tenant's autonomy allowlist to create,
+// resolve against, or attribute an action to — doc7 §G7 requires
+// allowlists "per tenant, role, risk class and tool" precisely so that
+// agentic execution is "a controlled execution model, not broad delegated
+// authority", and a caller-declared tenant is that delegation. The field
+// is kept in the API for compatibility but is now only allowed to agree
+// with the verified header; disagreement is refused rather than silently
+// resolved in either direction.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request, declared string) (string, bool) {
+	tenantID := middleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized,
+			"X-Tenant-Id is required — the gateway sets it from a verified identity envelope")
+		return "", false
+	}
+	if declared != "" && declared != tenantID {
+		writeError(w, http.StatusForbidden,
+			"tenant_id in the request does not match the verified X-Tenant-Id")
+		return "", false
+	}
+	return tenantID, true
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, actionType string) bool {
@@ -119,7 +153,10 @@ func (h *Handler) CreateAIRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tenantID := r.Header.Get("X-Tenant-Id")
+	tenantID, ok := h.requireTenant(w, r, "")
+	if !ok {
+		return
+	}
 
 	uncertaintyState := domain.UncertaintyNone
 	if req.UncertaintyState != "" {
@@ -156,7 +193,15 @@ func (h *Handler) CreateAIRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, a)
 }
 
+// GetAIRun reads back one AI run, scoped to the caller's tenant. An AI run
+// carries model_id, prompt_version, source_refs, evidence_refs and
+// recommended_action — the reasoning behind a governed decision and the
+// evidence it rested on — so a cross-tenant read here exposes how another
+// tenant's decisions were made, not just that they were.
 func (h *Handler) GetAIRun(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
 	a, err := h.store.GetAIRun(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if errors.Is(err, domain.ErrAIRunNotFound) {
@@ -227,12 +272,18 @@ func (h *Handler) CreateAutomationPolicy(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.TenantID == "" || req.Role == "" || req.Tool == "" || req.ActionType == "" {
-		writeError(w, http.StatusBadRequest, "tenant_id, role, tool, and action_type are required")
+	if req.Role == "" || req.Tool == "" || req.ActionType == "" {
+		writeError(w, http.StatusBadRequest, "role, tool, and action_type are required")
 		return
 	}
 
 	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// tenant_id is no longer required in the body, and no longer trusted
+	// from it: the allowlist entry is created in the verified tenant.
+	tenantID, ok := h.requireTenant(w, r, req.TenantID)
 	if !ok {
 		return
 	}
@@ -246,7 +297,7 @@ func (h *Handler) CreateAutomationPolicy(w http.ResponseWriter, r *http.Request)
 	}
 	p := &domain.AutomationPolicy{
 		AutomationPolicyID:   uuid.NewString(),
-		TenantID:             req.TenantID,
+		TenantID:             tenantID,
 		Role:                 req.Role,
 		RiskCategory:         riskCategory,
 		Tool:                 req.Tool,
@@ -272,11 +323,24 @@ func (h *Handler) CreateAutomationPolicy(w http.ResponseWriter, r *http.Request)
 
 // ResolveAutomationPolicy is doc7 §G7's core check: may this
 // tenant/role/risk-class/tool autonomously perform this action right now.
+//
+// The tenant now comes from the verified header, never the query string.
+// This is the single most security-relevant read in the service — it
+// answers "is this autonomous action allowed" and returns
+// kill_switch_engaged — and it used to accept ?tenant_id=, so any caller
+// could resolve against another tenant's allowlist and read whether their
+// kill switch was engaged. A ?tenant_id= that disagrees with the header is
+// refused rather than ignored, so a caller that means to ask about
+// another tenant gets an error instead of a quietly reinterpreted answer.
 func (h *Handler) ResolveAutomationPolicy(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	tenantID, role, riskCategory, tool, actionType := q.Get("tenant_id"), q.Get("role"), q.Get("risk_category"), q.Get("tool"), q.Get("action_type")
-	if tenantID == "" || role == "" || tool == "" || actionType == "" {
-		writeError(w, http.StatusBadRequest, "tenant_id, role, tool, and action_type query params are required")
+	role, riskCategory, tool, actionType := q.Get("role"), q.Get("risk_category"), q.Get("tool"), q.Get("action_type")
+	if role == "" || tool == "" || actionType == "" {
+		writeError(w, http.StatusBadRequest, "role, tool, and action_type query params are required")
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, q.Get("tenant_id"))
+	if !ok {
 		return
 	}
 	if riskCategory == "" {
@@ -301,12 +365,16 @@ func (h *Handler) ProposeAutomationAction(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.TenantID == "" || req.ActionType == "" || req.Role == "" || req.Tool == "" || req.IdempotencyKey == "" {
-		writeError(w, http.StatusBadRequest, "tenant_id, action_type, role, tool, and idempotency_key are required")
+	if req.ActionType == "" || req.Role == "" || req.Tool == "" || req.IdempotencyKey == "" {
+		writeError(w, http.StatusBadRequest, "action_type, role, tool, and idempotency_key are required")
 		return
 	}
 
 	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r, req.TenantID)
 	if !ok {
 		return
 	}
@@ -326,7 +394,7 @@ func (h *Handler) ProposeAutomationAction(w http.ResponseWriter, r *http.Request
 		requiresMakerChecker = classification.RequiresMakerChecker
 	}
 
-	resolution, err := h.store.ResolveAutomationPolicy(r.Context(), req.TenantID, req.Role, string(riskCategory), req.Tool, req.ActionType)
+	resolution, err := h.store.ResolveAutomationPolicy(r.Context(), tenantID, req.Role, string(riskCategory), req.Tool, req.ActionType)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to resolve automation policy")
 		return
@@ -342,7 +410,7 @@ func (h *Handler) ProposeAutomationAction(w http.ResponseWriter, r *http.Request
 	}
 	a := &domain.AutomationAction{
 		AutomationActionID:    uuid.NewString(),
-		TenantID:              req.TenantID,
+		TenantID:              tenantID,
 		ActionType:            req.ActionType,
 		RiskCategory:          riskCategory,
 		IdempotencyKey:        req.IdempotencyKey,
@@ -372,6 +440,9 @@ func (h *Handler) ProposeAutomationAction(w http.ResponseWriter, r *http.Request
 }
 
 func (h *Handler) GetAutomationAction(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
 	a, err := h.store.GetAutomationAction(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		if errors.Is(err, domain.ErrAutomationActionNotFound) {
@@ -386,8 +457,18 @@ func (h *Handler) GetAutomationAction(w http.ResponseWriter, r *http.Request) {
 
 // DecideAutomationAction is doc7 §G2/§H3's maker-checker decision step —
 // self-approval (decider == proposer) is blocked fail-closed.
+//
+// This is the most consequential write in the service: approving here is
+// what authorizes an autonomous action to execute. It is now tenant-scoped
+// at three layers — this handler requires a verified tenant, the
+// GetAutomationAction fetch below is tenant-scoped so a foreign action id
+// 404s before any decision is reached, and the UPDATE itself carries the
+// tenant predicate so it does not depend on that ordering holding.
 func (h *Handler) DecideAutomationAction(w http.ResponseWriter, r *http.Request) {
 	actionID := chi.URLParam(r, "id")
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
 	var req domain.ApproveAutomationActionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
