@@ -21,6 +21,7 @@ import (
 	"zoiko.io/evidence-manifest-svc/internal/events"
 	"zoiko.io/evidence-manifest-svc/internal/handler"
 	"zoiko.io/evidence-manifest-svc/internal/health"
+	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
 	"zoiko.io/evidence-manifest-svc/internal/store"
 )
 
@@ -90,7 +91,15 @@ func main() {
 
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", healthH.Readiness)
-	handler.RegisterRoutes(r, h)
+
+	// The tenant requirement is mounted on the API routes only, not on the
+	// router as a whole: /healthz and /readyz are probed by the platform with
+	// no tenant identity, and a blanket middleware would fail every probe and
+	// take the service out of its own load balancer.
+	r.Group(func(r chi.Router) {
+		r.Use(svcmiddleware.TenantContext())
+		handler.RegisterRoutes(r, h)
+	})
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
