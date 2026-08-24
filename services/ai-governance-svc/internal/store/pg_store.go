@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/ai-governance-svc/internal/domain"
+	"zoiko.io/ai-governance-svc/internal/middleware"
 )
 
 func isUniqueViolation(err error) bool {
@@ -64,6 +65,42 @@ func unmarshalStrings(data []byte) []string {
 	return out
 }
 
+// withTenant runs fn inside a transaction with app.tenant_id set from the
+// request context, so the tenant_isolation_policy added in migration
+// 000002_add_rls.sql has a value to enforce against.
+//
+// Only the three tenant-scoped tables go through this: ai_runs,
+// automation_policies and automation_actions. The other three carry no
+// tenant_id and are correct that way — action_risk_classifications is the
+// platform risk taxonomy, model_provider_registrations the provider
+// registry, and policy_change_approvals is platform governance because
+// doc7 §G3 says policy changes "alter governance truth across tenants".
+// Those methods deliberately stay on s.pool; wrapping them would imply a
+// tenant boundary the doc does not want.
+//
+// The tenant comes from context, set by middleware.TenantContext from a
+// gateway-verified X-Tenant-Id and enforced by Handler.requireTenant. It
+// is never read from a request body or query string — which is exactly
+// what this service used to do, letting a caller name the tenant whose
+// autonomy allowlist it was creating or resolving against.
+func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.tenant_id', $1, true)", middleware.TenantFromContext(ctx),
+	); err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *PgStore) CreateAIRun(ctx context.Context, a *domain.AIRun) error {
 	sourceRefs, err := marshalStrings(a.SourceRefs)
 	if err != nil {
@@ -73,36 +110,51 @@ func (s *PgStore) CreateAIRun(ctx context.Context, a *domain.AIRun) error {
 	if err != nil {
 		return fmt.Errorf("marshal evidence_refs: %w", err)
 	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO ai_runs (
-			ai_run_id, tenant_id, run_type, model_id, prompt_version, tool_version,
-			source_refs, evidence_refs, confidence, limitation, uncertainty_state,
-			recommended_action, audit_id, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-	`, a.AIRunID, a.TenantID, string(a.RunType), a.ModelID, a.PromptVersion, a.ToolVersion,
-		sourceRefs, evidenceRefs, a.Confidence, a.Limitation, string(a.UncertaintyState),
-		a.RecommendedAction, a.AuditID, a.CreatedAt, a.CreatedByPrincipalID,
-	)
+	err = s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO ai_runs (
+				ai_run_id, tenant_id, run_type, model_id, prompt_version, tool_version,
+				source_refs, evidence_refs, confidence, limitation, uncertainty_state,
+				recommended_action, audit_id, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		`, a.AIRunID, a.TenantID, string(a.RunType), a.ModelID, a.PromptVersion, a.ToolVersion,
+			sourceRefs, evidenceRefs, a.Confidence, a.Limitation, string(a.UncertaintyState),
+			a.RecommendedAction, a.AuditID, a.CreatedAt, a.CreatedByPrincipalID,
+		)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("insert ai run: %w", err)
 	}
 	return nil
 }
 
+// GetAIRun reads one AI run scoped to the caller's tenant.
+//
+// The tenant predicate is new. This query was `WHERE ai_run_id = $1`
+// alone, so any caller holding or guessing an ai_run_id could read another
+// tenant's model_id, prompt_version, source_refs, evidence_refs and
+// recommended_action — how a governed decision was reached and what
+// evidence it rested on. Returns ErrAIRunNotFound rather than a distinct
+// forbidden error, so a probe cannot confirm the id exists.
 func (s *PgStore) GetAIRun(ctx context.Context, aiRunID string) (*domain.AIRun, error) {
 	var a domain.AIRun
 	var runType, uncertaintyState string
 	var sourceRefs, evidenceRefs []byte
-	err := s.pool.QueryRow(ctx, `
-		SELECT ai_run_id, tenant_id, run_type, model_id, prompt_version, tool_version,
-		       source_refs, evidence_refs, confidence, limitation, uncertainty_state,
-		       recommended_action, audit_id, created_at, created_by_principal_id
-		FROM ai_runs WHERE ai_run_id = $1
-	`, aiRunID).Scan(
-		&a.AIRunID, &a.TenantID, &runType, &a.ModelID, &a.PromptVersion, &a.ToolVersion,
-		&sourceRefs, &evidenceRefs, &a.Confidence, &a.Limitation, &uncertaintyState,
-		&a.RecommendedAction, &a.AuditID, &a.CreatedAt, &a.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT ai_run_id, tenant_id, run_type, model_id, prompt_version, tool_version,
+			       source_refs, evidence_refs, confidence, limitation, uncertainty_state,
+			       recommended_action, audit_id, created_at, created_by_principal_id
+			FROM ai_runs
+			WHERE ai_run_id = $1
+			  AND tenant_id = $2
+		`, aiRunID, middleware.TenantFromContext(ctx)).Scan(
+			&a.AIRunID, &a.TenantID, &runType, &a.ModelID, &a.PromptVersion, &a.ToolVersion,
+			&sourceRefs, &evidenceRefs, &a.Confidence, &a.Limitation, &uncertaintyState,
+			&a.RecommendedAction, &a.AuditID, &a.CreatedAt, &a.CreatedByPrincipalID,
+		)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrAIRunNotFound
 	}
@@ -157,16 +209,19 @@ func (s *PgStore) GetActionRiskClassification(ctx context.Context, actionType st
 }
 
 func (s *PgStore) CreateAutomationPolicy(ctx context.Context, p *domain.AutomationPolicy) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO automation_policies (
-			automation_policy_id, tenant_id, role, risk_category, tool, action_type,
-			max_scope_amount, required_approvals, dry_run_required, rate_limit_per_day,
-			kill_switch_engaged, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-	`, p.AutomationPolicyID, p.TenantID, p.Role, string(p.RiskCategory), p.Tool, p.ActionType,
-		p.MaxScopeAmount, p.RequiredApprovals, p.DryRunRequired, p.RateLimitPerDay,
-		p.KillSwitchEngaged, p.CreatedAt, p.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO automation_policies (
+				automation_policy_id, tenant_id, role, risk_category, tool, action_type,
+				max_scope_amount, required_approvals, dry_run_required, rate_limit_per_day,
+				kill_switch_engaged, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		`, p.AutomationPolicyID, p.TenantID, p.Role, string(p.RiskCategory), p.Tool, p.ActionType,
+			p.MaxScopeAmount, p.RequiredApprovals, p.DryRunRequired, p.RateLimitPerDay,
+			p.KillSwitchEngaged, p.CreatedAt, p.CreatedByPrincipalID,
+		)
+		return err
+	})
 	if err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: an automation policy already exists for this tenant/role/risk-category/tool/action", domain.ErrConflict)
@@ -179,12 +234,20 @@ func (s *PgStore) CreateAutomationPolicy(ctx context.Context, p *domain.Automati
 // ResolveAutomationPolicy is doc7 §G7's core check: may this tenant/role/tool
 // autonomously perform this action right now. Fail-closed — absence of a
 // matching row means NOT_ALLOWLISTED, never a default allow.
+//
+// The tenantID parameter is retained, but the handler now sources it from
+// the verified X-Tenant-Id rather than a ?tenant_id= query param, and RLS
+// is a second gate beneath it: if a future caller passed a foreign tenant
+// here, the policy would match no row and this fails closed to
+// NOT_ALLOWLISTED rather than leaking that tenant's kill-switch state.
 func (s *PgStore) ResolveAutomationPolicy(ctx context.Context, tenantID, role, riskCategory, tool, actionType string) (*domain.AutomationPolicyResolution, error) {
 	var killSwitchEngaged bool
-	err := s.pool.QueryRow(ctx, `
-		SELECT kill_switch_engaged FROM automation_policies
-		WHERE tenant_id = $1 AND role = $2 AND risk_category = $3 AND tool = $4 AND action_type = $5
-	`, tenantID, role, riskCategory, tool, actionType).Scan(&killSwitchEngaged)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT kill_switch_engaged FROM automation_policies
+			WHERE tenant_id = $1 AND role = $2 AND risk_category = $3 AND tool = $4 AND action_type = $5
+		`, tenantID, role, riskCategory, tool, actionType).Scan(&killSwitchEngaged)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &domain.AutomationPolicyResolution{Allowed: false, ReasonCode: "NOT_ALLOWLISTED"}, nil
 	}
@@ -198,16 +261,19 @@ func (s *PgStore) ResolveAutomationPolicy(ctx context.Context, tenantID, role, r
 }
 
 func (s *PgStore) ProposeAutomationAction(ctx context.Context, a *domain.AutomationAction) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO automation_actions (
-			automation_action_id, tenant_id, action_type, risk_category, idempotency_key,
-			preconditions_met, approval_status, postcondition_verified, rollback_plan,
-			status, proposed_by_principal_id, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
-	`, a.AutomationActionID, a.TenantID, a.ActionType, string(a.RiskCategory), a.IdempotencyKey,
-		a.PreconditionsMet, string(a.ApprovalStatus), a.PostconditionVerified, a.RollbackPlan,
-		string(a.Status), a.ProposedByPrincipalID, a.CreatedAt,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO automation_actions (
+				automation_action_id, tenant_id, action_type, risk_category, idempotency_key,
+				preconditions_met, approval_status, postcondition_verified, rollback_plan,
+				status, proposed_by_principal_id, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+		`, a.AutomationActionID, a.TenantID, a.ActionType, string(a.RiskCategory), a.IdempotencyKey,
+			a.PreconditionsMet, string(a.ApprovalStatus), a.PostconditionVerified, a.RollbackPlan,
+			string(a.Status), a.ProposedByPrincipalID, a.CreatedAt,
+		)
+		return err
+	})
 	if err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: idempotency_key %s", domain.ErrDuplicateIdempotencyKey, a.IdempotencyKey)
@@ -217,19 +283,29 @@ func (s *PgStore) ProposeAutomationAction(ctx context.Context, a *domain.Automat
 	return nil
 }
 
+// GetAutomationAction reads one proposed or executed autonomous action
+// scoped to the caller's tenant.
+//
+// The tenant predicate is new, and it also guards the decision path:
+// DecideAutomationAction fetches through here first, so a foreign action
+// id now 404s before any approval is possible.
 func (s *PgStore) GetAutomationAction(ctx context.Context, automationActionID string) (*domain.AutomationAction, error) {
 	var a domain.AutomationAction
 	var riskCategory, approvalStatus, status string
-	err := s.pool.QueryRow(ctx, `
-		SELECT automation_action_id, tenant_id, action_type, risk_category, idempotency_key,
-		       preconditions_met, approval_status, postcondition_verified, rollback_plan,
-		       status, proposed_by_principal_id, approved_by_principal_id, created_at, updated_at
-		FROM automation_actions WHERE automation_action_id = $1
-	`, automationActionID).Scan(
-		&a.AutomationActionID, &a.TenantID, &a.ActionType, &riskCategory, &a.IdempotencyKey,
-		&a.PreconditionsMet, &approvalStatus, &a.PostconditionVerified, &a.RollbackPlan,
-		&status, &a.ProposedByPrincipalID, &a.ApprovedByPrincipalID, &a.CreatedAt, &a.UpdatedAt,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT automation_action_id, tenant_id, action_type, risk_category, idempotency_key,
+			       preconditions_met, approval_status, postcondition_verified, rollback_plan,
+			       status, proposed_by_principal_id, approved_by_principal_id, created_at, updated_at
+			FROM automation_actions
+			WHERE automation_action_id = $1
+			  AND tenant_id = $2
+		`, automationActionID, middleware.TenantFromContext(ctx)).Scan(
+			&a.AutomationActionID, &a.TenantID, &a.ActionType, &riskCategory, &a.IdempotencyKey,
+			&a.PreconditionsMet, &approvalStatus, &a.PostconditionVerified, &a.RollbackPlan,
+			&status, &a.ProposedByPrincipalID, &a.ApprovedByPrincipalID, &a.CreatedAt, &a.UpdatedAt,
+		)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrAutomationActionNotFound
 	}
@@ -247,21 +323,41 @@ func (s *PgStore) GetAutomationAction(ctx context.Context, automationActionID st
 // from the original proposer) is enforced by the caller (handler) before
 // this is invoked, since the store layer alone can't distinguish "no rows
 // changed because already decided" from "no rows changed because blocked."
+//
+// The tenant predicate is new and this is the service's most consequential
+// write: approving here is what authorizes an autonomous action to
+// execute. The UPDATE was `WHERE automation_action_id = $5 AND
+// approval_status = 'PENDING'`, so a caller holding another tenant's
+// action id could approve that tenant's pending autonomous action — grant
+// agentic authority inside someone else's tenant. The handler's fetch is
+// now tenant-scoped too, but the predicate is here as well so this does
+// not depend on the handler's call ordering staying as it is.
 func (s *PgStore) DecideAutomationAction(ctx context.Context, automationActionID, decision, deciderPrincipalID string) (*domain.AutomationAction, error) {
 	now := time.Now().UTC()
 	newStatus := domain.AutomationActionApproved
 	if decision == string(domain.ApprovalRejected) {
 		newStatus = domain.AutomationActionRejected
 	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE automation_actions
-		SET approval_status = $1, status = $2, approved_by_principal_id = $3, updated_at = $4
-		WHERE automation_action_id = $5 AND approval_status = 'PENDING'
-	`, decision, string(newStatus), deciderPrincipalID, now, automationActionID)
+	var rowsAffected int64
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE automation_actions
+			SET approval_status = $1, status = $2, approved_by_principal_id = $3, updated_at = $4
+			WHERE automation_action_id = $5
+			  AND tenant_id = $6
+			  AND approval_status = 'PENDING'
+		`, decision, string(newStatus), deciderPrincipalID, now, automationActionID,
+			middleware.TenantFromContext(ctx))
+		if err != nil {
+			return err
+		}
+		rowsAffected = tag.RowsAffected()
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("decide automation action: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if rowsAffected == 0 {
 		return nil, domain.ErrInvalidDecision
 	}
 	return s.GetAutomationAction(ctx, automationActionID)

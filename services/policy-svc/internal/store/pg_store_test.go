@@ -393,6 +393,74 @@ func TestPgStore_ListVersionHistory_NewestFirstIncludesSuperseded(t *testing.T) 
 	}
 }
 
+// TestPgStore_TenantIsolation_ListVersionHistory proves the fix for the
+// real gap found in this row: ListVersionHistory previously took no
+// tenant at all, so any caller could list every tenant's policy
+// versions for a policy_id — approval thresholds, spend limits, SoD
+// rules, and who activated them. Tenant B must see the global version
+// but not tenant A's.
+func TestPgStore_TenantIsolation_ListVersionHistory(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	p, _, err := s.CreatePolicy(ctx, domain.CreatePolicyParams{
+		PolicyCode:           "APPROVAL_5K",
+		PolicyName:           "5K Approval Threshold",
+		PolicyType:           "APPROVAL_THRESHOLD",
+		CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create policy: %v", err)
+	}
+
+	tenantA := strPtr(uuid.New().String())
+	tenantB := strPtr(uuid.New().String())
+	ctxA := svcmiddleware.WithTenant(ctx, *tenantA)
+	ctxB := svcmiddleware.WithTenant(ctx, *tenantB)
+
+	global, _, err := s.CreatePolicyVersion(ctx, domain.CreatePolicyVersionParams{
+		PolicyID: p.PolicyID, RulePayload: []byte(`{"threshold_amount":1000}`),
+		EffectiveFrom: time.Now().UTC().Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create global version: %v", err)
+	}
+	tenantAV, _, err := s.CreatePolicyVersion(ctxA, domain.CreatePolicyVersionParams{
+		PolicyID: p.PolicyID, TenantID: tenantA, RulePayload: []byte(`{"threshold_amount":9000}`),
+		EffectiveFrom: time.Now().UTC().Add(time.Hour).Truncate(time.Microsecond), CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("failed to create tenant A's version: %v", err)
+	}
+
+	// Probe: tenant B's context, listing the same policy tenant A has a version on.
+	resultsB, err := s.ListVersionHistory(ctxB, p.PolicyID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, v := range resultsB {
+		if v.PolicyVersionID == tenantAV.PolicyVersionID {
+			t.Fatalf("ISOLATION FAILURE: ListVersionHistory returned tenant A's version under tenant B's context: %+v", v)
+		}
+	}
+	if len(resultsB) != 1 || resultsB[0].PolicyVersionID != global.PolicyVersionID {
+		t.Fatalf("expected tenant B to see only the global version, got %+v", resultsB)
+	}
+
+	// Sanity: tenant A sees both its own version and the global one.
+	resultsA, err := s.ListVersionHistory(ctxA, p.PolicyID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resultsA) != 2 {
+		t.Fatalf("expected tenant A to see 2 versions (its own + global), got %d: %+v", len(resultsA), resultsA)
+	}
+}
+
 func TestPgStore_FindApplicableVersions_ScopePrecedenceAndIsolation(t *testing.T) {
 	pool := getTestPool(t)
 	defer pool.Close()

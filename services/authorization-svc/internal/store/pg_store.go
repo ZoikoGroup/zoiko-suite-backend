@@ -27,9 +27,10 @@ type Store interface {
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
 
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
-	RevokeRoleAssignment(ctx context.Context, assignmentID string) (*domain.PrincipalRoleAssignment, error)
+	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
+	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
 
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
@@ -68,6 +69,55 @@ func New(pool *pgxpool.Pool, log *zap.Logger) *PgStore {
 	return &PgStore{pool: pool, log: log}
 }
 
+// withRLS runs fn inside a transaction with app.tenant_id set for the
+// session, so roles/sod_rules' tenant_isolation_policy has a value to
+// enforce against. Mirrors tenant-entity-registry-svc's PgStore.withRLS.
+// An empty tenantID is valid — it means "no specific tenant" and only
+// ever matches a sod_rules row whose own tenant_id is NULL (a globally-
+// applicable rule), never a real tenant's row.
+func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		return fmt.Errorf("set_config app.tenant_id: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// withPlatformScope runs fn inside a transaction flagged as platform
+// scope, which the roles policy treats as visible regardless of
+// tenant_id. Used ONLY by FindRoleByID, whose entire purpose is to
+// discover which tenant an unknown role_id belongs to — the caller
+// cannot know the tenant to scope the read by until after this read
+// returns, so this read structurally cannot be tenant-scoped without
+// being pointless (same reasoning as secret-vault-integration-svc's
+// FindSecretPolicyVersionByID). Safety comes from the caller (handler.go)
+// always comparing the returned role's TenantID against the verified
+// caller's own scope and refusing on mismatch — this function's result is
+// never trusted as pre-authorized.
+func (s *PgStore) withPlatformScope(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+		return fmt.Errorf("set_config app.platform_scope: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ── roles ────────────────────────────────────────────────────────────────────
 
 const roleColumns = `role_id, tenant_id, role_code, role_name, role_scope_type, active_flag, created_at, created_by_principal_id`
@@ -78,10 +128,17 @@ func scanRole(row pgx.Row) (*domain.Role, error) {
 	return r, err
 }
 
+// FindRoleByID looks up a role by its UUID primary key, regardless of
+// tenant — see withPlatformScope's doc comment for why this specific
+// read has to run unscoped, and why that's safe.
 func (s *PgStore) FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error) {
 	const query = `SELECT ` + roleColumns + ` FROM roles WHERE role_id = $1;`
-	row := s.pool.QueryRow(ctx, query, roleID)
-	r, err := scanRole(row)
+	var r *domain.Role
+	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		r, scanErr = scanRole(tx.QueryRow(ctx, query, roleID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrRoleNotFound
@@ -142,28 +199,38 @@ func (s *PgStore) CreateRole(ctx context.Context, params domain.CreateRoleParams
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (tenant_id, role_code) DO NOTHING
 		RETURNING ` + roleColumns + `;`
+	const lookupQuery = `SELECT ` + roleColumns + ` FROM roles WHERE tenant_id = $1 AND role_code = $2;`
 
-	row := s.pool.QueryRow(ctx, query, params.RoleID, params.TenantID, params.RoleCode, params.RoleName, params.RoleScopeType, params.CreatedByPrincipalID)
-	r, err := scanRole(row)
-	if err == nil {
-		return r, true, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	var result *domain.Role
+	var created bool
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		r, err := scanRole(tx.QueryRow(ctx, query, params.RoleID, params.TenantID, params.RoleCode, params.RoleName, params.RoleScopeType, params.CreatedByPrincipalID))
+		if err == nil {
+			result, created = r, true
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+
+		existing, err := scanRole(tx.QueryRow(ctx, lookupQuery, params.TenantID, params.RoleCode))
+		if err != nil {
+			return err
+		}
+		if existing.RoleName != params.RoleName || existing.RoleScopeType != params.RoleScopeType {
+			return domain.ErrConflict
+		}
+		result, created = existing, false
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrConflict) {
+			return nil, false, domain.ErrConflict
+		}
 		s.log.Error("pg CreateRole failed", zap.Error(err))
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-
-	const lookupQuery = `SELECT ` + roleColumns + ` FROM roles WHERE tenant_id = $1 AND role_code = $2;`
-	row = s.pool.QueryRow(ctx, lookupQuery, params.TenantID, params.RoleCode)
-	r, err = scanRole(row)
-	if err != nil {
-		s.log.Error("pg CreateRole lookup existing failed", zap.Error(err))
-		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	if r.RoleName != params.RoleName || r.RoleScopeType != params.RoleScopeType {
-		return nil, false, domain.ErrConflict
-	}
-	return r, false, nil
+	return result, created, nil
 }
 
 // ── permission_bundles ───────────────────────────────────────────────────────
@@ -237,15 +304,32 @@ func (s *PgStore) CreateRoleAssignment(ctx context.Context, params domain.Create
 	return a, nil
 }
 
-func (s *PgStore) RevokeRoleAssignment(ctx context.Context, assignmentID string) (*domain.PrincipalRoleAssignment, error) {
+// RevokeRoleAssignment ends an assignment, scoped to tenantID through the
+// assignment's role — principal_role_assignments has no tenant_id column
+// of its own, only legal_entity_id, so the join through roles is how
+// "does this assignment belong to the caller's tenant" is answered at
+// all. A cross-tenant attempt reports ErrRoleAssignmentNotFound, same as
+// a genuinely missing one — it must not confirm another tenant's
+// assignment exists.
+func (s *PgStore) RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error) {
 	const query = `
 		UPDATE principal_role_assignments
 		SET effective_to = NOW()
-		WHERE principal_role_assignment_id = $1 AND (effective_to IS NULL OR effective_to > NOW())
+		WHERE principal_role_assignment_id = $1
+		  AND (effective_to IS NULL OR effective_to > NOW())
+		  AND role_id IN (SELECT role_id FROM roles WHERE tenant_id = $2)
 		RETURNING ` + assignmentColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query, assignmentID)
-	a, err := scanAssignment(row)
+	// The subquery reads `roles`, which carries RLS — without app.tenant_id
+	// set, the subquery would see zero rows regardless of the WHERE
+	// tenant_id = $2 predicate, since RLS filters before that clause ever
+	// runs.
+	var a *domain.PrincipalRoleAssignment
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		a, scanErr = scanAssignment(tx.QueryRow(ctx, query, assignmentID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrRoleAssignmentNotFound
@@ -287,16 +371,29 @@ func (s *PgStore) CreateDelegatedAuthority(ctx context.Context, params domain.Cr
 	return d, nil
 }
 
-func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error) {
-	const findQuery = `SELECT ` + delegationColumns + ` FROM delegated_authorities WHERE delegated_authority_id = $1;`
-	row := s.pool.QueryRow(ctx, findQuery, delegatedAuthorityID)
-	current, err := scanDelegation(row)
+// FindDelegatedAuthorityByID looks up a delegation by its primary key —
+// the pre-mutation fetch RevokeDelegatedAuthority's handler needs to
+// verify the caller is the delegator before revoking (that check must
+// happen BEFORE the transition, not after, same doctrine as
+// secret-vault-integration-svc's RevokeLease).
+func (s *PgStore) FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error) {
+	const query = `SELECT ` + delegationColumns + ` FROM delegated_authorities WHERE delegated_authority_id = $1;`
+	row := s.pool.QueryRow(ctx, query, delegatedAuthorityID)
+	d, err := scanDelegation(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrDelegatedAuthorityNotFound
 		}
-		s.log.Error("pg RevokeDelegatedAuthority lookup failed", zap.Error(err))
+		s.log.Error("pg FindDelegatedAuthorityByID failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return d, nil
+}
+
+func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error) {
+	current, err := s.FindDelegatedAuthorityByID(ctx, delegatedAuthorityID)
+	if err != nil {
+		return nil, err
 	}
 	if current.RevocationStatus == "REVOKED" {
 		return nil, domain.ErrInvalidTransition
@@ -308,7 +405,7 @@ func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthori
 		WHERE delegated_authority_id = $1
 		RETURNING ` + delegationColumns + `;`
 
-	row = s.pool.QueryRow(ctx, query, delegatedAuthorityID)
+	row := s.pool.QueryRow(ctx, query, delegatedAuthorityID)
 	d, err := scanDelegation(row)
 	if err != nil {
 		s.log.Error("pg RevokeDelegatedAuthority failed", zap.Error(err))
@@ -329,9 +426,16 @@ func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRule
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING sod_rule_id, domain_code, action_a, action_b, conflict_type, jurisdiction_id, tenant_id, active_flag, created_at;`
 
-	row := s.pool.QueryRow(ctx, query, params.SoDRuleID, params.DomainCode, params.ActionA, params.ActionB, params.ConflictType, params.JurisdictionID, params.TenantID)
+	var tenantID string
+	if params.TenantID != nil {
+		tenantID = *params.TenantID
+	}
 	r := &domain.SoDRule{}
-	if err := row.Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType, &r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt); err != nil {
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, params.SoDRuleID, params.DomainCode, params.ActionA, params.ActionB, params.ConflictType, params.JurisdictionID, params.TenantID).
+			Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType, &r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt)
+	})
+	if err != nil {
 		s.log.Error("pg CreateSoDRule failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
@@ -344,6 +448,17 @@ func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRule
 // role assignment + active bundle for (principalID, legalEntityID). A
 // tenant-wide assignment (pra.legal_entity_id IS NULL) matches regardless
 // of which legal entity is being evaluated.
+//
+// Platform-scoped (bypasses roles' RLS), deliberately: this is the core
+// /v1/authorize evaluation path, called on nearly every mutating request
+// platform-wide, and the caller of /v1/authorize is not required to
+// supply — and generally does not know — which tenant owns principalID.
+// tenant_id is simply not this query's scoping variable; principal_id +
+// legal_entity_id + active_flag + the effective-dated window already are,
+// exactly as before RLS existed on this table. Scoping this by tenant
+// would not add security, it would silently deny every real grant look-up
+// once zoiko_app (the platform's actual non-superuser runtime role) makes
+// FORCE ROW LEVEL SECURITY bite for real.
 func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error) {
 	const query = `
 		SELECT r.role_code, pb.permitted_actions
@@ -355,34 +470,36 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 		  AND pra.effective_from <= NOW()
 		  AND (pra.effective_to IS NULL OR pra.effective_to > NOW());`
 
-	rows, err := s.pool.Query(ctx, query, principalID, legalEntityID)
-	if err != nil {
-		s.log.Error("pg FindGrantedActions failed", zap.Error(err))
-		return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
 	seen := map[string]bool{}
 	var actions []string
 	var roleCodes []string
-	for rows.Next() {
-		var roleCode string
-		var rawActions []byte
-		if err := rows.Scan(&roleCode, &rawActions); err != nil {
-			s.log.Error("pg FindGrantedActions scan failed", zap.Error(err))
-			return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, principalID, legalEntityID)
+		if err != nil {
+			return err
 		}
-		var bundleActions []string
-		_ = json.Unmarshal(rawActions, &bundleActions)
-		roleCodes = append(roleCodes, roleCode)
-		for _, a := range bundleActions {
-			if !seen[a] {
-				seen[a] = true
-				actions = append(actions, a)
+		defer rows.Close()
+
+		for rows.Next() {
+			var roleCode string
+			var rawActions []byte
+			if err := rows.Scan(&roleCode, &rawActions); err != nil {
+				return err
+			}
+			var bundleActions []string
+			_ = json.Unmarshal(rawActions, &bundleActions)
+			roleCodes = append(roleCodes, roleCode)
+			for _, a := range bundleActions {
+				if !seen[a] {
+					seen[a] = true
+					actions = append(actions, a)
+				}
 			}
 		}
-	}
-	if err := rows.Err(); err != nil {
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg FindGrantedActions failed", zap.Error(err))
 		return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
@@ -471,35 +588,41 @@ func (s *PgStore) CheckSoDConflict(ctx context.Context, grantedActions []string,
 		  AND (action_a = $1 OR action_b = $1)
 		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid);`
 
-	rows, err := s.pool.Query(ctx, query, candidateAction, tenantID)
-	if err != nil {
-		s.log.Error("pg CheckSoDConflict failed", zap.Error(err))
-		return "", false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	defer rows.Close()
-
 	grantedSet := map[string]bool{}
 	for _, a := range grantedActions {
 		grantedSet[a] = true
 	}
 
-	for rows.Next() {
-		var a, b string
-		if err := rows.Scan(&a, &b); err != nil {
-			return "", false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	var conflicting string
+	var hasConflict bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, candidateAction, tenantID)
+		if err != nil {
+			return err
 		}
-		other := a
-		if a == candidateAction {
-			other = b
+		defer rows.Close()
+
+		for rows.Next() {
+			var a, b string
+			if err := rows.Scan(&a, &b); err != nil {
+				return err
+			}
+			other := a
+			if a == candidateAction {
+				other = b
+			}
+			if grantedSet[other] {
+				conflicting, hasConflict = other, true
+				return nil
+			}
 		}
-		if grantedSet[other] {
-			return other, true, nil
-		}
-	}
-	if err := rows.Err(); err != nil {
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg CheckSoDConflict failed", zap.Error(err))
 		return "", false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	return "", false, nil
+	return conflicting, hasConflict, nil
 }
 
 // ── access_decision_log ──────────────────────────────────────────────────────

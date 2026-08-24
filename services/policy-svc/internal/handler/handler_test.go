@@ -780,7 +780,7 @@ func TestListVersionHistory_EmptyReturnsArray(t *testing.T) {
 	store := &stubStore{history: nil}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -796,7 +796,7 @@ func TestListVersionHistory_NotFound(t *testing.T) {
 	store := &stubStore{historyErr: domain.ErrPolicyNotFound}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies/missing/versions", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/missing/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -815,7 +815,7 @@ func TestListVersionHistory_NewestFirst(t *testing.T) {
 	}
 	r := newTestRouter(store)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil)
+	req := scoped(httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -1221,6 +1221,19 @@ func TestGetPolicyVersionByID_NoTenantScope_Refused(t *testing.T) {
 	r := newTestRouter(&stubStore{findVersion: &domain.PolicyVersion{PolicyVersionID: "pv-1"}})
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policy-versions/pv-1", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ListVersionHistory had no tenant scoping at all until this fix — any
+// authenticated caller could list every tenant's policy versions for a
+// policy_id. This proves the missing-header case is now refused, same
+// as its sibling GetPolicyVersionByID above.
+func TestListVersionHistory_NoTenantScope_Refused(t *testing.T) {
+	r := newTestRouter(&stubStore{history: []*domain.PolicyVersion{{PolicyVersionID: "pv-1"}}})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/policies/p-1/versions", nil))
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with no X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
 	}

@@ -592,8 +592,14 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/policies/{policy_id}/versions ───────────────────────────────────
 
 // ListVersionHistory handles GET /v1/policies/{policy_id}/versions.
-// Returns the full version history for a policy, newest first
+// Returns the version history for a policy visible to the caller's
+// tenant (global versions plus that tenant's own), newest first
 // (by effective_from, then created_at, descending).
+//
+// Had no tenant scoping at all until now: any authenticated caller
+// could list every tenant's policy versions for a policy_id — approval
+// thresholds, spend limits, SoD rules. Now requires X-Tenant-Id, same as
+// GetPolicyVersionByID.
 //
 // Response:
 //
@@ -603,6 +609,10 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
 	policyID := chi.URLParam(r, "policy_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 
 	results, err := h.store.ListVersionHistory(r.Context(), policyID)
 	if err != nil {
