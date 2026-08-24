@@ -15,6 +15,7 @@ import (
 	"zoiko.io/commercial-account-svc/internal/authz"
 	"zoiko.io/commercial-account-svc/internal/domain"
 	"zoiko.io/commercial-account-svc/internal/events"
+	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 )
 
 type stubStore struct {
@@ -39,14 +40,25 @@ func (s *stubStore) CreateCommercialAccount(_ context.Context, a *domain.Commerc
 	return nil
 }
 
-func (s *stubStore) GetCommercialAccount(_ context.Context, id string) (*domain.CommercialAccount, error) {
-	if a, ok := s.accounts[id]; ok {
+// The tenant-scoped reads below mirror PgStore's scoping deliberately.
+// They previously took `_ context.Context` and ignored it, which meant this
+// stub could not enforce a tenant boundary even in principle — so any
+// handler test asserting isolation was asserting against a fake that could
+// not fail. Taking ctx and applying the same predicate is what makes those
+// assertions mean something about production.
+func (s *stubStore) GetCommercialAccount(ctx context.Context, id string) (*domain.CommercialAccount, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if a, ok := s.accounts[id]; ok && a.OrganizationID == tenantID {
 		return a, nil
 	}
 	return nil, domain.ErrCommercialAccountNotFound
 }
 
-func (s *stubStore) GetCommercialAccountByOrganization(_ context.Context, organizationID string) (*domain.CommercialAccount, error) {
+func (s *stubStore) GetCommercialAccountByOrganization(ctx context.Context, organizationID string) (*domain.CommercialAccount, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" || tenantID != organizationID {
+		return nil, domain.ErrCommercialAccountNotFound
+	}
 	for _, a := range s.accounts {
 		if a.OrganizationID == organizationID {
 			return a, nil
@@ -63,17 +75,19 @@ func (s *stubStore) CreateMembership(_ context.Context, m *domain.Membership) er
 	return nil
 }
 
-func (s *stubStore) GetMembership(_ context.Context, id string) (*domain.Membership, error) {
-	if m, ok := s.memberships[id]; ok {
+func (s *stubStore) GetMembership(ctx context.Context, id string) (*domain.Membership, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if m, ok := s.memberships[id]; ok && m.OrganizationID == tenantID {
 		return m, nil
 	}
 	return nil, domain.ErrMembershipNotFound
 }
 
-func (s *stubStore) ListMembershipsByOrganization(_ context.Context, organizationID string) ([]domain.Membership, error) {
+func (s *stubStore) ListMemberships(ctx context.Context) ([]domain.Membership, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
 	var out []domain.Membership
 	for _, m := range s.memberships {
-		if m.OrganizationID == organizationID {
+		if m.OrganizationID == tenantID {
 			out = append(out, *m)
 		}
 	}
@@ -185,6 +199,7 @@ func TestCreateCommercialAccount_AuthzDenied(t *testing.T) {
 func TestCreateMembershipAndDeactivate(t *testing.T) {
 	h := newTestHandler()
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
 
 	body := domain.CreateMembershipRequest{
@@ -220,6 +235,7 @@ func TestCreateMembershipAndDeactivate(t *testing.T) {
 func TestListMemberships(t *testing.T) {
 	h := newTestHandler()
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
 
 	body := domain.CreateMembershipRequest{
@@ -234,8 +250,14 @@ func TestListMemberships(t *testing.T) {
 		t.Fatalf("expected 201, got %d", wCreate.Code)
 	}
 
+	// The list request must carry org-test-02's own identity. It previously
+	// carried org-test-01's (buildRequest's default) and still returned
+	// org-test-02's roster, because nothing compared the path organization
+	// to the verified tenant — which is the defect this change closes.
 	wList := httptest.NewRecorder()
-	r.ServeHTTP(wList, buildRequest(http.MethodGet, "/v1/organizations/org-test-02/memberships", nil))
+	listReq := buildRequest(http.MethodGet, "/v1/organizations/org-test-02/memberships", nil)
+	listReq.Header.Set("X-Tenant-Id", "org-test-02")
+	r.ServeHTTP(wList, listReq)
 	if wList.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", wList.Code)
 	}
@@ -254,6 +276,7 @@ func TestListMemberships(t *testing.T) {
 func TestGetCommercialAccount_NotFound(t *testing.T) {
 	h := newTestHandler()
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
 
 	w := httptest.NewRecorder()

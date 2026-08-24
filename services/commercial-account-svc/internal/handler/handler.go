@@ -14,6 +14,7 @@ import (
 	authzpkg "zoiko.io/commercial-account-svc/internal/authz"
 	"zoiko.io/commercial-account-svc/internal/domain"
 	"zoiko.io/commercial-account-svc/internal/events"
+	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 	"zoiko.io/commercial-account-svc/internal/store"
 )
 
@@ -55,6 +56,36 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireTenant returns the gateway-verified organization scope, and
+// refuses the request when there is none.
+//
+// It is not applied as blanket middleware because this service serves
+// genuinely tenant-less routes: the price catalog, plans and entitlement
+// limits are platform administration (doc7 §U1 — an approved catalog is
+// never edited in place, and every tenant reads the same one), and those
+// handlers authorize at platformScopeID rather than at an organization. A
+// blanket 401 would break them.
+//
+// declared is an organization the caller named itself — a URL path segment
+// or a body field. Where one is present it may only AGREE with the
+// verified header; disagreement is refused rather than silently resolved,
+// so a caller asking about another organization gets an error instead of a
+// quietly reinterpreted answer.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request, declared string) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized,
+			"X-Tenant-Id is required — the gateway sets it from a verified identity envelope")
+		return "", false
+	}
+	if declared != "" && declared != tenantID {
+		writeError(w, http.StatusForbidden,
+			"organization in the request does not match the verified X-Tenant-Id")
+		return "", false
+	}
+	return tenantID, true
 }
 
 // authorize checks the calling principal against authorization-svc for the
@@ -139,7 +170,16 @@ func (h *Handler) CreateCommercialAccount(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusCreated, acct)
 }
 
+// GetCommercialAccount reads one account, scoped to the verified tenant.
+//
+// requireTenant is new here. This route has no authz check of its own, and
+// the store's tenant predicate used to disable itself when the tenant was
+// absent, so a header-less request could read any account by id — legal
+// customer name, contact email, contract reference, processor customer ref.
 func (h *Handler) GetCommercialAccount(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	acct, err := h.store.GetCommercialAccount(r.Context(), id)
 	if err != nil {
@@ -201,7 +241,13 @@ func (h *Handler) CreateMembership(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, m)
 }
 
+// GetMembership reads one membership, scoped to the verified tenant. Same
+// two gaps as GetCommercialAccount: no authz check on the route, and a
+// store predicate that disabled itself when the tenant was absent.
 func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	m, err := h.store.GetMembership(r.Context(), id)
 	if err != nil {
@@ -215,9 +261,19 @@ func (h *Handler) GetMembership(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
+// ListMemberships lists the verified tenant's own memberships.
+//
+// The {organizationID} path segment is kept in the route for URL
+// compatibility but is no longer what the query filters on: it must now
+// AGREE with the verified X-Tenant-Id, and the roster is read from the
+// context tenant either way. Previously the path value went straight to
+// the store with no authz check and no tenant comparison, so any caller
+// could enumerate any organization's membership roster.
 func (h *Handler) ListMemberships(w http.ResponseWriter, r *http.Request) {
-	organizationID := chi.URLParam(r, "organizationID")
-	memberships, err := h.store.ListMembershipsByOrganization(r.Context(), organizationID)
+	if _, ok := h.requireTenant(w, r, chi.URLParam(r, "organizationID")); !ok {
+		return
+	}
+	memberships, err := h.store.ListMemberships(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list memberships")
 		return
@@ -232,6 +288,14 @@ func (h *Handler) ListMemberships(w http.ResponseWriter, r *http.Request) {
 // row is never deleted — historical attribution (who was a member, when)
 // must survive removal.
 func (h *Handler) DeactivateMembership(w http.ResponseWriter, r *http.Request) {
+	// The store's GetMembership is tenant-scoped, so a foreign membership
+	// already fails closed here as a 404. requireTenant is still worth
+	// running first: without it a header-less caller gets "membership not
+	// found" for a membership that does exist, which is a misleading answer
+	// to a request that should simply have been refused.
+	if _, ok := h.requireTenant(w, r, ""); !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 
 	existing, err := h.store.GetMembership(r.Context(), id)
