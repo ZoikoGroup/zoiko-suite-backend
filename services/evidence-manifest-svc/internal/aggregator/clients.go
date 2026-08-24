@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-manifest-svc/internal/domain"
+	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
 )
 
 var ErrSourceUnavailable = errors.New("aggregator: source service unavailable")
@@ -31,6 +32,34 @@ type SourceRecord struct {
 	SourceType     domain.SourceType
 	SourceRecordID string
 	RawJSON        []byte
+}
+
+// forwardTenant propagates the caller's verified tenant to the source
+// service.
+//
+// This was missing entirely, and it was not merely a defence-in-depth gap —
+// it left manifest generation NON-FUNCTIONAL for two of the three sources.
+// governance-decision-log-svc returns 400 missing_tenant_id without the
+// header and workflow-svc returns 401 missing_tenant_scope (the latter as a
+// direct result of the Priority 1 row 6 fix, which correctly stopped its
+// by-id read falling back to an unscoped lookup). getByID maps any non-200
+// to ErrSourceUnavailable and collectRecords fails closed on the first
+// source error, so the whole manifest failed — and reported it as "source
+// unavailable", which reads as a downstream outage rather than a missing
+// header. That misdiagnosis is the expensive part.
+//
+// authorization-svc's access-decision read does not currently require the
+// header, so that source kept working; the header is forwarded to all three
+// regardless, since a source that does not require a tenant today may
+// tomorrow, and the correct value is the same either way.
+//
+// The tenant is read from the incoming request's context — never from the
+// manifest request body — so a caller cannot widen its own evidence
+// collection by naming a different tenant downstream.
+func forwardTenant(ctx context.Context, req *http.Request) {
+	if tenantID := svcmiddleware.TenantFromContext(ctx); tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
 }
 
 // ── governance-decision-log-svc ──────────────────────────────────────────────
@@ -62,6 +91,7 @@ func (c *GovernanceDecisionClient) ListByEntityAndDateRange(ctx context.Context,
 	if err != nil {
 		return nil, ErrSourceUnavailable
 	}
+	forwardTenant(ctx, req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("governance-decision-log-svc unreachable — failing closed", zap.Error(err))
@@ -156,6 +186,7 @@ func getByID(ctx context.Context, client *http.Client, log *zap.Logger, url stri
 	if err != nil {
 		return nil, ErrSourceUnavailable
 	}
+	forwardTenant(ctx, req)
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Error("source service unreachable — failing closed", zap.String("url", url), zap.Error(err))
