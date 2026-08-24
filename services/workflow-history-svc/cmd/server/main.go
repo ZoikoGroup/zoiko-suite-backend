@@ -36,6 +36,7 @@ import (
 
 	"zoiko.io/workflow-history-svc/internal/config"
 	"zoiko.io/workflow-history-svc/internal/consumer"
+	svcenvelope "zoiko.io/workflow-history-svc/internal/envelope"
 	"zoiko.io/workflow-history-svc/internal/handler"
 	"zoiko.io/workflow-history-svc/internal/health"
 	kafkarunner "zoiko.io/workflow-history-svc/internal/kafka"
@@ -130,6 +131,13 @@ func main() {
 	router.Use(middleware.RealIP)
 	router.Use(middleware.Recoverer)
 	router.Use(correlationIDMiddleware)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	router.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	// Health probes — no auth, no tenant context required.
 	healthH := health.New(pool, log)

@@ -24,8 +24,10 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/auth"
+	"zoiko.io/identity-context-svc/internal/authz"
 	"zoiko.io/identity-context-svc/internal/config"
 	identityctx "zoiko.io/identity-context-svc/internal/context"
+	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
 	"zoiko.io/identity-context-svc/internal/session"
@@ -138,6 +140,12 @@ func main() {
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "identity-context-svc", log)
 
+	// ── AuthZ client ───────────────────────────────────────────────────────
+	authzClient, err := authz.NewClient(cfg.AuthzEnv, cfg.AuthzServiceURL, log)
+	if err != nil {
+		log.Fatal("failed to initialize authz client", zap.Error(err))
+	}
+
 	// ── Resolver ──────────────────────────────────────────────────────────
 	resolver := identityctx.NewResolver(
 		cfg,
@@ -162,6 +170,13 @@ func main() {
 	r.Use(otelchi.Middleware("identity-context-svc", otelchi.WithChiRoutes(r)))
 	r.Use(metrics.HTTPMiddleware)
 
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
 	// Structured request logging
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -185,7 +200,7 @@ func main() {
 	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
 
 	// Domain routes (all under /v1/)
-	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, log)
+	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, authzClient, log)
 	identityctx.RegisterRoutes(r, h)
 
 	// ── Server ────────────────────────────────────────────────────────────

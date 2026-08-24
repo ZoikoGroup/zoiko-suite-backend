@@ -1,6 +1,7 @@
 package context
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -13,11 +14,31 @@ import (
 	"zoiko.io/identity-context-svc/internal/store"
 )
 
+// AuthZClient checks whether a principal is authorized to perform an action.
+type AuthZClient interface {
+	// CheckAllowed returns nil if principalID is authorized to perform
+	// actionType within legalEntityID and tenantID. Returns domain.ErrAuthorizationDenied
+	// on a DENIED decision, or domain.ErrAuthorizationServiceUnavailable if
+	// no decision could be obtained — callers must fail closed on the latter.
+	// tenantID is the caller's verified tenant scope (from X-Tenant-Id header).
+	// Empty string means no tenant scope (global-only SoD rules).
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error
+}
+
+const actionPrincipalStatusManage = "PRINCIPAL_STATUS_MANAGE"
+
+// ErrIdentityMissing is returned when X-Principal-Id header is absent.
+var ErrIdentityMissing = errors.New("missing X-Principal-Id header")
+
+// ErrTenantMissing is returned when X-Tenant-Id header is absent.
+var ErrTenantMissing = errors.New("missing X-Tenant-Id header")
+
 // Handler exposes the eight inbound REST endpoints defined in openapi.yaml.
 type Handler struct {
 	resolver   *Resolver
 	sessions   SessionCache
 	principals PrincipalStore
+	authz      AuthZClient
 	log        *zap.Logger
 }
 
@@ -25,12 +46,14 @@ func NewHandler(
 	resolver *Resolver,
 	sessions SessionCache,
 	principals PrincipalStore,
+	authz AuthZClient,
 	log *zap.Logger,
 ) *Handler {
 	return &Handler{
 		resolver:   resolver,
 		sessions:   sessions,
 		principals: principals,
+		authz:      authz,
 		log:        log,
 	}
 }
@@ -117,68 +140,34 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ── GET /v1/principals/:principalID ─────────────────────────────────────────
-
-func (h *Handler) GetPrincipal(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-Id")
-	if tenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
-		return
-	}
-	principalID := chi.URLParam(r, "principalID")
-	p, err := h.principals.FindByID(r.Context(), principalID, tenantID)
-	if err != nil || p == nil {
-		writeError(w, http.StatusNotFound, "principal not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, p)
-}
-
-// ── GET /v1/principals/:principalID/roles ────────────────────────────────────
-
-func (h *Handler) GetPrincipalRoles(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-Id")
-	if tenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
-		return
-	}
-	principalID := chi.URLParam(r, "principalID")
-	assignments, err := h.principals.FindActiveRoleAssignments(r.Context(), principalID, tenantID, nil)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to retrieve role assignments")
-		return
-	}
-	writeJSON(w, http.StatusOK, assignments)
-}
-
-// ── GET /v1/principals/:principalID/delegations ──────────────────────────────
-
-func (h *Handler) GetPrincipalDelegations(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-Id")
-	if tenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
-		return
-	}
-	principalID := chi.URLParam(r, "principalID")
-	delegations, err := h.principals.FindActiveDelegations(r.Context(), principalID, tenantID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to retrieve delegations")
-		return
-	}
-	writeJSON(w, http.StatusOK, delegations)
-}
-
 // ── PUT /v1/principals/:principalID/status ───────────────────────────────────
 // Status transitions only. No soft-delete per doctrine (data-model §2.11).
 // Idempotent — re-applying same status is a no-op at the DB level.
-
+//
+// Requires X-Principal-Id and X-Tenant-Id headers. Authorization is checked
+// against PRINCIPAL_STATUS_MANAGE on the platform scope legal entity.
+// req.Status must be a valid PrincipalStatus value.
+//
+// Response: 204 no content / 400 invalid status / 401 missing identity or tenant
+// / 403 authorization denied / 404 principal not found / 503 unavailable.
 func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-Id")
-	if tenantID == "" {
-		writeError(w, http.StatusBadRequest, "missing X-Tenant-Id header")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
-	principalID := chi.URLParam(r, "principalID")
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	// Authorization: caller must hold PRINCIPAL_STATUS_MANAGE at platform scope.
+	// The platform scope legal entity is configured via AUTHZ_PLATFORM_SCOPE_ENTITY_ID.
+	// If not configured, the check fails closed.
+	if err := h.authz.CheckAllowed(r.Context(), principalID, "", actionPrincipalStatusManage, tenantID); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
 	correlationID := r.Header.Get("X-Correlation-ID")
 	actorPrincipalID := r.Header.Get("X-Actor-Principal-ID")
 
@@ -188,17 +177,124 @@ func (h *Handler) UpdatePrincipalStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Validate status against domain.PrincipalStatus values.
+	if req.Status != domain.PrincipalStatusActive && req.Status != domain.PrincipalStatusSuspended && req.Status != domain.PrincipalStatusDisabled {
+		writeError(w, http.StatusBadRequest, "invalid status: must be ACTIVE, SUSPENDED, or DISABLED")
+		return
+	}
+
+	targetPrincipalID := chi.URLParam(r, "principalID")
+
 	if err := h.principals.UpdateStatus(
-		r.Context(), principalID, tenantID, req.Status, actorPrincipalID, correlationID,
+		r.Context(), targetPrincipalID, tenantID, req.Status, actorPrincipalID, correlationID,
 	); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to update status")
+		h.writeStoreErr(w, err)
 		return
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ── GET /v1/principals/:principalID ─────────────────────────────────────────
+
+func (h *Handler) GetPrincipal(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	p, err := h.principals.FindByID(r.Context(), chi.URLParam(r, "principalID"), tenantID)
+	if err != nil {
+		h.writeStoreErr(w, err)
+		return
+	}
+	if p == nil {
+		writeError(w, http.StatusNotFound, "principal not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// ── GET /v1/principals/:principalID/roles ────────────────────────────────────
+
+func (h *Handler) GetPrincipalRoles(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	assignments, err := h.principals.FindActiveRoleAssignments(r.Context(), principalID, tenantID, nil)
+	if err != nil {
+		h.writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, assignments)
+}
+
+// ── GET /v1/principals/:principalID/delegations ──────────────────────────────
+
+func (h *Handler) GetPrincipalDelegations(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	delegations, err := h.principals.FindActiveDelegations(r.Context(), principalID, tenantID)
+	if err != nil {
+		h.writeStoreErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, delegations)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// requirePrincipal reads the caller's verified principal from the
+// X-Principal-Id header, rejecting the request if absent.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized, ErrIdentityMissing.Error())
+		return "", false
+	}
+	return principalID, true
+}
+
+// requireTenant reads the caller's verified tenant scope from the
+// X-Tenant-Id header, rejecting the request if absent.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, ErrTenantMissing.Error())
+		return "", false
+	}
+	return tenantID, true
+}
+
+func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, domain.ErrAuthorizationDenied) {
+		writeError(w, http.StatusForbidden, "authorization denied")
+	} else {
+		writeError(w, http.StatusServiceUnavailable, "authz unavailable")
+	}
+}
+
+func (h *Handler) writeStoreErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, domain.ErrPrincipalNotFound) {
+		writeError(w, http.StatusNotFound, "principal not found")
+		return
+	}
+	h.log.Error("principal store error", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "store unavailable")
+}
 
 type errorResponse struct {
 	Error         string `json:"error"`

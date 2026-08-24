@@ -25,6 +25,7 @@ import (
 	"zoiko.io/compensation-svc/internal/config"
 	"zoiko.io/compensation-svc/internal/domain"
 	"zoiko.io/compensation-svc/internal/employee"
+	svcenvelope "zoiko.io/compensation-svc/internal/envelope"
 	"zoiko.io/compensation-svc/internal/events"
 	"zoiko.io/compensation-svc/internal/handler"
 	"zoiko.io/compensation-svc/internal/health"
@@ -273,6 +274,13 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, employeeClient, log)
 	handler.RegisterRoutes(r, h)

@@ -2,7 +2,10 @@
 // Field names are verbatim from docs/architecture/04-data-model.md §06.1.
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // ---------------------------------------------------------------------------
 // Principal  (data-model §06.1)
@@ -217,3 +220,12 @@ type VerifiedClaims struct {
 	TenantID string
 	MFADone  bool
 }
+
+// ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
+var ErrPrincipalNotFound = errors.New("principal not found")
+
+// ErrAuthorizationDenied is returned when the caller is not authorized for the requested action.
+var ErrAuthorizationDenied = errors.New("authorization denied")
+
+// ErrAuthorizationServiceUnavailable is returned when authorization-svc cannot be reached.
+var ErrAuthorizationServiceUnavailable = errors.New("authorization service unavailable")

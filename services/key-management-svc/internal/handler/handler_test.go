@@ -20,6 +20,7 @@ func newRouter() http.Handler {
 
 func TestHealthCheck(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(r)
 	w := httptest.NewRecorder()
 	newRouter().ServeHTTP(w, r)
 	if w.Code != 200 {
@@ -39,6 +40,7 @@ func TestKeyLifecycle(t *testing.T) {
 		ExternalKeyARN: "arn:aws:kms:eu-west-1:123456789012:key/abc-123",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/keys", bytes.NewBuffer(regBody))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -57,6 +59,7 @@ func TestKeyLifecycle(t *testing.T) {
 
 	// Rotate Key
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/keys/"+key.ID+"/rotate", nil)
+	withEnvelope(req2)
 	req2.Header.Set("X-Tenant-ID", "t1")
 	w2 := httptest.NewRecorder()
 	router.ServeHTTP(w2, req2)
@@ -71,6 +74,7 @@ func TestKeyLifecycle(t *testing.T) {
 
 	// Disable Key
 	req3 := httptest.NewRequest(http.MethodPost, "/v1/keys/"+key.ID+"/disable", nil)
+	withEnvelope(req3)
 	req3.Header.Set("X-Tenant-ID", "t1")
 	w3 := httptest.NewRecorder()
 	router.ServeHTTP(w3, req3)
@@ -88,6 +92,7 @@ func TestValidationErrors(t *testing.T) {
 		KeyProvider:   domain.ProviderAWSKMS,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/keys", bytes.NewBuffer(regBody))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	w := httptest.NewRecorder()
 	newRouter().ServeHTTP(w, req)

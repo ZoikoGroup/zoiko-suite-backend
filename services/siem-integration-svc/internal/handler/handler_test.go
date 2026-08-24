@@ -19,6 +19,7 @@ func newRouter() http.Handler {
 
 func TestHealthCheck(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(r)
 	w := httptest.NewRecorder()
 	newRouter().ServeHTTP(w, r)
 	if w.Code != 200 {
@@ -37,6 +38,7 @@ func TestExporterAndStreamLifecycle(t *testing.T) {
 		EndpointURL:   "https://splunk.corp:8088/services/collector",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/siem/exporters", bytes.NewBuffer(expBody))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -48,6 +50,7 @@ func TestExporterAndStreamLifecycle(t *testing.T) {
 
 	// Get Exporter
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters/"+exp.ID, nil)
+	withEnvelope(req2)
 	req2.Header.Set("X-Tenant-ID", "t1")
 	w2 := httptest.NewRecorder()
 	router.ServeHTTP(w2, req2)
@@ -64,6 +67,7 @@ func TestExporterAndStreamLifecycle(t *testing.T) {
 		Message:    "Unusual transaction spike detected on account ACC-999",
 	})
 	req3 := httptest.NewRequest(http.MethodPost, "/v1/siem/stream", bytes.NewBuffer(evtBody))
+	withEnvelope(req3)
 	req3.Header.Set("X-Tenant-ID", "t1")
 	w3 := httptest.NewRecorder()
 	router.ServeHTTP(w3, req3)
@@ -73,6 +77,7 @@ func TestExporterAndStreamLifecycle(t *testing.T) {
 
 	// List Events
 	req4 := httptest.NewRequest(http.MethodGet, "/v1/siem/events?exporter_id="+exp.ID, nil)
+	withEnvelope(req4)
 	req4.Header.Set("X-Tenant-ID", "t1")
 	w4 := httptest.NewRecorder()
 	router.ServeHTTP(w4, req4)
@@ -84,6 +89,7 @@ func TestExporterAndStreamLifecycle(t *testing.T) {
 func TestValidationErrors(t *testing.T) {
 	expBody, _ := json.Marshal(domain.CreateExporterRequest{Name: "Missing LE"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/siem/exporters", bytes.NewBuffer(expBody))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	w := httptest.NewRecorder()
 	newRouter().ServeHTTP(w, req)

@@ -1,64 +1,54 @@
+// Package config provides typed, env-driven configuration for secret-vault-integration-svc.
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
 )
 
-// Config holds all runtime configuration for secret-vault-integration-svc.
+// Config holds all runtime configuration.
 type Config struct {
-	Env  string
 	Port int
 
-	DB DBConfig
+	// Vault backend: "hashicorp", "aws-secretsmanager", "gcp-secretmanager", "azure-keyvault", "local"
+	VaultBackend string
 
+	// HashiCorp Vault
+	VaultAddr      string
+	VaultToken     string
+	VaultNamespace string
+	VaultMountPath string // e.g., "secret/data/zoiko"
+
+	// AWS Secrets Manager
+	AWSRegion          string
+	AWSSecretsPrefix   string
+	AWSKMSKeyID        string
+	AWSAccessKeyID     string
+	AWSSecretAccessKey string
+
+	// GCP Secret Manager
+	GCPProjectID string
+	GCPPrefix    string
+
+	// Azure Key Vault
+	AzureVaultURL string
+	AzureTenantID string
+	AzureClientID string
+	AzureClientSecret string
+
+	// Local file-based (dev only)
+	LocalStorePath string
+
+	DB    DBConfig
+	Redis RedisConfig
 	Kafka KafkaConfig
 
-	// AuthZServiceURL is the base URL of authorization-svc. Every mutating
-	// API call is authorized there before proceeding; no service
-	// self-authorizes a material action (03-microservices.md §17.1).
-	AuthZServiceURL string
-
-	// AuthZPlatformScopeID is the legal_entity_id presented to
-	// authorization-svc when the mutation is not scoped to one.
-	// authorization-svc rejects an empty legal_entity_id outright.
-	AuthZPlatformScopeID string
-
-	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
-	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
-	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
-	// unless explicitly turned on.
-	AuthzMTLSEnabled         bool
-	AuthzMTLSURL             string
-	MTLSManagementServiceURL string
-
-	// VaultKeyPath is where the v1 LocalFileVaultBackend persists its
-	// encrypted-at-rest secret material. Production replaces this whole
-	// backend with a real HashiCorp Vault / cloud KMS client — see
-	// context.md §7.6. This is the same class of local-file bootstrap
-	// compromise identity-context-svc's JWT_SIGNING_PRIVATE_KEY_PATH
-	// already accepts.
-	VaultKeyPath string
-
-	// VaultMasterKeyHex is the AES-256 key (32 bytes, hex-encoded) used
-	// to encrypt/decrypt secret material at rest. Never has a default —
-	// must be supplied, or the backend refuses to start.
-	VaultMasterKeyHex string
-
-	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
-	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
+	SIEMServiceURL       string
 }
 
-// KafkaConfig holds event backbone connection parameters.
-type KafkaConfig struct {
-	Brokers []string
-	GroupID string
-	Topic   string
-}
-
-// DBConfig holds PostgreSQL connection parameters.
 type DBConfig struct {
 	Host     string
 	Port     int
@@ -77,34 +67,93 @@ func (d DBConfig) DSN() string {
 		" sslmode=" + d.SSLMode
 }
 
+type RedisConfig struct {
+	Host string
+	Port int
+	TTL  int
+}
+
+type KafkaConfig struct {
+	Brokers []string
+	GroupID string
+	Topic   string
+}
+
 // Load reads configuration from environment variables.
 func Load() (*Config, error) {
-	return &Config{
-		Env:  env("ENV", "local"),
+	cfg := &Config{
 		Port: envInt("PORT", 8087),
+
+		VaultBackend: env("VAULT_BACKEND", "local"),
+
+		VaultAddr:      env("VAULT_ADDR", "http://vault:8200"),
+		VaultToken:     env("VAULT_TOKEN", ""),
+		VaultNamespace: env("VAULT_NAMESPACE", ""),
+		VaultMountPath: env("VAULT_MOUNT_PATH", "secret/data/zoiko"),
+
+		AWSRegion:          env("AWS_REGION", "us-east-1"),
+		AWSSecretsPrefix:   env("AWS_SECRETS_PREFIX", "zoiko/"),
+		AWSKMSKeyID:        env("AWS_KMS_KEY_ID", ""),
+		AWSAccessKeyID:     env("AWS_ACCESS_KEY_ID", ""),
+		AWSSecretAccessKey: env("AWS_SECRET_ACCESS_KEY", ""),
+
+		GCPProjectID: env("GCP_PROJECT_ID", ""),
+		GCPPrefix:    env("GCP_PREFIX", "zoiko-"),
+
+		AzureVaultURL:      env("AZURE_VAULT_URL", ""),
+		AzureTenantID:      env("AZURE_TENANT_ID", ""),
+		AzureClientID:      env("AZURE_CLIENT_ID", ""),
+		AzureClientSecret:  env("AZURE_CLIENT_SECRET", ""),
+
+		LocalStorePath: env("LOCAL_STORE_PATH", "./vault-data"),
+
 		DB: DBConfig{
 			Host:     env("DB_HOST", "localhost"),
 			Port:     envInt("DB_PORT", 5432),
-			Name:     env("DB_NAME", "secret_vault_integration"),
+			Name:     env("DB_NAME", "secret_vault"),
 			User:     env("DB_USER", "postgres"),
 			Password: env("DB_PASSWORD", ""),
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
-		VaultKeyPath:         env("VAULT_LOCAL_STORE_PATH", "./secret_store.local"),
-		VaultMasterKeyHex:    env("VAULT_MASTER_KEY_HEX", ""),
-		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
-		AuthZPlatformScopeID: env("AUTHZ_PLATFORM_SCOPE_ID", ""),
-
-		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
-		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
-		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
-		Kafka: KafkaConfig{
-			Brokers: envList("KAFKA_BROKERS", []string{"localhost:9092"}),
-			GroupID: env("KAFKA_GROUP_ID", "secret-vault-integration-svc"),
-			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.secretvault.events"),
+		Redis: RedisConfig{
+			Host: env("REDIS_HOST", "localhost"),
+			Port: envInt("REDIS_PORT", 6379),
+			TTL:  envInt("REDIS_TTL_SECONDS", 300),
 		},
-	}, nil
+		Kafka: KafkaConfig{
+			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			GroupID: env("KAFKA_GROUP_ID", "secret-vault-integration-svc"),
+			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.secrets.events"),
+		},
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		SIEMServiceURL:       env("SIEM_SERVICE_URL", ""),
+	}
+
+	// Validate required config for non-local backends
+	if cfg.VaultBackend != "local" {
+		switch cfg.VaultBackend {
+		case "hashicorp":
+			if cfg.VaultToken == "" {
+				return nil, errors.New("VAULT_TOKEN required for hashicorp backend")
+			}
+		case "aws-secretsmanager":
+			if cfg.AWSAccessKeyID == "" || cfg.AWSSecretAccessKey == "" {
+				return nil, errors.New("AWS credentials required for aws-secretsmanager backend")
+			}
+		case "gcp-secretmanager":
+			if cfg.GCPProjectID == "" {
+				return nil, errors.New("GCP_PROJECT_ID required for gcp-secretmanager backend")
+			}
+		case "azure-keyvault":
+			if cfg.AzureVaultURL == "" || cfg.AzureClientID == "" || cfg.AzureClientSecret == "" {
+				return nil, errors.New("Azure credentials required for azure-keyvault backend")
+			}
+		default:
+			return nil, errors.New("unknown VAULT_BACKEND: " + cfg.VaultBackend)
+		}
+	}
+
+	return cfg, nil
 }
 
 func env(key, def string) string {
@@ -112,23 +161,6 @@ func env(key, def string) string {
 		return v
 	}
 	return def
-}
-
-// envList reads a comma-separated list, trimming blanks. Unlike env(), an
-// explicitly empty value is honoured rather than replaced by the default:
-// KAFKA_BROKERS= is how a single-service local run says "no event backbone".
-func envList(key string, def []string) []string {
-	raw, set := os.LookupEnv(key)
-	if !set {
-		return def
-	}
-	out := []string{}
-	for _, part := range strings.Split(raw, ",") {
-		if part = strings.TrimSpace(part); part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
 }
 
 func envInt(key string, def int) int {

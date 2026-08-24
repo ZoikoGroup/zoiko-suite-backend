@@ -134,6 +134,11 @@ type AccessDecisionLog struct {
 	// PAYMENT_INITIATE", "no_grant") — never just "denied" with no reason.
 	DecisionBasis string `json:"decision_basis"`
 
+	// TenantID is the tenant the decision was made in scope of. Nullable
+	// because /v1/authorize cannot require it without breaking every caller
+	// that predates it — see RecordAccessDecisionParams.TenantID.
+	TenantID *string `json:"tenant_id,omitempty"`
+
 	CorrelationID string    `json:"correlation_id"`
 	DecidedAt     time.Time `json:"decided_at"`
 }
@@ -204,6 +209,27 @@ type EvaluateParams struct {
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────
+
+// RecordAccessDecisionParams is the write shape for access_decision_log.
+// A struct rather than seven positional strings, because tenant_id was the
+// seventh and adding it positionally is exactly how a caller ends up passing
+// the correlation ID as the tenant.
+type RecordAccessDecisionParams struct {
+	PrincipalID   string
+	LegalEntityID string
+	ActionType    string
+	Outcome       string
+	Basis         string
+	CorrelationID string
+
+	// TenantID is the caller's verified tenant scope, empty when the caller
+	// supplied none. Stored as SQL NULL when empty: /v1/authorize is called
+	// by ~60 services and most do not send a tenant yet, so requiring one
+	// would deny every one of those callers rather than record an
+	// unattributed decision. A NULL-tenant row is deliberately NOT readable
+	// through GET /v1/access-decisions/{id}, which is tenant-scoped.
+	TenantID string
+}
 
 var ErrRoleNotFound = errorString("role not found")
 var ErrRoleAssignmentNotFound = errorString("role assignment not found")

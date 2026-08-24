@@ -74,7 +74,7 @@ func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*d
 func (s *stubStore) FindRoleByID(_ context.Context, _ string) (*domain.Role, error) {
 	return s.role, s.findRoleErr
 }
-func (s *stubStore) SetRoleActive(_ context.Context, _ string, active bool) (*domain.Role, error) {
+func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool) (*domain.Role, error) {
 	s.setActiveCalls++
 	s.setActiveWanted = append(s.setActiveWanted, active)
 	return s.setActiveRole, s.setActiveErr
@@ -109,13 +109,13 @@ func (s *stubStore) FindDelegatedActions(_ context.Context, _, _ string) ([]stri
 func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _, _ string) (string, bool, error) {
 	return s.sodConflictAction, s.sodHasConflict, s.sodErr
 }
-func (s *stubStore) RecordAccessDecision(_ context.Context, _, _, _, outcome, basis, _ string) (*domain.AccessDecisionLog, error) {
+func (s *stubStore) RecordAccessDecision(_ context.Context, _ domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
 	if s.decision != nil {
 		return s.decision, s.recordErr
 	}
-	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: outcome, DecisionBasis: basis}, s.recordErr
+	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: "GRANTED", DecisionBasis: "test"}, s.recordErr
 }
-func (s *stubStore) FindAccessDecisionByID(_ context.Context, _ string) (*domain.AccessDecisionLog, error) {
+func (s *stubStore) FindAccessDecisionByID(_ context.Context, _, _ string) (*domain.AccessDecisionLog, error) {
 	return s.findDecision, s.findDecisionErr
 }
 
@@ -152,7 +152,7 @@ func newTestRouter(s *stubStore) chi.Router {
 
 func newTestRouterFull(s *stubStore, p *stubPublisher, v *stubValidator) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), zap.NewNop())
+	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -517,10 +517,15 @@ func TestCreateDelegatedAuthority_NotOwnAuthority_Refused(t *testing.T) {
 // promises". A /retire that set the flag true would still answer 200.
 
 func TestRetireRole_SetsActiveFalse(t *testing.T) {
-	store := &stubStore{setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: false}}
+	store := &stubStore{
+		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: false},
+	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -536,10 +541,15 @@ func TestRetireRole_SetsActiveFalse(t *testing.T) {
 }
 
 func TestReactivateRole_SetsActiveTrue(t *testing.T) {
-	store := &stubStore{setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: true}}
+	store := &stubStore{
+		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: false},
+		setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: true},
+	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/reactivate", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -554,10 +564,15 @@ func TestReactivateRole_SetsActiveTrue(t *testing.T) {
 func TestRetireRole_UnknownRoleIs404(t *testing.T) {
 	// 404 and not 503: the store reached the database and answered. Collapsing
 	// the two would make a typo'd role id look like an outage.
-	store := &stubStore{setActiveErr: domain.ErrRoleNotFound}
+	store := &stubStore{
+		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		setActiveErr: domain.ErrRoleNotFound,
+	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/does-not-exist/retire", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -567,10 +582,15 @@ func TestRetireRole_UnknownRoleIs404(t *testing.T) {
 }
 
 func TestRetireRole_StoreDownIs503(t *testing.T) {
-	store := &stubStore{setActiveErr: domain.ErrStoreUnavailable}
+	store := &stubStore{
+		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		setActiveErr: domain.ErrStoreUnavailable,
+	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -584,9 +604,10 @@ func TestRetireRole_StoreDownIs503(t *testing.T) {
 func TestCreateSoDRule_JurisdictionNotFound(t *testing.T) {
 	r := newTestRouterFull(&stubStore{}, &stubPublisher{}, &stubValidator{err: domain.ErrJurisdictionNotFound})
 
-	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","jurisdiction_id":"jur-missing"}`
+	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","jurisdiction_id":"jur-missing","tenant_id":"tenant-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -599,9 +620,10 @@ func TestCreateSoDRule_NoJurisdiction_Created(t *testing.T) {
 	store := &stubStore{sodRule: &domain.SoDRule{SoDRuleID: "sod-1"}}
 	r := newTestRouter(store)
 
-	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE"}`
+	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","tenant_id":"tenant-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -671,6 +693,8 @@ func TestGetAccessDecision_NotFound(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/access-decisions/missing", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -684,6 +708,8 @@ func TestGetAccessDecision_Found(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/access-decisions/d-1", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

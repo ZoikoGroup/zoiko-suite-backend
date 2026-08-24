@@ -125,13 +125,13 @@ type stubAuthzAdmin struct {
 	setRoleActiveWant []bool
 }
 
-func (a *stubAuthzAdmin) CreateRole(_ context.Context, _, _, _, _, _, _ string) error {
+func (a *stubAuthzAdmin) CreateRole(_ context.Context, _, _, _, _, _, _, _ string) error {
 	return a.createRoleErr
 }
-func (a *stubAuthzAdmin) CreatePermissionBundle(_ context.Context, _, _ string, _ []string) error {
+func (a *stubAuthzAdmin) CreatePermissionBundle(_ context.Context, _, _ string, _ []string, _ string) error {
 	return a.createBundleErr
 }
-func (a *stubAuthzAdmin) SetRoleActive(_ context.Context, _ string, active bool) error {
+func (a *stubAuthzAdmin) SetRoleActive(_ context.Context, _ string, active bool, _ string) error {
 	a.setRoleActiveWant = append(a.setRoleActiveWant, active)
 	return a.setRoleActiveErr
 }

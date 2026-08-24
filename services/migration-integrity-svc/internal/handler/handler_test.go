@@ -40,6 +40,7 @@ func newRouter(t *testing.T) http.Handler {
 func TestHealthCheck(t *testing.T) {
 	router := newRouter(t)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(req)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -77,6 +78,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 
 	body, _ := json.Marshal(validateReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	req.Header.Set("X-Principal-Id", "user-1")
 	req.Header.Set("Content-Type", "application/json")
@@ -113,6 +115,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 
 	// 2. Get Job by ID
 	getReq := httptest.NewRequest(http.MethodGet, "/v1/migrations/"+job.ID, nil)
+	withEnvelope(getReq)
 	getReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	getRec := httptest.NewRecorder()
 	router.ServeHTTP(getRec, getReq)
@@ -122,6 +125,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 
 	// 3. List Jobs
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/migrations?legal_entity_id=LE-5005", nil)
+	withEnvelope(listReq)
 	listReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	listRec := httptest.NewRecorder()
 	router.ServeHTTP(listRec, listReq)
@@ -139,6 +143,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 		entryID := job.AuditEntries[0].ID
 		remBody, _ := json.Marshal(domain.RemediateRequest{Notes: "Corrected in source system"})
 		remReq := httptest.NewRequest(http.MethodPost, "/v1/migrations/"+job.ID+"/audit/"+entryID+"/remediate", bytes.NewBuffer(remBody))
+		withEnvelope(remReq)
 		remReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
 		remReq.Header.Set("X-Principal-Id", "user-1")
 		remReq.Header.Set("Content-Type", "application/json")
@@ -156,6 +161,7 @@ func TestValidateMigrationAndLifecycle(t *testing.T) {
 
 	// 5. Archive Job
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/migrations/"+job.ID, nil)
+	withEnvelope(delReq)
 	delReq.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	delReq.Header.Set("X-Principal-Id", "user-1")
 	delRec := httptest.NewRecorder()
@@ -183,6 +189,7 @@ func TestValidateMigrationCleanData(t *testing.T) {
 
 	body, _ := json.Marshal(cleanReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	req.Header.Set("X-Principal-Id", "user-1")
 	rec := httptest.NewRecorder()
@@ -212,6 +219,7 @@ func TestValidationErrors(t *testing.T) {
 	// Missing legal_entity_id
 	body, _ := json.Marshal(domain.ValidateMigrationRequest{MigrationName: "test"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/migrations/validate", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-mig-55")
 	req.Header.Set("X-Principal-Id", "user-1")
 	rec := httptest.NewRecorder()

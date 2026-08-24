@@ -38,6 +38,49 @@ var ValidJournalTransitions = map[JournalStatus][]JournalStatus{
 	JournalStatusReversed:  {},
 }
 
+// JournalType is ACC-03's "journal type" input.
+//
+// The set is deliberately closed. The type decides how a posting is read by
+// every downstream consumer — an accrual is expected to reverse, an opening
+// balance must be excluded from period movement, a reclass must net to zero
+// against another — so an open string would let a caller invent a category
+// nothing downstream knows how to treat.
+type JournalType string
+
+const (
+	JournalTypeStandard   JournalType = "STANDARD"
+	JournalTypeAdjustment JournalType = "ADJUSTMENT"
+	JournalTypeAccrual    JournalType = "ACCRUAL"
+	JournalTypeReversal   JournalType = "REVERSAL"
+	JournalTypeOpening    JournalType = "OPENING"
+	JournalTypeClosing    JournalType = "CLOSING"
+	JournalTypeReclass    JournalType = "RECLASS"
+
+	// JournalTypeUnspecified marks rows written before migration 000006 added
+	// the field. It is never accepted on a new journal — see ValidJournalType —
+	// and exists only so historical postings remain readable and identifiable
+	// as pre-dating the input contract.
+	JournalTypeUnspecified JournalType = "UNSPECIFIED"
+)
+
+var acceptedJournalTypes = map[JournalType]bool{
+	JournalTypeStandard: true, JournalTypeAdjustment: true, JournalTypeAccrual: true,
+	JournalTypeReversal: true, JournalTypeOpening: true, JournalTypeClosing: true,
+	JournalTypeReclass: true,
+}
+
+// ValidJournalType reports whether t may be supplied on a new journal.
+// UNSPECIFIED is excluded on purpose: it is a backfill marker, not a choice.
+func ValidJournalType(t JournalType) bool { return acceptedJournalTypes[t] }
+
+// JournalTypes lists the accepted values, for error messages and the console.
+func JournalTypes() []JournalType {
+	return []JournalType{
+		JournalTypeStandard, JournalTypeAdjustment, JournalTypeAccrual,
+		JournalTypeReversal, JournalTypeOpening, JournalTypeClosing, JournalTypeReclass,
+	}
+}
+
 // JournalHeader is one journal entry moving through the Tri-Phase Commit
 // lifecycle. Entity-bound (LegalEntityID), never hard-deleted.
 type JournalHeader struct {
@@ -46,6 +89,47 @@ type JournalHeader struct {
 	LegalEntityID string        `json:"legal_entity_id"`
 	FiscalPeriod  string        `json:"fiscal_period"` // e.g. "2026-07" — no Fiscal Calendar service exists yet, plain string reference
 	Status        JournalStatus `json:"status"`
+
+	// ── ACC-03 required business/source inputs (§9.D) ──────────────────────
+
+	JournalType JournalType `json:"journal_type"`
+
+	// TransactionDate is ACC-03's "document/transaction date" — when the
+	// underlying business document is dated. PostingDate is when the entry
+	// takes effect in the ledger. They are separate fields because they
+	// legitimately differ: a supplier invoice dated the 28th, received and
+	// posted on the 3rd of the next month, is one document with two dates, and
+	// collapsing them would move it into the wrong period in one direction or
+	// misstate the document in the other.
+	//
+	// Dates, not timestamps: a posting belongs to a day in the entity's books,
+	// and carrying a time-of-day would invite two postings on the same business
+	// day to sort into different periods across a timezone boundary.
+	TransactionDate Date `json:"transaction_date"`
+	PostingDate     Date `json:"posting_date"`
+
+	// CurrencyCode is the transaction currency of every line in this journal.
+	// §6.1: "Currency is part of the value, not display metadata."
+	//
+	// Validated for shape only (three uppercase letters). REF-02 Currency
+	// Registry does not exist, so nothing can say whether the code is one this
+	// tenant actually transacts in.
+	CurrencyCode string `json:"currency_code"`
+
+	// BookID and ReportingBasis are ACC-03's "book" input and INV-03's basis
+	// scope. Nil in practice today: REF-06 Accounting Book / Ledger Basis does
+	// not exist, so no service can issue or validate one. Carried rather than
+	// required so callers can begin sending it and existing postings are not
+	// forced to claim a basis nobody decided.
+	BookID         *string `json:"book_id,omitempty"`
+	ReportingBasis *string `json:"reporting_basis,omitempty"`
+
+	// EvidenceRefs is ACC-03's "source/evidence" input, taken from the §4
+	// envelope's evidence_refs. Empty for a posting that needs no supporting
+	// document.
+	EvidenceRefs []string `json:"evidence_refs,omitempty"`
+
+	// ──────────────────────────────────────────────────────────────────────
 
 	// ReversalOfJournalID is set only on a reversing journal, pointing back
 	// at the FINALIZED journal it reverses. Nil for every ordinary journal.
@@ -92,6 +176,18 @@ type JournalLine struct {
 	// oversight.
 	TaxCode            *string `json:"tax_code,omitempty"`
 	TaxLogicSnapshotID *string `json:"tax_logic_snapshot_id,omitempty"`
+
+	// Dimensions is ACC-03's "dimensions" input — cost centre, project,
+	// department, product, or whatever analysis axes the tenant posts against.
+	//
+	// Per line, not per journal: one journal routinely splits a single cost
+	// across cost centres, and a header-level set could not express that.
+	//
+	// Free-form keys because REF-08 Financial Dimension Registry does not
+	// exist. Nothing can say which dimensions a tenant has defined or which
+	// values are valid for one, so the keys are recorded as supplied and not
+	// validated — the same posture as account_code with no Chart of Accounts.
+	Dimensions Dimensions `json:"dimensions,omitempty"`
 }
 
 // JournalWithLines is the full aggregate returned by read endpoints.
@@ -110,6 +206,9 @@ type CreateJournalLineInput struct {
 
 	TaxCode            *string `json:"tax_code,omitempty"`
 	TaxLogicSnapshotID *string `json:"tax_logic_snapshot_id,omitempty"`
+
+	// ACC-03 "dimensions". See JournalLine.Dimensions.
+	Dimensions Dimensions `json:"dimensions,omitempty"`
 }
 
 type CreateJournalRequest struct {
@@ -119,6 +218,24 @@ type CreateJournalRequest struct {
 	Description   string                   `json:"description"`
 	Lines         []CreateJournalLineInput `json:"lines"`
 	CorrelationID string                   `json:"correlation_id"`
+
+	// ── ACC-03 required business/source inputs ────────────────────────────
+	//
+	// Required. See JournalHeader for why transaction and posting dates are
+	// separate fields and why currency is not display metadata.
+	JournalType     JournalType `json:"journal_type"`
+	TransactionDate Date        `json:"transaction_date"`
+	PostingDate     Date        `json:"posting_date"`
+	CurrencyCode    string      `json:"currency_code"`
+
+	// Optional: no service can issue or validate these yet (REF-06).
+	BookID         *string `json:"book_id,omitempty"`
+	ReportingBasis *string `json:"reporting_basis,omitempty"`
+
+	// EvidenceRefs may be sent in the body or, preferably, as the §4 envelope's
+	// X-Evidence-Refs header. The handler merges both — a caller that has
+	// already put its evidence on the envelope should not have to repeat it.
+	EvidenceRefs []string `json:"evidence_refs,omitempty"`
 
 	// SourceEventID and GovernanceDecisionID are optional Atomic Linking
 	// references — see JournalHeader's field docs.
@@ -188,4 +305,38 @@ var (
 	// tenant scope at all — it never passed gateway-auth-svc's ForwardAuth
 	// verification. Fail closed, same posture as ErrIdentityMissing.
 	ErrTenantScopeMissing = errorString("caller tenant scope missing")
+
+	// ── ACC-03 input contract ────────────────────────────────────────────
+
+	ErrInvalidJournalType = errorString("journal_type must be one of STANDARD, ADJUSTMENT, ACCRUAL, REVERSAL, OPENING, CLOSING, RECLASS")
+
+	// ErrInvalidCurrency covers shape only. REF-02 Currency Registry does not
+	// exist, so nothing can say whether a well-formed code is one this tenant
+	// or book actually transacts in.
+	ErrInvalidCurrency = errorString("currency_code must be a 3-letter ISO 4217 code, e.g. GBP")
+
+	// ErrPostingBeforeTransaction is raised when posting_date precedes
+	// transaction_date. The reverse order is ordinary — an invoice dated the
+	// 28th posted on the 3rd — but a journal that reaches the ledger before its
+	// own source document exists is a data-entry error every time, and catching
+	// it here is cheaper than finding it in a period reconciliation.
+	ErrPostingBeforeTransaction = errorString("posting_date cannot precede transaction_date")
 )
+
+// ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic
+// code: exactly three uppercase ASCII letters.
+//
+// Shape only, deliberately. Checking membership of a real currency list would
+// mean embedding one, and doctrine forbids a service hardcoding a currency —
+// that belongs in REF-02 Currency Registry, consumed as versioned data.
+func ValidCurrencyCode(s string) bool {
+	if len(s) != 3 {
+		return false
+	}
+	for i := 0; i < 3; i++ {
+		if s[i] < 'A' || s[i] > 'Z' {
+			return false
+		}
+	}
+	return true
+}

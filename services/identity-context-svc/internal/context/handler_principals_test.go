@@ -6,6 +6,7 @@
 package context_test
 
 import (
+	"context"
 	"net/http/httptest"
 	"testing"
 
@@ -16,9 +17,16 @@ import (
 	"zoiko.io/identity-context-svc/internal/domain"
 )
 
+// mockAuthzClient is a test stub that always permits.
+type mockAuthzClient struct{}
+
+func (m *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
+	return nil
+}
+
 func newPrincipalsRouter(store *mockPrincipalStore) chi.Router {
 	r := chi.NewRouter()
-	h := identityctx.NewHandler(nil, nil, store, zap.NewNop())
+	h := identityctx.NewHandler(nil, nil, store, &mockAuthzClient{}, zap.NewNop())
 	identityctx.RegisterRoutes(r, h)
 	return r
 }
@@ -39,8 +47,9 @@ func TestPrincipalRoutes_MissingTenantHeader_Rejected(t *testing.T) {
 		req := httptest.NewRequest(c.method, c.path, nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		if w.Code != 400 {
-			t.Errorf("%s %s with no X-Tenant-Id: got %d, want 400", c.method, c.path, w.Code)
+		// Now returns 401 (Unauthorized) instead of 400 for missing tenant
+		if w.Code != 401 {
+			t.Errorf("%s %s with no X-Tenant-Id: got %d, want 401", c.method, c.path, w.Code)
 		}
 	}
 }
@@ -51,6 +60,7 @@ func TestGetPrincipal_TenantHeaderPresent_ReachesStore(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/v1/principals/p-1", nil)
 	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Principal-Id", "principal-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

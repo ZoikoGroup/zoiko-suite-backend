@@ -2,6 +2,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -31,6 +32,11 @@ type Config struct {
 	TenantRegistryURL     string
 	DelegatedAuthorityURL string
 	AccessControlURL      string
+
+	// Authorization Service URL for admin mutation authorization checks.
+	// Must be set in production/staging; a placeholder is allowed only in local development.
+	AuthzServiceURL string
+	AuthzEnv        string
 
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
@@ -75,7 +81,7 @@ type KafkaConfig struct {
 }
 
 // Load reads configuration from environment variables with safe defaults.
-// Returns an error description string for any missing mandatory value.
+// Returns an error if any mandatory value is missing or invalid.
 func Load() (*Config, error) {
 	cfg := &Config{
 		Port:                     envInt("PORT", 8080),
@@ -108,9 +114,20 @@ func Load() (*Config, error) {
 		TenantRegistryURL:     env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
 		DelegatedAuthorityURL: env("DELEGATED_AUTHORITY_URL", "http://delegated-authority-svc"),
 		AccessControlURL:      env("ACCESS_CONTROL_URL", "http://access-control-svc"),
+		AuthzServiceURL:       env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		AuthzEnv:              env("AUTHZ_ENV", "development"),
 		OTELExporterEndpoint:  env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		SIEMServiceURL:        env("SIEM_SERVICE_URL", ""),
 	}
+
+	// JWT_SIGNING_SECRET is mandatory and must be at least 32 bytes for HS256.
+	if cfg.JWTSigningSecret == "" {
+		return nil, errors.New("JWT_SIGNING_SECRET is required")
+	}
+	if len(cfg.JWTSigningSecret) < 32 {
+		return nil, errors.New("JWT_SIGNING_SECRET must be at least 32 bytes")
+	}
+
 	return cfg, nil
 }
 

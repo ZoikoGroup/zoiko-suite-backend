@@ -38,6 +38,19 @@ type Config struct {
 	// SIEMServiceURL is siem-integration-svc. Empty disables streaming —
 	// see internal/siem's doc comment.
 	SIEMServiceURL string
+
+	// PlatformScopeEntityID is the synthetic legal_entity_id a platform-wide
+	// governance act is authorized against — the same pattern policy-svc uses
+	// for a policy with no owning legal entity. Creating a segregation-of-
+	// duties rule with no tenant_id applies it to every tenant, so it is
+	// authorized against this entity rather than the caller's own tenant
+	// scope (handler.requirePlatformAction).
+	//
+	// Empty by default and empty means REFUSE, not permit: a deployment that
+	// has not provisioned the platform-scope entity and its role grant cannot
+	// author platform-wide rules at all. That is the safe direction for a
+	// control whose blast radius is the whole estate.
+	PlatformScopeEntityID string
 }
 
 type DBConfig struct {
@@ -96,6 +109,7 @@ func Load() (*Config, error) {
 		MTLSPort:                 envInt("MTLS_PORT", 8449),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		SIEMServiceURL:           env("SIEM_SERVICE_URL", ""),
+		PlatformScopeEntityID:    env("AUTHZ_PLATFORM_SCOPE_ENTITY_ID", ""),
 	}, nil
 }
 

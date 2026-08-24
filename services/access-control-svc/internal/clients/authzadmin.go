@@ -25,7 +25,7 @@ func NewAuthzAdminClient(baseURL string) *AuthzAdminClient {
 
 // CreateRole calls POST /v1/admin/roles. Idempotent server-side on
 // (tenant_id, role_code) — a retried provisioning call is safe.
-func (c *AuthzAdminClient) CreateRole(ctx context.Context, roleID, tenantID, roleCode, roleName, roleScopeType, createdByPrincipalID string) error {
+func (c *AuthzAdminClient) CreateRole(ctx context.Context, roleID, tenantID, roleCode, roleName, roleScopeType, createdByPrincipalID, correlationID string) error {
 	body, _ := json.Marshal(map[string]string{
 		"role_id":                 roleID,
 		"tenant_id":               tenantID,
@@ -34,42 +34,42 @@ func (c *AuthzAdminClient) CreateRole(ctx context.Context, roleID, tenantID, rol
 		"role_scope_type":         roleScopeType,
 		"created_by_principal_id": createdByPrincipalID,
 	})
-	return c.post(ctx, "/v1/admin/roles", body)
+	return c.post(ctx, "/v1/admin/roles", body, createdByPrincipalID, tenantID, correlationID)
 }
 
 // SetRoleActive calls POST /v1/admin/roles/{roleID}/retire or /reactivate.
-//
-// This is the call that makes a status change here mean something. Retiring a
-// role in this catalogue used to update one row in one database and nothing
-// else: authorization-svc kept the role active, FindGrantedActions kept joining
-// through it, and every principal holding the role kept every action it granted.
-// The catalogue said RETIRED and the platform enforced ACTIVE.
-//
-// Idempotent server-side — retiring an already-retired role is 200, so a retry
-// after a timeout is safe and does not need distinguishing from the first call.
-func (c *AuthzAdminClient) SetRoleActive(ctx context.Context, roleID string, active bool) error {
+func (c *AuthzAdminClient) SetRoleActive(ctx context.Context, roleID string, active bool, correlationID string) error {
 	action := "retire"
 	if active {
 		action = "reactivate"
 	}
-	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/%s", roleID, action), []byte(`{}`))
+	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/%s", roleID, action), []byte(`{}`), "", "", correlationID)
 }
 
 // CreatePermissionBundle calls POST /v1/admin/roles/{roleID}/permission-bundles.
-func (c *AuthzAdminClient) CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string) error {
+func (c *AuthzAdminClient) CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string, correlationID string) error {
 	body, _ := json.Marshal(map[string]any{
 		"bundle_code":       bundleCode,
 		"permitted_actions": permittedActions,
 	})
-	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/permission-bundles", roleID), body)
+	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/permission-bundles", roleID), body, "", "", correlationID)
 }
 
-func (c *AuthzAdminClient) post(ctx context.Context, path string, body []byte) error {
+func (c *AuthzAdminClient) post(ctx context.Context, path string, body []byte, principalID, tenantID, correlationID string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if principalID != "" {
+		req.Header.Set("X-Principal-Id", principalID)
+	}
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	if correlationID != "" {
+		req.Header.Set("X-Correlation-ID", correlationID)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

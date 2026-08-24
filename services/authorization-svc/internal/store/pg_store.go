@@ -24,6 +24,7 @@ import (
 type Store interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
+	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error)
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
 
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
@@ -54,8 +55,12 @@ type Store interface {
 	// the caller's tenant to also bring that tenant's own SoD rules in.
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
 
-	RecordAccessDecision(ctx context.Context, principalID, legalEntityID, actionType, outcome, basis, correlationID string) (*domain.AccessDecisionLog, error)
-	FindAccessDecisionByID(ctx context.Context, accessDecisionID string) (*domain.AccessDecisionLog, error)
+	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
+
+	// FindAccessDecisionByID returns the decision only if it was recorded in
+	// tenantID scope. A decision recorded without a tenant is not readable
+	// here at all - see RecordAccessDecisionParams.TenantID.
+	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -171,14 +176,28 @@ func (s *PgStore) FindRoleByID(ctx context.Context, roleID string) (*domain.Role
 // remain, and reactivating restores exactly the access that was suspended;
 // cascading revocation would be irreversible and is a separate decision from
 // "stop enforcing this role for now".
-func (s *PgStore) SetRoleActive(ctx context.Context, roleID string, active bool) (*domain.Role, error) {
+//
+// TENANT SCOPE. tenantID is the caller's VERIFIED scope, and both controls
+// that isolate it are applied: the explicit tenant_id predicate, and withRLS
+// so the tenant_isolation_policy on `roles` has a value to enforce against.
+// This UPDATE previously ran on s.pool with neither. Against a NOBYPASSRLS
+// role - which is what zoiko_app is - app.tenant_id was never set, the FORCE
+// policy predicate evaluated to NULL, and the statement matched zero rows, so
+// every retire/reactivate answered 404 and role retirement did not work at
+// all. Against an owner or superuser connection the same statement retired
+// ANY tenant's role by id. One missing scope, two opposite failures.
+func (s *PgStore) SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error) {
 	const query = `
-		UPDATE roles SET active_flag = $2
-		WHERE role_id = $1
+		UPDATE roles SET active_flag = $3
+		WHERE role_id = $1 AND tenant_id = $2::uuid
 		RETURNING ` + roleColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query, roleID, active)
-	r, err := scanRole(row)
+	var r *domain.Role
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		r, scanErr = scanRole(tx.QueryRow(ctx, query, roleID, tenantID, active))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrRoleNotFound
@@ -627,30 +646,70 @@ func (s *PgStore) CheckSoDConflict(ctx context.Context, grantedActions []string,
 
 // ── access_decision_log ──────────────────────────────────────────────────────
 
-func (s *PgStore) RecordAccessDecision(ctx context.Context, principalID, legalEntityID, actionType, outcome, basis, correlationID string) (*domain.AccessDecisionLog, error) {
-	const query = `
-		INSERT INTO access_decision_log (principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id, decided_at;`
+const accessDecisionColumns = `access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, tenant_id, correlation_id, decided_at`
 
-	row := s.pool.QueryRow(ctx, query, principalID, legalEntityID, actionType, outcome, basis, correlationID)
+func scanAccessDecision(row pgx.Row) (*domain.AccessDecisionLog, error) {
 	d := &domain.AccessDecisionLog{}
-	if err := row.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID, &d.ActionType, &d.DecisionOutcome, &d.DecisionBasis, &d.CorrelationID, &d.DecidedAt); err != nil {
+	err := row.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID, &d.ActionType,
+		&d.DecisionOutcome, &d.DecisionBasis, &d.TenantID, &d.CorrelationID, &d.DecidedAt)
+	return d, err
+}
+
+// RecordAccessDecision appends the decision artifact for one evaluation.
+//
+// params.TenantID is written as SQL NULL when empty, which is the honest
+// record of a caller that supplied no tenant - see
+// domain.RecordAccessDecisionParams.TenantID for why /v1/authorize cannot
+// simply require one. The insert runs inside withRLS so the WITH CHECK on
+// access_decision_log's policy has a value to test; that policy admits a NULL
+// tenant_id deliberately, and the read path below is what keeps a NULL-tenant
+// row from being served to an arbitrary tenant.
+func (s *PgStore) RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
+	const query = `
+		INSERT INTO access_decision_log (principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id, tenant_id)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::uuid)
+		RETURNING ` + accessDecisionColumns + `;`
+
+	var d *domain.AccessDecisionLog
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanAccessDecision(tx.QueryRow(ctx, query,
+			params.PrincipalID, params.LegalEntityID, params.ActionType,
+			params.Outcome, params.Basis, params.CorrelationID, params.TenantID))
+		return scanErr
+	})
+	if err != nil {
 		s.log.Error("pg RecordAccessDecision failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return d, nil
 }
 
-func (s *PgStore) FindAccessDecisionByID(ctx context.Context, accessDecisionID string) (*domain.AccessDecisionLog, error) {
+// FindAccessDecisionByID reads one decision, scoped to tenantID.
+//
+// The explicit tenant_id predicate is the control here, not the RLS policy:
+// the policy admits NULL-tenant rows (it has to, so RecordAccessDecision can
+// write one), and this predicate is what excludes them. Before this, the read
+// carried no tenant or entity predicate at all and the route required no
+// authentication, so decision ids could be walked to read every tenant's
+// principal_id / legal_entity_id / action_type / decision_basis - including
+// the sod:conflict_with basis, which names where the SoD tripwires are.
+//
+// A row belonging to another tenant, and a row recorded with no tenant, are
+// both reported as ErrAccessDecisionNotFound - the handler answers 404, so a
+// probe cannot distinguish "not yours" from "does not exist".
+func (s *PgStore) FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error) {
 	const query = `
-		SELECT access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id, decided_at
+		SELECT ` + accessDecisionColumns + `
 		FROM access_decision_log
-		WHERE access_decision_id = $1;`
+		WHERE access_decision_id = $1 AND tenant_id = $2::uuid;`
 
-	row := s.pool.QueryRow(ctx, query, accessDecisionID)
-	d := &domain.AccessDecisionLog{}
-	err := row.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID, &d.ActionType, &d.DecisionOutcome, &d.DecisionBasis, &d.CorrelationID, &d.DecidedAt)
+	var d *domain.AccessDecisionLog
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanAccessDecision(tx.QueryRow(ctx, query, accessDecisionID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrAccessDecisionNotFound

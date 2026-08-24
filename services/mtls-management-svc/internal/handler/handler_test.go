@@ -58,6 +58,7 @@ func mustParsePEMPrivateKey(t *testing.T, pemBytes string) {
 
 func TestHealthCheck(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(r)
 	w := httptest.NewRecorder()
 	newRouter(t).ServeHTTP(w, r)
 	if w.Code != 200 {
@@ -70,6 +71,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	// Provision
 	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "ledger-svc", CommonName: "ledger-svc.zoiko.internal", RotationDays: 90, AutoRotate: true})
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
@@ -111,6 +113,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	// Get — GetCert must return the public cert but must NEVER leak a
 	// private key field.
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates/"+cert.ID, nil)
+	withEnvelope(req2)
 	req2.Header.Set("X-Tenant-ID", "t1")
 	w2 := httptest.NewRecorder()
 	router.ServeHTTP(w2, req2)
@@ -123,6 +126,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 
 	// List
 	req3 := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates?legal_entity_id=LE-1", nil)
+	withEnvelope(req3)
 	req3.Header.Set("X-Tenant-ID", "t1")
 	w3 := httptest.NewRecorder()
 	router.ServeHTTP(w3, req3)
@@ -140,6 +144,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 
 	// Rotate — must issue a genuinely different key pair and certificate.
 	req4 := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates/"+cert.ID+"/rotate", nil)
+	withEnvelope(req4)
 	req4.Header.Set("X-Tenant-ID", "t1")
 	w4 := httptest.NewRecorder()
 	router.ServeHTTP(w4, req4)
@@ -166,6 +171,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	// Policy
 	polBody, _ := json.Marshal(domain.CreatePolicyRequest{PolicyName: "ledger-to-treasury", SourceService: "ledger-svc", TargetService: "treasury-svc", Action: domain.PolicyAllow, RequiresMtls: true})
 	req5 := httptest.NewRequest(http.MethodPost, "/v1/mtls/policies", bytes.NewBuffer(polBody))
+	withEnvelope(req5)
 	req5.Header.Set("X-Tenant-ID", "t1")
 	w5 := httptest.NewRecorder()
 	router.ServeHTTP(w5, req5)
@@ -175,6 +181,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 
 	// Revoke
 	req6 := httptest.NewRequest(http.MethodDelete, "/v1/mtls/certificates/"+cert.ID, nil)
+	withEnvelope(req6)
 	req6.Header.Set("X-Tenant-ID", "t1")
 	w6 := httptest.NewRecorder()
 	router.ServeHTTP(w6, req6)
@@ -186,6 +193,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 func TestValidationError(t *testing.T) {
 	body, _ := json.Marshal(domain.ProvisionCertRequest{ServiceName: "svc"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	w := httptest.NewRecorder()
 	newRouter(t).ServeHTTP(w, req)

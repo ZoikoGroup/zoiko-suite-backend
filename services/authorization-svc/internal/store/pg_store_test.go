@@ -481,7 +481,14 @@ func TestPgStore_AccessDecisionLog_RecordAndRetrieve(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
-	d, err := s.RecordAccessDecision(ctx, "principal-1", "00000000-0000-0000-0000-0000000000e1", "PAYMENT_APPROVE", "DENIED", "no_grant", "corr-1")
+	d, err := s.RecordAccessDecision(ctx, domain.RecordAccessDecisionParams{
+		PrincipalID:   "principal-1",
+		LegalEntityID: "00000000-0000-0000-0000-0000000000e1",
+		ActionType:    "PAYMENT_APPROVE",
+		Outcome:       "DENIED",
+		Basis:         "no_grant",
+		CorrelationID: "corr-1",
+	})
 	if err != nil {
 		t.Fatalf("record: %v", err)
 	}
@@ -489,7 +496,7 @@ func TestPgStore_AccessDecisionLog_RecordAndRetrieve(t *testing.T) {
 		t.Fatalf("expected DENIED, got %s", d.DecisionOutcome)
 	}
 
-	found, err := s.FindAccessDecisionByID(ctx, d.AccessDecisionID)
+	found, err := s.FindAccessDecisionByID(ctx, d.AccessDecisionID, "tenant-1")
 	if err != nil {
 		t.Fatalf("find: %v", err)
 	}
@@ -504,7 +511,7 @@ func TestPgStore_FindAccessDecisionByID_NotFound(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	_, err := s.FindAccessDecisionByID(context.Background(), "00000000-0000-0000-0000-000000000099")
+	_, err := s.FindAccessDecisionByID(context.Background(), "00000000-0000-0000-0000-000000000099", "tenant-1")
 	if !errors.Is(err, domain.ErrAccessDecisionNotFound) {
 		t.Fatalf("expected ErrAccessDecisionNotFound, got %v", err)
 	}

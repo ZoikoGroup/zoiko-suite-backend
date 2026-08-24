@@ -33,10 +33,12 @@ import (
 // Client is the narrow interface the handler depends on.
 type Client interface {
 	// CheckAllowed returns nil if principalID is authorized to perform
-	// actionType within legalEntityID. Returns domain.ErrAuthorizationDenied
+	// actionType within legalEntityID and tenantID. Returns domain.ErrAuthorizationDenied
 	// on a DENIED decision, or domain.ErrAuthorizationServiceUnavailable if
 	// no decision could be obtained — callers must fail closed on the latter.
-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+	// tenantID is the caller's verified tenant scope (from X-Tenant-Id header).
+	// Empty string means no tenant scope (global-only SoD rules).
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error
 }
 
 // Action types this service asks authorization-svc about. These must exist
@@ -46,6 +48,14 @@ const (
 	ActionPolicyCreate          = "POLICY_CREATE"
 	ActionPolicyVersionCreate   = "POLICY_VERSION_CREATE"
 	ActionPolicyVersionActivate = "POLICY_VERSION_ACTIVATE"
+
+	// Global-scope actions are distinct from tenant-scoped ones because
+	// publishing a version that applies to EVERY tenant is a platform-wide
+	// governance act with a much larger blast radius. A principal holding
+	// only the tenant-scoped grant must not be able to create/activate a
+	// global version by simply omitting tenant_id.
+	ActionPolicyVersionCreateGlobal   = "POLICY_VERSION_CREATE_GLOBAL"
+	ActionPolicyVersionActivateGlobal = "POLICY_VERSION_ACTIVATE_GLOBAL"
 
 	ActionControlTestDefinitionCreate = "CONTROL_TEST_DEFINITION_CREATE"
 	ActionControlTestExecutionRecord  = "CONTROL_TEST_EXECUTION_RECORD"
@@ -110,6 +120,7 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
+	TenantID      string `json:"tenant_id,omitempty"`
 }
 
 // authorizeResponse matches authorization-svc's response. Both GRANTED and
@@ -121,14 +132,14 @@ type authorizeResponse struct {
 	AccessDecisionID string `json:"access_decision_id"`
 }
 
-func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType + "|" + tenantID
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType, tenantID)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -178,11 +189,12 @@ func (c *HTTPClient) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
 	body, err := json.Marshal(authorizeRequest{
 		PrincipalID:   principalID,
 		LegalEntityID: legalEntityID,
 		ActionType:    actionType,
+		TenantID:      tenantID,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
@@ -242,7 +254,7 @@ type PermitAllClient struct{ log *zap.Logger }
 
 func NewPermitAllClient(log *zap.Logger) *PermitAllClient { return &PermitAllClient{log: log} }
 
-func (c *PermitAllClient) CheckAllowed(_ context.Context, principalID, _, actionType string) error {
+func (c *PermitAllClient) CheckAllowed(_ context.Context, principalID, _, actionType, _ string) error {
 	c.log.Debug("authz stub — permitted (local development only)",
 		zap.String("principal_id", principalID),
 		zap.String("action_type", actionType),
