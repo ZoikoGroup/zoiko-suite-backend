@@ -146,6 +146,10 @@ func (s *PgStore) CreateSubscription(ctx context.Context, sub *domain.Commercial
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	if err := setTenantOnTx(ctx, tx); err != nil {
+		return err
+	}
+
 	_, err = tx.Exec(ctx, `
 		INSERT INTO commercial_subscriptions (
 			subscription_id, commercial_account_id, plan_id, catalog_version_id, billing_interval,
@@ -184,16 +188,22 @@ func (s *PgStore) GetSubscription(ctx context.Context, subscriptionID string) (*
 	var sub domain.CommercialSubscription
 	var status string
 	var billingSource string
-	err := s.pool.QueryRow(ctx, `
-		SELECT subscription_id, commercial_account_id, plan_id, catalog_version_id, billing_interval,
-		       status, renewal_date, canceled_at, processor_subscription_ref,
-		       created_at, updated_at, created_by_principal_id, billing_source
-		FROM commercial_subscriptions WHERE subscription_id = $1
-	`, subscriptionID).Scan(
-		&sub.SubscriptionID, &sub.CommercialAccountID, &sub.PlanID, &sub.CatalogVersionID, &sub.BillingInterval,
-		&status, &sub.RenewalDate, &sub.CanceledAt, &sub.ProcessorSubscriptionRef,
-		&sub.CreatedAt, &sub.UpdatedAt, &sub.CreatedByPrincipalID, &billingSource,
-	)
+	// No organization predicate in the SQL: commercial_subscriptions has no
+	// organization_id column, so the boundary here is the RLS policy from
+	// migration 000005, which resolves subscription → commercial_account →
+	// organization. withTenant is what supplies it the tenant to enforce.
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT subscription_id, commercial_account_id, plan_id, catalog_version_id, billing_interval,
+			       status, renewal_date, canceled_at, processor_subscription_ref,
+			       created_at, updated_at, created_by_principal_id, billing_source
+			FROM commercial_subscriptions WHERE subscription_id = $1
+		`, subscriptionID).Scan(
+			&sub.SubscriptionID, &sub.CommercialAccountID, &sub.PlanID, &sub.CatalogVersionID, &sub.BillingInterval,
+			&status, &sub.RenewalDate, &sub.CanceledAt, &sub.ProcessorSubscriptionRef,
+			&sub.CreatedAt, &sub.UpdatedAt, &sub.CreatedByPrincipalID, &billingSource,
+		)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrSubscriptionNotFound
 	}
@@ -219,7 +229,11 @@ func (s *PgStore) TransitionSubscriptionStatus(ctx context.Context, subscription
 	if err != nil {
 		return fmt.Errorf("begin transition: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err := setTenantOnTx(ctx, tx); err != nil {
+		return err
+	}
 
 	var currentStatus string
 	err = tx.QueryRow(ctx, `SELECT status FROM commercial_subscriptions WHERE subscription_id = $1`, subscriptionID).Scan(&currentStatus)
@@ -282,7 +296,11 @@ func (s *PgStore) CreateBillingSourceTransfer(ctx context.Context, transfer *dom
 	if err != nil {
 		return fmt.Errorf("begin transfer: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if err := setTenantOnTx(ctx, tx); err != nil {
+		return err
+	}
 
 	if transfer.OldSubscriptionID != nil {
 		now := time.Now().UTC()
@@ -342,26 +360,32 @@ func (s *PgStore) CreateBillingSourceTransfer(ctx context.Context, transfer *dom
 }
 
 func (s *PgStore) ListStatusEventsBySubscription(ctx context.Context, subscriptionID string) ([]domain.SubscriptionStatusEvent, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT status_event_id, subscription_id, previous_status, new_status, reason,
-		       created_at, created_by_principal_id
-		FROM subscription_status_events WHERE subscription_id = $1 ORDER BY created_at DESC
-	`, subscriptionID)
+	var out []domain.SubscriptionStatusEvent
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT status_event_id, subscription_id, previous_status, new_status, reason,
+			       created_at, created_by_principal_id
+			FROM subscription_status_events WHERE subscription_id = $1 ORDER BY created_at DESC
+		`, subscriptionID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var e domain.SubscriptionStatusEvent
+			if err := rows.Scan(&e.StatusEventID, &e.SubscriptionID, &e.PreviousStatus, &e.NewStatus, &e.Reason,
+				&e.CreatedAt, &e.CreatedByPrincipalID); err != nil {
+				return err
+			}
+			out = append(out, e)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var out []domain.SubscriptionStatusEvent
-	for rows.Next() {
-		var e domain.SubscriptionStatusEvent
-		if err := rows.Scan(&e.StatusEventID, &e.SubscriptionID, &e.PreviousStatus, &e.NewStatus, &e.Reason,
-			&e.CreatedAt, &e.CreatedByPrincipalID); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // UpdateSubscriptionPlan is used by ApplyChangeRequest — an upgrade/downgrade
@@ -369,31 +393,42 @@ func (s *PgStore) ListStatusEventsBySubscription(ctx context.Context, subscripti
 // at a new plan_id/catalog_version_id.
 func (s *PgStore) UpdateSubscriptionPlan(ctx context.Context, subscriptionID, planID, catalogVersionID string) error {
 	now := time.Now().UTC()
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE commercial_subscriptions
-		SET plan_id = $1, catalog_version_id = $2, updated_at = $3
-		WHERE subscription_id = $4
-	`, planID, catalogVersionID, now, subscriptionID)
+	var affected int64
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE commercial_subscriptions
+			SET plan_id = $1, catalog_version_id = $2, updated_at = $3
+			WHERE subscription_id = $4
+		`, planID, catalogVersionID, now, subscriptionID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("update subscription plan: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	if affected == 0 {
 		return domain.ErrSubscriptionNotFound
 	}
 	return nil
 }
 
 func (s *PgStore) CreateEvaluationProgram(ctx context.Context, e *domain.EvaluationProgram) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO evaluation_programs (
-			evaluation_program_id, subscription_id, duration_days, payment_required,
-			conversion_policy, expiry_action, started_at, expires_at,
-			created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, e.EvaluationProgramID, e.SubscriptionID, e.DurationDays, e.PaymentRequired,
-		e.ConversionPolicy, e.ExpiryAction, e.StartedAt, e.ExpiresAt,
-		e.CreatedAt, e.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO evaluation_programs (
+				evaluation_program_id, subscription_id, duration_days, payment_required,
+				conversion_policy, expiry_action, started_at, expires_at,
+				created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, e.EvaluationProgramID, e.SubscriptionID, e.DurationDays, e.PaymentRequired,
+			e.ConversionPolicy, e.ExpiryAction, e.StartedAt, e.ExpiresAt,
+			e.CreatedAt, e.CreatedByPrincipalID,
+		)
+		return err
+	})
 	if err != nil {
 		if isUniqueViolation(err) {
 			return fmt.Errorf("%w: subscription_id %s", domain.ErrConflict, e.SubscriptionID)
@@ -405,16 +440,18 @@ func (s *PgStore) CreateEvaluationProgram(ctx context.Context, e *domain.Evaluat
 
 func (s *PgStore) GetEvaluationProgramBySubscription(ctx context.Context, subscriptionID string) (*domain.EvaluationProgram, error) {
 	var e domain.EvaluationProgram
-	err := s.pool.QueryRow(ctx, `
-		SELECT evaluation_program_id, subscription_id, duration_days, payment_required,
-		       conversion_policy, expiry_action, started_at, expires_at,
-		       created_at, created_by_principal_id
-		FROM evaluation_programs WHERE subscription_id = $1
-	`, subscriptionID).Scan(
-		&e.EvaluationProgramID, &e.SubscriptionID, &e.DurationDays, &e.PaymentRequired,
-		&e.ConversionPolicy, &e.ExpiryAction, &e.StartedAt, &e.ExpiresAt,
-		&e.CreatedAt, &e.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT evaluation_program_id, subscription_id, duration_days, payment_required,
+			       conversion_policy, expiry_action, started_at, expires_at,
+			       created_at, created_by_principal_id
+			FROM evaluation_programs WHERE subscription_id = $1
+		`, subscriptionID).Scan(
+			&e.EvaluationProgramID, &e.SubscriptionID, &e.DurationDays, &e.PaymentRequired,
+			&e.ConversionPolicy, &e.ExpiryAction, &e.StartedAt, &e.ExpiresAt,
+			&e.CreatedAt, &e.CreatedByPrincipalID,
+		)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrEvaluationProgramNotFound
 	}
@@ -422,16 +459,19 @@ func (s *PgStore) GetEvaluationProgramBySubscription(ctx context.Context, subscr
 }
 
 func (s *PgStore) CreateOverlay(ctx context.Context, o *domain.ContractEntitlementOverlay) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO contract_entitlement_overlays (
-			overlay_id, commercial_account_id, metric_type, override_limit_value,
-			legal_reference, effective_from, effective_to, approved_by_principal_id,
-			created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-	`, o.OverlayID, o.CommercialAccountID, o.MetricType, o.OverrideLimitValue,
-		o.LegalReference, o.EffectiveFrom, o.EffectiveTo, o.ApprovedByPrincipalID,
-		o.CreatedAt, o.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO contract_entitlement_overlays (
+				overlay_id, commercial_account_id, metric_type, override_limit_value,
+				legal_reference, effective_from, effective_to, approved_by_principal_id,
+				created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		`, o.OverlayID, o.CommercialAccountID, o.MetricType, o.OverrideLimitValue,
+			o.LegalReference, o.EffectiveFrom, o.EffectiveTo, o.ApprovedByPrincipalID,
+			o.CreatedAt, o.CreatedByPrincipalID,
+		)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("insert overlay: %w", err)
 	}
@@ -443,20 +483,22 @@ func (s *PgStore) CreateOverlay(ctx context.Context, o *domain.ContractEntitleme
 func (s *PgStore) activeOverlayForMetric(ctx context.Context, commercialAccountID, metricType string) (*domain.ContractEntitlementOverlay, error) {
 	now := time.Now().UTC()
 	var o domain.ContractEntitlementOverlay
-	err := s.pool.QueryRow(ctx, `
-		SELECT overlay_id, commercial_account_id, metric_type, override_limit_value,
-		       legal_reference, effective_from, effective_to, approved_by_principal_id,
-		       created_at, created_by_principal_id
-		FROM contract_entitlement_overlays
-		WHERE commercial_account_id = $1 AND metric_type = $2
-		  AND effective_from <= $3 AND (effective_to IS NULL OR effective_to > $3)
-		ORDER BY effective_from DESC
-		LIMIT 1
-	`, commercialAccountID, metricType, now).Scan(
-		&o.OverlayID, &o.CommercialAccountID, &o.MetricType, &o.OverrideLimitValue,
-		&o.LegalReference, &o.EffectiveFrom, &o.EffectiveTo, &o.ApprovedByPrincipalID,
-		&o.CreatedAt, &o.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT overlay_id, commercial_account_id, metric_type, override_limit_value,
+			       legal_reference, effective_from, effective_to, approved_by_principal_id,
+			       created_at, created_by_principal_id
+			FROM contract_entitlement_overlays
+			WHERE commercial_account_id = $1 AND metric_type = $2
+			  AND effective_from <= $3 AND (effective_to IS NULL OR effective_to > $3)
+			ORDER BY effective_from DESC
+			LIMIT 1
+		`, commercialAccountID, metricType, now).Scan(
+			&o.OverlayID, &o.CommercialAccountID, &o.MetricType, &o.OverrideLimitValue,
+			&o.LegalReference, &o.EffectiveFrom, &o.EffectiveTo, &o.ApprovedByPrincipalID,
+			&o.CreatedAt, &o.CreatedByPrincipalID,
+		)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -512,33 +554,49 @@ func (s *PgStore) ResolveEntitlement(ctx context.Context, subscriptionID, metric
 }
 
 func (s *PgStore) RecordUsageEvent(ctx context.Context, e *domain.UsageMeterEvent) error {
-	tag, err := s.pool.Exec(ctx, `
-		INSERT INTO commercial_usage_meter_events (
-			usage_event_id, subscription_id, metric_type, quantity, occurred_at,
-			source_service, billable_state, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (usage_event_id) DO NOTHING
-	`, e.UsageEventID, e.SubscriptionID, e.MetricType, e.Quantity, e.OccurredAt,
-		e.SourceService, e.BillableState, e.CreatedAt,
-	)
+	var affected int64
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO commercial_usage_meter_events (
+				usage_event_id, subscription_id, metric_type, quantity, occurred_at,
+				source_service, billable_state, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			ON CONFLICT (usage_event_id) DO NOTHING
+		`, e.UsageEventID, e.SubscriptionID, e.MetricType, e.Quantity, e.OccurredAt,
+			e.SourceService, e.BillableState, e.CreatedAt,
+		)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
 	if err != nil {
 		return fmt.Errorf("insert usage event: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	// Zero rows now has two possible causes: the ON CONFLICT no-op (a
+	// genuine duplicate) or the RLS WITH CHECK refusing a subscription the
+	// caller cannot see. Both are correctly refusals from the caller's point
+	// of view, and neither should report which — distinguishing them would
+	// tell a prober whether another tenant's subscription_id exists.
+	if affected == 0 {
 		return domain.ErrDuplicateUsageEvent
 	}
 	return nil
 }
 
 func (s *PgStore) CreateChangeRequest(ctx context.Context, c *domain.SubscriptionChangeRequest) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO subscription_change_requests (
-			change_request_id, subscription_id, target_plan_id, effective_at,
-			status, requested_by_principal_id, created_at, applied_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, c.ChangeRequestID, c.SubscriptionID, c.TargetPlanID, c.EffectiveAt,
-		c.Status, c.RequestedByPrincipalID, c.CreatedAt, c.AppliedAt,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO subscription_change_requests (
+				change_request_id, subscription_id, target_plan_id, effective_at,
+				status, requested_by_principal_id, created_at, applied_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, c.ChangeRequestID, c.SubscriptionID, c.TargetPlanID, c.EffectiveAt,
+			c.Status, c.RequestedByPrincipalID, c.CreatedAt, c.AppliedAt,
+		)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("insert change request: %w", err)
 	}
@@ -547,14 +605,16 @@ func (s *PgStore) CreateChangeRequest(ctx context.Context, c *domain.Subscriptio
 
 func (s *PgStore) GetChangeRequest(ctx context.Context, changeRequestID string) (*domain.SubscriptionChangeRequest, error) {
 	var c domain.SubscriptionChangeRequest
-	err := s.pool.QueryRow(ctx, `
-		SELECT change_request_id, subscription_id, target_plan_id, effective_at,
-		       status, requested_by_principal_id, created_at, applied_at
-		FROM subscription_change_requests WHERE change_request_id = $1
-	`, changeRequestID).Scan(
-		&c.ChangeRequestID, &c.SubscriptionID, &c.TargetPlanID, &c.EffectiveAt,
-		&c.Status, &c.RequestedByPrincipalID, &c.CreatedAt, &c.AppliedAt,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT change_request_id, subscription_id, target_plan_id, effective_at,
+			       status, requested_by_principal_id, created_at, applied_at
+			FROM subscription_change_requests WHERE change_request_id = $1
+		`, changeRequestID).Scan(
+			&c.ChangeRequestID, &c.SubscriptionID, &c.TargetPlanID, &c.EffectiveAt,
+			&c.Status, &c.RequestedByPrincipalID, &c.CreatedAt, &c.AppliedAt,
+		)
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrChangeRequestNotFound
 	}
@@ -572,6 +632,10 @@ func (s *PgStore) ApplyChangeRequest(ctx context.Context, changeRequestID string
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+
+	if err := setTenantOnTx(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	var subscriptionID, targetPlanID, status string
 	err = tx.QueryRow(ctx, `

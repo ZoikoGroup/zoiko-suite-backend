@@ -17,6 +17,7 @@ import (
 	"zoiko.io/evidence-manifest-svc/internal/aggregator"
 	"zoiko.io/evidence-manifest-svc/internal/domain"
 	"zoiko.io/evidence-manifest-svc/internal/handler"
+	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
 )
 
 // ── stub store ───────────────────────────────────────────────────────────────
@@ -31,24 +32,46 @@ func newStubStore() *stubStore {
 	return &stubStore{manifests: map[string]*domain.EvidenceManifest{}, records: map[string][]domain.ManifestRecord{}}
 }
 
-func (s *stubStore) CreateManifest(_ context.Context, m *domain.EvidenceManifest) error {
+// Every method below scopes to the tenant on the context, mirroring
+// PgStore. These previously took `_ context.Context` and ignored it, so the
+// stub could not enforce a tenant boundary even in principle — any handler
+// test asserting isolation would have been asserting against a fake that
+// could not fail. Taking ctx is what makes those assertions mean something
+// about production.
+func (s *stubStore) tenantOf(ctx context.Context, manifestID string) (*domain.EvidenceManifest, bool) {
+	m, ok := s.manifests[manifestID]
+	if !ok || m.TenantID != svcmiddleware.TenantFromContext(ctx) {
+		return nil, false
+	}
+	return m, true
+}
+
+func (s *stubStore) CreateManifest(ctx context.Context, m *domain.EvidenceManifest) error {
 	if s.createErr != nil {
 		return s.createErr
 	}
 	m.ManifestID = "manifest-1"
 	m.Status = domain.StatusPending
+	// Attribution comes from the verified context, as in PgStore — never
+	// from the request body, which is what made the tenant caller-declared.
+	m.TenantID = svcmiddleware.TenantFromContext(ctx)
 	s.manifests[m.ManifestID] = m
 	return nil
 }
 
-func (s *stubStore) AddRecord(_ context.Context, r *domain.ManifestRecord) error {
+func (s *stubStore) AddRecord(ctx context.Context, r *domain.ManifestRecord) error {
+	// Mirrors the RLS WITH CHECK on manifest_records: a record cannot be
+	// appended to a manifest the caller cannot see.
+	if _, ok := s.tenantOf(ctx, r.ManifestID); !ok {
+		return domain.ErrManifestNotFound
+	}
 	r.ManifestRecordID = "record-" + r.SourceRecordID
 	s.records[r.ManifestID] = append(s.records[r.ManifestID], *r)
 	return nil
 }
 
-func (s *stubStore) FinalizeGenerated(_ context.Context, manifestID, checksum string) (*domain.EvidenceManifest, error) {
-	m, ok := s.manifests[manifestID]
+func (s *stubStore) FinalizeGenerated(ctx context.Context, manifestID, checksum string) (*domain.EvidenceManifest, error) {
+	m, ok := s.tenantOf(ctx, manifestID)
 	if !ok {
 		return nil, domain.ErrManifestNotFound
 	}
@@ -57,8 +80,8 @@ func (s *stubStore) FinalizeGenerated(_ context.Context, manifestID, checksum st
 	return m, nil
 }
 
-func (s *stubStore) FinalizeFailed(_ context.Context, manifestID, reason string) (*domain.EvidenceManifest, error) {
-	m, ok := s.manifests[manifestID]
+func (s *stubStore) FinalizeFailed(ctx context.Context, manifestID, reason string) (*domain.EvidenceManifest, error) {
+	m, ok := s.tenantOf(ctx, manifestID)
 	if !ok {
 		return nil, domain.ErrManifestNotFound
 	}
@@ -67,15 +90,18 @@ func (s *stubStore) FinalizeFailed(_ context.Context, manifestID, reason string)
 	return m, nil
 }
 
-func (s *stubStore) FindManifestByID(_ context.Context, manifestID string) (*domain.EvidenceManifest, error) {
-	m, ok := s.manifests[manifestID]
+func (s *stubStore) FindManifestByID(ctx context.Context, manifestID string) (*domain.EvidenceManifest, error) {
+	m, ok := s.tenantOf(ctx, manifestID)
 	if !ok {
 		return nil, domain.ErrManifestNotFound
 	}
 	return m, nil
 }
 
-func (s *stubStore) ListRecords(_ context.Context, manifestID string) ([]domain.ManifestRecord, error) {
+func (s *stubStore) ListRecords(ctx context.Context, manifestID string) ([]domain.ManifestRecord, error) {
+	if _, ok := s.tenantOf(ctx, manifestID); !ok {
+		return nil, nil
+	}
 	return s.records[manifestID], nil
 }
 
@@ -132,6 +158,7 @@ func (p *stubPublisher) PublishManifestGenerated(_ context.Context, m *domain.Ev
 
 func newRouter(s *stubStore, gov *stubGovernance, acc *stubAccess, wf *stubWorkflow, pub *stubPublisher) chi.Router {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	h := handler.New(s, gov, acc, wf, pub, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
@@ -157,6 +184,7 @@ func TestGenerateManifest_WithExplicitGovernanceID_Returns201Generated(t *testin
 		GovernanceDecisionIDs: []string{"gd-1"},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -178,6 +206,7 @@ func TestGenerateManifest_MissingScenarioType_Returns400(t *testing.T) {
 
 	body, _ := json.Marshal(domain.GenerateManifestRequest{TenantID: "t1", LegalEntityID: "e1"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -192,6 +221,7 @@ func TestGenerateManifest_InvalidScenarioType_Returns400(t *testing.T) {
 		GovernanceDecisionIDs: []string{"gd-1"},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -205,6 +235,7 @@ func TestGenerateManifest_NoRecordsRequested_Returns400(t *testing.T) {
 		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioAudit,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -227,6 +258,7 @@ func TestGenerateManifest_OneSourceUnavailable_FailsClosed_WholeManifestFails(t 
 		AccessDecisionIDs:     []string{"ad-1"},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -258,6 +290,7 @@ func TestGenerateManifest_MultipleSources_AllIncluded(t *testing.T) {
 		WorkflowInstanceIDs:     []string{"wf-1"},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -272,6 +305,7 @@ func TestGetManifest_NotFound_Returns404(t *testing.T) {
 	r := newRouter(newStubStore(), gov, acc, wf, pub)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/nope", nil)
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
@@ -288,9 +322,12 @@ func TestListRecords_ReturnsAllRecordsForManifest(t *testing.T) {
 		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioAudit,
 		GovernanceDecisionIDs: []string{"gd-1"},
 	})
-	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(createBody)))
+	seedReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(createBody))
+	seedReq.Header.Set("X-Tenant-Id", "t1")
+	r.ServeHTTP(httptest.NewRecorder(), seedReq)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/manifest-1/records", nil)
+	req.Header.Set("X-Tenant-Id", "t1")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 

@@ -15,6 +15,7 @@ import (
 	authzpkg "zoiko.io/kill-switch-registry-svc/internal/authz"
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
 	"zoiko.io/kill-switch-registry-svc/internal/events"
+	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
 )
 
 // stubStore is a tiny in-memory re-implementation of the real
@@ -147,6 +148,7 @@ func newTestHandler() (*Handler, *stubStore, *stubPublisher) {
 
 func newTestRouter(h *Handler) *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
 	return r
 }
@@ -159,6 +161,19 @@ func buildRequest(method, path string, body interface{}) *http.Request {
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("X-Principal-Id", "incident-commander-1")
 	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+// tenantRequest is buildRequest plus a verified tenant identity.
+//
+// The resolve tests previously passed ?tenant_id= with no header and still
+// got that tenant's answer, because the query parameter was the only source
+// of the tenant dimension. It is now taken from the verified header and the
+// parameter may only agree with it — so a test asking about a tenant has to
+// present that tenant's identity, which is what a real caller does.
+func tenantRequest(method, path, tenantID string) *http.Request {
+	req := buildRequest(method, path, nil)
+	req.Header.Set("X-Tenant-Id", tenantID)
 	return req
 }
 
@@ -198,7 +213,7 @@ func TestEngage_PlatformWideThenResolveBlocksEverything(t *testing.T) {
 	// blocked by the platform-wide switch — that's the whole point of a
 	// nil dimension matching everything.
 	wResolve := httptest.NewRecorder()
-	r.ServeHTTP(wResolve, buildRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=IMPORT_SYNC&tenant_id=t-1", nil))
+	r.ServeHTTP(wResolve, tenantRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=IMPORT_SYNC&tenant_id=t-1", "t-1"))
 	var resolution domain.KillSwitchResolution
 	_ = json.Unmarshal(wResolve.Body.Bytes(), &resolution)
 	if !resolution.Blocked {
@@ -233,7 +248,7 @@ func TestResolve_MostSpecificEngagedSwitchWins(t *testing.T) {
 	// tenant-safe should resolve to whichever is most specific — since both
 	// are ENGAGE here, the tenant-scoped one (more specific) wins.
 	w := httptest.NewRecorder()
-	r.ServeHTTP(w, buildRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=AUTOMATION_ACTION&tenant_id=tenant-safe", nil))
+	r.ServeHTTP(w, tenantRequest(http.MethodGet, "/v1/kill-switches/resolve?domain=AUTOMATION_ACTION&tenant_id=tenant-safe", "tenant-safe"))
 	var resolution domain.KillSwitchResolution
 	_ = json.Unmarshal(w.Body.Bytes(), &resolution)
 	if !resolution.Blocked || resolution.MatchedEvent == nil || resolution.MatchedEvent.TenantID == nil || *resolution.MatchedEvent.TenantID != "tenant-safe" {

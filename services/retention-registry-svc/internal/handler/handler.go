@@ -14,6 +14,7 @@ import (
 	authzpkg "zoiko.io/retention-registry-svc/internal/authz"
 	"zoiko.io/retention-registry-svc/internal/domain"
 	"zoiko.io/retention-registry-svc/internal/events"
+	svcmiddleware "zoiko.io/retention-registry-svc/internal/middleware"
 	"zoiko.io/retention-registry-svc/internal/store"
 )
 
@@ -47,6 +48,36 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// resolveTenantScope returns the tenant dimension for the resolve read,
+// taken from the verified X-Tenant-Id rather than the caller's query
+// string.
+//
+// Resolve used to read ?tenant_id= directly with no authorization, so any
+// caller could ask what retention rules and — more sensitively — what legal
+// holds applied to any tenant's record class. A hold is evidence of
+// litigation or investigation.
+//
+// A NIL return is legitimate and is NOT the fail-closed case, which makes
+// this service behave like kill-switch-registry-svc rather than
+// evidence-manifest-svc. A nil tenant means "the platform-level question",
+// and under migration 000002's policy a caller with no verified tenant
+// still sees every tenant_id IS NULL row — platform-wide retention rules
+// and platform-wide holds — and nobody's tenant-specific ones. Hiding those
+// is precisely the failure that would permit deleting records under a
+// platform-wide hold, so middleware.TenantContext stays permissive here.
+//
+// A ?tenant_id= that disagrees with the verified header is refused rather
+// than ignored.
+func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, declared string) (*string, bool) {
+	verified := svcmiddleware.TenantFromContext(r.Context())
+	if declared != "" && declared != verified {
+		writeError(w, http.StatusForbidden,
+			"tenant_id does not match the verified X-Tenant-Id")
+		return nil, false
+	}
+	return strPtrOrNil(verified), true
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
@@ -189,6 +220,15 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetLegalHold handles GET /v1/legal-holds/{id}.
+// GetLegalHold handles GET /v1/legal-holds/{id}.
+//
+// This route had no tenant input and no authorization at all, so any caller
+// holding a legal_hold_id could read its scope_description, custodians and
+// authority — learning that another tenant is under a legal hold, and over
+// what. That a customer is under litigation or regulatory investigation is
+// not something their neighbours should be able to enumerate. The store is
+// now tenant-scoped; the missing authorization within a tenant is tracked
+// separately rather than invented here.
 func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 	hld, err := h.store.FindLegalHoldByID(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
@@ -275,8 +315,12 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jurisdictionCode := strPtrOrNil(q.Get("jurisdiction_code"))
-	tenantID := strPtrOrNil(q.Get("tenant_id"))
 	entityRef := strPtrOrNil(q.Get("entity_ref"))
+
+	tenantID, ok := h.resolveTenantScope(w, r, q.Get("tenant_id"))
+	if !ok {
+		return
+	}
 
 	result, err := h.store.Resolve(r.Context(), recordClass, jurisdictionCode, tenantID, entityRef)
 	if err != nil {

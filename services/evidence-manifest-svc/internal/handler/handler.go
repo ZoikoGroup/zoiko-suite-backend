@@ -15,6 +15,7 @@ import (
 
 	"zoiko.io/evidence-manifest-svc/internal/aggregator"
 	"zoiko.io/evidence-manifest-svc/internal/domain"
+	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
 )
 
 type Store interface {
@@ -79,6 +80,18 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 
 	if missing := requiredFieldMissing(req); missing != "" {
 		writeError(w, http.StatusBadRequest, "missing_field", missing)
+		return
+	}
+	// tenant_id stays in the request contract but is no longer the source of
+	// truth: it was previously the ONLY source, validated as non-empty and
+	// otherwise trusted, which made the tenant caller-declared. It may now
+	// only AGREE with the verified header. Disagreement is refused rather
+	// than silently resolved, so a caller meaning to act on another tenant
+	// gets an error instead of a quietly reinterpreted request.
+	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+	if req.TenantID != verifiedTenant {
+		writeError(w, http.StatusForbidden, "tenant_mismatch",
+			"tenant_id in the request does not match the verified X-Tenant-Id")
 		return
 	}
 	if !req.ScenarioType.Valid() {
