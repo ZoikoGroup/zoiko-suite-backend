@@ -268,6 +268,74 @@ missed if re-run naively; checked their actual file contents directly instead.
 | 19 | source-authority-svc | **Not applicable** | False positive — its only "tenant_id" mention is a comment comparing its real column (`entity_ref`, free-text, no tenant dimension) to kill-switch-registry-svc's design. Genuinely platform-wide reference data; no fix needed. |
 | 20 | tax-authority-interface-svc | Done | `f7da196`. Same three defects, done with row 8f — last of the six connectors. Most sensitive read in the tier: `GetSubmissionByID` filtered on `submission_id` alone, exposing another tenant's `tax_amount`, `tax_period`, `filing_type` and the authority's `ack_reference` — their actual filed tax figures. `ListSubmissions`' only predicate was `interface_id`, self-disabling, so omitting it returned every tenant's filings. MemoryStore fixed too. **Three** negative controls this time, on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role: migration removed → ENABLE/FORCE + WITH CHECK fail; Go predicate removed with migration present → isolation still holds (RLS is load-bearing alone); both removed → tenant B really reads tenant A's filing amount and ack_reference, so the test detects the leak rather than passing vacuously. |
 
+
+## Priority 2b — Services with NO authorization on any route
+
+Opened 2026-08-25, after Priorities 1/1b/2 closed the tenant boundary estate-wide.
+
+**Why this is now the weakest link.** Tenant isolation and authorization answer different
+questions. Isolation asks *"is this row in my tenant?"*; authorization asks *"is this principal
+allowed to do this?"*. Priorities 1–2 made the first one solid. Where the second is absent, a
+correctly-isolated tenant still lets **any** principal holding **any** valid envelope read or
+mutate **anything within that tenant** — which is half a boundary, not a boundary.
+
+Nothing here is a cross-tenant hole. Every service below is now tenant-scoped and verified.
+These are intra-tenant privilege gaps.
+
+**Measured, not guessed** — and the measurement needed two corrections, both worth recording
+because the same traps keep recurring:
+
+- A first pass grepped `CheckAllowed` across `internal/` and reported 10 services. It matched a
+  **comment I had written myself** in evidence-manifest-svc explaining that the service has no
+  authz client, excluding the very service the search was meant to find. Third time this class of
+  false positive has appeared (after `default-tenant` in rows 4, 19, 8i).
+- `workflow-svc` appeared as a gap but calls `h.authz.CheckApprovalAllowed(...)` — a
+  differently-named method on its own client. Not a defect; a pattern that was too narrow.
+
+### Legitimately authz-free — no fix, do not "fix" these
+
+| Service | Why |
+|---|---|
+| `authorization-svc` | It *is* the authorization service. Its `/v1/admin/*` writes were hardened in Priority 1 row 5 (verified tenant + actor from `X-Principal-Id`); it cannot call itself. |
+| `gateway-auth-svc` | The ForwardAuth verifier that produces the identity envelope every other service trusts. Sits upstream of authorization by design. |
+| `audit-event-store-svc` | Zero HTTP routes — a Kafka consumer. Nothing to authorize. (Its missing query API is row 68a, a separate gap.) |
+| `search-indexer-svc` | Background syncer, no HTTP API. (Its obligations sync is broken — row 65a.) |
+| `workflow-svc` | False positive; uses `CheckApprovalAllowed`. |
+
+### Real gaps — routes serving sensitive data with no authorization call
+
+Ordered by payload severity, which is how Priority 2 taught us to order this rather than by tier.
+
+| # | Service | Routes | What an unauthorized principal reaches |
+|---|---|---|---|
+| 87 | `evidence-manifest-svc` | 6 | **Assembled evidence bundles** — `record_snapshot` holds verbatim governance decisions, access decisions and workflow instances, i.e. the artefact handed to an auditor or regulator. No `internal/authz` package at all. Worst payload in the estate. |
+| 88 | `mtls-management-svc` | 9 | Certificate lifecycle including **revoke** and rotate. Revoking a cert breaks the service-to-service auth depending on it. |
+| 89 | `siem-integration-svc` | 7 | Exporter `auth_token` (a live credential — see 8p-a) and the tenant's whole security event stream. |
+| 90 | `key-management-svc` | 7 | Key metadata including **disable**, which is a denial of service on whatever the key protects. |
+| 91 | `tenant-entity-registry-svc` | 28 | Tenant records, entity structure, residency region. Already logged as 65b; folded in here. |
+| 92 | `schema-registry-svc` | 9 | `POST /{eventName}/versions` — writes to the platform event-schema registry, which every service's envelope shape depends on. |
+| 93 | `carta-svc` | 5 | Access-decision telemetry: device trust, trusted IPs, allow/deny boundary, and `RiskFactors` naming why a score moved. |
+| 94 | `workflow-history-svc` | 1 | Workflow history reads. |
+| 95 | `identity-context-svc` | ? | Routes live in `internal/context/`, not `internal/handler/`, and no authz call was found there. **Needs its own read before being called a gap** — it is the identity source, so some routes may be legitimately pre-authorization like gateway-auth-svc. |
+| 96 | `jurisdiction-rules-svc` | 21 GET / 5 POST | Reads are platform reference data and correctly open (established N/A twice, rows 4 and 19). The **5 POST routes write that reference data**, and every service's jurisdiction resolution depends on it. Reads need nothing; writes need a platform-scope gate. |
+
+### Notes for whoever picks this up
+
+- Four of these (`mtls`, `siem`, `key-management`, `carta`) have **no Postgres at all** — in-memory
+  stores. So there is no RLS dimension and no migration; the fix is entirely handler-side.
+- `evidence-manifest-svc` needs an authz client built from scratch (no `internal/authz` package),
+  action constants, and wiring through `main.go`. The other services with an existing client are
+  cheaper.
+- The pattern to copy is `commercial-account-svc`'s `h.authorize(w, r, principalID,
+  organizationID, ACTION)` — note it passes the *resource's own* organization, resolved from the
+  row, not a value the caller supplied. See row 84a for the identifier-namespace trap: that
+  service passes `organization_id` on some routes and `commercial_account_id` on others into the
+  same `legal_entity_id` parameter, and a grant written in one namespace can never match a check
+  in the other.
+- Adding an authz gate to a **read** path is a behaviour change with a real failure mode: if
+  authorization-svc is unreachable the client fails closed (`ErrAuthzServiceUnavailable` → 503),
+  so a read that works today starts failing during an authz outage. That is the correct posture
+  for governed data, but it must be a deliberate decision per route, not a blanket sweep.
 ## Priority 3 — RLS enabled but not FORCEd (defense-in-depth only)
 
 **Re-scoped 2026-08-25 after two empirical checks. This tier is genuinely low-value — read this before spending a day on 40 migrations.**
