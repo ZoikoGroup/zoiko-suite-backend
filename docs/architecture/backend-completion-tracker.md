@@ -93,7 +93,17 @@ checking before marking any row Done:
    control explicitly: temporarily remove the `_add_rls.up.sql` file, confirm the test
    fails, restore it, confirm it passes.
 
-## Priority 1b — Fabricated tenant identity: the `"default-tenant"` fallback (16 services)
+## Priority 1b — Fabricated tenant identity: the `"default-tenant"` fallback — ✅ COMPLETE
+
+**Closed 2026-08-25.** 15 services fixed, 1 false positive (row 8i). `grep -rn "default-tenant" --include=*.go services/` now returns **zero** real fabrication sites estate-wide (only explanatory comments remain).
+
+### What this tier taught us
+
+1. **A fabricated tenant is not a weaker missing check — it is the opposite of one.** A missing check makes a request *fail*. This made it *succeed*, into a tenant that does not exist, shared by every header-less caller.
+2. **A correctly-scoped store makes it worse, not better.** Every service in this tier had a store that filtered by tenant properly — so it enforced the fake tenant just as faithfully as a real one. Correct code plus one fabricated identity produced shared control planes over key material, mTLS trust, and SIEM credentials.
+3. **Where RLS already existed, the policy was SATISFIED, not bypassed.** Five services pushed the fabricated value through `set_config(app.tenant_id)` into a live `USING (tenant_id = current_setting(...))` policy. Postgres did exactly as told. `pg_class` reports the policy exists; tests passing a real tenant go green. This is why 1b was resequenced ahead of the remaining RLS work — adding RLS first would have produced a green, audited, useless boundary.
+4. **A blanket tenant gate breaks legitimately tenant-less routes.** Applying the middleware with `r.Use()` wrapped `/healthz` in five services; probes carry no tenant, so every liveness check would have 401d and the orchestrator would restart the container in a loop. Fixed with `r.With()` on the `/v1` subtree — never a path comparison inside the middleware, which is a classic bypass source. Each service now has a test asserting a header-less probe still returns 200.
+5. **This grep produces false positives.** 3 of 16 candidates were comments, not code (rows 4, 19, 8i). Read the file; never count the grep.
 
 **Found 2026-08-22 during Priority 2 reconnaissance. This blocks meaningful RLS on 6 of
 Priority 2's rows, so it is sequenced ahead of them.**
@@ -145,15 +155,15 @@ either one keeps the hole.
 | 8d | external-data-feed-svc | yes (row 15) | **Done** `5b3bb97` — fixed together with row 15 |
 | 8e | hris-connector-svc | yes (row 16) | **Done** `3c97c3e` — fixed together with row 16 |
 | 8f | tax-authority-interface-svc | yes (row 20) | **Done** `f7da196` — fixed together with row 20 |
-| 8g | carta-svc | no | Not Started |
-| 8h | compliance-risk-scoring-svc | no | Not Started |
-| 8i | evidence-requirements-svc | no | Not Started |
-| 8j | forecasting-svc | no | Not Started |
+| 8g | carta-svc | no | **Done** `342461b` |
+| 8h | compliance-risk-scoring-svc | no | **Done** `342461b` |
+| 8i | evidence-requirements-svc | no | **Not applicable** — false positive (3rd from this grep, after jurisdiction-rules-svc and source-authority-svc). Both hits are *comments* explaining that this service rejects a missing tenant instead of fabricating one; handlers call `requireTenant`. Its comment also names offboarding-severance-svc and workforce-compliance-svc as fabricating — verified, they no longer do, so that comment is stale. |
+| 8j | forecasting-svc | no | **Done** `342461b` |
 | 8k | key-management-svc | no | **Done** `4afed19` — store was already correctly scoped on every method, so the fabricated tenant produced a *shared control plane over key material*: header-less callers could list each other's keys and, via RotateKey/DisableKey, disable them. No RLS applicable (no migrations, no Postgres — see row 82). Negative control prints the bug in its own output. |
-| 8l | migration-integrity-svc | no | Not Started |
+| 8l | migration-integrity-svc | no | **Done** `342461b` |
 | 8m | mtls-management-svc | no | **Done** `e119065` — same shape; the shared bucket was a control plane over mutual-TLS trust (RevokeCert/RotateCert scoped like the reads, so header-less callers could revoke each other's certificates and break their service-to-service auth). Also fixed a latent store bug: `CreateCert` accepted a `tenantID` param and **silently dropped it**, never setting `cert.TenantID` — it worked only because the handler happened to populate the field, so any future caller that forgot would create an unattributed certificate. No RLS applicable. |
-| 8n | reconciliation-intelligence-svc | no | Not Started |
-| 8o | reporting-orchestration-svc | no | Not Started |
+| 8n | reconciliation-intelligence-svc | no | **Done** `342461b` |
+| 8o | reporting-orchestration-svc | no | **Done** `342461b` |
 | 8p | siem-integration-svc | no | **Done** `e119065` — **worst payload of the three security services.** A `SIEMExporter` carries `endpoint_url` AND `auth_token`, stored as supplied and **never redacted on read**, so the shared bucket exposed a live credential for another tenant's SIEM destination — the secret itself, not metadata. `ListEvents` was shared too: a tenant's security event stream readable by anyone omitting a header, i.e. the pipeline meant to detect this. One of my own tests was a **false pass** (asserted only "not 201", actually failing on a 400 from a wrong field name, so it would have stayed green with the tenant check removed) — now asserts 404 specifically. No RLS applicable. See 8p-a. |
 
 Note 8k/8m/8p (key-management, mtls-management, siem-integration) are **security** services —
