@@ -43,6 +43,12 @@ func NewMemoryStore() *MemoryStore {
 func (m *MemoryStore) CreateCert(ctx context.Context, tenantID string, cert *domain.MtlsCertificate) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Stamp attribution from the verified tenant, never trust the caller to
+	// have pre-populated it. This parameter was previously accepted and
+	// silently dropped: the invariant held only because the handler happened
+	// to set cert.TenantID itself, so any future caller that forgot would
+	// create an unattributed certificate.
+	cert.TenantID = tenantID
 	cert.ID = uuid.New().String()
 	m.certs[cert.ID] = cert
 	return nil
