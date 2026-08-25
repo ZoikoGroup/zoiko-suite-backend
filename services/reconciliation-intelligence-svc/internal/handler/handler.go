@@ -45,11 +45,19 @@ func NewRouter(h *Handler) http.Handler {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
-	r.Use(customMiddleware.TenantMiddleware)
 
+	// /healthz stays OUTSIDE the tenant gate. Liveness and readiness
+	// probes carry no tenant, so a blanket tenant requirement would 401
+	// every probe and the orchestrator would restart the container in a
+	// loop — a security fix that takes the service down.
 	r.Get("/healthz", health.Handler())
 
-	r.Route("/v1/reconciliations", func(r chi.Router) {
+	// Everything below requires a gateway-verified tenant. Applied via
+	// With() on the route subtree rather than as a path exemption inside
+	// the middleware: comparing r.URL.Path to skip an auth gate is a
+	// classic bypass source (traversal, trailing slash, case). The route
+	// tree is the source of truth for what is and is not protected.
+	r.With(customMiddleware.TenantMiddleware).Route("/v1/reconciliations", func(r chi.Router) {
 		r.Post("/analyze", h.AnalyzeReconciliation)
 		r.Get("/", h.ListJobs)
 		r.Get("/{id}", h.GetJobByID)

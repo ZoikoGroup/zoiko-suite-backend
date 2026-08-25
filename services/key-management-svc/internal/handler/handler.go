@@ -12,12 +12,38 @@ import (
 	"zoiko.io/key-management-svc/internal/store"
 )
 
-func getTenant(r *http.Request) string {
-	t := r.Header.Get("X-Tenant-ID")
-	if t == "" {
-		return "default-tenant"
+// requireTenant returns the gateway-verified tenant, or refuses the
+// request. It replaces a getTenant helper that substituted the literal
+// string "default-tenant" when X-Tenant-ID was absent.
+//
+// That default was worse than a missing check, and worse here than in most
+// services. A missing check makes a request fail; a fabricated tenant makes
+// it SUCCEED, into one synthetic bucket shared by every header-less
+// caller. The store is correctly scoped on every method, so it faithfully
+// enforced that shared bucket: header-less callers could list each other's
+// customer-key metadata, and — because RotateKey and DisableKey are scoped
+// the same way — rotate or DISABLE each other's keys. Disabling a key is a
+// denial of service on whatever that key protects, so the fabricated
+// identity turned a correctly-written store into a shared control plane
+// over key material.
+//
+// Returns "" and writes 401 rather than falling back to anything. Note the
+// header is read as X-Tenant-ID and set elsewhere as X-Tenant-Id: Go
+// canonicalises header keys, so both forms match the same value. That is
+// not a bug, and normalising the spelling here would be a cosmetic change
+// to a security path.
+func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
 	}
-	return t
+	return tenantID, true
 }
 
 type Handler struct {
@@ -48,7 +74,10 @@ func NewRouter(h *Handler) http.Handler {
 }
 
 func (h *Handler) RegisterKey(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var req domain.RegisterKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, 400, "invalid body")
@@ -73,7 +102,10 @@ func (h *Handler) RegisterKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	key, err := h.store.GetKeyByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
 		h.errJSON(w, 404, "key not found")
@@ -83,7 +115,10 @@ func (h *Handler) GetKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	keys, _ := h.store.ListKeys(r.Context(), tenantID, r.URL.Query().Get("legal_entity_id"))
 	if keys == nil {
 		keys = []domain.CustomerKey{}
@@ -92,7 +127,10 @@ func (h *Handler) ListKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	key, err := h.store.RotateKey(r.Context(), tenantID, id)
 	if err != nil {
@@ -108,7 +146,10 @@ func (h *Handler) RotateKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DisableKey(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if err := h.store.DisableKey(r.Context(), tenantID, id); err != nil {
 		h.errJSON(w, 404, "key not found")
