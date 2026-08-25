@@ -17,6 +17,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/domain"
 	"zoiko.io/accounts-payable-svc/internal/handler"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
+	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
 )
 
 // tenant_id and legal_entity_id are uuid columns, so the fixtures are UUIDs —
@@ -117,15 +118,35 @@ type stubAuthZ struct {
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+// stubPO stands in for purchase-order-svc. The zero value returns (nil, nil),
+// i.e. "no purchase order to copy anything from", which is the shape the
+// handler sees when a caller keys an invoice with no PO reference.
+type stubPO struct {
+	po  *purchaseorder.PurchaseOrder
+	err error
+}
+
+func (p *stubPO) Verify(_ context.Context, _, _, _, _ string) (*purchaseorder.PurchaseOrder, error) {
+	return p.po, p.err
+}
+
 // newRouter mounts TenantContext, which the real server mounts in
 // cmd/server/main.go. It used to be omitted, so every handler under test saw an
 // empty tenant scope and fell back to the query parameter or the body — the very
 // behaviour these tests are supposed to be checking. A handler harness must
 // mount the middleware the handler depends on.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
+	return newRouterPO(s, p, a, &stubPO{})
+}
+
+// newRouterPO is newRouter with the purchase-order verifier made explicit, for
+// the tests that key an invoice against a PO. The two are separate so that the
+// tests which never set purchase_order_id — the large majority, which never
+// reach Verify at all — do not each have to name a stub they do not use.
+func newRouterPO(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, a, zap.NewNop())
+	h := handler.New(s, p, a, po, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -158,6 +179,12 @@ func doRequestAs(r chi.Router, method, path string, body any, principalID, tenan
 
 // ── CreateInvoice ────────────────────────────────────────────────────────────
 
+// validCreateReq is the fixture every CreateInvoice test builds on, so AP-05's
+// mandatory inputs are set here rather than in each test: invoice_date and
+// supply_date are required outright, and the lines must account for the gross
+// amount or the request is refused as invoice_does_not_balance. 900 net + 100
+// tax = the 1000 gross declared above; changing one without the others is what
+// the balance check exists to catch.
 func validCreateReq() domain.CreateVendorInvoiceRequest {
 	return domain.CreateVendorInvoiceRequest{
 		TenantID:      tenantA,
@@ -168,6 +195,11 @@ func validCreateReq() domain.CreateVendorInvoiceRequest {
 		CurrencyCode:  "USD",
 		DueDate:       domain.CalendarDate{Time: time.Now().Add(30 * 24 * time.Hour)},
 		CorrelationID: "corr-1",
+		InvoiceDate:   domain.CalendarDate{Time: time.Now()},
+		SupplyDate:    domain.CalendarDate{Time: time.Now()},
+		Lines: []domain.CreateVendorInvoiceLineInput{
+			{Description: "consulting", NetAmount: 900, TaxAmount: 100},
+		},
 	}
 }
 
@@ -273,7 +305,9 @@ func TestCreateInvoice_DueDate_AcceptsBareCalendarDateAndRFC3339(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
 			body := `{"tenant_id":"` + tenantA + `","legal_entity_id":"` + entityA + `","vendor_id":"v1","invoice_number":"INV-1",
-			          "amount":10,"currency_code":"USD","due_date":` + tc.dueDate + `,"correlation_id":"c1"}`
+			          "amount":10,"currency_code":"USD","due_date":` + tc.dueDate + `,"correlation_id":"c1",
+			          "invoice_date":"2026-08-25","supply_date":"2026-08-25",
+			          "lines":[{"description":"consulting","net_amount":10}]}`
 
 			rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", body, "principal-1")
 
@@ -686,5 +720,101 @@ func TestCreateInvoice_MalformedLegalEntityID_Refused(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for a non-UUID legal_entity_id, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── Purchase-order matching at intake ────────────────────────────────────────
+//
+// The PO verification added with AP05 shipped without tests: every existing
+// case omits purchase_order_id, so none of them reach Verify and the whole
+// switch was unexercised. These pin the four outcomes, and in particular that
+// an unreachable purchase-order-svc fails closed as a 503 rather than letting
+// the invoice through unmatched.
+
+func poInvoiceBody(poID string) string {
+	return `{"tenant_id":"` + tenantA + `","legal_entity_id":"` + entityA + `",` +
+		`"vendor_id":"v1","invoice_number":"INV-PO-1","amount":10,"currency_code":"USD",` +
+		`"due_date":"2026-09-01","correlation_id":"c1",` +
+		`"invoice_date":"2026-08-25","supply_date":"2026-08-25",` +
+		`"lines":[{"description":"consulting","net_amount":10}],` +
+		`"purchase_order_id":"` + poID + `"}`
+}
+
+func TestCreateInvoice_PurchaseOrderUnknown_Rejected(t *testing.T) {
+	r := newRouterPO(newStubStore(), &stubPublisher{}, &stubAuthZ{},
+		&stubPO{err: domain.ErrPurchaseOrderUnknown})
+
+	rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", poInvoiceBody("po-1"), "principal-1")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unrecognised purchase order, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrorCode(t, rec); code != "purchase_order_unknown" {
+		t.Fatalf("expected error code purchase_order_unknown, got %q", code)
+	}
+}
+
+func TestCreateInvoice_PurchaseOrderClosed_Rejected(t *testing.T) {
+	r := newRouterPO(newStubStore(), &stubPublisher{}, &stubAuthZ{},
+		&stubPO{err: domain.ErrPurchaseOrderClosed})
+
+	rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", poInvoiceBody("po-1"), "principal-1")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for a closed purchase order, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrorCode(t, rec); code != "purchase_order_closed" {
+		t.Fatalf("expected error code purchase_order_closed, got %q", code)
+	}
+}
+
+// An unreachable purchase-order-svc must not admit the invoice. Anything other
+// than a refusal here means an invoice can be posted against a commitment
+// nobody confirmed, which is the entire point of the check.
+func TestCreateInvoice_PurchaseOrderUnverifiable_FailsClosed(t *testing.T) {
+	store := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouterPO(store, pub, &stubAuthZ{}, &stubPO{err: errors.New("dial tcp: connection refused")})
+
+	rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", poInvoiceBody("po-1"), "principal-1")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when the purchase order cannot be verified, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if code := decodeErrorCode(t, rec); code != "purchase_order_unverifiable" {
+		t.Fatalf("expected error code purchase_order_unverifiable, got %q", code)
+	}
+	if n := len(store.invoices); n != 0 {
+		t.Fatalf("invoice was stored despite an unverifiable purchase order: %d stored", n)
+	}
+}
+
+// The PO's supplier identifier is recorded on the invoice, not enforced against
+// vendor_id: the two identifiers are not known to share a space.
+func TestCreateInvoice_PurchaseOrderVerified_RecordsVendorProfile(t *testing.T) {
+	r := newRouterPO(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubPO{
+		po: &purchaseorder.PurchaseOrder{
+			PurchaseOrderID: "po-1",
+			TenantID:        tenantA,
+			LegalEntityID:   entityA,
+			VendorProfileID: "vendor-profile-9",
+			POStatus:        "OPEN",
+		},
+	})
+
+	rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", poInvoiceBody("po-1"), "principal-1")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got domain.VendorInvoice
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("response is not an invoice: %v", err)
+	}
+	if got.POVendorProfileID == nil {
+		t.Fatal("po_vendor_profile_id was not copied from the verified purchase order")
+	}
+	if *got.POVendorProfileID != "vendor-profile-9" {
+		t.Fatalf("po_vendor_profile_id = %q, want vendor-profile-9", *got.POVendorProfileID)
 	}
 }
