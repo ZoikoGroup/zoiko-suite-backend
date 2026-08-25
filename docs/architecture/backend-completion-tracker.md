@@ -270,6 +270,35 @@ missed if re-run naively; checked their actual file contents directly instead.
 
 ## Priority 3 — RLS enabled but not FORCEd (defense-in-depth only)
 
+**Re-scoped 2026-08-25 after two empirical checks. This tier is genuinely low-value — read this before spending a day on 40 migrations.**
+
+**Finding 1 — `WITH CHECK` is NOT missing, it is implicit.** 39 services write their policies as
+`FOR ALL USING (...)` with no `WITH CHECK`. I hypothesised that left the write side ungoverned,
+so the runtime role could INSERT rows attributed to other tenants. **Tested against real
+Postgres 16 as a NOSUPERUSER NOBYPASSRLS role: wrong.** A foreign-tenant insert is refused with
+`ERROR: new row violates row-level security policy (SQLSTATE 42501)`. Postgres reuses the
+`USING` expression as the write check when `WITH CHECK` is omitted on a `FOR ALL` policy. The
+own-tenant control insert succeeded, so that refusal is tenant-specific rather than a
+refuse-everything policy. **Adding explicit `WITH CHECK` to those 39 services is cosmetic.**
+Had I trusted the hypothesis I would have written 39 migrations and described them as closing a
+write hole that never existed.
+
+**Finding 2 — `FORCE` is close to a no-op under the current role setup.** `FORCE` makes RLS apply
+to the table *owner*; it does **not** affect superusers, which bypass RLS unconditionally either
+way. Verified from `deployments/init-db.sh`: the runtime role is `zoiko_app`, created
+`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`, and 26 services get `DB_USER: zoiko_app` (6
+more get `DATABASE_URL: postgres://zoiko_app` in the phase-6 compose). As a non-owner it is
+already fully subject to RLS, so `FORCE` changes nothing for it. The tables are owned by whoever
+ran the migrations — `postgres`, a superuser — for whom `FORCE` also changes nothing. So `FORCE`
+only starts earning its keep if a **non-superuser owner** role ever connects. That is real
+insurance against a future regression, but it is insurance, not a live gap.
+
+**Recommendation: leave this tier where it is and do it opportunistically** — add `FORCE` when
+touching a service for another reason, rather than as a 40-service sweep. The tier below was
+correctly labelled "defense-in-depth only" and both checks confirm it.
+
+Original note follows.
+
 40 services (list below) have `ENABLE ROW LEVEL SECURITY` + a policy, but not `FORCE ROW LEVEL
 SECURITY`. **Lower urgency than Priority 1/2** — the platform's `zoiko_app` runtime role is a
 non-owner, so RLS already applies to normal traffic; FORCE only matters if something connects
