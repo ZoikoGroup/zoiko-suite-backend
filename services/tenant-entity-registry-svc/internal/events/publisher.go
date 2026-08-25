@@ -112,6 +112,43 @@ func (p *Publisher) PublishWorkspaceCreated(ctx context.Context, workspace *doma
 	})
 }
 
+// PublishWorkspaceUpdated carries the commercial fields, not just the id.
+// A reclassified workspace is a change to whether it may ever be charged, and
+// commercial-account-svc lives in a separate plane — it has to be told the new
+// classification rather than having to come back and ask for it.
+func (p *Publisher) PublishWorkspaceUpdated(ctx context.Context, workspace *domain.Workspace, correlationID string) {
+	legalEntityID := ""
+	if workspace.LegalEntityID != nil {
+		legalEntityID = *workspace.LegalEntityID
+	}
+	p.emit(ctx, "workspace.updated", correlationID, workspace.TenantID, legalEntityID, "", workspace.UpdatedByPrincipalID, workspace.WorkspaceID, map[string]any{
+		"tenant_id":              workspace.TenantID,
+		"workspace_id":           workspace.WorkspaceID,
+		"legal_entity_id":        workspace.LegalEntityID,
+		"name":                   workspace.Name,
+		"billing_classification": workspace.BillingClassification,
+		"billing_source":         workspace.BillingSource,
+		"commercial_account_id":  workspace.CommercialAccountID,
+	})
+}
+
+// PublishWorkspaceStatusChanged reports an archive or restore. previous_status
+// is populated here — unlike entity.status.changed, which omits it — because
+// the workspace transition reads the prior value in the same statement.
+func (p *Publisher) PublishWorkspaceStatusChanged(
+	ctx context.Context,
+	tenantID, workspaceID, actorID string,
+	previousStatus, newStatus domain.WorkspaceStatus,
+	correlationID string,
+) {
+	p.emit(ctx, "workspace.status.changed", correlationID, tenantID, "", "", actorID, workspaceID, map[string]any{
+		"tenant_id":       tenantID,
+		"workspace_id":    workspaceID,
+		"previous_status": previousStatus,
+		"new_status":      newStatus,
+	})
+}
+
 func (p *Publisher) PublishEntityUpdated(ctx context.Context, entity *domain.LegalEntity, correlationID string) {
 	p.emit(ctx, "entity.updated", correlationID, entity.TenantID, entity.LegalEntityID, entity.PrimaryJurisdictionID, entity.UpdatedByPrincipalID, entity.LegalEntityID, map[string]any{
 		"tenant_id":       entity.TenantID,

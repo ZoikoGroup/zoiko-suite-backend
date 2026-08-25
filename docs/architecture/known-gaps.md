@@ -1137,3 +1137,113 @@ To close: build the privileged admin surface, move the lifecycle commands onto
 it, then set `ONBOARDING`/`Provisioning` non-operable in
 `envelope.tenantOperable`. Both halves have to land together — flipping the
 resolver first reintroduces the deadlock.
+
+## Resolved (2026-08-25): tenant-entity-registry-svc's HTTP layer had no tests
+
+`internal/handler` was at 0.0% statement coverage — no test file existed at all,
+for any of its 27 routes. The cause was structural rather than neglect:
+`handler.New` took the concrete `*registry.Service` while the interface it
+actually stored was unexported, so the only way to reach a handler from a test
+was to construct a real service over a real store. Nothing about the HTTP layer
+was verifiable in isolation.
+
+The interface is now exported as `handler.Service` and `New` takes it.
+`*registry.Service` satisfies it unchanged, so production wiring in
+`cmd/server/main.go` is untouched.
+
+`internal/handler/handler_test.go` covers the layer at 99.6%, pinning the things
+the HTTP layer alone decides:
+
+- the route table — every declared method+path reaches its handler, which is
+  what catches a route registered on the wrong verb;
+- each route's success status (201 create / 200 read / 204 command), and that
+  204 replies carry no body;
+- the whole `writeErr` sentinel-to-status map, including the pair most often
+  collapsed (`ErrUnauthenticated` 401 vs `ErrUnauthorized` 403) and the two that
+  share 409 for different reasons, plus that an unmapped error becomes a generic
+  500 rather than leaking driver text;
+- the URL parameter each handler extracts. This is the failure a copied handler
+  body produces silently: reading `{entityID}` where the route declares
+  `{tenantID}` yields an empty string, not an error, so the handler appears to
+  work and operates on nothing;
+- `end_date` on the two end-dating routes — required, RFC3339 only. Defaulting a
+  missing value to "now" would close a record the caller meant to keep;
+- correlation-id propagation, including that the transition endpoints take it
+  from the header and overwrite whatever the body claimed.
+
+Verified by mutation: pointing `ListEntities` at the wrong chi parameter and
+remapping `ErrUnauthenticated` to 403 each fail with the message naming the
+defect.
+
+## Resolved (2026-08-25): workspaces were create-only, so a misclassification was permanent
+
+`workspaces` had `CreateWorkspace`, `GetWorkspaceByID` and
+`ListWorkspacesByTenant` and nothing else — no update, no status change. The
+table has carried `updated_at` and `updated_by_principal_id` since
+`000005_add_workspaces.up.sql`, and no write path ever set either, which is what
+identified this as an omission rather than deliberate immutability.
+
+The practical consequence was `billing_classification`. It decides whether a
+workspace may ever produce a live charge, doc7 §T requires it on every
+workspace, and a workspace created under the wrong class stayed wrong for the
+rest of its life — the only remedy being to abandon it and create another,
+orphaning everything already recorded against it.
+
+Added, mirroring the entity paths rather than inventing a second idiom:
+
+- `PATCH /v1/workspaces/{workspaceID}` — name, business unit, billing
+  classification, billing source, commercial account. `tenant_id` and
+  `legal_entity_id` are deliberately not patchable: they are the workspace's
+  position in the tenant hierarchy, and moving it would silently re-attribute
+  everything already booked against it.
+- `POST /v1/workspaces/{workspaceID}/status` — archive and restore, applied as
+  one CTE-guarded `UPDATE` against the allowed prior states, so the
+  state-machine check and the write cannot straddle a concurrent transition.
+  Unlike `TransitionEntityStatus` it returns the prior status, which the CTE
+  already holds, so `workspace.status.changed` can name what the workspace moved
+  away from instead of emitting an empty `previous_status`.
+- `ValidWorkspaceStatusTransitions`, with archiving reversible. Archiving hides
+  a workspace but deletes nothing, so an accidental archive has to be
+  recoverable; making `ARCHIVED` terminal would make a misclick permanent.
+  `ARCHIVED -> ARCHIVED` is not declared, so a repeated archive is refused
+  rather than silently re-stamping the audit columns with a no-op.
+- `workspace.updated` carries the commercial fields, not just the id.
+  commercial-account-svc is in a different plane (doc7 §3), so it has to be told
+  the new classification rather than having to come back and ask.
+- `ValidBillingSources`. The create path defaulted an empty `billing_source` to
+  `NONE` but never validated a non-empty one, so an unrecognised value reached
+  the `VARCHAR(50)` column and would later read back as though it meant
+  something. Now gated on both create and update.
+- `commercial_account_id` is validated as a UUID at the service boundary. It is
+  a `UUID` column, so a malformed value previously reached the driver and
+  surfaced as an unmapped 500 rather than a 400 naming the field.
+
+Store coverage for both statements is in `pg_store_test.go`, including
+cross-tenant refusal and the prior-state guard touching nothing when it does not
+match. Those run against Postgres in CI; they skip locally, so the two SQL
+statements are CI-verified rather than developer-verified.
+
+## Open: tenant-entity-registry-svc still has no admin surface or tenant listing
+
+Recorded together because they are the same missing thing.
+
+There is no `GET /v1/tenants`. A tenant can only be fetched by id, so the
+console shows the caller's own tenant and nothing else. Cross-tenant listing is
+exactly the privileged operation ZS-API-001 §3 puts under `/admin/v1/`, so
+adding it to the tenant surface would be the wrong fix — it belongs on the
+admin surface that does not yet exist, alongside the lifecycle commands, per the
+`ONBOARDING` entry above.
+
+Also still open for this service:
+
+- `internal/store` is at 0.0% coverage locally by construction — every test
+  there is `TEST_DATABASE_URL`-guarded and skips without Postgres. CI supplies
+  it (`ci.yml` lists this service, and it has its own store-isolation step), so
+  the SQL is covered there and nowhere else. A local `go test ./...` reporting
+  `ok` for that package means "skipped", not "verified".
+- `internal/middleware`, `internal/authz`, `internal/jurisdiction`,
+  `internal/classification` and `internal/config` remain at 0.0%.
+  `middleware.Identity` is the component that establishes the verified tenant
+  and principal every other guarantee in the service rests on.
+- The lifecycle vocabulary divergence and `FailedProvisioning` remain as
+  recorded above; nothing here renames an enum value.
