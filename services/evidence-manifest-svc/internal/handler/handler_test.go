@@ -156,10 +156,21 @@ func (p *stubPublisher) PublishManifestGenerated(_ context.Context, m *domain.Ev
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+// stubAuthz is a test double for handler.AuthzChecker. It GRANTS by default
+// so the existing behavioural tests keep exercising the real path; tests that
+// need the deny or unavailable branch set err.
+type stubAuthz struct {
+	err error
+}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return s.err
+}
+
 func newRouter(s *stubStore, gov *stubGovernance, acc *stubAccess, wf *stubWorkflow, pub *stubPublisher) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, gov, acc, wf, pub, zap.NewNop())
+	h := handler.New(s, gov, acc, wf, pub, &stubAuthz{}, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -185,6 +196,7 @@ func TestGenerateManifest_WithExplicitGovernanceID_Returns201Generated(t *testin
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -207,6 +219,7 @@ func TestGenerateManifest_MissingScenarioType_Returns400(t *testing.T) {
 	body, _ := json.Marshal(domain.GenerateManifestRequest{TenantID: "t1", LegalEntityID: "e1"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -222,6 +235,7 @@ func TestGenerateManifest_InvalidScenarioType_Returns400(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -236,6 +250,7 @@ func TestGenerateManifest_NoRecordsRequested_Returns400(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
@@ -259,6 +274,7 @@ func TestGenerateManifest_OneSourceUnavailable_FailsClosed_WholeManifestFails(t 
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -291,6 +307,7 @@ func TestGenerateManifest_MultipleSources_AllIncluded(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -306,6 +323,7 @@ func TestGetManifest_NotFound_Returns404(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/nope", nil)
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusNotFound, rec.Code)
@@ -324,10 +342,12 @@ func TestListRecords_ReturnsAllRecordsForManifest(t *testing.T) {
 	})
 	seedReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(createBody))
 	seedReq.Header.Set("X-Tenant-Id", "t1")
+	seedReq.Header.Set("X-Principal-Id", "principal-test-01")
 	r.ServeHTTP(httptest.NewRecorder(), seedReq)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/manifest-1/records", nil)
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 

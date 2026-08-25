@@ -51,6 +51,7 @@ func seedManifest(t *testing.T, r http.Handler, tenantID string) string {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", "principal-seed")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -119,6 +120,7 @@ func TestGenerateManifest_ForeignTenantInBody_Refused(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
 	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -140,6 +142,7 @@ func TestGetManifest_ForeignTenant_NotFound(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/"+manifestID, nil)
 	req.Header.Set("X-Tenant-Id", "t2")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -151,6 +154,7 @@ func TestGetManifest_ForeignTenant_NotFound(t *testing.T) {
 	// broken lookup.
 	ownReq := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/"+manifestID, nil)
 	ownReq.Header.Set("X-Tenant-Id", "t1")
+	ownReq.Header.Set("X-Principal-Id", "principal-test-01")
 	ownW := httptest.NewRecorder()
 	r.ServeHTTP(ownW, ownReq)
 	if ownW.Code != http.StatusOK {
@@ -169,6 +173,7 @@ func TestListRecords_ForeignTenant_LeaksNothing(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/evidence-manifests/"+manifestID+"/records", nil)
 	req.Header.Set("X-Tenant-Id", "t2")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

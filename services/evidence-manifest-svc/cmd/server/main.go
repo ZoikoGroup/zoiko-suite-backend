@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-manifest-svc/internal/aggregator"
+	"zoiko.io/evidence-manifest-svc/internal/authz"
 	"zoiko.io/evidence-manifest-svc/internal/config"
 	"zoiko.io/evidence-manifest-svc/internal/events"
 	"zoiko.io/evidence-manifest-svc/internal/handler"
@@ -80,7 +81,12 @@ func main() {
 	workflowClient := aggregator.NewWorkflowClient(cfg.WorkflowServiceURL, log)
 	publisher := events.NewPublisher(kafkaWriter, log)
 
-	h := handler.New(pgStore, governanceClient, accessClient, workflowClient, publisher, log)
+	// authorization-svc client. Reuses AuthorizationServiceURL, already
+	// configured for the access-decision aggregator client above — same
+	// service, different endpoint.
+	authzClient := authz.NewClient(cfg.AuthorizationServiceURL)
+
+	h := handler.New(pgStore, governanceClient, accessClient, workflowClient, publisher, authzClient, log)
 	healthH := health.New(pool)
 
 	r := chi.NewRouter()
