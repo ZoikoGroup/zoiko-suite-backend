@@ -11,12 +11,43 @@ import (
 	"zoiko.io/carta-svc/internal/store"
 )
 
-func getTenant(r *http.Request) string {
-	t := r.Header.Get("X-Tenant-ID")
-	if t == "" {
-		return "default-tenant"
+// requireTenant returns the gateway-verified tenant, or refuses the
+// request. It replaces a getTenant helper that substituted the literal
+// string "default-tenant" when X-Tenant-ID was absent.
+//
+// A missing check makes a request fail; a fabricated tenant makes it
+// SUCCEED, into one synthetic bucket shared by every header-less caller.
+// The store here is correctly written — SaveAssessment stamps the tenant,
+// and both reads compare it, with subject_id narrowing WITHIN the tenant
+// rather than replacing it — so it enforced the fake tenant faithfully as
+// though it were real.
+//
+// What that shared bucket held is this service's whole point. A
+// CartaAssessment records who requested access to what, from which IP, on
+// what device (DeviceTrustLevel), at what hour, and what the platform
+// decided: ALLOW / STEP_UP_MFA / ISOLATE / DENY. RiskFactors spells the
+// reasoning out in plain text ("Untrusted device (trust level 30)",
+// "Access request from unknown IP/location").
+//
+// Since domain.EvaluateAccess is a deterministic scoring function, reading
+// another tenant's assessments is close to reading a map of how to pass
+// their access checks: which subjects sit on weak devices, which IPs they
+// treat as known, where their allow/deny boundary falls, and which lever
+// moved any given score. That is a read exposure only — the store has no
+// update or delete — but it is the security posture of another tenant's
+// workforce.
+func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
 	}
-	return t
+	return tenantID, true
 }
 
 type Handler struct {
@@ -42,7 +73,10 @@ func NewRouter(h *Handler) http.Handler {
 }
 
 func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var req domain.EvaluateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, 400, "invalid body")
@@ -61,7 +95,10 @@ func (h *Handler) EvaluateAccess(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	asm, err := h.store.GetAssessmentByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
 		h.errJSON(w, 404, "assessment not found")
@@ -71,7 +108,10 @@ func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListAssessments(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	asms, _ := h.store.ListAssessments(r.Context(), tenantID, r.URL.Query().Get("subject_id"))
 	if asms == nil {
 		asms = []domain.CartaAssessment{}

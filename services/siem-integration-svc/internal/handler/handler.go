@@ -11,12 +11,32 @@ import (
 	"zoiko.io/siem-integration-svc/internal/store"
 )
 
-func getTenant(r *http.Request) string {
-	t := r.Header.Get("X-Tenant-ID")
-	if t == "" {
-		return "default-tenant"
+// requireTenant returns the gateway-verified tenant, or refuses the
+// request. It replaces a getTenant helper that substituted the literal
+// string "default-tenant" when X-Tenant-ID was absent.
+//
+// A missing check makes a request fail; a fabricated tenant makes it
+// SUCCEED, into one synthetic bucket shared by every header-less caller.
+// The store is correctly scoped, so it enforced that shared bucket
+// faithfully — and here the shared bucket held the worst payload of the
+// three security services in this tier. A SIEMExporter carries
+// endpoint_url AND auth_token, the token is stored as supplied and is
+// never redacted on read, so header-less callers could read each other's
+// live SIEM destination credential. They also shared ListEvents, i.e. each
+// other's security event stream — the pipeline that exists to detect this
+// kind of thing in the first place.
+func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
 	}
-	return t
+	return tenantID, true
 }
 
 type Handler struct {
@@ -44,7 +64,10 @@ func NewRouter(h *Handler) http.Handler {
 }
 
 func (h *Handler) CreateExporter(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var req domain.CreateExporterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, 400, "invalid body")
@@ -69,7 +92,10 @@ func (h *Handler) CreateExporter(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetExporter(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	exp, err := h.store.GetExporterByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
 		h.errJSON(w, 404, "exporter not found")
@@ -79,7 +105,10 @@ func (h *Handler) GetExporter(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListExporters(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	exps, _ := h.store.ListExporters(r.Context(), tenantID, r.URL.Query().Get("legal_entity_id"))
 	if exps == nil {
 		exps = []domain.SIEMExporter{}
@@ -88,7 +117,10 @@ func (h *Handler) ListExporters(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var req domain.StreamEventRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, 400, "invalid body")
@@ -114,7 +146,10 @@ func (h *Handler) StreamEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListEvents(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	evts, _ := h.store.ListEvents(r.Context(), tenantID, r.URL.Query().Get("exporter_id"))
 	if evts == nil {
 		evts = []domain.SIEMEvent{}

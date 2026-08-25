@@ -18,12 +18,31 @@ type ctxKey string
 
 const tenantKey ctxKey = "tenant_id"
 
-func getTenant(r *http.Request) string {
-	t := r.Header.Get("X-Tenant-ID")
-	if t == "" {
-		return "default-tenant"
+// requireTenant returns the gateway-verified tenant, or refuses the
+// request. It replaces a getTenant helper that substituted the literal
+// string "default-tenant" when X-Tenant-ID was absent.
+//
+// A missing check makes a request fail; a fabricated tenant makes it
+// SUCCEED, into one synthetic bucket shared by every header-less caller.
+// The store is correctly scoped, so it enforced that shared bucket
+// faithfully — meaning header-less callers could read each other's
+// certificate records and, through RevokeCert and ReplaceCertMaterial,
+// REVOKE or re-issue each other's mTLS certificates. Revoking a
+// certificate breaks the service-to-service authentication that depends on
+// it, so the fabricated identity turned a correct store into a shared
+// control plane over the platform's mutual-TLS trust.
+func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
 	}
-	return t
+	return tenantID, true
 }
 
 type Handler struct {
@@ -57,7 +76,10 @@ func NewRouter(h *Handler) http.Handler {
 }
 
 func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var req domain.ProvisionCertRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, 400, "invalid body")
@@ -111,7 +133,10 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	cert, err := h.store.GetCertByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
 		h.errJSON(w, 404, "certificate not found")
@@ -121,7 +146,10 @@ func (h *Handler) GetCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	certs, _ := h.store.ListCerts(r.Context(), tenantID, r.URL.Query().Get("legal_entity_id"), r.URL.Query().Get("status"))
 	if certs == nil {
 		certs = []domain.MtlsCertificate{}
@@ -130,7 +158,10 @@ func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 
 	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
@@ -167,7 +198,10 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
 	if err := h.store.RevokeCert(r.Context(), tenantID, id); err != nil {
 		h.errJSON(w, 404, "certificate not found")
@@ -178,7 +212,10 @@ func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var req domain.CreatePolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PolicyName == "" {
 		h.errJSON(w, 400, "policy_name is required")
@@ -196,7 +233,10 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPolicies(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	pols, _ := h.store.ListPolicies(r.Context(), tenantID)
 	if pols == nil {
 		pols = []domain.CommunicationPolicy{}

@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-manifest-svc/internal/aggregator"
+	authzpkg "zoiko.io/evidence-manifest-svc/internal/authz"
 	"zoiko.io/evidence-manifest-svc/internal/domain"
 	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
 )
@@ -47,18 +48,73 @@ type WorkflowSource interface {
 	GetByID(ctx context.Context, workflowInstanceID string) (*aggregator.SourceRecord, error)
 }
 
+// Action constants passed to authorization-svc as action_type.
+//
+// Two, not one: assembling a manifest and reading one back are different
+// privileges. Generation is an expensive fan-out across three source
+// services; reading returns the assembled bundle, which is the sensitive
+// half. A principal who may request evidence is not automatically a
+// principal who may read everyone's evidence.
+const (
+	EvidenceManifestGenerate = "EVIDENCE_MANIFEST_GENERATE"
+	EvidenceManifestRead     = "EVIDENCE_MANIFEST_READ"
+)
+
+// AuthzChecker is the authorization-svc contract this handler depends on.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
 type Handler struct {
 	store      Store
 	governance GovernanceSource
 	access     AccessSource
 	workflow   WorkflowSource
 	publisher  Publisher
+	authz      AuthzChecker
 	log        *zap.Logger
 }
 
 func New(store Store, governance GovernanceSource, access AccessSource,
-	workflow WorkflowSource, publisher Publisher, log *zap.Logger) *Handler {
-	return &Handler{store: store, governance: governance, access: access, workflow: workflow, publisher: publisher, log: log}
+	workflow WorkflowSource, publisher Publisher, authz AuthzChecker, log *zap.Logger) *Handler {
+	return &Handler{store: store, governance: governance, access: access, workflow: workflow, publisher: publisher, authz: authz, log: log}
+}
+
+// authorize asks authorization-svc whether this principal may perform
+// actionType within legalEntityID, and fails CLOSED.
+//
+// Until this change the service had no authorization at all — no
+// internal/authz package, no check on any route. Tenant isolation was
+// added in row 14 and holds (the store scopes every read by tenant), so
+// this was never a cross-tenant hole. It was an intra-tenant privilege
+// gap: any principal holding any valid envelope for the tenant could read
+// any manifest in it, and manifest_records carries record_snapshot —
+// verbatim governance decisions, access decisions and workflow instances.
+// That is the artefact assembled for an auditor or regulator, so "any
+// principal in the tenant" is the wrong audience for it.
+//
+// legalEntityID is deliberately taken from the manifest ROW on reads, not
+// from anything the caller supplied. See tracker row 84a for why that
+// matters: commercial-account-svc passes organization_id as the authz
+// scope on some routes and commercial_account_id on others, into the same
+// legal_entity_id parameter, and a grant recorded in one namespace can
+// never match a check in the other.
+//
+// Note the failure posture this introduces: authorization-svc being
+// unreachable now turns a working read into a 503. That is deliberate for
+// governed evidence — Doc 03 §22 has evidence fail safe — but it is a real
+// behaviour change, not a free addition.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not_authorized", "")
+			return false
+		}
+		h.log.Error("authorization check failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "authorization_unavailable", "")
+		return false
+	}
+	return true
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -104,9 +160,21 @@ func (h *Handler) GenerateManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, req.LegalEntityID, EvidenceManifestGenerate) {
+		return
+	}
+
+	// req.RequestedBy is still honoured — a service assembling evidence on
+	// behalf of a named human legitimately records that human — but it can no
+	// longer stand in for a missing verified principal, because there is no
+	// longer such a thing as a request without one.
 	requestedBy := req.RequestedBy
 	if requestedBy == "" {
-		requestedBy = actorFromHeader(r)
+		requestedBy = principalID
 	}
 
 	manifest := &domain.EvidenceManifest{
@@ -205,10 +273,24 @@ func (h *Handler) collectRecords(ctx context.Context, req domain.GenerateManifes
 // ── GET /v1/evidence-manifests/{manifestID} ──────────────────────────────────
 
 func (h *Handler) GetManifest(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	manifestID := chi.URLParam(r, "manifestID")
+
+	// Fetch first, then authorize against the manifest's OWN legal entity.
+	// The order matters and is deliberate: the store is tenant-scoped, so a
+	// manifest belonging to another tenant is already indistinguishable from
+	// a nonexistent one here (404). Authorizing against a caller-supplied
+	// scope instead would let a caller nominate an entity they do hold a
+	// grant for and read a manifest belonging to a different one.
 	m, err := h.store.FindManifestByID(r.Context(), manifestID)
 	if err != nil {
 		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, principalID, m.LegalEntityID, EvidenceManifestRead) {
 		return
 	}
 	writeJSON(w, http.StatusOK, m)
@@ -216,10 +298,25 @@ func (h *Handler) GetManifest(w http.ResponseWriter, r *http.Request) {
 
 // ── GET /v1/evidence-manifests/{manifestID}/records ──────────────────────────
 
+// ListRecords is the most sensitive route in the service: it returns
+// record_snapshot for every record in the manifest — verbatim governance
+// decisions, access decisions and workflow instances as they stood at
+// generation time. That is the assembled evidence itself, not metadata
+// about it.
 func (h *Handler) ListRecords(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	manifestID := chi.URLParam(r, "manifestID")
-	if _, err := h.store.FindManifestByID(r.Context(), manifestID); err != nil {
+	// The existing parent lookup already fails closed for another tenant's
+	// manifest; it now also supplies the legal entity to authorize against.
+	m, err := h.store.FindManifestByID(r.Context(), manifestID)
+	if err != nil {
 		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, principalID, m.LegalEntityID, EvidenceManifestRead) {
 		return
 	}
 	records, err := h.store.ListRecords(r.Context(), manifestID)
@@ -255,14 +352,37 @@ func requiredFieldMissing(req domain.GenerateManifestRequest) string {
 	}
 }
 
-func actorFromHeader(r *http.Request) string {
+// requirePrincipal returns the gateway-verified principal, or refuses the
+// request.
+//
+// It replaces actorFromHeader's fallback to the literal string "unknown".
+// That fallback was the same anti-pattern as the "default-tenant" tenant
+// fabrication removed across 15 services in Priority 1b, applied to the
+// actor instead: it made a header-less request SUCCEED, and wrote "unknown"
+// into evidence_manifests.requested_by.
+//
+// On this service that is worse than a cosmetic default. requested_by is
+// the attribution on an evidence bundle assembled for audit, regulator or
+// legal-discovery use. A NOT NULL column populated with "unknown" satisfies
+// the schema while carrying no accountability at all — and the platform's
+// evidential doctrine requires the actor to be preserved, not merely
+// present. It is also now load-bearing for a second reason: it is the
+// principal handed to authorization-svc, so a fabricated actor would mean
+// asking "is 'unknown' allowed to do this".
+//
+// Both header spellings are still accepted. X-Actor-Principal-ID takes
+// precedence over X-Principal-Id where a caller sends both, preserving the
+// existing contract; only the fabricated fallback is gone.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if a := r.Header.Get("X-Actor-Principal-ID"); a != "" {
-		return a
+		return a, true
 	}
 	if a := r.Header.Get("X-Principal-Id"); a != "" {
-		return a
+		return a, true
 	}
-	return "unknown"
+	writeError(w, http.StatusUnauthorized, "missing_principal",
+		"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
+	return "", false
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
