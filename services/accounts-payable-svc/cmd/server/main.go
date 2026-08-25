@@ -37,6 +37,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/health"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
 	"zoiko.io/accounts-payable-svc/internal/mtls"
+	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
@@ -189,7 +190,11 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	// AP-05's PO reference check. Only consulted when an invoice names a
+	// purchase order; an invoice with none is ordinary.
+	poClient := purchaseorder.NewClient(cfg.PurchaseOrderServiceURL)
+
+	h := handler.New(pgStore, publisher, authzClient, poClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

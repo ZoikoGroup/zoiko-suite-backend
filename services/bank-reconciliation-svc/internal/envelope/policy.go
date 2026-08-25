@@ -68,10 +68,30 @@ type Policy struct {
 	// idempotency key it has no state to protect.
 	MaterialWrite func(*http.Request) bool
 
+	// ExemptPaths lists exact paths that bypass validation, in addition to the
+	// health probes.
+	//
+	// This exists for endpoints that *produce* the envelope's mandatory fields
+	// rather than consume them, where requiring those fields as input is
+	// circular. gateway-auth-svc's /verify is the canonical case: Traefik calls
+	// it with the client's original method and headers precisely so it can
+	// derive X-Tenant-Id and X-Principal-Id from the signed token, so demanding
+	// those two headers on the way in would refuse every request the gateway
+	// exists to authenticate — and would only ever be satisfiable by a caller
+	// spoofing the values the gateway is supposed to establish.
+	//
+	// Declared as data rather than a closure so rollout.sh can generate it; a
+	// service needing richer logic sets Exempt instead, which takes precedence.
+	ExemptPaths []string
+
 	// Exempt suppresses validation entirely for a request. Health and readiness
 	// probes reach the router before any gateway sets identity headers, so
 	// without this every service would fail its own liveness check the moment
 	// enforcement turned on.
+	//
+	// Set this to replace the default behaviour entirely — it overrides both
+	// ExemptPaths and the built-in probe list, so an implementation must
+	// re-exempt the probes itself.
 	Exempt func(*http.Request) bool
 }
 
@@ -110,6 +130,11 @@ func (p Policy) materialWrite(r *http.Request) bool {
 func (p Policy) exempt(r *http.Request) bool {
 	if p.Exempt != nil {
 		return p.Exempt(r)
+	}
+	for _, path := range p.ExemptPaths {
+		if r.URL.Path == path {
+			return true
+		}
 	}
 	return defaultExempt(r)
 }

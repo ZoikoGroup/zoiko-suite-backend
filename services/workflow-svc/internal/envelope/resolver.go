@@ -189,17 +189,34 @@ func (rs *Resolver) Resolve(ctx context.Context, e Envelope) (ResolvedContext, e
 
 // tenantOperable reports whether a tenant may transact.
 //
+// The values are tenant-entity-registry-svc's TenantStatus and
+// TenantLifecycleState enums verbatim (internal/domain/enums.go). They are the
+// only two vocabularies that exist for these fields, so anything outside them
+// is a registry the caller does not understand.
+//
+// ONBOARDING is operable, and that is not a concession. ProvisionTenant creates
+// every tenant as status=ACTIVE + lifecycle=ONBOARDING, and the registry's own
+// enum documents the pair as legitimate: "a tenant can be ACTIVE in status while
+// still in ONBOARDING lifecycle". The only transition out of ONBOARDING is
+// POST /v1/tenants/{id}/lifecycle — a write on this same registry — so refusing
+// ONBOARDING would refuse the one call that could end it, and no tenant
+// provisioned by this platform could ever transact.
+//
 // The check is allow-listed rather than deny-listed: an unrecognised status —
 // one added to the registry after this file was written — reads as not
 // operable. A deny-list would admit exactly the states nobody has considered yet.
 func tenantOperable(status, lifecycle string) bool {
+	// TenantStatus: ACTIVE | SUSPENDED | ARCHIVED.
 	if status != "ACTIVE" {
 		return false
 	}
+	// TenantLifecycleState: ONBOARDING | ACTIVE | SUSPENDED | OFFBOARDING.
 	switch lifecycle {
-	case "ACTIVE", "PROVISIONED", "LIVE":
+	case "ACTIVE", "ONBOARDING":
 		return true
 	default:
+		// SUSPENDED and OFFBOARDING both mean "not transacting", and
+		// OFFBOARDING is terminal in ValidTenantLifecycleTransitions.
 		return false
 	}
 }

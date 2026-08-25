@@ -147,6 +147,64 @@ Not done for GL, and why: **ACC-04 posting-rule / account-mapping and ACC-05
 account indexes** need ACC-01 Chart of Accounts and ACC-02 Account Mapping,
 neither of which exists. `account_code` stays an unvalidated string.
 
+### tax-determination-svc — TAX-03 ✅
+
+§9.J TAX-03 requires: *"Seller/buyer; establishments; ship-from/to; supply
+location/date; product/service classification; taxable amount; currency;
+exemption facts; B2B/B2C facts."* Server-resolved: *"Registrations; jurisdiction
+pack; place-of-supply rules; rates; rounding."*
+
+Before this pass the service took a jurisdiction, a category and an amount and
+applied a rate — meaning **the caller had already decided the question the
+service exists to answer**.
+
+| TAX-03 input | Before | Now |
+| --- | --- | --- |
+| taxable amount, currency | present | currency now shape-validated |
+| **seller / buyer** | absent | **required** |
+| **establishments** | absent | **carried** (ORG-08 missing) |
+| **ship-from / ship-to** | absent | **carried + validated** against jurisdiction-rules-svc |
+| **supply location** | absent | **required + validated**; basis recorded |
+| **supply date** (tax point) | absent | **required**, ISO date |
+| **product/service classification** | absent | **required** — free-text code plus a closed `supply_kind` (GOODS / SERVICES / DIGITAL_SERVICES) |
+| **B2B/B2C facts** | absent | **required** — `supply_type` B2B/B2C/B2G; B2B additionally requires the buyer's registration |
+| **exemption facts** | amount only | **reason required** whenever `exempt_amount > 0` (INV-10), plus certificate ref |
+| **Registrations** (server-resolved) | absent | **resolved** from tenant-entity-registry-svc tax identity bundles, effective-dated to the supply date |
+| jurisdiction pack, rates | present | unchanged (tax-rules-svc) |
+| place-of-supply rules | absent | **cannot be done** — see below |
+| rounding | absent | **cannot be done** — REF-07 missing |
+
+Migration `000003_tax03_determination_inputs`.
+
+**Two findings worth calling out.**
+
+*Place of supply is asserted, not derived.* §9.J expects place-of-supply rules
+to derive it from establishments, supply kind and B2B/B2C facts. Those rules are
+jurisdiction-pack data (TAX-02) and no pack carries them. Rather than fake the
+derivation, the service takes the jurisdiction as an input and records
+`place_of_supply_basis = 'CALLER_ASSERTED'` on every determination — so the
+evidence says plainly that no rule engine decided it. When packs carry the rules
+the basis becomes `RULE_DERIVED`, and disagreement between the two is auditable.
+The console shows "caller-asserted" for the same reason.
+
+*`JURISDICTION_RULES_URL` was configured platform-wide but pointed at the wrong
+port.* jurisdiction-rules-svc listens on **8082**; 11 compose entries set 8081.
+Nothing read the variable, so the error was latent. This service now reads it,
+so the port is corrected in `deployments/docker-compose.yml` and in the service
+default.
+
+*Not done, and why:* rounding policy needs **REF-07 Accounting Policy**;
+establishment validation needs **ORG-08**; a single party master that both a
+selling entity and a customer resolve against does not exist, so `seller_party_id`
+and `buyer_party_id` are recorded unvalidated.
+
+*Pre-existing defect, flagged not changed:* `internal/rules/client.go` falls back
+to a **0% rate** when tax-rules-svc is unreachable, producing a zero-tax
+determination rather than failing closed. `snapshotTaxRule` already refuses to
+snapshot it, so the record is honest about being a fallback — but the tax figure
+is still zero. That is a fail-open on a governed calculation, sitting next to the
+two fail-closed paths added here. Worth a decision.
+
 ---
 
 ## 3. Server-resolved inputs — what can actually be retrieved

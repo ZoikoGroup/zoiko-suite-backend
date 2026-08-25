@@ -513,8 +513,27 @@ services:
       # still starts and verifies tokens correctly when phase6 isn't running.
       CARTA_SERVICE_URL: "http://carta-svc:8142"
       SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
+      # GOV-01 tenant context resolution (ZS-SVC-A-001 §4). The gateway reads
+      # the tenant/legal-entity master here to establish that the tenant may
+      # transact and that the entity in the token is its own, then forwards the
+      # server-resolved jurisdiction/timezone/residency downstream.
+      #
+      # Called service-to-service on :8081, deliberately NOT through Traefik —
+      # routing the resolver through the gateway it serves would make every
+      # verification depend on a verification.
+      #
+      # Unset this to disable resolution entirely; the gateway then verifies
+      # tokens and forwards exactly as it did before, rather than failing closed
+      # on a registry the deployment has not configured.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      TENANT_CONTEXT_TTL_SECONDS: "30"
+      # Bounded stale window for NON-MATERIAL READS only, while the registry is
+      # unreachable. Writes are never served from a stale context.
+      TENANT_CONTEXT_STALE_GRACE_SECONDS: "120"
     depends_on:
       identity-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8092/healthz"]
@@ -644,7 +663,14 @@ services:
       - "traefik.http.services.jurisdiction.loadbalancer.server.port=8082"
       - "traefik.http.middlewares.jurisdiction-strip.stripprefix.prefixes=/jurisdiction"
       - "traefik.http.middlewares.gateway-auth.forwardauth.address=http://gateway-auth-svc:8092/verify"
-      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id"
+      # Identity from the verified token, then the GOV-01 server-resolved
+      # context. Traefik OVERWRITES these names on the forwarded request, which
+      # is what makes them authoritative: a client asserting its own
+      # X-Jurisdiction-Context has it replaced by the registry's answer, per §5
+      # provenance class S ("client may request context but cannot override
+      # result"). A header the gateway sets and this list omits is dropped
+      # silently, so any addition in handler.Verify belongs here too.
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale"
       - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
@@ -2538,7 +2564,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.offboarding.events"
       EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -2579,7 +2605,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.compliance.events"
       EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -2616,7 +2642,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       GOVERNANCE_LOG_URL: "http://governance-svc:8083"
     depends_on:
       postgres:
@@ -2650,7 +2676,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2681,7 +2707,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.obligation-tracking.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2748,7 +2774,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       EVIDENCE_REQ_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
@@ -2782,7 +2808,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2813,7 +2839,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2845,7 +2871,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.tax-determination.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2879,7 +2905,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.vat-gst.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2913,7 +2939,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-tax.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       GENERAL_LEDGER_URL: "http://general-ledger-svc:8091"
     depends_on:
       postgres:

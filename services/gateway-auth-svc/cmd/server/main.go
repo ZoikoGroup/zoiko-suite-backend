@@ -13,17 +13,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
 	"zoiko.io/gateway-auth-svc/internal/carta"
 	"zoiko.io/gateway-auth-svc/internal/config"
-	svcenvelope "zoiko.io/gateway-auth-svc/internal/envelope"
 	"zoiko.io/gateway-auth-svc/internal/handler"
-	"zoiko.io/gateway-auth-svc/internal/health"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
+	"zoiko.io/gateway-auth-svc/internal/router"
 	"zoiko.io/gateway-auth-svc/internal/siem"
+	"zoiko.io/gateway-auth-svc/internal/tenantctx"
 )
 
 func main() {
@@ -42,25 +40,23 @@ func main() {
 	jwksClient := jwks.NewClient(cfg.JWKSURL, cfg.JWKSCacheTTL)
 	cartaClient := carta.New(cfg.CartaServiceURL, log)
 	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)
-	h := handler.New(cfg, jwksClient, cartaClient, siemClient, log)
 
-	r := chi.NewRouter()
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	// GOV-01 tenant context resolution against tenant-entity-registry-svc.
+	// nil when TENANT_REGISTRY_URL is unset, which leaves the gateway behaving
+	// exactly as before rather than failing closed on an unconfigured dependency.
+	tenantResolver := tenantctx.New(cfg.TenantRegistryURL, cfg.TenantContextTTL, cfg.TenantContextStaleGrace)
+	if tenantResolver.Enabled() {
+		log.Info("tenant context resolution enabled",
+			zap.String("registry", cfg.TenantRegistryURL),
+			zap.Duration("ttl", cfg.TenantContextTTL),
+			zap.Duration("stale_grace", cfg.TenantContextStaleGrace))
+	} else {
+		log.Warn("tenant context resolution DISABLED — set TENANT_REGISTRY_URL to enable GOV-01 " +
+			"resolution; tenant operability and cross-tenant entity ownership are not checked at the gateway")
+	}
 
-	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
-	// Recoverer and telemetry so a refusal is still traced, and ahead of every
-	// handler so no request reaches business logic without a resolved tenant,
-	// actor, correlation and — on material writes — an idempotency key.
-	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
-
-	r.Get("/healthz", health.Liveness)
-	r.Get("/readyz", health.Readiness(jwksClient))
-	// Traefik's ForwardAuth middleware calls this with the incoming
-	// request's original method, so it must not be restricted to GET.
-	r.Handle("/verify", http.HandlerFunc(h.Verify))
+	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log)
+	r := router.New(h, jwksClient)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),

@@ -994,3 +994,146 @@ threading them through outbox.Event → the stored row → the Relay's
 publish call. Deliberately not done in this pass to keep the outbox
 pattern's own correctness (the actual point of today's change) isolated
 from a schema migration.
+
+## Resolved (2026-08-25): the ForwardAuth endpoint refused every write on the platform
+
+`gateway-auth-svc`'s router applied the canonical input-contract middleware to
+all its own routes, including `/verify` — the endpoint Traefik's ForwardAuth
+calls. Traefik replays the client's original method there, so any
+POST/PUT/PATCH/DELETE arrived as a material write and was validated against the
+envelope in the default `write-strict` mode. Tenant and actor are exactly what
+that endpoint *derives from the signed token*, so they were absent by
+construction, and every state-changing request on the platform was refused
+`401 envelope_incomplete` (`missing=[tenant_id actor_subject_id request_id
+correlation_id source_channel]`) before its JWT was ever parsed. Reads passed,
+because `write-strict` admits them — which is why nothing looked broken.
+
+The only header set that could have satisfied it was one the client spoofed,
+i.e. precisely what the gateway exists to prevent. This also inverted
+ZS-API-001 §5's mandated pipeline order: "tenant/residency and authorization
+checks occur before... idempotency and concurrency are evaluated before side
+effects."
+
+Nothing caught it because every test in `internal/handler` called
+`Handler.Verify` directly, bypassing the middleware, and all of them used GET.
+
+Fixed by adding a declared `ExemptPaths` to `Policy` (generated per service from
+`EXEMPT_PATHS` in `rollout.sh`, so it survives regeneration) and exempting
+`/verify`. The router moved into `internal/router` so the real middleware stack
+is testable, and `router_wiring_test.go` covers all five methods. Verified the
+test fails without the exemption.
+
+## Resolved (2026-08-25): the tenant registry could not be bootstrapped
+
+`rollout.sh` listed `tenant-entity-registry-svc` as entity-scoped, giving it
+`LegalEntityID: RequiredOnWrite`. It was on that list because
+`internal/domain` carries `legal_entity_id` — but it carries it as *output*.
+This is the service that issues legal entity IDs, so `POST /v1/tenants` (which
+creates the tenant an entity would hang from) and `POST /v1/entities` (which
+mints the identifier itself) could never name one, and neither could
+`/v1/workspaces`, `/v1/residency-policies` or `/v1/entity-hierarchies`.
+
+The entity-scoped routes it does expose all take the entity from the path, where
+the handler already validates it against the tenant, so the header added nothing
+even where it was satisfiable.
+
+Fixed by removing it from `ENTITY_SCOPED`, with the rule recorded there: a
+service is entity-scoped when it *consumes* an entity identifier, never when it
+is the authority that issues one. Guarded by
+`internal/envelope/contract_test.go`, which fails if it is put back.
+
+This matches the position the deployment already took — `AUTHZ_PLATFORM_SCOPE_ID`
+exists in compose precisely because "ProvisionTenant is the one mutation with no
+tenant to scope to".
+
+## Resolved (2026-08-25): the context resolver rejected every newly provisioned tenant
+
+`envelope.Resolver.tenantOperable` allow-listed lifecycle values
+`ACTIVE`, `PROVISIONED`, `LIVE`. `PROVISIONED` and `LIVE` do not exist anywhere
+in the registry. The real enum is
+`ONBOARDING | ACTIVE | SUSPENDED | OFFBOARDING`, and `ProvisionTenant` writes
+`status=ACTIVE, lifecycle=ONBOARDING` — which was not on the list.
+
+Every tenant this platform provisions would therefore have failed context
+resolution, including on `POST /v1/tenants/{id}/lifecycle`, the only call that
+could move it out of `ONBOARDING`. A deadlock, latent only because nothing
+called the resolver (see below).
+
+Fixed to the registry's actual enum, with `ONBOARDING` operable. See the
+divergence recorded below — this is not what the new doc set specifies.
+
+## Resolved (2026-08-25): envelope.Resolver was dead code
+
+`services/_contract/envelope/resolver.go` — 298 lines implementing the
+server-resolved half of the input contract, with tenant-operability checks,
+cross-tenant entity refusal and conflict recording — was vendored into 86
+services and called by none. Every service took the caller's
+`X-Jurisdiction-Context` at face value, and nothing anywhere checked whether a
+tenant was permitted to transact.
+
+Wired into `gateway-auth-svc` as GOV-01 context resolution
+(`internal/tenantctx`), which is where ZS-SVC-A-001 §4 puts it: "resolve the
+trusted tenant and operating context for every request... before business
+processing begins", owning "TenantContextResolution, TenantRoutingHint cache"
+and explicitly not the tenant master.
+
+Implements GOV-01's degradation contract literally — "ambiguous or unresolved
+tenant => deny; stale context may be read only within bounded TTL for
+non-material reads; no fallback to global/default tenant":
+
+- registry says no (unknown/suspended tenant, cross-tenant entity) -> 403,
+  `X-Tenant-Context: denied`, not cached
+- registry unreachable on a write -> 503, `X-Tenant-Context: unresolved`
+- registry unreachable on a read -> bounded-stale cache entry, or 503 if cold
+- resolved -> `X-Jurisdiction-Context`, `X-Timezone`,
+  `X-Residency-Policy-Id` forwarded as server-resolved context
+
+Gated on `TENANT_REGISTRY_URL`; unset disables resolution entirely, matching how
+carta-svc and siem-integration-svc are already made optional here. The new
+headers were added to the ForwardAuth `authResponseHeaders` list — Traefik
+silently drops any header not named there.
+
+## Open: tenant lifecycle vocabulary diverges from the new canonical doc set
+
+`internal/domain/enums.go` documents its values as "verbatim from
+`docs/architecture/04-data-model.md` §05.1" — the *old* six-document series. The
+44-document register uploaded 2026-08-25 renames them. ZS-SVC-I-001 ORG-02
+specifies:
+
+    Provisioning -> Active -> Suspended -> Terminating -> Terminated
+
+against the code's:
+
+    ONBOARDING | ACTIVE | SUSPENDED | OFFBOARDING
+
+Also unimplemented from ORG-02: `FailedProvisioning` (its stated degradation
+state for partial provisioning), and the named commands `CreateTenant`,
+`ActivateTenant`, `SuspendTenant`, `ResumeTenant`, `InitiateTermination`,
+`CompleteTermination` — the code has one generic lifecycle-transition endpoint
+instead.
+
+Not a code defect on its own; it is an unreconciled rename between doc
+generations, and it should be settled before anything else binds to these
+values.
+
+## Open: ONBOARDING is treated as operable, which ORG-02 says it should not be
+
+Deliberate divergence, recorded so it is not mistaken for conformance.
+
+ZS-SVC-I-001 ORG-02 states "never expose partially isolated tenant as Active"
+and its minimum acceptance includes "partially provisioned tenant not active".
+Read strictly, a tenant in `Provisioning`/`ONBOARDING` should not transact.
+
+The doc-aligned design has `ActivateTenant` as a platform-scoped admin command
+on a separate privileged surface — ZS-API-001 §3 requires privileged
+cross-tenant operations to live under `/admin/v1/` and be "isolated from tenant
+public surface" — which would not pass through tenant-context resolution at all.
+
+No such admin surface exists. Every registry route is on the tenant surface, so
+refusing `ONBOARDING` at the gateway would refuse the activation call itself and
+deadlock every new tenant. `ONBOARDING` is therefore operable today.
+
+To close: build the privileged admin surface, move the lifecycle commands onto
+it, then set `ONBOARDING`/`Provisioning` non-operable in
+`envelope.tenantOperable`. Both halves have to land together — flipping the
+resolver first reintroduces the deadlock.

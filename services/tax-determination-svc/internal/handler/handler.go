@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -16,6 +17,7 @@ import (
 	"zoiko.io/tax-determination-svc/internal/domain"
 	"zoiko.io/tax-determination-svc/internal/events"
 	"zoiko.io/tax-determination-svc/internal/middleware"
+	"zoiko.io/tax-determination-svc/internal/registry"
 	"zoiko.io/tax-determination-svc/internal/rules"
 	"zoiko.io/tax-determination-svc/internal/store"
 )
@@ -58,16 +60,43 @@ type AuthzChecker interface {
 
 var _ AuthzChecker = (*authz.Client)(nil)
 
-type Handler struct {
-	store       store.Store
-	publisher   events.Publisher
-	authz       AuthzChecker
-	rulesClient *rules.Client
-	logger      *zap.Logger
+// JurisdictionValidator probes jurisdiction-rules-svc for the jurisdiction
+// references TAX-03 requires. An interface rather than the concrete client so
+// the handler's tests can exercise the unknown and unreachable branches, which
+// are the two that decide whether a determination is refused or fails closed.
+type JurisdictionValidator interface {
+	Validate(ctx context.Context, correlationID, jurisdictionID string) error
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, rc *rules.Client, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, rulesClient: rc, logger: logger}
+// RegistrationResolver reads TAX-03's server-resolved "Registrations" input —
+// whether the seller holds a tax registration in the place of supply.
+type RegistrationResolver interface {
+	ResolveSellerRegistration(ctx context.Context, tenantID, legalEntityID, jurisdictionID, supplyDate string) (*registry.Registration, error)
+}
+
+type Handler struct {
+	store        store.Store
+	publisher    events.Publisher
+	authz        AuthzChecker
+	rulesClient  *rules.Client
+	jurisdiction JurisdictionValidator
+	registry     RegistrationResolver
+	logger       *zap.Logger
+}
+
+func New(
+	st store.Store,
+	pub events.Publisher,
+	az AuthzChecker,
+	rc *rules.Client,
+	jv JurisdictionValidator,
+	rr RegistrationResolver,
+	logger *zap.Logger,
+) *Handler {
+	return &Handler{
+		store: st, publisher: pub, authz: az, rulesClient: rc,
+		jurisdiction: jv, registry: rr, logger: logger,
+	}
 }
 
 // authorize extracts the caller's principal from the X-Principal-Id header
@@ -91,6 +120,79 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, legalEntityI
 	return principalID, true
 }
 
+// optional turns an empty string into a nil pointer.
+//
+// The distinction is not cosmetic: a nil ship_from means "this supply has no
+// movement", and an empty string would claim the caller named a jurisdiction
+// and it was blank. On a record used to defend a tax position, absent and empty
+// are different assertions.
+func optional(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// missingTAX03Input names the first required §9.J input the request omits, or
+// "" when all are present. One field per refusal, named, so a caller adopting
+// the contract can fix them in sequence.
+func missingTAX03Input(req domain.DetermineTaxRequest) string {
+	switch {
+	case req.SellerPartyID == "":
+		return "seller_party_id is required — a determination has to say who is supplying"
+	case req.BuyerPartyID == "":
+		return "buyer_party_id is required — who is being supplied decides the treatment"
+	case req.SupplyJurisdictionID == "":
+		return "supply_jurisdiction_id is required — the place of supply is the jurisdiction whose rules govern this transaction"
+	case req.SupplyDate == "":
+		return "supply_date is required — the tax point decides which rule version applies"
+	case req.ProductClassification == "":
+		return "product_classification is required"
+	case req.SupplyKind == "":
+		return "supply_kind is required — one of GOODS, SERVICES, DIGITAL_SERVICES"
+	case req.SupplyType == "":
+		return "supply_type is required — one of B2B, B2C, B2G"
+	case req.Currency == "":
+		return "currency is required"
+	default:
+		return ""
+	}
+}
+
+// invalidTAX03Input names the first §9.J input that is present but wrong.
+//
+// Separate from missingTAX03Input because "you did not send supply_kind" and
+// "GOOD is not a supply kind" are different mistakes, and only the second can
+// be fixed by a caller that is told which value was rejected.
+func invalidTAX03Input(req domain.DetermineTaxRequest) string {
+	if !domain.ValidSupplyKind(req.SupplyKind) {
+		return domain.ErrInvalidSupplyKind.Error()
+	}
+	if !domain.ValidSupplyType(req.SupplyType) {
+		return domain.ErrInvalidSupplyType.Error()
+	}
+	if !domain.ValidCurrencyCode(req.Currency) {
+		return domain.ErrInvalidCurrency.Error()
+	}
+	if _, err := time.Parse("2006-01-02", req.SupplyDate); err != nil {
+		return domain.ErrInvalidSupplyDate.Error()
+	}
+	// The fact that decides reverse charge. A business buyer carrying no
+	// registration in the place of supply is a B2C supply in substance.
+	if req.SupplyType == domain.SupplyTypeB2B && req.BuyerTaxRegistrationID == "" {
+		return domain.ErrB2BNeedsBuyerRegistration.Error()
+	}
+	// INV-10: an exemption is the one number here that reduces tax without a
+	// rule having said so, and it cannot stand on an amount alone.
+	if req.ExemptAmount > 0 && req.ExemptionReason == "" {
+		return domain.ErrExemptionNeedsReason.Error()
+	}
+	if req.ExemptAmount > req.GrossAmount {
+		return "exempt_amount cannot exceed gross_amount"
+	}
+	return ""
+}
+
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/tax-determinations", func(r chi.Router) {
 		r.Post("/", h.DetermineTax)
@@ -112,9 +214,56 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "transaction_id, jurisdiction_id, tax_category, and positive gross_amount are required")
 		return
 	}
+	// TAX-03 required business/source inputs, checked before authorization so a
+	// malformed request is refused as malformed rather than as denied.
+	if detail := missingTAX03Input(req); detail != "" {
+		writeError(w, http.StatusBadRequest, detail)
+		return
+	}
+	if detail := invalidTAX03Input(req); detail != "" {
+		writeError(w, http.StatusBadRequest, detail)
+		return
+	}
 
 	principalID, ok := h.authorize(w, r, req.LegalEntityID, ActionTaxDeterminationCreate)
 	if !ok {
+		return
+	}
+
+	// Every jurisdiction this determination names must be one
+	// jurisdiction-rules-svc recognises. Unknown is the caller's mistake;
+	// unreachable is "cannot answer" and fails the determination closed rather
+	// than pinning a tax position to a jurisdiction nobody verified.
+	correlationID := r.Header.Get("X-Correlation-ID")
+	for field, id := range map[string]string{
+		"supply_jurisdiction_id":    req.SupplyJurisdictionID,
+		"jurisdiction_id":           req.JurisdictionID,
+		"ship_from_jurisdiction_id": req.ShipFromJurisdictionID,
+		"ship_to_jurisdiction_id":   req.ShipToJurisdictionID,
+	} {
+		if err := h.jurisdiction.Validate(r.Context(), correlationID, id); err != nil {
+			if errors.Is(err, domain.ErrJurisdictionUnknown) {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("%s: %s", field, err.Error()))
+				return
+			}
+			h.logger.Warn("jurisdiction validation unavailable",
+				zap.String("field", field), zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, domain.ErrJurisdictionUnverifiable.Error())
+			return
+		}
+	}
+
+	// TAX-03 server-resolved input: does the seller hold a tax registration in
+	// the place of supply, as at the supply date? Not the caller's to assert —
+	// it is what decides whether tax is charged at all.
+	//
+	// A nil registration is an answer (the seller is not registered there) and
+	// is recorded as such. Being unable to ask is not, and fails closed.
+	sellerReg, err := h.registry.ResolveSellerRegistration(
+		r.Context(), tenantID, req.LegalEntityID, req.SupplyJurisdictionID, req.SupplyDate)
+	if err != nil {
+		h.logger.Warn("seller registration could not be resolved", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, domain.ErrRegistryUnavailable.Error())
 		return
 	}
 
@@ -152,6 +301,38 @@ func (h *Handler) DetermineTax(w http.ResponseWriter, r *http.Request) {
 		Status:              domain.StatusCalculated,
 		EffectiveFrom:       req.EffectiveFrom,
 		EvaluatedBy:         req.EvaluatedBy,
+
+		// TAX-03 inputs, preserved so the determination can be reconstructed
+		// from the facts it was given (§9.J retrieval, Appendix B).
+		SellerPartyID:         req.SellerPartyID,
+		BuyerPartyID:          req.BuyerPartyID,
+		SellerEstablishmentID: optional(req.SellerEstablishmentID),
+		BuyerEstablishmentID:  optional(req.BuyerEstablishmentID),
+
+		ShipFromJurisdictionID: optional(req.ShipFromJurisdictionID),
+		ShipToJurisdictionID:   optional(req.ShipToJurisdictionID),
+
+		SupplyJurisdictionID: req.SupplyJurisdictionID,
+		SupplyDate:           optional(req.SupplyDate),
+		// No pack carries place-of-supply rules, so this engine did not derive
+		// the place of supply — the caller stated it. Recorded rather than left
+		// implicit. See domain.PlaceOfSupplyBasis.
+		PlaceOfSupplyBasis: domain.PlaceOfSupplyCallerAsserted,
+
+		ProductClassification: req.ProductClassification,
+		SupplyKind:            req.SupplyKind,
+		SupplyType:            req.SupplyType,
+
+		BuyerTaxRegistrationID: optional(req.BuyerTaxRegistrationID),
+
+		ExemptionReason:         optional(req.ExemptionReason),
+		ExemptionCertificateRef: optional(req.ExemptionCertificateRef),
+	}
+
+	if sellerReg != nil {
+		det.SellerRegistrationID = &sellerReg.BundleID
+		status := sellerReg.Status
+		det.SellerRegistrationStatus = &status
 	}
 
 	if err := h.store.CreateDetermination(r.Context(), det); err != nil {

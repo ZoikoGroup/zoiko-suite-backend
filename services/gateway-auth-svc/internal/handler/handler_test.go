@@ -20,6 +20,7 @@ import (
 	"zoiko.io/gateway-auth-svc/internal/handler"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
 	"zoiko.io/gateway-auth-svc/internal/siem"
+	"zoiko.io/gateway-auth-svc/internal/tenantctx"
 )
 
 const testKid = "test-key-1"
@@ -29,14 +30,23 @@ const testKid = "test-key-1"
 // and identity-context-svc's /.well-known/jwks.json endpoint.
 func newTestEnv(t *testing.T) (*handler.Handler, *rsa.PrivateKey, *config.Config) {
 	t.Helper()
-	return newTestEnvWithCartaDecision(t, "")
+	return newTestEnvWith(t, "", "")
 }
 
-// newTestEnvWithCartaDecision wires a fake carta-svc that always answers with
-// decision (or runs with no carta-svc at all, when decision == ""), so tests
-// can prove the block/no-block behavior for each CARTA outcome without a
-// real risk-scoring algorithm in the loop.
+// newTestEnvWithCartaDecision keeps the existing CARTA-focused tests reading as
+// they did before tenant-context resolution was added; those tests run with the
+// resolver disabled, which is the same posture as an unset TENANT_REGISTRY_URL.
 func newTestEnvWithCartaDecision(t *testing.T, decision string) (*handler.Handler, *rsa.PrivateKey, *config.Config) {
+	t.Helper()
+	return newTestEnvWith(t, decision, "")
+}
+
+// newTestEnvWith wires a fake carta-svc that always answers with decision (or
+// runs with no carta-svc at all, when decision == ""), so tests can prove the
+// block/no-block behavior for each CARTA outcome without a real risk-scoring
+// algorithm in the loop. registryURL likewise enables GOV-01 tenant-context
+// resolution only when a test supplies a stub registry.
+func newTestEnvWith(t *testing.T, decision, registryURL string) (*handler.Handler, *rsa.PrivateKey, *config.Config) {
 	t.Helper()
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -71,7 +81,12 @@ func newTestEnvWithCartaDecision(t *testing.T, decision string) (*handler.Handle
 	// assertions (see siem.Client's doc comment).
 	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)
 
-	return handler.New(cfg, jwksClient, cartaClient, siemClient, log), privateKey, cfg
+	cfg.TenantRegistryURL = registryURL
+	cfg.TenantContextTTL = time.Minute
+	cfg.TenantContextStaleGrace = time.Minute
+	tenantResolver := tenantctx.New(cfg.TenantRegistryURL, cfg.TenantContextTTL, cfg.TenantContextStaleGrace)
+
+	return handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log), privateKey, cfg
 }
 
 func jwksHandler(pub *rsa.PublicKey, kid string) http.HandlerFunc {

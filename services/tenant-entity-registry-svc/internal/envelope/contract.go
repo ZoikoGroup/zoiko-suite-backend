@@ -14,7 +14,7 @@ func ServicePolicy() Policy {
 		ServiceName: "tenant-entity-registry-svc",
 
 		// §4: mandatory for entity-specific records (INV-02).
-		LegalEntityID: RequiredOnWrite,
+		LegalEntityID: NotRequired,
 
 		// §4: required for governed sensitive access.
 		PurposeContext: NotRequired,

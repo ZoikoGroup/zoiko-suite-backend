@@ -136,6 +136,45 @@ func TestSuspendedTenantIsRefusedDespiteA200(t *testing.T) {
 	}
 }
 
+// Every tenant tenant-entity-registry-svc provisions starts as status=ACTIVE +
+// lifecycle=ONBOARDING, and the registry's own enum calls that pair legitimate.
+// Refusing it locks out every newly provisioned tenant — including from
+// POST /v1/tenants/{id}/lifecycle, the one call that could move it on.
+func TestOnboardingTenantIsOperable(t *testing.T) {
+	s := &stubRegistry{
+		tenant: `{"tenant_id":"tenant-01","status":"ACTIVE","lifecycle_state":"ONBOARDING",
+			"primary_timezone":"Europe/London"}`,
+		entity: gbEntity,
+	}
+	rs := NewResolver(s.server(t).URL)
+
+	got, err := rs.Resolve(context.Background(), envFor("tenant-01", "entity-01"))
+	if err != nil {
+		t.Fatalf("err = %v, want a freshly provisioned tenant to resolve", err)
+	}
+	if got.TenantLifecycle != "ONBOARDING" {
+		t.Fatalf("lifecycle = %q, want ONBOARDING carried through", got.TenantLifecycle)
+	}
+}
+
+// The remaining two registry lifecycle values both mean "not transacting".
+func TestNonTransactingLifecyclesAreRefused(t *testing.T) {
+	for _, lifecycle := range []string{"SUSPENDED", "OFFBOARDING"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			s := &stubRegistry{
+				tenant: `{"tenant_id":"tenant-01","status":"ACTIVE","lifecycle_state":"` + lifecycle + `"}`,
+				entity: gbEntity,
+			}
+			rs := NewResolver(s.server(t).URL)
+
+			_, err := rs.Resolve(context.Background(), envFor("tenant-01", "entity-01"))
+			if !errors.Is(err, ErrTenantNotResolvable) {
+				t.Fatalf("err = %v, want %s to be refused", err, lifecycle)
+			}
+		})
+	}
+}
+
 // An unrecognised lifecycle state — one added after this code was written —
 // must read as not operable rather than being admitted by default.
 func TestUnknownLifecycleIsNotOperable(t *testing.T) {

@@ -21,5 +21,10 @@ func ServicePolicy() Policy {
 
 		// This service does not post to an accounting book.
 		BookID: NotRequired,
+
+		// Endpoints that produce the envelope's mandatory fields rather than
+		// consume them, so requiring those fields as input would be circular.
+		// See EXEMPT_PATHS in rollout.sh.
+		ExemptPaths: []string{"/verify"},
 	}
 }

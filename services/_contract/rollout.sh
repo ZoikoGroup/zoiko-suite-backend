@@ -40,8 +40,23 @@ obligation-tracking-svc obligations-svc offboarding-severance-svc org-structure-
 payroll-run-svc payroll-tax-svc performance-review-svc policy-svc procurement-workflow-svc \
 purchase-order-svc purchase-request-svc reconciliation-intelligence-svc \
 reporting-orchestration-svc siem-integration-svc spend-controls-svc \
-tax-authority-interface-svc tax-determination-svc tenant-entity-registry-svc treasury-svc \
+tax-authority-interface-svc tax-determination-svc treasury-svc \
 vat-gst-svc vendor-due-diligence-svc withholding-tax-svc workflow-svc workforce-compliance-svc"
+
+# DELIBERATELY NOT ENTITY_SCOPED: tenant-entity-registry-svc.
+#
+# It carries legal_entity_id in internal/domain, which is what put it on this
+# list originally — but it carries it as OUTPUT. This is the service that issues
+# legal entity IDs, so requiring one as a mandatory input inverts the dependency:
+# POST /v1/tenants creates the tenant an entity would hang from, and
+# POST /v1/entities mints the very identifier the header would have to contain.
+# Neither call can name an entity that does not exist yet, so under
+# RequiredOnWrite the registry could never be bootstrapped at all — and every
+# entity-scoped route it does expose (/v1/entities/{entityID}/...) already takes
+# the entity from the path, where the handler validates it against the tenant.
+#
+# The rule this encodes: a service is entity-scoped when it *consumes* an entity
+# identifier, never when it is the authority that issues one.
 
 # Services whose reads touch personal, bank, tax, payroll or privileged content.
 # §4 requires purpose_context "for governed sensitive access", and §15 (INV-15)
@@ -72,9 +87,35 @@ reporting-orchestration-svc metric-registry-svc corporate-tax-svc vat-gst-svc \
 withholding-tax-svc tax-determination-svc payroll-tax-svc treasury-svc \
 bank-reconciliation-svc reconciliation-intelligence-svc"
 
+# Paths that must bypass the contract because they PRODUCE its mandatory fields
+# rather than consume them. Requiring tenant_id and actor_subject_id on the way
+# in to gateway-auth-svc's ForwardAuth endpoint is circular: Traefik calls
+# /verify with the client's original method and headers so the gateway can
+# derive those two values from the signed token, and the client cannot supply
+# them without spoofing exactly what the gateway exists to establish. Left
+# unexempted, every POST/PUT/PATCH/DELETE on the platform is refused 401 by the
+# authenticator itself while its JWT verification never runs.
+#
+# Format: "<svc>:<path>[,<path>...]" — one entry per service.
+EXEMPT_PATHS="gateway-auth-svc:/verify"
+
 in_list() {
 	local needle="$1" hay="$2" item
 	for item in $hay; do [ "$item" = "$needle" ] && return 0; done
+	return 1
+}
+
+# exempt_for prints the Go literal for a service's ExemptPaths, or nothing.
+exempt_for() {
+	local svc="$1" entry paths out=""
+	for entry in $EXEMPT_PATHS; do
+		[ "${entry%%:*}" = "$svc" ] || continue
+		paths="${entry#*:}"
+		local IFS=,
+		for p in $paths; do out="$out\"$p\", "; done
+		printf '%s' "${out%, }"
+		return 0
+	done
 	return 1
 }
 
@@ -108,6 +149,16 @@ for svc in "${targets[@]}"; do
 	purpose="NotRequired"
 	in_list "$svc" "$SENSITIVE" && purpose="RequiredOnWrite"
 
+	exempt_block=""
+	if exempt_literal="$(exempt_for "$svc")"; then
+		exempt_block="
+		// Endpoints that produce the envelope's mandatory fields rather than
+		// consume them, so requiring those fields as input would be circular.
+		// See EXEMPT_PATHS in rollout.sh.
+		ExemptPaths: []string{$exempt_literal},
+"
+	fi
+
 	book_note="// This service does not post to an accounting book."
 	if in_list "$svc" "$ACCOUNTING"; then
 		book_note="// BookID stays NotRequired despite §4 marking book_id mandatory for
@@ -140,7 +191,7 @@ func ServicePolicy() Policy {
 
 		$book_note
 		BookID: NotRequired,
-	}
+$exempt_block	}
 }
 CONTRACT
 

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -59,6 +60,16 @@ var invoiceColumns = []string{
 	"validated_at",
 	"approved_at",
 	"payment_requested_at",
+
+	// AP-05 (migration 000006).
+	"invoice_date",
+	"supply_date",
+	"net_amount",
+	"tax_amount",
+	"purchase_order_id",
+	"goods_receipt_ref",
+	"po_vendor_profile_id",
+	"invoice_document_id",
 }
 
 var invoiceSelectList = strings.Join(invoiceColumns, ", ")
@@ -87,6 +98,51 @@ func scanTargets(inv *domain.VendorInvoice, status *string) []any {
 		&inv.ValidatedAt,
 		&inv.ApprovedAt,
 		&inv.PaymentRequestedAt,
+
+		&inv.InvoiceDate,
+		&inv.SupplyDate,
+		&inv.NetAmount,
+		&inv.TaxAmount,
+		&inv.PurchaseOrderID,
+		&inv.GoodsReceiptRef,
+		&inv.POVendorProfileID,
+		&inv.InvoiceDocumentID,
+	}
+}
+
+// lineColumns and lineScanTargets are the same pair for vendor_invoice_lines,
+// guarded by the same init() check.
+var lineColumns = []string{
+	"invoice_line_id",
+	"invoice_id",
+	"line_number",
+	"description",
+	"quantity",
+	"unit_price",
+	"net_amount",
+	"tax_code",
+	"tax_amount",
+	"tax_determination_id",
+	"po_line_reference",
+	"dimensions",
+}
+
+var lineSelectList = strings.Join(lineColumns, ", ")
+
+func lineScanTargets(l *domain.VendorInvoiceLine) []any {
+	return []any{
+		&l.InvoiceLineID,
+		&l.InvoiceID,
+		&l.LineNumber,
+		&l.Description,
+		&l.Quantity,
+		&l.UnitPrice,
+		&l.NetAmount,
+		&l.TaxCode,
+		&l.TaxAmount,
+		&l.TaxDeterminationID,
+		&l.POLineReference,
+		&l.Dimensions,
 	}
 }
 
@@ -97,6 +153,11 @@ func init() {
 		panic(fmt.Sprintf(
 			"store: %d scan targets for %d invoice columns — they are derived from one list and must stay in step",
 			n, len(invoiceColumns)))
+	}
+	if n := len(lineScanTargets(&domain.VendorInvoiceLine{})); n != len(lineColumns) {
+		panic(fmt.Sprintf(
+			"store: %d scan targets for %d invoice line columns — they are derived from one list and must stay in step",
+			n, len(lineColumns)))
 	}
 }
 
@@ -197,12 +258,17 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) 
 			INSERT INTO vendor_invoices (
 				invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
 				amount, currency_code, due_date, status, source_contract_id, created_by_principal_id,
-				correlation_id, created_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				correlation_id, created_at,
+				invoice_date, supply_date, net_amount, tax_amount,
+				purchase_order_id, goods_receipt_ref, po_vendor_profile_id, invoice_document_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+			          $14, $15, $16, $17, $18, $19, $20, $21)
 			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 		`, inv.InvoiceID, inv.TenantID, inv.LegalEntityID, inv.VendorID, inv.InvoiceNumber,
 			inv.Amount, inv.CurrencyCode, inv.DueDate, string(inv.Status), inv.SourceContractID, inv.CreatedByPrincipalID,
-			inv.CorrelationID, now)
+			inv.CorrelationID, now,
+			inv.InvoiceDate.Time, inv.SupplyDate.Time, inv.NetAmount, inv.TaxAmount,
+			inv.PurchaseOrderID, inv.GoodsReceiptRef, inv.POVendorProfileID, inv.InvoiceDocumentID)
 		if err != nil {
 			return mapPgError(err)
 		}
@@ -215,9 +281,41 @@ func (s *PgStore) CreateInvoice(ctx context.Context, inv *domain.VendorInvoice) 
 				return err
 			}
 			inv.Status = domain.InvoiceStatus(status)
+
+			// A replay must return the ORIGINAL invoice in full, lines included.
+			// Returning the header alone would report the stored invoice with an
+			// empty line list, which now reads as a pre-contract invoice — so a
+			// retried POST would look like a different, older document than the
+			// one it actually resolved to.
+			lines, err := queryLines(ctx, tx, inv.TenantID, inv.InvoiceID)
+			if err != nil {
+				return err
+			}
+			inv.Lines = lines
 			created = false
 			return nil
 		}
+
+		// Lines are written in the same transaction as the header: an invoice
+		// whose header committed without its lines would be a payable with no
+		// account of what it is for, and nothing later would know to add them.
+		for i := range inv.Lines {
+			inv.Lines[i].InvoiceLineID = uuid.NewString()
+			inv.Lines[i].InvoiceID = inv.InvoiceID
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO vendor_invoice_lines (
+					invoice_line_id, invoice_id, tenant_id, line_number,
+					description, quantity, unit_price, net_amount,
+					tax_code, tax_amount, tax_determination_id, po_line_reference, dimensions
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			`, inv.Lines[i].InvoiceLineID, inv.InvoiceID, inv.TenantID, inv.Lines[i].LineNumber,
+				inv.Lines[i].Description, inv.Lines[i].Quantity, inv.Lines[i].UnitPrice, inv.Lines[i].NetAmount,
+				inv.Lines[i].TaxCode, inv.Lines[i].TaxAmount, inv.Lines[i].TaxDeterminationID,
+				inv.Lines[i].POLineReference, inv.Lines[i].Dimensions); err != nil {
+				return mapPgError(err)
+			}
+		}
+
 		inv.CreatedAt = now
 		created = true
 		return nil
@@ -245,6 +343,15 @@ func (s *PgStore) GetInvoice(ctx context.Context, invoiceID string) (*domain.Ven
 			return mapPgError(err)
 		}
 		inv.Status = domain.InvoiceStatus(status)
+
+		// Read in the same transaction as the header so a concurrent write
+		// cannot show a header from one moment with lines from another — which
+		// would make a balanced invoice read as unbalanced.
+		lines, err := queryLines(ctx, tx, tenantID, inv.InvoiceID)
+		if err != nil {
+			return err
+		}
+		inv.Lines = lines
 		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -261,6 +368,34 @@ func (s *PgStore) GetInvoice(ctx context.Context, invoiceID string) (*domain.Ven
 		return nil, err
 	}
 	return &inv, nil
+}
+
+// queryLines reads one invoice's lines, in line order.
+//
+// Scoped by tenant explicitly as well as by invoice_id, matching every other
+// query in this file: RLS alone is insufficient while the service connects as a
+// Postgres superuser (see migration 000004), so the predicate is what actually
+// isolates tenants.
+func queryLines(ctx context.Context, tx pgx.Tx, tenantID, invoiceID string) ([]domain.VendorInvoiceLine, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT `+lineSelectList+`
+		 FROM vendor_invoice_lines
+		 WHERE invoice_id = $1 AND tenant_id = $2
+		 ORDER BY line_number ASC`, invoiceID, tenantID)
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	defer rows.Close()
+
+	var lines []domain.VendorInvoiceLine
+	for rows.Next() {
+		var l domain.VendorInvoiceLine
+		if err := rows.Scan(lineScanTargets(&l)...); err != nil {
+			return nil, mapPgError(err)
+		}
+		lines = append(lines, l)
+	}
+	return lines, mapPgError(rows.Err())
 }
 
 // ListInvoices returns vendor invoices matching the given filter (tenant_id

@@ -15,6 +15,7 @@ import (
 
 	"zoiko.io/accounts-payable-svc/internal/domain"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
+	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
 )
 
 // Store is the persistence contract the handler depends on.
@@ -48,15 +49,57 @@ const (
 	actionRequestPayment  = "AP_PAYMENT_REQUEST"
 )
 
-type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	log       *zap.Logger
+// PurchaseOrderVerifier validates AP-05's PO reference against
+// purchase-order-svc. An interface rather than the concrete client so tests can
+// exercise the unknown, closed and unreachable branches — the three that decide
+// whether an invoice is refused, rejected or fails closed.
+type PurchaseOrderVerifier interface {
+	Verify(ctx context.Context, tenantID, legalEntityID, correlationID, purchaseOrderID string) (*purchaseorder.PurchaseOrder, error)
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+type Handler struct {
+	store          Store
+	publisher      Publisher
+	authz          AuthZClient
+	purchaseOrders PurchaseOrderVerifier
+	log            *zap.Logger
+}
+
+func New(store Store, publisher Publisher, authz AuthZClient, po PurchaseOrderVerifier, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, authz: authz, purchaseOrders: po, log: log}
+}
+
+// linesFromRequest maps the wire lines onto domain lines. Line numbers are
+// assigned here, from position, rather than taken from the caller: they are the
+// invoice's own ordering and a caller-supplied number could collide with the
+// (invoice_id, line_number) uniqueness the table declares.
+func linesFromRequest(in []domain.CreateVendorInvoiceLineInput) []domain.VendorInvoiceLine {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]domain.VendorInvoiceLine, len(in))
+	for i, l := range in {
+		quantity := l.Quantity
+		if quantity == 0 {
+			// A line keyed as a lump sum has no quantity, and storing zero
+			// would make unit_price x quantity read as nil rather than as the
+			// amount actually charged.
+			quantity = 1
+		}
+		out[i] = domain.VendorInvoiceLine{
+			LineNumber:         i + 1,
+			Description:        l.Description,
+			Quantity:           quantity,
+			UnitPrice:          l.UnitPrice,
+			NetAmount:          l.NetAmount,
+			TaxCode:            l.TaxCode,
+			TaxAmount:          l.TaxAmount,
+			TaxDeterminationID: l.TaxDeterminationID,
+			POLineReference:    l.POLineReference,
+			Dimensions:         l.Dimensions,
+		}
+	}
+	return out
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -83,6 +126,10 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Amount <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_field", "amount must be greater than zero")
+		return
+	}
+	if code, detail := invalidInvoiceLines(req); code != "" {
+		writeError(w, http.StatusBadRequest, code, detail)
 		return
 	}
 
@@ -115,6 +162,40 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AP-05's PO reference. Verified before the invoice is written: recording a
+	// payable against a purchase order that does not exist, belongs to another
+	// entity, or has been closed is how an unauthorised spend enters the ledger
+	// looking authorised.
+	//
+	// Unknown and closed are the caller's mistakes and answer 4xx; unreachable
+	// is "cannot answer" and fails closed with 503 rather than admitting an
+	// invoice against a commitment nobody confirmed.
+	var poVendorProfileID *string
+	if req.PurchaseOrderID != nil && *req.PurchaseOrderID != "" {
+		po, err := h.purchaseOrders.Verify(
+			r.Context(), tenantID, req.LegalEntityID, req.CorrelationID, *req.PurchaseOrderID)
+		switch {
+		case errors.Is(err, domain.ErrPurchaseOrderUnknown):
+			writeError(w, http.StatusBadRequest, "purchase_order_unknown", err.Error())
+			return
+		case errors.Is(err, domain.ErrPurchaseOrderClosed):
+			writeError(w, http.StatusUnprocessableEntity, "purchase_order_closed", err.Error())
+			return
+		case err != nil:
+			h.log.Warn("CreateInvoice: purchase order unverifiable", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "purchase_order_unverifiable",
+				domain.ErrPurchaseOrderUnverifiable.Error())
+			return
+		case po != nil && po.VendorProfileID != "":
+			// Recorded, not enforced — see the migration for why the two
+			// supplier identifiers cannot be assumed to be the same space.
+			id := po.VendorProfileID
+			poVendorProfileID = &id
+		}
+	}
+
+	netTotal, taxTotal := req.LineTotals()
+
 	inv := &domain.VendorInvoice{
 		InvoiceID:            uuid.NewString(),
 		TenantID:             tenantID,
@@ -128,6 +209,16 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		SourceContractID:     req.SourceContractID,
 		CreatedByPrincipalID: principalID,
 		CorrelationID:        req.CorrelationID,
+
+		InvoiceDate:       req.InvoiceDate,
+		SupplyDate:        req.SupplyDate,
+		NetAmount:         netTotal,
+		TaxAmount:         taxTotal,
+		PurchaseOrderID:   req.PurchaseOrderID,
+		GoodsReceiptRef:   req.GoodsReceiptRef,
+		POVendorProfileID: poVendorProfileID,
+		InvoiceDocumentID: req.InvoiceDocumentID,
+		Lines:             linesFromRequest(req.Lines),
 	}
 
 	created, err := h.store.CreateInvoice(r.Context(), inv)
@@ -262,6 +353,24 @@ func (h *Handler) ValidateInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, inv.LegalEntityID, actionValidateInvoice); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// AP-05's "invoice document", enforced at the completion boundary rather
+	// than at intake.
+	//
+	// §7 makes a draft an editable working state and INV-10 requires evidence
+	// before COMPLETION, not before creation. An invoice keyed ahead of its scan
+	// arriving is an ordinary Tuesday; an invoice asserted VALIDATED with no
+	// supplier document behind it is the audit gap — the point at which this
+	// service says the document is real and complete.
+	//
+	// A pre-contract invoice (recorded before migration 000006, so carrying no
+	// lines) is exempt: it was accepted under the old contract and refusing to
+	// let it move now would strand every historical payable mid-lifecycle.
+	if inv.InvoiceDocumentID == nil && !inv.IsPreContract() {
+		writeError(w, http.StatusUnprocessableEntity, "invoice_document_required",
+			domain.ErrInvoiceDocumentRequired.Error())
 		return
 	}
 
@@ -494,9 +603,40 @@ func requiredInvoiceFieldMissing(req domain.CreateVendorInvoiceRequest) string {
 		return "due_date"
 	case req.CorrelationID == "":
 		return "correlation_id"
+
+	// AP-05 required business/source inputs, reported the same way as the
+	// fields above so a caller gets one consistent missing_field answer.
+	case req.InvoiceDate.IsZero():
+		return "invoice_date"
+	case req.SupplyDate.IsZero():
+		return "supply_date"
 	default:
 		return ""
 	}
+}
+
+// invalidInvoiceLines checks AP-05's "lines" and "tax" inputs.
+//
+// Returns an error code and detail, or empty strings when the lines are
+// acceptable. Separate from requiredInvoiceFieldMissing because a line problem
+// cannot be named by a single field: a caller needs to know which line, and
+// whether the fault is the line itself or the total it rolls up to.
+func invalidInvoiceLines(req domain.CreateVendorInvoiceRequest) (code, detail string) {
+	if len(req.Lines) == 0 {
+		return "no_lines", domain.ErrNoLines.Error()
+	}
+	for i, l := range req.Lines {
+		if l.Description == "" || l.NetAmount < 0 || l.TaxAmount < 0 {
+			return "invalid_line", fmt.Sprintf("line %d: %s", i+1, domain.ErrInvalidLine.Error())
+		}
+	}
+	if !req.Balances() {
+		net, tax := req.LineTotals()
+		return "invoice_does_not_balance", fmt.Sprintf(
+			"%s (lines: net %.2f + tax %.2f = %.2f, amount: %.2f)",
+			domain.ErrInvoiceDoesNotBalance.Error(), net, tax, net+tax, req.Amount)
+	}
+	return "", ""
 }
 
 // requireTenant reads the caller's verified tenant scope from context (set by
