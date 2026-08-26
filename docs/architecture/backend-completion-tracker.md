@@ -311,7 +311,7 @@ Ordered by payload severity, which is how Priority 2 taught us to order this rat
 | 87 | `evidence-manifest-svc` — **Done** `ba54163` | 6 | **Assembled evidence bundles** — `record_snapshot` holds verbatim governance decisions, access decisions and workflow instances, i.e. the artefact handed to an auditor or regulator. No `internal/authz` package at all. Worst payload in the estate. |
 | 88 | `mtls-management-svc` — **Done** `d62a737` | 9 | Certificate lifecycle including **revoke** and rotate. Revoking a cert breaks the service-to-service auth depending on it. |
 | 89 | `siem-integration-svc` — **Done** `9e54275` (3 of 5 routes; see notes) | 7 | Exporter `auth_token` (a live credential — see 8p-a) and the tenant's whole security event stream. |
-| 90 | `key-management-svc` | 7 | Key metadata including **disable**, which is a denial of service on whatever the key protects. |
+| 90 | `key-management-svc` — **Done** `1d8623f` (5 of 5 routes) | 7 | Key metadata including **disable**, which is a denial of service on whatever the key protects. |
 | 91 | `tenant-entity-registry-svc` | 28 | **Not applicable** — corrected. It DOES authorize: `internal/authz.HTTPAuthZClient.Authorize` makes a real `POST /v1/authorize`, reached through a shared helper in `internal/registry/service.go` that maps authz errors. My Priority 2b measurement grepped `CheckAllowed(` and missed it because this service names the method `Authorize`. Row 65b closes with it. |
 | 92 | `schema-registry-svc` | 9 | `POST /{eventName}/versions` — writes to the platform event-schema registry, which every service's envelope shape depends on. |
 | 93 | `carta-svc` | 5 | Access-decision telemetry: device trust, trusted IPs, allow/deny boundary, and `RiskFactors` naming why a score moved. |
