@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"zoiko.io/mtls-management-svc/internal/authz"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/handler"
 	"zoiko.io/mtls-management-svc/internal/siem"
@@ -39,7 +40,8 @@ func main() {
 
 	s := store.NewMemoryStore()
 	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "mtls-management-svc", logger)
-	h := handler.New(s, internalCA, siemClient, logger)
+	authzClient := authz.NewClient(os.Getenv("AUTHZ_SERVICE_URL"))
+	h := handler.New(s, internalCA, siemClient, authzClient, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{Addr: ":" + port, Handler: router, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}
