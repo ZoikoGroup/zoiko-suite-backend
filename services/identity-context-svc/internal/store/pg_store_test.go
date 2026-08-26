@@ -32,9 +32,14 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS access_decision_log, delegated_authorities, principal_role_assignments, principals CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS principal_credentials, access_decision_log, delegated_authorities, principal_role_assignments, principals CASCADE;`)
 
-	for _, mFile := range []string{"000001_initial_schema.up.sql", "000002_add_data_classification.up.sql", "000003_add_rls.up.sql"} {
+	for _, mFile := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_data_classification.up.sql",
+		"000003_add_rls.up.sql",
+		"000004_add_principal_credentials.up.sql",
+	} {
 		migSQL, err := os.ReadFile(filepath.Join(migDir, mFile))
 		if err != nil {
 			t.Fatalf("failed to read migration file %s: %v", mFile, err)

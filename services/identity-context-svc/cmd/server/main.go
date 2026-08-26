@@ -27,6 +27,7 @@ import (
 	"zoiko.io/identity-context-svc/internal/authz"
 	"zoiko.io/identity-context-svc/internal/config"
 	identityctx "zoiko.io/identity-context-svc/internal/context"
+	"zoiko.io/identity-context-svc/internal/credential"
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
@@ -138,6 +139,33 @@ func main() {
 		log.Fatal("failed to initialise JWT signer", zap.Error(err))
 	}
 
+	// ── Password hashing ───────────────────────────────────────────────────
+	// Built before the server starts listening: NewHasher performs one
+	// derivation to precompute its timing decoy, and misconfigured cost
+	// factors must abort startup rather than silently hashing every password
+	// weakly for the life of the process.
+	hasher, err := credential.NewHasher(credential.Params{
+		MemoryKiB:   uint32(cfg.ArgonMemoryKiB),
+		Iterations:  uint32(cfg.ArgonIterations),
+		Parallelism: uint8(cfg.ArgonParallelism),
+		SaltLength:  credential.DefaultParams().SaltLength,
+		KeyLength:   credential.DefaultParams().KeyLength,
+	}, cfg.ArgonMaxConcurrent)
+	if err != nil {
+		log.Fatal("failed to initialise password hasher", zap.Error(err))
+	}
+	log.Info("password hasher ready",
+		zap.Int("argon2_memory_kib", cfg.ArgonMemoryKiB),
+		zap.Int("argon2_iterations", cfg.ArgonIterations),
+		zap.Int("max_concurrent", cfg.ArgonMaxConcurrent),
+		zap.Int("peak_memory_mib", (cfg.ArgonMemoryKiB*cfg.ArgonMaxConcurrent)/1024),
+	)
+
+	idpIssuer, err := auth.NewIdPTokenIssuer(cfg)
+	if err != nil {
+		log.Fatal("failed to initialise IdP token issuer", zap.Error(err))
+	}
+
 	siemClient := siem.New(cfg.SIEMServiceURL, "identity-context-svc", log)
 
 	// ── AuthZ client ───────────────────────────────────────────────────────
@@ -158,6 +186,24 @@ func main() {
 		verifier,
 		signer,
 		siemClient,
+	)
+
+	// ── Authenticator ─────────────────────────────────────────────────────
+	// The credential exchange that precedes resolution. principalRepo satisfies
+	// both PrincipalStore (for the resolver) and CredentialStore (for this) —
+	// they are separate interfaces over the same Postgres store because the
+	// two paths have no business reaching each other's tables.
+	authenticator := identityctx.NewAuthenticator(
+		log,
+		principalRepo,
+		hasher,
+		idpIssuer,
+		publisher,
+		siemClient,
+		identityctx.LockoutPolicy{
+			MaxFailedAttempts: cfg.AuthMaxFailedAttempts,
+			LockDuration:      time.Duration(cfg.AuthLockDurationSeconds) * time.Second,
+		},
 	)
 
 	// ── HTTP router ───────────────────────────────────────────────────────
@@ -200,7 +246,7 @@ func main() {
 	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
 
 	// Domain routes (all under /v1/)
-	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, authzClient, log)
+	h := identityctx.NewHandler(resolver, authenticator, sessionCache, principalRepo, authzClient, log)
 	identityctx.RegisterRoutes(r, h)
 
 	// ── Server ────────────────────────────────────────────────────────────
@@ -236,5 +282,6 @@ func main() {
 	}
 	log.Info("draining in-flight event goroutines")
 	resolver.Drain()
+	authenticator.Drain()
 	log.Info("identity-context-svc stopped")
 }

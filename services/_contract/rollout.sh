@@ -96,8 +96,19 @@ bank-reconciliation-svc reconciliation-intelligence-svc"
 # unexempted, every POST/PUT/PATCH/DELETE on the platform is refused 401 by the
 # authenticator itself while its JWT verification never runs.
 #
+# identity-context-svc:/v1/authenticate is the same circularity one step
+# earlier. It is where a human exchanges a password for the bearer token that
+# /v1/context/resolve turns into a signed envelope, so it necessarily runs
+# before any identity exists to put in the headers the contract demands. Left
+# unexempted, the endpoint that produces every identity on the platform refuses
+# every caller for lacking one.
+#
+# Note what is NOT exempted: /v1/context/resolve keeps the full contract. A
+# caller there already holds a verified bearer token and can name its tenant
+# and actor honestly.
+#
 # Format: "<svc>:<path>[,<path>...]" — one entry per service.
-EXEMPT_PATHS="gateway-auth-svc:/verify"
+EXEMPT_PATHS="gateway-auth-svc:/verify identity-context-svc:/v1/authenticate"
 
 in_list() {
 	local needle="$1" hay="$2" item

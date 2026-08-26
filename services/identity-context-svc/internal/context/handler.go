@@ -33,9 +33,10 @@ var ErrIdentityMissing = errors.New("missing X-Principal-Id header")
 // ErrTenantMissing is returned when X-Tenant-Id header is absent.
 var ErrTenantMissing = errors.New("missing X-Tenant-Id header")
 
-// Handler exposes the eight inbound REST endpoints defined in openapi.yaml.
+// Handler exposes the inbound REST endpoints defined in openapi.yaml.
 type Handler struct {
 	resolver   *Resolver
+	auth       *Authenticator
 	sessions   SessionCache
 	principals PrincipalStore
 	authz      AuthZClient
@@ -44,6 +45,7 @@ type Handler struct {
 
 func NewHandler(
 	resolver *Resolver,
+	auth *Authenticator,
 	sessions SessionCache,
 	principals PrincipalStore,
 	authz AuthZClient,
@@ -51,6 +53,7 @@ func NewHandler(
 ) *Handler {
 	return &Handler{
 		resolver:   resolver,
+		auth:       auth,
 		sessions:   sessions,
 		principals: principals,
 		authz:      authz,
@@ -62,6 +65,7 @@ func NewHandler(
 // All routes are under /v1/ per URI versioning strategy.
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1", func(r chi.Router) {
+		r.Post("/authenticate", h.Authenticate)
 		r.Post("/context/resolve", h.ResolveContext)
 		r.Get("/context/session/{sessionContextID}", h.GetSession)
 		r.Post("/context/session/{sessionContextID}/invalidate", h.InvalidateSession)
@@ -71,6 +75,67 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/principals/{principalID}/delegations", h.GetPrincipalDelegations)
 		r.Put("/principals/{principalID}/status", h.UpdatePrincipalStatus)
 	})
+}
+
+// ── POST /v1/authenticate ────────────────────────────────────────────────────
+//
+// The one endpoint on this service reachable without an identity, and the
+// entry point to the whole platform: it exchanges a human's password for the
+// bearer token /v1/context/resolve accepts.
+//
+// It is exempt from the canonical input contract (see EXEMPT_PATHS in
+// services/_contract/rollout.sh). The contract's unconditionally mandatory
+// fields include X-Tenant-Id and an actor header, and gateway-auth-svc sets
+// those only after verifying a signed envelope — which is what this endpoint
+// exists to make obtainable. Demanding them here would be circular, and
+// satisfiable only by a caller asserting the identity it has not yet proven.
+//
+// The tenant is therefore taken from the request BODY, not a header. That is
+// not a weakening: naming a tenant selects which tenant's principals to search
+// and confers nothing. A caller naming a tenant it has no credential in gets
+// the same rejection as any other wrong password.
+//
+// Response: 200 with a bearer token / 400 missing field / 401 invalid
+// credentials / 503 unavailable.
+func (h *Handler) Authenticate(w http.ResponseWriter, r *http.Request) {
+	var req domain.AuthenticateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.CorrelationID == "" {
+		req.CorrelationID = r.Header.Get("X-Correlation-ID")
+	}
+
+	resp, err := h.auth.Authenticate(r.Context(), req)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrAuthRequestInvalid):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, ErrInvalidCredentials):
+			// One message for every rejection reason. See ErrInvalidCredentials
+			// — the reason is in access_decision_log and the event stream, not
+			// on the wire, so this response cannot be used to enumerate
+			// accounts or probe lockout state.
+			writeError(w, http.StatusUnauthorized, "invalid credentials")
+		case errors.Is(err, ErrAuthUnavailable):
+			// 503, not 401: the attempt could not be decided. Collapsing the
+			// two would report an outage as a wrong password.
+			h.log.Error("authentication unavailable", zap.Error(err),
+				zap.String("correlation_id", req.CorrelationID))
+			writeError(w, http.StatusServiceUnavailable, "authentication unavailable")
+		default:
+			h.log.Error("unexpected authentication error", zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
+	// Tokens must never be cached by an intermediary or written to a shared
+	// store. Set explicitly rather than relying on any default.
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ── POST /v1/context/resolve ─────────────────────────────────────────────────
@@ -316,3 +381,4 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 var _ PrincipalStore = (*store.PgStore)(nil)
 var _ SessionCache = (*session.Cache)(nil)
 var _ RiskSignalCache = (*session.RiskSignalCache)(nil)
+var _ CredentialStore = (*store.PgStore)(nil)

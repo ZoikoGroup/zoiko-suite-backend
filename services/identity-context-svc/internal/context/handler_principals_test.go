@@ -26,7 +26,9 @@ func (m *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEn
 
 func newPrincipalsRouter(store *mockPrincipalStore) chi.Router {
 	r := chi.NewRouter()
-	h := identityctx.NewHandler(nil, nil, store, &mockAuthzClient{}, zap.NewNop())
+	// Resolver and authenticator are nil: these tests exercise only the
+	// /v1/principals routes, which touch neither.
+	h := identityctx.NewHandler(nil, nil, nil, store, &mockAuthzClient{}, zap.NewNop())
 	identityctx.RegisterRoutes(r, h)
 	return r
 }

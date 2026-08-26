@@ -214,15 +214,92 @@ type UpdateStatusRequest struct {
 	Reason string          `json:"reason,omitempty"`
 }
 
+// ---------------------------------------------------------------------------
+// Authentication  (the credential exchange that precedes resolution)
+// ---------------------------------------------------------------------------
+
+// AuthenticateRequest is a human presenting a password.
+//
+// TenantID is mandatory rather than derived from the email address. Every
+// store method on this service takes a tenant scope because the tables enforce
+// RLS against app.tenant_id, and a global email lookup would have to run
+// unscoped — reading across every tenant's principals to decide which tenant
+// the caller belongs to. That is precisely the query RLS exists to prevent, so
+// the caller names its tenant and the lookup stays inside it. A console knows
+// its own tenant; a caller that does not is not yet in a position to
+// authenticate.
+type AuthenticateRequest struct {
+	TenantID      string `json:"tenant_id"`
+	Email         string `json:"email"`
+	Password      string `json:"password"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// AuthenticateResponse carries the IdP-shaped bearer token that
+// POST /v1/context/resolve accepts.
+//
+// This is NOT the identity envelope and confers no access on its own: it
+// attests "this human proved possession of this principal's password" and
+// nothing else. The caller exchanges it for an envelope by calling
+// /v1/context/resolve with a legal_entity_id, which is where tenant lifecycle,
+// entity scope, role profile, delegated authority and trust posture are
+// actually resolved. Keeping the two steps separate is what stops a password
+// from being sufficient to act.
+type AuthenticateResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+	PrincipalID string `json:"principal_id"`
+	TenantID    string `json:"tenant_id"`
+	// MFARequired reports that the principal's trust posture will not reach
+	// MFA_VERIFIED from this token alone. It is advisory: authorization-svc,
+	// not this service, decides whether a posture is sufficient for an action.
+	MFARequired bool `json:"mfa_required"`
+}
+
+// PrincipalCredential is the stored password material for one principal.
+// SecretHash is a PHC-encoded argon2id digest and is never serialised — the
+// struct carries no JSON tags for exactly that reason.
+type PrincipalCredential struct {
+	CredentialID        string
+	PrincipalID         string
+	TenantID            string
+	CredentialType      string
+	SecretHash          string
+	Algorithm           string
+	Status              string
+	FailedAttemptCount  int
+	LockedUntil         *time.Time
+	LastAuthenticatedAt *time.Time
+}
+
+// CredentialStatus values. A RETIRED credential is kept rather than deleted so
+// a rotation leaves a trail (doctrine §2.11).
+const (
+	CredentialStatusActive  = "ACTIVE"
+	CredentialStatusRetired = "RETIRED"
+)
+
+// CredentialTypePassword is the only factor issued today.
+const CredentialTypePassword = "PASSWORD"
+
+// ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
+var ErrPrincipalNotFound = errors.New("principal not found")
+
+// ErrCredentialNotFound is returned when a principal exists but holds no
+// active credential of the requested type.
+//
+// Callers must not surface this to a client as distinct from a wrong password.
+// A client that can tell "no such account" from "wrong password" is a client
+// that can enumerate every account on the platform one request at a time.
+var ErrCredentialNotFound = errors.New("credential not found")
+
 // VerifiedClaims is the parsed output of a verified IdP token.
 type VerifiedClaims struct {
 	Subject  string
 	TenantID string
 	MFADone  bool
 }
-
-// ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
-var ErrPrincipalNotFound = errors.New("principal not found")
 
 // ErrAuthorizationDenied is returned when the caller is not authorized for the requested action.
 var ErrAuthorizationDenied = errors.New("authorization denied")

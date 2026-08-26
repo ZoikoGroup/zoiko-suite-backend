@@ -1,4 +1,16 @@
+# Environment files. `.env` on its own does NOT match `.env.local` or
+# `.env.production` — a gitignore pattern with no wildcard matches that exact
+# name only — so the variants are listed explicitly. Getting this wrong commits
+# live database credentials, and rewriting history is the only way back.
+#
+# `.env.example` is negated because it is the template: committed on purpose,
+# blank on purpose.
 .env
+.env.local
+.env.production
+.env.*.local
+!.env.example
+
 *.pem
 
 # secret-vault-integration-svc's local dev vault store — never commit
@@ -9,3 +21,9 @@ services/*/secret_store.local
 # binaries left in a service's own root directory)
 services/*/server
 services/*/healthcheck
+
+# same, for the Supabase bootstrap tool. `go build ./...` inside its directory
+# drops a ~13 MB binary named after the module, which is a build artifact and
+# not a deliverable — the tool is run with `go run .`.
+deployments/supabase/supabase-bootstrap
+deployments/supabase/supabase-bootstrap.exe

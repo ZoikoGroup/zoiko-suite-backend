@@ -458,6 +458,24 @@ services:
       JWT_SIGNING_SECRET: "local-dev-jwt-signing-secret-key-32-chars-long"
       JWT_SIGNING_PRIVATE_KEY_PATH: "/keys/envelope_signing_key.pem"
       JWT_KEY_ID: "local-dev-key-1"
+      # Lifetime of the bearer token POST /v1/authenticate mints. It is an
+      # intermediate credential the caller exchanges immediately for an
+      # identity envelope at /v1/context/resolve, so it is short by design.
+      IDP_TOKEN_TTL_SECONDS: "300"
+      # argon2id cost factors for password hashing (internal/credential).
+      # ARGON2_MEMORY_KIB x ARGON2_MAX_CONCURRENT is the peak memory the login
+      # path can hold at once — 19456 KiB x 4 = 76 MiB against the 256m
+      # mem_limit below. Raising either without checking the other is how a
+      # password-guessing attempt becomes an OOM kill of a Tier 0 service.
+      ARGON2_MEMORY_KIB: "19456"
+      ARGON2_ITERATIONS: "2"
+      ARGON2_PARALLELISM: "1"
+      ARGON2_MAX_CONCURRENT: "4"
+      # Per-credential lockout. Bounds guessing against one account; it does
+      # not bound a spray across many accounts at one guess each — that needs
+      # a gateway-level rate limit on /v1/authenticate.
+      AUTH_MAX_FAILED_ATTEMPTS: "5"
+      AUTH_LOCK_DURATION_SECONDS: "900"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       ACCESS_CONTROL_URL: "http://identity-svc:8080"
