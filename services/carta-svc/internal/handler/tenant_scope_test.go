@@ -56,6 +56,7 @@ func evaluate(t *testing.T, r http.Handler, tenantID, subjectID string, deviceTr
 	req := httptest.NewRequest(http.MethodPost, "/v1/carta/evaluate", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -130,6 +131,7 @@ func TestForeignTenant_CannotReadAssessment(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments/"+asmID, nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -147,6 +149,7 @@ func TestForeignTenant_CannotReadAssessment(t *testing.T) {
 	// assessment that happens to carry no RiskFactors at all).
 	ownReq := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments/"+asmID, nil)
 	ownReq.Header.Set("X-Tenant-ID", "tenant-a")
+	ownReq.Header.Set("X-Principal-Id", "principal-test-01")
 	ownW := httptest.NewRecorder()
 	r.ServeHTTP(ownW, ownReq)
 	if ownW.Code != http.StatusOK {
@@ -165,8 +168,9 @@ func TestForeignTenant_CannotListOthersAssessments(t *testing.T) {
 	evaluate(t, r, "tenant-a", "tenant-a-exec", 20, false)
 	evaluate(t, r, "tenant-b", "tenant-b-analyst", 95, true)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments?legal_entity_id=le-1", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -200,8 +204,9 @@ func TestSubjectFilter_NarrowsWithinTenant_DoesNotReplaceIt(t *testing.T) {
 
 	// Both tenants assessed a subject with the SAME id. Filtering by it as
 	// tenant-b must return only tenant-b's row.
-	req := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments?subject_id=shared-subject-id", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments?legal_entity_id=le-1&subject_id=shared-subject-id", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -249,7 +254,7 @@ func TestTwoHeaderlessCallersDoNotShareANamespace(t *testing.T) {
 		t.Fatalf("header-less evaluate must be refused, got %d: %s", w.Code, w.Body.String())
 	}
 
-	listReq := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments", nil)
+	listReq := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments?legal_entity_id=le-1", nil)
 	listW := httptest.NewRecorder()
 	r.ServeHTTP(listW, listReq)
 	if listW.Code != http.StatusUnauthorized {

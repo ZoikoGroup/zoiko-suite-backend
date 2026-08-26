@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 
+	"zoiko.io/workflow-history-svc/internal/authz"
 	"zoiko.io/workflow-history-svc/internal/config"
 	"zoiko.io/workflow-history-svc/internal/consumer"
 	"zoiko.io/workflow-history-svc/internal/handler"
@@ -138,7 +139,11 @@ func main() {
 	router.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
 
 	// Workflow history read API.
-	historyH := handler.New(pgStore, log)
+	// authorization-svc client. AUTHZ_SERVICE_URL rather than a config field:
+	// this service had no authorization dependency at all until now, so there
+	// was no existing config surface to extend.
+	authzClient := authz.NewClient(os.Getenv("AUTHZ_SERVICE_URL"))
+	historyH := handler.New(pgStore, authzClient, log)
 	// NOTE: The cross-workflow route /v1/workflows/history must be registered
 	// BEFORE the parameterised /v1/workflows/{workflow_instance_id}/history
 	// so chi's router matches the static path segment first.
