@@ -31,18 +31,43 @@ const (
 )
 
 type SIEMExporter struct {
-	ID            string         `json:"id"`
-	TenantID      string         `json:"tenant_id"`
-	LegalEntityID string         `json:"legal_entity_id"`
-	Name          string         `json:"name"`
-	Platform      SIEMPlatform   `json:"platform"`
-	EndpointURL   string         `json:"endpoint_url"`
-	AuthToken     string         `json:"auth_token,omitempty"`
-	Status        ExporterStatus `json:"status"`
-	EventsSent    int64          `json:"events_sent"`
-	LastStreamed  *time.Time     `json:"last_streamed,omitempty"`
-	CreatedAt     time.Time      `json:"created_at"`
-	UpdatedAt     time.Time      `json:"updated_at"`
+	ID            string       `json:"id"`
+	TenantID      string       `json:"tenant_id"`
+	LegalEntityID string       `json:"legal_entity_id"`
+	Name          string       `json:"name"`
+	Platform      SIEMPlatform `json:"platform"`
+	EndpointURL   string       `json:"endpoint_url"`
+	// AuthToken is the credential for the tenant's SIEM platform. It is
+	// json:"-" so it can NEVER be serialised, on any route, present or
+	// future — a structural fix rather than a per-handler one.
+	//
+	// It was previously json:"auth_token,omitempty", and both GetExporter
+	// and ListExporters return this struct directly, so any caller holding
+	// the tenant header read the live token back out. Redacting at each
+	// call site would have worked today and silently regressed the first
+	// time someone added a fourth read route; the wire format simply
+	// cannot carry it now. Nothing needs it there: CreateExporterRequest
+	// carries its own AuthToken field for input, and this struct is never
+	// JSON round-tripped for persistence (the store is in-memory).
+	//
+	// Two deeper problems this does NOT fix, both tracked as row 8p-a:
+	//
+	//  1. The token is stored in plaintext. Doc 05 §13 calls for a vault
+	//     reference rather than the secret itself, which needs
+	//     secret-vault-integration-svc to be able to return material —
+	//     blocked on row 81.
+	//  2. Nothing ever READS this field. StreamEvent persists events
+	//     locally and never authenticates to the SIEM platform, so the
+	//     service currently collects and holds a live third-party
+	//     credential it has no functional use for. Until egress exists,
+	//     the safest version of this service would not accept the token at
+	//     all.
+	AuthToken    string         `json:"-"`
+	Status       ExporterStatus `json:"status"`
+	EventsSent   int64          `json:"events_sent"`
+	LastStreamed *time.Time     `json:"last_streamed,omitempty"`
+	CreatedAt    time.Time      `json:"created_at"`
+	UpdatedAt    time.Time      `json:"updated_at"`
 }
 
 type SIEMEvent struct {
