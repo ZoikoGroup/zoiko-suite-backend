@@ -33,6 +33,16 @@ import (
 	"zoiko.io/workflow-history-svc/internal/store"
 )
 
+// grantingAuthz satisfies handler.AuthzChecker and always grants.
+//
+// This suite exercises health probes and store wiring against real Postgres,
+// not the authorization decision — the deny and unavailable branches are
+// covered by internal/handler/history_test.go. A denying stub here would mask
+// what this suite is actually testing.
+type grantingAuthz struct{}
+
+func (grantingAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return nil }
+
 // freePort returns an OS-assigned free TCP port on localhost.
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -97,7 +107,10 @@ func TestIntegration(t *testing.T) {
 	log := zap.NewNop()
 	pgStore := store.NewPgStore(pool, log)
 	healthH := health.New(pool, log)
-	historyH := handler.New(pgStore, log)
+	// A granting authorization stub. This suite exercises health probes and
+	// store wiring against real Postgres, not the authorization decision —
+	// a denying stub here would mask what it is actually testing.
+	historyH := handler.New(pgStore, grantingAuthz{}, log)
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
