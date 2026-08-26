@@ -40,6 +40,7 @@ func createExporter(t *testing.T, r http.Handler, tenantID, name, token string) 
 	req := httptest.NewRequest(http.MethodPost, "/v1/siem/exporters", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -112,6 +113,7 @@ func TestForeignTenant_CannotReadExporterAuthToken(t *testing.T) {
 	// Direct read by id.
 	req := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters/"+expID, nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -124,6 +126,7 @@ func TestForeignTenant_CannotReadExporterAuthToken(t *testing.T) {
 	// Unfiltered list.
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters", nil)
 	listReq.Header.Set("X-Tenant-ID", "tenant-b")
+	listReq.Header.Set("X-Principal-Id", "principal-test-01")
 	listW := httptest.NewRecorder()
 	r.ServeHTTP(listW, listReq)
 	if listW.Code != http.StatusOK {
@@ -138,6 +141,7 @@ func TestForeignTenant_CannotReadExporterAuthToken(t *testing.T) {
 	// Sanity: tenant-a still gets its own.
 	ownReq := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters/"+expID, nil)
 	ownReq.Header.Set("X-Tenant-ID", "tenant-a")
+	ownReq.Header.Set("X-Principal-Id", "principal-test-01")
 	ownW := httptest.NewRecorder()
 	r.ServeHTTP(ownW, ownReq)
 	if ownW.Code != http.StatusOK {
@@ -160,22 +164,49 @@ func TestForeignTenant_CannotReadOthersSecurityEvents(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/siem/stream", bytes.NewReader(streamBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-a")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("stream event as tenant-a: expected 201, got %d — %s", w.Code, w.Body.String())
 	}
 
-	// Tenant B, unfiltered event list.
-	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/events", nil)
+	// Tenant B asks for the event list using TENANT-A's exporter id.
+	//
+	// This is a stronger assertion than the unfiltered list it replaces.
+	// exporter_id is now required (it is the authorization scope), so the
+	// interesting question is no longer "does an unscoped list leak" but
+	// "does naming the victim's exporter directly get you anywhere". It must
+	// not: the store is tenant-scoped, so tenant-b's lookup of tenant-a's
+	// exporter finds nothing and the request stops at 404 — before the
+	// authorization check, and long before any event is read.
+	//
+	// 404 rather than 403 is deliberate. A distinct forbidden would confirm
+	// to a prober that the exporter id exists.
+	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/events?exporter_id="+expID, nil)
 	listReq.Header.Set("X-Tenant-ID", "tenant-b")
+	listReq.Header.Set("X-Principal-Id", "principal-test-01")
 	listW := httptest.NewRecorder()
 	r.ServeHTTP(listW, listReq)
-	if listW.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", listW.Code, listW.Body.String())
+	if listW.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for another tenant's exporter, got %d: %s", listW.Code, listW.Body.String())
 	}
 	if bytes.Contains(listW.Body.Bytes(), []byte("tenant-a-sensitive-detection-detail")) {
 		t.Fatalf("ISOLATION FAILURE: tenant-b read tenant-a's security events: %s", listW.Body.String())
+	}
+
+	// Sanity: tenant-a can read its own events through the same route, so
+	// the refusal above is isolation rather than a route that never works.
+	ownList := httptest.NewRequest(http.MethodGet, "/v1/siem/events?exporter_id="+expID, nil)
+	ownList.Header.Set("X-Tenant-ID", "tenant-a")
+	ownList.Header.Set("X-Principal-Id", "principal-test-01")
+	ownListW := httptest.NewRecorder()
+	r.ServeHTTP(ownListW, ownList)
+	if ownListW.Code != http.StatusOK {
+		t.Fatalf("tenant-a must read its own events, got %d: %s", ownListW.Code, ownListW.Body.String())
+	}
+	if !bytes.Contains(ownListW.Body.Bytes(), []byte("tenant-a-sensitive-detection-detail")) {
+		t.Fatalf("tenant-a's own event list should contain its event: %s", ownListW.Body.String())
 	}
 
 	var resp struct {
@@ -205,6 +236,7 @@ func TestForeignTenant_CannotStreamIntoOthersExporter(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/siem/stream", bytes.NewReader(streamBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-b")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	// Assert 404 specifically, not merely "not 201". An earlier draft of this
@@ -220,6 +252,7 @@ func TestForeignTenant_CannotStreamIntoOthersExporter(t *testing.T) {
 	// And tenant-a's feed must be clean.
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/events", nil)
 	listReq.Header.Set("X-Tenant-ID", "tenant-a")
+	listReq.Header.Set("X-Principal-Id", "principal-test-01")
 	listW := httptest.NewRecorder()
 	r.ServeHTTP(listW, listReq)
 	if bytes.Contains(listW.Body.Bytes(), []byte("forged-by-tenant-b")) {

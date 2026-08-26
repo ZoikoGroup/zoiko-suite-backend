@@ -1,12 +1,15 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	authzpkg "zoiko.io/carta-svc/internal/authz"
 	"zoiko.io/carta-svc/internal/domain"
 	"zoiko.io/carta-svc/internal/store"
 )
@@ -50,12 +53,86 @@ func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return tenantID, true
 }
 
+// Action constants passed to authorization-svc as action_type.
+const (
+	CartaAssessmentRead = "CARTA_ASSESSMENT_READ"
+)
+
+// AuthzChecker is the authorization-svc contract this handler depends on.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
 type Handler struct {
 	store  store.Store
+	authz  AuthzChecker
 	logger *zap.Logger
 }
 
-func New(s store.Store, l *zap.Logger) *Handler { return &Handler{store: s, logger: l} }
+func New(s store.Store, az AuthzChecker, l *zap.Logger) *Handler {
+	return &Handler{store: s, authz: az, logger: l}
+}
+
+// ── Why POST /v1/carta/evaluate has NO principal guard ──────────────────
+//
+// Two of this service's three routes require a verified principal and an
+// authorization decision. /evaluate does not, and that is not an oversight
+// to be tidied up later — a guard there would be circular.
+//
+// gateway-auth-svc calls POST /v1/carta/evaluate (and only that route — its
+// client has no reference to /assessments) with X-Tenant-ID and nothing
+// else. It passes the principal it is asking ABOUT as context.subject_id in
+// the request body, not as a caller identity.
+//
+// That is the whole point of the endpoint. It is called DURING
+// authentication, to score whether an access request should be allowed,
+// stepped up to MFA, isolated or denied. Requiring the subject to prove it
+// is authorized before the platform will decide whether it is trustworthy
+// inverts the dependency: the answer would be needed to ask the question.
+//
+// This is the same shape as siem-integration-svc's /stream (row 84d) —
+// gateway-auth-svc streaming an authentication FAILURE has no authenticated
+// principal either — and the correct control is the same: SERVICE identity
+// via mutual TLS, which mtls-management-svc already issues. Until that is
+// wired, /evaluate stays tenant-scoped only.
+//
+// Residual exposure, named rather than dismissed: a caller holding a tenant
+// header can submit fabricated evaluation requests, which both pollutes the
+// tenant's assessment history and lets an attacker probe the scoring
+// function to learn where the ALLOW boundary sits. Logged with row 84d
+// rather than left implicit.
+//
+// TestEvaluateStillWorksWithoutPrincipal pins the current behaviour, so a
+// future "consistency" change fails loudly instead of breaking the
+// platform's authentication path.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		h.errJSON(w, http.StatusUnauthorized,
+			"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
+		return "", false
+	}
+	return principalID, true
+}
+
+// authorize asks authorization-svc whether this principal may perform
+// actionType within legalEntityID, and fails CLOSED.
+//
+// One action, not several: both guarded routes are reads of the same
+// resource, and splitting READ from LIST would create two grants that no
+// policy would ever hold separately.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionType); err != nil {
+		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
+			h.errJSON(w, http.StatusForbidden, "not authorized to perform this action")
+			return false
+		}
+		h.logger.Error("authorization check failed", zap.Error(err))
+		h.errJSON(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		return false
+	}
+	return true
+}
 
 func NewRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
@@ -99,9 +176,19 @@ func (h *Handler) GetAssessment(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	asm, err := h.store.GetAssessmentByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
 		h.errJSON(w, 404, "assessment not found")
+		return
+	}
+	// Authorized against the assessment row's own legal entity, never a
+	// caller-supplied scope. The store is already tenant-scoped, so another
+	// tenant's assessment is a 404 above.
+	if !h.authorize(w, r, principalID, asm.LegalEntityID, CartaAssessmentRead) {
 		return
 	}
 	h.okJSON(w, 200, asm)
@@ -112,7 +199,23 @@ func (h *Handler) ListAssessments(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	asms, _ := h.store.ListAssessments(r.Context(), tenantID, r.URL.Query().Get("subject_id"))
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// legal_entity_id is REQUIRED — it is the authorization scope for a
+	// listing, and an optional scope parameter is a scope that disables
+	// itself. subject_id stays optional and narrows within it.
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		h.errJSON(w, http.StatusBadRequest,
+			"legal_entity_id query parameter is required — it is the authorization scope for this listing")
+		return
+	}
+	if !h.authorize(w, r, principalID, legalEntityID, CartaAssessmentRead) {
+		return
+	}
+	asms, _ := h.store.ListAssessments(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("subject_id"))
 	if asms == nil {
 		asms = []domain.CartaAssessment{}
 	}

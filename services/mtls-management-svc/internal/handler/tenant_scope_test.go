@@ -36,6 +36,7 @@ func provisionCert(t *testing.T, r http.Handler, tenantID, serviceName string) s
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -118,6 +119,7 @@ func TestForeignTenant_CannotRevokeCertificate(t *testing.T) {
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("X-Tenant-ID", "tenant-b")
+		req.Header.Set("X-Principal-Id", "principal-test-01")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusNotFound {
@@ -127,6 +129,7 @@ func TestForeignTenant_CannotRevokeCertificate(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates/"+certID, nil)
 	req.Header.Set("X-Tenant-ID", "tenant-a")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -156,8 +159,14 @@ func TestForeignTenant_CannotListOthersCertificates(t *testing.T) {
 	provisionCert(t, r, "tenant-a", "svc-a")
 	provisionCert(t, r, "tenant-b", "svc-b")
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates", nil)
+	// legal_entity_id is now mandatory: it is the authorization scope for a
+	// listing, and an optional scope parameter is a scope that disables
+	// itself. Both tenants provision under le-1, so this asks for the SAME
+	// legal entity tenant-a used — which is what makes the isolation
+	// assertion below meaningful rather than incidental.
+	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates?legal_entity_id=le-1", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
