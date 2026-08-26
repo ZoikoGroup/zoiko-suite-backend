@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,13 @@ import (
 	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
+
+// scopeStubAuthz is a test double for AuthzChecker in the internal test
+// package. GRANTS by default — these tests exercise TENANT isolation, and an
+// authorization denial here would mask what they are actually asserting.
+type scopeStubAuthz struct{}
+
+func (s *scopeStubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return nil }
 
 // Tenant-scope tests for key-management-svc (tracker row 8k).
 //
@@ -32,7 +40,7 @@ import (
 // actually encrypts or decrypts anything).
 
 func newTestRouter() http.Handler {
-	return NewRouter(New(store.NewMemoryStore(), siem.New("", "key-management-svc", zap.NewNop()), zap.NewNop()))
+	return NewRouter(New(store.NewMemoryStore(), siem.New("", "key-management-svc", zap.NewNop()), &scopeStubAuthz{}, zap.NewNop()))
 }
 
 func registerKey(t *testing.T, r http.Handler, tenantID, alias string) string {
@@ -47,6 +55,7 @@ func registerKey(t *testing.T, r http.Handler, tenantID, alias string) string {
 	req := httptest.NewRequest(http.MethodPost, "/v1/keys", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -117,6 +126,7 @@ func TestForeignTenant_CannotDisableKey(t *testing.T) {
 	for _, route := range []string{"/v1/keys/" + keyID + "/disable", "/v1/keys/" + keyID + "/rotate"} {
 		req := httptest.NewRequest(http.MethodPost, route, nil)
 		req.Header.Set("X-Tenant-ID", "tenant-b")
+		req.Header.Set("X-Principal-Id", "principal-test-01")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusNotFound {
@@ -127,6 +137,7 @@ func TestForeignTenant_CannotDisableKey(t *testing.T) {
 	// tenant-a's key must still be there and still usable.
 	req := httptest.NewRequest(http.MethodGet, "/v1/keys/"+keyID, nil)
 	req.Header.Set("X-Tenant-ID", "tenant-a")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -155,8 +166,12 @@ func TestForeignTenant_CannotListOthersKeys(t *testing.T) {
 	registerKey(t, r, "tenant-a", "tenant-a-key")
 	registerKey(t, r, "tenant-b", "tenant-b-key")
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/keys", nil)
+	// legal_entity_id is now mandatory — it is the authorization scope. Both
+	// tenants registered under le-1, so tenant-b asking for le-1 is the
+	// sharper test: same legal entity, different tenant.
+	req := httptest.NewRequest(http.MethodGet, "/v1/keys?legal_entity_id=le-1", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
