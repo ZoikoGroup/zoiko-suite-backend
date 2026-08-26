@@ -2,14 +2,15 @@
 //
 // Endpoints:
 //
-//	GET /v1/workflows/{workflow_instance_id}/history?tenant_id=...
+//	GET /v1/workflows/{workflow_instance_id}/history
 //	  Returns the full chronological transition list for one workflow instance,
-//	  scoped to the given tenant_id. 404 if no events exist for the given
-//	  instance ID within that tenant — indistinguishable from the instance
+//	  scoped to the VERIFIED tenant from X-Tenant-Id (a tenant_id query
+//	  parameter is still accepted but must match it). 404 if no events exist
+//	  for the given instance ID within that tenant — indistinguishable from the instance
 //	  belonging to a different tenant, so this endpoint cannot be used to
 //	  probe for the existence of another tenant's workflow instances.
 //
-//	GET /v1/workflows/history?tenant_id=...&legal_entity_id=...&from=...&to=...
+//	GET /v1/workflows/history?legal_entity_id=...&from=...&to=...
 //	  Cross-workflow query for all transitions within a time window for a
 //	  specific tenant and legal entity.
 //
@@ -21,25 +22,29 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	authzpkg "zoiko.io/workflow-history-svc/internal/authz"
 	"zoiko.io/workflow-history-svc/internal/store"
 )
 
 // Handler exposes the workflow history read API.
 type Handler struct {
-	read store.ReadStore
-	log  *zap.Logger
+	authz AuthzChecker
+	read  store.ReadStore
+	log   *zap.Logger
 }
 
 // New returns a Handler wired to the given ReadStore.
-func New(read store.ReadStore, log *zap.Logger) *Handler {
-	return &Handler{read: read, log: log}
+func New(read store.ReadStore, az AuthzChecker, log *zap.Logger) *Handler {
+	return &Handler{read: read, authz: az, log: log}
 }
 
 // historyEventResponse is the JSON shape returned by both read endpoints.
@@ -56,6 +61,82 @@ type historyEventResponse struct {
 
 type errorResponse struct {
 	Error string `json:"error"`
+}
+
+// Action constant passed to authorization-svc as action_type.
+const WorkflowHistoryRead = "WORKFLOW_HISTORY_READ"
+
+// AuthzChecker is the authorization-svc contract this handler depends on.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+}
+
+// requireTenant returns the gateway-verified tenant, and refuses the request
+// when there is none.
+//
+// This replaces reading tenant_id from the QUERY STRING, which is what both
+// routes did — and it was not merely a missing check, it was a cross-tenant
+// read. Nothing in this service ever read X-Tenant-Id at all.
+//
+// The chain mattered because this service DOES have row-level security:
+//
+//	handler:  tenantID := r.URL.Query().Get("tenant_id")   // caller-supplied
+//	store:    set_config('app.tenant_id', tenantID, ...)   // via withRLS
+//	policy:   USING (tenant_id = current_setting('app.tenant_id', true))
+//
+// So the policy was never bypassed — it was SATISFIED, with a value the
+// caller chose. Postgres faithfully returned the rows of whatever tenant was
+// named in the URL. That is the same security-theater shape as the five
+// Priority 1b business services, but strictly worse: there a header-less
+// caller landed in one shared synthetic bucket, whereas here a caller picks
+// its victim by editing a query parameter.
+//
+// What that exposed is the workflow transition log — every state change,
+// approval and event payload for another tenant's governed work.
+//
+// tenant_id is still accepted on the query string for URL compatibility, but
+// it may now only AGREE with the verified header; disagreement is refused
+// rather than silently resolved, so a caller that means to read another
+// tenant gets an error instead of a quietly reinterpreted answer.
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized,
+			"X-Tenant-Id is required — the gateway sets it from a verified identity envelope")
+		return "", false
+	}
+	if declared := r.URL.Query().Get("tenant_id"); declared != "" && declared != tenantID {
+		writeError(w, http.StatusForbidden,
+			"tenant_id in the query does not match the verified X-Tenant-Id")
+		return "", false
+	}
+	return tenantID, true
+}
+
+// requirePrincipal returns the gateway-verified principal, or refuses.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		writeError(w, http.StatusUnauthorized,
+			"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
+		return "", false
+	}
+	return principalID, true
+}
+
+// authorize asks authorization-svc whether this principal may read workflow
+// history within legalEntityID, and fails CLOSED.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, WorkflowHistoryRead); err != nil {
+		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
+			writeError(w, http.StatusForbidden, "not authorized to read workflow history")
+			return false
+		}
+		h.log.Error("authorization check failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		return false
+	}
+	return true
 }
 
 func toResponse(e store.WorkflowHistoryEvent) historyEventResponse {
@@ -75,17 +156,21 @@ func toResponse(e store.WorkflowHistoryEvent) historyEventResponse {
 //
 // Returns the full chronological transition list for one workflow instance,
 // ordered by recorded_at ASC (earliest event first).
-// 400 if tenant_id is missing. 404 if no events exist for the given instance
-// ID within that tenant.
+// 401 if X-Tenant-Id or X-Principal-Id is missing, 403 if a tenant_id query
+// parameter disagrees with the verified header or authorization is denied,
+// 404 if no events exist for the given instance ID within that tenant.
 func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 	instanceID := chi.URLParam(r, "workflow_instance_id")
 	if instanceID == "" {
 		writeError(w, http.StatusBadRequest, "workflow_instance_id is required")
 		return
 	}
-	tenantID := r.URL.Query().Get("tenant_id")
-	if tenantID == "" {
-		writeError(w, http.StatusBadRequest, "tenant_id is required")
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 
@@ -101,6 +186,16 @@ func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 
 	if len(events) == 0 {
 		writeError(w, http.StatusNotFound, "no history found for workflow_instance_id")
+		return
+	}
+
+	// Authorized against the legal entity these events actually belong to,
+	// read from the rows rather than from anything the caller supplied. The
+	// store query above is already scoped to the verified tenant, so another
+	// tenant's instance is indistinguishable from a nonexistent one (404)
+	// before this point — which is also why authorizing here cannot leak the
+	// existence of an instance the caller may not see.
+	if !h.authorize(w, r, principalID, events[0].LegalEntityID) {
 		return
 	}
 
@@ -127,17 +222,27 @@ func (h *Handler) GetInstanceHistory(w http.ResponseWriter, r *http.Request) {
 // See package doc for details.
 func (h *Handler) GetCrossWorkflowHistory(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	tenantID := q.Get("tenant_id")
 	legalEntityID := q.Get("legal_entity_id")
 	fromStr := q.Get("from")
 	toStr := q.Get("to")
 
-	if tenantID == "" {
-		writeError(w, http.StatusBadRequest, "tenant_id is required")
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	if legalEntityID == "" {
 		writeError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	// legal_entity_id was already mandatory on this route, which makes it a
+	// usable authorization scope as-is — no API tightening needed here,
+	// unlike the list routes in mtls/key-management/carta where it was
+	// optional and therefore self-disabling.
+	if !h.authorize(w, r, principalID, legalEntityID) {
 		return
 	}
 	if fromStr == "" {
