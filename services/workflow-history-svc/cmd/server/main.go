@@ -142,7 +142,15 @@ func main() {
 	// authorization-svc client. AUTHZ_SERVICE_URL rather than a config field:
 	// this service had no authorization dependency at all until now, so there
 	// was no existing config surface to extend.
-	authzClient := authz.NewClient(os.Getenv("AUTHZ_SERVICE_URL"))
+	// Fail fast rather than starting and 503-ing every guarded route. See the
+	// equivalent guard in the other Priority 2b services: authz.NewClient("")
+	// builds requests against an empty base URL, so every CheckAllowed fails
+	// and the client correctly refuses — right at request time, wrong at boot.
+	authzURL := os.Getenv("AUTHZ_SERVICE_URL")
+	if authzURL == "" {
+		log.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
+	}
+	authzClient := authz.NewClient(authzURL)
 	historyH := handler.New(pgStore, authzClient, log)
 	// NOTE: The cross-workflow route /v1/workflows/history must be registered
 	// BEFORE the parameterised /v1/workflows/{workflow_instance_id}/history

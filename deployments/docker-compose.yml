@@ -1214,6 +1214,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "workflow-history-svc"
       KAFKA_TOPIC: "zoiko.workflow.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:
@@ -1787,6 +1788,7 @@ services:
     environment:
       PORT: "8140"
       CA_DATA_DIR: "/data/ca"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     volumes:
       - mtls_ca_data:/data/ca
     healthcheck:

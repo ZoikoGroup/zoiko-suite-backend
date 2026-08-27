@@ -23,7 +23,18 @@ func main() {
 	}
 
 	s := store.NewMemoryStore()
-	authzClient := authz.NewClient(os.Getenv("AUTHZ_SERVICE_URL"))
+	// Fail fast rather than starting and 503-ing every guarded route.
+	// authz.NewClient("") builds requests against an empty base URL, so every
+	// CheckAllowed fails and the client — correctly — refuses. That posture is
+	// right at request time but wrong at boot: a service that starts and then
+	// rejects all authorized traffic hides a deployment mistake until a user
+	// finds it. This dependency was added in Priority 2b and was missing from
+	// docker-compose.yml for two services, which is exactly how that happens.
+	authzURL := os.Getenv("AUTHZ_SERVICE_URL")
+	if authzURL == "" {
+		logger.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
+	}
+	authzClient := authz.NewClient(authzURL)
 	h := handler.New(s, authzClient, logger)
 	router := handler.NewRouter(h)
 
