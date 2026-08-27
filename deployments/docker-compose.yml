@@ -457,6 +457,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.identity.events"
       JWT_SIGNING_SECRET: "local-dev-jwt-signing-secret-key-32-chars-long"
       JWT_SIGNING_PRIVATE_KEY_PATH: "/keys/envelope_signing_key.pem"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JWT_KEY_ID: "local-dev-key-1"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"

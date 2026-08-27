@@ -24,6 +24,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/auth"
+	"zoiko.io/identity-context-svc/internal/authz"
 	"zoiko.io/identity-context-svc/internal/config"
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/events"
@@ -184,8 +185,19 @@ func main() {
 
 	r.Get("/.well-known/jwks.json", auth.NewJWKSHandler(signer.PublicKey(), cfg.JWTKeyID))
 
+	// Fail fast rather than starting and 503-ing every guarded route.
+	// authz.NewClient("") builds requests against an empty base URL, so every
+	// CheckAllowed fails and the client — correctly — refuses. Right at
+	// request time, wrong at boot: a service that starts and then rejects all
+	// authorized traffic hides a deployment mistake until a user finds it.
+	authzURL := os.Getenv("AUTHZ_SERVICE_URL")
+	if authzURL == "" {
+		log.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
+	}
+	authzClient := authz.NewClient(authzURL)
+
 	// Domain routes (all under /v1/)
-	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, log)
+	h := identityctx.NewHandler(resolver, sessionCache, principalRepo, authzClient, log)
 	identityctx.RegisterRoutes(r, h)
 
 	// ── Server ────────────────────────────────────────────────────────────
