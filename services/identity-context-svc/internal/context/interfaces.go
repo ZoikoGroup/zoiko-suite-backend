@@ -47,11 +47,23 @@ type RiskSignalCache interface {
 
 // UpstreamRegistry is a read-only client to upstream Tier 0 services.
 // This service never writes to any upstream domain.
+//
+// FetchActiveDelegations used to be here and is deliberately gone. Delegated
+// authority for a principal lives in THIS service's own delegated_authorities
+// table and PrincipalStore already reads it, so routing the question through an
+// "upstream" meant a local fact was answered by a stub that returned an empty
+// slice — and an empty slice is indistinguishable from "this principal holds no
+// delegations" once it is inside a signed envelope. The resolver reads the store
+// directly, exactly as it already does for role assignments.
 type UpstreamRegistry interface {
 	IsTenantActive(ctx context.Context, tenantID string) (bool, error)
-	IsPrincipalAuthorizedForEntity(ctx context.Context, principalID, legalEntityID string) (bool, error)
+
+	// IsPrincipalAuthorizedForEntity takes the principal's own verified tenant
+	// because the registry scopes the entity read by it — that scoping IS the
+	// isolation check, so it cannot be derived from the entity being asked for.
+	IsPrincipalAuthorizedForEntity(ctx context.Context, principalID, tenantID, legalEntityID string) (bool, error)
+
 	ResolvePermissionBundles(ctx context.Context, roleIDs []string) ([]string, error)
-	FetchActiveDelegations(ctx context.Context, principalID, legalEntityID string) ([]domain.DelegatedAuthority, error)
 }
 
 // EventPublisher emits append-only domain events to the event backbone.

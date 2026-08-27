@@ -450,8 +450,20 @@ services:
       DB_USER: zoiko_app
       DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
+      # Blank keeps the local `redis` container below. Set REDIS_URL in .env to
+      # a managed endpoint (rediss://default:<token>@<host>.upstash.io:6379) and
+      # REDIS_HOST/REDIS_PORT are ignored entirely — the service reads one or
+      # the other, never a mixture.
+      #
+      # The `redis` container still starts either way: depends_on below is
+      # static, so compose cannot drop it on the strength of a variable. It is
+      # 256m of unused cache when REDIS_URL is set, not a second source of
+      # truth — nothing connects to it.
+      REDIS_URL: "${REDIS_URL:-}"
+      REDIS_HOST: "${REDIS_HOST:-redis}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      REDIS_TLS_ENABLED: "${REDIS_TLS_ENABLED:-false}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "identity-context-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.identity.events"

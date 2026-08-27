@@ -132,11 +132,9 @@ func (m *mockRiskSignalCache) GetLatestSignal(_ context.Context, _ string) (*dom
 type mockUpstreamRegistry struct {
 	tenantActive   bool
 	tenantErr      error
-	entityAuthz    bool
-	entityErr      error
-	permBundles    []string
-	delegations    []domain.DelegatedAuthority
-	delegationsErr error
+	entityAuthz bool
+	entityErr   error
+	permBundles []string
 }
 
 func defaultUpstream() *mockUpstreamRegistry {
@@ -145,14 +143,11 @@ func defaultUpstream() *mockUpstreamRegistry {
 func (m *mockUpstreamRegistry) IsTenantActive(_ context.Context, _ string) (bool, error) {
 	return m.tenantActive, m.tenantErr
 }
-func (m *mockUpstreamRegistry) IsPrincipalAuthorizedForEntity(_ context.Context, _, _ string) (bool, error) {
+func (m *mockUpstreamRegistry) IsPrincipalAuthorizedForEntity(_ context.Context, _, _, _ string) (bool, error) {
 	return m.entityAuthz, m.entityErr
 }
 func (m *mockUpstreamRegistry) ResolvePermissionBundles(_ context.Context, _ []string) ([]string, error) {
 	return m.permBundles, nil
-}
-func (m *mockUpstreamRegistry) FetchActiveDelegations(_ context.Context, _, _ string) ([]domain.DelegatedAuthority, error) {
-	return m.delegations, m.delegationsErr
 }
 
 // mockEventPublisher is a thread-safe event publisher for tests.

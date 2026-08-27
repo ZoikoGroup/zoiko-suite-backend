@@ -157,7 +157,7 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	}
 
 	// ── Dimension 3: Legal entity scope validation ──────────────────────────
-	if err := r.validateEntityScope(ctx, principal.PrincipalID, req.LegalEntityID, req.CorrelationID); err != nil {
+	if err := r.validateEntityScope(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, req.CorrelationID); err != nil {
 		return "", err
 	}
 
@@ -176,7 +176,10 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	}
 
 	// ── Dimension 5: Delegated authority ────────────────────────────────────
-	delegations, err := r.upstream.FetchActiveDelegations(ctx, principal.PrincipalID, req.LegalEntityID)
+	// Read from this service's own store, not an upstream. delegated_authorities
+	// is owned here, and asking a stubbed "upstream" for it meant every envelope
+	// carried an empty delegation list that looked authoritative.
+	delegations, err := r.principals.FindActiveDelegations(ctx, principal.PrincipalID, principal.TenantID)
 	if err != nil {
 		return "", fmt.Errorf("%w: delegated authority: %v", ErrUpstreamUnavailable, err)
 	}
@@ -224,8 +227,16 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		}
 	}
 
+	// FindActiveDelegations returns everything the principal holds across the
+	// tenant, so the session's own entity scope is applied here. A NULL
+	// legal_entity_id is tenant-wide and travels with every session; one naming
+	// a different entity must not, or an envelope issued for entity A would
+	// carry an authority that only exists on entity B.
 	activeDelegations := make([]domain.DelegatedAuthorityClaim, 0, len(delegations))
 	for _, d := range delegations {
+		if d.LegalEntityID != nil && *d.LegalEntityID != req.LegalEntityID {
+			continue
+		}
 		if d.RevocationStatus == domain.RevocationStatusActive {
 			activeDelegations = append(activeDelegations, domain.DelegatedAuthorityClaim{
 				DelegatedAuthorityID: d.DelegatedAuthorityID,
@@ -403,8 +414,8 @@ func (r *Resolver) validateTenant(ctx context.Context, tenantID, correlationID s
 	return nil
 }
 
-func (r *Resolver) validateEntityScope(ctx context.Context, principalID, legalEntityID, correlationID string) error {
-	authorized, err := r.upstream.IsPrincipalAuthorizedForEntity(ctx, principalID, legalEntityID)
+func (r *Resolver) validateEntityScope(ctx context.Context, principalID, tenantID, legalEntityID, correlationID string) error {
+	authorized, err := r.upstream.IsPrincipalAuthorizedForEntity(ctx, principalID, tenantID, legalEntityID)
 	if err != nil {
 		r.log.Error("entity registry unreachable — failing closed",
 			zap.String("principal_id", principalID),

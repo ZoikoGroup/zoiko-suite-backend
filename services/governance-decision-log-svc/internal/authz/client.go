@@ -17,11 +17,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/governance-decision-log-svc/internal/envelope"
 )
 
 // Sentinel errors, mapped to HTTP status codes by the handler.
@@ -82,7 +86,7 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 		log:     log,
 		// Tight timeout — a mutation must not stall indefinitely because
 		// authorization-svc is slow.
-		http:  &http.Client{Timeout: 2 * time.Second},
+		http:  &http.Client{Timeout: authzTimeout()},
 		cache: make(map[string]cachedDecision),
 	}
 }
@@ -188,6 +192,13 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// Forward the caller's canonical envelope. Without this the outbound request
+	// carried Content-Type and nothing else, authorization-svc refused it with 401
+	// envelope_incomplete, and this client turned that into "authorization service
+	// unavailable" -- failing closed on every authorized write while
+	// authorization-svc was healthy and answering correctly.
+	svcenvelope.ForwardTo(ctx, req)
+
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("authorization-svc unreachable — failing closed",
@@ -263,4 +274,27 @@ func NewClient(env, baseURL string, log *zap.Logger) (Client, error) {
 	}
 	log.Warn("using PERMIT-ALL authorization stub — wire real AuthZ before production")
 	return NewPermitAllClient(log), nil
+}
+
+// authzTimeout is the bound on one call to authorization-svc.
+//
+// TWO SECONDS WAS RIGHT AND IS NOT ANY MORE. It was chosen when every service
+// and the database sat on one Docker network, where an authorize call is a
+// sub-millisecond hop. authorization-svc now writes an access_decision_log row
+// to a managed Postgres before it answers -- doctrine requires the artifact
+// before the caller gets a decision -- so the call costs a real round trip to
+// wherever that database lives. Measured at ~1.6s against a Supabase pooler on
+// another continent, which fits inside 2s until it does not: the failure is
+// "context canceled" at exactly 2.000s, surfaced as authz_unavailable, and the
+// write is refused for a reason that has nothing to do with authorization.
+//
+// Kept as an environment knob with the original default, so nothing changes for
+// a co-located deployment and a high-latency one can say so.
+func authzTimeout() time.Duration {
+	if raw := os.Getenv("AUTHZ_HTTP_TIMEOUT_MS"); raw != "" {
+		if ms, err := strconv.Atoi(raw); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 2 * time.Second
 }

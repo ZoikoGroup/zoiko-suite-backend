@@ -27,3 +27,15 @@ services/*/healthcheck
 # not a deliverable — the tool is run with `go run .`.
 deployments/supabase/supabase-bootstrap
 deployments/supabase/supabase-bootstrap.exe
+
+# tools/servicectl's binary cache. One compiled binary per service, ~15 MB
+# each, rebuilt whenever a service's sources are newer than the cached copy.
+# Roughly 1.3 GB with all 86 built, which is a build artifact and not something
+# to carry in the repository.
+.servicectl/
+
+# same again for the launcher. `go build ./...` inside tools/servicectl drops a
+# binary named after the module; the one that is meant to exist is built with
+# -o into .servicectl/ above.
+tools/servicectl/servicectl
+tools/servicectl/servicectl.exe

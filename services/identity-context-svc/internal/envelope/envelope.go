@@ -244,3 +244,97 @@ func MustFromContext(ctx context.Context) Envelope {
 	e, _ := FromContext(ctx)
 	return e
 }
+
+// ApplyTo writes this envelope onto an OUTBOUND request, so a service calling a
+// peer forwards the caller's envelope instead of dropping it.
+//
+// WHY THIS EXISTS. Every authz client in this estate built its outbound call to
+// authorization-svc with one header:
+//
+//	req.Header.Set("Content-Type", "application/json")
+//
+// authorization-svc enforces the same canonical contract on POST /v1/authorize
+// that every other service enforces on a write, so it answered 401
+// envelope_incomplete naming six missing fields. The caller treats any non-2xx
+// as "authorization service unavailable" and fails closed, so the symptom was
+// 503 authz_unavailable on every authorized write in the platform -- with
+// authorization-svc healthy, reachable, and answering correctly the whole time.
+//
+// It is the exact inverse of Parse, and deliberately in this file next to it:
+// the two must not drift, because a header Parse reads and ApplyTo omits becomes
+// a field that silently disappears on every internal hop.
+//
+// THE ENVELOPE IS FORWARDED VERBATIM, including the idempotency key. That is the
+// doctrinal reading: the envelope identifies a business OPERATION, and an
+// authorization check made while serving that operation belongs to it rather
+// than being a new one. Minting a fresh key here would break the link between a
+// decision and the write it authorised.
+//
+// Empty fields are omitted rather than set blank. Header.Get returns "" for both
+// so a peer cannot tell them apart, but sending empty headers makes a request
+// dump unreadable and invites a peer to treat "" as a real value.
+func (e Envelope) ApplyTo(r *http.Request) {
+	set := func(header, value string) {
+		if value != "" {
+			r.Header.Set(header, value)
+		}
+	}
+
+	set(HeaderTenantID, e.TenantID)
+	set(HeaderActorSubjectID, e.ActorSubjectID)
+	set(HeaderWorkloadID, e.WorkloadID)
+	set(HeaderLegalEntityID, e.LegalEntityID)
+	set(HeaderBookID, e.BookID)
+	set(HeaderReportingBasis, e.ReportingBasis)
+	set(HeaderOperation, e.Operation)
+	set(HeaderRequestID, e.RequestID)
+	set(HeaderCorrelationID, e.CorrelationID)
+	set(HeaderCausationID, e.CausationID)
+	set(HeaderIdempotencyKey, e.IdempotencyKey)
+	set(HeaderSourceSystem, e.SourceSystem)
+	set(HeaderExternalReference, e.ExternalReference)
+	set(HeaderTimezone, e.Timezone)
+	set(HeaderJurisdictionContext, e.JurisdictionContext)
+	set(HeaderPurposeContext, e.PurposeContext)
+	set(HeaderExpectedVersion, e.ExpectedVersion)
+	set(HeaderWorkflowInstanceID, e.WorkflowInstanceID)
+	set(HeaderApprovalReference, e.ApprovalReference)
+
+	// source_channel is mandatory downstream and has a closed vocabulary, so an
+	// absent or unrecognised one cannot simply be passed along. A service-to-
+	// service hop with no channel of its own genuinely IS a system call, which
+	// is what ChannelSystem means -- this does not coerce a caller's real
+	// channel, it only fills a gap that would otherwise be a 401.
+	channel := e.SourceChannel
+	if !channel.Valid() {
+		channel = ChannelSystem
+	}
+	r.Header.Set(HeaderSourceChannel, string(channel))
+
+	// RFC3339 because that is the only format Parse accepts. Anything else
+	// arrives at the peer as a badTimes entry and is refused.
+	if e.OccurredAt != nil {
+		r.Header.Set(HeaderOccurredAt, e.OccurredAt.Format(time.RFC3339))
+	}
+	if e.EffectiveAt != nil {
+		r.Header.Set(HeaderEffectiveAt, e.EffectiveAt.Format(time.RFC3339))
+	}
+	if len(e.EvidenceRefs) > 0 {
+		r.Header.Set(HeaderEvidenceRefs, strings.Join(e.EvidenceRefs, ","))
+	}
+}
+
+// ForwardTo copies the envelope from ctx onto an outbound request. The
+// convenience form of ApplyTo for the common case, where a client has a ctx and
+// a request and nothing else.
+//
+// A missing envelope is not an error here: it means the middleware did not run,
+// which happens on an internal call made outside a request (a startup probe, a
+// background reconciler). Those get a bare request, and the peer refuses them if
+// its own contract says it must -- which is the correct outcome, decided at the
+// peer rather than papered over here.
+func ForwardTo(ctx context.Context, r *http.Request) {
+	if e, ok := FromContext(ctx); ok {
+		e.ApplyTo(r)
+	}
+}

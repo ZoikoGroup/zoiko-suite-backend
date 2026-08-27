@@ -100,6 +100,7 @@ func main() {
 		dryRun      = flag.Bool("dry-run", false, "report what would be applied, change nothing")
 		servicesDir = flag.String("services", "", "path to the services/ directory (default: resolved relative to this file's usual location)")
 		skipRoles   = flag.Bool("skip-roles", false, "apply migrations only; leave roles and grants alone")
+		rolesOnly   = flag.Bool("roles-only", false, "provision roles and grants only; apply no migrations")
 		list        = flag.Bool("list", false, "list the migrations that would be applied and exit; needs no database")
 	)
 	flag.Parse()
@@ -125,6 +126,9 @@ func main() {
 			"Connection string -> Session pooler (port 5432). Use the SESSION pooler\n" +
 			"here, not the transaction pooler on 6543: this tool issues DDL and\n" +
 			"advisory locks that must stay on one connection for the whole run.")
+	}
+	if *skipRoles && *rolesOnly {
+		fail("-skip-roles and -roles-only ask for opposite halves of the run; pass one or neither")
 	}
 	if *appPassword == "" && !*skipRoles && !*dryRun {
 		fail("no app role password: pass -app-password or set APP_DB_PASSWORD\n" +
@@ -159,16 +163,34 @@ func main() {
 		fmt.Println("DRY RUN — nothing will be written.")
 	}
 
-	if err := run(ctx, conn, root, *appPassword, *dryRun, *skipRoles); err != nil {
+	if err := run(ctx, conn, root, *appPassword, *dryRun, *skipRoles, *rolesOnly); err != nil {
 		fail("%v", err)
 	}
 }
 
-func run(ctx context.Context, conn *pgx.Conn, root, appPassword string, dryRun, skipRoles bool) error {
+func run(ctx context.Context, conn *pgx.Conn, root, appPassword string, dryRun, skipRoles, rolesOnly bool) error {
 	if !dryRun {
 		if err := ensureBookkeeping(ctx, conn); err != nil {
 			return err
 		}
+	}
+
+	// -roles-only exists because the two halves of this run were coupled, and
+	// they are independent. A single migration that cannot be applied -- a table
+	// created outside this tool, so an unguarded CREATE TABLE collides with it --
+	// returned before provisionRoles was ever reached, leaving ZERO roles for
+	// FOUR services, three of which had migrated perfectly. The services then
+	// could not start at all, for a reason that had nothing to do with them.
+	//
+	// Grants are applied to the tables that exist now, so on a partially
+	// migrated schema the role gets DML on those and ALTER DEFAULT PRIVILEGES
+	// covers whatever later migrations add.
+	if rolesOnly {
+		if dryRun {
+			fmt.Println("would provision roles only; no migration would be applied")
+			return nil
+		}
+		return provisionRoles(ctx, conn, appPassword)
 	}
 
 	for _, svc := range services {

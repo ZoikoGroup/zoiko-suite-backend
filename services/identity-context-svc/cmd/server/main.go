@@ -6,6 +6,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -54,17 +56,29 @@ func main() {
 	}
 
 	// ── Redis client ──────────────────────────────────────────────────────
-	rdb := redis.NewClient(&redis.Options{
-		Addr: fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
-	})
+	redisOpts, err := redisOptions(cfg.Redis)
+	if err != nil {
+		log.Fatal("Redis configuration invalid", zap.Error(err))
+	}
+	rdb := redis.NewClient(redisOpts)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		// Tier 0 — Redis is a hard dependency. Fail fast on startup.
-		log.Fatal("Redis unreachable on startup — aborting", zap.Error(err))
+		//
+		// tls is logged because it is the field that is wrong when a managed
+		// endpoint times out here: the server closes a cleartext connection
+		// without ever answering, so the symptom is a timeout and not the
+		// authentication failure the missing TLS really is.
+		log.Fatal("Redis unreachable on startup — aborting",
+			zap.String("addr", redisOpts.Addr),
+			zap.Bool("tls", redisOpts.TLSConfig != nil),
+			zap.Error(err),
+		)
 	}
 	log.Info("Redis connection established",
-		zap.String("addr", fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port)),
+		zap.String("addr", redisOpts.Addr),
+		zap.Bool("tls", redisOpts.TLSConfig != nil),
 	)
 
 	// ── Tracing (Observability Baseline, 03-microservices.md §3.8) ─────────
@@ -284,4 +298,38 @@ func main() {
 	resolver.Drain()
 	authenticator.Drain()
 	log.Info("identity-context-svc stopped")
+}
+
+// redisOptions turns RedisConfig into a go-redis client configuration.
+//
+// REDIS_URL wins outright when set. Managed providers issue one string that
+// already carries host, port, credentials and — through the `rediss` scheme —
+// TLS; splitting it back into four variables by hand is how one of the four
+// ends up stale. Host/Port/Password/TLSEnabled remain for the local container
+// and for deployments that inject the parts separately.
+//
+// Nothing here logs. Addr is safe for the caller to log because ParseURL keeps
+// the password in Options.Password rather than in Addr; the URL itself is not.
+func redisOptions(cfg config.RedisConfig) (*redis.Options, error) {
+	if cfg.URL != "" {
+		opts, err := redis.ParseURL(cfg.URL)
+		if err != nil {
+			// ParseURL echoes its input in the error, password included, so the
+			// message is replaced rather than wrapped.
+			return nil, errors.New("REDIS_URL is malformed — expected rediss://user:password@host:port")
+		}
+		return opts, nil
+	}
+
+	opts := &redis.Options{
+		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Password: cfg.Password,
+	}
+	if cfg.TLSEnabled {
+		opts.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			ServerName: cfg.Host,
+		}
+	}
+	return opts, nil
 }

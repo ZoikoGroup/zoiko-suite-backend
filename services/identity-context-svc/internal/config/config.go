@@ -155,8 +155,28 @@ func quoteDSNValue(v string) string {
 }
 
 type RedisConfig struct {
+	// URL is a complete connection string and, when non-empty, is the ONLY
+	// field read — Host, Port, Password and TLSEnabled are ignored. Managed
+	// Redis (Upstash, Redis Cloud, ElastiCache Serverless) hands out exactly
+	// one string:
+	//
+	//   rediss://default:<token>@<name>-<id>.upstash.io:6379
+	//
+	// The scheme is `rediss`, with two s. Plain `redis://` leaves TLS off and a
+	// managed endpoint drops the connection rather than speaking cleartext,
+	// which arrives as an i/o timeout on the startup Ping — not as the
+	// authentication error the missing TLS actually is.
+	URL string
+
 	Host string
 	Port int
+	// Password is empty for the local container, which runs without
+	// requirepass. Every managed endpoint requires it.
+	Password string
+	// TLSEnabled wraps a Host/Port connection in TLS. Ignored when URL is set,
+	// where the scheme decides instead.
+	TLSEnabled bool
+
 	// SessionTTLSeconds — hot-path cache TTL for signed envelope JWT (default 5 min)
 	SessionTTLSeconds int
 	// RoleProfileTTLSeconds — role profile cache TTL (default 15 min)
@@ -207,8 +227,11 @@ func Load() (*Config, error) {
 			Options: env("DB_OPTIONS", ""),
 		},
 		Redis: RedisConfig{
+			URL:                   env("REDIS_URL", ""),
 			Host:                  env("REDIS_HOST", "localhost"),
 			Port:                  envInt("REDIS_PORT", 6379),
+			Password:              env("REDIS_PASSWORD", ""),
+			TLSEnabled:            envBool("REDIS_TLS_ENABLED", false),
 			SessionTTLSeconds:     envInt("SESSION_CACHE_TTL_SECONDS", 300),
 			RoleProfileTTLSeconds: envInt("ROLE_PROFILE_CACHE_TTL_SECONDS", 900),
 		},
@@ -270,4 +293,16 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }

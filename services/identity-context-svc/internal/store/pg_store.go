@@ -70,6 +70,24 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 
 // FindByIDPSubject looks up a principal by IdP subject claim and tenant.
 // Returns (nil, nil) when no matching, non-disabled principal exists.
+//
+// Runs inside withRLS like every other method here. It previously queried the
+// pool directly, which was invisible for as long as the deployment target was
+// the local Docker Postgres: services connect there as a superuser, and a
+// superuser bypasses row-level security whatever the policy says, so the
+// missing scope changed nothing.
+//
+// On a managed host it is not invisible. The service connects as
+// app_identity_context, which is neither superuser nor BYPASSRLS, and 000003
+// declares principals ENABLE *and* FORCE row level security — so the policy
+// applies to the owner too. Its USING clause is
+// `tenant_id = current_setting('app.tenant_id', true)`, and that missing_ok
+// argument means an unscoped connection matches ZERO ROWS rather than raising.
+//
+// That failure is silent and total: this is the lookup POST /v1/context/resolve
+// performs, so every login answered 401 "principal inactive or not found" while
+// the principal was present and ACTIVE. Verified against Supabase — the same
+// query returns 0 rows unscoped and 1 row with app.tenant_id set.
 func (s *PgStore) FindByIDPSubject(ctx context.Context, subject, tenantID string) (*domain.Principal, error) {
 	s.log.Debug("store.FindByIDPSubject", zap.String("subject", subject), zap.String("tenant_id", tenantID))
 
@@ -81,7 +99,12 @@ func (s *PgStore) FindByIDPSubject(ctx context.Context, subject, tenantID string
 		  AND tenant_id = $2
 		  AND status != 'DISABLED'
 	`
-	p, err := s.scanOnePrincipal(s.pool.QueryRow(ctx, query, subject, tenantID))
+	var p *domain.Principal
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		p, scanErr = s.scanOnePrincipal(tx.QueryRow(ctx, query, subject, tenantID))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
