@@ -9,3 +9,9 @@ services/*/secret_store.local
 # binaries left in a service's own root directory)
 services/*/server
 services/*/healthcheck
+
+# New company-provided spec docs, landed 2026-08-27 as .docx alongside the
+# original zoiko_suite_doc1-7 (kept tracked, above). Left untracked for now
+# by explicit request — large (tens of MB total), not yet reviewed for
+# what should be extracted/kept vs. superseded.
+docs/original_doc/*.docx
