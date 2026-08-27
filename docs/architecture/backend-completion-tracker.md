@@ -269,9 +269,43 @@ missed if re-run naively; checked their actual file contents directly instead.
 | 20 | tax-authority-interface-svc | Done | `f7da196`. Same three defects, done with row 8f — last of the six connectors. Most sensitive read in the tier: `GetSubmissionByID` filtered on `submission_id` alone, exposing another tenant's `tax_amount`, `tax_period`, `filing_type` and the authority's `ack_reference` — their actual filed tax figures. `ListSubmissions`' only predicate was `interface_id`, self-disabling, so omitting it returned every tenant's filings. MemoryStore fixed too. **Three** negative controls this time, on real Postgres 16 as a NOSUPERUSER NOBYPASSRLS role: migration removed → ENABLE/FORCE + WITH CHECK fail; Go predicate removed with migration present → isolation still holds (RLS is load-bearing alone); both removed → tenant B really reads tenant A's filing amount and ack_reference, so the test detects the leak rather than passing vacuously. |
 
 
-## Priority 2b — Services with NO authorization on any route
+## Priority 2b — Services with NO authorization on any route — ✅ COMPLETE
 
 Opened 2026-08-25, after Priorities 1/1b/2 closed the tenant boundary estate-wide.
+**Closed 2026-08-27.** 7 services fixed, 3 closed as false positives of my own measurement.
+
+### What this tier taught — none of it visible from the row titles
+
+1. **"Which routes get a guard" is a question, not an assumption.** Coverage came out
+   deliberately uneven — 7/7, 5/5, 6/7, 3/5, 2/3 — because the first step was always *who
+   actually calls this service*. `key-management` got full coverage because that came back
+   empty; `siem` got 3 of 5 because five services call two of its routes with tenant-only
+   headers, and guarding those would have **silently** stopped security-event streaming
+   platform-wide (the clients log a warning and continue).
+2. **Three routes cannot be guarded even in principle.** `carta /evaluate`, `siem /stream` and
+   `identity-context /context/resolve` are all called *during* authentication. The last is the
+   clearest: token in, signed envelope out — requiring a verified principal means needing an
+   envelope to obtain one. All three carry guard-rail tests that fail if someone adds the check
+   "for consistency"; the identity-context one uses a *denying* stub so it also proves the route
+   never consults authorization. Their real control is mTLS service identity — row 84d.
+3. **Placement matters as much as presence.** `key-management`'s rotate/disable mutated *before*
+   they had the row to authorize against. A control proved the difference: with the check after
+   the mutation the caller gets a clean 403 **and the key is already disabled**. A
+   status-code-only test passes in that state, which is why those tests re-read the record.
+4. **The tier title under-described three services.** Two logged as "missing authorization" were
+   actually **cross-tenant**: `workflow-history` took its tenant from a query parameter, and
+   `identity-context` served another tenant's **credential**. Severity tracks what a route
+   returns, not what the row says.
+5. **My measurement was wrong five times, always the same shape.** Grepping `CheckAllowed(`
+   missed `Authorize`, `CheckApprovalAllowed` and `CheckSchemaPublishAllowed`, and once matched a
+   comment I had written myself explaining a service has no authz client — excluding the very
+   service the search existed to find. A broken pattern and a genuine absence are
+   indistinguishable in the output.
+6. **A new dependency needs its deployment wiring checked in the same change.** Five services
+   gained an authorization-svc dependency; two were never given `AUTHZ_SERVICE_URL` in
+   `docker-compose.yml`, which would have meant 503 on every guarded route while the containers
+   reported healthy. All six now refuse to start without it — failing closed at request time is
+   the right posture but the wrong moment.
 
 **Why this is now the weakest link.** Tenant isolation and authorization answer different
 questions. Isolation asks *"is this row in my tenant?"*; authorization asks *"is this principal
@@ -316,7 +350,7 @@ Ordered by payload severity, which is how Priority 2 taught us to order this rat
 | 92 | `schema-registry-svc` | 9 | **Not applicable** — corrected, 5th false positive from this measurement. It DOES authorize: `RegisterVersion` (its only write route, `POST /{eventName}/versions`) calls `h.authz.CheckSchemaPublishAllowed(...)`, a real HTTP client. My sweep grepped `CheckAllowed(` and this service names the method `CheckSchemaPublishAllowed`. Its four read routes are correctly open: event schema definitions are platform reference data every service must read to validate envelopes (Doc 04 §19). Same shape as jurisdiction-rules-svc — reads open, writes gated. |
 | 93 | `carta-svc` — **Done** `57808c2` (2 of 3 routes; `/evaluate` guard would be circular — see 84d) | 5 | Access-decision telemetry: device trust, trusted IPs, allow/deny boundary, and `RiskFactors` naming why a score moved. |
 | 94 | `workflow-history-svc` — **Done** `0f93455` | 2 | **Was worse than this row said.** Logged as "no authorization", but the real defect was a **cross-tenant read**: both routes took `tenant_id` from the **query string** and nothing in the service read `X-Tenant-Id` at all. The store feeds that into `set_config('app.tenant_id')` and the RLS policy reads it back — so the policy was **satisfied**, not bypassed, and Postgres returned whichever tenant the caller named in the URL. Strictly worse than the Priority 1b `default-tenant` cases: there a header-less caller landed in one shared bucket, here a caller picks its victim by editing a parameter. Exposed the workflow transition log — every state change, approval and payload for another tenant's governed work. Fixed both halves; also **had no handler tests at all**, which is part of how it survived. Two of the new tests assert on the tenant value the store *received*, since a 200 cannot distinguish "used the header" from "used the query param". |
-| 95 | `identity-context-svc` | 7 | **Investigated, not yet fixed — the analysis is the deliverable here.** 7 routes in `internal/context/`, no authz package. `POST /v1/context/resolve` **must stay unguarded by a principal check**: it takes a token in the body and returns a JWT, returning 401 on `ErrTokenInvalid`/`ErrNoToken` — it IS the authentication endpoint, so requiring a verified principal is perfectly circular (you would need an envelope to get an envelope). That is a stronger case than carta `/evaluate` or siem `/stream`; belongs with row 84d. The other 6 need guards, most urgently `PUT /principals/{id}/status` (changes principal status — suspend/activate) and the `roles`/`delegations` reads. Also found: `InvalidateSession` reads `X-Actor-Principal-ID` and records it as the actor **without verifying or authorizing it**, so a caller can invalidate any session and attribute it to anyone — an attribution gap as well as an authorization one. No external HTTP callers, so guarding the 6 breaks nothing. |
+| 95 | `identity-context-svc` — **Done** `2df4e98` (6 of 7 routes) | 7 | **Contained the most severe defect in the tier.** `GET /context/session/{id}` had no tenant check, no principal check, and returns `EnvelopeJWT` — the signed envelope itself. Knowing a session id was enough to obtain a **working credential for that identity in any tenant**: session hijacking with a GET, not a data leak. Scoped via `GetSessionContext` (SessionCache.Get carries no tenant); foreign session → 404 not 403, so session ids cannot be enumerated. `POST .../invalidate` also had no tenant check — any caller could force-logout any principal in any tenant, with the actor taken from an **unverified** `X-Actor-Principal-ID`, so the audit trail named whoever the caller claimed. `POST /context/resolve` stays unguarded: it IS the authentication endpoint (token in, signed envelope out), so a principal guard is circular — strongest instance of row 84d, pinned by a test using a *denying* stub. `UpdatePrincipalStatus` deliberately gets **no** self-exemption (a suspended principal must not reactivate itself). |
 | 96 | `jurisdiction-rules-svc` | 21 GET / 5 POST | **Not applicable** — corrected. Its 5 write routes each call a shared `checkAuthz` helper (5 call sites, matching 5 POSTs) which delegates to a real `Authorize`. The 21 GETs are platform reference data and correctly open. Missed for the same reason as row 91: the method is named `Authorize`, not `CheckAllowed`. |
 
 ### Notes for whoever picks this up
