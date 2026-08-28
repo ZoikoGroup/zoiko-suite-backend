@@ -229,16 +229,20 @@ func (h *Handler) TriggerRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Orchestrate: simulate cross-service aggregation and run completion
+	// No real cross-service aggregation exists yet — see
+	// domain.OrchestratReportRun's doc comment. The run is recorded as
+	// NOT_IMPLEMENTED, not COMPLETED, and the event name matches: publishing
+	// report.run_completed here would tell every downstream consumer a real
+	// report exists at OutputLocation when nothing was written.
 	domain.OrchestratReportRun(def, run)
 	_ = h.store.UpdateRun(r.Context(), tenantID, run)
 
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "report.run_completed", SubjectID: run.ID, TenantID: tenantID,
+		EventType: "report.run_not_implemented", SubjectID: run.ID, TenantID: tenantID,
 		LegalEntityID: def.LegalEntityID, ActorID: principalID,
 		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: run,
 	})
-	h.okJSON(w, http.StatusCreated, run)
+	h.okJSON(w, http.StatusAccepted, run)
 }
 
 func (h *Handler) GetRunByID(w http.ResponseWriter, r *http.Request) {

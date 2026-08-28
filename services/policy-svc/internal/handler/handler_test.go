@@ -1087,6 +1087,48 @@ func TestEvaluate_AmountEqualsThreshold_IsWithinThreshold(t *testing.T) {
 	}
 }
 
+// TestEvaluate_LargeAmount_PrecisionNotLost is the regression test for
+// PDC-I-11 (`ZS-SVC-V-001` §13.2/§14.2): "binary floating-point is not
+// used for material monetary... calculations." At this magnitude,
+// adjacent float64 values are more than 1 apart, so
+// 10000000000000000 and 10000000000000001 are literally the same
+// float64 bit pattern — a comparison done in float64 would report them
+// EQUAL and answer WITHIN_THRESHOLD, when the exact decimal amount is 1
+// over the threshold and the correct answer is APPROVAL_REQUIRED. The fix
+// (decodeExactAmount + big.Rat.Cmp) parses the wire's literal decimal
+// text directly, so no binary-floating-point rounding step exists in this
+// comparison at all.
+func TestEvaluate_LargeAmount_PrecisionNotLost(t *testing.T) {
+	store := &stubStore{
+		applicable: []*domain.ApplicablePolicyVersion{
+			{
+				PolicyVersion: domain.PolicyVersion{
+					PolicyVersionID: "pv-1",
+					VersionStatus:   "ACTIVE",
+					RulePayload:     []byte(`{"threshold_amount":10000000000000000}`),
+				},
+				PolicyCode: "APPROVAL_LARGE",
+			},
+		},
+	}
+	r := newTestRouter(store)
+
+	body := `{"policy_type":"APPROVAL_THRESHOLD","action_context":{"amount":10000000000000001},"evaluated_by_principal_id":"admin-1","decision_id":"dec-1"}`
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/policies/evaluate", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var got struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if got.Result != "APPROVAL_REQUIRED" {
+		t.Fatalf("BINARY-FLOAT PRECISION LOSS: amount exceeds threshold by exactly 1, expected APPROVAL_REQUIRED, got %s", got.Result)
+	}
+}
+
 // The GRANTED half of the outcome mapping. Paired with the ESCALATED assertion in
 // TestEvaluate_ApprovalRequired_RecordsDecision: an under-threshold evaluation is
 // a real authorization and must be recorded as one, or the audit trail cannot

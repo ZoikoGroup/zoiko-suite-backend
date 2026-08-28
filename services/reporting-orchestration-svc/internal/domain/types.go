@@ -39,6 +39,23 @@ const (
 	RunStatusRunning   RunStatus = "RUNNING"
 	RunStatusCompleted RunStatus = "COMPLETED"
 	RunStatusFailed    RunStatus = "FAILED"
+
+	// RunStatusNotImplemented is what OrchestratReportRun actually produces
+	// today. This service has no real cross-service data-aggregation
+	// fan-out — no HTTP calls to ledger-svc/payroll-svc/any source service
+	// exist anywhere in this codebase. It previously returned
+	// RunStatusCompleted with a fabricated row count looked up from a
+	// hardcoded map and a fabricated OutputLocation path that was never
+	// written. ZS-SVC-AC-001 (Governed Reporting/Analytics/Semantic
+	// Metrics/Export Control) names this exact anti-pattern by its own
+	// negative-path test NP-60: "Operator manually sets report state
+	// COMPLETE during incident → No bypass; state derived from execution/
+	// certification evidence." A run this function performed was never
+	// derived from any execution — it never ran anything. Building the
+	// real aggregation fan-out is a legitimate multi-service feature, out
+	// of scope here; what this status removes is the lie that it already
+	// happened.
+	RunStatusNotImplemented RunStatus = "NOT_IMPLEMENTED"
 )
 
 const (
@@ -121,31 +138,19 @@ func (r *CreateDefinitionRequest) Validate() error {
 
 // ─── Orchestration Engine ─────────────────────────────────────────────────────
 
-// OrchestratReportRun simulates the cross-service data aggregation and report generation
-// In production this would fan-out requests to data source services (ledger-svc, payroll-svc, etc.)
+// OrchestratReportRun records that a run was requested. It does not
+// aggregate any real data — no cross-service fan-out exists in this
+// codebase — and previously fabricated a COMPLETED result with a row count
+// looked up from a hardcoded map and an OutputLocation path that was never
+// written. See the RunStatusNotImplemented doc comment for the full
+// reasoning. This function now reports that state honestly instead.
 func OrchestratReportRun(def *ReportDefinition, run *ReportRun) {
 	now := time.Now()
 	run.StartedAt = &now
 
-	// Simulate row count based on report type
-	rowCountMap := map[ReportType]int{
-		ReportTypeFinancialSummary:   245,
-		ReportTypePayrollSummary:     180,
-		ReportTypeComplianceOverview: 94,
-		ReportTypeAuditTrail:         1200,
-		ReportTypeCashFlow:           312,
-		ReportTypeWorkforceAnalytics: 430,
-	}
-
-	count, ok := rowCountMap[def.ReportType]
-	if !ok {
-		count = 100
-	}
-
-	run.RowCount = count
-	run.Status = RunStatusCompleted
-	run.OutputLocation = fmt.Sprintf("/reports/%s/%s/%s.%s",
-		def.TenantID, def.ReportType, run.ID, def.OutputFormat)
+	run.RowCount = 0
+	run.Status = RunStatusNotImplemented
+	run.OutputLocation = ""
 	completed := time.Now()
 	run.CompletedAt = &completed
 }
