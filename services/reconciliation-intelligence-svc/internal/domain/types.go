@@ -64,21 +64,30 @@ type ReconciliationJob struct {
 }
 
 type UnmatchedItem struct {
-	ID                string                   `json:"id,omitempty"`
-	TenantID          string                   `json:"tenant_id"`
-	JobID             string                   `json:"job_id"`
-	TransactionRefA   string                   `json:"transaction_ref_a"`
-	TransactionRefB   string                   `json:"transaction_ref_b,omitempty"`
-	AmountA           float64                  `json:"amount_a"`
-	AmountB           float64                  `json:"amount_b"`
-	DiscrepancyAmount float64                  `json:"discrepancy_amount"`
-	DiscrepancyType   DiscrepancyType          `json:"discrepancy_type"`
-	ConfidenceScore   float64                  `json:"confidence_score"`
-	Recommendation    ResolutionRecommendation `json:"recommendation"`
-	ResolutionStatus  ResolutionStatus         `json:"resolution_status"`
-	ResolutionNotes   string                   `json:"resolution_notes,omitempty"`
-	CreatedAt         time.Time                `json:"created_at"`
-	UpdatedAt         time.Time                `json:"updated_at"`
+	ID                string          `json:"id,omitempty"`
+	TenantID          string          `json:"tenant_id"`
+	JobID             string          `json:"job_id"`
+	TransactionRefA   string          `json:"transaction_ref_a"`
+	TransactionRefB   string          `json:"transaction_ref_b,omitempty"`
+	AmountA           float64         `json:"amount_a"`
+	AmountB           float64         `json:"amount_b"`
+	DiscrepancyAmount float64         `json:"discrepancy_amount"`
+	DiscrepancyType   DiscrepancyType `json:"discrepancy_type"`
+	// ConfidenceScore is NOT statistically or ML-derived — it is one of three
+	// fixed values produced by PerformIntelligentReconciliation's hardcoded
+	// threshold rules (see the named heuristic constants below). ZS-SVC-Z-001
+	// (Data Quality/Reconciliation/Lineage/Control Totals) requires tolerance
+	// be "explicit and versioned" (its own INV-09); this remains an
+	// unversioned Go-code heuristic, not that. Kept as a documented,
+	// human-reviewed starting point — ResolutionNotes below carries the
+	// actual rule that fired, so a reviewer sees the reasoning rather than
+	// trusting this number as if it were a real confidence estimate.
+	ConfidenceScore  float64                  `json:"confidence_score"`
+	Recommendation   ResolutionRecommendation `json:"recommendation"`
+	ResolutionStatus ResolutionStatus         `json:"resolution_status"`
+	ResolutionNotes  string                   `json:"resolution_notes,omitempty"`
+	CreatedAt        time.Time                `json:"created_at"`
+	UpdatedAt        time.Time                `json:"updated_at"`
 }
 
 type AnalyzeReconciliationRequest struct {
@@ -111,7 +120,47 @@ func (r *AnalyzeReconciliationRequest) Validate() error {
 	return nil
 }
 
-// PerformIntelligentReconciliation executes matching analysis, discrepancy detection, & resolution recommendations
+// Heuristic thresholds and scores for PerformIntelligentReconciliation.
+//
+// These were previously bare numeric literals inline in the function body
+// (50.0, 10.0, 85.0, 60.0, 90.0), with no name, no comment, and no visible
+// connection between "this threshold" and "that confidence score." Named and
+// documented here instead — not because naming them makes the rule
+// governed or versioned (it does not; see the ConfidenceScore field comment
+// above and ZS-SVC-Z-001 INV-09), but because a rule a reviewer cannot see
+// is a rule they cannot audit or question. A future real tolerance-policy
+// service replaces this block, not just its literals.
+const (
+	// amountMismatchWriteOffTolerance: a matched pair (same reference in
+	// both systems) whose amounts differ by less than this is recommended
+	// for write-off; at or above it, a timing adjustment is recommended
+	// instead. Arbitrary and unversioned — not a tenant- or entity-specific
+	// materiality policy.
+	amountMismatchWriteOffTolerance = 50.0
+	amountMismatchConfidence        = 85.0
+
+	// missingReferenceSmallAmountTolerance: an item present in system A with
+	// no matching reference in system B is normally flagged for manual
+	// review; below this amount it is instead recommended for write-off
+	// outright, on the reasoning that the review cost exceeds the amount at
+	// risk. Also arbitrary and unversioned.
+	missingReferenceSmallAmountTolerance   = 10.0
+	missingReferenceWriteOffConfidence     = 90.0
+	missingReferenceManualReviewConfidence = 60.0
+)
+
+// PerformIntelligentReconciliation executes matching analysis, discrepancy
+// detection, & resolution recommendations.
+//
+// "Intelligent" here means two fixed threshold comparisons, not a model or a
+// governed rule — see the heuristic constants above. Every item this
+// produces carries ResolutionStatus RECOMMENDED, never anything further:
+// domain.StatusApproved/Rejected/Executed are only ever reached through
+// Handler.ApplyResolution, which requires an authenticated principal to hold
+// RECONCILIATION_APPLY_RESOLUTION. Nothing in this function writes anything
+// off; it proposes, and a human decides. That human-approval gate is what
+// keeps a heuristic acceptable as a starting point here — it would not be
+// if this function's output executed anything itself.
 func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, tenantID string) (int, int, float64, []UnmatchedItem) {
 	mapB := make(map[string]TransactionItem)
 	for _, txB := range req.TransactionsB {
@@ -132,12 +181,19 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 				matchedCount++
 			} else {
 				// Amount Mismatch
-				confScore := 85.0
+				confScore := amountMismatchConfidence
 				var rec ResolutionRecommendation
-				if discAmount < 50.0 {
+				var rationale string
+				if discAmount < amountMismatchWriteOffTolerance {
 					rec = RecommendationWriteOff
+					rationale = fmt.Sprintf(
+						"heuristic rule: discrepancy $%.2f is below the $%.2f write-off tolerance (unversioned platform default, not a governed policy)",
+						discAmount, amountMismatchWriteOffTolerance)
 				} else {
 					rec = RecommendationTimingAdjustment
+					rationale = fmt.Sprintf(
+						"heuristic rule: discrepancy $%.2f is at or above the $%.2f write-off tolerance (unversioned platform default, not a governed policy)",
+						discAmount, amountMismatchWriteOffTolerance)
 				}
 
 				unmatchedItems = append(unmatchedItems, UnmatchedItem{
@@ -152,17 +208,26 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 					ConfidenceScore:   confScore,
 					Recommendation:    rec,
 					ResolutionStatus:  StatusRecommended,
+					ResolutionNotes:   rationale,
 					CreatedAt:         time.Now(),
 					UpdatedAt:         time.Now(),
 				})
 			}
 		} else {
 			// Missing Reference in System B
-			confScore := 60.0
+			confScore := missingReferenceManualReviewConfidence
 			rec := RecommendationManualReview
-			if txA.Amount < 10.0 {
+			var rationale string
+			if txA.Amount < missingReferenceSmallAmountTolerance {
 				rec = RecommendationWriteOff
-				confScore = 90.0
+				confScore = missingReferenceWriteOffConfidence
+				rationale = fmt.Sprintf(
+					"heuristic rule: amount $%.2f is below the $%.2f small-amount write-off tolerance (unversioned platform default, not a governed policy)",
+					txA.Amount, missingReferenceSmallAmountTolerance)
+			} else {
+				rationale = fmt.Sprintf(
+					"heuristic rule: no matching reference in system B; amount $%.2f is at or above the $%.2f small-amount tolerance, so manual review is recommended rather than automatic write-off",
+					txA.Amount, missingReferenceSmallAmountTolerance)
 			}
 
 			unmatchedItems = append(unmatchedItems, UnmatchedItem{
@@ -176,6 +241,7 @@ func PerformIntelligentReconciliation(req *AnalyzeReconciliationRequest, jobID, 
 				ConfidenceScore:   confScore,
 				Recommendation:    rec,
 				ResolutionStatus:  StatusRecommended,
+				ResolutionNotes:   rationale,
 				CreatedAt:         time.Now(),
 				UpdatedAt:         time.Now(),
 			})
