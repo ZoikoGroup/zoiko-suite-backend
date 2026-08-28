@@ -61,6 +61,16 @@ CREATE TABLE purpose_versions (
     effective_from           TIMESTAMPTZ NOT NULL,
     supersedes_version_id    UUID        REFERENCES purpose_versions(purpose_version_id),
 
+    -- Tiebreaker ONLY, never returned to callers: two versions can be
+    -- created with the same wall-clock effective_from (millisecond+
+    -- timestamp collisions are rare but real under concurrent writes, and
+    -- routine under fast automated test clocks), and a resolution query
+    -- that orders by effective_from DESC alone would then pick between
+    -- them arbitrarily. sequence_no is a Postgres-generated, strictly
+    -- monotonic, collision-proof ordinal — see ORDER BY clauses in
+    -- ResolvePurposeAsOf/ResolveActivityAsOf.
+    sequence_no              BIGSERIAL,
+
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_by_principal_id  TEXT        NOT NULL
 );
@@ -116,6 +126,8 @@ CREATE TABLE processing_activity_versions (
     effective_from           TIMESTAMPTZ,
 
     supersedes_version_id    UUID        REFERENCES processing_activity_versions(activity_version_id),
+    -- Tiebreaker only — see purpose_versions.sequence_no's doc comment above.
+    sequence_no              BIGSERIAL,
 
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     created_by_principal_id  TEXT        NOT NULL

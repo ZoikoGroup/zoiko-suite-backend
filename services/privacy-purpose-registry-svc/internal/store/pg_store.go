@@ -266,7 +266,7 @@ func (s *PgStore) ResolvePurposeAsOf(ctx context.Context, purposeID string, asOf
 			FROM purpose_versions pv
 			JOIN purposes p ON p.purpose_id = pv.purpose_id
 			WHERE pv.purpose_id = $1 AND pv.version_status = 'PUBLISHED' AND pv.effective_from <= $2
-			ORDER BY pv.effective_from DESC
+			ORDER BY pv.effective_from DESC, pv.sequence_no DESC
 			LIMIT 1`,
 			purposeID, asOf,
 		))
@@ -504,7 +504,7 @@ func (s *PgStore) ResolveActivityAsOf(ctx context.Context, activityID string, as
 			WHERE av.activity_id = $1
 			  AND av.version_status IN ('ACTIVE', 'SUSPENDED', 'RETIRED')
 			  AND av.effective_from <= $2
-			ORDER BY av.effective_from DESC
+			ORDER BY av.effective_from DESC, av.sequence_no DESC
 			LIMIT 1`,
 			activityID, asOf,
 		))

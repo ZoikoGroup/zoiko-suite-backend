@@ -19,6 +19,15 @@ type stubStore struct {
 	purposeVersions  map[string]*domain.PurposeVersion
 	activities       map[string]*domain.ProcessingActivity
 	activityVersions map[string]*domain.ProcessingActivityVersion
+
+	// seq mirrors the real PgStore's sequence_no column: a monotonic,
+	// collision-proof insertion ordinal. Two versions created moments
+	// apart can legitimately share an identical wall-clock EffectiveFrom
+	// under Windows' coarse time.Now() resolution — this is what
+	// ResolvePurposeAsOf/ResolveActivityAsOf break ties with instead,
+	// same as the real Postgres ORDER BY ... sequence_no DESC.
+	nextSeq int
+	seq     map[string]int
 }
 
 func newStubStore() *stubStore {
@@ -27,7 +36,14 @@ func newStubStore() *stubStore {
 		purposeVersions:  map[string]*domain.PurposeVersion{},
 		activities:       map[string]*domain.ProcessingActivity{},
 		activityVersions: map[string]*domain.ProcessingActivityVersion{},
+		seq:              map[string]int{},
 	}
+}
+
+func (s *stubStore) nextSequence(versionID string) int {
+	s.nextSeq++
+	s.seq[versionID] = s.nextSeq
+	return s.nextSeq
 }
 
 func strp(s string) *string {
@@ -64,6 +80,7 @@ func (s *stubStore) CreatePurpose(ctx context.Context, tenantID string, req doma
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	s.purposeVersions[v.PurposeVersionID] = v
+	s.nextSequence(v.PurposeVersionID)
 	return p, v, nil
 }
 
@@ -84,6 +101,7 @@ func (s *stubStore) CreatePurposeVersion(ctx context.Context, purposeID string, 
 		CreatedAt:           time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	s.purposeVersions[v.PurposeVersionID] = v
+	s.nextSequence(v.PurposeVersionID)
 	return v, nil
 }
 
@@ -116,7 +134,8 @@ func (s *stubStore) ResolvePurposeAsOf(ctx context.Context, purposeID string, as
 		if v.EffectiveFrom.After(asOf) {
 			continue
 		}
-		if best == nil || v.EffectiveFrom.After(best.EffectiveFrom) {
+		if best == nil || v.EffectiveFrom.After(best.EffectiveFrom) ||
+			(v.EffectiveFrom.Equal(best.EffectiveFrom) && s.seq[v.PurposeVersionID] > s.seq[best.PurposeVersionID]) {
 			best = v
 		}
 	}
@@ -163,6 +182,7 @@ func (s *stubStore) CreateActivity(ctx context.Context, tenantID string, req dom
 		CreatedAt:     time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	s.activityVersions[v.ActivityVersionID] = v
+	s.nextSequence(v.ActivityVersionID)
 	return a, v, nil
 }
 
@@ -183,6 +203,7 @@ func (s *stubStore) CreateActivityVersion(ctx context.Context, activityID string
 		CreatedAt:           time.Now().UTC(), CreatedByPrincipalID: principalID,
 	}
 	s.activityVersions[v.ActivityVersionID] = v
+	s.nextSequence(v.ActivityVersionID)
 	return v, nil
 }
 
@@ -206,7 +227,8 @@ func (s *stubStore) ResolveActivityAsOf(ctx context.Context, activityID string, 
 		if v.EffectiveFrom == nil || v.EffectiveFrom.After(asOf) {
 			continue
 		}
-		if best == nil || v.EffectiveFrom.After(*best.EffectiveFrom) {
+		if best == nil || v.EffectiveFrom.After(*best.EffectiveFrom) ||
+			(v.EffectiveFrom.Equal(*best.EffectiveFrom) && s.seq[v.ActivityVersionID] > s.seq[best.ActivityVersionID]) {
 			best = v
 		}
 	}
