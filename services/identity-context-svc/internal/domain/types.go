@@ -74,8 +74,18 @@ type SessionContext struct {
 	TrustPosture     TrustPosture `json:"trust_posture"`
 	// MFAVerified is a point-in-time attestation only.
 	// AuthZ Service evaluates sufficiency; no callback into this service required (Q4).
-	MFAVerified      bool `json:"mfa_verified"`
-	DeviceTrustScore int  `json:"device_trust_score"`
+	MFAVerified bool `json:"mfa_verified"`
+	// DeviceTrustScore is nil when no device signal was available, which is
+	// every session today — no device fingerprint reaches this service.
+	//
+	// A pointer rather than an int because 0 is the WORST possible score, not
+	// the absence of one. Persisting a literal 0 said "this device was assessed
+	// and found maximally untrustworthy" about every session ever issued.
+	//
+	// Risk uses a source sentinel (UNAVAILABLE) instead of nil because a risk
+	// score has several possible producers worth naming. Device trust has one,
+	// so present-or-absent carries the whole distinction.
+	DeviceTrustScore *int `json:"device_trust_score"`
 	// AdaptiveRiskScore is sourced from RiskSignalCache ONLY.
 	// resolve() NEVER calls the Intelligence Plane or any Tier 2/3 service (Q3).
 	AdaptiveRiskScore int    `json:"adaptive_risk_score"`
@@ -251,9 +261,15 @@ type AuthenticateResponse struct {
 	ExpiresIn   int    `json:"expires_in"`
 	PrincipalID string `json:"principal_id"`
 	TenantID    string `json:"tenant_id"`
-	// MFARequired reports that the principal's trust posture will not reach
-	// MFA_VERIFIED from this token alone. It is advisory: authorization-svc,
-	// not this service, decides whether a posture is sufficient for an action.
+	// MFARequired reports that the principal must complete a second factor
+	// before its trust posture can reach MFA_VERIFIED. Advisory:
+	// authorization-svc, not this service, decides whether a posture is
+	// sufficient for an action.
+	//
+	// FALSE for every principal today, and that is accurate rather than
+	// permissive: no step-up factor is implemented anywhere in the estate, so
+	// there is nothing a client could do in response to true. It becomes a real
+	// per-principal answer when a factor lands.
 	MFARequired bool `json:"mfa_required"`
 }
 
@@ -285,6 +301,27 @@ const CredentialTypePassword = "PASSWORD"
 
 // ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
 var ErrPrincipalNotFound = errors.New("principal not found")
+
+// EntityScope is what Dimension 3 resolves about a legal entity: whether the
+// principal's tenant may act as it, and the residency policy it carries.
+//
+// The residency policy arrives on the same response as the authorization
+// answer, so returning a bare bool meant re-fetching it or — as was the case —
+// dropping it and persisting an empty value into every SessionContext.
+type EntityScope struct {
+	Authorized            bool
+	DataResidencyPolicyID string
+}
+
+// ErrSessionNotFound is returned when a session does not exist, has expired, or
+// belongs to another tenant — the three are deliberately one answer, because
+// distinguishing "wrong tenant" from "no such session" confirms the id exists.
+//
+// Separate from a store failure so the handler can answer 404 for absence and
+// 503 for "we could not tell". Reporting an unreachable store as "not found"
+// would send an operator looking at session expiry for a database outage — the
+// same category error the authenticator's ErrAuthUnavailable exists to avoid.
+var ErrSessionNotFound = errors.New("session not found or expired")
 
 // ErrCredentialNotFound is returned when a principal exists but holds no
 // active credential of the requested type.

@@ -86,6 +86,12 @@ var services = []service{
 		Role:   "app_governance_decision_log",
 		Why:    "the console's landing page reads it; an empty panel otherwise",
 	},
+	{
+		Dir:    "access-control-svc",
+		Schema: "access_control",
+		Role:   "app_access_control",
+		Why:    "owns role definitions and their permission bundles; identity-context-svc resolves Dimension 4 against it, and without it a principal holding any role cannot be resolved at all",
+	},
 }
 
 // bookkeepingSchema holds the migration ledger. Kept out of every service's

@@ -52,7 +52,6 @@ type Config struct {
 
 	// Upstream Tier 0 service base URLs (read-only calls only)
 	TenantRegistryURL     string
-	DelegatedAuthorityURL string
 	AccessControlURL      string
 
 	// Authorization Service URL for admin mutation authorization checks.
@@ -241,7 +240,6 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.identity.events"),
 		},
 		TenantRegistryURL:     env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
-		DelegatedAuthorityURL: env("DELEGATED_AUTHORITY_URL", "http://delegated-authority-svc"),
 		AccessControlURL:      env("ACCESS_CONTROL_URL", "http://access-control-svc"),
 		AuthzServiceURL:       env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
 		AuthzEnv:              env("AUTHZ_ENV", "development"),

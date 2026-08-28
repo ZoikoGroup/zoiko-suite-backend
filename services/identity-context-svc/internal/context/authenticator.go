@@ -152,9 +152,9 @@ func NewAuthenticator(
 	}
 }
 
-// Drain blocks until in-flight event goroutines finish. Called from main.go
-// after srv.Shutdown(), alongside Resolver.Drain.
-func (a *Authenticator) Drain() { a.wg.Wait() }
+// Drain waits for in-flight event goroutines, bounded by ctx. Called from
+// main.go after srv.Shutdown(), alongside Resolver.Drain.
+func (a *Authenticator) Drain(ctx context.Context) error { return waitCtx(ctx, &a.wg) }
 
 // Authenticate verifies a password and returns a short-lived bearer token.
 //
@@ -316,6 +316,8 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		ctx, cancel := detach(ctx)
+		defer cancel()
 		if err := a.events.PublishAuthenticationSucceeded(ctx, principal.PrincipalID, principal.TenantID, req.CorrelationID); err != nil {
 			a.log.Error("event publish failed",
 				zap.String("event_type", "identity.authentication.succeeded"),
@@ -332,13 +334,23 @@ func (a *Authenticator) Authenticate(ctx context.Context, req domain.Authenticat
 		zap.String("correlation_id", req.CorrelationID),
 	)
 
+	// MFARequired is false because it is currently true of nothing. No step-up
+	// factor exists anywhere in the estate — mfaDone is passed false above for
+	// that same reason — so a client honouring `true` would prompt for a second
+	// factor it cannot obtain and could never complete a login.
+	//
+	// The field stays in the response rather than being removed: it is the slot
+	// a real factor reports through, and clients already read it. When TOTP or
+	// WebAuthn lands, this becomes a per-principal answer sourced from that
+	// factor's enrolment state, and MFA_VERIFIED trust posture becomes
+	// reachable for the first time.
 	return &domain.AuthenticateResponse{
 		AccessToken: token,
 		TokenType:   "Bearer",
 		ExpiresIn:   a.issuer.TTLSeconds(),
 		PrincipalID: principal.PrincipalID,
 		TenantID:    principal.TenantID,
-		MFARequired: true,
+		MFARequired: false,
 	}, nil
 }
 
@@ -392,6 +404,8 @@ func (a *Authenticator) reject(ctx context.Context, subject, principalID, tenant
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		ctx, cancel := detach(ctx)
+		defer cancel()
 		if err := a.events.PublishAuthenticationFailed(ctx, subject, principalID, tenantID, correlationID, reason); err != nil {
 			a.log.Error("event publish failed",
 				zap.String("event_type", "identity.authentication.failed"),

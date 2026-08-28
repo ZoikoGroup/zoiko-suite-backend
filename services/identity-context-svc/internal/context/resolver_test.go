@@ -91,7 +91,7 @@ func (m *mockSessionCache) Put(_ context.Context, id, jwt string) error {
 	m.stored[id] = jwt
 	return nil
 }
-func (m *mockSessionCache) Get(_ context.Context, id string) (string, error) {
+func (m *mockSessionCache) Get(_ context.Context, id, _ string) (string, error) {
 	if v, ok := m.stored[id]; ok {
 		return v, nil
 	}
@@ -105,10 +105,10 @@ func (m *mockSessionCache) PersistSessionContext(_ context.Context, sc domain.Se
 	m.storedCtx[sc.SessionContextID] = &sc
 	return nil
 }
-func (m *mockSessionCache) GetSessionContext(_ context.Context, id string) (*domain.SessionContext, error) {
+func (m *mockSessionCache) GetSessionContext(_ context.Context, id, _ string) (*domain.SessionContext, error) {
 	return m.storedCtx[id], nil
 }
-func (m *mockSessionCache) Invalidate(_ context.Context, id string, reason domain.InvalidationReason, at time.Time) error {
+func (m *mockSessionCache) Invalidate(_ context.Context, id, _ string, reason domain.InvalidationReason, at time.Time) error {
 	m.invalidated = append(m.invalidated, id)
 	if sc, ok := m.storedCtx[id]; ok {
 		sc.InvalidatedAt = &at
@@ -116,7 +116,9 @@ func (m *mockSessionCache) Invalidate(_ context.Context, id string, reason domai
 	}
 	return nil
 }
-func (m *mockSessionCache) EvictAllForPrincipal(_ context.Context, _ string) error { return nil }
+func (m *mockSessionCache) EvictAllForPrincipal(_ context.Context, _, _ string, _ domain.InvalidationReason) (int, error) {
+	return 0, nil
+}
 
 // mockRiskSignalCache
 type mockRiskSignalCache struct {
@@ -130,11 +132,12 @@ func (m *mockRiskSignalCache) GetLatestSignal(_ context.Context, _ string) (*dom
 
 // mockUpstreamRegistry
 type mockUpstreamRegistry struct {
-	tenantActive   bool
-	tenantErr      error
-	entityAuthz bool
-	entityErr   error
-	permBundles []string
+	tenantActive            bool
+	tenantErr               error
+	entityAuthz             bool
+	entityErr               error
+	entityResidencyPolicyID string
+	permBundles             []string
 }
 
 func defaultUpstream() *mockUpstreamRegistry {
@@ -143,10 +146,16 @@ func defaultUpstream() *mockUpstreamRegistry {
 func (m *mockUpstreamRegistry) IsTenantActive(_ context.Context, _ string) (bool, error) {
 	return m.tenantActive, m.tenantErr
 }
-func (m *mockUpstreamRegistry) IsPrincipalAuthorizedForEntity(_ context.Context, _, _, _ string) (bool, error) {
-	return m.entityAuthz, m.entityErr
+func (m *mockUpstreamRegistry) ResolveEntityScope(_ context.Context, _, _, _ string) (*domain.EntityScope, error) {
+	if m.entityErr != nil {
+		return nil, m.entityErr
+	}
+	return &domain.EntityScope{
+		Authorized:            m.entityAuthz,
+		DataResidencyPolicyID: m.entityResidencyPolicyID,
+	}, nil
 }
-func (m *mockUpstreamRegistry) ResolvePermissionBundles(_ context.Context, _ []string) ([]string, error) {
+func (m *mockUpstreamRegistry) ResolvePermissionBundles(_ context.Context, _ string, _ []string) ([]string, error) {
 	return m.permBundles, nil
 }
 
@@ -492,19 +501,19 @@ func TestInvalidateSession_Idempotent_AlreadyInvalidated(t *testing.T) {
 	require.NotEmpty(t, sessionID)
 
 	// First invalidation
-	err = r.InvalidateSession(context.Background(), sessionID, domain.InvalidationReasonLogout, "admin", "corr1")
+	err = r.InvalidateSession(context.Background(), sessionID, "01HXXXTENANTID", domain.InvalidationReasonLogout, "admin", "corr1")
 	require.NoError(t, err)
 	assert.Len(t, f.sessions.invalidated, 1)
 
 	// Second invalidation — idempotent; Invalidate must NOT be called again
-	err = r.InvalidateSession(context.Background(), sessionID, domain.InvalidationReasonLogout, "admin", "corr2")
+	err = r.InvalidateSession(context.Background(), sessionID, "01HXXXTENANTID", domain.InvalidationReasonLogout, "admin", "corr2")
 	require.NoError(t, err)
 	assert.Len(t, f.sessions.invalidated, 1) // still 1, not 2
 }
 
 func TestInvalidateSession_NoOp_WhenSessionNotFound(t *testing.T) {
 	f := defaultFixture()
-	err := f.build().InvalidateSession(context.Background(), "nonexistent-id", domain.InvalidationReasonLogout, "admin", "corr1")
+	err := f.build().InvalidateSession(context.Background(), "nonexistent-id", "01HXXXTENANTID", domain.InvalidationReasonLogout, "admin", "corr1")
 	require.NoError(t, err) // must not error on missing session
 	assert.Empty(t, f.sessions.invalidated)
 }

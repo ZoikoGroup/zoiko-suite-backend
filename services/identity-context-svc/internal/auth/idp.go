@@ -34,8 +34,20 @@ import (
 type IdPTokenIssuer struct {
 	secret     []byte
 	issuer     string
+	audience   string
 	ttlSeconds int
 }
+
+// IdPTokenAudience binds a bearer token to the one endpoint entitled to consume
+// it.
+//
+// Without an audience the token asserted only "this subject authenticated" and
+// was valid anywhere the signature could be checked. It is deliberately NOT the
+// envelope's audience (zoiko-internal): the envelope is what other services
+// consume, this token is a single-use step between /v1/authenticate and
+// /v1/context/resolve, and the two must not be interchangeable at a verifier
+// that checks only a signature.
+const IdPTokenAudience = "identity-context-svc/resolve"
 
 // ErrTokenTTLInvalid is returned when the configured token lifetime is not
 // positive. Fails at construction rather than minting a token that is already
@@ -55,6 +67,7 @@ func NewIdPTokenIssuer(cfg *config.Config) (*IdPTokenIssuer, error) {
 	return &IdPTokenIssuer{
 		secret:     []byte(cfg.JWTSigningSecret),
 		issuer:     cfg.JWTIssuer,
+		audience:   IdPTokenAudience,
 		ttlSeconds: cfg.IdPTokenTTLSeconds,
 	}, nil
 }
@@ -90,8 +103,9 @@ func (i *IdPTokenIssuer) Issue(subject, tenantID string, mfaDone bool) (string, 
 		TenantID: tenantID,
 		MFADone:  mfaDone,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Subject: subject,
-			Issuer:  i.issuer,
+			Subject:  subject,
+			Issuer:   i.issuer,
+			Audience: jwt.ClaimStrings{i.audience},
 			// VerifyBearer parses with jwt.WithExpirationRequired(), so exp is
 			// not optional — a token without it is rejected, by design.
 			IssuedAt:  jwt.NewNumericDate(now),

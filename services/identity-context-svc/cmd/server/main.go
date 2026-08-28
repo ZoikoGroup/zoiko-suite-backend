@@ -140,10 +140,45 @@ func main() {
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
+
 	// ── Domain dependencies ───────────────────────────────────────────────
-	sessionCache := session.NewCache(rdb, cfg.Redis.SessionTTLSeconds)
-	riskCache := session.NewRiskSignalCache(rdb)
 	principalRepo := store.New(pool, log)
+	riskCache := session.NewRiskSignalCache(rdb)
+
+	// Redis is the hot cache; Postgres session_contexts is the durable evidence
+	// record (migration 000005). DurableCache composes them and is what carries
+	// the tenant scoping — a Redis session key names no owner, so the handlers
+	// cannot enforce isolation on the cache alone.
+	redisSessions := session.NewCache(rdb, cfg.Redis.SessionTTLSeconds)
+	sessionCache := session.NewDurableCache(redisSessions, principalRepo, log)
+
+	// ── Kafka consumer ────────────────────────────────────────────────────
+	// Revocation events reach the estate through here: authority.revoked,
+	// role.updated and entity.updated all invalidate live sessions, and
+	// session.risk.changed is the ONLY writer of the risk cache the resolver
+	// reads. None of it ran before, because this reader was never constructed
+	// and the Consumer was unreachable code.
+	//
+	// Started before the HTTP listener so a revocation published while the
+	// service was down is consumed rather than skipped. An absent broker is not
+	// fatal — the reader retries in the background and authentication, which
+	// needs no Kafka, serves throughout.
+	consumerCtx, stopConsumer := context.WithCancel(context.Background())
+	defer stopConsumer()
+
+	kafkaReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: cfg.Kafka.Brokers,
+		Topic:   cfg.Kafka.Topic,
+		GroupID: cfg.Kafka.GroupID,
+		// Errors are surfaced through ReadMessage rather than kafka-go's own
+		// logger, so the consumer decides the level. Without this a missing
+		// broker prints to stderr once per dial attempt, outside zap.
+		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+			log.Debug("kafka reader: " + fmt.Sprintf(msg, args...))
+		}),
+	})
+	consumer := events.NewConsumer(log, sessionCache, principalRepo, riskCache, events.NewRedisDeduper(rdb))
+	go consumer.Run(consumerCtx, kafkaReader)
 	upstreamRegistry := upstream.NewRegistryClient(cfg, log)
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	verifier := auth.NewJWTVerifier(cfg)
@@ -294,9 +329,23 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+	log.Info("stopping event consumer")
+	stopConsumer()
+
+	// Bounded. Drain used to block forever on a goroutine that never returned,
+	// which made a clean stop indistinguishable from a hang and left the
+	// process dependent on the orchestrator's SIGKILL. The budget is shorter
+	// than the shutdown context above so a stuck publish is reported here
+	// rather than surfacing as a killed container.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer drainCancel()
 	log.Info("draining in-flight event goroutines")
-	resolver.Drain()
-	authenticator.Drain()
+	if err := resolver.Drain(drainCtx); err != nil {
+		log.Warn("resolver drain incomplete — in-flight events may be lost", zap.Error(err))
+	}
+	if err := authenticator.Drain(drainCtx); err != nil {
+		log.Warn("authenticator drain incomplete — in-flight events may be lost", zap.Error(err))
+	}
 	log.Info("identity-context-svc stopped")
 }
 

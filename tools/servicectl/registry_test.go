@@ -135,6 +135,7 @@ func TestServiceURLsAddressTheServiceTheyName(t *testing.T) {
 		"LEDGER_SERVICE_URL":     port("general-ledger-svc"),
 		"GENERAL_LEDGER_URL":     port("general-ledger-svc"),
 		"SIEM_SERVICE_URL":       port("siem-integration-svc"),
+		"ACCESS_CONTROL_URL":     port("access-control-svc"),
 	}
 	for _, s := range reg.All() {
 		for k, want := range expect {

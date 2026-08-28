@@ -9,12 +9,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"zoiko.io/identity-context-svc/internal/config"
+	"zoiko.io/identity-context-svc/internal/domain"
 )
 
 // ErrNotImplemented is returned by a client method whose upstream service is
@@ -24,6 +27,17 @@ import (
 // previous stub returned an empty slice and nil, so a missing upstream was
 // indistinguishable from "this principal holds nothing".
 var ErrNotImplemented = errors.New("upstream client not implemented in this deployment")
+
+// ErrUpstreamRead is returned when an upstream answered but the answer cannot
+// be trusted — a transport failure, an unexpected status, or an undecodable
+// body. The resolver maps it to ErrUpstreamUnavailable and returns 503.
+var ErrUpstreamRead = errors.New("upstream read failed")
+
+// maxConcurrentBundleLookups bounds the per-resolution fan-out to
+// access-control-svc. Principals hold single-digit role counts, so this is
+// generous for the real workload while keeping one resolution from opening an
+// unbounded number of sockets if that ever stops being true.
+const maxConcurrentBundleLookups = 8
 
 // RegistryClient implements UpstreamRegistry against real Tier 0 service HTTP APIs.
 //
@@ -68,6 +82,10 @@ type entityView struct {
 	LegalEntityID string `json:"legal_entity_id"`
 	TenantID      string `json:"tenant_id"`
 	EntityStatus  string `json:"entity_status"`
+	// The registry treats this as MANDATORY — no LegalEntity exists without a
+	// residency policy (data-model §05.3). It travels into the SessionContext
+	// so the evidence record says which policy governed the session's PII.
+	DataResidencyPolicyID string `json:"data_residency_policy_id"`
 }
 
 // IsTenantActive calls the Tenant & Entity Registry to verify tenant lifecycle_state.
@@ -115,8 +133,8 @@ func (c *RegistryClient) IsTenantActive(ctx context.Context, tenantID string) (b
 	return active, nil
 }
 
-// IsPrincipalAuthorizedForEntity verifies the requested legal entity is one this
-// principal's tenant may act as.
+// ResolveEntityScope verifies the requested legal entity is one this
+// principal's tenant may act as, and returns what that entity carries.
 //
 //	GET {tenantRegistryURL}/v1/entities/{legalEntityID}
 //
@@ -132,15 +150,23 @@ func (c *RegistryClient) IsTenantActive(ctx context.Context, tenantID string) (b
 // answered from this service's own principal_role_assignments in the resolver's
 // Dimension 4. This method answers the prior one: is the entity real, active,
 // and inside the principal's tenant.
-func (c *RegistryClient) IsPrincipalAuthorizedForEntity(ctx context.Context, principalID, tenantID, legalEntityID string) (bool, error) {
+//
+// It returns the scope rather than a bare bool because the same response
+// carries the entity's data residency policy, which the SessionContext records
+// as MANDATORY. That value was being fetched and discarded on every resolution,
+// so every session was persisted with an empty residency policy — a field the
+// data model says no record may lack.
+func (c *RegistryClient) ResolveEntityScope(ctx context.Context, principalID, tenantID, legalEntityID string) (*domain.EntityScope, error) {
+	denied := &domain.EntityScope{Authorized: false}
+
 	if tenantID == "" || legalEntityID == "" {
-		return false, nil
+		return denied, nil
 	}
 
 	status, body, err := c.get(ctx, tenantID,
 		fmt.Sprintf("%s/v1/entities/%s", c.cfg.TenantRegistryURL, legalEntityID))
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	if status == http.StatusNotFound {
@@ -149,15 +175,15 @@ func (c *RegistryClient) IsPrincipalAuthorizedForEntity(ctx context.Context, pri
 			zap.String("tenant_id", tenantID),
 			zap.String("legal_entity_id", legalEntityID),
 		)
-		return false, nil
+		return denied, nil
 	}
 	if status != http.StatusOK {
-		return false, fmt.Errorf("tenant registry GET /v1/entities/%s returned %d", legalEntityID, status)
+		return nil, fmt.Errorf("tenant registry GET /v1/entities/%s returned %d", legalEntityID, status)
 	}
 
 	var e entityView
 	if err := json.Unmarshal(body, &e); err != nil {
-		return false, fmt.Errorf("entity response unreadable: %w", err)
+		return nil, fmt.Errorf("entity response unreadable: %w", err)
 	}
 
 	// Belt and braces. The registry already scopes the read by the header, but
@@ -170,7 +196,7 @@ func (c *RegistryClient) IsPrincipalAuthorizedForEntity(ctx context.Context, pri
 			zap.String("entity_tenant", e.TenantID),
 			zap.String("legal_entity_id", legalEntityID),
 		)
-		return false, nil
+		return denied, nil
 	}
 
 	// DISSOLVED, SUSPENDED and DORMANT entities exist and are readable; none of
@@ -180,32 +206,147 @@ func (c *RegistryClient) IsPrincipalAuthorizedForEntity(ctx context.Context, pri
 			zap.String("legal_entity_id", legalEntityID),
 			zap.String("entity_status", e.EntityStatus),
 		)
-		return false, nil
+		return denied, nil
 	}
-	return true, nil
+
+	// An ACTIVE entity with no residency policy contradicts the registry's own
+	// mandatory-field rule. Logged rather than refused: the session is
+	// legitimate and blocking it would make this service the enforcement point
+	// for another service's data-quality invariant. The empty value is carried
+	// through honestly instead of being invented.
+	if e.DataResidencyPolicyID == "" {
+		c.log.Warn("legal entity carries no data residency policy",
+			zap.String("legal_entity_id", legalEntityID),
+			zap.String("tenant_id", tenantID),
+		)
+	}
+
+	return &domain.EntityScope{
+		Authorized:            true,
+		DataResidencyPolicyID: e.DataResidencyPolicyID,
+	}, nil
 }
 
-// ResolvePermissionBundles fetches permission bundle IDs for a slice of role IDs.
+// permissionBundleView is the subset of access-control-svc's
+// PermissionBundleDef this service reads.
+type permissionBundleView struct {
+	BundleID   string `json:"bundle_id"`
+	ActiveFlag bool   `json:"active_flag"`
+}
+
+// ResolvePermissionBundles fetches the permission bundle IDs granted by a set
+// of roles.
 //
-//	GET {accessControlURL}/v1/roles?ids=r1,r2,r3
+//	GET {accessControlURL}/v1/role-definitions/{roleID}/permission-bundles
 //
-// NOT IMPLEMENTED, and deliberately an error rather than an empty slice.
-// access-control-svc owns the role -> permission-bundle mapping and is not part
-// of this deployment; ACCESS_CONTROL_URL currently points back at this service,
-// which serves no such route. Returning []string{}, nil — as the previous stub
-// did — puts an empty permission_bundle_ids into a SIGNED envelope, which reads
-// downstream as "this principal legitimately holds no permissions" rather than
-// as "nobody asked". An empty roleIDs slice is still a real answer and returns
-// empty without calling anything.
-func (c *RegistryClient) ResolvePermissionBundles(ctx context.Context, roleIDs []string) ([]string, error) {
+// FAN-OUT, NOT A BATCH QUERY. access-control-svc exposes bundles per role
+// definition and has no ids= filter, so this issues one request per role. The
+// previous signature documented `GET /v1/roles?ids=r1,r2,r3`, a route that
+// exists on no service in the estate — which is part of why this returned
+// ErrNotImplemented rather than calling anything.
+//
+// Requests run concurrently and bounded: this is on the P99 < 50ms resolve
+// path, and a principal with six roles would otherwise pay six sequential
+// round trips.
+//
+// FAILURE IS FAIL-CLOSED, per role. If any role cannot be resolved the whole
+// call errors and the resolver returns 503. Dropping the failed role and
+// returning the rest would put a SHORT bundle list into a signed envelope,
+// which downstream reads as "this principal legitimately lacks that
+// permission" — a silent, signed under-grant is worse than a loud refusal.
+//
+// An empty roleIDs slice is a real answer and returns empty without calling
+// anything: a principal with no roles genuinely holds no bundles.
+func (c *RegistryClient) ResolvePermissionBundles(ctx context.Context, tenantID string, roleIDs []string) ([]string, error) {
 	if len(roleIDs) == 0 {
 		return []string{}, nil
 	}
-	c.log.Error("permission bundle resolution requested but access-control-svc is not wired",
-		zap.Strings("role_ids", roleIDs),
-		zap.String("access_control_url", c.cfg.AccessControlURL),
-	)
-	return nil, fmt.Errorf("%w: access-control-svc (ACCESS_CONTROL_URL=%s)", ErrNotImplemented, c.cfg.AccessControlURL)
+	if tenantID == "" {
+		return nil, errors.New("ResolvePermissionBundles: tenant_id is required")
+	}
+
+	// Deduplicate: two assignments of the same role on different entities are
+	// distinct rows but one role definition.
+	unique := make([]string, 0, len(roleIDs))
+	seen := make(map[string]struct{}, len(roleIDs))
+	for _, id := range roleIDs {
+		if _, dup := seen[id]; dup || id == "" {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxConcurrentBundleLookups)
+
+	perRole := make([][]string, len(unique))
+	for i, roleID := range unique {
+		i, roleID := i, roleID
+		g.Go(func() error {
+			bundles, err := c.bundlesForRole(gctx, tenantID, roleID)
+			if err != nil {
+				return err
+			}
+			perRole[i] = bundles
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Flatten, deduplicating across roles: two roles sharing a bundle must not
+	// place it in the envelope twice.
+	out := make([]string, 0, len(unique))
+	emitted := make(map[string]struct{})
+	for _, bundles := range perRole {
+		for _, b := range bundles {
+			if _, dup := emitted[b]; dup {
+				continue
+			}
+			emitted[b] = struct{}{}
+			out = append(out, b)
+		}
+	}
+	return out, nil
+}
+
+// bundlesForRole resolves one role definition's active bundle ids.
+func (c *RegistryClient) bundlesForRole(ctx context.Context, tenantID, roleID string) ([]string, error) {
+	status, body, err := c.get(ctx, tenantID,
+		fmt.Sprintf("%s/v1/role-definitions/%s/permission-bundles", c.cfg.AccessControlURL, url.PathEscape(roleID)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: access control: %v", ErrUpstreamRead, err)
+	}
+
+	// 404 means the principal holds an assignment to a role definition that
+	// does not exist upstream. That is a data inconsistency, not an empty
+	// grant, and resolving it to "no bundles" would sign the inconsistency into
+	// an envelope. A role that genuinely grants nothing answers 200 with [].
+	if status == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: role definition %s not found in access-control-svc", ErrUpstreamRead, roleID)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("%w: access control GET /v1/role-definitions/%s/permission-bundles returned %d",
+			ErrUpstreamRead, roleID, status)
+	}
+
+	var bundles []permissionBundleView
+	if err := json.Unmarshal(body, &bundles); err != nil {
+		return nil, fmt.Errorf("%w: decode permission bundles for role %s: %v", ErrUpstreamRead, roleID, err)
+	}
+
+	ids := make([]string, 0, len(bundles))
+	for _, b := range bundles {
+		// An inactive bundle is a grant that has been withdrawn. Including it
+		// would keep it in force for the life of every envelope issued.
+		if !b.ActiveFlag || b.BundleID == "" {
+			continue
+		}
+		ids = append(ids, b.BundleID)
+	}
+	return ids, nil
 }
 
 // get performs one scoped read against an upstream service.

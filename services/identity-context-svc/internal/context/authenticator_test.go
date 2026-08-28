@@ -269,7 +269,8 @@ func TestAuthenticate_NeverAssertsMFA(t *testing.T) {
 	require.NoError(t, err)
 
 	require.False(t, issuer.issued[0].mfaDone, "a password must never assert a second factor")
-	require.True(t, resp.MFARequired)
+	require.False(t, resp.MFARequired,
+		"no step-up factor exists in the estate, so the response must not demand one a client cannot satisfy")
 }
 
 func TestAuthenticate_WrongPasswordRecordsFailure(t *testing.T) {
@@ -528,7 +529,7 @@ func TestAuthenticate_UnknownEmailIsStillObservable(t *testing.T) {
 	_, err := auth.Authenticate(context.Background(), request())
 	require.ErrorIs(t, err, identityctx.ErrInvalidCredentials)
 
-	auth.Drain()
+	_ = auth.Drain(context.Background())
 	require.Empty(t, store.deniedCalls, "there is no principal row to reference")
 	require.Len(t, events.events, 1)
 	require.Equal(t, "failed", events.events[0].kind)

@@ -158,6 +158,10 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 			errors.Is(err, ErrTrustPostureBlocked),
 			errors.Is(err, ErrNoToken):
 			writeError(w, http.StatusUnauthorized, err.Error())
+		case errors.Is(err, ErrSAMLUnsupported):
+			// 400, not 401. The request is malformed for this deployment; no
+			// credential the caller holds would change the outcome.
+			writeError(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, ErrUpstreamUnavailable):
 			writeError(w, http.StatusServiceUnavailable, err.Error())
 		default:
@@ -173,9 +177,30 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 	sessionContextID := chi.URLParam(r, "sessionContextID")
-	jwt, err := h.sessions.Get(r.Context(), sessionContextID)
+
+	// Scoped on the caller's verified tenant, like every /v1/principals route.
+	// Without it this returned any tenant's signed envelope to any caller
+	// holding the session id — and the envelope is the credential every
+	// downstream service trusts.
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	jwt, err := h.sessions.Get(r.Context(), sessionContextID, tenantID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "session not found or expired")
+		// 404 only for a session that genuinely is not there. A store that
+		// could not answer is 503: reporting it as "not found" would send an
+		// operator looking at session expiry for a database outage.
+		if errors.Is(err, domain.ErrSessionNotFound) {
+			writeError(w, http.StatusNotFound, "session not found or expired")
+			return
+		}
+		h.log.Error("session lookup failed",
+			zap.String("session_context_id", sessionContextID),
+			zap.Error(err),
+		)
+		writeError(w, http.StatusServiceUnavailable, "session store unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, domain.GetSessionResponse{EnvelopeJWT: jwt})
@@ -188,6 +213,13 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 	actorPrincipalID := r.Header.Get("X-Actor-Principal-ID")
 
+	// Same scoping as GetSession. Unscoped, this route let any tenant revoke
+	// any other tenant's sessions by id.
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
 	var req domain.InvalidateSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -195,10 +227,16 @@ func (h *Handler) InvalidateSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.resolver.InvalidateSession(
-		r.Context(), sessionContextID, req.Reason, actorPrincipalID, correlationID,
+		r.Context(), sessionContextID, tenantID, req.Reason, actorPrincipalID, correlationID,
 	); err != nil {
-		h.log.Error("invalidate session failed", zap.Error(err))
-		writeError(w, http.StatusInternalServerError, "failed to invalidate session")
+		// Invalidating an absent session is already an idempotent no-op inside
+		// the resolver, so an error here means the stores could not be reached
+		// — the caller must not read that as "revoked".
+		h.log.Error("invalidate session failed",
+			zap.String("session_context_id", sessionContextID),
+			zap.Error(err),
+		)
+		writeError(w, http.StatusServiceUnavailable, "session store unavailable")
 		return
 	}
 
@@ -379,6 +417,6 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // Ensure the interfaces defined in interfaces.go are satisfied at compile time.
 // The concrete implementations live in their own packages.
 var _ PrincipalStore = (*store.PgStore)(nil)
-var _ SessionCache = (*session.Cache)(nil)
+var _ SessionCache = (*session.DurableCache)(nil)
 var _ RiskSignalCache = (*session.RiskSignalCache)(nil)
 var _ CredentialStore = (*store.PgStore)(nil)

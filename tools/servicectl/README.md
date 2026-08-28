@@ -105,10 +105,20 @@ were never started alongside the main one. Under one launcher they would all
 fire, so the generator resolves these from the variable name and
 `registry_test.go` holds that property.
 
-The two `identity-context-svc` self-references — `ACCESS_CONTROL_URL` and
-`DELEGATED_AUTHORITY_URL` pointing at `identity-svc` — are deliberate: that
-service serves those endpoints itself, and the by-name rule is explicitly
-exempted for them.
+`identity-context-svc` carried two self-references — `ACCESS_CONTROL_URL` and
+`DELEGATED_AUTHORITY_URL` pointing at `identity-svc` — which this file
+previously described as deliberate, on the grounds that the service serves those
+endpoints itself. It does not. It has never registered a `/v1/roles` route, so
+`ACCESS_CONTROL_URL` addressed a service that would 404 it, and the only place
+the value ever appeared was in an error message. `DELEGATED_AUTHORITY_URL` was
+read into config and used nowhere at all — delegated authority is a local table
+this service already queries directly.
+
+Both are now resolved by the same by-name rule as everything else:
+`ACCESS_CONTROL_URL` addresses `access-control-svc` on `:8137`, which is where
+`/v1/role-definitions/{id}/permission-bundles` actually lives, and
+`DELEGATED_AUTHORITY_URL` is gone. `registry_test.go` holds the first as a
+property, so the exemption cannot quietly return.
 
 ## Regenerating the registry
 
@@ -145,11 +155,19 @@ existing key is *parsed* rather than trusted, because a corrupt one fails at
 `NewJWTSigner` with "parse private key", which reads like a code fault and no
 amount of restarting fixes.
 
-`JWT_SIGNING_SECRET` is **not** auto-generated, deliberately. Other services
-verify envelopes with it, so a fresh random value per run would break every
-cross-service verification — and it would fail as an authorization error, which
-sends you looking at RBAC. It must be in the global env; `.env.local` carries the
-same throwaway value compose pinned.
+`JWT_SIGNING_SECRET` is not auto-generated. The reason previously given here —
+that other services verify envelopes with it — is wrong twice over. Envelopes
+are RS256 and verified through the JWKS endpoint, precisely so no verifier holds
+a key that could mint one; and no service other than `identity-context-svc`
+reads this variable at all, in Go or in any compose file. Its only consumer is
+that service's own first-party IdP token issuer, which signs and verifies within
+one process.
+
+A fresh value per run would therefore invalidate only bearer tokens issued
+before a restart — those live 300 seconds and a re-login replaces them. It stays
+pinned anyway, because a stable value keeps a token usable across the restarts a
+development loop causes, and `.env.local` carries the same throwaway value
+compose used.
 
 ## Adopted listeners
 

@@ -25,12 +25,24 @@ type PrincipalStore interface {
 // invalidated_at is appended (append-only evidence obligation).
 type SessionCache interface {
 	Put(ctx context.Context, sessionContextID, envelopeJWT string) error
-	Get(ctx context.Context, sessionContextID string) (string, error)
+
+	// Get, GetSessionContext, Invalidate and EvictAllForPrincipal all take the
+	// caller's verified tenant. Redis session keys are flat — session:jwt:<ulid>
+	// carries no owner — so the tenant cannot be derived from the id, and
+	// without it these routes served and revoked across tenant boundaries while
+	// every /v1/principals route beside them scoped correctly.
+	Get(ctx context.Context, sessionContextID, tenantID string) (string, error)
 	Evict(ctx context.Context, sessionContextID string) error
 	PersistSessionContext(ctx context.Context, sc domain.SessionContext) error
-	GetSessionContext(ctx context.Context, sessionContextID string) (*domain.SessionContext, error)
-	Invalidate(ctx context.Context, sessionContextID string, reason domain.InvalidationReason, at time.Time) error
-	EvictAllForPrincipal(ctx context.Context, principalID string) error
+	GetSessionContext(ctx context.Context, sessionContextID, tenantID string) (*domain.SessionContext, error)
+	Invalidate(ctx context.Context, sessionContextID, tenantID string, reason domain.InvalidationReason, at time.Time) error
+
+	// EvictAllForPrincipal revokes every live session for a principal and
+	// returns how many were revoked. reason is recorded on each SessionContext
+	// so the evidence trail distinguishes a delegation revocation from a
+	// logout; a bare eviction would leave every revoked session looking as
+	// though it had simply expired.
+	EvictAllForPrincipal(ctx context.Context, principalID, tenantID string, reason domain.InvalidationReason) (int, error)
 }
 
 // RiskSignalCache provides READ-ONLY access to asynchronously-populated
@@ -58,12 +70,19 @@ type RiskSignalCache interface {
 type UpstreamRegistry interface {
 	IsTenantActive(ctx context.Context, tenantID string) (bool, error)
 
-	// IsPrincipalAuthorizedForEntity takes the principal's own verified tenant
-	// because the registry scopes the entity read by it — that scoping IS the
-	// isolation check, so it cannot be derived from the entity being asked for.
-	IsPrincipalAuthorizedForEntity(ctx context.Context, principalID, tenantID, legalEntityID string) (bool, error)
+	// ResolveEntityScope takes the principal's own verified tenant because the
+	// registry scopes the entity read by it — that scoping IS the isolation
+	// check, so it cannot be derived from the entity being asked for.
+	//
+	// Returns the scope rather than a bool so the entity's data residency
+	// policy, which arrives on the same response, reaches the SessionContext
+	// instead of being discarded.
+	ResolveEntityScope(ctx context.Context, principalID, tenantID, legalEntityID string) (*domain.EntityScope, error)
 
-	ResolvePermissionBundles(ctx context.Context, roleIDs []string) ([]string, error)
+	// ResolvePermissionBundles takes the principal's verified tenant because
+	// access-control-svc scopes the read by it, exactly as the entity read is
+	// scoped. Fan-out per role — there is no batch route.
+	ResolvePermissionBundles(ctx context.Context, tenantID string, roleIDs []string) ([]string, error)
 }
 
 // EventPublisher emits append-only domain events to the event backbone.
