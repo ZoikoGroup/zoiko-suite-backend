@@ -54,6 +54,9 @@ type stubStore struct {
 	sodHasConflict    bool
 	sodErr            error
 
+	ownObjectForbidden bool
+	ownObjectErr       error
+
 	decision        *domain.AccessDecisionLog
 	recordErr       error
 	findDecision    *domain.AccessDecisionLog
@@ -95,6 +98,9 @@ func (s *stubStore) FindDelegatedActions(_ context.Context, _, _ string) ([]stri
 }
 func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _, _ string) (string, bool, error) {
 	return s.sodConflictAction, s.sodHasConflict, s.sodErr
+}
+func (s *stubStore) CheckOwnObjectSoD(_ context.Context, _, _ string) (bool, error) {
+	return s.ownObjectForbidden, s.ownObjectErr
 }
 func (s *stubStore) RecordAccessDecision(_ context.Context, _, _, _, outcome, basis, _ string) (*domain.AccessDecisionLog, error) {
 	if s.decision != nil {
