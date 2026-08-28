@@ -29,6 +29,7 @@ services:
       - ../services/ai-governance-svc/deployments/migrations:/migrations/ai-governance:ro
       - ../services/kill-switch-registry-svc/deployments/migrations:/migrations/kill-switch-registry:ro
       - ../services/retention-registry-svc/deployments/migrations:/migrations/retention-registry:ro
+      - ../services/privacy-purpose-registry-svc/deployments/migrations:/migrations/privacy-purpose-registry:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3096,6 +3097,45 @@ services:
       DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/retention_registry?sslmode=disable"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.retention-registry.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── privacy-purpose-registry-svc (Port: 8151) ───────────────────────────
+  # PRV-01 of ZS-SVC-W-001 (Privacy/Consent/Purpose/Data Rights Control) —
+  # the only one of that spec's five services implemented so far. Owns the
+  # purpose registry and processing-activity registry/lifecycle
+  # (DRAFT -> VALIDATED -> SUBMITTED -> APPROVED -> ACTIVE, with
+  # reject/suspend/retire branches). Consent (PRV-02), runtime
+  # purpose-binding decisions (PRV-03), data rights/DSR (PRV-04), and
+  # transfer/processor control (PRV-05) all depend on this registry
+  # existing first and are not yet built.
+  privacy-purpose-registry-svc:
+    build:
+      context: ../services/privacy-purpose-registry-svc
+      dockerfile: Dockerfile
+    container_name: privacy-purpose-registry-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8151:8151"
+    environment:
+      PORT: "8151"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_purpose_registry?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.privacy-purpose-registry.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:

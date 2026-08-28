@@ -100,7 +100,7 @@ These aren't bugs in existing code — they're domains the new register specifie
 - **AP-07 Expense Claim** — confirmed absent estate-wide; no `expense-*-svc` exists anywhere.
 - **Assets, Inventory & Project Accounting** (`ZS-SVC-G-001`) — an entire 12-service domain (fixed assets, depreciation, inventory movement/valuation, project cost capture) with zero corresponding service anywhere in the 86-service repo.
 - **Most of Financial/Statutory/Regulatory Reporting** (`ZS-SVC-H-001`) — no XBRL/iXBRL, no Statutory Pack, no Financial Statements certification, no Regulatory Submission, no tamper-evident export/evidence package. `reporting-orchestration-svc` (see §0 above) only weakly resembles two of the seven required sub-services, and what exists is a stub.
-- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — confirmed zero services (`*privacy*`, `*consent*`, `*dsr*` all return nothing). Entire domain unbuilt.
+- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — PARTIALLY BUILT (2026-08-28): see §3.1 below. PRV-01 (the purpose/activity registry) now exists as `privacy-purpose-registry-svc`; PRV-02 through PRV-05 (consent, runtime decisions, data rights/DSR, transfer/processor) remain entirely unbuilt.
 - **Full AP-01/04/08/09/10/11** (Supplier Financial Profile, Goods Receipt, Payables, Payment Proposal/Authorization/Run) — only requisition/PO/invoice/matching exist; the payment side of AP is unbuilt.
 - **FP&A domain** (`ZS-SVC-J-001`) — `forecasting-svc` is a standalone statistics microservice; none of Budget/Forecast-with-approval/Scenario/Variance/KPI-Registry/Management-Accounts/Board-Pack exist as governed objects.
 - **Audit & Assurance engagement domain** (`ZS-SVC-K-001`) — no engagement/risk-assessment/sampling/workpaper/sign-off service exists; `audit-event-store-svc` is correctly-scoped infrastructure this domain would consume, not an implementation of it.
@@ -110,6 +110,27 @@ These aren't bugs in existing code — they're domains the new register specifie
 - **Platform Commercial Billing** (`ZS-SVC-Q-001` COM-05) — `commercial-account-svc` covers subscriptions/entitlements but has no invoicing/payment-collection/dunning-execution/reconciliation service.
 - **Corporate governance breadth** (`ZS-SVC-O-001`) — `corporate-actions-svc` and `counterparty-management-svc` have **zero** tracker coverage despite the doc imposing real invariants (ownership reconciliation, quorum/entitlement freezing) — never audited for tenant isolation at all, unlike every other service touched this session.
 - **Business Operations & Content Services domain** (`ZS-SVC-P-001`) — document management, CRM, task/case, catalog, deadline services: no tracker rows reference any of these by name.
+
+### 3.1 `privacy-purpose-registry-svc` — new service, PRV-01 of ZS-SVC-W-001 (2026-08-28)
+
+Built as a real, working v1 — not a scaffold — of PRV-01 ("Processing Activity, Purpose & Lawful-Basis Registry"), the first of the five services `ZS-SVC-W-001` specifies and the one its own §35 eight-wave sequence names as the first buildable service (PRV-02 consent, PRV-03 runtime purpose-binding decisions, PRV-04 data rights/DSR, and PRV-05 transfer/processor control all depend on this registry existing first).
+
+**What's real:**
+- Two independently-versioned registries (`purposes`/`purpose_versions`, `processing_activities`/`processing_activity_versions`), same stable-identity + immutable-once-published shape used throughout this platform.
+- The full processing-activity lifecycle from Figure 4: `DRAFT -> VALIDATED -> SUBMITTED -> APPROVED -> ACTIVE`, with a real reject/fix-loop branch (`SUBMITTED -> REJECTED`, dead end — the fix is a new version via `supersedes_version_id`, never a resurrection) and `SUSPENDED`/`RETIRED` branches. Every transition is atomically WHERE-guarded at the store layer and authorized against its own action.
+- Real structural validation (PRV-001/004/019-coded findings): an activity referencing an unpublished or nonexistent purpose fails validation and stays DRAFT (PRV-I13 — never a silent PERMIT), verified end-to-end through the handler.
+- Database-enforced immutability: published purpose versions (PRV-I06) and DRAFT-exited activity-version content (PRV-I20) are both protected by `BEFORE UPDATE` triggers, not just application code — same doctrine as `evidence-manifest-svc`'s `reject_mutation()`.
+- Full RLS tenant isolation, including the nullable-tenant-is-platform-wide convention this platform uses elsewhere (`retention-registry-svc`'s `retention_policies`/`legal_holds`).
+- `GET .../{id}?as_of=` historical resolution and `GET /privacy/ropa` (the role/jurisdiction-filtered processing inventory §9.1 names).
+- Handler test suite covers the full lifecycle, illegal-transition rejection, tenant-mismatch refusal, authorization denial, and the reject/fix-loop; two negative controls (immutability guard, APPROVED-gate on activation) were run and confirmed to genuinely fail before being restored.
+
+**What's deliberately NOT built, and why (see `internal/domain`'s package doc comment for the full statement):**
+- **Validate is structural only.** It does not evaluate jurisdiction-specific legal correctness — `ZS-SVC-W-001` §0 is explicit that "jurisdiction-specific production rules require approved PDC packages," and no such package or service exists anywhere in this codebase. Faking a legal-correctness check would have been exactly the fabricated-success shape this whole workstream exists to remove.
+- **No real workflow-svc orchestration behind Submit/Approve/Reject.** These are real, authorized, audited transitions — SUBMITTED is never silently treated as APPROVED — but there is no governed WFC engine wired in. This is an honest, simpler approval gate, not a fabricated one.
+- **`lawful_basis_refs`/`retention_rule_refs`/`transfer_refs` are opaque, unvalidated references** — same doctrine as `retention_policies.record_class`: recorded, not resolved against any registry, because none exists yet.
+- **PRV-02 through PRV-05 are not built.** Consent capture/evidence, the runtime purpose-binding decision endpoint (the Tier-1 hot path every other service would actually call before processing personal data), data-subject rights requests, and transfer/processor/subprocessor control all remain entirely unbuilt. **This means no service in the platform can yet actually check "am I allowed to use this data for this purpose" at runtime** — PRV-01 only lets that question eventually be answerable, it does not yet answer it.
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8151, db `privacy_purpose_registry`) but not started or smoke-tested against a live stack in this session, consistent with this session's minimal-Docker-footprint discipline — build/vet/test all pass against the in-memory stub store; RLS/immutability were verified by reading the migration SQL against this platform's proven patterns, not by running a live Postgres instance.
 
 ---
 
