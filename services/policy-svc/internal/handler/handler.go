@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -897,31 +899,63 @@ func (h *Handler) Evaluate(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// decodeExactAmount extracts field from a raw JSON object as an exact
+// decimal value — never float64. `ZS-SVC-V-001` §13.2/§14.2 (PDC-I-11):
+// "binary floating-point is not used for material monetary... calculations."
+// json.Number preserves the literal decimal text from the wire (e.g.
+// "1000.10"), and big.Rat.SetString parses that text exactly as a rational
+// number — no IEEE-754 rounding step exists anywhere in this path. Returns
+// (nil, false, nil) if the field is absent or null, distinct from a decode
+// error.
+func decodeExactAmount(raw json.RawMessage, field string) (*big.Rat, bool, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var obj map[string]interface{}
+	if err := dec.Decode(&obj); err != nil {
+		return nil, false, err
+	}
+	v, present := obj[field]
+	if !present || v == nil {
+		return nil, false, nil
+	}
+	num, ok := v.(json.Number)
+	if !ok {
+		return nil, false, fmt.Errorf("%s is not a JSON number", field)
+	}
+	amount, ok := new(big.Rat).SetString(num.String())
+	if !ok {
+		return nil, false, fmt.Errorf("%s is not a valid decimal number: %q", field, num.String())
+	}
+	return amount, true, nil
+}
+
 // evaluateApprovalThreshold implements the APPROVAL_THRESHOLD evaluation
 // rule: compare action_context.amount against the matched version's
 // rule_payload.threshold_amount. amount > threshold => APPROVAL_REQUIRED;
 // amount <= threshold (including exactly equal) => WITHIN_THRESHOLD.
 //
-// After a successful evaluation, records the decision in
-// governance-decision-log-svc (best-effort — see internal/decisionlog's
-// doc comment on HTTPClient) before responding to the caller.
+// The comparison itself is exact decimal arithmetic (see
+// decodeExactAmount) — this closes PDC-I-11 for this one comparison. It
+// does not, by itself, make money exact end to end: every amount arriving
+// here was very likely produced by an upstream financial service (AP/AR/
+// GL) that stores Amount as float64, same as the rest of this platform.
+// Fixing that is an estate-wide type migration, out of scope here — this
+// fix guarantees only that THIS comparison introduces no additional
+// binary-floating-point error of its own.
 func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Request, req evaluateRequest, applicable *domain.ApplicablePolicyVersion, correlationID string) {
-	var rule struct {
-		ThresholdAmount *float64 `json:"threshold_amount"`
-	}
-	if err := json.Unmarshal(applicable.RulePayload, &rule); err != nil || rule.ThresholdAmount == nil {
+	thresholdAmount, present, err := decodeExactAmount(applicable.RulePayload, "threshold_amount")
+	if err != nil || !present {
 		h.log.Error("evaluateApprovalThreshold: policy version has invalid/missing threshold_amount",
 			zap.String("policy_version_id", applicable.PolicyVersionID),
 			zap.String("correlation_id", correlationID),
+			zap.Error(err),
 		)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid_policy_payload"})
 		return
 	}
 
-	var action struct {
-		Amount *float64 `json:"amount"`
-	}
-	if err := json.Unmarshal(req.ActionContext, &action); err != nil || action.Amount == nil {
+	actionAmount, present, err := decodeExactAmount(req.ActionContext, "amount")
+	if err != nil || !present {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": "action_context.amount",
@@ -930,7 +964,7 @@ func (h *Handler) evaluateApprovalThreshold(w http.ResponseWriter, r *http.Reque
 	}
 
 	result := "WITHIN_THRESHOLD"
-	if *action.Amount > *rule.ThresholdAmount {
+	if actionAmount.Cmp(thresholdAmount) > 0 {
 		result = "APPROVAL_REQUIRED"
 	}
 	ruleBasis := fmt.Sprintf("%s:%s", applicable.PolicyCode, applicable.PolicyVersionID)

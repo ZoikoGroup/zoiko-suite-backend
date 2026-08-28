@@ -30,8 +30,12 @@ The new spec names these exact anti-patterns explicitly and independently for ea
 ### 1.1 `policy-svc`'s Priority 1c candidate hits are false positives — resolved, no fix needed
 Doc `ZS-SVC-V-001` (Policy/Rules/Decision/Jurisdictional Applicability), §10.1/§11.1/§25, requires tenant_id be sourced from auth context and any caller-supplied value only *compared*, never trusted. Read directly: every `req.TenantID` occurrence in `policy-svc/internal/handler/handler.go` passes through `refuseForeignTenant(w, req.TenantID, verifiedTenant)` — 403 on disagreement, never an override. This is exactly the doc's mandated pattern, and matches the precedent already established for `ai-governance-svc`. **No code change indicated.** Close the Priority 1c candidate row for this service.
 
-### 1.2 `policy-svc.Evaluate` has a real correctness bug — new finding, not tenant-related
-Same document, §13.2/§14.2 (PDC-I-11): "binary floating-point is not used for material monetary... calculations." `policy-svc`'s `Evaluate` implements `APPROVAL_THRESHOLD` via a Go `float64` comparison against a monetary value. This is a correctness defect independent of anything the tenant-isolation work was looking for — worth its own fix (decimal/rational comparison, not float64).
+### 1.2 `policy-svc.Evaluate` has a real correctness bug — FIXED (2026-08-28)
+Same document, §13.2/§14.2 (PDC-I-11): "binary floating-point is not used for material monetary... calculations." `policy-svc`'s `Evaluate` implemented `APPROVAL_THRESHOLD` via a Go `float64` comparison against a monetary value.
+
+Fix: added `decodeExactAmount`, which decodes `threshold_amount`/`amount` via `json.Decoder.UseNumber()` and parses the literal decimal text with `big.Rat.SetString` — no binary-floating-point rounding step exists in the comparison at all. Regression test `TestEvaluate_LargeAmount_PrecisionNotLost` demonstrates a real, reproducible divergence at large magnitudes: `10000000000000000` and `10000000000000001` are the identical float64 bit pattern (adjacent doubles are >1 apart at that scale), so the old code reported `WITHIN_THRESHOLD` when the exact decimal answer is `APPROVAL_REQUIRED`. Negative control (reverting to a float64 comparison) confirmed the new test fails with exactly that wrong outcome, then confirmed clean again on restore.
+
+**Scope note, not fixed here:** every financial service in this platform (`general-ledger-svc`, `accounts-payable-svc`, `accounts-receivable-svc`, ...) stores `Amount` as `float64` — this is the estate-wide convention, not an isolated bug. This fix guarantees only that policy-svc's own comparison introduces no *additional* binary-floating-point error; it does not make money exact end to end, since the value arriving over the wire may already have been produced by an upstream float64-typed field. Making money exact platform-wide would be its own estate-wide type migration, out of scope here.
 
 ### 1.3 `workflow-history-svc`'s fix is confirmed complete and doctrinally correct
 Doc `ZS-SVC-R-001` (Workflow/Approval/Case/Obligation Control), §11.1/§11.3/R-INV-22, requires tenant resolved from verified request context, checked at API boundary *and* enforced again by RLS at persistence — "cross-tenant identifier substitution" is named as a threat with the exact control shape already implemented (`requireTenant` + RLS via `set_config`). The doc's own language ("rejected at service boundary and again at persistence boundary") mirrors the tracker's own phrasing ("the policy was SATISFIED, not bypassed"). No further action needed on the fix itself — see §2.3 below for new schema obligations surfaced alongside it.
@@ -68,8 +72,10 @@ Invariant #3/#4 (consent/credential-reference model — OAuth scopes/expiry/revo
 ### 2.4 `retention-registry-svc`'s `GetLegalHold` has zero authorization (self-documented gap from earlier work) — FIXED (2026-08-28)
 Confirmed by the QA/data-governance doc review — the code comment already said this was deliberately deferred rather than invented. Fix: added a `LegalHoldRead` action constant and a fetch-then-authorize check (same order as `ReleaseLegalHold` — the store already collapses a foreign-tenant hold into the same not-found error as a genuinely absent one, so authorizing first against a caller-supplied scope would let a caller probe for holds outside a grant they do hold). Tests added in `get_legal_hold_authz_test.go` (authorized read, denied read, missing-principal 401); negative control (bypassing the new authorize gate) confirmed the denied-read test fails with the expected message, then confirmed clean again on restore.
 
-### 2.5 Platform-wide action-naming convention mismatch
+### 2.5 Platform-wide action-naming convention mismatch — REVIEWED, no change (2026-08-28)
 Every numbered spec document mandates dotted-lowercase action names (`invoice.approve`, `journal.post`, `period.close.approve`). Every service in the codebase uses `SCREAMING_SNAKE_CASE` (`AP_INVOICE_APPROVE`, `TAX_INTERFACE_CREATE`). Internally consistent, so functionally harmless today — but it means no service's action strings match what any of the 44 docs literally specify, which will matter the moment anyone tries to audit "what permission does X require" against the documentation.
+
+**Decision (2026-08-28): leave as-is.** Renaming would touch every service's action constants, every SoD rule row, every test asserting a specific action string, and every `authorization-svc` permission bundle already in the database — an estate-wide rename for a cosmetic-naming fix, not something to fold into ad-hoc edits. If this is ever undertaken, it should be its own tracked initiative with a migration plan, same posture as §5's event-envelope/API-contract migrations.
 
 ### 2.6 `authorization-svc` has no dynamic Segregation-of-Duties layer at all — FIXED (2026-08-28)
 `ZS-IAM-001` §10.2 requires dynamic SoD checks — e.g., a preparer cannot approve their own object (`resource.preparer_id == subject_id AND action == approve → DENY`). `authorization-svc` only checked static action-pairs held simultaneously by a principal; it had no relationship/ownership predicate evaluation and no `resource_attributes.preparer_id`-equivalent input at all.
@@ -78,8 +84,10 @@ Fix: added `resource_owner_principal_id` (optional) to `/v1/authorize`'s request
 
 Full attribute-condition ABAC beyond this one own-object case remains out of scope — no other attribute-condition rules exist anywhere in the architecture docs to encode.
 
-### 2.7 `authorization-svc`'s fail-closed posture on PDP-unavailable is a discrepancy worth a team decision
-`ZS-IAM-001` §7/§19 states an unavailable policy source "results in DENY" (a recorded decision). Current code returns a bare `503` without recording a DENIED decision, on the reasoning that "cannot evaluate" and "evaluated and denied" are distinct outcomes callers should be able to tell apart. Functionally similar effect (caller can't proceed either way) but the letter of the two approaches differs — flag for a decision, not an automatic change.
+### 2.7 `authorization-svc`'s fail-closed posture on PDP-unavailable — DECIDED, no change (2026-08-28)
+`ZS-IAM-001` §7/§19 states an unavailable policy source "results in DENY" (a recorded decision). Current code returns a bare `503` without recording a DENIED decision, on the reasoning that "cannot evaluate" and "evaluated and denied" are distinct outcomes callers should be able to tell apart. Functionally similar effect (caller can't proceed either way) but the letter of the two approaches differs.
+
+**Decision (2026-08-28): keep the current 503 behavior.** Switching to a recorded DENIED would be a real behavior change for every caller of `/v1/authorize` — a lookup failure would start looking identical to "you lack permission" rather than "we couldn't check," in every one of the roughly 86 services calling this endpoint. Not undertaken.
 
 ---
 
