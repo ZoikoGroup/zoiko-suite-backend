@@ -24,6 +24,7 @@ const (
 	RetentionPolicyCreate = "RETENTION_POLICY_CREATE"
 	LegalHoldCreate       = "LEGAL_HOLD_CREATE"
 	LegalHoldRelease      = "LEGAL_HOLD_RELEASE"
+	LegalHoldRead         = "LEGAL_HOLD_READ"
 )
 
 type AuthzChecker interface {
@@ -220,15 +221,19 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetLegalHold handles GET /v1/legal-holds/{id}.
-// GetLegalHold handles GET /v1/legal-holds/{id}.
 //
-// This route had no tenant input and no authorization at all, so any caller
+// The route had no tenant input and no authorization at all, so any caller
 // holding a legal_hold_id could read its scope_description, custodians and
 // authority — learning that another tenant is under a legal hold, and over
 // what. That a customer is under litigation or regulatory investigation is
 // not something their neighbours should be able to enumerate. The store is
-// now tenant-scoped; the missing authorization within a tenant is tracked
-// separately rather than invented here.
+// tenant-scoped (see FindLegalHoldByID); this closes the previously
+// self-documented remaining gap — the missing action-level authorization
+// within a tenant. Fetch-then-authorize, same order as ReleaseLegalHold:
+// the store already refuses another tenant's hold with the same
+// ErrLegalHoldNotFound a genuinely absent id would produce, so authorizing
+// against a caller-supplied scope first would let a caller nominate an
+// entity they hold a grant for and use it to probe for holds outside it.
 func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 	hld, err := h.store.FindLegalHoldByID(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
@@ -239,6 +244,19 @@ func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get legal hold")
 		return
 	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	scope := ""
+	if hld.TenantID != nil {
+		scope = *hld.TenantID
+	}
+	if !h.authorize(w, r, principalID, scope, LegalHoldRead) {
+		return
+	}
+
 	writeJSON(w, http.StatusOK, hld)
 }
 

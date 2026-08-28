@@ -159,14 +159,33 @@ func (h *Handler) SubmitTaxFiling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// This service has no real transmission mechanism to any tax authority —
+	// no outbound HTTP client to a filing endpoint exists anywhere in this
+	// codebase (verified: internal/ contains only an authz client and an
+	// mTLS helper, nothing that calls out to authority-provided infrastructure).
+	//
+	// The status this row previously received was TaxFilingSubmitted with a
+	// hardcoded AckReference ("TAX-ACK-991823") — a fabricated acknowledgement
+	// applied to every filing regardless of whether anything was sent. That is
+	// not a tenant-isolation or authorization defect; it is the service
+	// reporting a false real-world fact. ZS-SVC-F-001 (Tax/E-Invoicing/
+	// Regulatory Compliance) names this exact anti-pattern: "Transport success
+	// is not filing acceptance" / "Authority rejection hidden as submitted",
+	// and its negative-path acceptance tests require Pending/Unknown handling
+	// rather than an assumed-successful terminal state.
+	//
+	// Until a real transmission adapter exists, this endpoint records the
+	// filing intent honestly as PENDING with no acknowledgement — the state
+	// that is actually true — rather than fabricating SUBMITTED. A caller
+	// checking status sees the real state of the world: recorded, not yet
+	// transmitted, not yet acknowledged.
 	sub := &domain.TaxFilingSubmission{
-		InterfaceID:  req.InterfaceID,
-		TenantID:     tenantID,
-		TaxPeriod:    req.TaxPeriod,
-		FilingType:   req.FilingType,
-		TaxAmount:    req.TaxAmount,
-		Status:       domain.TaxFilingSubmitted,
-		AckReference: "TAX-ACK-991823",
+		InterfaceID: req.InterfaceID,
+		TenantID:    tenantID,
+		TaxPeriod:   req.TaxPeriod,
+		FilingType:  req.FilingType,
+		TaxAmount:   req.TaxAmount,
+		Status:      domain.TaxFilingPending,
 	}
 
 	if err := h.store.CreateSubmission(r.Context(), sub); err != nil {
@@ -175,12 +194,18 @@ func (h *Handler) SubmitTaxFiling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// tax.filing.submitted is deliberately NOT published here. That event
+	// name asserts a fact (transmitted to the authority) that has not
+	// happened; publishing it would propagate the same fabrication to every
+	// downstream consumer (workflow, evidence, obligations tracking) that
+	// trusts this service's events. tax.filing.recorded reflects what
+	// actually occurred: the request was accepted and persisted locally.
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "tax.filing.submitted", AggregateID: sub.SubmissionID, TenantID: tenantID,
+		EventType: "tax.filing.recorded", AggregateID: sub.SubmissionID, TenantID: tenantID,
 		LegalEntityID: iface.LegalEntityID, Jurisdiction: iface.Jurisdiction, ActorID: principalID,
 		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: sub,
 	})
-	writeJSON(w, http.StatusCreated, sub)
+	writeJSON(w, http.StatusAccepted, sub)
 }
 
 func (h *Handler) ListSubmissions(w http.ResponseWriter, r *http.Request) {

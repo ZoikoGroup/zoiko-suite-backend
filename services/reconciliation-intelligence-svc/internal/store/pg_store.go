@@ -11,6 +11,22 @@ import (
 	"zoiko.io/reconciliation-intelligence-svc/internal/domain"
 )
 
+// appendResolutionNote combines the existing note (typically the machine's
+// heuristic rationale, recorded when the item was generated) with a human's
+// decision note. Neither PgStore nor MemoryStore's ApplyResolution may
+// simply overwrite: the common case is a human approving with no note at
+// all, and blank human input must not erase why the system made the
+// recommendation in the first place.
+func appendResolutionNote(existing, human string) string {
+	if human == "" {
+		return existing
+	}
+	if existing == "" {
+		return human
+	}
+	return existing + " | decision: " + human
+}
+
 type Store interface {
 	CreateJob(ctx context.Context, tenantID string, job *domain.ReconciliationJob, items []domain.UnmatchedItem) error
 	GetJobByID(ctx context.Context, tenantID, id string) (*domain.ReconciliationJob, error)
@@ -208,12 +224,22 @@ func (s *PgStore) ApplyResolution(ctx context.Context, tenantID, jobID, itemID s
 		return nil, fmt.Errorf("unmatched item not found: %w", err)
 	}
 
+	// Append rather than overwrite. item.ResolutionNotes at this point still
+	// holds whatever PerformIntelligentReconciliation recorded as the
+	// machine's rationale for the recommendation (e.g. "heuristic rule:
+	// discrepancy $32.00 is below the $50.00 write-off tolerance"). A human
+	// applying a decision without typing their own note — the common case —
+	// must not silently erase that rationale; it is the only record of why
+	// the system proposed this in the first place, and it is most valuable
+	// at exactly the moment a decision is made.
+	combinedNotes := appendResolutionNote(item.ResolutionNotes, notes)
+
 	item.ResolutionStatus = status
-	item.ResolutionNotes = notes
+	item.ResolutionNotes = combinedNotes
 	item.UpdatedAt = time.Now()
 
 	updateQuery := `UPDATE reconciliation_unmatched_items SET resolution_status = $1, resolution_notes = $2, updated_at = $3 WHERE id = $4`
-	_, err = tx.Exec(ctx, updateQuery, string(status), notes, item.UpdatedAt, itemID)
+	_, err = tx.Exec(ctx, updateQuery, string(status), combinedNotes, item.UpdatedAt, itemID)
 	if err != nil {
 		return nil, err
 	}
@@ -323,8 +349,11 @@ func (m *MemoryStore) ApplyResolution(ctx context.Context, tenantID, jobID, item
 
 	for i := range j.UnmatchedItems {
 		if j.UnmatchedItems[i].ID == itemID {
+			// Append rather than overwrite — mirrors PgStore exactly. See its
+			// comment: the machine's rationale must survive a human's
+			// empty-note approval.
 			j.UnmatchedItems[i].ResolutionStatus = status
-			j.UnmatchedItems[i].ResolutionNotes = notes
+			j.UnmatchedItems[i].ResolutionNotes = appendResolutionNote(j.UnmatchedItems[i].ResolutionNotes, notes)
 			j.UnmatchedItems[i].UpdatedAt = time.Now()
 			return &j.UnmatchedItems[i], nil
 		}
