@@ -100,7 +100,7 @@ These aren't bugs in existing code — they're domains the new register specifie
 - **AP-07 Expense Claim** — confirmed absent estate-wide; no `expense-*-svc` exists anywhere.
 - **Assets, Inventory & Project Accounting** (`ZS-SVC-G-001`) — an entire 12-service domain (fixed assets, depreciation, inventory movement/valuation, project cost capture) with zero corresponding service anywhere in the 86-service repo.
 - **Most of Financial/Statutory/Regulatory Reporting** (`ZS-SVC-H-001`) — no XBRL/iXBRL, no Statutory Pack, no Financial Statements certification, no Regulatory Submission, no tamper-evident export/evidence package. `reporting-orchestration-svc` (see §0 above) only weakly resembles two of the seven required sub-services, and what exists is a stub.
-- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — PARTIALLY BUILT (2026-08-28): see §3.1/§3.2 below. PRV-01 (`privacy-purpose-registry-svc`) and PRV-02 (`privacy-consent-svc`) now exist; PRV-03 through PRV-05 (runtime purpose-binding decisions, data rights/DSR, transfer/processor) remain entirely unbuilt.
+- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — PARTIALLY BUILT (2026-08-28): see §3.1/§3.2/§3.3 below. PRV-01 (`privacy-purpose-registry-svc`), PRV-02 (`privacy-consent-svc`) and PRV-03 (`privacy-decision-svc`) now exist; PRV-04/PRV-05 (data rights/DSR, transfer/processor) remain entirely unbuilt.
 - **Full AP-01/04/08/09/10/11** (Supplier Financial Profile, Goods Receipt, Payables, Payment Proposal/Authorization/Run) — only requisition/PO/invoice/matching exist; the payment side of AP is unbuilt.
 - **FP&A domain** (`ZS-SVC-J-001`) — `forecasting-svc` is a standalone statistics microservice; none of Budget/Forecast-with-approval/Scenario/Variance/KPI-Registry/Management-Accounts/Board-Pack exist as governed objects.
 - **Audit & Assurance engagement domain** (`ZS-SVC-K-001`) — no engagement/risk-assessment/sampling/workpaper/sign-off service exists; `audit-event-store-svc` is correctly-scoped infrastructure this domain would consume, not an implementation of it.
@@ -128,7 +128,7 @@ Built as a real, working v1 — not a scaffold — of PRV-01 ("Processing Activi
 - **Validate is structural only.** It does not evaluate jurisdiction-specific legal correctness — `ZS-SVC-W-001` §0 is explicit that "jurisdiction-specific production rules require approved PDC packages," and no such package or service exists anywhere in this codebase. Faking a legal-correctness check would have been exactly the fabricated-success shape this whole workstream exists to remove.
 - **No real workflow-svc orchestration behind Submit/Approve/Reject.** These are real, authorized, audited transitions — SUBMITTED is never silently treated as APPROVED — but there is no governed WFC engine wired in. This is an honest, simpler approval gate, not a fabricated one.
 - **`lawful_basis_refs`/`retention_rule_refs`/`transfer_refs` are opaque, unvalidated references** — same doctrine as `retention_policies.record_class`: recorded, not resolved against any registry, because none exists yet.
-- **PRV-03 through PRV-05 are not built.** The runtime purpose-binding decision endpoint (the Tier-1 hot path every other service would actually call before processing personal data), data-subject rights requests, and transfer/processor/subprocessor control all remain entirely unbuilt. **This means no service in the platform can yet actually check "am I allowed to use this data for this purpose" at runtime** — PRV-01/PRV-02 together let that question eventually be answerable (a caller can now ask PRV-02 "what did this subject decide"), they do not yet provide the single centralized decision PRV-03 would.
+- **PRV-04/PRV-05 are not built.** Data-subject rights requests and transfer/processor/subprocessor control remain entirely unbuilt.
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8151, db `privacy_purpose_registry`) but not started or smoke-tested against a live stack in this session, consistent with this session's minimal-Docker-footprint discipline — build/vet/test all pass against the in-memory stub store; RLS/immutability were verified by reading the migration SQL against this platform's proven patterns, not by running a live Postgres instance.
 
@@ -148,6 +148,23 @@ Built as a real, working v1 of PRV-02 ("Notice, Consent & Preference Evidence Se
 **Deliberately NOT built:** PRV-03's runtime decision endpoint, PDC-backed lawful-basis evaluation (same reasoning as PRV-01 — no such package exists), and any relationship between `PreferenceAssertion` and consent/lawful basis (PRV-I12 forbids exactly that).
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8152, db `privacy_consent`, depends on `privacy-purpose-registry-svc`) but not started against a live stack this session — same discipline and same verification method as §3.1.
+
+### 3.3 `privacy-decision-svc` — new service, PRV-03 of ZS-SVC-W-001 (2026-08-28)
+
+Built as a real, working (deliberately partial) v1 of PRV-03 ("Purpose Binding & Runtime Data-Use Decision Service"), the third of ZS-SVC-W-001's five services.
+
+**Why it's deliberately partial.** The full spec (§12/§13) names five outcomes — `PERMIT`, `RESTRICT`, `BLOCK`, `REVIEW_REQUIRED`, `INDETERMINATE` — and a rich input contract including sensitivity flags, recipient/destination, and a PDC jurisdiction/policy package resolved "at effective + knowledge time." `RESTRICT` (machine-enforceable minimization/redaction/recipient-limitation constraints) and `REVIEW_REQUIRED` (routing to a qualified human reviewer) both require exactly the PDC rules engine that PRV-01's own package doc comment already flagged as nonexistent anywhere in this codebase. Building them would mean fabricating the business rules PDC is supposed to own — the same defect shape this fixing pass exists to remove. Both values are defined in the wire contract (`domain.ResultRestrict`/`domain.ResultReviewRequired`) so a future version can start returning them without a breaking change, but this version never produces them.
+
+**What v1 DOES check — real, not fabricated:**
+- The processing activity resolves to `ACTIVE` in PRV-01, and the purpose resolves to `PUBLISHED` in PRV-01 — both via live HTTP calls, not caller-supplied claims.
+- **PRV-C01, purpose limitation, enforced directly from PRV-01's own schema**: the proposed `purpose_id` must actually be one of the resolved activity's registered `purpose_ids` (`ProcessingActivityVersion.PurposeIDs`). This wasn't in the original plan — it fell out of actually reading PRV-01's response shape while building the client, and it's a genuine compliance check (a purpose that's individually valid but was never bound to the activity in question is now correctly blocked, with its own reason code and regression test).
+- Two checks are **opt-in and caller-declared, never inferred**: if the caller declares `consent_check.required`, PRV-02's `ResolveConsentStatus` must resolve `GRANTED`; if the caller supplies its own real `legal_hold_check.record_class`, retention-registry-svc must report no active hold. This service does not infer whether a purpose requires consent (PRV-01's `lawful_basis_refs` is documented as opaque, not a signal this service may interpret) and does not invent a `record_class` — repeating evidence-manifest-svc's §2.3 finding here would have been the same mistake twice.
+- Any unreachable dependency fails the **whole decision** closed as `INDETERMINATE` (§12.2: "Material processing fails closed") — verified with a negative control that confirmed a naive fail-open change silently downgrades to a different wrong answer rather than the required one.
+- Every decision is recorded as a permanent, append-only evidence row (§13.2 "decision durability") capturing the exact resolved `activity_version_id`/`purpose_version_id` — not just the caller's input IDs — so a past decision stays reproducible regardless of what PRV-01/PRV-02 report later.
+
+13 handler tests plus two verified negative controls (fail-closed-on-unreachable-dependency, purpose-limitation enforcement).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8153, db `privacy_decision`, depends on `privacy-purpose-registry-svc` + `privacy-consent-svc` + `retention-registry-svc`) but not started against a live stack this session — same discipline and same verification method as §3.1/§3.2.
 
 ---
 

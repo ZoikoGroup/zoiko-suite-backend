@@ -75,6 +75,7 @@ kill_switch_registry:kill-switch-registry
 retention_registry:retention-registry
 privacy_purpose_registry:privacy-purpose-registry
 privacy_consent:privacy-consent
+privacy_decision:privacy-decision
 metric_registry:metric-registry
 source_authority:source-authority
 jurisdiction_rules:jurisdiction-rules
@@ -219,8 +220,8 @@ for db in \
     intercompany_accounting invoice_approval jurisdiction_rules kill_switch_registry leave_absence \
     metric_registry notification obligation_tracking obligations offboarding_severance org_structure \
     payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \
-    privacy_purpose_registry procurement_workflow purchase_order purchase_request retention_registry \
-    schema_registry secret_vault_integration \
+    privacy_decision privacy_purpose_registry procurement_workflow purchase_order purchase_request \
+    retention_registry schema_registry secret_vault_integration \
     source_authority spend_controls tax_determination tax_rules tenant_entity_registry treasury \
     vat_gst vendor_due_diligence workflow workflow_history workforce_compliance; do
     if [ "$(psql -tAX --username "$POSTGRES_USER" --dbname postgres \

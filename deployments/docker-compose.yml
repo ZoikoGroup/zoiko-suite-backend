@@ -31,6 +31,7 @@ services:
       - ../services/retention-registry-svc/deployments/migrations:/migrations/retention-registry:ro
       - ../services/privacy-purpose-registry-svc/deployments/migrations:/migrations/privacy-purpose-registry:ro
       - ../services/privacy-consent-svc/deployments/migrations:/migrations/privacy-consent:ro
+      - ../services/privacy-decision-svc/deployments/migrations:/migrations/privacy-decision:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3118,10 +3119,11 @@ services:
   # PRV-01 of ZS-SVC-W-001 (Privacy/Consent/Purpose/Data Rights Control).
   # Owns the purpose registry and processing-activity registry/lifecycle
   # (DRAFT -> VALIDATED -> SUBMITTED -> APPROVED -> ACTIVE, with
-  # reject/suspend/retire branches). Consent (PRV-02) is now built
-  # alongside it (see privacy-consent-svc below); runtime purpose-binding
-  # decisions (PRV-03), data rights/DSR (PRV-04), and transfer/processor
-  # control (PRV-05) all depend on this registry existing first and are
+  # reject/suspend/retire branches). Consent (PRV-02, privacy-consent-svc)
+  # and the runtime purpose-binding decision (PRV-03,
+  # privacy-decision-svc) are now built alongside it; data rights/DSR
+  # (PRV-04) and transfer/processor control (PRV-05) all depend on this
+  # registry existing first and are
   # not yet built.
   privacy-purpose-registry-svc:
     build:
@@ -3185,6 +3187,56 @@ services:
       authorization-svc:
         condition: service_healthy
       privacy-purpose-registry-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── privacy-decision-svc (Port: 8153) ────────────────────────────────────
+  # PRV-03 of ZS-SVC-W-001 — Purpose Binding & Runtime Data-Use Decision
+  # Service. The full spec names five outcomes (PERMIT/RESTRICT/BLOCK/
+  # REVIEW_REQUIRED/INDETERMINATE); this version only ever produces
+  # PERMIT/BLOCK/INDETERMINATE — RESTRICT and REVIEW_REQUIRED need a PDC
+  # (jurisdiction-specific lawful-basis) rules engine that doesn't exist
+  # anywhere in this codebase, same gap already documented on PRV-01.
+  # What it DOES check is real: activity ACTIVE + purpose PUBLISHED in
+  # PRV-01, the proposed purpose actually bound to that activity (PRV-C01,
+  # purpose limitation), and two opt-in caller-declared checks — consent
+  # GRANTED in PRV-02 (PRV-C04) and no blocking legal hold in
+  # retention-registry-svc (using the caller's own real record_class,
+  # never an invented one). Any unreachable dependency fails the whole
+  # decision closed as INDETERMINATE.
+  privacy-decision-svc:
+    build:
+      context: ../services/privacy-decision-svc
+      dockerfile: Dockerfile
+    container_name: privacy-decision-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8153:8153"
+    environment:
+      PORT: "8153"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_decision?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.privacy-decision.events"
+      PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
+      CONSENT_REGISTRY_URL: "http://privacy-consent-svc:8152"
+      RETENTION_REGISTRY_URL: "http://retention-registry-svc:8148"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      privacy-purpose-registry-svc:
+        condition: service_healthy
+      privacy-consent-svc:
+        condition: service_healthy
+      retention-registry-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
