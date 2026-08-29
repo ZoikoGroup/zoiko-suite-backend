@@ -34,6 +34,10 @@ services:
       - ../services/privacy-decision-svc/deployments/migrations:/migrations/privacy-decision:ro
       - ../services/privacy-rights-svc/deployments/migrations:/migrations/privacy-rights:ro
       - ../services/privacy-transfer-svc/deployments/migrations:/migrations/privacy-transfer:ro
+      - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
+      - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
+      - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
+      - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3330,6 +3334,221 @@ services:
       authorization-svc:
         condition: service_healthy
       privacy-purpose-registry-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── supplier-financial-profile-svc (Port: 8156) ──────────────────────────
+  # AP-01 of the Procurement/Expenses/Accounts Payable baseline —
+  # Supplier Financial Profile. The foundational service of the unbuilt
+  # payment side of Accounts Payable (AP-09/10/11 all need a governed
+  # supplier financial profile to pay against). PayeeReference is an
+  # opaque, caller-supplied reference: AP-01's own contract names "ORG-10
+  # Banking Identity/Payee Master" as the authoritative owner of real
+  # bank/payee details, and no such service exists anywhere in this
+  # codebase (banking-connector-svc is a different bounded context —
+  # bank statement ingestion, not payee identity). The high-risk-change
+  # approval flow is the first real caller of authorization-svc's dynamic
+  # own-object Segregation-of-Duties layer outside its own tests: a
+  # proposer of a payee_reference/payment_method_preference change cannot
+  # approve their own proposal. Non-overlapping payment-terms effective
+  # periods (a named negative-path scenario in AP-01's own spec) are
+  # enforced by a genuine Postgres EXCLUDE constraint, not
+  # application-level date math.
+  supplier-financial-profile-svc:
+    build:
+      context: ../services/supplier-financial-profile-svc
+      dockerfile: Dockerfile
+    container_name: supplier-financial-profile-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8156:8156"
+    environment:
+      PORT: "8156"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/supplier_financial_profile?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.supplier-financial-profile.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── goods-service-receipt-svc (Port: 8157) ───────────────────────────────
+  # AP-04 of the Procurement/Expenses/Accounts Payable baseline — Goods/
+  # Service Receipt. The missing three-way-match link between
+  # purchase-order-svc (AP-03) and invoice-approval-svc (AP-05/06). Two
+  # scope decisions were made because the upstream data the spec assumes
+  # doesn't exist: purchase-order-svc has no PO-line/quantity model and only
+  # ISSUED/CLOSED statuses (no CANCELLED), so over-receipt tolerance is
+  # enforced at the aggregate-amount level against the PO's own
+  # total_amount, not per line — see internal/domain's package doc. GRNI
+  # accounting posts a real, idempotent journal entry to general-ledger-svc
+  # (correlation_id = receipt_id) but is deliberately best-effort: any
+  # posting failure is recorded as a visible EXCEPTION accounting event and
+  # never blocks or reverses the underlying receipt confirmation, matching
+  # the spec's own stated failure semantics verbatim.
+  goods-service-receipt-svc:
+    build:
+      context: ../services/goods-service-receipt-svc
+      dockerfile: Dockerfile
+    container_name: goods-service-receipt-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8157:8157"
+    environment:
+      PORT: "8157"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/goods_service_receipt?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.goods-service-receipt.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PURCHASE_ORDER_SERVICE_URL: "http://purchase-order-svc:8129"
+      GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      purchase-order-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── expense-claim-svc (Port: 8158) ───────────────────────────────────────
+  # AP-07 of the Procurement/Expenses/Accounts Payable baseline — Expense
+  # Claim. Real integrations verified against each peer's actual code
+  # before this service was written: employee-master-svc validates the
+  # claimant is a real ACTIVE employee; document-vault-svc validates a
+  # receipt reference actually exists (cross-claim reuse of the same
+  # receipt is blocked by this service's own partial UNIQUE index, a
+  # genuine database invariant); tax-determination-svc's real endpoint is
+  # called for every line claiming tax recovery, so a tax-recoverable
+  # amount is never inferred, only ever the literal result of that call;
+  # policy-svc's real APPROVAL_THRESHOLD evaluation gates which approval
+  # authority (ordinary vs delegated-exception) a claim needs. AP-08
+  # "Payables" has no real reimbursement-consuming endpoint today
+  # (accounts-payable-svc's whole model is vendor-invoice-shaped) — this
+  # service emits ExpenseClaimPayableRequested honestly, with no consumer
+  # yet, rather than fabricating that integration.
+  expense-claim-svc:
+    build:
+      context: ../services/expense-claim-svc
+      dockerfile: Dockerfile
+    container_name: expense-claim-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8158:8158"
+    environment:
+      PORT: "8158"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/expense_claim?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.expense-claim.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EMPLOYEE_MASTER_SERVICE_URL: "http://employee-master-svc:8108"
+      DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
+      POLICY_SERVICE_URL: "http://policy-svc:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+      tax-determination-svc:
+        condition: service_healthy
+      policy-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payment-proposal-svc (Port: 8159) ────────────────────────────────────
+  # AP-09 of the Procurement/Expenses/Accounts Payable baseline — Payment
+  # Proposal. Selects real eligible payables from accounts-payable-svc
+  # (APPROVED invoices) and expense-claim-svc (REIMBURSABLE claims) into a
+  # non-executing, fully reversible proposal. This service's own command
+  # list has no Authorize/Reject command — those belong to AP-10, a
+  # distinct, unbuilt service — so this only ever reaches FROZEN.
+  # supplier-financial-profile-svc's real ON_HOLD status is the only hold
+  # signal available anywhere upstream (accounts-payable-svc has none) and
+  # its updated_at is the only staleness signal (no version column exists)
+  # — both checked live again at Freeze time, not just at selection time.
+  # tax-determination-svc's real endpoint computes withholding, never
+  # inferred. BNK account/cash availability has no live endpoint anywhere
+  # in this codebase (checked directly) — PayingBankAccountRef is an
+  # opaque, caller-supplied reference, same doctrine as AP-01's
+  # PayeeReference. FreezePaymentProposal requires a principal distinct
+  # from the proposal's own preparer via authorization-svc's dynamic
+  # own-object SoD layer — the fourth reuse of that feature this session.
+  payment-proposal-svc:
+    build:
+      context: ../services/payment-proposal-svc
+      dockerfile: Dockerfile
+    container_name: payment-proposal-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8159:8159"
+    environment:
+      PORT: "8159"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payment_proposal?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payment-proposal.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ACCOUNTS_PAYABLE_SERVICE_URL: "http://accounts-payable-svc:8099"
+      EXPENSE_CLAIM_SERVICE_URL: "http://expense-claim-svc:8158"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      accounts-payable-svc:
+        condition: service_healthy
+      expense-claim-svc:
+        condition: service_healthy
+      supplier-financial-profile-svc:
+        condition: service_healthy
+      tax-determination-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
