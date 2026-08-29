@@ -33,6 +33,7 @@ services:
       - ../services/privacy-consent-svc/deployments/migrations:/migrations/privacy-consent:ro
       - ../services/privacy-decision-svc/deployments/migrations:/migrations/privacy-decision:ro
       - ../services/privacy-rights-svc/deployments/migrations:/migrations/privacy-rights:ro
+      - ../services/privacy-transfer-svc/deployments/migrations:/migrations/privacy-transfer:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3120,12 +3121,11 @@ services:
   # PRV-01 of ZS-SVC-W-001 (Privacy/Consent/Purpose/Data Rights Control).
   # Owns the purpose registry and processing-activity registry/lifecycle
   # (DRAFT -> VALIDATED -> SUBMITTED -> APPROVED -> ACTIVE, with
-  # reject/suspend/retire branches). Consent (PRV-02, privacy-consent-svc),
-  # the runtime purpose-binding decision (PRV-03, privacy-decision-svc)
-  # and data rights/complaints (PRV-04, privacy-rights-svc) are now built
-  # alongside it; transfer/processor control (PRV-05) depends on this
-  # registry existing first and is
-  # not yet built.
+  # reject/suspend/retire branches). All five ZS-SVC-W-001 services are
+  # now built: consent (PRV-02, privacy-consent-svc), the runtime
+  # purpose-binding decision (PRV-03, privacy-decision-svc), data
+  # rights/complaints (PRV-04, privacy-rights-svc), and processor/
+  # transfer control (PRV-05, privacy-transfer-svc below).
   privacy-purpose-registry-svc:
     build:
       context: ../services/privacy-purpose-registry-svc
@@ -3283,6 +3283,53 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── privacy-transfer-svc (Port: 8155) ────────────────────────────────────
+  # PRV-05 of ZS-SVC-W-001 — Processor, Subprocessor & Transfer Privacy
+  # Control. The last of the domain's five services. TransferMechanism is
+  # a directly-registered record (a real legal/compliance reviewer enters
+  # the mechanism, validity window and evidence), NOT a resolved PDC
+  # catalogue entry — no PDC exists anywhere in this codebase, same gap
+  # already documented on PRV-01/PRV-03. Whether a DPIA/TIA is required
+  # is an opt-in, caller-declared input to transfer-decision evaluation,
+  # never inferred. §17.2's fail-closed rule is encoded literally: a
+  # missing/expired/rejected assessment or an expired mechanism returns
+  # BLOCKED or REVIEW_REQUIRED — never a silent AUTHORIZED. CONDITIONAL
+  # (the fourth TransferAuthorization value, needing machine-enforceable
+  # transfer conditions) is defined in the wire contract but never
+  # produced, same reasoning as PRV-03's RESTRICT.
+  privacy-transfer-svc:
+    build:
+      context: ../services/privacy-transfer-svc
+      dockerfile: Dockerfile
+    container_name: privacy-transfer-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8155:8155"
+    environment:
+      PORT: "8155"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_transfer?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.privacy-transfer.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      privacy-purpose-registry-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

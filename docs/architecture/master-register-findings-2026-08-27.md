@@ -100,7 +100,7 @@ These aren't bugs in existing code — they're domains the new register specifie
 - **AP-07 Expense Claim** — confirmed absent estate-wide; no `expense-*-svc` exists anywhere.
 - **Assets, Inventory & Project Accounting** (`ZS-SVC-G-001`) — an entire 12-service domain (fixed assets, depreciation, inventory movement/valuation, project cost capture) with zero corresponding service anywhere in the 86-service repo.
 - **Most of Financial/Statutory/Regulatory Reporting** (`ZS-SVC-H-001`) — no XBRL/iXBRL, no Statutory Pack, no Financial Statements certification, no Regulatory Submission, no tamper-evident export/evidence package. `reporting-orchestration-svc` (see §0 above) only weakly resembles two of the seven required sub-services, and what exists is a stub.
-- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — PARTIALLY BUILT (2026-08-29): see §3.1–§3.4 below. PRV-01 (`privacy-purpose-registry-svc`), PRV-02 (`privacy-consent-svc`), PRV-03 (`privacy-decision-svc`) and PRV-04 (`privacy-rights-svc`) now exist; PRV-05 (transfer/processor control) remains entirely unbuilt.
+- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — FULLY BUILT (2026-08-29), v1 scope: see §3.1–§3.5 below. All five services now exist: PRV-01 (`privacy-purpose-registry-svc`), PRV-02 (`privacy-consent-svc`), PRV-03 (`privacy-decision-svc`), PRV-04 (`privacy-rights-svc`), PRV-05 (`privacy-transfer-svc`). None of the five is deployed against a live stack, and each has a documented, deliberate gap where the full spec requires a PDC (jurisdiction-specific legal-rule) engine that doesn't exist anywhere in this codebase — see each service's own section for exactly what that means for it.
 - **Full AP-01/04/08/09/10/11** (Supplier Financial Profile, Goods Receipt, Payables, Payment Proposal/Authorization/Run) — only requisition/PO/invoice/matching exist; the payment side of AP is unbuilt.
 - **FP&A domain** (`ZS-SVC-J-001`) — `forecasting-svc` is a standalone statistics microservice; none of Budget/Forecast-with-approval/Scenario/Variance/KPI-Registry/Management-Accounts/Board-Pack exist as governed objects.
 - **Audit & Assurance engagement domain** (`ZS-SVC-K-001`) — no engagement/risk-assessment/sampling/workpaper/sign-off service exists; `audit-event-store-svc` is correctly-scoped infrastructure this domain would consume, not an implementation of it.
@@ -128,7 +128,7 @@ Built as a real, working v1 — not a scaffold — of PRV-01 ("Processing Activi
 - **Validate is structural only.** It does not evaluate jurisdiction-specific legal correctness — `ZS-SVC-W-001` §0 is explicit that "jurisdiction-specific production rules require approved PDC packages," and no such package or service exists anywhere in this codebase. Faking a legal-correctness check would have been exactly the fabricated-success shape this whole workstream exists to remove.
 - **No real workflow-svc orchestration behind Submit/Approve/Reject.** These are real, authorized, audited transitions — SUBMITTED is never silently treated as APPROVED — but there is no governed WFC engine wired in. This is an honest, simpler approval gate, not a fabricated one.
 - **`lawful_basis_refs`/`retention_rule_refs`/`transfer_refs` are opaque, unvalidated references** — same doctrine as `retention_policies.record_class`: recorded, not resolved against any registry, because none exists yet.
-- **PRV-05 is not built.** Transfer/processor/subprocessor control (processor inventory, transfer mechanisms, DPIA/TIA, transfer authorization) remains entirely unbuilt.
+- All five ZS-SVC-W-001 services now exist — see §3.5 for PRV-05, the last one built.
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8151, db `privacy_purpose_registry`) but not started or smoke-tested against a live stack in this session, consistent with this session's minimal-Docker-footprint discipline — build/vet/test all pass against the in-memory stub store; RLS/immutability were verified by reading the migration SQL against this platform's proven patterns, not by running a live Postgres instance.
 
@@ -186,6 +186,24 @@ Built as a real, working (deliberately partial) v1 of PRV-04 ("Data Rights, Comp
 **Not modeled**: exemption/third-party review, redaction, and response-package assembly (§15.1's other control points) — these require case-specific legal judgment this service cannot supply.
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8154, db `privacy_rights`, depends on `authorization-svc`) but not started against a live stack this session — same discipline and same verification method as §3.1–§3.3.
+
+### 3.5 `privacy-transfer-svc` — new service, PRV-05 of ZS-SVC-W-001 (2026-08-29) — domain complete
+
+Built as a real, working (deliberately partial) v1 of PRV-05 ("Processor, Subprocessor & Transfer Privacy Control"), the fifth and final service in the ZS-SVC-W-001 build.
+
+**Why it's deliberately partial.** §16.1 defines `TransferMechanism` as "a governed mechanism ID/version from PDC/legal catalogue" — no PDC catalogue exists anywhere in this codebase, the same gap already documented on PRV-01/PRV-03. Rather than invent a legal-validity catalogue, `TransferMechanism` is its own directly-registered record: a real legal/compliance reviewer enters the mechanism (SCC/BCR/adequacy/derogation), its validity window and its evidence reference — the same trust model this platform already uses for SoD rules and notice content (a human records a real fact; the system enforces the machine-checkable invariant on top, here the validity-window expiry). Similarly, §17's "PDC rule says assessment required?" branch cannot be evaluated without a PDC rule to consult, so whether a DPIA/TIA is required is an opt-in, caller-declared input (`assessment_required`) — mirroring PRV-03's `ConsentCheckRequest`/`LegalHoldCheckRequest` pattern exactly.
+
+**What's real, not fabricated:**
+- Processor relationship and subprocessor inventory, matching §16.1's own field list, with `purpose_activity_refs` validated against a live call to PRV-01 (each must resolve to an ACTIVE processing activity) — not trusted as opaque strings.
+- **§17.2's fail-closed rule encoded literally, not invented**: "If a required DPIA/TIA, transfer mechanism... approval is missing, expired or conflicted, PRV-05 returns BLOCKED or REVIEW_REQUIRED." This service maps that sentence directly: an expired or not-yet-effective mechanism → `BLOCKED`; a missing assessment (when declared required) → `REVIEW_REQUIRED`; a `REJECT` outcome → `BLOCKED`; a `REMEDIATE` outcome → `REVIEW_REQUIRED`; an `APPROVE` outcome past its own `review_trigger_at` (§17.1's explicit reassessment trigger) → `REVIEW_REQUIRED`. Unlike PRV-03, `REVIEW_REQUIRED` is genuinely reachable here — it required no invented business rule, only the spec's own stated fail-closed behavior.
+- `CONDITIONAL` (the fourth `TransferAuthorization` value, requiring machine-enforceable transfer conditions this service has no rule engine to generate) is defined in the wire contract for forward compatibility but never produced — same reasoning as PRV-03's `RESTRICT`.
+- Every decision is a permanent, append-only evidence row, same "decision durability" doctrine as PRV-03, capturing the resolved `assessment_id` when one was consulted.
+
+16 handler tests plus two verified negative controls (mechanism-expiry check, assessment-expiry check).
+
+**All five ZS-SVC-W-001 services now exist.** None has been started against a live stack or exercised against a real Postgres/Kafka this session — every RLS policy, immutability trigger, and cross-service HTTP integration across all five services is verified by code inspection, unit tests against in-memory stubs, and `docker compose config` validation of the wiring, not by execution. A live-stack smoke test across the whole domain (in particular the real HTTP calls between PRV-02→PRV-01, PRV-03→PRV-01/02/retention-registry-svc, and PRV-05→PRV-01) is the natural next verification step before treating this domain as production-ready, and was not performed this session per the minimal-Docker-footprint discipline in place throughout.
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8155, db `privacy_transfer`, depends on `authorization-svc` + `privacy-purpose-registry-svc`).
 
 ---
 
