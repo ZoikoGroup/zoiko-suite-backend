@@ -37,6 +37,7 @@ services:
       - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
       - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
       - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
+      - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3488,6 +3489,66 @@ services:
       tax-determination-svc:
         condition: service_healthy
       policy-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payment-proposal-svc (Port: 8159) ────────────────────────────────────
+  # AP-09 of the Procurement/Expenses/Accounts Payable baseline — Payment
+  # Proposal. Selects real eligible payables from accounts-payable-svc
+  # (APPROVED invoices) and expense-claim-svc (REIMBURSABLE claims) into a
+  # non-executing, fully reversible proposal. This service's own command
+  # list has no Authorize/Reject command — those belong to AP-10, a
+  # distinct, unbuilt service — so this only ever reaches FROZEN.
+  # supplier-financial-profile-svc's real ON_HOLD status is the only hold
+  # signal available anywhere upstream (accounts-payable-svc has none) and
+  # its updated_at is the only staleness signal (no version column exists)
+  # — both checked live again at Freeze time, not just at selection time.
+  # tax-determination-svc's real endpoint computes withholding, never
+  # inferred. BNK account/cash availability has no live endpoint anywhere
+  # in this codebase (checked directly) — PayingBankAccountRef is an
+  # opaque, caller-supplied reference, same doctrine as AP-01's
+  # PayeeReference. FreezePaymentProposal requires a principal distinct
+  # from the proposal's own preparer via authorization-svc's dynamic
+  # own-object SoD layer — the fourth reuse of that feature this session.
+  payment-proposal-svc:
+    build:
+      context: ../services/payment-proposal-svc
+      dockerfile: Dockerfile
+    container_name: payment-proposal-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8159:8159"
+    environment:
+      PORT: "8159"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payment_proposal?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payment-proposal.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ACCOUNTS_PAYABLE_SERVICE_URL: "http://accounts-payable-svc:8099"
+      EXPENSE_CLAIM_SERVICE_URL: "http://expense-claim-svc:8158"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      accounts-payable-svc:
+        condition: service_healthy
+      expense-claim-svc:
+        condition: service_healthy
+      supplier-financial-profile-svc:
+        condition: service_healthy
+      tax-determination-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
