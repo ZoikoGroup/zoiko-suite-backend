@@ -19,6 +19,6 @@ WORKDIR /app
 COPY --from=builder /server /app/server
 COPY --from=builder /healthcheck /app/healthcheck
 
-EXPOSE 8152
+EXPOSE 8153
 
 ENTRYPOINT ["/app/server"]
