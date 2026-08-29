@@ -234,6 +234,25 @@ Built as a real, working (deliberately partial) v1 of AP-01 ("Supplier Financial
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8156, db `supplier_financial_profile`, depends on `authorization-svc`).
 
+### 3.8 `goods-service-receipt-svc` — new service, AP-04 of the Procurement/Expenses/Accounts Payable baseline (2026-08-29)
+
+Built as a real, working (deliberately partial) v1 of AP-04 ("Goods/Service Receipt"), the second service in this domain. It is the missing three-way-match link between `purchase-order-svc` (AP-03, already built) and `invoice-approval-svc` (AP-05/06, already built).
+
+**Why it's deliberately partial.** `purchase-order-svc` has no PO-line or quantity model at all — `domain.PurchaseOrder` is header-only (`total_amount`, `po_status`), with only two statuses (`ISSUED`, `CLOSED` — no `CANCELLED`). AP-04's own contract names "PO open quantity/amount" as server-resolved context and lists "receipt exceeds PO tolerance" and "receipt confirmed against cancelled PO" as required negative-path scenarios. Since no PO-line or received-quantity data exists upstream to match against, this service enforces the nearest real equivalent: an aggregate amount check against the PO's own `total_amount` (net of this service's own confirmed-and-not-yet-reversed receipts), and treats `purchase-order-svc`'s real `CLOSED` status as the blocking state, there being no `CANCELLED` status to check against. A caller-supplied `ToleranceExceptionRef` is required to confirm past that ceiling — the exception approval itself is out of this service's authority, the same "opaque caller-supplied reference" doctrine as `PayeeReference` (AP-01, §3.7) and `lawful_basis_refs` (PRV-01, §3.1). Verified directly against `purchase-order-svc`'s actual handler/domain code before writing a line of this service, not assumed.
+
+**What's real, not fabricated:**
+- Full receipt lifecycle (`Draft/PendingConfirmation/Confirmed/Rejected/PartiallyReversed/FullyReversed`), with the PO's real open/closed status live-checked at both create time and confirm time — a PO that closes in between is caught on the second check, not just the first.
+- **Negative-path scenario #1** ("receipt exceeds PO tolerance without approval") is enforced for real against a live `SUM(amount - reversed_amount)` aggregate across every confirmed receipt for that PO, compared to the PO's real `total_amount` from `purchase-order-svc` — not a fabricated per-line check.
+- **Negative-path scenario #2** ("receipt confirmed against cancelled PO") maps onto `purchase-order-svc`'s real `CLOSED` status, checked live via HTTP at confirm time, not cached from create time.
+- **Negative-path scenario #3** ("confirmed receipt deleted to fix mismatch") is blocked unconditionally by a `BEFORE DELETE` trigger — no row in `goods_service_receipts` can ever be deleted, at any status. `ReverseReceipt` is the only sanctioned correction path, itself an append-only record (`receipt_reversals`) that accumulates up to (never past) the original amount.
+- **Negative-path scenario #4** ("GRNI event emitted twice on replay") is enforced by riding `general-ledger-svc`'s own real idempotency contract: every GRNI journal post uses `receipt_id` as `correlation_id`, so a replayed request against the same journal returns the original rather than creating a duplicate — verified structurally in this service's own tests (the ledger stub asserts it is asked to post exactly once per receipt ID).
+- The SoD line ("receiver/acceptor cannot self-certify sensitive services where policy requires independent acceptance") is enforced via `authorization-svc`'s dynamic own-object SoD layer — the same feature and calling pattern first exercised by `supplier-financial-profile-svc` (AP-01, §3.7), now proven reusable by a second, independently-built service.
+- GRNI accounting posts a real journal entry to `general-ledger-svc` (a real, existing endpoint: create → validate → post) but is deliberately best-effort: any failure at any step (GL unreachable, fiscal period locked, GL-side rejection) is recorded as a visible `EXCEPTION` accounting event and never blocks or reverses the receipt confirmation that already succeeded — this is AP-04's own stated failure semantics ("accounting event failure leaves visible pending/exception state, never silent receipt deletion") applied literally. GRNI account codes are operator-configured (`GRNI_DEBIT_ACCOUNT_CODE`/`GRNI_CREDIT_ACCOUNT_CODE`) since no chart-of-accounts authority exists anywhere in this codebase to resolve them dynamically. There is no background retry scheduler in this codebase, so an `EXCEPTION` event requires manual operational follow-up — an honest gap, not a fabricated auto-retry.
+
+17 handler tests plus two verified negative controls (over-tolerance-without-exception, service-acceptance self-certification).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8157, db `goods_service_receipt`, depends on `authorization-svc` + `purchase-order-svc` + `general-ledger-svc`).
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

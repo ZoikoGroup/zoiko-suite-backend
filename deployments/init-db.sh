@@ -79,6 +79,7 @@ privacy_decision:privacy-decision
 privacy_rights:privacy-rights
 privacy_transfer:privacy-transfer
 supplier_financial_profile:supplier-financial-profile
+goods_service_receipt:goods-service-receipt
 metric_registry:metric-registry
 source_authority:source-authority
 jurisdiction_rules:jurisdiction-rules
@@ -219,7 +220,7 @@ for db in \
     clause_template commercial_account compensation configuration_feature_flag consolidation_svc \
     contract_lifecycle corporate_actions corporate_tax counterparty_management decision_support \
     delegated_authority document_vault employee_master employment_contracts evidence_manifest \
-    evidence_requirements financial_close general_ledger governance_decision_log identity_context \
+    evidence_requirements financial_close general_ledger goods_service_receipt governance_decision_log identity_context \
     intercompany_accounting invoice_approval jurisdiction_rules kill_switch_registry leave_absence \
     metric_registry notification obligation_tracking obligations offboarding_severance org_structure \
     payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \

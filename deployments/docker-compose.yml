@@ -35,6 +35,7 @@ services:
       - ../services/privacy-rights-svc/deployments/migrations:/migrations/privacy-rights:ro
       - ../services/privacy-transfer-svc/deployments/migrations:/migrations/privacy-transfer:ro
       - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
+      - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3378,6 +3379,56 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── goods-service-receipt-svc (Port: 8157) ───────────────────────────────
+  # AP-04 of the Procurement/Expenses/Accounts Payable baseline — Goods/
+  # Service Receipt. The missing three-way-match link between
+  # purchase-order-svc (AP-03) and invoice-approval-svc (AP-05/06). Two
+  # scope decisions were made because the upstream data the spec assumes
+  # doesn't exist: purchase-order-svc has no PO-line/quantity model and only
+  # ISSUED/CLOSED statuses (no CANCELLED), so over-receipt tolerance is
+  # enforced at the aggregate-amount level against the PO's own
+  # total_amount, not per line — see internal/domain's package doc. GRNI
+  # accounting posts a real, idempotent journal entry to general-ledger-svc
+  # (correlation_id = receipt_id) but is deliberately best-effort: any
+  # posting failure is recorded as a visible EXCEPTION accounting event and
+  # never blocks or reverses the underlying receipt confirmation, matching
+  # the spec's own stated failure semantics verbatim.
+  goods-service-receipt-svc:
+    build:
+      context: ../services/goods-service-receipt-svc
+      dockerfile: Dockerfile
+    container_name: goods-service-receipt-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8157:8157"
+    environment:
+      PORT: "8157"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/goods_service_receipt?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.goods-service-receipt.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PURCHASE_ORDER_SERVICE_URL: "http://purchase-order-svc:8129"
+      GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      purchase-order-svc:
+        condition: service_healthy
+      general-ledger-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
