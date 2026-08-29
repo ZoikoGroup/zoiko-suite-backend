@@ -32,6 +32,7 @@ services:
       - ../services/privacy-purpose-registry-svc/deployments/migrations:/migrations/privacy-purpose-registry:ro
       - ../services/privacy-consent-svc/deployments/migrations:/migrations/privacy-consent:ro
       - ../services/privacy-decision-svc/deployments/migrations:/migrations/privacy-decision:ro
+      - ../services/privacy-rights-svc/deployments/migrations:/migrations/privacy-rights:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3119,11 +3120,11 @@ services:
   # PRV-01 of ZS-SVC-W-001 (Privacy/Consent/Purpose/Data Rights Control).
   # Owns the purpose registry and processing-activity registry/lifecycle
   # (DRAFT -> VALIDATED -> SUBMITTED -> APPROVED -> ACTIVE, with
-  # reject/suspend/retire branches). Consent (PRV-02, privacy-consent-svc)
-  # and the runtime purpose-binding decision (PRV-03,
-  # privacy-decision-svc) are now built alongside it; data rights/DSR
-  # (PRV-04) and transfer/processor control (PRV-05) all depend on this
-  # registry existing first and are
+  # reject/suspend/retire branches). Consent (PRV-02, privacy-consent-svc),
+  # the runtime purpose-binding decision (PRV-03, privacy-decision-svc)
+  # and data rights/complaints (PRV-04, privacy-rights-svc) are now built
+  # alongside it; transfer/processor control (PRV-05) depends on this
+  # registry existing first and is
   # not yet built.
   privacy-purpose-registry-svc:
     build:
@@ -3237,6 +3238,51 @@ services:
       privacy-consent-svc:
         condition: service_healthy
       retention-registry-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── privacy-rights-svc (Port: 8154) ──────────────────────────────────────
+  # PRV-04 of ZS-SVC-W-001 — Data Rights, Complaint & Disclosure Control
+  # Service. Owns ONLY the privacy meaning and evidence of a rights
+  # request (case intake, identity-assurance evidence, discovery-manifest
+  # evidence, closure/outcome) — per the spec's own §14.1 ownership line,
+  # long-running task/deadline/approval orchestration belongs to
+  # workflow-svc ("WFC") and search/correction/export/erasure belongs to
+  # each domain service's own adapter, neither of which this service
+  # performs. wfc_process_ref is an optional, caller-supplied field, never
+  # created by this service — workflow-svc's real CreateWorkflow contract
+  # requires naming a concrete approver per stage up front, which this
+  # service has no legitimate way to know at intake. The one substantive
+  # rule enforced is the spec's own DISCLOSURE GATE (§15.2): a request can
+  # only close as FULFILLED if identity has been verified AND at least
+  # one discovery manifest was recorded.
+  privacy-rights-svc:
+    build:
+      context: ../services/privacy-rights-svc
+      dockerfile: Dockerfile
+    container_name: privacy-rights-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8154:8154"
+    environment:
+      PORT: "8154"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_rights?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.privacy-rights.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

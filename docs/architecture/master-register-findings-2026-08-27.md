@@ -100,7 +100,7 @@ These aren't bugs in existing code — they're domains the new register specifie
 - **AP-07 Expense Claim** — confirmed absent estate-wide; no `expense-*-svc` exists anywhere.
 - **Assets, Inventory & Project Accounting** (`ZS-SVC-G-001`) — an entire 12-service domain (fixed assets, depreciation, inventory movement/valuation, project cost capture) with zero corresponding service anywhere in the 86-service repo.
 - **Most of Financial/Statutory/Regulatory Reporting** (`ZS-SVC-H-001`) — no XBRL/iXBRL, no Statutory Pack, no Financial Statements certification, no Regulatory Submission, no tamper-evident export/evidence package. `reporting-orchestration-svc` (see §0 above) only weakly resembles two of the seven required sub-services, and what exists is a stub.
-- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — PARTIALLY BUILT (2026-08-28): see §3.1/§3.2/§3.3 below. PRV-01 (`privacy-purpose-registry-svc`), PRV-02 (`privacy-consent-svc`) and PRV-03 (`privacy-decision-svc`) now exist; PRV-04/PRV-05 (data rights/DSR, transfer/processor) remain entirely unbuilt.
+- **Privacy/Consent/Data Rights** (`ZS-SVC-W-001`) — PARTIALLY BUILT (2026-08-29): see §3.1–§3.4 below. PRV-01 (`privacy-purpose-registry-svc`), PRV-02 (`privacy-consent-svc`), PRV-03 (`privacy-decision-svc`) and PRV-04 (`privacy-rights-svc`) now exist; PRV-05 (transfer/processor control) remains entirely unbuilt.
 - **Full AP-01/04/08/09/10/11** (Supplier Financial Profile, Goods Receipt, Payables, Payment Proposal/Authorization/Run) — only requisition/PO/invoice/matching exist; the payment side of AP is unbuilt.
 - **FP&A domain** (`ZS-SVC-J-001`) — `forecasting-svc` is a standalone statistics microservice; none of Budget/Forecast-with-approval/Scenario/Variance/KPI-Registry/Management-Accounts/Board-Pack exist as governed objects.
 - **Audit & Assurance engagement domain** (`ZS-SVC-K-001`) — no engagement/risk-assessment/sampling/workpaper/sign-off service exists; `audit-event-store-svc` is correctly-scoped infrastructure this domain would consume, not an implementation of it.
@@ -128,7 +128,7 @@ Built as a real, working v1 — not a scaffold — of PRV-01 ("Processing Activi
 - **Validate is structural only.** It does not evaluate jurisdiction-specific legal correctness — `ZS-SVC-W-001` §0 is explicit that "jurisdiction-specific production rules require approved PDC packages," and no such package or service exists anywhere in this codebase. Faking a legal-correctness check would have been exactly the fabricated-success shape this whole workstream exists to remove.
 - **No real workflow-svc orchestration behind Submit/Approve/Reject.** These are real, authorized, audited transitions — SUBMITTED is never silently treated as APPROVED — but there is no governed WFC engine wired in. This is an honest, simpler approval gate, not a fabricated one.
 - **`lawful_basis_refs`/`retention_rule_refs`/`transfer_refs` are opaque, unvalidated references** — same doctrine as `retention_policies.record_class`: recorded, not resolved against any registry, because none exists yet.
-- **PRV-04/PRV-05 are not built.** Data-subject rights requests and transfer/processor/subprocessor control remain entirely unbuilt.
+- **PRV-05 is not built.** Transfer/processor/subprocessor control (processor inventory, transfer mechanisms, DPIA/TIA, transfer authorization) remains entirely unbuilt.
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8151, db `privacy_purpose_registry`) but not started or smoke-tested against a live stack in this session, consistent with this session's minimal-Docker-footprint discipline — build/vet/test all pass against the in-memory stub store; RLS/immutability were verified by reading the migration SQL against this platform's proven patterns, not by running a live Postgres instance.
 
@@ -165,6 +165,27 @@ Built as a real, working (deliberately partial) v1 of PRV-03 ("Purpose Binding &
 13 handler tests plus two verified negative controls (fail-closed-on-unreachable-dependency, purpose-limitation enforcement).
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8153, db `privacy_decision`, depends on `privacy-purpose-registry-svc` + `privacy-consent-svc` + `retention-registry-svc`) but not started against a live stack this session — same discipline and same verification method as §3.1/§3.2.
+
+### 3.4 `privacy-rights-svc` — new service, PRV-04 of ZS-SVC-W-001 (2026-08-29)
+
+Built as a real, working (deliberately partial) v1 of PRV-04 ("Data Rights, Complaint & Disclosure Control Service"), the fourth of ZS-SVC-W-001's five services.
+
+**Why it's deliberately partial.** §14.1 draws its own explicit ownership line: "PRV-04 owns the privacy meaning and evidence of a rights request. WFC [workflow-svc] owns long-running orchestration, tasks, deadlines, approvals and escalations. Domain adapters perform search, correction, restriction, export or erasure under explicit instructions and return evidence." This service builds only the first half. It does not orchestrate tasks/deadlines/approvals, and it does not perform search/correction/export/erasure itself.
+
+**A real integration question was investigated and deliberately declined.** The spec's own canonical API table (§18) shows `POST /privacy/rights-requests` returning a `wfc_process_ref`, implying PRV-04 creates a `workflow-svc` instance at intake. Before building that, `workflow-svc`'s actual `CreateWorkflow` handler was read directly: it requires the caller to name a concrete `approver_principal_id` for every stage up front, and separately enforces that the initiator cannot be an approver of their own workflow. At intake time, PRV-04 has no legitimate way to know who the correct privacy reviewer/approver is for an arbitrary jurisdiction/right-family combination — inventing one would be fabricating an organizational fact, the same defect shape already avoided elsewhere this session (evidence-manifest-svc's `record_class`, PRV-03's PDC rules). `wfc_process_ref` is instead an optional, caller-supplied field: whoever actually creates the real `workflow-svc` instance (a human process, or a future orchestrator with real approver-routing rules) may attach its reference via a dedicated endpoint, but this service never invents it.
+
+**What v1 DOES build — real, not fabricated:**
+- Case intake (`RightsRequest`) covering all of §14.2's right families (access, rectification, erasure, restriction, portability, objection/withdrawal, automated-decision challenge, complaint).
+- Identity-assurance evidence, recorded as a caller-declared fact rather than performed by this service (§15.1's risk-proportionate verification is an organizational/legal judgment call, not something to automate without a real verification-provider integration, which doesn't exist here) — a FAILED attempt is still recorded as evidence and, critically, verified NOT to silently advance the case status.
+- Discovery-manifest evidence attachment — domain services record what they found; this service never searches anything itself.
+- **§15.2's DISCLOSURE GATE, enforced verbatim, not invented**: "Finding a record is only discovery. Disclosure requires identity assurance... [and] approved response assembly." A request can only close with outcome `FULFILLED` if identity has been verified AND at least one discovery manifest was recorded — enforced atomically inside the closing transaction itself (not just the handler layer), so a race between two callers cannot slip a `FULFILLED` closure past the gate. `REJECTED`/`WITHDRAWN` carry no such precondition, since a request can legitimately be rejected precisely because identity could never be verified.
+- A closed request is permanently immutable at the database layer (a trigger rejects any further update once `status = CLOSED`).
+
+14 handler tests plus two verified negative controls on the two DISCLOSURE GATE preconditions — the first attempt at the identity-verification control was itself caught as flawed (the test hadn't attached a discovery manifest either, so the *other* precondition masked whether the identity check was doing anything at all); the test was corrected to isolate each precondition before the negative control was re-run and confirmed genuine.
+
+**Not modeled**: exemption/third-party review, redaction, and response-package assembly (§15.1's other control points) — these require case-specific legal judgment this service cannot supply.
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8154, db `privacy_rights`, depends on `authorization-svc`) but not started against a live stack this session — same discipline and same verification method as §3.1–§3.3.
 
 ---
 
