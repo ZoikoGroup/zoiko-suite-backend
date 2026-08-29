@@ -8,12 +8,21 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/privacy-decision-svc/internal/domain"
 	"zoiko.io/privacy-decision-svc/internal/middleware"
 )
+
+// isInvalidUUID reports whether err is Postgres's own "invalid input
+// syntax for type uuid" error (SQLSTATE 22P02) — see
+// privacy-purpose-registry-svc's identical helper for the full rationale.
+func isInvalidUUID(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
+}
 
 // Store is the interface the handler depends on.
 type Store interface {
@@ -95,7 +104,7 @@ func (s *PgStore) FindDecision(ctx context.Context, decisionID string) (*domain.
 			&d.PurposeID, &d.PurposeVersionID, &d.ProposedOperation, &d.Result, &reasonRaw,
 			&d.ConsentReceiptID, &d.LegalHoldID, &d.ActorPrincipalID, &correlationID, &d.DecidedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrDecisionNotFound
 	}
 	if err != nil {

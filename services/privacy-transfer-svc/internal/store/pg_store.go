@@ -10,12 +10,42 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/privacy-transfer-svc/internal/domain"
 	"zoiko.io/privacy-transfer-svc/internal/middleware"
 )
+
+// isInvalidUUID reports whether err is Postgres's own "invalid input
+// syntax for type uuid" error (SQLSTATE 22P02) — see
+// privacy-purpose-registry-svc's identical helper for the full rationale.
+func isInvalidUUID(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
+}
+
+// nullString bridges a nullable TEXT column onto a plain (non-pointer)
+// string field — several domain types here (ProcessingInstructions,
+// ContractEvidenceRef, EvidenceRef, Conditions, ResidualRisk, ...)
+// deliberately model "not present" as "" on the wire rather than a JSON
+// null, but the underlying columns are nullable and written via
+// strPtrOrNil. Without this, scanning a NULL directly into *string
+// fails outright ("cannot scan NULL into *string") — caught by live-
+// stack testing, not the unit suite, whose stub store has no real SQL
+// NULL to expose the mismatch.
+type nullString struct{ dest *string }
+
+func (n *nullString) Scan(src interface{}) error {
+	if src == nil {
+		*n.dest = ""
+		return nil
+	}
+	s, _ := src.(string)
+	*n.dest = s
+	return nil
+}
 
 // Store is the interface the handler depends on.
 type Store interface {
@@ -95,8 +125,8 @@ const relationshipColumns = `
 func scanRelationship(row pgx.Row) (*domain.ProcessorRelationship, error) {
 	r := &domain.ProcessorRelationship{}
 	var purposeRefsRaw, categoriesRaw, subjectsRaw, jurisdictionsRaw []byte
-	err := row.Scan(&r.RelationshipID, &r.TenantID, &r.ControllerRef, &r.ProcessorRef, &r.Service, &r.ProcessingInstructions,
-		&purposeRefsRaw, &categoriesRaw, &subjectsRaw, &r.ContractEvidenceRef, &jurisdictionsRaw,
+	err := row.Scan(&r.RelationshipID, &r.TenantID, &r.ControllerRef, &r.ProcessorRef, &r.Service, &nullString{&r.ProcessingInstructions},
+		&purposeRefsRaw, &categoriesRaw, &subjectsRaw, &nullString{&r.ContractEvidenceRef}, &jurisdictionsRaw,
 		&r.Status, &r.CreatedAt, &r.CreatedByPrincipalID)
 	if err != nil {
 		return nil, err
@@ -137,7 +167,7 @@ func (s *PgStore) FindRelationship(ctx context.Context, relationshipID string) (
 		r, err = scanRelationship(tx.QueryRow(ctx, `SELECT `+relationshipColumns+` FROM processor_relationships WHERE relationship_id = $1`, relationshipID))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrRelationshipNotFound
 	}
 	if err != nil {
@@ -182,7 +212,7 @@ func (s *PgStore) UpdateRelationshipStatus(ctx context.Context, relationshipID s
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrRelationshipNotFound
 	}
 	if err != nil {
@@ -200,7 +230,7 @@ func (s *PgStore) AttachSubprocessor(ctx context.Context, relationshipID string,
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var tenantID *string
 		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM processor_relationships WHERE relationship_id = $1`, relationshipID).Scan(&tenantID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 				return domain.ErrRelationshipNotFound
 			}
 			return err
@@ -217,8 +247,8 @@ func (s *PgStore) AttachSubprocessor(ctx context.Context, relationshipID string,
 			id, tenantID, relationshipID, req.ProviderIdentity, req.Service, strPtrOrNil(req.Purpose), strPtrOrNil(req.DataScope),
 			marshalSlice(req.ProcessingLocations), marshalSlice(req.OnwardSubprocessors), strPtrOrNil(req.NotificationApprovalModel),
 			strPtrOrNil(req.ContractEvidenceRef), principalID,
-		).Scan(&sp.SubprocessorID, &sp.TenantID, &sp.RelationshipID, &sp.ProviderIdentity, &sp.Service, &sp.Purpose, &sp.DataScope,
-			&locationsRaw, &onwardRaw, &sp.NotificationApprovalModel, &sp.ContractEvidenceRef, &sp.CreatedAt, &sp.CreatedByPrincipalID); err != nil {
+		).Scan(&sp.SubprocessorID, &sp.TenantID, &sp.RelationshipID, &sp.ProviderIdentity, &sp.Service, &nullString{&sp.Purpose}, &nullString{&sp.DataScope},
+			&locationsRaw, &onwardRaw, &nullString{&sp.NotificationApprovalModel}, &nullString{&sp.ContractEvidenceRef}, &sp.CreatedAt, &sp.CreatedByPrincipalID); err != nil {
 			return err
 		}
 		unmarshalSlice(locationsRaw, &sp.ProcessingLocations)
@@ -249,8 +279,8 @@ func (s *PgStore) ListSubprocessors(ctx context.Context, relationshipID string) 
 		for rows.Next() {
 			var sp domain.Subprocessor
 			var locationsRaw, onwardRaw []byte
-			if err := rows.Scan(&sp.SubprocessorID, &sp.TenantID, &sp.RelationshipID, &sp.ProviderIdentity, &sp.Service, &sp.Purpose, &sp.DataScope,
-				&locationsRaw, &onwardRaw, &sp.NotificationApprovalModel, &sp.ContractEvidenceRef, &sp.CreatedAt, &sp.CreatedByPrincipalID); err != nil {
+			if err := rows.Scan(&sp.SubprocessorID, &sp.TenantID, &sp.RelationshipID, &sp.ProviderIdentity, &sp.Service, &nullString{&sp.Purpose}, &nullString{&sp.DataScope},
+				&locationsRaw, &onwardRaw, &nullString{&sp.NotificationApprovalModel}, &nullString{&sp.ContractEvidenceRef}, &sp.CreatedAt, &sp.CreatedByPrincipalID); err != nil {
 				return err
 			}
 			unmarshalSlice(locationsRaw, &sp.ProcessingLocations)
@@ -272,7 +302,7 @@ const mechanismColumns = `mechanism_id, tenant_id, mechanism_type, evidence_ref,
 
 func scanMechanism(row pgx.Row) (*domain.TransferMechanism, error) {
 	m := &domain.TransferMechanism{}
-	err := row.Scan(&m.MechanismID, &m.TenantID, &m.MechanismType, &m.EvidenceRef, &m.Conditions, &m.ValidFrom, &m.ValidUntil, &m.CreatedAt, &m.CreatedByPrincipalID)
+	err := row.Scan(&m.MechanismID, &m.TenantID, &m.MechanismType, &nullString{&m.EvidenceRef}, &nullString{&m.Conditions}, &m.ValidFrom, &m.ValidUntil, &m.CreatedAt, &m.CreatedByPrincipalID)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +338,7 @@ func (s *PgStore) FindMechanism(ctx context.Context, mechanismID string) (*domai
 		m, err = scanMechanism(tx.QueryRow(ctx, `SELECT `+mechanismColumns+` FROM transfer_mechanisms WHERE mechanism_id = $1`, mechanismID))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrMechanismNotFound
 	}
 	if err != nil {
@@ -330,7 +360,7 @@ func (s *PgStore) RecordAssessment(ctx context.Context, tenantID string, req dom
 			RETURNING assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, review_trigger_at, created_at`,
 			id, strPtrOrNil(tenantID), req.RelationshipID, req.Outcome, principalID, strPtrOrNil(req.ResidualRisk),
 			strPtrOrNil(req.EvidenceRef), req.ReviewTriggerAt,
-		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &a.ResidualRisk, &a.EvidenceRef, &a.ReviewTriggerAt, &a.CreatedAt)
+		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &a.ReviewTriggerAt, &a.CreatedAt)
 	})
 	if err != nil {
 		s.log.Error("pg RecordAssessment failed", zap.Error(err))
@@ -345,9 +375,9 @@ func (s *PgStore) FindLatestAssessment(ctx context.Context, relationshipID strin
 		return tx.QueryRow(ctx, `
 			SELECT assessment_id, tenant_id, relationship_id, outcome, reviewer_principal_id, residual_risk, evidence_ref, review_trigger_at, created_at
 			FROM transfer_assessments WHERE relationship_id = $1 ORDER BY created_at DESC LIMIT 1`, relationshipID,
-		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &a.ResidualRisk, &a.EvidenceRef, &a.ReviewTriggerAt, &a.CreatedAt)
+		).Scan(&a.AssessmentID, &a.TenantID, &a.RelationshipID, &a.Outcome, &a.ReviewerPrincipalID, &nullString{&a.ResidualRisk}, &nullString{&a.EvidenceRef}, &a.ReviewTriggerAt, &a.CreatedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, nil
 	}
 	if err != nil {
@@ -394,7 +424,7 @@ func (s *PgStore) FindDecision(ctx context.Context, decisionID string) (*domain.
 		).Scan(&d.DecisionID, &d.TenantID, &d.RelationshipID, &d.TransferMechanismID, &destJurisdiction, &d.AssessmentID,
 			&d.Result, &reasonRaw, &d.ActorPrincipalID, &correlationID, &d.DecidedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrDecisionNotFound
 	}
 	if err != nil {

@@ -10,12 +10,27 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/privacy-purpose-registry-svc/internal/domain"
 	"zoiko.io/privacy-purpose-registry-svc/internal/middleware"
 )
+
+// isInvalidUUID reports whether err is Postgres's own "invalid input
+// syntax for type uuid" error (SQLSTATE 22P02) — a caller-supplied ID
+// that is not even syntactically a UUID. Without this check, that error
+// was indistinguishable from a real outage: it surfaced as the same
+// ErrStoreUnavailable/503 as a genuine connection failure, when the
+// correct, cheap answer is "not found" — the same answer a syntactically
+// valid but nonexistent UUID already gets. Found by live-stack testing,
+// not by the unit test suite, whose in-memory stub has no UUID column
+// type to reject a malformed string in the first place.
+func isInvalidUUID(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
+}
 
 // Store is the interface the handler depends on — narrow enough to be
 // stubbed in tests without a real database.
@@ -191,7 +206,7 @@ func (s *PgStore) CreatePurposeVersion(ctx context.Context, purposeID string, re
 		))
 		return err
 	})
-	if errors.Is(err, domain.ErrPurposeVersionNotFound) {
+	if errors.Is(err, domain.ErrPurposeVersionNotFound) || isInvalidUUID(err) {
 		return nil, domain.ErrPurposeVersionNotFound
 	}
 	if err != nil {
@@ -218,7 +233,7 @@ func (s *PgStore) PublishPurposeVersion(ctx context.Context, purposeID, versionI
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		// Distinguish "doesn't exist" from "exists but already published"
 		// so the handler can return the right status code.
 		existing, findErr := s.FindPurposeVersion(ctx, purposeID, versionID)
@@ -247,7 +262,7 @@ func (s *PgStore) FindPurposeVersion(ctx context.Context, purposeID, versionID s
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrPurposeVersionNotFound
 	}
 	if err != nil {
@@ -272,7 +287,7 @@ func (s *PgStore) ResolvePurposeAsOf(ctx context.Context, purposeID string, asOf
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrPurposeNotFound
 	}
 	if err != nil {
@@ -322,6 +337,12 @@ func (s *PgStore) IsPurposePublished(ctx context.Context, purposeID string) (boo
 			)`, purposeID,
 		).Scan(&exists)
 	})
+	// A malformed purposeID cannot possibly be published — the correct
+	// answer is false, same as a syntactically valid but unpublished one,
+	// not an internal error.
+	if isInvalidUUID(err) {
+		return false, nil
+	}
 	if err != nil {
 		s.log.Error("pg IsPurposePublished failed", zap.Error(err))
 		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -451,7 +472,7 @@ func (s *PgStore) CreateActivityVersion(ctx context.Context, activityID string, 
 		))
 		return err
 	})
-	if errors.Is(err, domain.ErrActivityVersionNotFound) {
+	if errors.Is(err, domain.ErrActivityVersionNotFound) || isInvalidUUID(err) {
 		return nil, domain.ErrActivityVersionNotFound
 	}
 	if err != nil {
@@ -474,7 +495,7 @@ func (s *PgStore) FindActivityVersion(ctx context.Context, activityID, versionID
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrActivityVersionNotFound
 	}
 	if err != nil {
@@ -510,7 +531,7 @@ func (s *PgStore) ResolveActivityAsOf(ctx context.Context, activityID string, as
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrActivityNotFound
 	}
 	if err != nil {
@@ -580,7 +601,7 @@ func (s *PgStore) SetValidationOutcome(ctx context.Context, activityID, versionI
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrActivityVersionNotFound
 	}
 	if err != nil {
@@ -608,7 +629,7 @@ func (s *PgStore) TransitionActivity(ctx context.Context, activityID, versionID 
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		existing, findErr := s.FindActivityVersion(ctx, activityID, versionID)
 		if findErr == nil && existing != nil {
 			return nil, domain.ErrInvalidTransition
@@ -635,7 +656,7 @@ func (s *PgStore) RejectActivity(ctx context.Context, activityID, versionID, rea
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		existing, findErr := s.FindActivityVersion(ctx, activityID, versionID)
 		if findErr == nil && existing != nil {
 			return nil, domain.ErrInvalidTransition
@@ -662,7 +683,7 @@ func (s *PgStore) ActivateActivity(ctx context.Context, activityID, versionID st
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		existing, findErr := s.FindActivityVersion(ctx, activityID, versionID)
 		if findErr == nil && existing != nil {
 			return nil, domain.ErrInvalidTransition

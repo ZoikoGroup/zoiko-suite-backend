@@ -8,12 +8,21 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/privacy-rights-svc/internal/domain"
 	"zoiko.io/privacy-rights-svc/internal/middleware"
 )
+
+// isInvalidUUID reports whether err is Postgres's own "invalid input
+// syntax for type uuid" error (SQLSTATE 22P02) — see
+// privacy-purpose-registry-svc's identical helper for the full rationale.
+func isInvalidUUID(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
+}
 
 // Store is the interface the handler depends on.
 type Store interface {
@@ -68,7 +77,7 @@ const requestColumns = `
 func scanRequest(row pgx.Row) (*domain.RightsRequest, error) {
 	r := &domain.RightsRequest{}
 	var outcome *string
-	err := row.Scan(&r.RequestID, &r.TenantID, &r.SubjectRef, &r.RightFamily, &r.Jurisdiction, &r.RequesterRef, &r.SubmittedVia,
+	err := row.Scan(&r.RequestID, &r.TenantID, &r.SubjectRef, &r.RightFamily, &nullString{&r.Jurisdiction}, &nullString{&r.RequesterRef}, &nullString{&r.SubmittedVia},
 		&r.Status, &r.IdentityVerified, &outcome, &r.ResponseEvidenceHash, &r.WFCProcessRef,
 		&r.CreatedAt, &r.CreatedByPrincipalID, &r.ClosedAt)
 	if err != nil {
@@ -109,7 +118,7 @@ func (s *PgStore) FindRequest(ctx context.Context, requestID string) (*domain.Ri
 		request, err = scanRequest(tx.QueryRow(ctx, `SELECT `+requestColumns+` FROM rights_requests WHERE request_id = $1`, requestID))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrRequestNotFound
 	}
 	if err != nil {
@@ -150,7 +159,7 @@ func (s *PgStore) RecordIdentityVerification(ctx context.Context, requestID stri
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var tenantID *string
 		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM rights_requests WHERE request_id = $1`, requestID).Scan(&tenantID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 				return domain.ErrRequestNotFound
 			}
 			return err
@@ -161,7 +170,7 @@ func (s *PgStore) RecordIdentityVerification(ctx context.Context, requestID stri
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			RETURNING event_id, tenant_id, request_id, verified, method, note, verified_by_principal_id, created_at`,
 			id, tenantID, requestID, req.Verified, req.Method, strPtrOrNilForNote(req.Note), principalID,
-		).Scan(&event.EventID, &event.TenantID, &event.RequestID, &event.Verified, &event.Method, &noteScan{&event.Note}, &event.VerifiedByPrincipalID, &event.CreatedAt); err != nil {
+		).Scan(&event.EventID, &event.TenantID, &event.RequestID, &event.Verified, &event.Method, &nullString{&event.Note}, &event.VerifiedByPrincipalID, &event.CreatedAt); err != nil {
 			return err
 		}
 
@@ -199,7 +208,7 @@ func (s *PgStore) AttachDiscoveryManifest(ctx context.Context, requestID string,
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var tenantID *string
 		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM rights_requests WHERE request_id = $1`, requestID).Scan(&tenantID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 				return domain.ErrRequestNotFound
 			}
 			return err
@@ -211,7 +220,7 @@ func (s *PgStore) AttachDiscoveryManifest(ctx context.Context, requestID string,
 			RETURNING manifest_id, tenant_id, request_id, domain, content_hash, candidate_count, evidence_ref, submitted_by_principal_id, created_at`,
 			id, tenantID, requestID, req.Domain, req.ContentHash, req.CandidateCount, strPtrOrNil(req.EvidenceRef), principalID,
 		).Scan(&manifest.ManifestID, &manifest.TenantID, &manifest.RequestID, &manifest.Domain, &manifest.ContentHash,
-			&manifest.CandidateCount, &evidenceRefScan{&manifest.EvidenceRef}, &manifest.SubmittedByPrincipalID, &manifest.CreatedAt); err != nil {
+			&manifest.CandidateCount, &nullString{&manifest.EvidenceRef}, &manifest.SubmittedByPrincipalID, &manifest.CreatedAt); err != nil {
 			return err
 		}
 
@@ -248,7 +257,7 @@ func (s *PgStore) ListDiscoveryManifests(ctx context.Context, requestID string) 
 		for rows.Next() {
 			var m domain.DiscoveryManifest
 			if err := rows.Scan(&m.ManifestID, &m.TenantID, &m.RequestID, &m.Domain, &m.ContentHash,
-				&m.CandidateCount, &evidenceRefScan{&m.EvidenceRef}, &m.SubmittedByPrincipalID, &m.CreatedAt); err != nil {
+				&m.CandidateCount, &nullString{&m.EvidenceRef}, &m.SubmittedByPrincipalID, &m.CreatedAt); err != nil {
 				return err
 			}
 			out = append(out, m)
@@ -273,7 +282,7 @@ func (s *PgStore) CloseRequest(ctx context.Context, requestID string, req domain
 		var status string
 		var identityVerified bool
 		if err := tx.QueryRow(ctx, `SELECT status, identity_verified FROM rights_requests WHERE request_id = $1`, requestID).Scan(&status, &identityVerified); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 				return domain.ErrRequestNotFound
 			}
 			return err
@@ -327,7 +336,7 @@ func (s *PgStore) AttachWFCProcessRef(ctx context.Context, requestID, wfcProcess
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrRequestNotFound
 	}
 	if err != nil {
@@ -337,13 +346,18 @@ func (s *PgStore) AttachWFCProcessRef(ctx context.Context, requestID, wfcProcess
 	return request, nil
 }
 
-// noteScan/evidenceRefScan adapt a nullable TEXT column onto a plain
-// (non-pointer) string field on the domain struct — Note/EvidenceRef are
-// documented as always-present-but-possibly-empty strings on the wire,
-// not omitempty pointers, so the scan target must bridge NULL -> "".
-type noteScan struct{ dest *string }
+// nullString bridges a nullable TEXT column onto a plain (non-pointer)
+// string field on a domain struct — several fields here (Note,
+// EvidenceRef, Jurisdiction, RequesterRef, SubmittedVia) are documented
+// as always-present-but-possibly-empty strings on the wire, not
+// omitempty pointers, so the scan target must bridge NULL -> "" rather
+// than fail outright. A gap in this coverage (scanRequest originally
+// scanned Jurisdiction/RequesterRef/SubmittedVia directly into *string)
+// was caught by live-stack testing, not the unit suite, whose stub store
+// has no real SQL NULL to expose the mismatch.
+type nullString struct{ dest *string }
 
-func (n *noteScan) Scan(src interface{}) error {
+func (n *nullString) Scan(src interface{}) error {
 	if src == nil {
 		*n.dest = ""
 		return nil
@@ -355,16 +369,4 @@ func (n *noteScan) Scan(src interface{}) error {
 
 func strPtrOrNilForNote(s string) *string {
 	return strPtrOrNil(s)
-}
-
-type evidenceRefScan struct{ dest *string }
-
-func (e *evidenceRefScan) Scan(src interface{}) error {
-	if src == nil {
-		*e.dest = ""
-		return nil
-	}
-	s, _ := src.(string)
-	*e.dest = s
-	return nil
 }
