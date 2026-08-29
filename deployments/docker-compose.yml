@@ -31,6 +31,13 @@ services:
       - ../services/retention-registry-svc/deployments/migrations:/migrations/retention-registry:ro
       - ../services/privacy-purpose-registry-svc/deployments/migrations:/migrations/privacy-purpose-registry:ro
       - ../services/privacy-consent-svc/deployments/migrations:/migrations/privacy-consent:ro
+      - ../services/privacy-decision-svc/deployments/migrations:/migrations/privacy-decision:ro
+      - ../services/privacy-rights-svc/deployments/migrations:/migrations/privacy-rights:ro
+      - ../services/privacy-transfer-svc/deployments/migrations:/migrations/privacy-transfer:ro
+      - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
+      - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
+      - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
+      - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3118,11 +3125,11 @@ services:
   # PRV-01 of ZS-SVC-W-001 (Privacy/Consent/Purpose/Data Rights Control).
   # Owns the purpose registry and processing-activity registry/lifecycle
   # (DRAFT -> VALIDATED -> SUBMITTED -> APPROVED -> ACTIVE, with
-  # reject/suspend/retire branches). Consent (PRV-02) is now built
-  # alongside it (see privacy-consent-svc below); runtime purpose-binding
-  # decisions (PRV-03), data rights/DSR (PRV-04), and transfer/processor
-  # control (PRV-05) all depend on this registry existing first and are
-  # not yet built.
+  # reject/suspend/retire branches). All five ZS-SVC-W-001 services are
+  # now built: consent (PRV-02, privacy-consent-svc), the runtime
+  # purpose-binding decision (PRV-03, privacy-decision-svc), data
+  # rights/complaints (PRV-04, privacy-rights-svc), and processor/
+  # transfer control (PRV-05, privacy-transfer-svc below).
   privacy-purpose-registry-svc:
     build:
       context: ../services/privacy-purpose-registry-svc
@@ -3185,6 +3192,363 @@ services:
       authorization-svc:
         condition: service_healthy
       privacy-purpose-registry-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── privacy-decision-svc (Port: 8153) ────────────────────────────────────
+  # PRV-03 of ZS-SVC-W-001 — Purpose Binding & Runtime Data-Use Decision
+  # Service. The full spec names five outcomes (PERMIT/RESTRICT/BLOCK/
+  # REVIEW_REQUIRED/INDETERMINATE); this version only ever produces
+  # PERMIT/BLOCK/INDETERMINATE — RESTRICT and REVIEW_REQUIRED need a PDC
+  # (jurisdiction-specific lawful-basis) rules engine that doesn't exist
+  # anywhere in this codebase, same gap already documented on PRV-01.
+  # What it DOES check is real: activity ACTIVE + purpose PUBLISHED in
+  # PRV-01, the proposed purpose actually bound to that activity (PRV-C01,
+  # purpose limitation), and two opt-in caller-declared checks — consent
+  # GRANTED in PRV-02 (PRV-C04) and no blocking legal hold in
+  # retention-registry-svc (using the caller's own real record_class,
+  # never an invented one). Any unreachable dependency fails the whole
+  # decision closed as INDETERMINATE.
+  privacy-decision-svc:
+    build:
+      context: ../services/privacy-decision-svc
+      dockerfile: Dockerfile
+    container_name: privacy-decision-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8153:8153"
+    environment:
+      PORT: "8153"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_decision?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.privacy-decision.events"
+      PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
+      CONSENT_REGISTRY_URL: "http://privacy-consent-svc:8152"
+      RETENTION_REGISTRY_URL: "http://retention-registry-svc:8148"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      privacy-purpose-registry-svc:
+        condition: service_healthy
+      privacy-consent-svc:
+        condition: service_healthy
+      retention-registry-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── privacy-rights-svc (Port: 8154) ──────────────────────────────────────
+  # PRV-04 of ZS-SVC-W-001 — Data Rights, Complaint & Disclosure Control
+  # Service. Owns ONLY the privacy meaning and evidence of a rights
+  # request (case intake, identity-assurance evidence, discovery-manifest
+  # evidence, closure/outcome) — per the spec's own §14.1 ownership line,
+  # long-running task/deadline/approval orchestration belongs to
+  # workflow-svc ("WFC") and search/correction/export/erasure belongs to
+  # each domain service's own adapter, neither of which this service
+  # performs. wfc_process_ref is an optional, caller-supplied field, never
+  # created by this service — workflow-svc's real CreateWorkflow contract
+  # requires naming a concrete approver per stage up front, which this
+  # service has no legitimate way to know at intake. The one substantive
+  # rule enforced is the spec's own DISCLOSURE GATE (§15.2): a request can
+  # only close as FULFILLED if identity has been verified AND at least
+  # one discovery manifest was recorded.
+  privacy-rights-svc:
+    build:
+      context: ../services/privacy-rights-svc
+      dockerfile: Dockerfile
+    container_name: privacy-rights-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8154:8154"
+    environment:
+      PORT: "8154"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_rights?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.privacy-rights.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── privacy-transfer-svc (Port: 8155) ────────────────────────────────────
+  # PRV-05 of ZS-SVC-W-001 — Processor, Subprocessor & Transfer Privacy
+  # Control. The last of the domain's five services. TransferMechanism is
+  # a directly-registered record (a real legal/compliance reviewer enters
+  # the mechanism, validity window and evidence), NOT a resolved PDC
+  # catalogue entry — no PDC exists anywhere in this codebase, same gap
+  # already documented on PRV-01/PRV-03. Whether a DPIA/TIA is required
+  # is an opt-in, caller-declared input to transfer-decision evaluation,
+  # never inferred. §17.2's fail-closed rule is encoded literally: a
+  # missing/expired/rejected assessment or an expired mechanism returns
+  # BLOCKED or REVIEW_REQUIRED — never a silent AUTHORIZED. CONDITIONAL
+  # (the fourth TransferAuthorization value, needing machine-enforceable
+  # transfer conditions) is defined in the wire contract but never
+  # produced, same reasoning as PRV-03's RESTRICT.
+  privacy-transfer-svc:
+    build:
+      context: ../services/privacy-transfer-svc
+      dockerfile: Dockerfile
+    container_name: privacy-transfer-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8155:8155"
+    environment:
+      PORT: "8155"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/privacy_transfer?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.privacy-transfer.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PURPOSE_REGISTRY_URL: "http://privacy-purpose-registry-svc:8151"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      privacy-purpose-registry-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── supplier-financial-profile-svc (Port: 8156) ──────────────────────────
+  # AP-01 of the Procurement/Expenses/Accounts Payable baseline —
+  # Supplier Financial Profile. The foundational service of the unbuilt
+  # payment side of Accounts Payable (AP-09/10/11 all need a governed
+  # supplier financial profile to pay against). PayeeReference is an
+  # opaque, caller-supplied reference: AP-01's own contract names "ORG-10
+  # Banking Identity/Payee Master" as the authoritative owner of real
+  # bank/payee details, and no such service exists anywhere in this
+  # codebase (banking-connector-svc is a different bounded context —
+  # bank statement ingestion, not payee identity). The high-risk-change
+  # approval flow is the first real caller of authorization-svc's dynamic
+  # own-object Segregation-of-Duties layer outside its own tests: a
+  # proposer of a payee_reference/payment_method_preference change cannot
+  # approve their own proposal. Non-overlapping payment-terms effective
+  # periods (a named negative-path scenario in AP-01's own spec) are
+  # enforced by a genuine Postgres EXCLUDE constraint, not
+  # application-level date math.
+  supplier-financial-profile-svc:
+    build:
+      context: ../services/supplier-financial-profile-svc
+      dockerfile: Dockerfile
+    container_name: supplier-financial-profile-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8156:8156"
+    environment:
+      PORT: "8156"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/supplier_financial_profile?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.supplier-financial-profile.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── goods-service-receipt-svc (Port: 8157) ───────────────────────────────
+  # AP-04 of the Procurement/Expenses/Accounts Payable baseline — Goods/
+  # Service Receipt. The missing three-way-match link between
+  # purchase-order-svc (AP-03) and invoice-approval-svc (AP-05/06). Two
+  # scope decisions were made because the upstream data the spec assumes
+  # doesn't exist: purchase-order-svc has no PO-line/quantity model and only
+  # ISSUED/CLOSED statuses (no CANCELLED), so over-receipt tolerance is
+  # enforced at the aggregate-amount level against the PO's own
+  # total_amount, not per line — see internal/domain's package doc. GRNI
+  # accounting posts a real, idempotent journal entry to general-ledger-svc
+  # (correlation_id = receipt_id) but is deliberately best-effort: any
+  # posting failure is recorded as a visible EXCEPTION accounting event and
+  # never blocks or reverses the underlying receipt confirmation, matching
+  # the spec's own stated failure semantics verbatim.
+  goods-service-receipt-svc:
+    build:
+      context: ../services/goods-service-receipt-svc
+      dockerfile: Dockerfile
+    container_name: goods-service-receipt-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8157:8157"
+    environment:
+      PORT: "8157"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/goods_service_receipt?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.goods-service-receipt.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PURCHASE_ORDER_SERVICE_URL: "http://purchase-order-svc:8129"
+      GENERAL_LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      purchase-order-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── expense-claim-svc (Port: 8158) ───────────────────────────────────────
+  # AP-07 of the Procurement/Expenses/Accounts Payable baseline — Expense
+  # Claim. Real integrations verified against each peer's actual code
+  # before this service was written: employee-master-svc validates the
+  # claimant is a real ACTIVE employee; document-vault-svc validates a
+  # receipt reference actually exists (cross-claim reuse of the same
+  # receipt is blocked by this service's own partial UNIQUE index, a
+  # genuine database invariant); tax-determination-svc's real endpoint is
+  # called for every line claiming tax recovery, so a tax-recoverable
+  # amount is never inferred, only ever the literal result of that call;
+  # policy-svc's real APPROVAL_THRESHOLD evaluation gates which approval
+  # authority (ordinary vs delegated-exception) a claim needs. AP-08
+  # "Payables" has no real reimbursement-consuming endpoint today
+  # (accounts-payable-svc's whole model is vendor-invoice-shaped) — this
+  # service emits ExpenseClaimPayableRequested honestly, with no consumer
+  # yet, rather than fabricating that integration.
+  expense-claim-svc:
+    build:
+      context: ../services/expense-claim-svc
+      dockerfile: Dockerfile
+    container_name: expense-claim-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8158:8158"
+    environment:
+      PORT: "8158"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/expense_claim?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.expense-claim.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EMPLOYEE_MASTER_SERVICE_URL: "http://employee-master-svc:8108"
+      DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
+      POLICY_SERVICE_URL: "http://policy-svc:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+      tax-determination-svc:
+        condition: service_healthy
+      policy-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payment-proposal-svc (Port: 8159) ────────────────────────────────────
+  # AP-09 of the Procurement/Expenses/Accounts Payable baseline — Payment
+  # Proposal. Selects real eligible payables from accounts-payable-svc
+  # (APPROVED invoices) and expense-claim-svc (REIMBURSABLE claims) into a
+  # non-executing, fully reversible proposal. This service's own command
+  # list has no Authorize/Reject command — those belong to AP-10, a
+  # distinct, unbuilt service — so this only ever reaches FROZEN.
+  # supplier-financial-profile-svc's real ON_HOLD status is the only hold
+  # signal available anywhere upstream (accounts-payable-svc has none) and
+  # its updated_at is the only staleness signal (no version column exists)
+  # — both checked live again at Freeze time, not just at selection time.
+  # tax-determination-svc's real endpoint computes withholding, never
+  # inferred. BNK account/cash availability has no live endpoint anywhere
+  # in this codebase (checked directly) — PayingBankAccountRef is an
+  # opaque, caller-supplied reference, same doctrine as AP-01's
+  # PayeeReference. FreezePaymentProposal requires a principal distinct
+  # from the proposal's own preparer via authorization-svc's dynamic
+  # own-object SoD layer — the fourth reuse of that feature this session.
+  payment-proposal-svc:
+    build:
+      context: ../services/payment-proposal-svc
+      dockerfile: Dockerfile
+    container_name: payment-proposal-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8159:8159"
+    environment:
+      PORT: "8159"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payment_proposal?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payment-proposal.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      ACCOUNTS_PAYABLE_SERVICE_URL: "http://accounts-payable-svc:8099"
+      EXPENSE_CLAIM_SERVICE_URL: "http://expense-claim-svc:8158"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      accounts-payable-svc:
+        condition: service_healthy
+      expense-claim-svc:
+        condition: service_healthy
+      supplier-financial-profile-svc:
+        condition: service_healthy
+      tax-determination-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

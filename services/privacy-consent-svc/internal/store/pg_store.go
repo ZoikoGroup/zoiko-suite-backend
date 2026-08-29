@@ -9,12 +9,24 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/privacy-consent-svc/internal/domain"
 	"zoiko.io/privacy-consent-svc/internal/middleware"
 )
+
+// isInvalidUUID reports whether err is Postgres's own "invalid input
+// syntax for type uuid" error (SQLSTATE 22P02) — see
+// privacy-purpose-registry-svc's identical helper for the full
+// rationale: found by live-stack testing, where a malformed caller-
+// supplied ID was surfacing as ErrStoreUnavailable/503 (indistinguishable
+// from a real outage) instead of the cheap, correct "not found" answer.
+func isInvalidUUID(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "22P02"
+}
 
 // Store is the interface the handler depends on.
 type Store interface {
@@ -148,7 +160,7 @@ func (s *PgStore) CreateNoticeVersion(ctx context.Context, noticeID string, req 
 		))
 		return err
 	})
-	if errors.Is(err, domain.ErrNoticeVersionNotFound) {
+	if errors.Is(err, domain.ErrNoticeVersionNotFound) || isInvalidUUID(err) {
 		return nil, domain.ErrNoticeVersionNotFound
 	}
 	if err != nil {
@@ -171,7 +183,7 @@ func (s *PgStore) FindNoticeVersion(ctx context.Context, noticeID, versionID str
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrNoticeVersionNotFound
 	}
 	if err != nil {
@@ -194,7 +206,7 @@ func (s *PgStore) ApproveNoticeVersion(ctx context.Context, noticeID, versionID,
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidNoticeTransition
 	}
 	if err != nil {
@@ -233,7 +245,7 @@ func (s *PgStore) PublishNoticeVersion(ctx context.Context, noticeID, versionID 
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidNoticeTransition
 	}
 	if err != nil {
@@ -256,7 +268,7 @@ func (s *PgStore) WithdrawNoticeVersion(ctx context.Context, noticeID, versionID
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrInvalidNoticeTransition
 	}
 	if err != nil {
@@ -283,7 +295,7 @@ func (s *PgStore) ResolveNoticeAsOf(ctx context.Context, noticeID string, asOf t
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrNoticeNotFound
 	}
 	if err != nil {
@@ -316,7 +328,7 @@ func (s *PgStore) RecordPresentation(ctx context.Context, tenantID, noticeID, ve
 		).Scan(&receipt.PresentationReceiptID, &receipt.TenantID, &receipt.NoticeVersionID,
 			&receipt.SubjectRef, &receipt.Channel, &receipt.Locale, &receipt.CreatedAt)
 	})
-	if errors.Is(err, domain.ErrNoticeVersionNotFound) {
+	if errors.Is(err, domain.ErrNoticeVersionNotFound) || isInvalidUUID(err) {
 		return nil, domain.ErrNoticeVersionNotFound
 	}
 	if err != nil {
@@ -377,7 +389,7 @@ func (s *PgStore) FindConsentReceipt(ctx context.Context, receiptID string) (*do
 		))
 		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		return nil, domain.ErrConsentReceiptNotFound
 	}
 	if err != nil {
@@ -393,7 +405,7 @@ func (s *PgStore) WithdrawConsent(ctx context.Context, receiptID, channel, princ
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		var tenantID *string
 		if err := tx.QueryRow(ctx, `SELECT tenant_id FROM consent_receipts WHERE consent_receipt_id = $1`, receiptID).Scan(&tenantID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+			if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 				return domain.ErrConsentReceiptNotFound
 			}
 			return err
@@ -440,7 +452,7 @@ func (s *PgStore) ResolveConsentStatus(ctx context.Context, subjectRef, purposeI
 			LIMIT 1`,
 			subjectRef, purposeID,
 		))
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 			return nil
 		}
 		if err != nil {
@@ -504,7 +516,7 @@ func (s *PgStore) ResolvePreference(ctx context.Context, subjectRef, channelOrPu
 			subjectRef, channelOrPurpose,
 		).Scan(&p.PreferenceAssertionID, &p.TenantID, &p.SubjectRef, &p.ChannelOrPurpose, &p.Value, &p.Source, &p.CreatedAt)
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || isInvalidUUID(err) {
 		p = domain.PreferenceAssertion{SubjectRef: subjectRef, ChannelOrPurpose: channelOrPurpose, Value: domain.PreferenceNotApplicable}
 		return &p, nil
 	}
