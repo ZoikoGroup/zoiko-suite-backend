@@ -34,6 +34,7 @@ services:
       - ../services/privacy-decision-svc/deployments/migrations:/migrations/privacy-decision:ro
       - ../services/privacy-rights-svc/deployments/migrations:/migrations/privacy-rights:ro
       - ../services/privacy-transfer-svc/deployments/migrations:/migrations/privacy-transfer:ro
+      - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3330,6 +3331,53 @@ services:
       authorization-svc:
         condition: service_healthy
       privacy-purpose-registry-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── supplier-financial-profile-svc (Port: 8156) ──────────────────────────
+  # AP-01 of the Procurement/Expenses/Accounts Payable baseline —
+  # Supplier Financial Profile. The foundational service of the unbuilt
+  # payment side of Accounts Payable (AP-09/10/11 all need a governed
+  # supplier financial profile to pay against). PayeeReference is an
+  # opaque, caller-supplied reference: AP-01's own contract names "ORG-10
+  # Banking Identity/Payee Master" as the authoritative owner of real
+  # bank/payee details, and no such service exists anywhere in this
+  # codebase (banking-connector-svc is a different bounded context —
+  # bank statement ingestion, not payee identity). The high-risk-change
+  # approval flow is the first real caller of authorization-svc's dynamic
+  # own-object Segregation-of-Duties layer outside its own tests: a
+  # proposer of a payee_reference/payment_method_preference change cannot
+  # approve their own proposal. Non-overlapping payment-terms effective
+  # periods (a named negative-path scenario in AP-01's own spec) are
+  # enforced by a genuine Postgres EXCLUDE constraint, not
+  # application-level date math.
+  supplier-financial-profile-svc:
+    build:
+      context: ../services/supplier-financial-profile-svc
+      dockerfile: Dockerfile
+    container_name: supplier-financial-profile-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8156:8156"
+    environment:
+      PORT: "8156"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/supplier_financial_profile?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.supplier-financial-profile.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

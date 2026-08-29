@@ -217,6 +217,23 @@ Every claim in §3.1–§3.5 above about RLS/immutability/cross-service integrat
 
 Neither bug was caught by any of the 71 unit tests written across the five services, because the in-memory stub stores have no real UUID column type to reject a malformed string, and no real nullable-column semantics to violate — both defects are specifically the kind that only a real database can expose. All five services were rebuilt, redeployed, and the exact failing requests re-run to confirm both fixes live, then the full unit suites re-run to confirm no regression, before the containers used for this test were stopped.
 
+### 3.7 `supplier-financial-profile-svc` — new service, AP-01 of the Procurement/Expenses/Accounts Payable baseline (2026-08-29)
+
+Built as a real, working (deliberately partial) v1 of AP-01 ("Supplier Financial Profile"), the first service of a new domain, opened after all five ZS-SVC-W-001 privacy services were complete and verified (§3.1–§3.6). AP-01 is the foundation the unbuilt payment side of Accounts Payable (AP-09/10/11, Payment Proposal/Authorization/Run) will eventually need a governed supplier record to pay against.
+
+**Why it's deliberately partial.** AP-01's own contract names "ORG-10 Banking Identity/Payee Master" as the authoritative owner of real bank/payee details — no such service exists anywhere in this codebase (`banking-connector-svc` is a different bounded context: bank statement ingestion for reconciliation, not payee identity). Rather than fabricate a resolution, `PayeeReference` is modeled as an opaque, caller-supplied string, never validated or resolved — the same doctrine already used for `lawful_basis_refs` (PRV-01) and `record_class` (`retention-registry-svc`). The spec's state model (`Draft → Active → OnHold/Suspended → Retired`) requires a `Draft → Active` transition but the spec's own command list has no explicit `Activate` command — added honestly as `ActivateSupplierFinancialProfile` rather than silently omitted or smuggled into `AmendSupplierFinancialProfile`.
+
+**What's real, not fabricated:**
+- Full profile lifecycle (`Draft/Active/OnHold/Suspended/Retired`) with state-machine-enforced transitions, matching the spec's model exactly.
+- **Negative-path scenario #2 from AP-01's own acceptance table** ("supplier payment terms overlap effective periods" must be blocked) is enforced by a genuine Postgres `EXCLUDE USING gist` constraint on `payment_terms_periods` (`profile_id WITH =, tstzrange(effective_from, effective_to) WITH &&`, requiring `btree_gist`) — a database-layer, race-proof invariant, not an application-level check-then-insert a race could defeat.
+- **A variant of negative-path scenario #3** ("bank/payee changer cannot authorize resulting payment without independent control") is enforced via a real propose/decide flow (`ProposeHighRiskChange` / `DecideHighRiskChange` on `payee_reference` and `payment_method_preference`) that calls `authorization-svc`'s dynamic own-object Segregation-of-Duties layer (`CheckAllowedOwnObject`, built earlier this session — see §2.6) with the proposer as `resource_owner_principal_id`. This is the first real caller of that feature outside authorization-svc's own tests, and it worked as designed on first integration.
+- Every state transition and high-risk-change decision is a permanent, append-only `profile_change_events` row (immutability enforced by `BEFORE UPDATE/DELETE` triggers, since the runtime connects as Postgres superuser and bypasses GRANT/REVOKE).
+- Scenarios **not** built: negative-path #1 (invoice/payee bank-detail mismatch) and #4 (inactive supplier used in new PO/invoice) both need the *other* side of the check — a live call from `invoice-approval-svc`/`purchase-order-svc` into this service — which is out of scope for AP-01 alone and not wired up here; this service exposes the state (`ACTIVE`/`RETIRED`, `PayeeReference`) those services would need to consult, but the consulting side wasn't built or integrated as part of this task.
+
+14 handler tests plus two verified negative controls (payment-terms overlap, high-risk-change self-approval).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8156, db `supplier_financial_profile`, depends on `authorization-svc`).
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

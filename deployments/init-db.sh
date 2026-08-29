@@ -78,6 +78,7 @@ privacy_consent:privacy-consent
 privacy_decision:privacy-decision
 privacy_rights:privacy-rights
 privacy_transfer:privacy-transfer
+supplier_financial_profile:supplier-financial-profile
 metric_registry:metric-registry
 source_authority:source-authority
 jurisdiction_rules:jurisdiction-rules
@@ -224,7 +225,7 @@ for db in \
     payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \
     privacy_decision privacy_purpose_registry privacy_rights privacy_transfer procurement_workflow \
     purchase_order purchase_request retention_registry schema_registry secret_vault_integration \
-    source_authority spend_controls tax_determination tax_rules tenant_entity_registry treasury \
+    source_authority spend_controls supplier_financial_profile tax_determination tax_rules tenant_entity_registry treasury \
     vat_gst vendor_due_diligence workflow workflow_history workforce_compliance; do
     if [ "$(psql -tAX --username "$POSTGRES_USER" --dbname postgres \
             -c "SELECT 1 FROM pg_roles WHERE rolname = 'app_${db}'")" = "1" ]; then
