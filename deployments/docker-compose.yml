@@ -36,6 +36,7 @@ services:
       - ../services/privacy-transfer-svc/deployments/migrations:/migrations/privacy-transfer:ro
       - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
       - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
+      - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3429,6 +3430,64 @@ services:
       purchase-order-svc:
         condition: service_healthy
       general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── expense-claim-svc (Port: 8158) ───────────────────────────────────────
+  # AP-07 of the Procurement/Expenses/Accounts Payable baseline — Expense
+  # Claim. Real integrations verified against each peer's actual code
+  # before this service was written: employee-master-svc validates the
+  # claimant is a real ACTIVE employee; document-vault-svc validates a
+  # receipt reference actually exists (cross-claim reuse of the same
+  # receipt is blocked by this service's own partial UNIQUE index, a
+  # genuine database invariant); tax-determination-svc's real endpoint is
+  # called for every line claiming tax recovery, so a tax-recoverable
+  # amount is never inferred, only ever the literal result of that call;
+  # policy-svc's real APPROVAL_THRESHOLD evaluation gates which approval
+  # authority (ordinary vs delegated-exception) a claim needs. AP-08
+  # "Payables" has no real reimbursement-consuming endpoint today
+  # (accounts-payable-svc's whole model is vendor-invoice-shaped) — this
+  # service emits ExpenseClaimPayableRequested honestly, with no consumer
+  # yet, rather than fabricating that integration.
+  expense-claim-svc:
+    build:
+      context: ../services/expense-claim-svc
+      dockerfile: Dockerfile
+    container_name: expense-claim-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8158:8158"
+    environment:
+      PORT: "8158"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/expense_claim?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.expense-claim.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      EMPLOYEE_MASTER_SERVICE_URL: "http://employee-master-svc:8108"
+      DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
+      POLICY_SERVICE_URL: "http://policy-svc:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      employee-master-svc:
+        condition: service_healthy
+      document-vault-svc:
+        condition: service_healthy
+      tax-determination-svc:
+        condition: service_healthy
+      policy-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

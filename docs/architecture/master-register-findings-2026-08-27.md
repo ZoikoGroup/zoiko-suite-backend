@@ -253,6 +253,29 @@ Built as a real, working (deliberately partial) v1 of AP-04 ("Goods/Service Rece
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8157, db `goods_service_receipt`, depends on `authorization-svc` + `purchase-order-svc` + `general-ledger-svc`).
 
+### 3.9 `expense-claim-svc` — new service, AP-07 of the Procurement/Expenses/Accounts Payable baseline (2026-08-29)
+
+Built as a real, working (deliberately partial) v1 of AP-07 ("Expense Claim"), the third service in this domain. Unlike AP-01 and AP-04, every one of AP-07's own named dependencies (Workforce/ORG, Policy, TAX, Documents) turned out to be a real, existing service — the scope decisions here are about integration depth, not missing peers, except for AP-08.
+
+**What's real, not fabricated:**
+- Claimant identity is verified against `employee-master-svc`'s real `GET /v1/employees/{id}` at `CreateExpenseClaim` time — must exist, belong to the stated legal entity, and be `ACTIVE` (not `ONBOARDING`/`SUSPENDED`/`TERMINATED`).
+- Receipt evidence is verified against `document-vault-svc`'s real `GET /v1/documents/{id}` when a line attaches one — must exist, match tenant/legal entity, and not be `PURGE_PENDING`.
+- **Negative-path scenario #2** ("same receipt used on two claims") is enforced by a genuine partial `UNIQUE` index on `expense_lines.receipt_document_id` (`WHERE receipt_document_id IS NOT NULL`) — a database invariant spanning every claim platform-wide, not an application check a race could defeat.
+- **Negative-path scenario #4** ("tax reclaim inferred without TAX result" must be blocked) is enforced literally: every line declaring `ClaimTaxRecovery` gets a real `POST /v1/tax-determinations` call to `tax-determination-svc` at `SubmitExpenseClaim` time; `TaxableAmount`/`CalculatedTaxAmount` are set only from that call's own response, keyed by its real `DeterminationID`, and a failed call blocks the entire submission (`422`) rather than leaving an invented figure on the claim.
+- Policy-svc's real `POST /v1/policies/evaluate` (`policy_type=APPROVAL_THRESHOLD` — the only type it has real evaluation logic for) is called against the claim total at submit time. A `404 no_applicable_policy` (no threshold configured) is treated as `WITHIN_THRESHOLD`, per policy-svc's own documented stance that it will not guess fail-open/fail-closed for an unconfigured policy — a judgment call, documented in code rather than silently assumed.
+- **Negative-path scenario #1** ("claimant approves own expense") is blocked via `authorization-svc`'s dynamic own-object SoD layer — the third independent reuse of that feature this session (after AP-01 and AP-04), now clearly a load-bearing, general-purpose platform capability rather than a one-off.
+- **Negative-path scenario #3** ("expense over receipt threshold approved without evidence") is enforced at `ApproveExpenseClaim`: any line above `RECEIPT_REQUIRED_THRESHOLD` with no attached receipt blocks approval outright, unless `RecordExpensePolicyException` (itself gated behind a stronger `EXPENSE_EXCEPTION_APPROVE` authority and the same SoD check) has explicitly waived it for that claim — the literal mapping of AP-07's own SoD line ("approver cannot override policy/receipt requirement outside delegated exception authority").
+- A claim policy-svc flags `APPROVAL_REQUIRED` needs that same stronger `EXPENSE_EXCEPTION_APPROVE` authority to approve at all, not the ordinary `EXPENSE_APPROVE` — policy escalation is enforced by which authorization action is checked, not by application-level logic duplicating policy-svc's own decision.
+- Every claim transition is a permanent, append-only `expense_claim_events` row; expense lines and the claim itself are immutable once the claim leaves `DRAFT`/`RETURNED` (enforced by `BEFORE INSERT/UPDATE/DELETE` triggers, since the runtime connects as Postgres superuser and bypasses GRANT/REVOKE).
+
+**Honest gap: AP-08 "Payables."** `accounts-payable-svc` exists but its entire domain is vendor-invoice-shaped (`vendor_id`, `CreateInvoice`/`ApproveInvoice`) with no claimant/reimbursement concept anywhere in it. Routing an approved expense claim through it as a fabricated "vendor invoice" would be exactly the kind of invented integration this codebase's discipline forbids. `ApproveExpenseClaim` instead emits `ExpenseClaimPayableRequested` honestly, with no real consumer yet — the same class of gap as AP-01's ORG-10 and AP-04's PO-line model.
+
+**Two consolidations of the spec's own state model, not gaps in a peer:** the spec names both "Submitted" and "PendingApproval" as distinct states with only one command (`SubmitExpenseClaim`) to reach either — collapsed into one `PENDING_APPROVAL` status, the same kind of honest consolidation as AP-01's added `Activate` command. And "Approved → Reimbursable → Closed" only ever reaches `REIMBURSABLE` here — `Closed` would require a real payables consumer to report the reimbursement settled, which doesn't exist (see AP-08 above).
+
+18 handler tests plus two verified negative controls (over-threshold-without-exception, self-approval).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8158, db `expense_claim`, depends on `authorization-svc` + `employee-master-svc` + `document-vault-svc` + `tax-determination-svc` + `policy-svc`).
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)
