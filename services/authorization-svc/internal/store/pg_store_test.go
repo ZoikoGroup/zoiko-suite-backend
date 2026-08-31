@@ -30,36 +30,26 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
 	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
 
-	mig1, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration 1: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(mig1)); err != nil {
-		t.Fatalf("failed to execute migration 1: %v", err)
-	}
-
-	mig2, err := os.ReadFile("../../deployments/migrations/000002_add_sod_rule_tenant_scoping.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration 2: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(mig2)); err != nil {
-		t.Fatalf("failed to execute migration 2: %v", err)
-	}
-
-	mig3, err := os.ReadFile("../../deployments/migrations/000003_nullable_legal_entity_for_tenant_scope.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration 3: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(mig3)); err != nil {
-		t.Fatalf("failed to execute migration 3: %v", err)
-	}
-
-	mig4, err := os.ReadFile("../../deployments/migrations/000004_add_rls.up.sql")
-	if err != nil {
-		t.Fatalf("failed to read migration 4: %v", err)
-	}
-	if _, err := pool.Exec(ctx, string(mig4)); err != nil {
-		t.Fatalf("failed to execute migration 4: %v", err)
+	// Every up migration, in order. This was five copy-pasted blocks naming
+	// four files, and 000005 was never added when it landed — so
+	// access_decision_log had no tenant_id here and both AccessDecisionLog
+	// tests failed on a column the real schema has. A list is the shape that
+	// makes the next migration a one-line change instead of a missed one.
+	for _, name := range []string{
+		"000001_initial_schema.up.sql",
+		"000002_add_sod_rule_tenant_scoping.up.sql",
+		"000003_nullable_legal_entity_for_tenant_scope.up.sql",
+		"000004_add_rls.up.sql",
+		"000005_add_access_decision_tenant.up.sql",
+		"000006_add_delegation_tenant.up.sql",
+	} {
+		sql, err := os.ReadFile("../../deployments/migrations/" + name)
+		if err != nil {
+			t.Fatalf("failed to read migration %s: %v", name, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to execute migration %s: %v", name, err)
+		}
 	}
 }
 
@@ -130,7 +120,7 @@ func TestPgStore_FindGrantedActions_RBAC(t *testing.T) {
 
 	setupRoleWithGrant(t, s, "00000000-0000-0000-0000-000000000001", "principal-1", "00000000-0000-0000-0000-0000000000e1", "FINANCE_APPROVER", []string{"PAYMENT_APPROVE", "PAYMENT_VIEW"})
 
-	actions, basis, err := s.FindGrantedActions(ctx, "principal-1", "00000000-0000-0000-0000-0000000000e1")
+	actions, basis, err := s.FindGrantedActions(ctx, "principal-1", "00000000-0000-0000-0000-0000000000e1", "00000000-0000-0000-0000-000000000001")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -142,7 +132,7 @@ func TestPgStore_FindGrantedActions_RBAC(t *testing.T) {
 	}
 
 	// Different entity — no grant.
-	actions, _, err = s.FindGrantedActions(ctx, "principal-1", "00000000-0000-0000-0000-0000000000e2")
+	actions, _, err = s.FindGrantedActions(ctx, "principal-1", "00000000-0000-0000-0000-0000000000e2", "00000000-0000-0000-0000-000000000001")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -193,7 +183,7 @@ func TestPgStore_CreateRoleAssignment_TenantWideRequiresTenantScopedRole(t *test
 
 	// A tenant-wide grant must be visible when evaluating ANY legal entity.
 	for _, entity := range []string{"00000000-0000-0000-0000-0000000000e1", "00000000-0000-0000-0000-0000000000e2"} {
-		actions, _, err := s.FindGrantedActions(ctx, "principal-1", entity)
+		actions, _, err := s.FindGrantedActions(ctx, "principal-1", entity, tenantID)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -222,7 +212,7 @@ func TestPgStore_RevokeRoleAssignment_EndsGrant(t *testing.T) {
 		t.Fatalf("create assignment: %v", err)
 	}
 
-	actions, _, _ := s.FindGrantedActions(ctx, "principal-1", legalEntityID)
+	actions, _, _ := s.FindGrantedActions(ctx, "principal-1", legalEntityID, tenantID)
 	if len(actions) != 1 {
 		t.Fatalf("expected grant before revoke, got %v", actions)
 	}
@@ -231,7 +221,7 @@ func TestPgStore_RevokeRoleAssignment_EndsGrant(t *testing.T) {
 		t.Fatalf("revoke: %v", err)
 	}
 
-	actions, _, _ = s.FindGrantedActions(ctx, "principal-1", legalEntityID)
+	actions, _, _ = s.FindGrantedActions(ctx, "principal-1", legalEntityID, tenantID)
 	if len(actions) != 0 {
 		t.Fatalf("expected no grant after revoke, got %v", actions)
 	}
@@ -278,7 +268,7 @@ func TestPgStore_TenantIsolation_RevokeRoleAssignment(t *testing.T) {
 	}
 
 	// Verify tenant A's grant is genuinely still active.
-	actions, _, err := s.FindGrantedActions(ctx, "principal-1", legalEntityID)
+	actions, _, err := s.FindGrantedActions(ctx, "principal-1", legalEntityID, tenantA)
 	if err != nil || len(actions) == 0 {
 		t.Fatalf("ISOLATION FAILURE: tenant A's grant was revoked by tenant B's attempt, actions=%v err=%v", actions, err)
 	}
@@ -322,7 +312,7 @@ func TestPgStore_PlatformScope_FindGrantedActionsAcrossTenants(t *testing.T) {
 
 	// No tenant is passed here at all — exactly how /v1/authorize's
 	// handler actually calls this today.
-	actions, basis, err := s.FindGrantedActions(context.Background(), "principal-1", legalEntityID)
+	actions, basis, err := s.FindGrantedActions(context.Background(), "principal-1", legalEntityID, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -340,7 +330,9 @@ func TestPgStore_DelegatedAuthority_RevocationIsOneWay(t *testing.T) {
 	ctx := context.Background()
 
 	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
+	tenantID := "00000000-0000-0000-0000-000000000001"
 	d, err := s.CreateDelegatedAuthority(ctx, domain.CreateDelegatedAuthorityParams{
+		TenantID:             tenantID,
 		DelegatorPrincipalID: "boss-1", DelegatePrincipalID: "principal-1", ScopeType: "FULL",
 		LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
 	})
@@ -351,7 +343,7 @@ func TestPgStore_DelegatedAuthority_RevocationIsOneWay(t *testing.T) {
 		t.Fatalf("expected ACTIVE, got %s", d.RevocationStatus)
 	}
 
-	revoked, err := s.RevokeDelegatedAuthority(ctx, d.DelegatedAuthorityID)
+	revoked, err := s.RevokeDelegatedAuthority(ctx, d.DelegatedAuthorityID, tenantID)
 	if err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
@@ -360,7 +352,7 @@ func TestPgStore_DelegatedAuthority_RevocationIsOneWay(t *testing.T) {
 	}
 
 	// Revoking an already-revoked delegation must fail, not silently succeed.
-	if _, err := s.RevokeDelegatedAuthority(ctx, d.DelegatedAuthorityID); !errors.Is(err, domain.ErrInvalidTransition) {
+	if _, err := s.RevokeDelegatedAuthority(ctx, d.DelegatedAuthorityID, tenantID); !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("expected ErrInvalidTransition on double-revoke, got %v", err)
 	}
 }
@@ -377,13 +369,14 @@ func TestPgStore_FindDelegatedActions_ResolvesViaDelegator(t *testing.T) {
 	setupRoleWithGrant(t, s, "00000000-0000-0000-0000-000000000001", "boss-1", legalEntityID, "FINANCE_APPROVER", []string{"PAYMENT_APPROVE"})
 
 	if _, err := s.CreateDelegatedAuthority(ctx, domain.CreateDelegatedAuthorityParams{
+		TenantID:             "00000000-0000-0000-0000-000000000001",
 		DelegatorPrincipalID: "boss-1", DelegatePrincipalID: "assistant-1", ScopeType: "FULL",
 		LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
 	}); err != nil {
 		t.Fatalf("create delegation: %v", err)
 	}
 
-	actions, basis, err := s.FindDelegatedActions(ctx, "assistant-1", legalEntityID)
+	actions, basis, err := s.FindDelegatedActions(ctx, "assistant-1", legalEntityID, "00000000-0000-0000-0000-000000000001")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -481,6 +474,14 @@ func TestPgStore_AccessDecisionLog_RecordAndRetrieve(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 	ctx := context.Background()
 
+	// tenant_id is a UUID column since 000005, and a decision recorded with
+	// NO tenant is deliberately unreadable — so this records one WITH a tenant
+	// and reads it back under the same scope. The original form of this test
+	// recorded no tenant and expected to find it, which is the behaviour
+	// 000005 removed on purpose.
+	tenantID := "00000000-0000-0000-0000-000000000001"
+	otherTenant := "00000000-0000-0000-0000-000000000002"
+
 	d, err := s.RecordAccessDecision(ctx, domain.RecordAccessDecisionParams{
 		PrincipalID:   "principal-1",
 		LegalEntityID: "00000000-0000-0000-0000-0000000000e1",
@@ -488,6 +489,7 @@ func TestPgStore_AccessDecisionLog_RecordAndRetrieve(t *testing.T) {
 		Outcome:       "DENIED",
 		Basis:         "no_grant",
 		CorrelationID: "corr-1",
+		TenantID:      tenantID,
 	})
 	if err != nil {
 		t.Fatalf("record: %v", err)
@@ -496,12 +498,34 @@ func TestPgStore_AccessDecisionLog_RecordAndRetrieve(t *testing.T) {
 		t.Fatalf("expected DENIED, got %s", d.DecisionOutcome)
 	}
 
-	found, err := s.FindAccessDecisionByID(ctx, d.AccessDecisionID, "tenant-1")
+	found, err := s.FindAccessDecisionByID(ctx, d.AccessDecisionID, tenantID)
 	if err != nil {
 		t.Fatalf("find: %v", err)
 	}
 	if found.DecisionBasis != "no_grant" {
 		t.Fatalf("expected basis no_grant, got %s", found.DecisionBasis)
+	}
+
+	// Another tenant must not be able to read it, and must not be able to tell
+	// it exists — 404, not 403.
+	if _, err := s.FindAccessDecisionByID(ctx, d.AccessDecisionID, otherTenant); !errors.Is(err, domain.ErrAccessDecisionNotFound) {
+		t.Fatalf("ISOLATION FAILURE: expected ErrAccessDecisionNotFound reading tenant 1's decision as tenant 2, got %v", err)
+	}
+
+	// A decision recorded with no tenant at all is readable by nobody.
+	anon, err := s.RecordAccessDecision(ctx, domain.RecordAccessDecisionParams{
+		PrincipalID:   "principal-2",
+		LegalEntityID: "00000000-0000-0000-0000-0000000000e1",
+		ActionType:    "PAYMENT_APPROVE",
+		Outcome:       "DENIED",
+		Basis:         "no_grant",
+		CorrelationID: "corr-2",
+	})
+	if err != nil {
+		t.Fatalf("record untenanted: %v", err)
+	}
+	if _, err := s.FindAccessDecisionByID(ctx, anon.AccessDecisionID, tenantID); !errors.Is(err, domain.ErrAccessDecisionNotFound) {
+		t.Fatalf("expected a NULL-tenant decision to be unreadable, got %v", err)
 	}
 }
 
@@ -511,8 +535,137 @@ func TestPgStore_FindAccessDecisionByID_NotFound(t *testing.T) {
 	setupTestDB(t, pool)
 
 	s := store.New(pool, zap.NewNop())
-	_, err := s.FindAccessDecisionByID(context.Background(), "00000000-0000-0000-0000-000000000099", "tenant-1")
+	_, err := s.FindAccessDecisionByID(context.Background(), "00000000-0000-0000-0000-000000000099", "00000000-0000-0000-0000-000000000001")
 	if !errors.Is(err, domain.ErrAccessDecisionNotFound) {
 		t.Fatalf("expected ErrAccessDecisionNotFound, got %v", err)
+	}
+}
+
+// TestPgStore_FindGrantedActions_DoesNotLeakAcrossTenants is the regression
+// guard for the cross-tenant privilege escalation that platform-scoping this
+// query unconditionally used to allow.
+//
+// Setup is the shape that made it exploitable: a TENANT-WIDE assignment
+// (legal_entity_id IS NULL) in tenant A, which the assignment predicate's
+// `OR pra.legal_entity_id IS NULL` matches for ANY legal entity — including
+// one belonging to tenant B. Before the fix, evaluating principal-1 against
+// tenant B returned tenant A's PAYROLL_RUN_FINALIZE.
+func TestPgStore_FindGrantedActions_DoesNotLeakAcrossTenants(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	tenantA := "00000000-0000-0000-0000-0000000000a1"
+	tenantB := "00000000-0000-0000-0000-0000000000b1"
+	entityInB := "00000000-0000-0000-0000-0000000000eb"
+
+	// Tenant A: a tenant-wide role carrying a materially dangerous action.
+	roleA, _, err := s.CreateRole(ctx, domain.CreateRoleParams{
+		TenantID: tenantA, RoleCode: "A_ADMIN", RoleName: "A Admin", RoleScopeType: "TENANT", CreatedByPrincipalID: "admin-1",
+	})
+	if err != nil {
+		t.Fatalf("create tenant A role: %v", err)
+	}
+	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
+		RoleID: roleA.RoleID, BundleCode: "default", PermittedActions: []string{"PAYROLL_RUN_FINALIZE"},
+	}); err != nil {
+		t.Fatalf("create tenant A bundle: %v", err)
+	}
+	if _, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
+		PrincipalID: "principal-1", RoleID: roleA.RoleID, LegalEntityID: nil,
+		EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
+	}); err != nil {
+		t.Fatalf("create tenant A tenant-wide assignment: %v", err)
+	}
+
+	// Tenant B: the same principal, holding only a harmless action.
+	setupRoleWithGrant(t, s, tenantB, "principal-1", entityInB, "B_VIEWER", []string{"REPORT_VIEW"})
+
+	actions, _, err := s.FindGrantedActions(ctx, "principal-1", entityInB, tenantB)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	for _, a := range actions {
+		if a == "PAYROLL_RUN_FINALIZE" {
+			t.Fatalf("ISOLATION FAILURE: tenant A's tenant-wide grant resolved while evaluating tenant B, got %v", actions)
+		}
+	}
+	if len(actions) != 1 || actions[0] != "REPORT_VIEW" {
+		t.Fatalf("expected only tenant B's own grant, got %v", actions)
+	}
+}
+
+// TestPgStore_TenantIsolation_DelegatedAuthority is the regression guard for
+// the gap 000006 closed. Before it, delegated_authorities had no tenant_id and
+// therefore no policy, and every read, revoke and evaluation of a delegation
+// ran with no tenant predicate at all.
+//
+// Each leg below failed before the column existed.
+func TestPgStore_TenantIsolation_DelegatedAuthority(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := context.Background()
+
+	tenantA := "00000000-0000-0000-0000-0000000000a1"
+	tenantB := "00000000-0000-0000-0000-0000000000b1"
+	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
+
+	// Tenant A's boss delegates to their assistant.
+	setupRoleWithGrant(t, s, tenantA, "boss-1", legalEntityID, "FINANCE_APPROVER", []string{"PAYMENT_APPROVE"})
+	d, err := s.CreateDelegatedAuthority(ctx, domain.CreateDelegatedAuthorityParams{
+		TenantID:             tenantA,
+		DelegatorPrincipalID: "boss-1", DelegatePrincipalID: "assistant-1", ScopeType: "FULL",
+		LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("create delegation: %v", err)
+	}
+	if d.TenantID != tenantA {
+		t.Fatalf("expected the delegation to carry tenant A, got %q", d.TenantID)
+	}
+
+	// 1. Tenant B must not be able to read it — and must get "not found", not
+	//    "forbidden", so a probe cannot confirm the id exists.
+	if _, err := s.FindDelegatedAuthorityByID(ctx, d.DelegatedAuthorityID, tenantB); !errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
+		t.Fatalf("ISOLATION FAILURE: tenant B read tenant A's delegation, got %v", err)
+	}
+
+	// 2. Nor revoke it. This is the one that mattered most: revoking someone
+	//    else's delegation silently removes an authority they are relying on.
+	if _, err := s.RevokeDelegatedAuthority(ctx, d.DelegatedAuthorityID, tenantB); !errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
+		t.Fatalf("ISOLATION FAILURE: tenant B revoked tenant A's delegation, got %v", err)
+	}
+
+	// 3. Nor have it resolve during authorization under their own scope.
+	actions, _, err := s.FindDelegatedActions(ctx, "assistant-1", legalEntityID, tenantB)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("ISOLATION FAILURE: tenant A's delegation granted %v while evaluating tenant B", actions)
+	}
+
+	// 4. Tenant A's own use of it is unaffected.
+	actions, _, err = s.FindDelegatedActions(ctx, "assistant-1", legalEntityID, tenantA)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(actions) != 1 || actions[0] != "PAYMENT_APPROVE" {
+		t.Fatalf("expected tenant A's own delegation to still resolve, got %v", actions)
+	}
+
+	// 5. A delegation with no tenant is refused rather than written as a row
+	//    no policy could ever match.
+	if _, err := s.CreateDelegatedAuthority(ctx, domain.CreateDelegatedAuthorityParams{
+		DelegatorPrincipalID: "boss-1", DelegatePrincipalID: "assistant-2", ScopeType: "FULL",
+		LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour),
+	}); !errors.Is(err, domain.ErrTenantScopeRequired) {
+		t.Fatalf("expected ErrTenantScopeRequired for a tenantless delegation, got %v", err)
 	}
 }

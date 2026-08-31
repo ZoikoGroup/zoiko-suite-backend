@@ -24,11 +24,11 @@ type AuthorizationStore interface {
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
-	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
-	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
+	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
-	FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
-	FindDelegatedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
+	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
+	FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
 	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
 	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
@@ -163,7 +163,10 @@ func (h *Handler) requirePlatformAction(w http.ResponseWriter, r *http.Request, 
 		return false
 	}
 
-	actions, basis, err := h.store.FindGrantedActions(r.Context(), principalID, h.platformScopeEntityID)
+	// Empty tenant, deliberately: a platform-wide grant is held against the
+	// platform-scope entity and is NOT satisfied by any tenant-level role, so
+	// scoping this to the caller's tenant would refuse every platform act.
+	actions, basis, err := h.store.FindGrantedActions(r.Context(), principalID, h.platformScopeEntityID, "")
 	if err != nil {
 		h.log.Error("platform-scope action check failed — refusing",
 			zap.String("correlation_id", correlationID),
@@ -632,6 +635,13 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	// This was the one /v1/admin/* route that never resolved a tenant, because
+	// the table had no tenant_id to put one in. 000006 gives it one, NOT NULL,
+	// so the scope is now required here as it already was everywhere else.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	var req createDelegationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -666,6 +676,7 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	}
 
 	d, err := h.store.CreateDelegatedAuthority(r.Context(), domain.CreateDelegatedAuthorityParams{
+		TenantID:             tenantScope,
 		DelegatedAuthorityID: req.DelegatedAuthorityID, DelegatorPrincipalID: req.DelegatorPrincipalID,
 		DelegatePrincipalID: req.DelegatePrincipalID, ScopeType: req.ScopeType, LegalEntityID: legalEntityID,
 		AuthorityLimitType: req.AuthorityLimitType, AuthorityLimitValue: req.AuthorityLimitValue,
@@ -681,10 +692,20 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 
 // RevokeDelegatedAuthority handles POST /v1/admin/delegated-authorities/{delegation_id}/revoke.
 //
-// Response: 200 revoked / 404 not found / 409 already revoked / 503 unavailable.
+// Response: 200 revoked / 401 no scope / 404 not found / 409 already revoked /
+// 503 unavailable.
+//
+// The lookup below is tenant-scoped, so another tenant's delegation is a 404
+// before the delegator check is ever reached — "not yours" and "does not
+// exist" are deliberately indistinguishable to a prober.
 func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Request) {
 	delegationID := chi.URLParam(r, "delegation_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	revokeTenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -695,7 +716,7 @@ func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	// secret-vault-integration-svc's RevokeLease: only the delegator may
 	// take back authority they gave away — this had no check of any kind
 	// before, so any caller could revoke any principal's delegation.
-	existing, err := h.store.FindDelegatedAuthorityByID(r.Context(), delegationID)
+	existing, err := h.store.FindDelegatedAuthorityByID(r.Context(), delegationID, revokeTenantScope)
 	if err != nil {
 		if errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "delegated_authority_not_found"})
@@ -713,7 +734,7 @@ func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	d, err := h.store.RevokeDelegatedAuthority(r.Context(), delegationID)
+	d, err := h.store.RevokeDelegatedAuthority(r.Context(), delegationID, revokeTenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrDelegatedAuthorityNotFound):
@@ -967,7 +988,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rbacActions, rbacBasis, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, req.LegalEntityID)
+	rbacActions, rbacBasis, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, req.LegalEntityID, tenantScope)
 	if err != nil {
 		// Fail-closed: the store is unreachable, so no decision can be made
 		// or recorded. Returning 503 here (rather than a recorded DENIED)
@@ -984,7 +1005,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	allHeldActions := append([]string{}, rbacActions...)
 
 	if !granted {
-		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, req.LegalEntityID)
+		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, req.LegalEntityID, tenantScope)
 		if err != nil {
 			h.log.Error("Authorize: store unavailable (delegation lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})

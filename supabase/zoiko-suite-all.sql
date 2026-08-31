@@ -5702,18 +5702,53 @@ $$;
 -- and the code disagree. Whether that read should take the caller verified
 -- tenant instead belongs in its own review.
 
+-- ── Why every statement below is guarded ─────────────────────────────────────
+--
+-- `authorization_svc` is not created by anything in this directory. It reaches
+-- a database through deployments/supabase applying the service's own compose
+-- migrations, which happens AFTER the SQL editor has been given the migration
+-- set. So on a fresh project — and in supabase/verify.sh, which applies only
+-- this directory — the schema genuinely is not there yet.
+--
+-- Written as bare DDL, the first ALTER TABLE aborted the whole batch with
+--
+--     ERROR:  schema "authorization_svc" does not exist
+--
+-- which stopped 0029 and everything after it from being applied at all. The
+-- guard makes this file a no-op in that case and leaves the rest of the set to
+-- run; where the schema does exist the executed statements are unchanged, so
+-- the end state is identical. 0027 has the same dependency and survives it only
+-- because it happens to iterate a catalogue, which is empty rather than absent.
+--
+-- Re-run this file after deployments/supabase has created the schema.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0028 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
 -- ── permission_bundles and principal_role_assignments ────────────────────────
 
-ALTER TABLE authorization_svc.permission_bundles         ENABLE ROW LEVEL SECURITY;
-ALTER TABLE authorization_svc.permission_bundles         FORCE  ROW LEVEL SECURITY;
-ALTER TABLE authorization_svc.principal_role_assignments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE authorization_svc.principal_role_assignments FORCE  ROW LEVEL SECURITY;
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         FORCE  ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments FORCE  ROW LEVEL SECURITY$stmt$;
 
 -- The subquery reads `roles`, which is itself under RLS, so this policy is
 -- whatever the roles policy is: tenant-scoped normally, platform-wide under
 -- app.platform_scope. Do not inline the roles predicate here — duplicating it
 -- would let the two drift, and the platform-scope hatch would have to be
 -- repeated in three places instead of living in one.
+-- Dropped first so this file is re-runnable. The guard above tells you to run
+-- it again once deployments/supabase has created the schema, and on a project
+-- where it HAS already applied a bare CREATE POLICY would fail with "policy
+-- ... already exists" — turning the documented recovery step into an error.
+-- The two policies below are recreated identically, so a re-run is a no-op.
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.permission_bundles$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_via_role ON authorization_svc.permission_bundles
     FOR ALL
     USING (EXISTS (
@@ -5721,8 +5756,11 @@ CREATE POLICY tenant_isolation_via_role ON authorization_svc.permission_bundles
          WHERE r.role_id = permission_bundles.role_id))
     WITH CHECK (EXISTS (
         SELECT 1 FROM authorization_svc.roles r
-         WHERE r.role_id = permission_bundles.role_id));
+         WHERE r.role_id = permission_bundles.role_id))
+$stmt$;
 
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.principal_role_assignments$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_via_role ON authorization_svc.principal_role_assignments
     FOR ALL
     USING (EXISTS (
@@ -5730,11 +5768,13 @@ CREATE POLICY tenant_isolation_via_role ON authorization_svc.principal_role_assi
          WHERE r.role_id = principal_role_assignments.role_id))
     WITH CHECK (EXISTS (
         SELECT 1 FROM authorization_svc.roles r
-         WHERE r.role_id = principal_role_assignments.role_id));
+         WHERE r.role_id = principal_role_assignments.role_id))
+$stmt$;
 
 -- ── sod_rules and access_decision_log: globals become platform-only ──────────
 
-DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.sod_rules;
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.sod_rules$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_policy ON authorization_svc.sod_rules
     FOR ALL
     USING (
@@ -5744,9 +5784,11 @@ CREATE POLICY tenant_isolation_policy ON authorization_svc.sod_rules
     WITH CHECK (
         (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
         OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
-    );
+    )
+$stmt$;
 
-DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.access_decision_log;
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.access_decision_log$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log
     FOR ALL
     USING (
@@ -5756,11 +5798,11 @@ CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log
     WITH CHECK (
         (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
         OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
-    );
+    )
+$stmt$;
 
 -- ── Verification ─────────────────────────────────────────────────────────────
 
-DO $$
 DECLARE unprotected int; no_check int;
 BEGIN
     SELECT count(*) INTO unprotected
@@ -5780,8 +5822,10 @@ BEGIN
     IF no_check > 0 THEN
         RAISE EXCEPTION '% nullable-tenant policies still have no WITH CHECK', no_check;
     END IF;
+END;
+
 END
-$$;
+$guard$;
 
 
 -- ============================================================================
@@ -5944,3 +5988,544 @@ BEGIN
     RAISE NOTICE 'verified: non-finalized deletes proceed, finalized deletes refused';
 END
 $$;
+
+
+-- ============================================================================
+-- FILE: 0030_employment_contracts_svc.sql
+-- ============================================================================
+
+-- 0030_employment_contracts_svc.sql
+-- employment-contracts-svc → schema `employment_contracts`
+--
+-- Squashed end state of 000001_initial_schema and 000002_add_idempotency.
+-- Two tables: employment_contracts, contract_amendments.
+--
+-- ── Why this service, and why now ────────────────────────────────────────────
+--
+-- 0022-0025 brought the HR domain onto Supabase and stopped one step short.
+-- payroll-run-svc resolves every payslip from compensation-svc, but it reaches
+-- that call only after confirming an active salary contract for each employee:
+--
+--     if len(missingContracts) > 0 { ... return }   // handler.go
+--     bd, err := h.compClient.GetBreakdown(..., contracts[emp.EmployeeID].BaseSalaryAmount)
+--
+-- The base amount the breakdown is resolved against IS the contract's, so the
+-- compensation call cannot run before contracts do. With this service absent
+-- from Supabase, every payroll calculation there ends at 422
+-- contract_lookup_failed and the compensation path — written, wired, and
+-- covered by tests — has never executed against the real database.
+--
+-- This migration is what makes that path reachable. It is the fifth and last
+-- service the HR domain needs.
+--
+-- ── What changes relative to the service's own migration ─────────────────────
+--
+-- The service's 000001 is the compose-estate schema, and it carries the two
+-- defects the README names as the reason this move is worth making:
+--
+--   ENABLE without FORCE. The estate's recurring defect — a policy that is
+--   present, correct, and never executed. Every table here gets both.
+--
+--   USING without WITH CHECK. USING governs what is visible; WITH CHECK governs
+--   what may be written. With only USING, a caller can insert a contract into
+--   another tenant that it then cannot see. Both policies below carry both.
+--
+-- It also reads `current_setting('app.tenant_id', true)` directly. That works
+-- only for a service calling set_config, and says nothing for a PostgREST
+-- caller carrying a JWT. app.current_tenant_id() resolves either.
+--
+-- ── Policies carry no TO clause ──────────────────────────────────────────────
+--
+-- 0026 removed the role restriction from all 62 policies that named
+-- zoiko_backend, because the services connect as app_<service>, not as
+-- zoiko_backend, and a policy that names roles applies to those roles only —
+-- under FORCE that means zero rows read and nothing written. This migration
+-- runs after 0026, so writing `TO zoiko_backend` here would reintroduce exactly
+-- what that file repaired, in the one schema it could not have covered.
+--
+-- Isolation comes from the grants instead: app_employment_contracts holds USAGE
+-- on this schema alone.
+
+CREATE SCHEMA IF NOT EXISTS employment_contracts;
+
+COMMENT ON SCHEMA employment_contracts IS
+    'employment-contracts-svc. The authoritative base salary and its effective-dated version history. payroll-run-svc fails closed without it, and resolves every compensation breakdown against the base amount held here.';
+
+GRANT USAGE ON SCHEMA employment_contracts TO zoiko_backend, authenticated;
+
+-- ── employment_contracts ─────────────────────────────────────────────────────
+
+CREATE TABLE employment_contracts.employment_contracts (
+    contract_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id          VARCHAR(255) NOT NULL,
+    legal_entity_id    VARCHAR(255) NOT NULL,
+    employee_id        UUID         NOT NULL,
+
+    contract_number    VARCHAR(100) NOT NULL,
+    version            INT          NOT NULL DEFAULT 1,
+
+    -- FULL_TIME | PART_TIME | FIXED_TERM | EXECUTIVE
+    contract_type      VARCHAR(50)  NOT NULL,
+    -- DRAFT | ACTIVE | SUPERSEDED | TERMINATED | EXPIRED
+    status             VARCHAR(50)  NOT NULL,
+
+    title              VARCHAR(150) NOT NULL,
+    base_salary_amount NUMERIC(18, 4) NOT NULL,
+    currency           VARCHAR(3)   NOT NULL,
+    -- MONTHLY | BIWEEKLY | WEEKLY
+    pay_frequency      VARCHAR(50)  NOT NULL,
+
+    effective_from     DATE         NOT NULL,
+    effective_to       DATE,
+
+    document_vault_ref VARCHAR(255),
+
+    -- Idempotency key for IssueContract. NOT NULL DEFAULT '' rather than
+    -- nullable because the service's ON CONFLICT targets the partial index
+    -- below, and '' is how it spells "this caller sent no key".
+    correlation_id     VARCHAR(255) NOT NULL DEFAULT '',
+
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- The vocabularies the domain defines. They live in a Go comment on
+    -- domain.EmploymentContract and nowhere else today, so any other writer —
+    -- a migration, a console, the service_role key — could leave a value no
+    -- consumer knows how to read. payroll-run-svc filters on status = 'ACTIVE'
+    -- to find the salary it pays; a row whose status is misspelled is a salary
+    -- that silently stops being paid.
+    CONSTRAINT contracts_type_known
+        CHECK (contract_type IN ('FULL_TIME', 'PART_TIME', 'FIXED_TERM', 'EXECUTIVE')),
+    CONSTRAINT contracts_status_known
+        CHECK (status IN ('DRAFT', 'ACTIVE', 'SUPERSEDED', 'TERMINATED', 'EXPIRED')),
+    CONSTRAINT contracts_pay_frequency_known
+        CHECK (pay_frequency IN ('MONTHLY', 'BIWEEKLY', 'WEEKLY')),
+
+    -- The handler already refuses base_salary_amount <= 0 on issue. It does not
+    -- re-check it on amend, where the figure is caller-supplied and optional,
+    -- so a negative salary could reach the table by that path alone.
+    CONSTRAINT contracts_salary_positive
+        CHECK (base_salary_amount > 0),
+
+    -- ISO 4217, which is what every consumer assumes when it renders an amount.
+    CONSTRAINT contracts_currency_iso
+        CHECK (currency ~ '^[A-Z]{3}$'),
+
+    -- A contract cannot end before it began. AmendContract closes the prior
+    -- version by setting effective_to to the amendment's effective_from, so
+    -- without this a backdated amendment leaves a negative-length contract.
+    CONSTRAINT contracts_effective_range
+        CHECK (effective_to IS NULL OR effective_to >= effective_from),
+
+    CONSTRAINT contracts_version_positive
+        CHECK (version >= 1),
+
+    -- The target of the composite foreign key from contract_amendments.
+    CONSTRAINT contracts_tenant_id_unique UNIQUE (tenant_id, contract_id)
+);
+
+-- Version history is resolved by contract_number:
+--
+--     SELECT ... WHERE tenant_id = $1 AND contract_number = $2 ORDER BY version
+--
+-- so every row sharing a number is presented as a version of one contract. Two
+-- rows claiming the same version of the same number make that history
+-- ambiguous, and AmendContract — which writes version = old + 1 — has no way to
+-- discover it happened. contract_number is caller-supplied on issue, so nothing
+-- upstream prevents it.
+CREATE UNIQUE INDEX idx_contracts_tenant_number_version
+    ON employment_contracts.employment_contracts (tenant_id, contract_number, version);
+
+-- Idempotency. This index is what the service's ON CONFLICT names:
+--
+--     ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
+--
+-- The predicate has to match this one for the inference to resolve, so the two
+-- are a pair — changing either alone turns a retried IssueContract back into a
+-- duplicate contract. Partial because the many rows carrying no key must not
+-- collide with each other.
+CREATE UNIQUE INDEX idx_contracts_tenant_correlation
+    ON employment_contracts.employment_contracts (tenant_id, correlation_id)
+    WHERE correlation_id <> '';
+
+CREATE INDEX idx_contracts_tenant_employee
+    ON employment_contracts.employment_contracts (tenant_id, employee_id);
+CREATE INDEX idx_contracts_tenant_status
+    ON employment_contracts.employment_contracts (tenant_id, status);
+CREATE INDEX idx_contracts_tenant_entity
+    ON employment_contracts.employment_contracts (tenant_id, legal_entity_id);
+
+-- The payroll hot path. A payroll run calls
+-- GET /v1/contracts/employee/{id}/active once per employee, which is
+--
+--     WHERE tenant_id = $1 AND employee_id = $2 AND status = 'ACTIVE'
+--     ORDER BY version DESC LIMIT 1
+--
+-- Without this, a 500-employee run is 500 scans of the tenant's whole contract
+-- history.
+CREATE INDEX idx_contracts_active_by_employee
+    ON employment_contracts.employment_contracts (tenant_id, employee_id, version DESC)
+    WHERE status = 'ACTIVE';
+
+-- ── contract_amendments ──────────────────────────────────────────────────────
+--
+-- The audit log of why a salary changed. Append-only: an amendment is the
+-- evidence for a pay change, and a pay change whose stated reason can be edited
+-- afterwards is not evidence of anything.
+
+CREATE TABLE employment_contracts.contract_amendments (
+    amendment_id     UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id        VARCHAR(255) NOT NULL,
+    contract_id      UUID         NOT NULL,
+
+    from_version     INT          NOT NULL,
+    to_version       INT          NOT NULL,
+
+    amendment_reason TEXT         NOT NULL,
+    amended_by       VARCHAR(255) NOT NULL,
+    effective_from   DATE         NOT NULL,
+
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- An amendment moves a contract forward. Equal or descending versions would
+    -- describe a rollback, which the service has no operation for and no
+    -- consumer would read correctly.
+    CONSTRAINT amendments_version_advances
+        CHECK (to_version > from_version),
+
+    CONSTRAINT amendments_from_version_positive
+        CHECK (from_version >= 1),
+
+    -- An amendment belonging to another tenant's contract is unrepresentable.
+    -- The single-column form the service's own migration uses would have
+    -- accepted one: nothing made the referenced contract's tenant agree with
+    -- the amendment's, and the two are written from separate parameters in
+    -- AmendContract.
+    CONSTRAINT amendments_contract_same_tenant
+        FOREIGN KEY (tenant_id, contract_id)
+        REFERENCES employment_contracts.employment_contracts (tenant_id, contract_id)
+);
+
+CREATE INDEX idx_amendments_tenant_contract
+    ON employment_contracts.contract_amendments (tenant_id, contract_id);
+
+CREATE TRIGGER contract_amendments_append_only
+    BEFORE UPDATE OR DELETE ON employment_contracts.contract_amendments
+    FOR EACH ROW EXECUTE FUNCTION app.reject_mutation();
+
+COMMENT ON TRIGGER contract_amendments_append_only
+    ON employment_contracts.contract_amendments IS
+    'A pay change''s stated reason is evidence. Withholding UPDATE/DELETE stops zoiko_backend; this trigger also binds a BYPASSRLS role such as Supabase''s service_role.';
+
+-- ── Row-level security ───────────────────────────────────────────────────────
+
+ALTER TABLE employment_contracts.employment_contracts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE employment_contracts.employment_contracts FORCE  ROW LEVEL SECURITY;
+ALTER TABLE employment_contracts.contract_amendments  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE employment_contracts.contract_amendments  FORCE  ROW LEVEL SECURITY;
+
+-- No TO clause: see the header. Fails closed on a missing tenant by SQL
+-- semantics — app.current_tenant_id() is NULL with no identity installed, and
+-- `tenant_id = NULL` is NULL, which is not true.
+CREATE POLICY tenant_isolation ON employment_contracts.employment_contracts
+    FOR ALL
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON employment_contracts.contract_amendments
+    FOR ALL
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+-- ── Grants ───────────────────────────────────────────────────────────────────
+
+-- No DELETE on contracts: a contract is the basis of every payslip calculated
+-- from it. Ending one is a status change to TERMINATED with effective_to set,
+-- which is what TerminateContract does.
+GRANT SELECT, INSERT, UPDATE ON employment_contracts.employment_contracts TO zoiko_backend;
+
+-- No UPDATE and no DELETE on the log. The service only ever inserts.
+GRANT SELECT, INSERT ON employment_contracts.contract_amendments TO zoiko_backend;
+
+-- ── The service's own login role ─────────────────────────────────────────────
+--
+-- Same shape as 0026 section 2: a policy expression is evaluated as the
+-- querying role, so app_employment_contracts must be able to call
+-- app.current_tenant_id() or every policy above raises instead of filtering.
+--
+-- Guarded on the role existing. On a fresh project the migrations run before
+-- deployments/supabase creates the roles, and a missing one must not abort the
+-- batch; that tool performs the same grants on a later run.
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_employment_contracts') THEN
+        GRANT USAGE ON SCHEMA app TO app_employment_contracts;
+        GRANT EXECUTE ON FUNCTION app.current_tenant_id()    TO app_employment_contracts;
+        GRANT EXECUTE ON FUNCTION app.current_principal_id() TO app_employment_contracts;
+
+        GRANT USAGE ON SCHEMA employment_contracts TO app_employment_contracts;
+        GRANT SELECT, INSERT, UPDATE
+            ON employment_contracts.employment_contracts TO app_employment_contracts;
+        GRANT SELECT, INSERT
+            ON employment_contracts.contract_amendments  TO app_employment_contracts;
+
+        RAISE NOTICE 'app_employment_contracts granted its schema and the identity helpers';
+    ELSE
+        RAISE NOTICE 'role app_employment_contracts absent; deployments/supabase will grant it';
+    END IF;
+END
+$$;
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+--
+-- Proves the properties this migration exists for, rather than asserting them:
+-- both tables forced, both policies carrying WITH CHECK, the idempotency index
+-- actually inferrable by the service's ON CONFLICT, and tenant isolation
+-- binding in both directions.
+--
+-- The isolation probe runs as zoiko_backend rather than as the applying role.
+-- Migrations are applied by a superuser, and a superuser bypasses row security
+-- unconditionally — asserting isolation from here without switching role would
+-- test nothing and fail. zoiko_backend is the NOSUPERUSER NOBYPASSRLS role 0001
+-- creates for exactly this reason. Skipped, not failed, where the applying role
+-- cannot assume it.
+
+DO $$
+DECLARE
+    unprotected int;
+    no_check    int;
+    ten_a       TEXT := 'zzz-0030-tenant-a';
+    ten_b       TEXT := 'zzz-0030-tenant-b';
+    emp         UUID := gen_random_uuid();
+    c1          UUID := gen_random_uuid();
+    inserted    int;
+    leaked      int;
+    refused     boolean := false;
+BEGIN
+    -- 1. Both tables enabled AND forced.
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'employment_contracts' AND c.relkind = 'r'
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION '% employment_contracts tables lack forced row security', unprotected;
+    END IF;
+
+    -- 2. Every policy governs writes as well as reads.
+    SELECT count(*) INTO no_check
+      FROM pg_policies
+     WHERE schemaname = 'employment_contracts' AND with_check IS NULL;
+    IF no_check > 0 THEN
+        RAISE EXCEPTION '% employment_contracts policies have no WITH CHECK', no_check;
+    END IF;
+
+    -- 3. Idempotency. The second INSERT is the retry the service performs
+    --    verbatim; if the ON CONFLICT cannot infer this index the statement
+    --    errors rather than resolving to the original row.
+    PERFORM set_config('app.tenant_id', ten_a, true);
+
+    INSERT INTO employment_contracts.employment_contracts
+        (contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
+         version, contract_type, status, title, base_salary_amount, currency,
+         pay_frequency, effective_from, correlation_id)
+    VALUES (c1, ten_a, 'le-verify', emp, 'VERIFY-0030',
+            1, 'FULL_TIME', 'ACTIVE', 'Verification', 1000, 'USD',
+            'MONTHLY', '2026-01-01', 'corr-0030');
+
+    INSERT INTO employment_contracts.employment_contracts
+        (contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
+         version, contract_type, status, title, base_salary_amount, currency,
+         pay_frequency, effective_from, correlation_id)
+    VALUES (gen_random_uuid(), ten_a, 'le-verify', emp, 'VERIFY-0030-DUP',
+            1, 'FULL_TIME', 'ACTIVE', 'Retry', 1000, 'USD',
+            'MONTHLY', '2026-01-01', 'corr-0030')
+    -- `!=` deliberately, which is how the service spells it. Postgres
+    -- normalises it to `<>` before matching the index predicate, and this
+    -- statement is the proof of that rather than an assumption about it.
+    ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING;
+    GET DIAGNOSTICS inserted = ROW_COUNT;
+    IF inserted <> 0 THEN
+        RAISE EXCEPTION 'a retried IssueContract created a duplicate contract';
+    END IF;
+
+    -- 4 and 5. Isolation, both directions, as a role the policies apply to.
+    IF NOT pg_has_role(current_user, 'zoiko_backend', 'USAGE') THEN
+        RAISE NOTICE 'skipping the isolation probe: % cannot assume zoiko_backend', current_user;
+    ELSE
+        SET LOCAL ROLE zoiko_backend;
+
+        -- 4. The write side is bound. Tenant A must not be able to plant a row
+        --    in tenant B — the gap a USING-only policy leaves open, and the one
+        --    the service's own migration still has.
+        PERFORM set_config('app.tenant_id', ten_a, true);
+        BEGIN
+            INSERT INTO employment_contracts.employment_contracts
+                (contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
+                 version, contract_type, status, title, base_salary_amount, currency,
+                 pay_frequency, effective_from)
+            VALUES (gen_random_uuid(), ten_b, 'le-verify', emp, 'VERIFY-0030-X',
+                    1, 'FULL_TIME', 'ACTIVE', 'Cross tenant', 1000, 'USD',
+                    'MONTHLY', '2026-01-01');
+        EXCEPTION WHEN insufficient_privilege THEN
+            refused := true;
+        END;
+
+        -- A failed subtransaction rolls back the SET LOCAL ROLE with it, so
+        -- re-establish it rather than assuming it survived the handler.
+        SET LOCAL ROLE zoiko_backend;
+
+        IF NOT refused THEN
+            RAISE EXCEPTION 'a tenant-scoped connection wrote a row into another tenant';
+        END IF;
+
+        -- 5. The read side is bound too.
+        PERFORM set_config('app.tenant_id', ten_b, true);
+        SELECT count(*) INTO leaked
+          FROM employment_contracts.employment_contracts
+         WHERE contract_number LIKE 'VERIFY-0030%';
+        IF leaked <> 0 THEN
+            RAISE EXCEPTION 'tenant B read % of tenant A''s contracts', leaked;
+        END IF;
+
+        RESET ROLE;
+    END IF;
+
+    -- 6. Clean up. Contracts carry no DELETE grant for zoiko_backend, so this
+    --    runs after RESET ROLE, as the applying role.
+    DELETE FROM employment_contracts.employment_contracts
+     WHERE contract_number LIKE 'VERIFY-0030%';
+    PERFORM set_config('app.tenant_id', '', true);
+
+    RAISE NOTICE 'verified: forced RLS, WITH CHECK on every policy, idempotent issue, isolation both ways';
+END
+$$;
+
+
+-- ============================================================================
+-- FILE: 0031_delegated_authorities_tenant.sql
+-- ============================================================================
+
+-- 0031_delegated_authorities_tenant.sql
+-- authorization-svc → schema `authorization_svc`. Creates no tables.
+--
+-- The change authorization-svc's own 000006_add_delegation_tenant makes, in the
+-- form this project applies it. Same statements, same end state; whichever runs
+-- first, the other is a no-op.
+--
+-- ── What this closes ─────────────────────────────────────────────────────────
+--
+-- 0028 gave permission_bundles and principal_role_assignments row security
+-- through their parent role, and left one table alone, saying so explicitly:
+--
+--   "delegated_authorities still has no row security. It carries neither
+--    tenant_id nor role_id, so there is no path to a tenant to write a policy
+--    against, and giving it one means a column the service INSERT does not
+--    supply — a change to authorization-svc, not to its schema."
+--
+-- That is exactly right, and it is why this migration ships alongside the
+-- service change rather than on its own. authorization-svc now resolves the
+-- caller's verified tenant on both delegation routes and supplies it on INSERT;
+-- without that, the NOT NULL below would reject every write.
+--
+-- With this applied, delegated_authorities is the last table in this schema to
+-- gain row security — `verify.sh`'s "tables with NO row-level security at all"
+-- check then covers authorization_svc completely.
+--
+-- ── What was exposed ─────────────────────────────────────────────────────────
+--
+-- A delegation says "principal X may act with principal Y's authority". Every
+-- read and write of it ran with no tenant predicate and no policy:
+--
+--   FindDelegatedAuthorityByID   WHERE delegated_authority_id = $1 only
+--   RevokeDelegatedAuthority     WHERE delegated_authority_id = $1 only
+--   FindDelegatedActions         WHERE delegate_principal_id = $1 only
+--
+-- The handler's ownership check (only the delegator may revoke) bounded the
+-- damage. Nothing bounded it by tenant.
+--
+-- ── Guarded, like 0027 and 0028 ──────────────────────────────────────────────
+--
+-- `authorization_svc` is not created by anything in this directory — it arrives
+-- via deployments/supabase applying the service's own migrations. On a fresh
+-- project, and in supabase/verify.sh, the schema is genuinely absent, and bare
+-- DDL would abort the whole batch and silently skip everything numbered after.
+
+DO $guard$
+DECLARE untenanted int;
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0031 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ADD COLUMN IF NOT EXISTS tenant_id UUID$stmt$;
+
+-- NOT NULL because a NULL tenant here is not "global" — it is a row no policy
+-- can ever match, so the delegation exists and silently never grants anything.
+-- The table held 0 rows when this was surveyed; if that has changed, stop
+-- rather than invent a tenant for a row describing who may act for whom.
+SELECT count(*) INTO untenanted
+  FROM authorization_svc.delegated_authorities
+ WHERE tenant_id IS NULL;
+IF untenanted > 0 THEN
+    RAISE EXCEPTION
+        '% delegated_authorities rows have no tenant_id. Backfill them from the delegator''s tenant before re-running: a NULL tenant matches no policy, so those delegations would exist and never grant anything.',
+        untenanted;
+END IF;
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ALTER COLUMN tenant_id SET NOT NULL$stmt$;
+
+-- The evaluation lookup FindDelegatedActions performs, now tenant-first.
+EXECUTE $stmt$
+CREATE INDEX IF NOT EXISTS idx_delegations_tenant_lookup
+    ON authorization_svc.delegated_authorities (tenant_id, delegate_principal_id, revocation_status)
+$stmt$;
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities FORCE  ROW LEVEL SECURITY$stmt$;
+
+-- app.current_tenant_id() rather than current_setting directly: on this
+-- database a caller may arrive through PostgREST with a JWT instead of through
+-- a service calling set_config, and only the helper resolves both. The service
+-- migration uses current_setting because the app schema does not exist on the
+-- compose estate.
+--
+-- No platform_scope hatch, unlike roles: nothing needs to discover which tenant
+-- owns an unknown delegation_id.
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.delegated_authorities$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.delegated_authorities
+    FOR ALL
+    USING      (tenant_id::text = app.current_tenant_id())
+    WITH CHECK (tenant_id::text = app.current_tenant_id())
+$stmt$;
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+
+DECLARE unprotected int; no_check int;
+BEGIN
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'authorization_svc' AND c.relkind = 'r'
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION
+            '% authorization_svc tables still lack forced row security — delegated_authorities was meant to be the last one', unprotected;
+    END IF;
+
+    SELECT count(*) INTO no_check
+      FROM pg_policies
+     WHERE schemaname = 'authorization_svc'
+       AND tablename = 'delegated_authorities'
+       AND with_check IS NULL;
+    IF no_check > 0 THEN
+        RAISE EXCEPTION 'delegated_authorities policy has no WITH CHECK';
+    END IF;
+
+    RAISE NOTICE 'verified: authorization_svc now has forced row security on every table';
+END;
+
+END
+$guard$;
