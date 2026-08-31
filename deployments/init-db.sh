@@ -84,6 +84,8 @@ expense_claim:expense-claim
 payment_proposal:payment-proposal
 payment_authorization:payment-authorization
 payment_run:payment-run
+payment_initiation_adapter:payment-initiation-adapter
+payment_status:payment-status
 metric_registry:metric-registry
 source_authority:source-authority
 jurisdiction_rules:jurisdiction-rules
@@ -227,7 +229,7 @@ for db in \
     evidence_requirements expense_claim financial_close general_ledger goods_service_receipt governance_decision_log identity_context \
     intercompany_accounting invoice_approval jurisdiction_rules kill_switch_registry leave_absence \
     metric_registry notification obligation_tracking obligations offboarding_severance org_structure \
-    payment_authorization payment_proposal payment_run payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \
+    payment_authorization payment_initiation_adapter payment_proposal payment_run payment_status payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \
     privacy_decision privacy_purpose_registry privacy_rights privacy_transfer procurement_workflow \
     purchase_order purchase_request retention_registry schema_registry secret_vault_integration \
     source_authority spend_controls supplier_financial_profile tax_determination tax_rules tenant_entity_registry treasury \

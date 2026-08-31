@@ -339,6 +339,41 @@ Built as a real, working v1 of AP-11 ("Payment Run"), the sixth service in this 
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8161, db `payment_run`, depends on `authorization-svc` + `payment-authorization-svc`).
 
+### 3.13 `payment-initiation-adapter-svc` — new service, BNK-06 of the Banking, Cash & Treasury baseline (2026-08-31)
+
+Built after the user asked directly "how will banks be added, and who adds them" following §3.12's central gap — the Banking spec (a separate document, `ZoikoSuite_Banking_Cash_Treasury_Detailed_Service_Specifications_v1_0.docx`, not read until this question was asked) turned out to define exactly the two services AP-11 named as dependencies: BNK-06 (this one) and BNK-07 (§3.14). Both were scoped and built in direct response.
+
+**The Provider Adapter boundary.** The Banking spec itself names "Provider Adapter" as a dependency of BNK-06 but never gives it its own numbered section or contract anywhere in the spec set — confirming it as the genuinely pluggable point where a real bank/PSP integration (a specific bank's API, a SWIFT gateway, a payment processor's SDK, real credentials) belongs. This service defines that boundary as a real Go interface (`provideradapter.Client`) and ships a real, working, clearly-labeled `StubProviderAdapter` behind it — deterministic (its outcome is derived from the request's own `PaymentReference` via a documented `SIMULATE_TIMEOUT`/`SIMULATE_REJECT` prefix convention, not random), and never disguised as a real bank connection. Swapping in a real provider means implementing this same interface against a real API; nothing else in this service would need to change.
+
+**What's real, not fabricated, on this side of that boundary:**
+- **"Attempt record created after external call"** is structurally impossible: `PrepareAttempt` persists a `PREPARED` row *before* `SubmitAttempt` is ever allowed to call the provider adapter — there is no code path that calls the adapter without a durable record already committed.
+- **"Provider timeout triggers new payment ID"** is structurally impossible: `RetrySameAttempt` re-submits the *same* `AttemptID`/`IdempotencyKey` row — a genuine database unique index on `idempotency_key` backs this. A timeout moves the attempt to `PENDING_UNKNOWN`, never `REJECTED` — verified directly: forcing the outcome mapping to treat timeout as rejection broke the negative-control test immediately.
+- **"Payment amount changed after authorization"**: once `PREPARED`, an attempt's authorized fields (amount, currency, payer/payee references, authorization fingerprint) are immutable via a database trigger.
+- **"Payment sent from suspended/unverified account"** has no real account-status source to check against (AP-09/AP-10 already treat bank account references as opaque) — this service requires the caller to explicitly assert `PayerAccountVerified=true` at prepare time, a real caller-attested gate, not a fabricated automatic check.
+- `PrepareAttempt` is itself idempotent on `idempotency_key`: a repeat call returns the existing attempt (`200`), never a duplicate — verified directly as a negative control.
+
+13 handler tests plus two verified negative controls (duplicate-idempotency-key returns existing rather than creating a second row; a corrupted timeout-outcome mapping is caught immediately by the test suite).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8162, db `payment_initiation_adapter`, depends on `authorization-svc` only — no real Banking dependency to depend on yet).
+
+### 3.14 `payment-status-svc` — new service, BNK-07 of the Banking, Cash & Treasury baseline (2026-08-31)
+
+Built alongside BNK-06 as its status/finality counterpart. **Unlike BNK-06, this service's central capability IS fully real**: a genuine HMAC-SHA256 signature-verified webhook receiver. There is no real bank/PSP sending callbacks in this environment, but the *receiving* side's security, ordering and idempotency logic is exactly what a real integration with a real provider (Stripe, Adyen, a bank's own webhook feed — all of which use this same signed-payload pattern) would need, and none of it is faked. Swapping in a real provider means pointing its webhook configuration at `POST /bnk07/webhooks/provider-callback` and sharing its real signing secret via `WEBHOOK_SHARED_SECRET`; nothing about this service's own logic would need to change.
+
+**What's real, not fabricated:**
+- `ProcessProviderCallback` verifies an HMAC-SHA256 signature (the `X-Webhook-Signature` header, computed over the exact raw request body, never the re-parsed/re-serialized JSON) against a configured shared secret before touching anything — the literal fix for negative-path scenario #1 ("forged callback accepted"). Verified directly: a callback signed with the wrong secret is rejected with `401`, confirmed as a negative control.
+- **Negative-path scenario #2** ("out-of-order status regresses settled payment"): once a payment reaches a governed final state (`SETTLED`, `REJECTED`, `CANCELLED`), no callback or statement link can ever change its status again — enforced by a database trigger with a distinct SQLSTATE (`ZK002`) the store maps precisely. Only the distinct, explicit `RecordReturn` command may move a `SETTLED` payment to `RETURNED` — matching the spec's own words, "governed final states cannot regress without explicit return/reversal semantics." Verified directly: a late callback reporting `PENDING` against an already-`SETTLED` payment is silently ignored (`applied: false`), confirmed as a negative control.
+- **Negative-path scenario #3** ("duplicate callback creates duplicate accounting effect") is enforced by a genuine database uniqueness constraint on `(payment_id, provider_event_ref)` — a repeat callback for the same real-world event is idempotent, never double-applied.
+- **Negative-path scenario #4** ("provider says settled but statement evidence conflicts and is ignored"): `LinkStatementConfirmation` compares its caller-supplied statement status against the current canonical status; a mismatch raises a real, blocking conflict record rather than silently overwriting either side. Only `ResolveStatusConflict` — requiring the stronger `PAYMENT_FINALITY_CONFIRM` action, matching the spec's own SoD line ("manual finality override requires exceptional controlled workflow and evidence") — can close it.
+
+**Honest gap:** `PollPaymentStatus` has no real provider to poll (the same reason as BNK-06's Provider Adapter boundary — no real bank/PSP integration exists in this codebase), so it is a caller-attested command sharing the same apply-status logic as the real webhook, just tagged `MANUAL_POLL` instead of `PROVIDER_CALLBACK` and requiring an authorized principal instead of a signature — the same "record a real external fact a human observed" doctrine used throughout this session.
+
+11 handler tests plus two verified negative controls (forged-signature rejection, settled-payment regression blocking).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8163, db `payment_status`, depends on `authorization-svc` only).
+
+**Not yet done:** `payment-run-svc` (AP-11, §3.12) does not yet call either of these two services — `SubmitPaymentRun` still only records intent, and `ReconcilePaymentRunStatus` is still caller-attested. Wiring AP-11 to actually call BNK-06's `PrepareAttempt`/`SubmitAttempt` and consume BNK-07's canonical status would close AP-11's two biggest documented gaps for real, moving the domain's one remaining honest gap down to just the Provider Adapter's actual bank/PSP network call. Scoped but deliberately not started in this session — a natural next step, not a silent scope expansion.
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

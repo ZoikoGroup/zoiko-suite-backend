@@ -40,6 +40,8 @@ services:
       - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/payment-authorization-svc/deployments/migrations:/migrations/payment-authorization:ro
       - ../services/payment-run-svc/deployments/migrations:/migrations/payment-run:ro
+      - ../services/payment-initiation-adapter-svc/deployments/migrations:/migrations/payment-initiation-adapter:ro
+      - ../services/payment-status-svc/deployments/migrations:/migrations/payment-status:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3657,6 +3659,93 @@ services:
       authorization-svc:
         condition: service_healthy
       payment-authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payment-initiation-adapter-svc (Port: 8162) ──────────────────────────
+  # BNK-06 of the Banking, Cash & Treasury baseline — Payment Initiation
+  # Adapter. The Banking spec names "Provider Adapter" as a dependency but
+  # never gives it its own contract anywhere — it is the genuinely
+  # pluggable point where a real bank/PSP integration would be
+  # implemented. This service defines that boundary as a real Go interface
+  # and ships a real, clearly-labeled StubProviderAdapter behind it —
+  # deterministic, never disguised as a real bank connection. What IS real:
+  # durable-attempt-before-network-call by construction, structural
+  # impossibility of "provider timeout triggers new payment ID" (retry
+  # reuses the same attempt/idempotency key), and immutable authorized
+  # fields once prepared.
+  payment-initiation-adapter-svc:
+    build:
+      context: ../services/payment-initiation-adapter-svc
+      dockerfile: Dockerfile
+    container_name: payment-initiation-adapter-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8162:8162"
+    environment:
+      PORT: "8162"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payment_initiation_adapter?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payment-initiation.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payment-status-svc (Port: 8163) ──────────────────────────────────────
+  # BNK-07 of the Banking, Cash & Treasury baseline — Payment Status &
+  # Confirmation. Unlike BNK-06, this service's central capability IS fully
+  # real: a genuine HMAC-SHA256 signature-verified webhook receiver at
+  # POST /bnk07/webhooks/provider-callback. There is no real bank/PSP
+  # sending callbacks in this environment, but the receiving side's
+  # security, ordering (a governed final state can never regress — only
+  # RecordReturn may move SETTLED to RETURNED) and idempotency (a real
+  # database uniqueness constraint on payment_id+provider_event_ref) logic
+  # is exactly what a real provider integration would need. Swapping in a
+  # real provider means pointing its webhook config at this endpoint and
+  # sharing its signing secret via WEBHOOK_SHARED_SECRET below — nothing
+  # else changes. WEBHOOK_SHARED_SECRET's default is dev-only and must be
+  # replaced before any real provider is ever connected.
+  payment-status-svc:
+    build:
+      context: ../services/payment-status-svc
+      dockerfile: Dockerfile
+    container_name: payment-status-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8163:8163"
+    environment:
+      PORT: "8163"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payment_status?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payment-status.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      WEBHOOK_SHARED_SECRET: "dev-only-shared-secret-replace-before-any-real-integration"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
