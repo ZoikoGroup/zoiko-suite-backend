@@ -297,6 +297,26 @@ Built as a real, working (deliberately partial) v1 of AP-09 ("Payment Proposal")
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8159, db `payment_proposal`, depends on `authorization-svc` + `accounts-payable-svc` + `expense-claim-svc` + `supplier-financial-profile-svc` + `tax-determination-svc`).
 
+### 3.11 `payment-authorization-svc` — new service, AP-10 of the Procurement/Expenses/Accounts Payable baseline (2026-08-31)
+
+Built as a real, working v1 of AP-10 ("Payment Authorization"), the fifth service in this domain and the **first real consumer of AP-09's own `FROZEN` state and `GetFingerprint` endpoint** — both built in the previous session specifically so a real downstream authorization step could exist. This closes the authorization half of the AP-09→AP-10 handoff the domain has been building toward since AP-09 was scoped.
+
+**What's real, not fabricated:**
+- `payment-proposal-svc`'s real `GET /ap09/proposals/{id}` and `GET /ap09/proposals/{id}/fingerprint` are called to verify a proposal is genuinely `FROZEN` before authorization can be requested against it, and its fingerprint is captured as `ProposalFingerprint` at request time.
+- **Negative-path scenario #1** ("payee bank details changed after approval"): AP-09 already snapshots each `AP_INVOICE` item's payee `updated_at` at its own freeze time, but that guarantee is only as fresh as AP-09's freeze moment. This service copies those snapshots into its own `authorization_payee_snapshots` (its own authoritative record, per its own contract) at request time, then independently re-verifies them live against `supplier-financial-profile-svc` at **both** `ApprovePayment` and `ConsumePaymentAuthorization` — two further, later checkpoints than AP-09 ever had the chance to check. Any mismatch (fingerprint or payee identity) moves the authorization to a genuinely reachable `INVALIDATED` state, not just a blocked request — the literal reading of the state model's own words, "any protected-field mismatch invalidates."
+- **Negative-path scenario #2** ("signer exceeds delegated limit") reuses `policy-svc`'s real `APPROVAL_THRESHOLD` evaluation against the authorization's net amount — the same integration AP-07 and AP-09 already use — as AP-10's own "delegated signing limit": a signer without the stronger `PAYMENT_AUTHORIZE_HIGHVALUE` authority cannot approve a payment policy-svc flags `APPROVAL_REQUIRED`.
+- **Negative-path scenario #3** ("proposal maker self-authorizes where prohibited") is enforced via `authorization-svc`'s dynamic own-object SoD layer, with the proposal's own preparer (fetched from AP-09) as resource owner — **the fifth independent reuse of that feature this session**, after AP-01, AP-04, AP-07, and AP-09.
+- **Negative-path scenario #4** ("authorization token replayed after consumption") is enforced redundantly at two layers, mirroring every other service's immutability discipline this session: the store's own `WHERE status = 'APPROVED'` guard on `ConsumeAuthorization`, plus the migration's `BEFORE UPDATE` trigger making every terminal status (`CONSUMED` included) permanently immutable. Verified directly: disabling the handler-level guard alone left the negative-control test passing, because the store's own guard caught the replay independently — genuine two-layer redundancy, not a single point of failure disguised as two checks.
+- A bonus real invariant beyond the four named scenarios: a frozen proposal can have at most one active (`PENDING`/`APPROVED`) authorization request in flight at a time, enforced by a partial unique index — the same technique as AP-09's own active-payable uniqueness.
+
+**Two honest gaps, not fabricated:**
+- `ExpirePaymentAuthorization` has no automatic trigger — there is no background scheduler anywhere in this codebase (the same class of gap already documented for AP-04's GRNI retry and AP-01's high-risk-change flow). It is a real, callable command an operator or a future scheduled job can invoke, never an invented automatic timer this service doesn't actually run.
+- `ConsumePaymentAuthorization` has no real caller yet: AP-11 ("Payment Run"), the service that would actually execute a payment and consume its authorization, does not exist in this codebase. It is still implemented fully and honestly — including negative-path #4's replay protection — so it is ready the moment AP-11 exists, rather than left half-built.
+
+15 handler tests plus two verified negative controls (self-approval SoD denial, consumption-replay rejection — the latter confirmed to be enforced independently at both the handler and store layers).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8160, db `payment_authorization`, depends on `authorization-svc` + `payment-proposal-svc` + `supplier-financial-profile-svc` + `policy-svc`).
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

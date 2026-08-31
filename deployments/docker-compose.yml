@@ -38,6 +38,7 @@ services:
       - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
       - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
       - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
+      - ../services/payment-authorization-svc/deployments/migrations:/migrations/payment-authorization:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3549,6 +3550,62 @@ services:
       supplier-financial-profile-svc:
         condition: service_healthy
       tax-determination-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payment-authorization-svc (Port: 8160) ───────────────────────────────
+  # AP-10 of the Procurement/Expenses/Accounts Payable baseline — Payment
+  # Authorization. The first real consumer of payment-proposal-svc's FROZEN
+  # state and GetFingerprint endpoint (both built specifically last session
+  # so a real downstream authorization step could exist). Re-verifies the
+  # proposal's fingerprint and each payee's identity live at BOTH approval
+  # and consumption time — later checkpoints than AP-09 ever had the chance
+  # to check — moving to INVALIDATED on any mismatch. policy-svc's real
+  # APPROVAL_THRESHOLD evaluation is reused as AP-10's own delegated
+  # signing limit; a signer without PAYMENT_AUTHORIZE_HIGHVALUE cannot
+  # approve a payment policy-svc flags as requiring escalation.
+  # RequestPaymentAuthorization/ApprovePayment both require a principal
+  # distinct from the proposal's own preparer via authorization-svc's
+  # dynamic own-object SoD layer — the fifth reuse of that feature this
+  # session. ConsumePaymentAuthorization has no real caller yet (AP-11
+  # "Payment Run" does not exist), but is implemented fully and honestly,
+  # including its replay protection, so it is ready the moment AP-11 exists.
+  payment-authorization-svc:
+    build:
+      context: ../services/payment-authorization-svc
+      dockerfile: Dockerfile
+    container_name: payment-authorization-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8160:8160"
+    environment:
+      PORT: "8160"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payment_authorization?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payment-authorization.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PAYMENT_PROPOSAL_SERVICE_URL: "http://payment-proposal-svc:8159"
+      SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      POLICY_SERVICE_URL: "http://policy-svc:8085"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      payment-proposal-svc:
+        condition: service_healthy
+      supplier-financial-profile-svc:
+        condition: service_healthy
+      policy-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
