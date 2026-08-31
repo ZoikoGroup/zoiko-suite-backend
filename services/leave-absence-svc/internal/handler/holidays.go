@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/leave-absence-svc/internal/domain"
+	svcmiddleware "zoiko.io/leave-absence-svc/internal/middleware"
 )
 
 var allowedHolidayTypes = map[string]bool{
@@ -59,7 +60,11 @@ func (h *Handler) CreateHoliday(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	holiday := &domain.Holiday{
-		HolidayID:     uuid.NewString(),
+		HolidayID: uuid.NewString(),
+		// The store takes the tenant from the context, so the row was always
+		// written correctly — but this struct is what the caller gets back, and
+		// without it the create response reported tenant_id as "".
+		TenantID:      svcmiddleware.TenantFromContext(r.Context()),
 		LegalEntityID: req.LegalEntityID,
 		Name:          req.Name,
 		Date:          req.Date,
