@@ -62,7 +62,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 // (LIMIT 1, no ORDER BY) would then return an arbitrary one of the two rows.
 func TestPgStore_CreateWageRevision_ConcurrentRevisions_NeverLeavesTwoActive(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -133,7 +133,7 @@ func TestPgStore_CreateWageRevision_ConcurrentRevisions_NeverLeavesTwoActive(t *
 // duplicate (and instead of erroring on the one-active-per-employee index).
 func TestPgStore_CreateWageRevision_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -182,7 +182,7 @@ func TestPgStore_CreateWageRevision_RetriedCorrelationID_IsIdempotent(t *testing
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()

@@ -22,10 +22,31 @@ func isUniqueViolation(err error) bool {
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// schema is applied as a transaction-local search_path on every withRLS
+	// transaction. Empty means the server default, which is what a
+	// database-per-service deployment wants.
+	//
+	// It is set per transaction rather than once per connection because neither
+	// connection-level mechanism survives a transaction pooler:
+	//
+	//   - The DSN's " search_path=x" is a startup option, and Supavisor in
+	//     transaction mode drops startup options - a pooled server connection
+	//     is shared, so it cannot carry per-client session state.
+	//   - ALTER ROLE ... SET search_path is applied by Postgres at SESSION
+	//     start, and the pooler reuses server connections whose sessions began
+	//     before the change. Measured: of four roles altered at the same
+	//     moment, one picked it up and three were still on "$user", public
+	//     five minutes and many connections later, with no way to force a
+	//     recycle from the client.
+	//
+	// A transaction-local set_config is re-applied every transaction, so it
+	// holds whichever pooled connection serves it.
+	schema string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+func New(pool *pgxpool.Pool, schema string) *PgStore {
+	return &PgStore{pool: pool, schema: schema}
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
@@ -36,6 +57,14 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	// Before anything reads a table: an unqualified name resolves against
+	// search_path, and the pooler cannot be relied on to have carried it.
+	if s.schema != "" {
+		if _, err := tx.Exec(ctx, "SELECT set_config('search_path', $1, true)", s.schema); err != nil {
+			return fmt.Errorf("set search_path: %w", err)
+		}
+	}
 
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		return fmt.Errorf("set tenant context: %w", err)

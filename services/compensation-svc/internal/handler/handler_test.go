@@ -27,6 +27,8 @@ type stubStore struct {
 	revisionsByCorr map[string]string
 	bonuses         map[string]*domain.BonusGrant
 	bonusesByCorr   map[string]string
+	components      map[string]*domain.SalaryComponent
+	composition     map[string][]domain.StructureComponent
 }
 
 func newStubStore() *stubStore {
@@ -37,6 +39,8 @@ func newStubStore() *stubStore {
 		revisionsByCorr: make(map[string]string),
 		bonuses:         make(map[string]*domain.BonusGrant),
 		bonusesByCorr:   make(map[string]string),
+		components:      make(map[string]*domain.SalaryComponent),
+		composition:     make(map[string][]domain.StructureComponent),
 	}
 }
 

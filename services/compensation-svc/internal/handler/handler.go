@@ -26,6 +26,14 @@ type Store interface {
 	GetBonusGrant(ctx context.Context, grantID string) (*domain.BonusGrant, error)
 	ApproveBonusGrant(ctx context.Context, grantID, approvedBy string) error
 	ListBonusGrants(ctx context.Context, employeeID, status string) ([]domain.BonusGrant, error)
+
+	GetStructure(ctx context.Context, structureID string) (*domain.CompensationStructure, error)
+	CreateComponent(ctx context.Context, c *domain.SalaryComponent) error
+	GetComponent(ctx context.Context, componentID string) (*domain.SalaryComponent, error)
+	ListComponents(ctx context.Context, legalEntityID, componentType string, includeInactive bool) ([]domain.SalaryComponent, error)
+	DeactivateComponent(ctx context.Context, componentID string) error
+	SetStructureComponents(ctx context.Context, structureID string, inputs []domain.StructureComponentInput) error
+	ListStructureComponents(ctx context.Context, structureID string) ([]domain.StructureComponent, error)
 }
 
 type Publisher interface {
@@ -72,6 +80,14 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/compensation", func(r chi.Router) {
 		r.Post("/structures", h.CreateStructure)
 		r.Get("/structures", h.ListStructures)
+
+		r.Post("/components", h.CreateComponent)
+		r.Get("/components", h.ListComponents)
+		r.Delete("/components/{id}", h.DeactivateComponent)
+
+		r.Put("/structures/{id}/components", h.SetStructureComponents)
+		r.Get("/structures/{id}/components", h.ListStructureComponents)
+		r.Get("/structures/{id}/breakdown", h.GetStructureBreakdown)
 
 		r.Post("/revisions", h.ReviseWage)
 		r.Get("/revisions/employee/{employee_id}", h.GetWageHistory)
