@@ -139,6 +139,17 @@ services:
       DB_SCHEMA: compensation
       DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
 
+  employment-contracts-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_employment_contracts.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: employment_contracts
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
   payroll-run-svc:
     environment:
       DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"

@@ -93,9 +93,9 @@ var services = []service{
 		Why:    "owns role definitions and their permission bundles; identity-context-svc resolves Dimension 4 against it, and without it a principal holding any role cannot be resolved at all",
 	},
 
-	// ── HR domain (supabase migrations 0022-0025) ────────────────────────────
+	// ── HR domain (supabase migrations 0022-0025, 0030) ──────────────────────
 	//
-	// Not on the login path. These four are here because their schemas exist on
+	// Not on the login path. These five are here because their schemas exist on
 	// Supabase and their DB_USER in docker-compose.supabase.yml names these
 	// roles — a role that is not created arrives as a password failure, which
 	// sends you looking at APP_DB_PASSWORD rather than at the missing role.
@@ -116,6 +116,12 @@ var services = []service{
 		Schema: "compensation",
 		Role:   "app_compensation",
 		Why:    "pay structures and the component breakdown payroll-run-svc resolves every payslip from",
+	},
+	{
+		Dir:    "employment-contracts-svc",
+		Schema: "employment_contracts",
+		Role:   "app_employment_contracts",
+		Why:    "the authoritative base salary. payroll-run-svc blocks the whole run at 422 contract_lookup_failed without it, so the compensation breakdown it resolves against that salary is unreachable until this schema exists",
 	},
 	{
 		Dir:    "payroll-run-svc",
