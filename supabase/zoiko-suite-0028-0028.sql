@@ -100,18 +100,53 @@
 -- and the code disagree. Whether that read should take the caller verified
 -- tenant instead belongs in its own review.
 
+-- ── Why every statement below is guarded ─────────────────────────────────────
+--
+-- `authorization_svc` is not created by anything in this directory. It reaches
+-- a database through deployments/supabase applying the service's own compose
+-- migrations, which happens AFTER the SQL editor has been given the migration
+-- set. So on a fresh project — and in supabase/verify.sh, which applies only
+-- this directory — the schema genuinely is not there yet.
+--
+-- Written as bare DDL, the first ALTER TABLE aborted the whole batch with
+--
+--     ERROR:  schema "authorization_svc" does not exist
+--
+-- which stopped 0029 and everything after it from being applied at all. The
+-- guard makes this file a no-op in that case and leaves the rest of the set to
+-- run; where the schema does exist the executed statements are unchanged, so
+-- the end state is identical. 0027 has the same dependency and survives it only
+-- because it happens to iterate a catalogue, which is empty rather than absent.
+--
+-- Re-run this file after deployments/supabase has created the schema.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0028 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
 -- ── permission_bundles and principal_role_assignments ────────────────────────
 
-ALTER TABLE authorization_svc.permission_bundles         ENABLE ROW LEVEL SECURITY;
-ALTER TABLE authorization_svc.permission_bundles         FORCE  ROW LEVEL SECURITY;
-ALTER TABLE authorization_svc.principal_role_assignments ENABLE ROW LEVEL SECURITY;
-ALTER TABLE authorization_svc.principal_role_assignments FORCE  ROW LEVEL SECURITY;
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         FORCE  ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments FORCE  ROW LEVEL SECURITY$stmt$;
 
 -- The subquery reads `roles`, which is itself under RLS, so this policy is
 -- whatever the roles policy is: tenant-scoped normally, platform-wide under
 -- app.platform_scope. Do not inline the roles predicate here — duplicating it
 -- would let the two drift, and the platform-scope hatch would have to be
 -- repeated in three places instead of living in one.
+-- Dropped first so this file is re-runnable. The guard above tells you to run
+-- it again once deployments/supabase has created the schema, and on a project
+-- where it HAS already applied a bare CREATE POLICY would fail with "policy
+-- ... already exists" — turning the documented recovery step into an error.
+-- The two policies below are recreated identically, so a re-run is a no-op.
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.permission_bundles$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_via_role ON authorization_svc.permission_bundles
     FOR ALL
     USING (EXISTS (
@@ -119,8 +154,11 @@ CREATE POLICY tenant_isolation_via_role ON authorization_svc.permission_bundles
          WHERE r.role_id = permission_bundles.role_id))
     WITH CHECK (EXISTS (
         SELECT 1 FROM authorization_svc.roles r
-         WHERE r.role_id = permission_bundles.role_id));
+         WHERE r.role_id = permission_bundles.role_id))
+$stmt$;
 
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.principal_role_assignments$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_via_role ON authorization_svc.principal_role_assignments
     FOR ALL
     USING (EXISTS (
@@ -128,11 +166,13 @@ CREATE POLICY tenant_isolation_via_role ON authorization_svc.principal_role_assi
          WHERE r.role_id = principal_role_assignments.role_id))
     WITH CHECK (EXISTS (
         SELECT 1 FROM authorization_svc.roles r
-         WHERE r.role_id = principal_role_assignments.role_id));
+         WHERE r.role_id = principal_role_assignments.role_id))
+$stmt$;
 
 -- ── sod_rules and access_decision_log: globals become platform-only ──────────
 
-DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.sod_rules;
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.sod_rules$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_policy ON authorization_svc.sod_rules
     FOR ALL
     USING (
@@ -142,9 +182,11 @@ CREATE POLICY tenant_isolation_policy ON authorization_svc.sod_rules
     WITH CHECK (
         (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
         OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
-    );
+    )
+$stmt$;
 
-DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.access_decision_log;
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.access_decision_log$stmt$;
+EXECUTE $stmt$
 CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log
     FOR ALL
     USING (
@@ -154,11 +196,11 @@ CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log
     WITH CHECK (
         (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
         OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
-    );
+    )
+$stmt$;
 
 -- ── Verification ─────────────────────────────────────────────────────────────
 
-DO $$
 DECLARE unprotected int; no_check int;
 BEGIN
     SELECT count(*) INTO unprotected
@@ -178,5 +220,7 @@ BEGIN
     IF no_check > 0 THEN
         RAISE EXCEPTION '% nullable-tenant policies still have no WITH CHECK', no_check;
     END IF;
+END;
+
 END
-$$;
+$guard$;
