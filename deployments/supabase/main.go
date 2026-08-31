@@ -92,6 +92,37 @@ var services = []service{
 		Role:   "app_access_control",
 		Why:    "owns role definitions and their permission bundles; identity-context-svc resolves Dimension 4 against it, and without it a principal holding any role cannot be resolved at all",
 	},
+
+	// ── HR domain (supabase migrations 0022-0025) ────────────────────────────
+	//
+	// Not on the login path. These four are here because their schemas exist on
+	// Supabase and their DB_USER in docker-compose.supabase.yml names these
+	// roles — a role that is not created arrives as a password failure, which
+	// sends you looking at APP_DB_PASSWORD rather than at the missing role.
+	{
+		Dir:    "employee-master-svc",
+		Schema: "employee_master",
+		Role:   "app_employee_master",
+		Why:    "the employee identity the rest of the HR domain resolves legal-entity scope against; leave, compensation and payroll each fail closed without it",
+	},
+	{
+		Dir:    "leave-absence-svc",
+		Schema: "leave_absence",
+		Role:   "app_leave_absence",
+		Why:    "leave types and their enforced policy, per-employee balances, and the holiday calendar a payslip is explained by",
+	},
+	{
+		Dir:    "compensation-svc",
+		Schema: "compensation",
+		Role:   "app_compensation",
+		Why:    "pay structures and the component breakdown payroll-run-svc resolves every payslip from",
+	},
+	{
+		Dir:    "payroll-run-svc",
+		Schema: "payroll_run",
+		Role:   "app_payroll_run",
+		Why:    "payroll runs and the per-line payslips they produce; a COMPLETED run is immutable by trigger",
+	},
 }
 
 // bookkeepingSchema holds the migration ledger. Kept out of every service's
@@ -496,6 +527,32 @@ func provisionRoles(ctx context.Context, conn *pgx.Conn, password string) error 
 			// role that can create there could put a table in front of a
 			// pg_catalog name for any session whose search_path includes it.
 			"REVOKE ALL ON SCHEMA public FROM " + quoteIdent(svc.Role),
+
+			// The identity helpers the tenant policies are written against. A
+			// policy expression is evaluated as the QUERYING role, so a role the
+			// policies apply to must be able to run app.current_tenant_id() —
+			// 0001 grants that to zoiko_backend, authenticated and anon only,
+			// and without it every query fails on the policy rather than on the
+			// data. 0026 performs the same grants for roles that already exist.
+			"GRANT USAGE ON SCHEMA app TO " + quoteIdent(svc.Role),
+			"GRANT EXECUTE ON FUNCTION app.current_tenant_id() TO " + quoteIdent(svc.Role),
+			"GRANT EXECUTE ON FUNCTION app.current_principal_id() TO " + quoteIdent(svc.Role),
+
+			// NOT a member of zoiko_backend, deliberately.
+			//
+			// Until 0026 the policies read `FOR ALL TO zoiko_backend`, so making
+			// them apply to a service role appeared to need that membership. It
+			// works, and it destroys the property this whole loop exists to
+			// establish: every migration grants zoiko_backend USAGE and DML on
+			// its own schema, so that role accumulates access to all of them,
+			// and a member inherits the lot. Measured — with the membership,
+			// app_employee_master could read and write payroll_run.pay_slips.
+			//
+			// 0026 dropped the role restriction from the policies instead, so
+			// isolation is left to the grants above and the membership is not
+			// needed. The REVOKE keeps a database that was worked around by hand
+			// from silently staying wide.
+			"REVOKE zoiko_backend FROM " + quoteIdent(svc.Role),
 		}
 		for _, g := range grants {
 			if _, err := conn.Exec(ctx, g); err != nil {
