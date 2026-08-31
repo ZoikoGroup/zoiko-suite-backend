@@ -229,7 +229,7 @@ func main() {
 	log.Info("db pool connected")
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
-	pgStore := store.New(pool)
+	pgStore := store.New(pool, cfg.DB.Schema)
 
 	// AllowAutoTopicCreation is required even though the broker itself has
 	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults

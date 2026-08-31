@@ -76,7 +76,7 @@ func setupLeaveTypeAndBalance(t *testing.T, s *store.PgStore, ctx context.Contex
 // of creating a duplicate request and double-locking pending hours.
 func TestPgStore_SubmitLeaveRequest_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -116,7 +116,7 @@ func TestPgStore_SubmitLeaveRequest_RetriedCorrelationID_IsIdempotent(t *testing
 // transition.
 func TestPgStore_ApproveLeaveRequest_ConcurrentApproveReject_NeverDoubleMutates(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -184,7 +184,7 @@ func TestPgStore_ApproveLeaveRequest_ConcurrentApproveReject_NeverDoubleMutates(
 
 func TestPgStore_ApproveLeaveRequest_DoubleApprove_SecondFails(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -217,7 +217,7 @@ func TestPgStore_ApproveLeaveRequest_DoubleApprove_SecondFails(t *testing.T) {
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
