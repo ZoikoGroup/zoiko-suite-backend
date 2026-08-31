@@ -22,6 +22,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/payroll-run-svc/internal/compensation"
 	"zoiko.io/payroll-run-svc/internal/config"
 	"zoiko.io/payroll-run-svc/internal/contract"
 	"zoiko.io/payroll-run-svc/internal/domain"
@@ -191,6 +192,7 @@ func main() {
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("employee_master_url", cfg.EmployeeMasterURL),
 		zap.String("employment_contracts_url", cfg.EmploymentContractsURL),
+		zap.String("compensation_url", cfg.CompensationURL),
 		zap.String("authz_url", cfg.AuthZServiceURL),
 	)
 
@@ -235,7 +237,7 @@ func main() {
 	log.Info("db pool connected")
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
-	pgStore := store.New(pool)
+	pgStore := store.New(pool, cfg.DB.Schema)
 
 	// AllowAutoTopicCreation is required even though the broker itself has
 	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
@@ -269,6 +271,7 @@ func main() {
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	empClient := employee.NewClient(cfg.EmployeeMasterURL, &http.Client{Timeout: 5 * time.Second})
 	ctrClient := contract.NewClient(cfg.EmploymentContractsURL, &http.Client{Timeout: 5 * time.Second})
+	compClient := compensation.NewClient(cfg.CompensationURL, &http.Client{Timeout: 5 * time.Second})
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -288,7 +291,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, empClient, ctrClient, log)
+	h := handler.New(pgStore, publisher, authzClient, empClient, ctrClient, compClient, cfg.DefaultTaxRate, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

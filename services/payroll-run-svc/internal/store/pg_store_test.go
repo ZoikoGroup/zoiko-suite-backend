@@ -78,7 +78,7 @@ func newTestRun(tenantID, correlationID string) *domain.PayrollRun {
 // cast (pgx cannot decode binary DATE into *string directly).
 func TestPgStore_CreatePayrollRun_RealPostgres(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -106,7 +106,7 @@ func TestPgStore_CreatePayrollRun_RealPostgres(t *testing.T) {
 
 func TestPgStore_CreatePayrollRun_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -135,7 +135,7 @@ func TestPgStore_CreatePayrollRun_RetriedCorrelationID_IsIdempotent(t *testing.T
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()
