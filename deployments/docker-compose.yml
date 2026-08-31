@@ -39,6 +39,7 @@ services:
       - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
       - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/payment-authorization-svc/deployments/migrations:/migrations/payment-authorization:ro
+      - ../services/payment-run-svc/deployments/migrations:/migrations/payment-run:ro
       - ../services/metric-registry-svc/deployments/migrations:/migrations/metric-registry:ro
       - ../services/source-authority-svc/deployments/migrations:/migrations/source-authority:ro
       - ../services/jurisdiction-rules-svc/deployments/migrations:/migrations/jurisdiction-rules:ro
@@ -3606,6 +3607,56 @@ services:
       supplier-financial-profile-svc:
         condition: service_healthy
       policy-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payment-run-svc (Port: 8161) ─────────────────────────────────────────
+  # AP-11 of the Procurement/Expenses/Accounts Payable baseline — Payment
+  # Run. IMPORTANT SCOPE NOTE: a direct search of this entire codebase
+  # (banking-connector-svc, bank-reconciliation-svc, treasury-svc) found no
+  # real endpoint anywhere that initiates an outbound payment to an
+  # external bank/provider, and no real webhook/callback receiver for a
+  # provider's status response — confirmed with the user before building
+  # this service at all rather than fabricating a fake bank integration.
+  # SubmitPaymentRun therefore only records that submission was attempted
+  # (no bank is actually called); ReconcilePaymentRunStatus is a
+  # caller-attested command, not a webhook receiver. What IS real: this is
+  # the FIRST real caller of payment-authorization-svc's
+  # ConsumeAuthorization anywhere in this codebase (a gap AP-10 itself
+  # documented as having no caller yet), cross-tenant payables are blocked
+  # for real via a live AP-10 lookup on every authorization named, and
+  # idempotency (replay-after-timeout, replayed-provider-event) is enforced
+  # via genuine database uniqueness constraints throughout.
+  payment-run-svc:
+    build:
+      context: ../services/payment-run-svc
+      dockerfile: Dockerfile
+    container_name: payment-run-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8161:8161"
+    environment:
+      PORT: "8161"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payment_run?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payment-run.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PAYMENT_AUTHORIZATION_SERVICE_URL: "http://payment-authorization-svc:8160"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      payment-authorization-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

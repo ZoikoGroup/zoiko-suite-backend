@@ -317,6 +317,28 @@ Built as a real, working v1 of AP-10 ("Payment Authorization"), the fifth servic
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8160, db `payment_authorization`, depends on `authorization-svc` + `payment-proposal-svc` + `supplier-financial-profile-svc` + `policy-svc`).
 
+### 3.12 `payment-run-svc` — new service, AP-11 of the Procurement/Expenses/Accounts Payable baseline (2026-08-31) — the domain's central honest gap
+
+Built as a real, working v1 of AP-11 ("Payment Run"), the sixth service in this domain. **This is the one service in the whole AP-01→AP-11 build where the gap is not a field-level omission but the literal, stated purpose of the service itself, and it was confirmed with the user before writing any code, not discovered after.**
+
+**The gap, stated plainly.** AP-11's purpose per its own spec: "Orchestrate authorized payable instructions into controlled payment runs and hand them to Banking for external initiation/status." A direct search of this entire codebase — `banking-connector-svc`, `bank-reconciliation-svc`, `treasury-svc` — found no real endpoint anywhere that initiates an outbound payment to an external bank/provider, and no real webhook/callback receiver for a provider's status response. `treasury-svc`'s own `POST /v1/treasury/transfers` ("InitiateTransfer") looked promising but only inserts a row and moves balances between two of its own internal ledger rows — it never calls anything external. Every previous gap in this domain (AP-01's ORG-10, AP-09's bank-balance check, AP-10's `ConsumePaymentAuthorization` caller) was a supporting piece; this is AP-11's entire reason for existing. Presented to the user directly, with three options (build the honest partial slice, skip to AP-12, or stop the domain here) — the first was chosen.
+
+**What that means concretely:** `SubmitPaymentRun` does not call any bank — it records that submission was attempted and nothing more, collapsing the spec's `Submitted → Pending/Unknown` into one `SUBMITTED` status since there is no real provider response to distinguish them by. `ReconcilePaymentRunStatus` is not a webhook receiver — there is no real callback to receive — it is a command an operator calls with a caller-attested `ExternalStatus` and `ProviderEventRef`, the same "record a real external fact a human observed" doctrine already used for AP-01's high-risk-change approvals.
+
+**What IS real, not fabricated, despite the gap:**
+- **This is the FIRST real caller of `payment-authorization-svc`'s `ConsumeAuthorization`** anywhere in this codebase — a gap AP-10 itself documented two services ago as having no real caller yet. `LockPaymentRun` calls AP-10's real `ValidateAuthorization` (live re-check) then `ConsumeAuthorization` for every instruction in the run; a mid-sequence failure moves the whole run to `EXCEPTION` rather than silently leaving some authorizations consumed and others not (verified directly: a forced consumption failure moves the run to `EXCEPTION`, confirmed via the test suite).
+- **Negative-path scenario #4** ("cross-tenant payable included in run") is enforced for real: every authorization named in `CreatePaymentRun` is fetched live from AP-10, and its own `LegalEntityID`/`TenantID` must match the run's, or the whole create is rejected.
+- **Negative-path scenario #1** ("payment run replayed after timeout") is enforced by a real idempotency-key check: a repeat `SubmitPaymentRun` call on an already-`SUBMITTED` run with the *same* key is a no-op returning current state; a *different* key is rejected outright.
+- **Negative-path scenario #2** ("provider callback forged/replayed"), reinterpreted honestly for a service with no real callback to verify a signature on: a genuine database uniqueness constraint on `(instruction_id, provider_event_ref)` makes a repeat `ReconcilePaymentRunStatus` call idempotent, never double-applied.
+- **Negative-path scenario #3** ("run marks payment settled from initiation response") is enforced structurally, not by a runtime check that could be forgotten: `SubmitPaymentRun`'s own method signature has no path to any status beyond `SUBMITTED` — only a later, separate `ReconcilePaymentRunStatus` call can ever move a run to `ACCEPTED`/`REJECTED`/`PARTIALLY_ACCEPTED`/`SETTLED`.
+- A bonus real invariant beyond the four named scenarios: an authorization consumed into one run instruction can never be included in another, via a genuine unique index (AP-10's authorizations are already single-use, but this is AP-11's own defense-in-depth layer of the same guarantee).
+
+**Scope note, not a gap:** unlike every other service in this domain, this one does **not** call `authorization-svc`'s dynamic own-object SoD layer. AP-11's own SoD line ("run operator cannot alter authorized fields; unauthorized re-initiation prohibited") is a data-immutability/idempotency requirement, not a maker/checker person-pair rule — there is nothing here for that feature to check, and forcing a sixth reuse where the spec doesn't call for one would itself have been a small fabrication.
+
+14 handler tests plus two verified negative controls (idempotency-key-mismatch rejection, replayed-provider-event idempotency).
+
+Registered in `docker-compose.yml`/`init-db.sh` (port 8161, db `payment_run`, depends on `authorization-svc` + `payment-authorization-svc`).
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)
