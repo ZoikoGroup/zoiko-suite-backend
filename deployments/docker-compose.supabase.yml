@@ -88,3 +88,64 @@ services:
       DB_SSLMODE: require
       DB_SCHEMA: governance_decision_log
       DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  # ── HR domain (supabase migrations 0022-0025) ───────────────────────────────
+  #
+  # Four more services, added when the HR domain moved over. Same shape as the
+  # four above: one schema each, a role scoped to that schema, and the pooler's
+  # prepared-statement workaround.
+  #
+  # These four also talk to EACH OTHER over HTTP, and that is unaffected by
+  # anything here — leave-absence-svc resolves an employee through
+  # employee-master-svc, and payroll-run-svc reads a breakdown from
+  # compensation-svc, both by service name on the compose network. Only their
+  # database endpoints move.
+  #
+  # Roles: run deployments/supabase to create app_employee_master,
+  # app_leave_absence, app_compensation and app_payroll_run, each holding USAGE
+  # on its own schema and nothing else. A role that does not exist arrives as a
+  # password failure, which sends you looking at APP_DB_PASSWORD instead.
+
+  employee-master-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_employee_master.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: employee_master
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  leave-absence-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_leave_absence.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: leave_absence
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  compensation-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_compensation.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: compensation
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  payroll-run-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_payroll_run.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: payroll_run
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
