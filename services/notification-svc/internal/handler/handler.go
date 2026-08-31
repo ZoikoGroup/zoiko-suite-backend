@@ -14,6 +14,7 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/templates"
 )
 
 type Store interface {
@@ -113,10 +114,39 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A template renders subject and body; supplying both forms would leave it
+	// ambiguous which one the recipient actually got.
+	if req.Template != "" && (req.Subject != "" || req.Body != "") {
+		writeError(w, http.StatusBadRequest, "conflicting_content",
+			"supply either template (with variables) or subject and body, not both")
+		return
+	}
+
+	if req.Template != "" {
+		subject, body, err := templates.Render(req.Template, req.Variables)
+		switch e := err.(type) {
+		case nil:
+			req.Subject, req.Body = subject, body
+		case templates.ErrUnknownTemplate:
+			writeError(w, http.StatusBadRequest, "unknown_template", e.Error())
+			return
+		case templates.ErrMissingVariables:
+			// Refusing beats sending a message with a blank organization name
+			// or an empty login link.
+			writeError(w, http.StatusBadRequest, "missing_template_variables", e.Error())
+			return
+		default:
+			h.log.Error("failed to render notification template",
+				zap.String("template", req.Template), zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "template_render_failed", e.Error())
+			return
+		}
+	}
+
 	if req.RecipientPrincipalID == "" || req.LegalEntityID == "" || req.Channel == "" ||
 		req.Subject == "" || req.CorrelationID == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields",
-			"recipient_principal_id, legal_entity_id, channel, subject, correlation_id are required")
+			"recipient_principal_id, legal_entity_id, channel, correlation_id are required, plus either subject or template")
 		return
 	}
 

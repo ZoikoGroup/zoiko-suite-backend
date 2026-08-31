@@ -29,6 +29,14 @@ type SendNotificationRequest struct {
 	SourceEventType      string `json:"source_event_type,omitempty"`
 	SourceReference      string `json:"source_reference,omitempty"`
 	CorrelationID        string `json:"correlation_id"`
+
+	// Template names a catalogue template to render instead of supplying
+	// subject and body directly. Variables fills its placeholders.
+	//
+	// The two forms are mutually exclusive: accepting both would leave it
+	// ambiguous which one actually reached the recipient.
+	Template  string            `json:"template,omitempty"`
+	Variables map[string]string `json:"variables,omitempty"`
 }
 
 // ListFilter carries every constraint on a register read, including the
