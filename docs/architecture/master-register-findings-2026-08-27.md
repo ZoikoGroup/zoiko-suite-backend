@@ -440,6 +440,25 @@ Registered in `docker-compose.yml` (port 8164, db `payable_open_item`, depends o
 
 `docker-compose.yml` updated: `payment-proposal-svc` now depends on `payable-open-item-svc` instead of `expense-claim-svc`, and carries `PAYABLE_OPEN_ITEM_SERVICE_URL` in place of `EXPENSE_CLAIM_SERVICE_URL`. `docker compose config --quiet` validated clean.
 
+**Update, same day:** AP-08's remaining source gap (vendor invoices) named in §3.16 is now closed — see §3.18.
+
+---
+
+### 3.18 `accounts-payable-svc` wired to `payable-open-item-svc` (AP-08) — closes AP-08's last documented source gap (2026-09-01)
+
+`ApproveInvoice` (VALIDATED → APPROVED) now calls AP-08's real `CreatePayableFromApprovedSource` — AP-08's first real vendor-invoice source; it previously only had `expense-claim-svc`. This is the last of AP-08's two named upstream sources (vendor invoices, expense claims) now wired for real.
+
+**What's real, not fabricated:**
+- The call is deliberately best-effort, mirroring `expense-claim-svc`'s and `goods-service-receipt-svc`'s own doctrine for a downstream side effect that must never undo a transition that already committed: a failure is logged (`ApproveInvoice: AP-08 payable creation failed`) but never returned to the caller as an error, and the invoice's own `APPROVED` transition — already durable by that point — stands regardless. Verified directly as its own test.
+- `accounts-payable-svc` predates this session (it already had its own mature config/authz/mTLS/telemetry infrastructure, distinct in style from every service built this session) — the new `internal/payableopenitem` client and its wiring were added following this service's own existing conventions (its `Store`/`Publisher`/`AuthZClient` narrow-interface `Handler` pattern) rather than importing this session's newer conventions wholesale.
+- `SourceReference` is the invoice's own `InvoiceID`; `PayeeRef` is `VendorID`; `OriginalAmount`/`Currency`/`DueDate` come directly from the invoice record — no field is invented or re-derived.
+
+2 new handler tests (real AP-08 call on approval, approval stands despite AP-08 failure), plus a verified negative control (disabled the call-counting, confirmed the test genuinely caught the missing call, restored). Full existing `accounts-payable-svc` suite (unrelated to this change) still green — `authz`, `config`, `domain`, `events`, `store` packages all untouched and passing.
+
+**What remains open, not started here:** `payment-proposal-svc` (AP-09)'s `AP_INVOICE` branch still sources directly from `accounts-payable-svc` rather than from AP-08 (§3.17 named this as the one remaining piece of its own switch-over). Now that AP-08 has a real vendor-invoice source, that switch is unblocked but not started in this turn.
+
+`docker-compose.yml` updated: `accounts-payable-svc` now depends on `payable-open-item-svc` and carries `PAYABLE_OPEN_ITEM_SERVICE_URL`. `docker compose config --quiet` validated clean.
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

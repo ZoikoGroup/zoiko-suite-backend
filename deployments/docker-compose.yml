@@ -1296,7 +1296,12 @@ services:
   # authorization-svc first, real HTTP client from day one (financial data).
   # Postgres RLS + explicit tenant_id filters in every query — RLS alone is
   # insufficient given this platform connects as a Postgres superuser (found
-  # via general-ledger-svc's CI failure).
+  # via general-ledger-svc's CI failure). UPDATE: ApproveInvoice now calls
+  # payable-open-item-svc (AP-08)'s real CreatePayableFromApprovedSource —
+  # AP-08's first real vendor-invoice source (it previously only had
+  # expense-claim-svc). Deliberately best-effort: a failure is logged, never
+  # returned to the caller, so an AP-08 outage never blocks or reverses an
+  # approval that already committed.
   accounts-payable-svc:
     build:
       context: ../services/accounts-payable-svc
@@ -1317,12 +1322,15 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.accounts-payable.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      payable-open-item-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
