@@ -532,6 +532,22 @@ Scoped by a dedicated research sweep of this session's own package docs: four al
 
 Registered in `docker-compose.yml` (port 8166, db `payee_banking_identity`, depends on `authorization-svc` and `counterparty-management-svc`) and `init-db.sh`. `docker compose config --quiet` validated clean.
 
+**Update, same day:** the AP-10 wiring named above as ORG-10's own remaining next step is now done — see §3.22.
+
+---
+
+### 3.22 `payment-authorization-svc` (AP-10) wired to `payee-banking-identity-svc` (ORG-10) — closes ORG-10's own named dependency (2026-09-01)
+
+`RequestPaymentAuthorization` and `verifyStillEligible` (the shared re-check run at both `ApprovePayment` and `ConsumePaymentAuthorization`) now consult ORG-10's real `GetActivePayeeDestination` — the first real caller of that endpoint anywhere in this codebase, closing ORG-10's own named dependency ("AP-10 fingerprints active version").
+
+**What's real, not fabricated:**
+- At request time, every AP_INVOICE-sourced payee's `PayeeSnapshot` is extended with `DestinationID`, pinning ORG-10's currently-active destination for that payee. `verifyStillEligible` re-checks it live at both later checkpoints exactly like the existing supplier-profile identity check: a destination that has since been superseded (a different `DestinationID` is now active) or removed entirely (no active destination at all — e.g. suspended with no replacement yet) invalidates the authorization, the same "any protected-field mismatch invalidates" doctrine already governing the fingerprint and payee-identity checks. Verified directly, twice: disabling the changed-destination comparison let an authorization approve at `200` despite the payee's destination having been superseded; disabling the no-active-destination branch caused a genuinely-removed destination to be misreported as a `503` outage instead of correctly invalidating. Both confirmed as negative controls, then restored.
+- The check is deliberately optional at request time and skipped at re-verification when no destination was ever pinned: ORG-10 is a brand-new service and does not yet have every existing payee onboarded, so a payee with no ORG-10 coverage is a real, current gap, not something this change should fabricate coverage for or block on. Verified directly as its own test.
+
+2 new domain columns/fields (`authorization_payee_snapshots.destination_id`, migration `000004_payee_destination`), 4 new handler tests, 2 negative controls verified. Full existing AP-10 suite (19 tests total) still green.
+
+`docker-compose.yml` updated: `payment-authorization-svc` now depends on `payee-banking-identity-svc` and carries `PAYEE_IDENTITY_SERVICE_URL`. `docker compose config --quiet` validated clean.
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

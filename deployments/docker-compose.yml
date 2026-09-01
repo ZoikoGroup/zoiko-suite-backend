@@ -3767,6 +3767,11 @@ services:
   # session. ConsumePaymentAuthorization has no real caller yet (AP-11
   # "Payment Run" does not exist), but is implemented fully and honestly,
   # including its replay protection, so it is ready the moment AP-11 exists.
+  # UPDATE: payee-banking-identity-svc's (ORG-10) real
+  # GetActivePayeeDestination is now consulted at request time and
+  # re-checked live at both approval and consumption — closing ORG-10's own
+  # named dependency ("AP-10 fingerprints active version"). A payee with no
+  # ORG-10 coverage yet is a real, current gap, not a blocker.
   payment-authorization-svc:
     build:
       context: ../services/payment-authorization-svc
@@ -3784,6 +3789,7 @@ services:
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PAYMENT_PROPOSAL_SERVICE_URL: "http://payment-proposal-svc:8159"
       SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
+      PAYEE_IDENTITY_SERVICE_URL: "http://payee-banking-identity-svc:8166"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
     depends_on:
       postgres:
@@ -3795,6 +3801,8 @@ services:
       payment-proposal-svc:
         condition: service_healthy
       supplier-financial-profile-svc:
+        condition: service_healthy
+      payee-banking-identity-svc:
         condition: service_healthy
       policy-svc:
         condition: service_healthy
