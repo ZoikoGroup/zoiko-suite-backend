@@ -129,7 +129,7 @@ func TestRender_MissingRequiredVariables(t *testing.T) {
 	}
 }
 
-// Whitespace-only is as unusable as absent — it would render a blank line where
+// Whitespace-only is as unusable as absent â€” it would render a blank line where
 // the organization name should be.
 func TestRender_BlankVariableTreatedAsMissing(t *testing.T) {
 	_, _, err := templates.Render(templates.Suspended, map[string]string{
@@ -191,4 +191,70 @@ func asUnknown(err error, target *templates.ErrUnknownTemplate) bool {
 		*target = e
 	}
 	return ok
+}
+
+// Catalogue is what the console builds its form from, so a template whose
+// required variables it advertises wrongly produces a form that cannot be
+// submitted successfully. Every entry is therefore checked against Render
+// itself rather than against a second copy of the same list.
+func TestCatalogue_MatchesWhatRenderActuallyRequires(t *testing.T) {
+	catalogue := templates.Catalogue()
+	if len(catalogue) != len(templates.Names()) {
+		t.Fatalf("Catalogue has %d entries, Names has %d", len(catalogue), len(templates.Names()))
+	}
+
+	for _, entry := range catalogue {
+		if entry.Subject == "" {
+			t.Errorf("%s: advertises no subject", entry.Name)
+		}
+
+		// Supplying exactly what the catalogue advertises must render.
+		vars := map[string]string{}
+		for _, key := range entry.Required {
+			vars[key] = "x"
+		}
+		if _, _, err := templates.Render(entry.Name, vars); err != nil {
+			t.Errorf("%s: advertised variables %v were not enough: %v", entry.Name, entry.Required, err)
+		}
+
+		// And each one must genuinely be required — an over-declared variable
+		// would put a field on the form that the template does not need.
+		for _, key := range entry.Required {
+			short := map[string]string{}
+			for _, k := range entry.Required {
+				if k != key {
+					short[k] = "x"
+				}
+			}
+			if _, _, err := templates.Render(entry.Name, short); err == nil {
+				t.Errorf("%s: %q is advertised as required but renders without it", entry.Name, key)
+			}
+		}
+	}
+}
+
+// The catalogue must be sorted and must not hand out the package's own slices:
+// a caller that sorts or truncates Required in place would change what every
+// later caller believes the template needs.
+func TestCatalogue_IsSortedAndDefensivelyCopied(t *testing.T) {
+	first := templates.Catalogue()
+	for i := 1; i < len(first); i++ {
+		if first[i-1].Name >= first[i].Name {
+			t.Fatalf("catalogue is not sorted: %q before %q", first[i-1].Name, first[i].Name)
+		}
+	}
+
+	for i := range first {
+		for j := range first[i].Required {
+			first[i].Required[j] = "clobbered"
+		}
+	}
+
+	for _, entry := range templates.Catalogue() {
+		for _, key := range entry.Required {
+			if key == "clobbered" {
+				t.Fatalf("%s: Required is shared with package state, not copied", entry.Name)
+			}
+		}
+	}
 }

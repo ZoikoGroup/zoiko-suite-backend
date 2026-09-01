@@ -1554,6 +1554,30 @@ services:
   # wired up on the platform yet. Delivery failure is deliberately never a
   # 5xx to the caller, per the service's own critical constraint: "notification
   # failure must not collapse source operational workflows."
+  # ── Mailpit — local mail catcher for notification-svc ────────────────────────
+  #
+  # Accepts SMTP on 1025 and serves everything it receives at
+  # http://localhost:8025. It delivers nothing onward, which is the point: with
+  # a real relay configured here, running the estate locally would email real
+  # people the first time anyone exercised the approval workflow.
+  #
+  # This is what makes EMAIL testable end to end without an account anywhere.
+  # notification-svc's own tests drive an in-process SMTP server instead, so
+  # this container is for manual verification and demos, not for CI.
+  mailpit:
+    image: axllent/mailpit:v1.21
+    container_name: mailpit
+    mem_limit: 128m
+    cpus: "0.25"
+    ports:
+      - "8025:8025" # web UI
+      - "1025:1025" # SMTP
+    environment:
+      MP_MAX_MESSAGES: "5000"
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    restart: on-failure
+
   notification-svc:
     build:
       context: ../services/notification-svc
@@ -1574,6 +1598,39 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.notification.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+
+      # identity-context-svc owns principals and their contact facts. An EMAIL
+      # notification names its recipient by principal id, so without this the
+      # service has no address to deliver to.
+      IDENTITY_SERVICE_URL: "http://identity-context-svc:8080"
+
+      # Mail provider. Mailpit catches everything locally and serves it at
+      # http://localhost:8025 — nothing leaves the machine, so a developer
+      # running the estate cannot accidentally email a real person.
+      #
+      # SMTP_ALLOW_CLEARTEXT is required because mailpit is a sibling
+      # container rather than loopback, and the provider refuses cleartext to a
+      # non-loopback host without it. config.Load refuses it in production.
+      NOTIFICATION_EMAIL_PROVIDER: "${NOTIFICATION_EMAIL_PROVIDER:-smtp}"
+      NOTIFICATION_EMAIL_FROM: "${NOTIFICATION_EMAIL_FROM:-Zoiko Suite <no-reply@zoiko.local>}"
+      SMTP_HOST: "${SMTP_HOST:-mailpit}"
+      SMTP_PORT: "${SMTP_PORT:-1025}"
+      SMTP_TLS_MODE: "${SMTP_TLS_MODE:-none}"
+      SMTP_ALLOW_CLEARTEXT: "${SMTP_ALLOW_CLEARTEXT:-true}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+
+      # Transient delivery failures — a relay restarting, greylisting, an
+      # identity-context-svc blip — are re-attempted by the in-process worker
+      # rather than concluded FAILED on the first try. Five attempts over
+      # roughly ten minutes; the interval is how often the worker looks, not
+      # how long a notification waits.
+      NOTIFICATION_RETRY_ENABLED: "${NOTIFICATION_RETRY_ENABLED:-true}"
+      NOTIFICATION_RETRY_MAX_ATTEMPTS: "${NOTIFICATION_RETRY_MAX_ATTEMPTS:-5}"
+      NOTIFICATION_RETRY_BASE_DELAY: "${NOTIFICATION_RETRY_BASE_DELAY:-30s}"
+      NOTIFICATION_RETRY_MAX_DELAY: "${NOTIFICATION_RETRY_MAX_DELAY:-8m}"
+      NOTIFICATION_RETRY_INTERVAL: "${NOTIFICATION_RETRY_INTERVAL:-10s}"
+      NOTIFICATION_RETRY_BATCH_SIZE: "${NOTIFICATION_RETRY_BATCH_SIZE:-50}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1581,6 +1638,8 @@ services:
         condition: service_healthy
       authorization-svc:
         condition: service_healthy
+      mailpit:
+        condition: service_started
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
       # dead database pool reads as healthy while every read returns 500.

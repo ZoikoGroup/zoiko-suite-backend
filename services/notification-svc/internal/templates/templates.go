@@ -118,6 +118,37 @@ func Names() []string {
 	return out
 }
 
+// Entry is one template as a caller sees it: what it is called, the subject it
+// will send under, and the variables it will refuse to render without.
+type Entry struct {
+	Name     string   `json:"name"`
+	Subject  string   `json:"subject"`
+	Required []string `json:"required_variables"`
+}
+
+// Catalogue describes every template, sorted by name.
+//
+// This exists so the console can build a form for a template instead of
+// hardcoding one. The templates were ported with their required-variable
+// contracts intact and Render refuses a partial message — but nothing outside
+// this package could discover what those contracts were, so the console could
+// only send free-text subject and body and the whole catalogue was unreachable
+// from the platform's own UI.
+//
+// Required is copied rather than shared: specs is package state, and handing
+// callers the backing array would let one of them reorder or truncate another
+// caller's view of what a template needs.
+func Catalogue() []Entry {
+	out := make([]Entry, 0, len(specs))
+	for name, s := range specs {
+		required := make([]string, len(s.required))
+		copy(required, s.required)
+		out = append(out, Entry{Name: name, Subject: s.subject, Required: required})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
 // Render produces the subject and HTML body for one template.
 //
 // Values are escaped for the context they appear in, so an organization name

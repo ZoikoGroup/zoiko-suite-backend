@@ -21,12 +21,15 @@ import (
 
 	"zoiko.io/notification-svc/internal/authz"
 	"zoiko.io/notification-svc/internal/config"
+	"zoiko.io/notification-svc/internal/deliver"
 	svcenvelope "zoiko.io/notification-svc/internal/envelope"
 	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
+	"zoiko.io/notification-svc/internal/identity"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
 )
@@ -141,6 +144,99 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthZServiceURL, log)
 	}
 
+	// identity-context-svc owns principals and their contact facts. An EMAIL
+	// notification names its recipient by principal id, so without this client
+	// there is no address to deliver to — which is the state this service
+	// shipped in, covered by a stub adapter that reported success anyway.
+	identityClient := identity.NewClient(cfg.IdentityServiceURL, log)
+
+	// Mail provider. Nil when unconfigured, and the router then records EMAIL
+	// as FAILED naming the missing provider rather than claiming a send.
+	//
+	// Constructed before the server starts listening so a malformed From
+	// address or an impossible TLS mode is a startup failure with the variable
+	// named, not one FAILED notification per send describing the same mistake
+	// in the vocabulary of a delivery error.
+	var emailProvider deliver.Provider
+	switch cfg.Email.Provider {
+	case "":
+		log.Warn("no email provider configured — EMAIL notifications will be recorded as FAILED",
+			zap.String("set", "NOTIFICATION_EMAIL_PROVIDER=smtp with SMTP_HOST and NOTIFICATION_EMAIL_FROM"))
+	case "smtp":
+		p, err := deliver.NewSMTPProvider(deliver.SMTPConfig{
+			Host:     cfg.Email.Host,
+			Port:     cfg.Email.Port,
+			Username: cfg.Email.Username,
+			Password: cfg.Email.Password,
+			From:           cfg.Email.From,
+			TLSMode:        deliver.TLSMode(cfg.Email.TLSMode),
+			AllowCleartext: cfg.Email.AllowCleartext,
+		})
+		if err != nil {
+			log.Fatal("email provider configuration is invalid", zap.Error(err))
+		}
+		emailProvider = p
+		log.Info("smtp email provider configured",
+			zap.String("host", cfg.Email.Host),
+			zap.Int("port", cfg.Email.Port),
+			zap.String("tls_mode", cfg.Email.TLSMode),
+			zap.String("from", cfg.Email.From),
+			zap.Bool("authenticated", cfg.Email.Username != ""))
+
+		// Prove the credentials at startup rather than on somebody's password
+		// reset.
+		//
+		// Every fault this catches — unreachable relay, no STARTTLS on the
+		// configured port, a rejected password — is permanent and identical
+		// for every message, so discovering it on the first real notification
+		// means a person waited for an email that was never going to arrive
+		// while the log said only "delivery failed".
+		//
+		// A WARNING, not a Fatal. Refusing to start would take IN_APP
+		// notifications down with the mail relay, and IN_APP does not touch
+		// SMTP at all — that is precisely the coupling ZS-SVC-Y-001 §9.7 says
+		// must not exist. The service runs; EMAIL records FAILED with the
+		// provider's own reason until the credential is corrected.
+		//
+		// Skipped when SMTP_VERIFY_ON_START=false, for an estate where the
+		// relay is legitimately not reachable from where the service starts.
+		if cfg.Email.VerifyOnStart {
+			verifyCtx, cancelVerify := context.WithTimeout(context.Background(), 15*time.Second)
+			if err := p.Verify(verifyCtx); err != nil {
+				log.Warn("smtp credentials did not verify — EMAIL notifications will fail until this is fixed",
+					zap.String("relay", p.Describe()),
+					zap.Error(err))
+			} else {
+				log.Info("smtp credentials verified", zap.String("relay", p.Describe()))
+			}
+			cancelVerify()
+		}
+	default:
+		log.Fatal("unknown NOTIFICATION_EMAIL_PROVIDER",
+			zap.String("provider", cfg.Email.Provider),
+			zap.String("supported", "smtp"))
+	}
+
+	deliverer := deliver.NewRouter(emailProvider, log)
+
+	// â”€â”€ 4b. Retry policy and worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	//
+	// One policy, shared. The handler writes the first schedule when a send
+	// fails transiently and the worker extends it from there, so they cannot
+	// disagree about how many attempts a notification gets.
+	retryPolicy := retry.Policy{
+		MaxAttempts: cfg.Retry.MaxAttempts,
+		BaseDelay:   cfg.Retry.BaseDelay,
+		MaxDelay:    cfg.Retry.MaxDelay,
+	}
+	if !cfg.Retry.Enabled {
+		// Not zero: MaxAttempts 1 means "the synchronous attempt and no more",
+		// which the handler reports on the record. Zero would Normalize back
+		// to the default and quietly re-enable what an operator turned off.
+		retryPolicy.MaxAttempts = 1
+	}
+	retryPolicy = retryPolicy.Normalize()
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -159,10 +255,37 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, handler.StubDeliverer{Log: log}, log)
+	h := handler.New(handler.Deps{
+		Store:       pgStore,
+		Publisher:   publisher,
+		AuthZ:       authzClient,
+		Deliverer:   deliverer,
+		Recipient:   identityClient,
+		RetryPolicy: retryPolicy,
+		Log:         log,
+	})
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
+	// â”€â”€ 6a. Delivery retry worker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+	//
+	// Started even when retry is disabled, deliberately. Turning the policy off
+	// stops new schedules being written; it does not un-schedule the
+	// notifications already waiting, and without a worker those sit PENDING
+	// forever with nothing to move them. The worker drains that backlog and
+	// then finds nothing, which is the correct behaviour for "disabled".
+	workerCtx, stopWorker := context.WithCancel(context.Background())
+	defer stopWorker()
+
+	retryWorker := retry.NewWorker(
+		pgStore, deliverer, publisher, identityClient, identity.IsSettled,
+		retry.Options{
+			Interval:  cfg.Retry.Interval,
+			BatchSize: cfg.Retry.BatchSize,
+			Policy:    retryPolicy,
+		}, log)
+	go retryWorker.Start(workerCtx)
+
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
