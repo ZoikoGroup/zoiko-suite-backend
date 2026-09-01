@@ -19,10 +19,10 @@ import (
 	"zoiko.io/payment-proposal-svc/internal/authz"
 	"zoiko.io/payment-proposal-svc/internal/config"
 	"zoiko.io/payment-proposal-svc/internal/events"
-	"zoiko.io/payment-proposal-svc/internal/expenseclaim"
 	"zoiko.io/payment-proposal-svc/internal/handler"
 	"zoiko.io/payment-proposal-svc/internal/health"
 	"zoiko.io/payment-proposal-svc/internal/middleware"
+	"zoiko.io/payment-proposal-svc/internal/payableopenitem"
 	"zoiko.io/payment-proposal-svc/internal/store"
 	"zoiko.io/payment-proposal-svc/internal/supplierprofile"
 	"zoiko.io/payment-proposal-svc/internal/tax"
@@ -65,11 +65,11 @@ func main() {
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	apClient := accountspayable.NewHTTPClient(cfg.AccountsPayableServiceURL, logger)
-	claimClient := expenseclaim.NewHTTPClient(cfg.ExpenseClaimServiceURL, logger)
+	payableClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger)
 	supplierClient := supplierprofile.NewHTTPClient(cfg.SupplierProfileServiceURL, logger)
 	taxClient := tax.NewHTTPClient(cfg.TaxDeterminationServiceURL, logger)
 
-	h := handler.New(pgStore, publisher, authzClient, apClient, claimClient, supplierClient, taxClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, apClient, payableClient, supplierClient, taxClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

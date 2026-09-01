@@ -54,6 +54,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/ap08/payables", func(r chi.Router) {
 		r.Post("/", h.CreatePayableFromApprovedSource)
 		r.Get("/", h.ListOpenPayables)
+		r.Get("/by-source", h.GetPayableBySource)
 		r.Get("/{payableID}", h.GetPayable)
 		r.Get("/{payableID}/history", h.GetPayableHistory)
 		r.Get("/{payableID}/available-actions", h.GetAvailableActions)
@@ -169,6 +170,34 @@ func (h *Handler) GetPayable(w http.ResponseWriter, r *http.Request) {
 	payableID := chi.URLParam(r, "payableID")
 	p, ok := h.fetchPayableForAuth(w, r, payableID)
 	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
+}
+
+// GetPayableBySource is the real correlation lookup a caller who only
+// knows its own upstream reference (e.g. expense-claim-svc's ClaimID) needs
+// — not in AP-08's own listed read contracts, but a direct consequence of
+// (source_type, source_reference) already being this table's real
+// uniqueness key. payment-proposal-svc (AP-09) is this endpoint's first
+// real caller, verifying an EXPENSE_CLAIM item against this service's own
+// eligibility state instead of expense-claim-svc's simple REIMBURSABLE
+// status check.
+func (h *Handler) GetPayableBySource(w http.ResponseWriter, r *http.Request) {
+	sourceType := domain.SourceType(r.URL.Query().Get("source_type"))
+	sourceReference := r.URL.Query().Get("source_reference")
+	if sourceType == "" || sourceReference == "" {
+		writeError(w, http.StatusBadRequest, "source_type and source_reference query parameters are required")
+		return
+	}
+	p, err := h.store.FindBySource(r.Context(), sourceType, sourceReference)
+	if err != nil {
+		if errors.Is(err, domain.ErrPayableNotFound) {
+			writeError(w, http.StatusNotFound, "payable not found")
+			return
+		}
+		h.log.Error("GetPayableBySource: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
 	writeJSON(w, http.StatusOK, p)

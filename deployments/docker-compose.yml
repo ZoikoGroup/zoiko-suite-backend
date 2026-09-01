@@ -3560,21 +3560,28 @@ services:
   # ── payment-proposal-svc (Port: 8159) ────────────────────────────────────
   # AP-09 of the Procurement/Expenses/Accounts Payable baseline — Payment
   # Proposal. Selects real eligible payables from accounts-payable-svc
-  # (APPROVED invoices) and expense-claim-svc (REIMBURSABLE claims) into a
+  # (APPROVED invoices) and payable-open-item-svc (AP-08, real
+  # open/residual/held/disputed state for EXPENSE_CLAIM items) into a
   # non-executing, fully reversible proposal. This service's own command
   # list has no Authorize/Reject command — those belong to AP-10, a
   # distinct, unbuilt service — so this only ever reaches FROZEN.
-  # supplier-financial-profile-svc's real ON_HOLD status is the only hold
-  # signal available anywhere upstream (accounts-payable-svc has none) and
-  # its updated_at is the only staleness signal (no version column exists)
-  # — both checked live again at Freeze time, not just at selection time.
-  # tax-determination-svc's real endpoint computes withholding, never
-  # inferred. BNK account/cash availability has no live endpoint anywhere
-  # in this codebase (checked directly) — PayingBankAccountRef is an
-  # opaque, caller-supplied reference, same doctrine as AP-01's
-  # PayeeReference. FreezePaymentProposal requires a principal distinct
-  # from the proposal's own preparer via authorization-svc's dynamic
-  # own-object SoD layer — the fourth reuse of that feature this session.
+  # UPDATE: EXPENSE_CLAIM items are now verified against AP-08 instead of
+  # calling expense-claim-svc directly — the switch AP-08's own package doc
+  # named as its natural next wiring step. This also closes a real parity
+  # gap: EXPENSE_CLAIM items now get the same ExceptionRef hold-override
+  # AP_INVOICE items already had, from AP-08's own IsHeld/IsDisputed
+  # fields. supplier-financial-profile-svc's real ON_HOLD status remains
+  # the hold signal for AP_INVOICE items (accounts-payable-svc has none of
+  # its own) and its updated_at is the only staleness signal (no version
+  # column exists) — both checked live again at Freeze time, not just at
+  # selection time. tax-determination-svc's real endpoint computes
+  # withholding, never inferred. BNK account/cash availability has no live
+  # endpoint anywhere in this codebase (checked directly) —
+  # PayingBankAccountRef is an opaque, caller-supplied reference, same
+  # doctrine as AP-01's PayeeReference. FreezePaymentProposal requires a
+  # principal distinct from the proposal's own preparer via
+  # authorization-svc's dynamic own-object SoD layer — the fourth reuse of
+  # that feature this session.
   payment-proposal-svc:
     build:
       context: ../services/payment-proposal-svc
@@ -3591,7 +3598,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.payment-proposal.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       ACCOUNTS_PAYABLE_SERVICE_URL: "http://accounts-payable-svc:8099"
-      EXPENSE_CLAIM_SERVICE_URL: "http://expense-claim-svc:8158"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
       SUPPLIER_PROFILE_SERVICE_URL: "http://supplier-financial-profile-svc:8156"
       TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
     depends_on:
@@ -3603,7 +3610,7 @@ services:
         condition: service_healthy
       accounts-payable-svc:
         condition: service_healthy
-      expense-claim-svc:
+      payable-open-item-svc:
         condition: service_healthy
       supplier-financial-profile-svc:
         condition: service_healthy

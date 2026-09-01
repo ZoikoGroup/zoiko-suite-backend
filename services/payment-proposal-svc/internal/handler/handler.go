@@ -19,8 +19,8 @@ import (
 	authzpkg "zoiko.io/payment-proposal-svc/internal/authz"
 	"zoiko.io/payment-proposal-svc/internal/domain"
 	"zoiko.io/payment-proposal-svc/internal/events"
-	"zoiko.io/payment-proposal-svc/internal/expenseclaim"
 	svcmiddleware "zoiko.io/payment-proposal-svc/internal/middleware"
+	"zoiko.io/payment-proposal-svc/internal/payableopenitem"
 	"zoiko.io/payment-proposal-svc/internal/store"
 	"zoiko.io/payment-proposal-svc/internal/supplierprofile"
 	"zoiko.io/payment-proposal-svc/internal/tax"
@@ -51,14 +51,14 @@ type Handler struct {
 	pub      events.Publisher
 	authz    AuthzChecker
 	ap       accountspayable.Client
-	claims   expenseclaim.Client
+	payables payableopenitem.Client
 	supplier supplierprofile.Client
 	tax      tax.Client
 	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, ap accountspayable.Client, claims expenseclaim.Client, supplier supplierprofile.Client, taxClient tax.Client, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, ap: ap, claims: claims, supplier: supplier, tax: taxClient, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, ap accountspayable.Client, payables payableopenitem.Client, supplier supplierprofile.Client, taxClient tax.Client, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, ap: ap, payables: payables, supplier: supplier, tax: taxClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -201,12 +201,11 @@ func (h *Handler) ListProposalItems(w http.ResponseWriter, r *http.Request) {
 }
 
 // AddEligiblePayable is where negative-path scenarios #1 and #2 are
-// enforced. #1 (a held payable force-added without exception): the only
-// real hold signal available anywhere upstream is
-// supplier-financial-profile-svc's own ON_HOLD status (accounts-payable-svc
-// has no hold concept of its own) — an AP_INVOICE item whose supplier is
-// ON_HOLD is rejected unless the caller supplies a non-empty ExceptionRef,
-// which itself requires the stronger PAYMENT_PROPOSAL_EXCEPTION_RESOLVE
+// enforced. #1 (a held payable force-added without exception): an
+// AP_INVOICE item whose supplier-financial-profile-svc profile is ON_HOLD,
+// or an EXPENSE_CLAIM item whose AP-08 payable is IsHeld/IsDisputed, is
+// rejected unless the caller supplies a non-empty ExceptionRef, which
+// itself requires the stronger PAYMENT_PROPOSAL_EXCEPTION_RESOLVE
 // authority, not ordinary PAYMENT_PROPOSAL_MANAGE. #2 (duplicate/in-flight
 // payable) is enforced by the store's own database constraint.
 func (h *Handler) AddEligiblePayable(w http.ResponseWriter, r *http.Request) {
@@ -295,17 +294,25 @@ func (h *Handler) AddEligiblePayable(w http.ResponseWriter, r *http.Request) {
 		item.ExceptionRef = req.ExceptionRef
 
 	case domain.SourceExpenseClaim:
-		claim, err := h.claims.GetEligibleClaim(r.Context(), verifiedTenant, proposal.LegalEntityID, req.PayableID)
+		payable, err := h.payables.GetEligiblePayable(r.Context(), verifiedTenant, proposal.LegalEntityID, req.PayableID)
 		if err != nil {
 			h.writePayableErr(w, err)
 			return
 		}
-		item.PayeeRef = claim.ClaimantPrincipalID
-		item.GrossAmount = claim.TotalAmount
-		item.NetAmount = claim.TotalAmount
-		item.Currency = claim.Currency
-		// expense-claim-svc has no due-date concept for a reimbursement —
-		// the claim became payable the moment it reached REIMBURSABLE.
+		if payable.IsHeld || payable.IsDisputed {
+			if req.ExceptionRef == "" {
+				writeError(w, http.StatusConflict, "payee is on hold; an exception reference is required to add this payable")
+				return
+			}
+			isHeldOverride = true
+		}
+		item.PayeeRef = payable.PayeeRef
+		item.GrossAmount = payable.ResidualAmount
+		item.NetAmount = payable.ResidualAmount
+		item.Currency = payable.Currency
+		item.ExceptionRef = req.ExceptionRef
+		// AP-08 has no due-date concept for a reimbursement either — the
+		// claim became payable the moment expense-claim-svc created it there.
 		item.DueDate = time.Now().UTC()
 	}
 

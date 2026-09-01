@@ -16,9 +16,9 @@ import (
 	authzpkg "zoiko.io/payment-proposal-svc/internal/authz"
 	"zoiko.io/payment-proposal-svc/internal/domain"
 	"zoiko.io/payment-proposal-svc/internal/events"
-	"zoiko.io/payment-proposal-svc/internal/expenseclaim"
 	"zoiko.io/payment-proposal-svc/internal/handler"
 	"zoiko.io/payment-proposal-svc/internal/middleware"
+	"zoiko.io/payment-proposal-svc/internal/payableopenitem"
 	"zoiko.io/payment-proposal-svc/internal/supplierprofile"
 	"zoiko.io/payment-proposal-svc/internal/tax"
 )
@@ -86,28 +86,32 @@ func (a *stubAP) GetEligibleInvoice(_ context.Context, tenantID, legalEntityID, 
 
 var _ accountspayable.Client = (*stubAP)(nil)
 
-// ── stub expense-claim-svc client ───────────────────────────────────────────
+// ── stub payable-open-item-svc (AP-08) client ───────────────────────────────
 
-type stubClaims struct{ claims map[string]expenseclaim.Claim }
+type stubPayables struct {
+	payables map[string]payableopenitem.Payable
+}
 
-func newStubClaims() *stubClaims { return &stubClaims{claims: map[string]expenseclaim.Claim{}} }
+func newStubPayables() *stubPayables {
+	return &stubPayables{payables: map[string]payableopenitem.Payable{}}
+}
 
-func (c *stubClaims) add(id, tenantID, legalEntityID, claimant, status string, total float64) {
-	c.claims[id] = expenseclaim.Claim{
-		ClaimID: id, TenantID: tenantID, LegalEntityID: legalEntityID, ClaimantPrincipalID: claimant,
-		Currency: "USD", Status: status, TotalAmount: total,
+func (c *stubPayables) add(id, legalEntityID, payeeRef, status string, isHeld, isDisputed bool, residual float64) {
+	c.payables[id] = payableopenitem.Payable{
+		PayableID: "payable-" + id, LegalEntityID: legalEntityID, SourceReference: id, PayeeRef: payeeRef,
+		Currency: "USD", Status: status, IsHeld: isHeld, IsDisputed: isDisputed, ResidualAmount: residual,
 	}
 }
 
-func (c *stubClaims) GetEligibleClaim(_ context.Context, tenantID, legalEntityID, claimID string) (*expenseclaim.Claim, error) {
-	claim, ok := c.claims[claimID]
-	if !ok || claim.TenantID != tenantID || claim.LegalEntityID != legalEntityID || claim.Status != "REIMBURSABLE" {
+func (c *stubPayables) GetEligiblePayable(_ context.Context, _, legalEntityID, claimID string) (*payableopenitem.Payable, error) {
+	p, ok := c.payables[claimID]
+	if !ok || p.LegalEntityID != legalEntityID || p.Status != "OPEN" && p.Status != "PARTIALLY_SETTLED" || p.ResidualAmount <= 0 {
 		return nil, domain.ErrPayableNotEligible
 	}
-	return &claim, nil
+	return &p, nil
 }
 
-var _ expenseclaim.Client = (*stubClaims)(nil)
+var _ payableopenitem.Client = (*stubPayables)(nil)
 
 // ── stub supplier-financial-profile-svc client ──────────────────────────────
 
@@ -159,9 +163,9 @@ const testTenant = "tenant-ap09-1"
 const testLegalEntity = "le-ap09-1"
 const testPreparer = "principal-preparer"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, ap *stubAP, claims *stubClaims, sup *stubSupplier, tx *stubTax) chi.Router {
+func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, ap *stubAP, payables *stubPayables, sup *stubSupplier, tx *stubTax) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, ap, claims, sup, tx, logger)
+	h := handler.New(st, pub, az, ap, payables, sup, tx, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -229,7 +233,7 @@ func recalcAndReview(t *testing.T, r http.Handler, proposalID string) {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 func TestCreateProposal_Draft(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubClaims(), newStubSupplier(), &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubPayables(), newStubSupplier(), &stubTax{})
 	p := createProposal(t, r)
 	if p.Status != domain.StatusDraft {
 		t.Fatalf("expected DRAFT, got %s", p.Status)
@@ -241,7 +245,7 @@ func TestAddEligiblePayable_APInvoice(t *testing.T) {
 	ap.add("inv-1", testTenant, testLegalEntity, "vendor-1", "APPROVED", 1000)
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-1", "ACTIVE", time.Now().UTC(), "")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r)
 
 	item := addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-1"})
@@ -253,7 +257,7 @@ func TestAddEligiblePayable_APInvoice(t *testing.T) {
 func TestAddEligiblePayable_NotEligibleInvoice_Rejected(t *testing.T) {
 	ap := newStubAP()
 	ap.add("inv-2", testTenant, testLegalEntity, "vendor-1", "RECEIVED", 1000) // not yet APPROVED
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), newStubSupplier(), &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), newStubSupplier(), &stubTax{})
 	p := createProposal(t, r)
 
 	w := doRequest(r, http.MethodPost, "/ap09/proposals/"+p.ProposalID+"/items",
@@ -270,7 +274,7 @@ func TestAddEligiblePayable_OnHoldWithoutException_Rejected(t *testing.T) {
 	ap.add("inv-3", testTenant, testLegalEntity, "vendor-held", "APPROVED", 500)
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-held", "ON_HOLD", time.Now().UTC(), "")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r)
 
 	w := doRequest(r, http.MethodPost, "/ap09/proposals/"+p.ProposalID+"/items",
@@ -286,7 +290,7 @@ func TestAddEligiblePayable_OnHoldWithException_Succeeds(t *testing.T) {
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-held-2", "ON_HOLD", time.Now().UTC(), "")
 	az := &stubAuthz{}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, az, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, az, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r)
 
 	item := addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{
@@ -306,7 +310,7 @@ func TestAddEligiblePayable_DuplicatePayable_Rejected(t *testing.T) {
 	ap.add("inv-5", testTenant, testLegalEntity, "vendor-2", "APPROVED", 200)
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-2", "ACTIVE", time.Now().UTC(), "")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), sup, &stubTax{})
 	p1 := createProposal(t, r)
 	addAPInvoiceItem(t, r, p1.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-5"})
 
@@ -319,9 +323,9 @@ func TestAddEligiblePayable_DuplicatePayable_Rejected(t *testing.T) {
 }
 
 func TestAddEligiblePayable_ExpenseClaim(t *testing.T) {
-	claims := newStubClaims()
-	claims.add("claim-1", testTenant, testLegalEntity, "employee-1", "REIMBURSABLE", 250)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), claims, newStubSupplier(), &stubTax{})
+	payables := newStubPayables()
+	payables.add("claim-1", testLegalEntity, "employee-1", "OPEN", false, false, 250)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), payables, newStubSupplier(), &stubTax{})
 	p := createProposal(t, r)
 
 	item := addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceExpenseClaim, PayableID: "claim-1"})
@@ -330,12 +334,37 @@ func TestAddEligiblePayable_ExpenseClaim(t *testing.T) {
 	}
 }
 
+// TestAddEligiblePayable_ExpenseClaim_HeldRequiresException verifies the
+// real parity gap this AP-08 switch closes: an EXPENSE_CLAIM item now gets
+// the same ExceptionRef hold-override AP_INVOICE items already had —
+// expense-claim-svc itself never had a hold concept for this service to
+// check before AP-08 existed.
+func TestAddEligiblePayable_ExpenseClaim_HeldRequiresException(t *testing.T) {
+	payables := newStubPayables()
+	payables.add("claim-2", testLegalEntity, "employee-2", "OPEN", true, false, 100)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), payables, newStubSupplier(), &stubTax{})
+	p := createProposal(t, r)
+
+	w := doRequest(r, http.MethodPost, "/ap09/proposals/"+p.ProposalID+"/items",
+		domain.AddEligiblePayableRequest{PayableSource: domain.SourceExpenseClaim, PayableID: "claim-2"}, testTenant)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 held payable without exception, got %d: %s", w.Code, w.Body.String())
+	}
+
+	item := addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{
+		PayableSource: domain.SourceExpenseClaim, PayableID: "claim-2", ExceptionRef: "exception-ref-1",
+	})
+	if item.ExceptionRef != "exception-ref-1" {
+		t.Fatalf("expected exception ref recorded, got %+v", item)
+	}
+}
+
 func TestRecalculateAndSubmitForReview(t *testing.T) {
 	ap := newStubAP()
 	ap.add("inv-6", testTenant, testLegalEntity, "vendor-3", "APPROVED", 300)
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-3", "ACTIVE", time.Now().UTC(), "")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r)
 	addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-6"})
 
@@ -358,7 +387,7 @@ func TestFreezePaymentProposal_SelfFreeze_Denied(t *testing.T) {
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-4", "ACTIVE", time.Now().UTC(), "")
 	az := &stubAuthz{sodRules: true}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, az, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, az, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r) // created (prepared) by testPreparer
 	addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-7"})
 	recalcAndReview(t, r, p.ProposalID)
@@ -375,7 +404,7 @@ func TestFreezePaymentProposal_IndependentFreezer_Succeeds(t *testing.T) {
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-5", "ACTIVE", time.Now().UTC(), "")
 	az := &stubAuthz{sodRules: true}
-	r := newTestRouter(newStubStore(), &stubPublisher{}, az, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, az, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r)
 	addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-8"})
 	recalcAndReview(t, r, p.ProposalID)
@@ -398,7 +427,7 @@ func TestFreezePaymentProposal_StalePayeeIdentity_Blocked(t *testing.T) {
 	sup := newStubSupplier()
 	initialUpdatedAt := time.Now().UTC()
 	sup.set(testLegalEntity, "vendor-6", "ACTIVE", initialUpdatedAt, "")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r)
 	addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-9"})
 	recalcAndReview(t, r, p.ProposalID)
@@ -420,7 +449,7 @@ func TestFreezePaymentProposal_WentOnHoldSinceAdd_Blocked(t *testing.T) {
 	sup := newStubSupplier()
 	updatedAt := time.Now().UTC()
 	sup.set(testLegalEntity, "vendor-7", "ACTIVE", updatedAt, "")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), sup, &stubTax{})
 	p := createProposal(t, r)
 	addAPInvoiceItem(t, r, p.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-10"})
 	recalcAndReview(t, r, p.ProposalID)
@@ -441,7 +470,7 @@ func TestCancelProposal_FreesPayableForReselection(t *testing.T) {
 	ap.add("inv-11", testTenant, testLegalEntity, "vendor-8", "APPROVED", 150)
 	sup := newStubSupplier()
 	sup.set(testLegalEntity, "vendor-8", "ACTIVE", time.Now().UTC(), "")
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubClaims(), sup, &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, ap, newStubPayables(), sup, &stubTax{})
 	p1 := createProposal(t, r)
 	addAPInvoiceItem(t, r, p1.ProposalID, domain.AddEligiblePayableRequest{PayableSource: domain.SourceAPInvoice, PayableID: "inv-11"})
 
@@ -458,7 +487,7 @@ func TestCancelProposal_FreesPayableForReselection(t *testing.T) {
 }
 
 func TestGetAvailableActions_Draft(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubClaims(), newStubSupplier(), &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubPayables(), newStubSupplier(), &stubTax{})
 	p := createProposal(t, r)
 
 	w := doRequest(r, http.MethodGet, "/ap09/proposals/"+p.ProposalID+"/available-actions", nil, testTenant)
@@ -482,7 +511,7 @@ func TestGetAvailableActions_Draft(t *testing.T) {
 }
 
 func TestGetFingerprint(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubClaims(), newStubSupplier(), &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubPayables(), newStubSupplier(), &stubTax{})
 	p := createProposal(t, r)
 
 	w := doRequest(r, http.MethodGet, "/ap09/proposals/"+p.ProposalID+"/fingerprint", nil, testTenant)
@@ -499,7 +528,7 @@ func TestGetFingerprint(t *testing.T) {
 }
 
 func TestGetProposal_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubClaims(), newStubSupplier(), &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAP(), newStubPayables(), newStubSupplier(), &stubTax{})
 	w := doRequest(r, http.MethodGet, "/ap09/proposals/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
@@ -507,7 +536,7 @@ func TestGetProposal_NotFound(t *testing.T) {
 }
 
 func TestCreateProposal_AuthorizationDenied(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{deny: true}, newStubAP(), newStubClaims(), newStubSupplier(), &stubTax{})
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{deny: true}, newStubAP(), newStubPayables(), newStubSupplier(), &stubTax{})
 	req := domain.CreateProposalRequest{LegalEntityID: testLegalEntity, PayingBankAccountRef: "acct", Currency: "USD", PaymentMethod: "ACH", PaymentDate: time.Now().UTC()}
 	w := doRequest(r, http.MethodPost, "/ap09/proposals/", req, testTenant)
 	if w.Code != http.StatusForbidden {

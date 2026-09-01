@@ -420,6 +420,26 @@ Confirmed directly against the actual spec (section 11, "AP-08 — Payables") be
 
 Registered in `docker-compose.yml` (port 8164, db `payable_open_item`, depends only on `authorization-svc`) and `init-db.sh`; `expense-claim-svc` now also depends on it. `docker compose config --quiet` validated clean.
 
+**Update, same day:** the AP-09 switch-over named above as a next step is now done — see §3.17.
+
+---
+
+### 3.17 `payment-proposal-svc` (AP-09) switched to source EXPENSE_CLAIM payables from `payable-open-item-svc` — closes §3.16's own named next step (2026-09-01)
+
+`AddEligiblePayable`'s `EXPENSE_CLAIM` branch now calls AP-08's real `GetPayableBySource` (a new AP-08 query endpoint, added for this exact cross-service correlation need) instead of `expense-claim-svc` directly. `expense-claim-svc` is no longer called from this service at all — its old `internal/expenseclaim` client package is deleted.
+
+**What's real, not fabricated:**
+- The new `internal/payableopenitem` client asks AP-08 for the payable it created for `(EXPENSE_CLAIM, claimID)` and checks its real `Status`/`ResidualAmount` — a materially stronger existence/settlement check than `expense-claim-svc`'s own simple `REIMBURSABLE` status test, since AP-08 is `expense-claim-svc`'s own real payables consumer now (§3.16).
+- **A real parity gap is closed, not just relocated:** `EXPENSE_CLAIM` items now get the exact same `ExceptionRef` hold-override path `AP_INVOICE` items already had — `expense-claim-svc` never had a hold/dispute concept for this service to check at all before AP-08 existed, so this is new coverage, not a rename of an old check. Verified directly: disabling the `IsHeld`/`IsDisputed` check let a held `EXPENSE_CLAIM` payable be added without an exception reference at `201`; restored after confirming the negative control failed as expected.
+- `PayeeRef`/`NetAmount`/`Currency` now come from AP-08's own payable record (`PayeeRef`, `ResidualAmount`, `Currency`) rather than re-summing `expense-claim-svc`'s lines client-side — AP-08 is the authoritative residual now, not a value this service should independently recompute.
+- The design deliberately splits responsibility the same way the `AP_INVOICE` branch already does: the client (`GetEligiblePayable`) only confirms the payable exists, matches the legal entity, and is still a real unsettled liability; whether a held/disputed one may still be force-added is the handler's own SoD decision (`ExceptionRef` + `PAYMENT_PROPOSAL_EXCEPTION_RESOLVE`), never decided unilaterally inside the client.
+
+**Honest gap, unchanged:** `AP_INVOICE` items are still sourced directly from `accounts-payable-svc`, since AP-08 does not yet have vendor invoices wired as a source (§3.16's own remaining gap). Once that wiring exists, this branch would switch too — not started here.
+
+2 new/updated handler tests for the `EXPENSE_CLAIM` branch (basic selection from AP-08, held-without-exception blocked), plus the negative control above. Full existing AP-09 suite still green.
+
+`docker-compose.yml` updated: `payment-proposal-svc` now depends on `payable-open-item-svc` instead of `expense-claim-svc`, and carries `PAYABLE_OPEN_ITEM_SERVICE_URL` in place of `EXPENSE_CLAIM_SERVICE_URL`. `docker compose config --quiet` validated clean.
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

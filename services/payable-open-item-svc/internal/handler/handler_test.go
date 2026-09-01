@@ -296,6 +296,29 @@ func TestGetSupplierBalance(t *testing.T) {
 	}
 }
 
+func TestGetPayableBySource(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := createPayable(t, r, "claim-15", 100)
+
+	w := doRequest(r, http.MethodGet, "/ap08/payables/by-source?source_type=EXPENSE_CLAIM&source_reference=claim-15", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var found domain.PayableOpenItem
+	_ = json.Unmarshal(w.Body.Bytes(), &found)
+	if found.PayableID != p.PayableID {
+		t.Fatalf("expected the same payable found by source, got a different one")
+	}
+}
+
+func TestGetPayableBySource_NotFound(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	w := doRequest(r, http.MethodGet, "/ap08/payables/by-source?source_type=EXPENSE_CLAIM&source_reference=does-not-exist", nil, testTenant)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestGetPayable_NotFound(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
 	w := doRequest(r, http.MethodGet, "/ap08/payables/does-not-exist", nil, testTenant)
