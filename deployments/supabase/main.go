@@ -129,6 +129,15 @@ var services = []service{
 		Role:   "app_payroll_run",
 		Why:    "payroll runs and the per-line payslips they produce; a COMPLETED run is immutable by trigger",
 	},
+	{
+		Dir:    "notification-svc",
+		Schema: "notification",
+		Role:   "app_notification",
+		Why: "the register of every person-directed notice and whether it actually went out. " +
+			"Its retry worker is the one component here that reads ACROSS tenants — it does so " +
+			"under a SELECT-only platform-scope policy (0033) and projects ids alone, so this " +
+			"role needs no privilege beyond the DML the loop below grants every service",
+	},
 }
 
 // bookkeepingSchema holds the migration ledger. Kept out of every service's

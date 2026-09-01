@@ -160,3 +160,35 @@ services:
       DB_SSLMODE: require
       DB_SCHEMA: payroll_run
       DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  # ── Notification (supabase migrations 0007, 0032, 0033) ─────────────────────
+  #
+  # The register of every person-directed notice and whether it actually went
+  # out. Added when read state, recipient provenance and delivery retry landed.
+  #
+  # Two things here are unlike the services above.
+  #
+  # It is the only service in this file with an OUTBOUND dependency that is not
+  # another Zoiko service: a mail relay. The SMTP_* variables are inherited from
+  # the base compose file, which points them at the local mailpit container —
+  # that is wrong for anything but a developer's machine, so a real deployment
+  # must override them with a provider's relay and set SMTP_TLS_MODE=starttls.
+  # Left inherited rather than pinned here because the credential belongs in the
+  # environment, not in a file under version control. The service verifies them
+  # at startup and logs the result.
+  #
+  # It is also the only one whose background worker reads across tenants. That
+  # runs under 0033's SELECT-only platform-scope policy and projects notification
+  # ids alone, so app_notification needs no privilege the other roles lack — but
+  # it does mean this service must not be pointed at a schema that has not had
+  # 0033 applied, or the retry worker silently finds nothing.
+  notification-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_notification.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: notification
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
