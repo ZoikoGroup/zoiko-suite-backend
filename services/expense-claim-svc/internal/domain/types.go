@@ -37,12 +37,20 @@
 //     rather than hidden.
 //   - AP-08 "Payables": accounts-payable-svc exists but its entire model is
 //     vendor-invoice-shaped (vendor_id, CreateInvoice/ApproveInvoice) with
-//     no claimant/reimbursement concept anywhere in it. Routing an approved
-//     claim through it as a fabricated "vendor invoice" would be exactly
-//     the kind of invented integration this codebase's discipline forbids.
-//     ApproveExpenseClaim instead emits ExpenseClaimPayableRequested with
-//     no real consumer yet — an honest gap, the same class as AP-01's
-//     ORG-10 and AP-04's PO-line model.
+//     no claimant/reimbursement concept anywhere in it, so routing an
+//     approved claim through it as a fabricated "vendor invoice" was never
+//     going to happen. UPDATE: payable-open-item-svc (a real AP-08) now
+//     exists specifically to close this gap — ApproveExpenseClaim calls its
+//     real CreatePayableFromApprovedSource (internal/payableopenitem
+//     client) instead of emitting an unconsumed event. The call is
+//     deliberately best-effort, mirroring goods-service-receipt-svc's own
+//     GRNI-posting doctrine: a failure emits
+//     EXPENSE_CLAIM_PAYABLE_CREATE_FAILED for visibility but never undoes
+//     the approval that already succeeded — the claimant should not be
+//     penalized for a downstream service being unavailable at this instant.
+//     PayeeRef falls back to the claimant's own principal ID when no
+//     PaymentPreferenceRef was recorded; DueDate is "now" since nothing in
+//     this domain gives a reimbursement a negotiated payment term.
 //
 // Two scope decisions of this service's own design, not gaps in a peer:
 //
@@ -165,14 +173,15 @@ type ExpenseClaimEvent struct {
 }
 
 const (
-	EventClaimCreated            = "EXPENSE_CLAIM_CREATED"
-	EventClaimSubmitted          = "EXPENSE_CLAIM_SUBMITTED"
-	EventClaimApproved           = "EXPENSE_CLAIM_APPROVED"
-	EventClaimRejected           = "EXPENSE_CLAIM_REJECTED"
-	EventClaimReturned           = "EXPENSE_CLAIM_RETURNED"
-	EventClaimCancelled          = "EXPENSE_CLAIM_CANCELLED"
-	EventPolicyExceptionRecorded = "EXPENSE_CLAIM_POLICY_EXCEPTION_RECORDED"
-	EventClaimPayableRequested   = "EXPENSE_CLAIM_PAYABLE_REQUESTED"
+	EventClaimCreated             = "EXPENSE_CLAIM_CREATED"
+	EventClaimSubmitted           = "EXPENSE_CLAIM_SUBMITTED"
+	EventClaimApproved            = "EXPENSE_CLAIM_APPROVED"
+	EventClaimRejected            = "EXPENSE_CLAIM_REJECTED"
+	EventClaimReturned            = "EXPENSE_CLAIM_RETURNED"
+	EventClaimCancelled           = "EXPENSE_CLAIM_CANCELLED"
+	EventPolicyExceptionRecorded  = "EXPENSE_CLAIM_POLICY_EXCEPTION_RECORDED"
+	EventClaimPayableCreated      = "EXPENSE_CLAIM_PAYABLE_CREATED"
+	EventClaimPayableCreateFailed = "EXPENSE_CLAIM_PAYABLE_CREATE_FAILED"
 )
 
 // ── request DTOs ────────────────────────────────────────────────────────────
@@ -235,5 +244,6 @@ const (
 	ErrMissingRequiredReceipt     = sentinel("one or more expense lines exceed the receipt-required threshold without an attached, verified receipt")
 	ErrTaxDeterminationFailed     = sentinel("tax-determination-svc call failed for a line claiming tax recovery")
 	ErrPolicyServiceUnavailable   = sentinel("policy-svc unavailable")
+	ErrPayableServiceUnavailable  = sentinel("payable-open-item-svc unavailable")
 	ErrStoreUnavailable           = sentinel("store unavailable")
 )

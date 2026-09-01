@@ -14,6 +14,7 @@ import (
 	"zoiko.io/payment-authorization-svc/internal/domain"
 	"zoiko.io/payment-authorization-svc/internal/events"
 	svcmiddleware "zoiko.io/payment-authorization-svc/internal/middleware"
+	"zoiko.io/payment-authorization-svc/internal/payeeidentity"
 	"zoiko.io/payment-authorization-svc/internal/paymentproposal"
 	"zoiko.io/payment-authorization-svc/internal/policy"
 	"zoiko.io/payment-authorization-svc/internal/store"
@@ -45,12 +46,13 @@ type Handler struct {
 	authz    AuthzChecker
 	proposal paymentproposal.Client
 	supplier supplierprofile.Client
+	payee    payeeidentity.Client
 	policy   policy.Client
 	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, proposal paymentproposal.Client, supplier supplierprofile.Client, pol policy.Client, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, proposal: proposal, supplier: supplier, policy: pol, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, proposal paymentproposal.Client, supplier supplierprofile.Client, payee payeeidentity.Client, pol policy.Client, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, proposal: proposal, supplier: supplier, payee: payee, policy: pol, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -173,7 +175,17 @@ func (h *Handler) RequestPaymentAuthorization(w http.ResponseWriter, r *http.Req
 		if item.PayeeSnapshotAt == nil {
 			continue
 		}
-		snapshots = append(snapshots, domain.PayeeSnapshot{PayeeRef: item.PayeeRef, PayeeSnapshotAt: *item.PayeeSnapshotAt})
+		snap := domain.PayeeSnapshot{PayeeRef: item.PayeeRef, PayeeSnapshotAt: *item.PayeeSnapshotAt}
+		// payee-banking-identity-svc (ORG-10) — best-effort at request time:
+		// a payee with no ORG-10 coverage yet is a real, expected absence,
+		// not a failure (see internal/domain's package doc). Only a
+		// genuine ORG-10 outage is logged; either way the request proceeds.
+		if dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, proposal.LegalEntityID, item.PayeeRef); err == nil {
+			snap.DestinationID = dest.DestinationID
+		} else if !errors.Is(err, domain.ErrNoActiveDestination) {
+			h.log.Warn("RequestPaymentAuthorization: payee-banking-identity-svc lookup failed — proceeding without a pinned destination", zap.Error(err))
+		}
+		snapshots = append(snapshots, snap)
 	}
 
 	auth := domain.PaymentAuthorization{
@@ -255,6 +267,29 @@ func (h *Handler) verifyStillEligible(w http.ResponseWriter, r *http.Request, a 
 		if !profile.UpdatedAt.Equal(snap.PayeeSnapshotAt) {
 			_, _ = h.store.InvalidateAuthorization(r.Context(), a.AuthorizationID, "payee identity changed since authorization was requested")
 			writeError(w, http.StatusConflict, "payee identity has changed; authorization invalidated")
+			return false
+		}
+		if snap.DestinationID == "" {
+			continue // no ORG-10 coverage was on file at request time — nothing to re-check
+		}
+		dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, a.LegalEntityID, snap.PayeeRef)
+		if errors.Is(err, domain.ErrNoActiveDestination) {
+			// A destination that was pinned at request time and is no
+			// longer the active one at all (superseded/suspended with no
+			// replacement yet) is exactly as much a change as a different
+			// DestinationID would be.
+			_, _ = h.store.InvalidateAuthorization(r.Context(), a.AuthorizationID, "payee's active banking destination changed since authorization was requested")
+			writeError(w, http.StatusConflict, domain.ErrPayeeDestinationChanged.Error())
+			return false
+		}
+		if err != nil {
+			h.log.Error("verifyStillEligible: payee-banking-identity-svc lookup failed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, domain.ErrPayeeDestinationServiceUnavailable.Error())
+			return false
+		}
+		if dest.DestinationID != snap.DestinationID {
+			_, _ = h.store.InvalidateAuthorization(r.Context(), a.AuthorizationID, "payee's active banking destination changed since authorization was requested")
+			writeError(w, http.StatusConflict, domain.ErrPayeeDestinationChanged.Error())
 			return false
 		}
 	}
@@ -560,6 +595,14 @@ func (h *Handler) ValidateAuthorization(w http.ResponseWriter, r *http.Request) 
 			if !profile.UpdatedAt.Equal(snap.PayeeSnapshotAt) {
 				valid = false
 				reasons = append(reasons, "payee "+snap.PayeeRef+" identity has changed")
+			}
+			if snap.DestinationID == "" {
+				continue
+			}
+			dest, err := h.payee.GetActiveDestination(r.Context(), verifiedTenant, a.LegalEntityID, snap.PayeeRef)
+			if err != nil || dest.DestinationID != snap.DestinationID {
+				valid = false
+				reasons = append(reasons, "payee "+snap.PayeeRef+"'s active banking destination has changed")
 			}
 		}
 	}

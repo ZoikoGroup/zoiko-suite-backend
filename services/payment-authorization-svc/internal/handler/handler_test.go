@@ -17,6 +17,7 @@ import (
 	"zoiko.io/payment-authorization-svc/internal/events"
 	"zoiko.io/payment-authorization-svc/internal/handler"
 	"zoiko.io/payment-authorization-svc/internal/middleware"
+	"zoiko.io/payment-authorization-svc/internal/payeeidentity"
 	"zoiko.io/payment-authorization-svc/internal/paymentproposal"
 	"zoiko.io/payment-authorization-svc/internal/policy"
 	"zoiko.io/payment-authorization-svc/internal/supplierprofile"
@@ -125,6 +126,30 @@ func (s *stubSupplier) FindActiveProfile(_ context.Context, _, legalEntityID, su
 
 var _ supplierprofile.Client = (*stubSupplier)(nil)
 
+// ── stub payee-banking-identity-svc (ORG-10) client ─────────────────────────
+
+type stubPayee struct {
+	destinations map[string]payeeidentity.Destination
+}
+
+func newStubPayee() *stubPayee {
+	return &stubPayee{destinations: map[string]payeeidentity.Destination{}}
+}
+
+func (p *stubPayee) set(legalEntityID, payeeRef, destinationID string) {
+	p.destinations[legalEntityID+"|"+payeeRef] = payeeidentity.Destination{DestinationID: destinationID, LegalEntityID: legalEntityID, Status: "ACTIVE"}
+}
+
+func (p *stubPayee) GetActiveDestination(_ context.Context, _, legalEntityID, payeeRef string) (*payeeidentity.Destination, error) {
+	d, ok := p.destinations[legalEntityID+"|"+payeeRef]
+	if !ok {
+		return nil, domain.ErrNoActiveDestination
+	}
+	return &d, nil
+}
+
+var _ payeeidentity.Client = (*stubPayee)(nil)
+
 // ── stub policy-svc client ──────────────────────────────────────────────────
 
 type stubPolicy struct{ result string }
@@ -145,8 +170,12 @@ const testLegalEntity = "le-ap10-1"
 const testPreparer = "principal-preparer"
 
 func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, prop *stubProposal, sup *stubSupplier, pol *stubPolicy) chi.Router {
+	return newTestRouterWithPayee(st, pub, az, prop, sup, newStubPayee(), pol)
+}
+
+func newTestRouterWithPayee(st *stubStore, pub *stubPublisher, az *stubAuthz, prop *stubProposal, sup *stubSupplier, payee *stubPayee, pol *stubPolicy) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, prop, sup, pol, logger)
+	h := handler.New(st, pub, az, prop, sup, payee, pol, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -323,6 +352,93 @@ func TestApprovePayment_PayeeIdentityChanged_Invalidated(t *testing.T) {
 	w := doRequestAs(r, http.MethodPost, "/ap10/authorizations/"+a.AuthorizationID+"/approve", nil, testTenant, "principal-checker")
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 payee identity changed, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestRequestPaymentAuthorization_PinsPayeeDestination is the first real
+// caller of payee-banking-identity-svc's (ORG-10) GetActivePayeeDestination
+// anywhere in this codebase — closing ORG-10's own named dependency
+// ("AP-10 fingerprints active version").
+func TestRequestPaymentAuthorization_PinsPayeeDestination(t *testing.T) {
+	prop := newStubProposal()
+	sup := newStubSupplier()
+	setupFrozenProposal(prop, sup, "prop-9", "vendor-8", time.Now().UTC(), 100)
+	payee := newStubPayee()
+	payee.set(testLegalEntity, "vendor-8", "destination-abc")
+	r := newTestRouterWithPayee(newStubStore(), &stubPublisher{}, &stubAuthz{}, prop, sup, payee, &stubPolicy{})
+
+	a := requestAuthorization(t, r, "prop-9")
+
+	w := doRequest(r, http.MethodGet, "/ap10/authorizations/"+a.AuthorizationID, nil, testTenant)
+	var resp struct {
+		PayeeSnapshots []domain.PayeeSnapshot `json:"payee_snapshots"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if len(resp.PayeeSnapshots) != 1 || resp.PayeeSnapshots[0].DestinationID != "destination-abc" {
+		t.Fatalf("expected the ORG-10 destination pinned on the snapshot, got %+v", resp.PayeeSnapshots)
+	}
+}
+
+// TestRequestPaymentAuthorization_NoORG10Coverage_ProceedsWithoutDestination
+// verifies ORG-10 coverage is genuinely optional at request time — a payee
+// ORG-10 has never onboarded is a real, current gap, not a blocker.
+func TestRequestPaymentAuthorization_NoORG10Coverage_ProceedsWithoutDestination(t *testing.T) {
+	prop := newStubProposal()
+	sup := newStubSupplier()
+	setupFrozenProposal(prop, sup, "prop-10", "vendor-9", time.Now().UTC(), 100)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, prop, sup, &stubPolicy{}) // default stubPayee has no coverage for anyone
+
+	a := requestAuthorization(t, r, "prop-10")
+	if a.Status != domain.StatusPending {
+		t.Fatalf("expected PENDING despite no ORG-10 coverage, got %s", a.Status)
+	}
+}
+
+// TestApprovePayment_PayeeDestinationChanged_Invalidated is the literal
+// enforcement of ORG-10's own dependency: a destination that has since
+// been superseded invalidates the authorization exactly like a changed
+// supplier profile identity.
+func TestApprovePayment_PayeeDestinationChanged_Invalidated(t *testing.T) {
+	prop := newStubProposal()
+	sup := newStubSupplier()
+	setupFrozenProposal(prop, sup, "prop-11", "vendor-10", time.Now().UTC(), 100)
+	payee := newStubPayee()
+	payee.set(testLegalEntity, "vendor-10", "destination-original")
+	r := newTestRouterWithPayee(newStubStore(), &stubPublisher{}, &stubAuthz{}, prop, sup, payee, &stubPolicy{})
+	a := requestAuthorization(t, r, "prop-11")
+
+	// The supplier proposes and activates a new destination — a real
+	// change ORG-10 would report the moment it happens.
+	payee.set(testLegalEntity, "vendor-10", "destination-superseding")
+
+	w := doRequestAs(r, http.MethodPost, "/ap10/authorizations/"+a.AuthorizationID+"/approve", nil, testTenant, "principal-checker")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 payee destination changed, got %d: %s", w.Code, w.Body.String())
+	}
+
+	fetched, _ := newStubStoreFind(t, r, a.AuthorizationID, testTenant)
+	if fetched.Status != domain.StatusInvalidated {
+		t.Fatalf("expected INVALIDATED, got %s", fetched.Status)
+	}
+}
+
+// TestApprovePayment_PayeeDestinationRemoved_Invalidated covers the
+// destination being suspended with no replacement yet — ORG-10 reports no
+// active destination at all, still a real change from what was pinned.
+func TestApprovePayment_PayeeDestinationRemoved_Invalidated(t *testing.T) {
+	prop := newStubProposal()
+	sup := newStubSupplier()
+	setupFrozenProposal(prop, sup, "prop-12", "vendor-11", time.Now().UTC(), 100)
+	payee := newStubPayee()
+	payee.set(testLegalEntity, "vendor-11", "destination-x")
+	r := newTestRouterWithPayee(newStubStore(), &stubPublisher{}, &stubAuthz{}, prop, sup, payee, &stubPolicy{})
+	a := requestAuthorization(t, r, "prop-12")
+
+	delete(payee.destinations, testLegalEntity+"|vendor-11")
+
+	w := doRequestAs(r, http.MethodPost, "/ap10/authorizations/"+a.AuthorizationID+"/approve", nil, testTenant, "principal-checker")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 payee destination removed, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

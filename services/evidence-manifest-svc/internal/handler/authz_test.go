@@ -45,7 +45,7 @@ func routerWithAuthz(t *testing.T, az handler.AuthzChecker) chi.Router {
 	gov, acc, wf, pub := scopeTestSources()
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(newStubStore(), gov, acc, wf, pub, az, zap.NewNop())
+	h := handler.New(newStubStore(), gov, acc, wf, &stubWorkflowHistory{}, pub, az, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -160,7 +160,7 @@ func TestAuthzDenied_OnExistingManifest_Is403(t *testing.T) {
 	granting := &stubAuthz{}
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(store, gov, acc, wf, pub, granting, zap.NewNop())
+	h := handler.New(store, gov, acc, wf, &stubWorkflowHistory{}, pub, granting, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 
 	seedReq := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(generateBody(t, "t1")))

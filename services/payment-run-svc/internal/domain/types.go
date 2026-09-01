@@ -19,26 +19,41 @@
 // building this service at all, rather than silently fabricating a fake
 // bank integration to look complete.
 //
-// What that means concretely, command by command:
+// UPDATE — this gap is now half-closed by wiring to BNK-06/BNK-07 (the two
+// real Banking services this package doc originally said didn't exist yet
+// as real callers of AP-11). What changed, command by command:
 //
-//   - SubmitPaymentRun does not call any bank. It records that submission
-//     was attempted (moving LOCKED -> SUBMITTED) and nothing more. There is
-//     no real "Pending/Unknown" distinction to make without a real
-//     provider response, so this service collapses the spec's
-//     Submitted -> Pending/Unknown into one SUBMITTED status.
-//   - ReconcilePaymentRunStatus is not a webhook receiver — there is no
-//     real callback to receive. It is a command an operator calls with a
-//     caller-attested ExternalStatus and ProviderEventRef, the same
-//     "record a real external fact a human observed, then enforce the
-//     machine-checkable invariant on top of it" doctrine already used for
-//     AP-01's high-risk-change approvals and every opaque reference field
-//     in this domain. Negative-path scenario #2 ("provider callback
-//     forged/replayed") is reinterpreted as its nearest real, buildable
-//     equivalent: a repeat call with the same ProviderEventRef against the
-//     same instruction is idempotent (a genuine database uniqueness
-//     constraint), never double-applied — the closest this service can
-//     honestly get to "replay protection" without a real callback to
-//     verify a signature on.
+//   - SubmitPaymentRun now calls BNK-06's PrepareAttempt+SubmitAttempt for
+//     every instruction (internal/provideradapter client), and records the
+//     resulting canonical execution record with BNK-07's RecordPaymentStatus
+//     (internal/paymentstatus client) before ever transitioning the run
+//     itself from LOCKED to SUBMITTED — mirroring LockPaymentRun's own
+//     "do the real work first, only then transition; any failure raises
+//     EXCEPTION instead of a silent partial state" discipline. This is a
+//     REAL handoff to Banking now, not a no-op.
+//   - What is still honestly not real: BNK-06's own Provider Adapter behind
+//     that call is a documented stub (see payment-initiation-adapter-svc's
+//     own package doc) — no actual bank/PSP network call exists anywhere in
+//     this codebase. Wiring AP-11 to BNK-06/BNK-07 moves the one remaining
+//     honest gap down to exactly that boundary, and no further.
+//   - PollInstructionStatus (new) queries BNK-07's real canonical
+//     GetPaymentStatus for the instruction's own bnk07_payment_id and
+//     reconciles the run from that real answer — this is what
+//     ReconcilePaymentRunStatus used to have to fake with a caller-attested
+//     ExternalStatus. ReconcilePaymentRunStatus itself is kept as a
+//     deliberate, separate manual-override path (an operator recording a
+//     real external fact some other way BNK-07 didn't capture) rather than
+//     removed — the same "record a real external fact a human observed"
+//     doctrine used throughout this session. Negative-path scenario #2
+//     ("provider callback forged/replayed") is enforced identically either
+//     way: a repeat call with the same ProviderEventRef against the same
+//     instruction is idempotent (a genuine database uniqueness constraint),
+//     never double-applied.
+//   - PayerAccountVerified is asserted true when calling BNK-06 — AP-09/
+//     AP-10 already treat the paying bank account reference as opaque (no
+//     real account-status source exists anywhere in this codebase, exactly
+//     as BNK-06's own package doc says), so this is the same caller-
+//     attestation gate BNK-06 itself defines, not a new fabrication.
 //
 // What IS real, not fabricated:
 //
@@ -153,6 +168,13 @@ type RunInstruction struct {
 	ConsumedAt       *time.Time
 	ProviderEventRef string
 
+	// ProviderAttemptID correlates to BNK-06's PaymentInitiationAttempt;
+	// Bnk07PaymentID correlates to BNK-07's PaymentExecutionState. Both are
+	// set exactly once, at first real submission to Banking (SubmitPaymentRun),
+	// and are immutable afterward — enforced by a database trigger.
+	ProviderAttemptID string
+	Bnk07PaymentID    string
+
 	CreatedAt time.Time
 }
 
@@ -229,4 +251,7 @@ const (
 	ErrIdempotencyKeyRequired          = sentinel("idempotency_key is required")
 	ErrProviderEventAlreadyApplied     = sentinel("this provider event has already been applied")
 	ErrStoreUnavailable                = sentinel("store unavailable")
+	ErrProviderAdapterUnavailable      = sentinel("payment-initiation-adapter-svc unavailable")
+	ErrPaymentStatusUnavailable        = sentinel("payment-status-svc unavailable")
+	ErrInstructionNotSubmitted         = sentinel("instruction was never submitted to Banking; nothing to poll")
 )

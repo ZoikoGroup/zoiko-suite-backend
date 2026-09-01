@@ -24,6 +24,13 @@ type Config struct {
 	// internal/authz.HTTPClient.
 	AuthZServiceURL string
 
+	// PayableOpenItemServiceURL is the base URL of payable-open-item-svc
+	// (AP-08) — ApproveInvoice calls its real CreatePayableFromApprovedSource
+	// once an invoice reaches APPROVED, deliberately best-effort (never
+	// blocks the approval that already succeeded). See internal/handler's
+	// doc comment on ApproveInvoice.
+	PayableOpenItemServiceURL string
+
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
 	// Disabled by default — AuthZServiceURL (plain HTTP) keeps being used
@@ -93,6 +100,8 @@ func Load() (*Config, error) {
 		},
 		AuthZServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+
+		PayableOpenItemServiceURL: env("PAYABLE_OPEN_ITEM_SERVICE_URL", "http://payable-open-item-svc:8164"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

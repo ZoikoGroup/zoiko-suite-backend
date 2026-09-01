@@ -42,6 +42,19 @@
 //     FIFTH reuse of that feature this session (after AP-01, AP-04, AP-07,
 //     AP-09), directly enforcing negative-path scenario #3 ("proposal
 //     maker self-authorizes where prohibited").
+//   - UPDATE: payee-banking-identity-svc (ORG-10)'s real
+//     GetActivePayeeDestination is now consulted at RequestPaymentAuthorization
+//     time for every AP_INVOICE-sourced payee, pinning its active
+//     destination as PayeeSnapshot.DestinationID when ORG-10 has one on
+//     file — closing ORG-10's own named dependency ("AP-10 fingerprints
+//     active version"). verifyStillEligible re-checks it live at both
+//     ApprovePayment and ConsumePaymentAuthorization exactly like the
+//     supplier-profile identity check: a destination that has since been
+//     superseded or suspended invalidates the authorization, the same
+//     "any protected-field mismatch invalidates" doctrine. When ORG-10 has
+//     no destination on file for a payee (real, current coverage gap —
+//     ORG-10 is new), DestinationID stays empty and no re-check is made
+//     for that payee — an honest absence, not a fabricated pass.
 //
 // Two honest gaps, not fabricated:
 //
@@ -127,12 +140,20 @@ type PaymentAuthorization struct {
 // version it authorized against — copied from AP-09's own item snapshots
 // at RequestPaymentAuthorization time, then independently re-verified
 // live at ApprovePayment and ConsumePaymentAuthorization. See package doc.
+//
+// DestinationID additionally pins payee-banking-identity-svc's (ORG-10)
+// active destination for this payee at request time, when ORG-10 has one
+// on file — empty otherwise (ORG-10 coverage is not yet complete across
+// every existing payee, a real, current gap rather than a fabricated
+// absence). When non-empty, verifyStillEligible re-checks it live exactly
+// like the supplier-profile identity check.
 type PayeeSnapshot struct {
 	SnapshotID      string
 	TenantID        *string
 	AuthorizationID string
 	PayeeRef        string
 	PayeeSnapshotAt time.Time
+	DestinationID   string
 	CreatedAt       time.Time
 }
 
@@ -177,14 +198,17 @@ type sentinel string
 func (s sentinel) Error() string { return string(s) }
 
 const (
-	ErrAuthorizationNotFound      = sentinel("payment authorization not found")
-	ErrInvalidTransition          = sentinel("invalid payment authorization state transition")
-	ErrProposalNotEligible        = sentinel("proposal does not exist, does not belong to this legal entity, or is not FROZEN")
-	ErrProposalServiceUnavailable = sentinel("payment-proposal-svc unavailable")
-	ErrProposalAlreadyRequested   = sentinel("proposal already has an active (non-terminal) authorization request")
-	ErrFingerprintMismatch        = sentinel("proposal fingerprint no longer matches the one captured at request time")
-	ErrPayeeIdentityStale         = sentinel("a payee identity has changed since this authorization was requested")
-	ErrPayeeServiceUnavailable    = sentinel("supplier-financial-profile-svc unavailable")
-	ErrPolicyServiceUnavailable   = sentinel("policy-svc unavailable")
-	ErrStoreUnavailable           = sentinel("store unavailable")
+	ErrAuthorizationNotFound              = sentinel("payment authorization not found")
+	ErrInvalidTransition                  = sentinel("invalid payment authorization state transition")
+	ErrProposalNotEligible                = sentinel("proposal does not exist, does not belong to this legal entity, or is not FROZEN")
+	ErrProposalServiceUnavailable         = sentinel("payment-proposal-svc unavailable")
+	ErrProposalAlreadyRequested           = sentinel("proposal already has an active (non-terminal) authorization request")
+	ErrFingerprintMismatch                = sentinel("proposal fingerprint no longer matches the one captured at request time")
+	ErrPayeeIdentityStale                 = sentinel("a payee identity has changed since this authorization was requested")
+	ErrPayeeServiceUnavailable            = sentinel("supplier-financial-profile-svc unavailable")
+	ErrPayeeDestinationChanged            = sentinel("a payee's active banking destination has changed since this authorization was requested")
+	ErrPayeeDestinationServiceUnavailable = sentinel("payee-banking-identity-svc unavailable")
+	ErrNoActiveDestination                = sentinel("payee-banking-identity-svc has no active destination on file for this payee")
+	ErrPolicyServiceUnavailable           = sentinel("policy-svc unavailable")
+	ErrStoreUnavailable                   = sentinel("store unavailable")
 )
