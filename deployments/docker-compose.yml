@@ -38,6 +38,7 @@ services:
       - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
       - ../services/payable-open-item-svc/deployments/migrations:/migrations/payable-open-item:ro
       - ../services/supplier-recovery-svc/deployments/migrations:/migrations/supplier-recovery:ro
+      - ../services/payee-banking-identity-svc/deployments/migrations:/migrations/payee-banking-identity:ro
       - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
       - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/payment-authorization-svc/deployments/migrations:/migrations/payment-authorization:ro
@@ -2815,6 +2816,65 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── payee-banking-identity-svc (Port: 8166) ──────────────────────────────
+  # ORG-10 of the Organization, Legal Entity & Global Reference Data
+  # baseline — Banking Identity / Payee Master. Closes a gap FOUR
+  # already-built AP services each named by this exact document ID:
+  # supplier-financial-profile-svc (AP-01), payable-open-item-svc (AP-08),
+  # payment-proposal-svc (AP-09), and payment-run-svc (AP-11) all treat a
+  # payee/bank-account reference as opaque and caller-supplied because "no
+  # such ORG-10 service exists anywhere in this codebase." This service is
+  # that ORG-10 — scoped, per spec, to EXTERNAL beneficiary/payee banking
+  # identity only; a tenant's OWN bank account remains BNK-01's
+  # (banking-connector-svc's) responsibility.
+  # ProposePayeeDestination verifies the named party against
+  # counterparty-management-svc's real GET /v1/counterparties/{id}.
+  # "Invoice-supplied bank data never activates destination" is enforced
+  # structurally: an INVOICE_OCR/EMAIL-sourced candidate can never reach
+  # VERIFIED through a verification method that isn't genuinely
+  # independent of its own source. Maker-checker for ApprovePayeeDestination
+  # reuses authorization-svc's dynamic own-object SoD layer. "Only one
+  # active version per party/scope" is enforced by a real database partial
+  # unique index plus an in-transaction supersession of whatever was
+  # previously active. Full account identifiers are masked on every read
+  # except through a dedicated, more strongly authorized privileged-read
+  # path. Honest gaps: no real "BNK provider validation" exists anywhere in
+  # this codebase, so VerifyPayeeDestination is caller-attested; AP-10's own
+  # named dependency (consulting this service's active destination
+  # fingerprint before authorizing) is not yet wired.
+  payee-banking-identity-svc:
+    build:
+      context: ../services/payee-banking-identity-svc
+      dockerfile: Dockerfile
+    container_name: payee-banking-identity-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8166:8166"
+    environment:
+      PORT: "8166"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payee_banking_identity?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payee-banking-identity.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      COUNTERPARTY_SERVICE_URL: "http://counterparty-management-svc:8124"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      counterparty-management-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

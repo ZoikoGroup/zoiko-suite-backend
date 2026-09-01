@@ -509,6 +509,31 @@ Registered in `docker-compose.yml` (port 8165, db `supplier_recovery`, depends o
 
 ---
 
+### 3.21 `payee-banking-identity-svc` — new service, ORG-10 of the Organization, Legal Entity & Global Reference Data baseline (2026-09-01)
+
+Scoped by a dedicated research sweep of this session's own package docs: four already-built services — `supplier-financial-profile-svc` (AP-01), `payable-open-item-svc` (AP-08), `payment-proposal-svc` (AP-09), and `payment-run-svc` (AP-11) — each independently treat a payee/bank-account reference as opaque and caller-supplied, citing the exact same reason: "no such ORG-10 service exists anywhere in this codebase." Confirmed directly against the spec (section 4.10, "Banking Identity / Payee Master") before writing any code — ORG-10 is explicitly scoped to **external** beneficiary/payee banking identity only; a tenant's own bank account remains BNK-01's (`banking-connector-svc`'s) responsibility.
+
+**What's real, not fabricated:**
+- `ProposePayeeDestination` verifies the named party against `counterparty-management-svc`'s real `GET /v1/counterparties/{id}` (ORG-07) — confirms it exists and belongs to the right legal entity before a candidate is ever created against it.
+- The spec's own "Minimum service acceptance" #1 ("invoice-supplied bank data never activates destination") is enforced structurally: a candidate sourced from `INVOICE_OCR` or `EMAIL` can never reach `VERIFIED` through a verification method that isn't genuinely independent of its own source (`domain.CanVerify`). Verified directly: disabling that check let an invoice-sourced candidate verify against its own source method at `200`; confirmed as a negative control, then restored.
+- Maker-checker for `ApprovePayeeDestination` reuses `authorization-svc`'s dynamic own-object SoD layer — the destination's own proposer cannot approve it, the literal enforcement of the spec's own SoD line ("supplier-profile editor cannot alone activate changed beneficiary details").
+- "Only one active version per party/scope" (the spec's own idempotency/concurrency line) is enforced by a real database partial unique index, with activation of a new destination superseding whatever was previously `ACTIVE` for the same party/scope in the same transaction. Verified directly: disabling the in-transaction supersession left two destinations simultaneously `ACTIVE` for the same party; confirmed as a negative control, then restored.
+- A real destination-candidate fingerprint (SHA-256 over institution + account + currency) detects duplicate proposals via a genuine database uniqueness constraint, scoped to non-superseded rows so a legitimately retired-then-reused account isn't permanently blocked.
+- Full account identifiers are masked on every read except through a dedicated, more strongly authorized privileged-read path (`PAYEE_MASTER_PRIVILEGED_READ`) — the literal enforcement of "full account never overexposed."
+
+**Scope decision, not a gap in a peer:** `ApprovePayeeDestination` moves `VERIFIED → APPROVAL_PENDING` — the spec's own state model names `ApprovalPending` but its command list has no separate command to reach it before `Approve`, and no distinct `Approved` state at all; read here as "approved, awaiting the mechanical `ActivateDestination` step," the same kind of consolidation applied throughout this session wherever the spec names a state with no dedicated command.
+
+**Honest gaps, not fabricated:**
+- No real "BNK provider validation" (the spec's own named dependency for independent verification) exists anywhere in this codebase — confirmed during this session's own direct research before BNK-06 was built, and unchanged since. `VerifyPayeeDestination` is therefore caller-attested, requiring real evidence fields, never a fabricated automatic verification call.
+- AP-10's own named dependency — payment authorization consulting this service's active destination fingerprint before authorizing — is **not wired** in this build. Scoped as the natural next step, mirroring exactly how AP-11 was wired to BNK-06/BNK-07 in a later turn after those services were first built standalone.
+- Full account identifiers are stored without field-level encryption via a real KMS/`secret-vault-integration-svc` call — masking is real and enforced at the read layer, but at-rest encryption of the raw value is an honest gap, the same posture every other service handling sensitive reference data in this codebase already has.
+
+10 handler tests, all passing; two negative controls verified as described above.
+
+Registered in `docker-compose.yml` (port 8166, db `payee_banking_identity`, depends on `authorization-svc` and `counterparty-management-svc`) and `init-db.sh`. `docker compose config --quiet` validated clean.
+
+---
+
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)
 
 - `tenant-entity-registry-svc`'s schema matches `ZS-SVC-I-001`'s canonical Tenant→LegalEntity→OrgUnit model almost field-for-field; its RLS posture (explicit WHERE-clause enforcement, RLS as defense-in-depth only, because the runtime connects as Postgres superuser) exceeds the doc's minimum.
