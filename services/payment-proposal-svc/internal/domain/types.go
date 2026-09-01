@@ -23,35 +23,44 @@
 // Real integrations, verified against each peer's actual code before this
 // service was written:
 //
-//   - accounts-payable-svc's real GET /v1/invoices/{id}: an APPROVED
-//     invoice is eligible for selection. It has no hold/disputed status of
-//     its own and no bank/payee reference field at all.
-//   - UPDATE: EXPENSE_CLAIM items are now verified against
-//     payable-open-item-svc (AP-08) instead of expense-claim-svc directly —
-//     the same switch AP-08's own package doc names as its natural next
-//     wiring step. AP-08's real open/residual/held/disputed state is a
-//     materially stronger check than expense-claim-svc's own simple
-//     REIMBURSABLE status test, and it gives EXPENSE_CLAIM items the same
-//     ExceptionRef hold-override path AP_INVOICE items already had — a real
-//     parity gap this switch closes, not just a relocation of the same
-//     check. PayeeRef/NetAmount/Currency now come from AP-08's own payable
-//     record (PayeeRef, ResidualAmount, Currency) rather than re-summing
-//     expense-claim-svc's lines, since AP-08 is the authoritative residual
-//     now. expense-claim-svc itself is no longer called from this service.
+//   - UPDATE: both AP_INVOICE and EXPENSE_CLAIM items are now verified
+//     against payable-open-item-svc (AP-08) — a single client, one real
+//     source of truth for both, replacing the original two separate direct
+//     calls to accounts-payable-svc and expense-claim-svc. This was done in
+//     two steps in this session (EXPENSE_CLAIM first, then AP_INVOICE,
+//     mirroring how AP-08 itself gained its two sources one at a time) but
+//     the end state treats both sources identically: GetEligiblePayable
+//     confirms the AP-08 payable exists, belongs to the right legal entity,
+//     and is still open/residual — a materially stronger check than either
+//     peer's own simple status test, since AP-08 is now both peers' real
+//     payables consumer (see their own updated package docs). PayeeRef/
+//     GrossAmount/NetAmount/Currency/DueDate all come from AP-08's own
+//     payable record now, not from re-fetching either upstream service's
+//     invoice/claim directly — AP-08 is the authoritative residual and
+//     identity for both. Neither accounts-payable-svc nor expense-claim-svc
+//     is called from this service anymore.
+//   - A real parity gap is closed by this unification, not just relocated:
+//     both source types now get the exact same ExceptionRef hold-override
+//     path from AP-08's own IsHeld/IsDisputed fields. Previously only
+//     AP_INVOICE items could be held (via supplier-financial-profile-svc's
+//     ON_HOLD), and EXPENSE_CLAIM items had no hold concept to check at
+//     all. Now either source type can be held at the AP-08 payable level
+//     (e.g. a supplier dispute recorded directly on the payable) in
+//     addition to AP_INVOICE's own supplier-level hold below — a payable
+//     is blocked from selection if EITHER signal says held/disputed.
 //   - supplier-financial-profile-svc's real GET /ap01/supplier-financial-profiles
-//     (list, unfiltered — it has no server-side filter by supplier_ref) is
-//     the real source of a hold concept for AP_INVOICE items: its ON_HOLD
-//     status is negative-path scenario #1's literal enforcement point — an
+//     (list, unfiltered — it has no server-side filter by supplier_ref)
+//     remains a second, additional real source of a hold concept for
+//     AP_INVOICE items specifically — a SUPPLIER-level signal AP-08 itself
+//     has no way to know about, since AP-08 only tracks one payable at a
+//     time, not a supplier's overall standing. Its ON_HOLD status is
+//     negative-path scenario #1's literal enforcement point — an
 //     AP_INVOICE item whose supplier profile is ON_HOLD is rejected unless
 //     the caller supplies a non-empty ExceptionRef (a controlled,
 //     caller-attested override, the same "opaque approval reference"
 //     doctrine as AP-01's ToleranceExceptionRef/AP-04's
-//     ToleranceExceptionRef). accounts-payable-svc itself has no hold
-//     concept, so this is the only place a hold signal can come from for
-//     that source. EXPENSE_CLAIM items now get the exact same override
-//     pattern from AP-08's own IsHeld/IsDisputed fields — a real gap this
-//     switch closes, since expense-claim-svc never had a hold concept for
-//     this service to check at all before AP-08 existed.
+//     ToleranceExceptionRef). This lookup is skipped entirely for
+//     EXPENSE_CLAIM items — a claimant has no "supplier profile" concept.
 //   - supplier-financial-profile-svc's `updated_at` is the only available
 //     staleness signal for negative-path scenario #4 ("payment uses stale
 //     payee identity version") — there is no version/revision column on

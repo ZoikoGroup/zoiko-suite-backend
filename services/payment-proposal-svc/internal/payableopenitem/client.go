@@ -1,15 +1,14 @@
-// Package payableopenitem verifies an EXPENSE_CLAIM payable against the
-// real payable-open-item-svc (AP-08) before it can be selected into a
-// payment proposal — replacing the previous direct call to
-// expense-claim-svc. AP-08 is expense-claim-svc's own real payables
-// consumer now (see expense-claim-svc's own updated package doc), so
-// checking a payable's real open/residual/hold/dispute state here is a
-// materially stronger real check than expense-claim-svc's own simple
-// REIMBURSABLE status test. This client confirms the payable still exists
-// and is unsettled (GetEligiblePayable); whether a held/disputed one may
-// still be force-added is the calling handler's own SoD decision, exactly
-// like an ON_HOLD AP_INVOICE supplier — never decided unilaterally here.
-// Fails closed.
+// Package payableopenitem verifies a payable against the real
+// payable-open-item-svc (AP-08) before it can be selected into a payment
+// proposal — replacing the previous direct calls to expense-claim-svc
+// (EXPENSE_CLAIM items) and accounts-payable-svc (AP_INVOICE items). AP-08
+// is both peers' own real payables consumer now (see their own updated
+// package docs), so checking a payable's real open/residual/hold/dispute
+// state here is a materially stronger real check than either peer's own
+// simple status test. This client confirms the payable still exists and is
+// unsettled (GetEligiblePayable); whether a held/disputed one may still be
+// force-added is the calling handler's own SoD decision — never decided
+// unilaterally here. Fails closed.
 package payableopenitem
 
 import (
@@ -24,25 +23,34 @@ import (
 	"zoiko.io/payment-proposal-svc/internal/domain"
 )
 
+type SourceType string
+
+const (
+	SourceExpenseClaim    SourceType = "EXPENSE_CLAIM"
+	SourceSupplierInvoice SourceType = "SUPPLIER_INVOICE"
+)
+
 type Client interface {
 	// GetEligiblePayable looks up the AP-08 payable created for
-	// (EXPENSE_CLAIM, claimID) and confirms it belongs to legalEntityID and
-	// is genuinely eligible for payment selection right now.
-	GetEligiblePayable(ctx context.Context, tenantID, legalEntityID, claimID string) (*Payable, error)
+	// (sourceType, sourceReference) and confirms it belongs to
+	// legalEntityID and is genuinely eligible for payment selection right
+	// now.
+	GetEligiblePayable(ctx context.Context, tenantID, legalEntityID string, sourceType SourceType, sourceReference string) (*Payable, error)
 }
 
 // Payable is the subset of AP-08's own PayableOpenItem (PascalCase wire
 // shape, no json tags on AP-08's side) this service needs.
 type Payable struct {
-	PayableID       string  `json:"PayableID"`
-	LegalEntityID   string  `json:"LegalEntityID"`
-	SourceReference string  `json:"SourceReference"`
-	PayeeRef        string  `json:"PayeeRef"`
-	ResidualAmount  float64 `json:"ResidualAmount"`
-	Currency        string  `json:"Currency"`
-	Status          string  `json:"Status"`
-	IsHeld          bool    `json:"IsHeld"`
-	IsDisputed      bool    `json:"IsDisputed"`
+	PayableID       string    `json:"PayableID"`
+	LegalEntityID   string    `json:"LegalEntityID"`
+	SourceReference string    `json:"SourceReference"`
+	PayeeRef        string    `json:"PayeeRef"`
+	ResidualAmount  float64   `json:"ResidualAmount"`
+	Currency        string    `json:"Currency"`
+	DueDate         time.Time `json:"DueDate"`
+	Status          string    `json:"Status"`
+	IsHeld          bool      `json:"IsHeld"`
+	IsDisputed      bool      `json:"IsDisputed"`
 }
 
 // isSelectable checks only that the payable is still a real, unsettled
@@ -66,8 +74,8 @@ func NewHTTPClient(baseURL string, log *zap.Logger) *HTTPClient {
 	return &HTTPClient{baseURL: baseURL, log: log, http: &http.Client{Timeout: 2 * time.Second}}
 }
 
-func (c *HTTPClient) GetEligiblePayable(ctx context.Context, tenantID, legalEntityID, claimID string) (*Payable, error) {
-	q := url.Values{"source_type": {"EXPENSE_CLAIM"}, "source_reference": {claimID}}
+func (c *HTTPClient) GetEligiblePayable(ctx context.Context, tenantID, legalEntityID string, sourceType SourceType, sourceReference string) (*Payable, error) {
+	q := url.Values{"source_type": {string(sourceType)}, "source_reference": {sourceReference}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/ap08/payables/by-source?"+q.Encode(), nil)
 	if err != nil {
 		return nil, domain.ErrPayableServiceUnavailable

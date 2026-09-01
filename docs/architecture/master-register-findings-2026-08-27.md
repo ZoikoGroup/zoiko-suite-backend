@@ -459,6 +459,26 @@ Registered in `docker-compose.yml` (port 8164, db `payable_open_item`, depends o
 
 `docker-compose.yml` updated: `accounts-payable-svc` now depends on `payable-open-item-svc` and carries `PAYABLE_OPEN_ITEM_SERVICE_URL`. `docker compose config --quiet` validated clean.
 
+**Update, same day:** the remaining piece named above is now done — see §3.19. AP-08's unification across the whole Procurement/Expenses/Accounts Payable payables chain is complete.
+
+---
+
+### 3.19 `payment-proposal-svc` (AP-09) `AP_INVOICE` branch switched to `payable-open-item-svc` (AP-08) — completes AP-08's unification across the domain (2026-09-01)
+
+The last piece named in §3.17: `AddEligiblePayable`'s `AP_INVOICE` branch now also goes through AP-08, using the same `GetEligiblePayable` client already built for `EXPENSE_CLAIM` items (generalized to take a `sourceType` parameter). `accounts-payable-svc` is no longer called from this service at all — the old `internal/accountspayable` client package is deleted, alongside its now-unused `ACCOUNTS_PAYABLE_SERVICE_URL` config entry.
+
+**What's real, not fabricated:**
+- Both `AP_INVOICE` and `EXPENSE_CLAIM` items now flow through one identical eligibility check against AP-08's real open/residual state — `PayeeRef`/`GrossAmount`/`NetAmount`/`Currency`/`DueDate` all come from AP-08's own payable record, not from re-fetching either upstream service's invoice/claim directly. AP-08 is the authoritative residual and identity for both sources now, matching its own stated purpose as the domain's payables ledger.
+- **A second real parity gap is closed:** `AP_INVOICE` items can now be held via AP-08's own `IsHeld`/`IsDisputed` fields, in addition to the pre-existing `supplier-financial-profile-svc` `ON_HOLD` check — previously only the supplier-level signal could hold an invoice item; a payable-level hold recorded directly in AP-08 (e.g. a dispute opened against that specific liability, independent of the supplier's overall standing) now blocks it too, with the same `ExceptionRef` override required either way. Verified directly: disabling the `IsHeld` half of the combined check let an AP-08-held invoice item through at `201` with an otherwise-`ACTIVE` supplier profile; confirmed as a negative control, then restored.
+- `supplier-financial-profile-svc`'s `ON_HOLD` status and `TaxWithholdingRef`/`updated_at` staleness signal are kept as an **additional** real check for `AP_INVOICE` items specifically — a supplier-level concept AP-08 has no way to know about, since AP-08 only tracks one payable at a time. This lookup is correctly skipped for `EXPENSE_CLAIM` items, which have no supplier profile concept at all.
+- A test previously seeded a `RECEIVED` (not yet `APPROVED`) invoice via a stub `accounts-payable-svc` client to exercise "not eligible" — since that upstream is no longer called, the equivalent real scenario is simply an invoice AP-08 has no payable record for yet (because `accounts-payable-svc`'s own `ApproveInvoice` never ran `CreatePayableFromApprovedSource` for it), which is exactly what the rewritten test now exercises — arguably a more accurate simulation of the real gap than the original.
+
+1 new handler test (AP-08-level hold blocking an otherwise-active-supplier invoice item), plus the negative control above. Full AP-09 suite (19 tests) green — every existing `AP_INVOICE` test converted to seed its fixture through the unified `stubPayables` rather than a separate `stubAP`, keyed by `(sourceType, sourceReference)` exactly like the real AP-08.
+
+`docker-compose.yml` updated: `payment-proposal-svc` no longer depends on `accounts-payable-svc` at all; `ACCOUNTS_PAYABLE_SERVICE_URL` removed. `docker compose config --quiet` validated clean.
+
+**Where the domain's payables chain stands now:** `accounts-payable-svc` (AP-05/06) and `expense-claim-svc` (AP-07) both create real AP-08 payables on approval; `payment-proposal-svc` (AP-09) sources exclusively from AP-08 for both source types; `payment-authorization-svc` (AP-10) and `payment-run-svc` (AP-11) consume AP-09's frozen proposals as before. AP-08's own remaining honest gaps (§3.16) — `ApplyConfirmedPayment` having no real caller yet, `ApplyRecovery`'s AP-12 dependency not existing — are unchanged by this turn.
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)
