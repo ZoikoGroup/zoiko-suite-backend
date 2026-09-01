@@ -479,6 +479,34 @@ The last piece named in §3.17: `AddEligiblePayable`'s `AP_INVOICE` branch now a
 
 **Where the domain's payables chain stands now:** `accounts-payable-svc` (AP-05/06) and `expense-claim-svc` (AP-07) both create real AP-08 payables on approval; `payment-proposal-svc` (AP-09) sources exclusively from AP-08 for both source types; `payment-authorization-svc` (AP-10) and `payment-run-svc` (AP-11) consume AP-09's frozen proposals as before. AP-08's own remaining honest gaps (§3.16) — `ApplyConfirmedPayment` having no real caller yet, `ApplyRecovery`'s AP-12 dependency not existing — are unchanged by this turn.
 
+**Update, same day:** AP-12 now exists — see §3.20. `ApplyRecovery`'s "no real caller yet" gap is closed; `ApplyConfirmedPayment` remains open.
+
+---
+
+### 3.20 `supplier-recovery-svc` — new service, AP-12 of the Procurement, Expenses & Accounts Payable baseline (2026-09-01) — the last of AP-01 through AP-12
+
+Confirmed directly against the spec (section 15, "AP-12 — Supplier Refund / Recovery") before writing any code. Closes the last remaining named dependency in the domain: `payable-open-item-svc`'s (AP-08) own `ApplyRecovery` command has had no real caller since AP-08 was built (§3.16) — this service is that caller.
+
+**What's real, not fabricated:**
+- `ApplyApprovedOffset` is the first real caller of AP-08's `ApplyRecovery` anywhere in this codebase — an approved offset genuinely reduces the source payable's residual in AP-08, not a locally-recorded intention. Verified directly as its own test (asserting the real call count).
+- `LinkConfirmedSupplierRefund` is the literal enforcement of negative-path #1 ("supplier refund marked received before bank confirmation"): it calls `bank-reconciliation-svc`'s real `GetStatementLine` and requires that line to already be `MATCHED` — the only real "a bank event genuinely happened" fact available anywhere in this codebase for an inbound receipt. Verified directly: disabling the `MATCHED` check let an `UNMATCHED` statement line be accepted at `200`, confirmed as a negative control, then restored.
+- Negative-path #3 ("recovery write-off self-approved") and the spec's own SoD line ("case owner cannot self-approve material offset/write-off") are enforced via `authorization-svc`'s dynamic own-object SoD layer, applied to both `ApplyApprovedOffset` and `WriteOffRecovery` — reused here because the spec explicitly names self-approval as the exact scenario to block, unlike AP-09/AP-11's own deliberate non-reuse where the spec didn't call for it.
+- Negative-path #4 ("recovery closes while AP/GL/bank difference remains") is enforced structurally: `CloseRecoveryCase` is only reachable once `RecoveredAmount` has reached `TotalAmount` exactly (state `RECOVERED`), computed server-side from the same append-only `RecoveryApplication` ledger every offset/refund is recorded in — never a caller-supplied "yes it's fully recovered" flag. Verified directly: with that guard disabled, a case with `$0` recovered against a `$300` total genuinely closed at `200`; confirmed as a negative control, then restored.
+- **A real gap in AP-08 itself was found and worked around, not silently trusted:** AP-08's own database uniqueness constraint on settlement applications (`uq_settlement_applications_payment_ref`) only covers `PAYMENT`-type applications, not `RECOVERY` — so AP-08 cannot itself reject a duplicate `ApplyRecovery` call. This service therefore checks its own idempotency ledger (`(case_id, application_type, idempotency_ref)`, a real database uniqueness constraint on this service's own side) BEFORE ever calling AP-08, so an ordinary replay never reaches AP-08 a second time. Verified directly: disabling that pre-check caused AP-08 to be called twice for the same replayed reference, confirmed as a negative control, then restored. The one residual, explicitly documented risk: a network failure after AP-08 applies the offset but before this service records the result locally could still cause a duplicate reduction at AP-08 on a caller's retry — narrow, and named in `internal/handler`'s own doc comment rather than assumed away.
+- `CreateSupplierRecoveryCase` verifies the named source payable genuinely exists in AP-08 (`GetPayable`) and belongs to the same legal entity before creating a case against it.
+
+**Scope decisions, not gaps in a peer** (documented in `internal/domain`'s package doc): the spec's state model names a separate `Proposed`/`Approved` pair before `InRecovery`, but there is no command to reach either as a distinct resting state before recovery begins — `ApproveRecoveryPlan` moves a case directly `OPEN → IN_RECOVERY`, the same kind of honest consolidation AP-08 itself used collapsing `Recognized` into `OPEN`. `APPROVED` is kept in the status `CHECK` constraint for forward compatibility only.
+
+**Honest gaps, not fabricated:**
+- No `tax-determination-svc` call is made — the spec names TAX as a dependency for recovery basis/treatment, but gives AP-12 no analogue of AP-07/AP-09's real withholding/reclaim request contract to call. `RecoveryReason` and legal/tax basis are caller-supplied evidence fields, the same "record a real fact a human observed" doctrine used throughout this session.
+- `RecordSupplierCommitment` is entirely caller-attested — no supplier communication channel exists anywhere in this codebase to verify a supplier's own commitment against.
+
+13 handler tests, all passing on first run; three negative controls verified as described above. `go vet`/`gofmt` clean.
+
+Registered in `docker-compose.yml` (port 8165, db `supplier_recovery`, depends on `payable-open-item-svc` and `bank-reconciliation-svc`) and `init-db.sh`. `docker compose config --quiet` validated clean.
+
+**The Procurement, Expenses & Accounts Payable baseline (AP-01 through AP-12) is now complete** — every service the original spec names has a real, tested implementation in this codebase, with every cross-service integration either genuinely real or explicitly, honestly documented as a caller-attested/opaque-reference gap.
+
 ---
 
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)

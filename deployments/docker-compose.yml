@@ -37,6 +37,7 @@ services:
       - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
       - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
       - ../services/payable-open-item-svc/deployments/migrations:/migrations/payable-open-item:ro
+      - ../services/supplier-recovery-svc/deployments/migrations:/migrations/supplier-recovery:ro
       - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
       - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/payment-authorization-svc/deployments/migrations:/migrations/payment-authorization:ro
@@ -3494,6 +3495,66 @@ services:
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  # ── supplier-recovery-svc (Port: 8165) ───────────────────────────────────
+  # AP-12 of the Procurement/Expenses/Accounts Payable baseline — Supplier
+  # Refund/Recovery, the last of AP-01 through AP-12. Closes the last
+  # remaining named dependency in the domain: payable-open-item-svc's
+  # (AP-08) own ApplyRecovery command had no real caller since AP-08 was
+  # built — ApplyApprovedOffset here is that caller, genuinely reducing the
+  # source payable's residual in AP-08, not just recording a local
+  # intention. LinkConfirmedSupplierRefund is the literal enforcement of
+  # negative-path #1 ("refund marked received before bank confirmation"):
+  # it calls bank-reconciliation-svc's real GetStatementLine and requires
+  # MATCHED — the only real "a bank event genuinely happened" fact
+  # available anywhere in this codebase for an inbound receipt.
+  # Negative-path #3 ("write-off self-approved") and the spec's own SoD
+  # line for offset are enforced via authorization-svc's dynamic
+  # own-object SoD layer. Negative-path #4 ("recovery closes while a
+  # difference remains") is enforced structurally: CloseRecoveryCase is
+  # only reachable once RecoveredAmount has reached TotalAmount exactly,
+  # computed server-side from this service's own append-only application
+  # ledger. Honest gap: AP-08's own uniqueness constraint only covers
+  # PAYMENT-type applications, not RECOVERY, so this service must (and
+  # does) check its own idempotency ledger before ever calling AP-08 — a
+  # narrow residual risk (a network failure after AP-08 applies but before
+  # this service records it) is documented in internal/handler's own doc
+  # comment rather than silently assumed safe.
+  supplier-recovery-svc:
+    build:
+      context: ../services/supplier-recovery-svc
+      dockerfile: Dockerfile
+    container_name: supplier-recovery-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8165:8165"
+    environment:
+      PORT: "8165"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/supplier_recovery?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.supplier-recovery.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
+      BANK_RECONCILIATION_SERVICE_URL: "http://bank-reconciliation-svc:8102"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      payable-open-item-svc:
+        condition: service_healthy
+      bank-reconciliation-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
