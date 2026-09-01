@@ -396,6 +396,32 @@ Registered in `docker-compose.yml`/`init-db.sh` (port 8163, db `payment_status`,
 
 ---
 
+### 3.16 `payable-open-item-svc` — new service, AP-08 of the Procurement, Expenses & Accounts Payable baseline (2026-09-01) — closes a gap named by both AP-07 (§3.9) and AP-09 (§3.10)
+
+Confirmed directly against the actual spec (section 11, "AP-08 — Payables") before writing any code. Two earlier services in this domain each documented, in their own package docs, that they had no real AP-08 to hand off to: `expense-claim-svc` (AP-07) could only emit an unconsumed `ExpenseClaimPayableRequested` event because `accounts-payable-svc`'s entire model is vendor-invoice-shaped with no claimant/reimbursement concept; `payment-proposal-svc` (AP-09) had to pull its eligible-payable population directly from `accounts-payable-svc`/`expense-claim-svc` rather than through a proper payables ledger, because none existed. This service is that ledger.
+
+**What's real, not fabricated:**
+- `expense-claim-svc`'s `ApproveExpenseClaim` now calls this service's real `CreatePayableFromApprovedSource` (new `internal/payableopenitem` client) instead of emitting an unconsumed event — the first real consumer AP-07 has ever had for its approved claims. The call is deliberately best-effort, mirroring `goods-service-receipt-svc`'s own GRNI-posting doctrine (§3.8): a failure emits `EXPENSE_CLAIM_PAYABLE_CREATE_FAILED` for visibility but never undoes the approval that already succeeded. Verified directly: with the AP-08 client stubbed to fail, the claim's approval still returns `200`/`REIMBURSABLE`, confirmed as a test in its own right.
+- **Negative-path #4** ("AP totals match GL but duplicate/missing open items remain") is enforced by a genuine database uniqueness constraint on `(source_type, source_reference)` — a repeat `CreatePayableFromApprovedSource` call for an already-recorded source returns the existing payable idempotently rather than creating a duplicate.
+- **Negative-path #3** ("confirmed payment applied twice") is enforced by a genuine database uniqueness constraint on `(payable_id, idempotency_ref)`, scoped to `PAYMENT` applications only. A real ordering bug was caught and fixed during testing: the idempotency check must run *before* the state-transition guard, or a payment that fully settles a payable on its first application gets its replay wrongly rejected as "already settled" instead of returned as the idempotent no-op it actually is — caught by the test itself failing on first run, fixed in both the stub store and the real Postgres store, then reverified.
+- **Negative-path #2** ("disputed payable included as eligible payment") is enforced by `GetPaymentEligibility`'s own exclusion of held/disputed payables (`IsEligibleForPayment`) — a dedicated query endpoint AP-09 is meant to call once wired to this service, rather than reimplementing the filter itself. Verified directly: with the exclusion condition disabled, a disputed payable wrongly appeared in the eligible-payment list, confirmed as a negative control, then restored.
+- **Negative-path #1** ("payable residual manually overwritten") is structurally impossible: there is no generic update endpoint; residual only ever changes through the specific settlement-application command handlers, computed server-side from a caller-supplied *delta*, never a caller-supplied absolute value.
+- The residual is allowed to go negative through exactly one path — `ApplySupplierCredit` — matching the spec's own words ("residual cannot go negative except explicit supplier-credit state"); every other settlement application (`ApplyConfirmedPayment`, `ApplyRecovery`) is blocked from taking it negative.
+
+**Two scope decisions of this service's own design, not gaps in a peer** (documented in `internal/domain`'s package doc): `CreatePayableFromApprovedSource` lands the payable directly in `OPEN` rather than a separate `RECOGNIZED` state the spec names but gives no command to leave; `ClosePayable` — in the spec's command list but absent from its own state model and event list, a real inconsistency in the spec text — is modeled as marking an already-fully-`SETTLED`, non-held, non-disputed payable as archived (`ClosedAt` set), the narrowest reading consistent with both facts.
+
+**Honest gaps, left for a natural next step rather than fabricated:**
+- `accounts-payable-svc` (vendor invoices, AP-05/06) is **not yet wired** as this service's second source — only `expense-claim-svc` is, in this build.
+- `payment-proposal-svc` (AP-09) has **not yet been switched over** to source payables from here (`ListOpenPayables`/`GetPaymentEligibility`) — it still sources directly from `accounts-payable-svc`/`expense-claim-svc`. This is the natural next wiring step, the same shape as AP-11's wiring to BNK-06/BNK-07 in §3.15.
+- `ApplyConfirmedPayment` has no real caller yet (would come from AP-11/BNK-07's settlement chain) — caller-attested for now, the same "record a real external fact a human observed" doctrine used throughout this session.
+- `ApplyRecovery` names AP-12 (Supplier Refund/Recovery), which does not exist anywhere in this codebase — its `RecoveryRef` is an opaque, caller-supplied reference, the same pattern as AP-01's `PayeeReference`.
+
+12 handler tests, all passing; two negative controls verified as described above (idempotency-before-state-guard ordering, and disputed/held exclusion from eligibility).
+
+Registered in `docker-compose.yml` (port 8164, db `payable_open_item`, depends only on `authorization-svc`) and `init-db.sh`; `expense-claim-svc` now also depends on it. `docker compose config --quiet` validated clean.
+
+---
+
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)
 
 - `tenant-entity-registry-svc`'s schema matches `ZS-SVC-I-001`'s canonical Tenant→LegalEntity→OrgUnit model almost field-for-field; its RLS posture (explicit WHERE-clause enforcement, RLS as defense-in-depth only, because the runtime connects as Postgres superuser) exceeds the doc's minimum.

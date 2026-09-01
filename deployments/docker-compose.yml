@@ -36,6 +36,7 @@ services:
       - ../services/privacy-transfer-svc/deployments/migrations:/migrations/privacy-transfer:ro
       - ../services/supplier-financial-profile-svc/deployments/migrations:/migrations/supplier-financial-profile:ro
       - ../services/goods-service-receipt-svc/deployments/migrations:/migrations/goods-service-receipt:ro
+      - ../services/payable-open-item-svc/deployments/migrations:/migrations/payable-open-item:ro
       - ../services/expense-claim-svc/deployments/migrations:/migrations/expense-claim:ro
       - ../services/payment-proposal-svc/deployments/migrations:/migrations/payment-proposal:ro
       - ../services/payment-authorization-svc/deployments/migrations:/migrations/payment-authorization:ro
@@ -3444,6 +3445,56 @@ services:
       start_period: 10s
     restart: on-failure
 
+  # ── payable-open-item-svc (Port: 8164) ───────────────────────────────────
+  # AP-08 of the Procurement/Expenses/Accounts Payable baseline — Payables.
+  # Closes a gap two earlier services (AP-07, AP-09) each explicitly
+  # documented: expense-claim-svc had no real payables consumer to hand an
+  # approved claim to, and payment-proposal-svc had to source eligible
+  # payables directly from accounts-payable-svc/expense-claim-svc instead
+  # of through a proper payables ledger. This service IS that ledger.
+  # Confirmed directly against the spec (section 11) before writing code.
+  # Real, not fabricated: expense-claim-svc's ApproveExpenseClaim now calls
+  # this service's CreatePayableFromApprovedSource, the first real consumer
+  # AP-07 has ever had. Negative-path #4 ("duplicate/missing open items") is
+  # enforced by a real unique index on (source_type, source_reference);
+  # negative-path #3 ("confirmed payment applied twice") by a real unique
+  # index on (payable_id, idempotency_ref); negative-path #2 ("disputed
+  # payable included as eligible payment") by GetPaymentEligibility's own
+  # exclusion of held/disputed payables. Honest gap: accounts-payable-svc
+  # (vendor invoices) is NOT yet wired as a second source, and
+  # payment-proposal-svc (AP-09) has not yet been switched over to source
+  # from here — both scoped as natural next steps, not started in this
+  # build.
+  payable-open-item-svc:
+    build:
+      context: ../services/payable-open-item-svc
+      dockerfile: Dockerfile
+    container_name: payable-open-item-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8164:8164"
+    environment:
+      PORT: "8164"
+      DATABASE_URL: "postgres://${DB_USER:-postgres}:${DB_PASSWORD:-postgres}@postgres:5432/payable_open_item?sslmode=disable"
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.payable-open-item.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
   # ── expense-claim-svc (Port: 8158) ───────────────────────────────────────
   # AP-07 of the Procurement/Expenses/Accounts Payable baseline — Expense
   # Claim. Real integrations verified against each peer's actual code
@@ -3455,11 +3506,12 @@ services:
   # called for every line claiming tax recovery, so a tax-recoverable
   # amount is never inferred, only ever the literal result of that call;
   # policy-svc's real APPROVAL_THRESHOLD evaluation gates which approval
-  # authority (ordinary vs delegated-exception) a claim needs. AP-08
-  # "Payables" has no real reimbursement-consuming endpoint today
-  # (accounts-payable-svc's whole model is vendor-invoice-shaped) — this
-  # service emits ExpenseClaimPayableRequested honestly, with no consumer
-  # yet, rather than fabricating that integration.
+  # authority (ordinary vs delegated-exception) a claim needs. UPDATE:
+  # ApproveExpenseClaim now calls payable-open-item-svc (AP-08)'s real
+  # CreatePayableFromApprovedSource instead of emitting an unconsumed event
+  # — best-effort, mirroring goods-service-receipt-svc's own GRNI-posting
+  # doctrine, so an AP-08 outage never undoes an approval that already
+  # succeeded.
   expense-claim-svc:
     build:
       context: ../services/expense-claim-svc
@@ -3479,6 +3531,7 @@ services:
       DOCUMENT_VAULT_SERVICE_URL: "http://document-vault-svc:8094"
       TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
+      PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
     depends_on:
       postgres:
         condition: service_healthy
@@ -3493,6 +3546,8 @@ services:
       tax-determination-svc:
         condition: service_healthy
       policy-svc:
+        condition: service_healthy
+      payable-open-item-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

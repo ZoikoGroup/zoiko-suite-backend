@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -16,6 +17,7 @@ import (
 	"zoiko.io/expense-claim-svc/internal/employeemaster"
 	"zoiko.io/expense-claim-svc/internal/events"
 	svcmiddleware "zoiko.io/expense-claim-svc/internal/middleware"
+	"zoiko.io/expense-claim-svc/internal/payableopenitem"
 	"zoiko.io/expense-claim-svc/internal/policy"
 	"zoiko.io/expense-claim-svc/internal/store"
 	"zoiko.io/expense-claim-svc/internal/tax"
@@ -52,12 +54,13 @@ type Handler struct {
 	docs     documentvault.Client
 	tax      tax.Client
 	policy   policy.Client
+	payable  payableopenitem.Client
 	cfg      Config
 	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, emp employeemaster.Client, docs documentvault.Client, taxClient tax.Client, pol policy.Client, cfg Config, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, employee: emp, docs: docs, tax: taxClient, policy: pol, cfg: cfg, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, emp employeemaster.Client, docs documentvault.Client, taxClient tax.Client, pol policy.Client, payable payableopenitem.Client, cfg Config, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, employee: emp, docs: docs, tax: taxClient, policy: pol, payable: payable, cfg: cfg, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -400,19 +403,23 @@ func (h *Handler) ApproveExpenseClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	lines, err := h.store.ListLines(r.Context(), claimID)
+	if err != nil {
+		h.log.Error("ApproveExpenseClaim: failed to list lines", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
 	if !claim.HasPolicyException {
-		lines, err := h.store.ListLines(r.Context(), claimID)
-		if err != nil {
-			h.log.Error("ApproveExpenseClaim: failed to list lines", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "store unavailable")
-			return
-		}
 		for _, l := range lines {
 			if l.Amount > h.cfg.ReceiptRequiredThreshold && l.ReceiptDocumentID == "" {
 				writeError(w, http.StatusConflict, "one or more expense lines exceed the receipt-required threshold without an attached receipt")
 				return
 			}
 		}
+	}
+	var totalAmount float64
+	for _, l := range lines {
+		totalAmount += l.Amount
 	}
 
 	updated, err := h.store.ApproveClaim(r.Context(), claimID, principalID)
@@ -430,14 +437,36 @@ func (h *Handler) ApproveExpenseClaim(w http.ResponseWriter, r *http.Request) {
 		EventType: domain.EventClaimApproved, EntityID: updated.ClaimID, ActorID: principalID,
 		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
 	})
-	// AP-08 has no real reimbursement-consuming endpoint for a claimant
-	// expense (see internal/domain's package doc) — this event is emitted
-	// honestly with no consumer, not routed through accounts-payable-svc's
-	// unrelated vendor-invoice model.
-	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: domain.EventClaimPayableRequested, EntityID: updated.ClaimID, ActorID: principalID,
-		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
-	})
+
+	// AP-08 (payable-open-item-svc) is this claim's first real payables
+	// consumer — replacing the previously-unconsumed
+	// EXPENSE_CLAIM_PAYABLE_REQUESTED event. payeeRef falls back to the
+	// claimant's own principal ID when no PaymentPreferenceRef was recorded
+	// (reimbursement pays the claimant themselves in that case) — a real,
+	// defensible default, not a fabricated identity. DueDate is set to now:
+	// unlike a negotiated vendor payment term, nothing in this service's own
+	// domain gives an expense reimbursement a due date, so it is treated as
+	// payable immediately upon approval.
+	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+	payeeRef := updated.PaymentPreferenceRef
+	if payeeRef == "" {
+		payeeRef = updated.ClaimantPrincipalID
+	}
+	if payable, err := h.payable.CreatePayableFromApprovedSource(r.Context(), verifiedTenant, principalID, payableopenitem.CreatePayableRequest{
+		LegalEntityID: updated.LegalEntityID, SourceType: payableopenitem.SourceExpenseClaim, SourceReference: updated.ClaimID,
+		PayeeRef: payeeRef, OriginalAmount: totalAmount, Currency: updated.Currency, DueDate: time.Now().UTC(),
+	}); err != nil {
+		h.log.Warn("AP-08 payable creation failed — recording EXCEPTION event, claim approval stands", zap.Error(err))
+		_ = h.pub.Publish(r.Context(), events.PublishParams{
+			EventType: domain.EventClaimPayableCreateFailed, EntityID: updated.ClaimID, ActorID: principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: map[string]string{"error": err.Error()},
+		})
+	} else {
+		_ = h.pub.Publish(r.Context(), events.PublishParams{
+			EventType: domain.EventClaimPayableCreated, EntityID: updated.ClaimID, ActorID: principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: payable,
+		})
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 

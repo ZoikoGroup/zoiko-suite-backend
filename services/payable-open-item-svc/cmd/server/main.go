@@ -15,18 +15,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
-	"zoiko.io/expense-claim-svc/internal/authz"
-	"zoiko.io/expense-claim-svc/internal/config"
-	"zoiko.io/expense-claim-svc/internal/documentvault"
-	"zoiko.io/expense-claim-svc/internal/employeemaster"
-	"zoiko.io/expense-claim-svc/internal/events"
-	"zoiko.io/expense-claim-svc/internal/handler"
-	"zoiko.io/expense-claim-svc/internal/health"
-	"zoiko.io/expense-claim-svc/internal/middleware"
-	"zoiko.io/expense-claim-svc/internal/payableopenitem"
-	"zoiko.io/expense-claim-svc/internal/policy"
-	"zoiko.io/expense-claim-svc/internal/store"
-	"zoiko.io/expense-claim-svc/internal/tax"
+	"zoiko.io/payable-open-item-svc/internal/authz"
+	"zoiko.io/payable-open-item-svc/internal/config"
+	"zoiko.io/payable-open-item-svc/internal/events"
+	"zoiko.io/payable-open-item-svc/internal/handler"
+	"zoiko.io/payable-open-item-svc/internal/health"
+	"zoiko.io/payable-open-item-svc/internal/middleware"
+	"zoiko.io/payable-open-item-svc/internal/store"
 )
 
 func main() {
@@ -65,15 +60,8 @@ func main() {
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
-	employeeClient := employeemaster.NewHTTPClient(cfg.EmployeeMasterServiceURL, logger)
-	docsClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, logger)
-	taxClient := tax.NewHTTPClient(cfg.TaxDeterminationServiceURL, logger)
-	policyClient := policy.NewHTTPClient(cfg.PolicyServiceURL, logger)
-	payableClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger)
 
-	h := handler.New(pgStore, publisher, authzClient, employeeClient, docsClient, taxClient, policyClient, payableClient, handler.Config{
-		ReceiptRequiredThreshold: cfg.ReceiptRequiredThreshold,
-	}, logger)
+	h := handler.New(pgStore, publisher, authzClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
@@ -97,7 +85,7 @@ func main() {
 	}
 
 	go func() {
-		logger.Info("starting expense-claim-svc", zap.String("port", cfg.Port))
+		logger.Info("starting payable-open-item-svc", zap.String("port", cfg.Port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("server ListenAndServe error", zap.Error(err))
 		}
@@ -107,7 +95,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 
-	logger.Info("shutting down expense-claim-svc gracefully...")
+	logger.Info("shutting down payable-open-item-svc gracefully...")
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

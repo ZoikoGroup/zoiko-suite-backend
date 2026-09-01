@@ -19,6 +19,7 @@ import (
 	"zoiko.io/expense-claim-svc/internal/events"
 	"zoiko.io/expense-claim-svc/internal/handler"
 	"zoiko.io/expense-claim-svc/internal/middleware"
+	"zoiko.io/expense-claim-svc/internal/payableopenitem"
 	"zoiko.io/expense-claim-svc/internal/policy"
 	"zoiko.io/expense-claim-svc/internal/tax"
 )
@@ -147,19 +148,40 @@ func (p *stubPolicy) EvaluateApprovalThreshold(_ context.Context, _, _, _ string
 
 var _ policy.Client = (*stubPolicy)(nil)
 
+// ── stub payable-open-item-svc (AP-08) client ───────────────────────────────
+
+type stubPayable struct {
+	fail  bool
+	calls int
+}
+
+func (p *stubPayable) CreatePayableFromApprovedSource(_ context.Context, _, _ string, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
+	p.calls++
+	if p.fail {
+		return nil, domain.ErrPayableServiceUnavailable
+	}
+	return &payableopenitem.PayableOpenItem{PayableID: "payable-" + req.SourceReference, Status: "OPEN"}, nil
+}
+
+var _ payableopenitem.Client = (*stubPayable)(nil)
+
 // ── test harness ─────────────────────────────────────────────────────────────
 
 const testTenant = "tenant-ap07-1"
 const testLegalEntity = "le-ap07-1"
 const testClaimant = "principal-claimant"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy) chi.Router {
+func newTestRouterWithPayable(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy, payable *stubPayable) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, emp, docs, tx, pol, handler.Config{ReceiptRequiredThreshold: 25.0}, logger)
+	h := handler.New(st, pub, az, emp, docs, tx, pol, payable, handler.Config{ReceiptRequiredThreshold: 25.0}, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
 	return r
+}
+
+func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy) chi.Router {
+	return newTestRouterWithPayable(st, pub, az, emp, docs, tx, pol, &stubPayable{})
 }
 
 func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID, principalID string) *httptest.ResponseRecorder {
@@ -355,6 +377,50 @@ func TestApproveExpenseClaim_IndependentApprover_Succeeds(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &approved)
 	if approved.Status != domain.StatusReimbursable {
 		t.Fatalf("expected REIMBURSABLE, got %s", approved.Status)
+	}
+}
+
+// TestApproveExpenseClaim_CreatesRealAP08Payable is the first real
+// consumer expense-claim-svc has ever had for its approved claims —
+// replacing the previously-unconsumed EXPENSE_CLAIM_PAYABLE_REQUESTED
+// event with a real call to payable-open-item-svc (AP-08).
+func TestApproveExpenseClaim_CreatesRealAP08Payable(t *testing.T) {
+	emp := newStubEmployee()
+	payable := &stubPayable{}
+	r := newTestRouterWithPayable(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, payable)
+	c := createClaim(t, r, emp)
+	addLine(t, r, c.ClaimID, newLineReq(10))
+	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+
+	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if payable.calls != 1 {
+		t.Fatalf("expected exactly one real CreatePayableFromApprovedSource call to AP-08, got %d", payable.calls)
+	}
+}
+
+// TestApproveExpenseClaim_AP08Unavailable_ApprovalStillStands verifies the
+// AP-08 call is genuinely best-effort — mirroring goods-service-receipt-svc's
+// own GRNI-posting doctrine — and never undoes an approval that already
+// succeeded.
+func TestApproveExpenseClaim_AP08Unavailable_ApprovalStillStands(t *testing.T) {
+	emp := newStubEmployee()
+	payable := &stubPayable{fail: true}
+	r := newTestRouterWithPayable(newStubStore(), &stubPublisher{}, &stubAuthz{sodRules: true}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, payable)
+	c := createClaim(t, r, emp)
+	addLine(t, r, c.ClaimID, newLineReq(10))
+	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+
+	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 approval to stand despite AP-08 failure, got %d: %s", w.Code, w.Body.String())
+	}
+	var approved domain.ExpenseClaim
+	_ = json.Unmarshal(w.Body.Bytes(), &approved)
+	if approved.Status != domain.StatusReimbursable {
+		t.Fatalf("expected REIMBURSABLE despite AP-08 failure, got %s", approved.Status)
 	}
 }
 
