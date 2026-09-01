@@ -550,6 +550,23 @@ Registered in `docker-compose.yml` (port 8166, db `payee_banking_identity`, depe
 
 ---
 
+### 3.23 `evidence-manifest-svc` wired to `workflow-history-svc` — closes a gap the LATTER service's own package doc named directly (2026-09-01)
+
+Scoped by a dedicated research sweep outside the completed Procurement/AP/Banking/ORG-10 chains. `workflow-history-svc`'s own handler package doc states the gap in so many words: *"v1 Known Gap: evidence-manifest-svc currently fetches workflow data directly from workflow-svc by workflow_instance_id and is NOT wired to this cross-workflow query endpoint... The endpoint is fully functional; no upstream caller uses it in v1."* This is the first time in this session the *pointing* service (rather than the pointed-to gap) was itself already built and just never connected — both services pre-date this session; only the wiring between them is new.
+
+**What's real, not fabricated:**
+- Every `WorkflowInstanceID` named in a `GenerateManifestRequest` now also calls `workflow-history-svc`'s real `GET /v1/workflows/{id}/history` — the first real caller of that endpoint anywhere in this codebase — producing one `ManifestRecord` (`SourceWorkflowHistory`) per real transition event, in addition to the existing `workflow-svc` instance snapshot. Verified directly: disabling the call let a manifest generate with only the snapshot record; the transition-event records were silently missing. Confirmed as a negative control, then restored.
+- This is deliberately **not** a new opt-in request field: an instance's own transition history is intrinsically part of its evidence, exactly the same stance already taken for governance decisions (never optional). A caller who names a `WorkflowInstanceID` gets its full history automatically.
+- The existing "manifest is all-or-nothing" fail-closed doctrine (already governing the other two sources) applies identically here: a `workflow-history-svc` outage fails the whole manifest generation, never a silently-incomplete one. Verified directly as its own test.
+
+**Honest gap, not fabricated:** `workflow-history-svc`'s own comment actually names its **cross-workflow** query (`GET /v1/workflows/history?legal_entity_id=...&from=...&to=...`) as the unwired endpoint, not the per-instance one used here. That broader, tenant/entity/date-range discovery surface has no analogue in `evidence-manifest-svc`'s own request contract (which only accepts explicit `WorkflowInstanceIDs`, the same shape as its `AccessDecisionIDs`) — wiring it would mean adding a genuinely new discovery capability, not connecting two things that already agree on shape. Scoped but not started here, left as a further, separate next step.
+
+2 new handler tests, all passing on first run; 1 negative control verified. New `SourceType` (`WORKFLOW_HISTORY`), migration `000004_add_workflow_history_source` widening the `source_type` `CHECK` constraint. Full existing `evidence-manifest-svc` suite (aggregator/events/handler/store packages) still green and unaffected — every existing test kept its original call shape via a shared test-harness default.
+
+`docker-compose.yml` updated: `evidence-manifest-svc` now depends on `workflow-history-svc` and carries `WORKFLOW_HISTORY_SERVICE_URL`. `docker compose config --quiet` validated clean.
+
+---
+
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)
 
 - `tenant-entity-registry-svc`'s schema matches `ZS-SVC-I-001`'s canonical Tenant→LegalEntity→OrgUnit model almost field-for-field; its RLS posture (explicit WHERE-clause enforcement, RLS as defense-in-depth only, because the runtime connects as Postgres superuser) exceeds the doc's minimum.

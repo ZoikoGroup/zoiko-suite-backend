@@ -1132,6 +1132,14 @@ services:
   # no discovery query (see internal/domain package doc — a documented v1
   # scope constraint, not an oversight). Fails closed: any source service
   # error fails manifest generation entirely, never a silent partial manifest.
+  # UPDATE: every requested WorkflowInstanceID now also pulls that instance's
+  # real transition history from workflow-history-svc — closing the gap
+  # workflow-history-svc's own package doc named directly ("evidence-
+  # manifest-svc currently... is NOT wired to this... endpoint"). Not a new
+  # opt-in field: an instance's history is intrinsically part of its
+  # evidence. The cross-workflow query endpoint remains unwired — a
+  # separate, broader discovery surface this service has no request shape
+  # for yet.
   evidence-manifest-svc:
     build:
       context: ../services/evidence-manifest-svc
@@ -1154,6 +1162,7 @@ services:
       GOVERNANCE_DECISION_LOG_SERVICE_URL: "http://governance-svc:8083"
       AUTHORIZATION_SERVICE_URL: "http://authorization-svc:8089"
       WORKFLOW_SERVICE_URL: "http://workflow-svc:8090"
+      WORKFLOW_HISTORY_SERVICE_URL: "http://workflow-history-svc:8097"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1164,6 +1173,8 @@ services:
       authorization-svc:
         condition: service_healthy
       workflow-svc:
+        condition: service_healthy
+      workflow-history-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8095/healthz"]
