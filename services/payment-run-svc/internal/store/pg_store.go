@@ -47,6 +47,7 @@ type Store interface {
 
 	ValidateRun(ctx context.Context, runID, principalID string) (*domain.PaymentRun, error)
 	MarkInstructionConsumed(ctx context.Context, instructionID string) error
+	SetInstructionProviderRefs(ctx context.Context, instructionID, providerAttemptID, bnk07PaymentID string) error
 	LockRun(ctx context.Context, runID, principalID string) (*domain.PaymentRun, error)
 	MarkRunException(ctx context.Context, runID, reason, principalID string) (*domain.PaymentRun, error)
 	SubmitRun(ctx context.Context, runID, idempotencyKey, principalID string) (*domain.PaymentRun, error)
@@ -114,12 +115,13 @@ func scanRun(row pgx.Row) (*domain.PaymentRun, error) {
 }
 
 const instructionColumns = `
-	instruction_id, tenant_id, run_id, authorization_id, payee_ref, net_amount, currency, status, consumed_at, created_at`
+	instruction_id, tenant_id, run_id, authorization_id, payee_ref, net_amount, currency, status, consumed_at,
+	provider_attempt_id, bnk07_payment_id, created_at`
 
 func scanInstruction(row pgx.Row) (*domain.RunInstruction, error) {
 	i := &domain.RunInstruction{}
 	err := row.Scan(&i.InstructionID, &i.TenantID, &i.RunID, &i.AuthorizationID, &i.PayeeRef, &i.NetAmount,
-		&i.Currency, &i.Status, &i.ConsumedAt, &i.CreatedAt)
+		&i.Currency, &i.Status, &i.ConsumedAt, &i.ProviderAttemptID, &i.Bnk07PaymentID, &i.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +150,7 @@ func (s *PgStore) CreateRun(ctx context.Context, tenantID string, req domain.Cre
 			id := uuid.New().String()
 			created, err := scanInstruction(tx.QueryRow(ctx, `
 				INSERT INTO run_instructions (`+instructionColumns+`)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', NULL, NOW())
+				VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', NULL, '', '', NOW())
 				RETURNING `+instructionColumns,
 				id, run.TenantID, runID, ins.AuthorizationID, ins.PayeeRef, ins.NetAmount, ins.Currency,
 			))
@@ -280,6 +282,36 @@ func (s *PgStore) MarkInstructionConsumed(ctx context.Context, instructionID str
 	}
 	if err != nil {
 		s.log.Error("pg MarkInstructionConsumed failed", zap.Error(err))
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return nil
+}
+
+// SetInstructionProviderRefs records the real correlation to BNK-06's
+// attempt and BNK-07's execution record, once, right after SubmitPaymentRun
+// actually hands an instruction to Banking. The WHERE clause only matches a
+// row that has never had this set before — 000004's trigger enforces the
+// same invariant at the database level as defense in depth.
+func (s *PgStore) SetInstructionProviderRefs(ctx context.Context, instructionID, providerAttemptID, bnk07PaymentID string) error {
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE run_instructions SET provider_attempt_id = $1, bnk07_payment_id = $2
+			WHERE instruction_id = $3 AND provider_attempt_id = ''`,
+			providerAttemptID, bnk07PaymentID, instructionID,
+		)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInstructionNotFound
+		}
+		return nil
+	})
+	if errors.Is(err, domain.ErrInstructionNotFound) || isInvalidUUID(err) {
+		return domain.ErrInstructionNotFound
+	}
+	if err != nil {
+		s.log.Error("pg SetInstructionProviderRefs failed", zap.Error(err))
 		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return nil

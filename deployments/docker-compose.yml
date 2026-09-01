@@ -3626,15 +3626,23 @@ services:
   # external bank/provider, and no real webhook/callback receiver for a
   # provider's status response — confirmed with the user before building
   # this service at all rather than fabricating a fake bank integration.
-  # SubmitPaymentRun therefore only records that submission was attempted
-  # (no bank is actually called); ReconcilePaymentRunStatus is a
-  # caller-attested command, not a webhook receiver. What IS real: this is
-  # the FIRST real caller of payment-authorization-svc's
-  # ConsumeAuthorization anywhere in this codebase (a gap AP-10 itself
-  # documented as having no caller yet), cross-tenant payables are blocked
-  # for real via a live AP-10 lookup on every authorization named, and
-  # idempotency (replay-after-timeout, replayed-provider-event) is enforced
-  # via genuine database uniqueness constraints throughout.
+  # UPDATE: this gap is now half-closed. SubmitPaymentRun really hands every
+  # instruction to BNK-06 (PrepareAttempt+SubmitAttempt) and records the
+  # canonical execution record with BNK-07 (RecordPaymentStatus) before
+  # transitioning the run itself — the first real caller of either service
+  # anywhere in this codebase. PollInstructionStatus (new) then reconciles
+  # from BNK-07's own real GetPaymentStatus, rather than only accepting a
+  # caller's word for it (ReconcilePaymentRunStatus, kept as a deliberate
+  # manual-override path). What's still honestly stubbed: BNK-06's own
+  # Provider Adapter behind that call — no real bank/PSP network call
+  # exists anywhere in this codebase; see payment-initiation-adapter-svc's
+  # own package doc. What else IS real: this is also the FIRST real caller
+  # of payment-authorization-svc's ConsumeAuthorization anywhere in this
+  # codebase (a gap AP-10 itself documented as having no caller yet),
+  # cross-tenant payables are blocked for real via a live AP-10 lookup on
+  # every authorization named, and idempotency (replay-after-timeout,
+  # replayed-provider-event) is enforced via genuine database uniqueness
+  # constraints throughout.
   payment-run-svc:
     build:
       context: ../services/payment-run-svc
@@ -3651,6 +3659,8 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.payment-run.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       PAYMENT_AUTHORIZATION_SERVICE_URL: "http://payment-authorization-svc:8160"
+      PAYMENT_INITIATION_ADAPTER_URL: "http://payment-initiation-adapter-svc:8162"
+      PAYMENT_STATUS_SERVICE_URL: "http://payment-status-svc:8163"
     depends_on:
       postgres:
         condition: service_healthy
@@ -3659,6 +3669,10 @@ services:
       authorization-svc:
         condition: service_healthy
       payment-authorization-svc:
+        condition: service_healthy
+      payment-initiation-adapter-svc:
+        condition: service_healthy
+      payment-status-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

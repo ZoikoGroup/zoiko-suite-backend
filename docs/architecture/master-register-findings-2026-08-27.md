@@ -372,7 +372,27 @@ Built alongside BNK-06 as its status/finality counterpart. **Unlike BNK-06, this
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8163, db `payment_status`, depends on `authorization-svc` only).
 
-**Not yet done:** `payment-run-svc` (AP-11, §3.12) does not yet call either of these two services — `SubmitPaymentRun` still only records intent, and `ReconcilePaymentRunStatus` is still caller-attested. Wiring AP-11 to actually call BNK-06's `PrepareAttempt`/`SubmitAttempt` and consume BNK-07's canonical status would close AP-11's two biggest documented gaps for real, moving the domain's one remaining honest gap down to just the Provider Adapter's actual bank/PSP network call. Scoped but deliberately not started in this session — a natural next step, not a silent scope expansion.
+**Update, same day:** the wiring described above as a next step is now done — see §3.15.
+
+---
+
+### 3.15 `payment-run-svc` (AP-11) wired to BNK-06/BNK-07 — closes §3.12's and §3.14's documented gap (2026-09-01)
+
+`SubmitPaymentRun` now really hands every instruction to Banking before transitioning the run itself, and a new `PollInstructionStatus` reconciles from BNK-07's real canonical status — the two pieces §3.12 and §3.14 both explicitly scoped as "not yet done."
+
+**What's real, not fabricated:**
+- `SubmitPaymentRun` calls BNK-06's `PrepareAttempt`+`SubmitAttempt` (via a new `internal/provideradapter` client) for every instruction, then registers the canonical execution record with BNK-07's `RecordPaymentStatus` (via a new `internal/paymentstatus` client) — the first real caller of either service anywhere in this codebase. This happens **before** the run itself transitions from `LOCKED` to `SUBMITTED`, mirroring `LockPaymentRun`'s own "do the real work first, only then transition; any failure raises `EXCEPTION` rather than a silent partial state" discipline. Verified directly: with BNK-06 stubbed to fail, the run is confirmed to move to `EXCEPTION` rather than reaching `SUBMITTED` — disabling that guard and re-running the test showed the run wrongly reaching `SUBMITTED` at `200`, confirmed as a negative control, then restored.
+- The correlation to both services is durable, not just passed through: two new columns on `run_instructions` (`provider_attempt_id`, `bnk07_payment_id`, migration `000004_provider_refs`) are written exactly once and are immutable afterward — enforced by the same database trigger pattern used for every other authorized field on this table.
+- `PollInstructionStatus` (new endpoint, `POST /ap11/instructions/{instructionID}/poll`) queries BNK-07's real `GetPaymentStatus` for the instruction's own `bnk07_payment_id` and reconciles the run from that real answer, sharing the same authorization/idempotent-apply/aggregate-recompute path as the existing `ReconcilePaymentRunStatus` (both now call a common `applyExternalStatus`). A poll while BNK-07 still reports `PREPARED`/`SUBMITTED`/`PENDING` correctly reports `applied: false` rather than fabricating progress — verified directly: forcing the "no news yet" branch to always report news caused the test to genuinely fail, confirmed as a negative control, then restored.
+- `ReconcilePaymentRunStatus` (the old caller-attested command) is deliberately kept, not removed — a manual-override path for an operator recording a real external fact BNK-07 didn't itself capture, the same "record a real external fact a human observed" doctrine used throughout this session.
+- The derived `ProviderEventRef` for a poll (`"<bnk07_payment_id>:<status>"`) is deterministic, so re-polling the same real status twice is idempotent through the exact same database uniqueness constraint `ReconcilePaymentRunStatus` already relies on — no separate idempotency mechanism was needed.
+- `PayerAccountVerified` is asserted `true` when calling BNK-06 — not a new fabrication; AP-09/AP-10 already treat the paying bank account reference as opaque (no real account-status source exists anywhere in this codebase), and this is the exact same caller-attestation gate BNK-06's own package doc defines for that reason.
+
+**What remains the one honest gap, now one layer further down:** BNK-06's own Provider Adapter behind `SubmitAttempt` is a documented stub (§3.13) — no actual bank/PSP network call exists anywhere in this codebase. Wiring AP-11 through BNK-06/BNK-07 for real moves the domain's one remaining honest gap down to exactly that boundary, and no further.
+
+4 new handler tests (real Banking handoff, handoff-failure → `EXCEPTION`, real-status poll settling a run, poll-with-no-news not applying), plus the two negative controls above. Full existing AP-11 suite (17 tests total) still green.
+
+`docker-compose.yml` updated: `payment-run-svc` now depends on `payment-initiation-adapter-svc`/`payment-status-svc` (`service_healthy`) and carries their base URLs (`PAYMENT_INITIATION_ADAPTER_URL`, `PAYMENT_STATUS_SERVICE_URL`). `docker compose config --quiet` validated clean.
 
 ---
 
