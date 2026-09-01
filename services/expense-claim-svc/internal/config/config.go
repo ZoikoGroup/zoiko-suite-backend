@@ -16,6 +16,7 @@ type Config struct {
 	DocumentVaultServiceURL    string
 	TaxDeterminationServiceURL string
 	PolicyServiceURL           string
+	PayableOpenItemServiceURL  string
 	ReceiptRequiredThreshold   float64
 }
 
@@ -38,6 +39,7 @@ func Load() (*Config, error) {
 		DocumentVaultServiceURL:    getEnvOrDefault("DOCUMENT_VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 		TaxDeterminationServiceURL: getEnvOrDefault("TAX_DETERMINATION_SERVICE_URL", "http://tax-determination-svc:8126"),
 		PolicyServiceURL:           getEnvOrDefault("POLICY_SERVICE_URL", "http://policy-svc:8085"),
+		PayableOpenItemServiceURL:  getEnvOrDefault("PAYABLE_OPEN_ITEM_SERVICE_URL", "http://payable-open-item-svc:8164"),
 		ReceiptRequiredThreshold:   getEnvFloatOrDefault("RECEIPT_REQUIRED_THRESHOLD", 25.0),
 	}, nil
 }

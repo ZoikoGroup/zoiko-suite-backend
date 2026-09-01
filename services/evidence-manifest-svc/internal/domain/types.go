@@ -18,6 +18,15 @@
 //   - workflow-svc exposes ONLY GET /v1/workflows/{id}, and even that returns
 //     the instance + stages, NOT the transition history itself (there is no
 //     endpoint exposing workflow_transitions at all).
+//   - UPDATE: workflow-history-svc exists specifically to expose that
+//     missing transition history (GET /v1/workflows/{id}/history), and its
+//     own "v1 Known Gap" comment named this exact service as the caller
+//     that was never wired to it. Every WorkflowInstanceID requested now
+//     automatically pulls that instance's full transition history too —
+//     one ManifestRecord per real transition event (SourceWorkflowHistory),
+//     not just the workflow-svc snapshot. This is not a new opt-in field:
+//     an instance's own history is intrinsically part of its evidence, the
+//     same way a governance decision's evidence was never optional either.
 //   - audit-event-store-svc exposes NO query API whatsoever (health probes
 //     only) — it is a pure Kafka consumer. It is NOT included in v1 manifests;
 //     this is a deferred gap, not an oversight (see ManifestSection below).
@@ -78,6 +87,7 @@ const (
 	SourceGovernanceDecision SourceType = "GOVERNANCE_DECISION"
 	SourceAccessDecision     SourceType = "ACCESS_DECISION"
 	SourceWorkflowInstance   SourceType = "WORKFLOW_INSTANCE"
+	SourceWorkflowHistory    SourceType = "WORKFLOW_HISTORY"
 )
 
 // ManifestRecord is one append-only reference to a source-of-truth record

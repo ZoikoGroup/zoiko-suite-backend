@@ -13,6 +13,7 @@ type Config struct {
 	AuthzServiceURL           string
 	PaymentProposalServiceURL string
 	SupplierProfileServiceURL string
+	PayeeIdentityServiceURL   string
 	PolicyServiceURL          string
 }
 
@@ -33,6 +34,7 @@ func Load() (*Config, error) {
 		AuthzServiceURL:           getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		PaymentProposalServiceURL: getEnvOrDefault("PAYMENT_PROPOSAL_SERVICE_URL", "http://payment-proposal-svc:8159"),
 		SupplierProfileServiceURL: getEnvOrDefault("SUPPLIER_PROFILE_SERVICE_URL", "http://supplier-financial-profile-svc:8156"),
+		PayeeIdentityServiceURL:   getEnvOrDefault("PAYEE_IDENTITY_SERVICE_URL", "http://payee-banking-identity-svc:8166"),
 		PolicyServiceURL:          getEnvOrDefault("POLICY_SERVICE_URL", "http://policy-svc:8085"),
 	}, nil
 }

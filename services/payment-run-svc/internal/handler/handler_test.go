@@ -18,6 +18,8 @@ import (
 	"zoiko.io/payment-run-svc/internal/handler"
 	"zoiko.io/payment-run-svc/internal/middleware"
 	"zoiko.io/payment-run-svc/internal/paymentauthorization"
+	"zoiko.io/payment-run-svc/internal/paymentstatus"
+	"zoiko.io/payment-run-svc/internal/provideradapter"
 )
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -89,14 +91,66 @@ func (a *stubAuth) ConsumeAuthorization(_ context.Context, _, _, authorizationID
 
 var _ paymentauthorization.Client = (*stubAuth)(nil)
 
+// ── stub payment-initiation-adapter-svc (BNK-06) client ─────────────────────
+
+type stubProvider struct {
+	fail  bool
+	calls int
+}
+
+func newStubProvider() *stubProvider { return &stubProvider{} }
+
+func (p *stubProvider) PrepareAndSubmit(_ context.Context, _, _ string, req provideradapter.PrepareAndSubmitRequest) (*provideradapter.Attempt, error) {
+	p.calls++
+	if p.fail {
+		return nil, domain.ErrProviderAdapterUnavailable
+	}
+	return &provideradapter.Attempt{
+		AttemptID: "attempt-" + req.SourceReference, Status: "SUBMITTED",
+		ProviderRequestID: "preq-" + req.SourceReference,
+	}, nil
+}
+
+var _ provideradapter.Client = (*stubProvider)(nil)
+
+// ── stub payment-status-svc (BNK-07) client ─────────────────────────────────
+
+type stubStatus struct {
+	fail     bool
+	statuses map[string]string // payment_id -> Status
+	calls    int
+}
+
+func newStubStatus() *stubStatus { return &stubStatus{statuses: map[string]string{}} }
+
+func (s *stubStatus) RecordInitialStatus(_ context.Context, _, _ string, req paymentstatus.RecordInitialStatusRequest) (*paymentstatus.PaymentState, error) {
+	s.calls++
+	if s.fail {
+		return nil, domain.ErrPaymentStatusUnavailable
+	}
+	id := "payment-" + req.SourceReference
+	s.statuses[id] = "PREPARED"
+	return &paymentstatus.PaymentState{PaymentID: id, Status: "PREPARED"}, nil
+}
+
+func (s *stubStatus) GetStatus(_ context.Context, _, paymentID string) (*paymentstatus.PaymentState, error) {
+	status, ok := s.statuses[paymentID]
+	if !ok {
+		return nil, domain.ErrPaymentStatusUnavailable
+	}
+	return &paymentstatus.PaymentState{PaymentID: paymentID, Status: status}, nil
+}
+
+var _ paymentstatus.Client = (*stubStatus)(nil)
+
 // ── test harness ─────────────────────────────────────────────────────────────
 
 const testTenant = "tenant-ap11-1"
 const testLegalEntity = "le-ap11-1"
 
-func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, auth *stubAuth) chi.Router {
+func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, auth *stubAuth, provider provideradapter.Client, status paymentstatus.Client) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, auth, logger)
+	h := handler.New(st, pub, az, auth, provider, status, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -154,7 +208,7 @@ func validateAndLock(t *testing.T, r http.Handler, runID string) *httptest.Respo
 func TestCreateRun_Draft(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-1", testTenant, testLegalEntity, 500)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 
 	run := createRun(t, r, []string{"auth-1"})
 	if run.Status != domain.StatusDraft {
@@ -166,7 +220,7 @@ func TestCreateRun_Draft(t *testing.T) {
 func TestCreateRun_CrossTenantAuthorization_Rejected(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-2", "some-other-tenant", testLegalEntity, 200)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 
 	w := doRequest(r, http.MethodPost, "/ap11/runs/", domain.CreateRunRequest{
 		LegalEntityID: testLegalEntity, PayingBankAccountRef: "acct", Currency: "USD",
@@ -180,7 +234,7 @@ func TestCreateRun_CrossTenantAuthorization_Rejected(t *testing.T) {
 func TestCreateRun_AuthorizationAlreadyInAnotherRun_Rejected(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-3", testTenant, testLegalEntity, 300)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	createRun(t, r, []string{"auth-3"})
 
 	w := doRequest(r, http.MethodPost, "/ap11/runs/", domain.CreateRunRequest{
@@ -196,7 +250,7 @@ func TestValidatePaymentRun_NoLongerValid_Blocked(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-4", testTenant, testLegalEntity, 100)
 	auth.validity["auth-4"] = false
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-4"})
 
 	w := doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/validate", nil, testTenant)
@@ -210,7 +264,7 @@ func TestValidatePaymentRun_NoLongerValid_Blocked(t *testing.T) {
 func TestLockPaymentRun_ConsumesAuthorizations(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-5", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-5"})
 
 	w := validateAndLock(t, r, run.RunID)
@@ -231,7 +285,7 @@ func TestLockPaymentRun_ConsumeFails_RunMovesToException(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-6", testTenant, testLegalEntity, 100)
 	auth.consumeFails["auth-6"] = true
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-6"})
 	doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/validate", nil, testTenant)
 
@@ -254,7 +308,7 @@ func TestLockPaymentRun_ConsumeFails_RunMovesToException(t *testing.T) {
 func TestSubmitPaymentRun_ReplaySameKey_Idempotent(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-7", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-7"})
 	validateAndLock(t, r, run.RunID)
 
@@ -272,7 +326,7 @@ func TestSubmitPaymentRun_ReplaySameKey_Idempotent(t *testing.T) {
 func TestSubmitPaymentRun_ReplayDifferentKey_Rejected(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-8", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-8"})
 	validateAndLock(t, r, run.RunID)
 	doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-key-a"}, testTenant)
@@ -286,7 +340,7 @@ func TestSubmitPaymentRun_ReplayDifferentKey_Rejected(t *testing.T) {
 func TestReconcilePaymentRunStatus_UpdatesInstructionAndRun(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-9", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-9"})
 	validateAndLock(t, r, run.RunID)
 	doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-9"}, testTenant)
@@ -318,7 +372,7 @@ func TestReconcilePaymentRunStatus_UpdatesInstructionAndRun(t *testing.T) {
 func TestReconcilePaymentRunStatus_ReplayedEvent_Idempotent(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-10", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-10"})
 	validateAndLock(t, r, run.RunID)
 	doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-10"}, testTenant)
@@ -349,7 +403,7 @@ func TestReconcilePaymentRunStatus_ReplayedEvent_Idempotent(t *testing.T) {
 func TestCancelUnsubmittedRun(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-11", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-11"})
 
 	w := doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/cancel", domain.CancelRunRequest{Reason: "duplicate run"}, testTenant)
@@ -361,7 +415,7 @@ func TestCancelUnsubmittedRun(t *testing.T) {
 func TestRetrySafeInstruction(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-12", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-12"})
 	validateAndLock(t, r, run.RunID)
 	doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-12"}, testTenant)
@@ -382,7 +436,7 @@ func TestRetrySafeInstruction(t *testing.T) {
 func TestGetAvailableActions_Draft(t *testing.T) {
 	auth := newStubAuth()
 	auth.add("auth-13", testTenant, testLegalEntity, 100)
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
 	run := createRun(t, r, []string{"auth-13"})
 
 	w := doRequest(r, http.MethodGet, "/ap11/runs/"+run.RunID+"/available-actions", nil, testTenant)
@@ -406,9 +460,144 @@ func TestGetAvailableActions_Draft(t *testing.T) {
 }
 
 func TestGetRun_NotFound(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAuth())
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, newStubAuth(), newStubProvider(), newStubStatus())
 	w := doRequest(r, http.MethodGet, "/ap11/runs/does-not-exist", nil, testTenant)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── Banking wiring (BNK-06/BNK-07) ───────────────────────────────────────────
+
+func instructionIDOf(t *testing.T, r http.Handler, runID string) string {
+	t.Helper()
+	w := doRequest(r, http.MethodGet, "/ap11/runs/"+runID+"/instructions", nil, testTenant)
+	var listResp struct {
+		Data []domain.RunInstruction `json:"data"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &listResp)
+	if len(listResp.Data) == 0 {
+		t.Fatalf("expected at least one instruction")
+	}
+	return listResp.Data[0].InstructionID
+}
+
+// TestSubmitPaymentRun_HandsInstructionToBanking is the first real caller of
+// BNK-06's PrepareAttempt/SubmitAttempt and BNK-07's RecordPaymentStatus
+// anywhere in this codebase — SubmitPaymentRun no longer only records
+// intent.
+func TestSubmitPaymentRun_HandsInstructionToBanking(t *testing.T) {
+	auth := newStubAuth()
+	auth.add("auth-14", testTenant, testLegalEntity, 100)
+	provider := newStubProvider()
+	status := newStubStatus()
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, provider, status)
+	run := createRun(t, r, []string{"auth-14"})
+	validateAndLock(t, r, run.RunID)
+
+	w := doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-14"}, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 submitting, got %d: %s", w.Code, w.Body.String())
+	}
+	if provider.calls != 1 {
+		t.Fatalf("expected exactly one real PrepareAndSubmit call to BNK-06, got %d", provider.calls)
+	}
+	if status.calls != 1 {
+		t.Fatalf("expected exactly one real RecordInitialStatus call to BNK-07, got %d", status.calls)
+	}
+
+	w = doRequest(r, http.MethodGet, "/ap11/runs/"+run.RunID+"/instructions", nil, testTenant)
+	var listResp struct {
+		Data []domain.RunInstruction `json:"data"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &listResp)
+	if listResp.Data[0].ProviderAttemptID == "" || listResp.Data[0].Bnk07PaymentID == "" {
+		t.Fatalf("expected instruction to carry real Banking correlation ids, got %+v", listResp.Data[0])
+	}
+}
+
+// TestSubmitPaymentRun_BankingHandoffFails_RunMovesToException mirrors
+// LockPaymentRun's own "any failure raises EXCEPTION, never a silent
+// partial state" discipline, now applied to the Banking handoff too.
+func TestSubmitPaymentRun_BankingHandoffFails_RunMovesToException(t *testing.T) {
+	auth := newStubAuth()
+	auth.add("auth-15", testTenant, testLegalEntity, 100)
+	provider := newStubProvider()
+	provider.fail = true
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, provider, newStubStatus())
+	run := createRun(t, r, []string{"auth-15"})
+	validateAndLock(t, r, run.RunID)
+
+	w := doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-15"}, testTenant)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Banking handoff failed, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doRequest(r, http.MethodGet, "/ap11/runs/"+run.RunID, nil, testTenant)
+	var resp struct {
+		Run domain.PaymentRun `json:"run"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Run.Status != domain.StatusException {
+		t.Fatalf("expected EXCEPTION after failed Banking handoff, got %s", resp.Run.Status)
+	}
+}
+
+// TestPollInstructionStatus_AppliesRealBankingStatus is the real
+// reconciliation path: it fetches BNK-07's own canonical status rather than
+// accepting a caller's unverified word for it (ReconcilePaymentRunStatus).
+func TestPollInstructionStatus_AppliesRealBankingStatus(t *testing.T) {
+	auth := newStubAuth()
+	auth.add("auth-16", testTenant, testLegalEntity, 100)
+	provider := newStubProvider()
+	status := newStubStatus()
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, provider, status)
+	run := createRun(t, r, []string{"auth-16"})
+	validateAndLock(t, r, run.RunID)
+	doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-16"}, testTenant)
+	instructionID := instructionIDOf(t, r, run.RunID)
+
+	// BNK-07 now reports the payment genuinely settled.
+	for paymentID := range status.statuses {
+		status.statuses[paymentID] = "SETTLED"
+	}
+
+	w := doRequest(r, http.MethodPost, "/ap11/instructions/"+instructionID+"/poll", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 polling, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doRequest(r, http.MethodGet, "/ap11/runs/"+run.RunID, nil, testTenant)
+	var resp struct {
+		Run domain.PaymentRun `json:"run"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Run.Status != domain.StatusSettled {
+		t.Fatalf("expected run SETTLED from BNK-07's real status, got %s", resp.Run.Status)
+	}
+}
+
+// TestPollInstructionStatus_NoNewsYet_NotApplied covers BNK-07 reporting a
+// status this service doesn't reconcile on yet (still SUBMITTED) — polling
+// must not fabricate progress.
+func TestPollInstructionStatus_NoNewsYet_NotApplied(t *testing.T) {
+	auth := newStubAuth()
+	auth.add("auth-17", testTenant, testLegalEntity, 100)
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, newStubProvider(), newStubStatus())
+	run := createRun(t, r, []string{"auth-17"})
+	validateAndLock(t, r, run.RunID)
+	doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-17"}, testTenant)
+	instructionID := instructionIDOf(t, r, run.RunID)
+
+	w := doRequest(r, http.MethodPost, "/ap11/instructions/"+instructionID+"/poll", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Applied bool `json:"applied"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Applied {
+		t.Fatalf("expected applied=false while BNK-07 still reports PREPARED")
 	}
 }

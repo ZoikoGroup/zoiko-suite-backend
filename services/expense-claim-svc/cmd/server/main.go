@@ -23,6 +23,7 @@ import (
 	"zoiko.io/expense-claim-svc/internal/handler"
 	"zoiko.io/expense-claim-svc/internal/health"
 	"zoiko.io/expense-claim-svc/internal/middleware"
+	"zoiko.io/expense-claim-svc/internal/payableopenitem"
 	"zoiko.io/expense-claim-svc/internal/policy"
 	"zoiko.io/expense-claim-svc/internal/store"
 	"zoiko.io/expense-claim-svc/internal/tax"
@@ -68,8 +69,9 @@ func main() {
 	docsClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, logger)
 	taxClient := tax.NewHTTPClient(cfg.TaxDeterminationServiceURL, logger)
 	policyClient := policy.NewHTTPClient(cfg.PolicyServiceURL, logger)
+	payableClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger)
 
-	h := handler.New(pgStore, publisher, authzClient, employeeClient, docsClient, taxClient, policyClient, handler.Config{
+	h := handler.New(pgStore, publisher, authzClient, employeeClient, docsClient, taxClient, policyClient, payableClient, handler.Config{
 		ReceiptRequiredThreshold: cfg.ReceiptRequiredThreshold,
 	}, logger)
 

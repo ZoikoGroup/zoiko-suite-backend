@@ -139,6 +139,21 @@ func (s *stubWorkflow) GetByID(_ context.Context, id string) (*aggregator.Source
 	return s.result, s.err
 }
 
+// stubWorkflowHistory is a test double for handler.WorkflowHistorySource —
+// see aggregator.WorkflowHistoryClient's doc comment for what this closes.
+// Defaults to an empty history (no error) so existing tests that never
+// configure it keep exercising the real path unaffected.
+type stubWorkflowHistory struct {
+	result []aggregator.SourceRecord
+	err    error
+	calls  int
+}
+
+func (s *stubWorkflowHistory) ListByInstanceID(_ context.Context, _ string) ([]aggregator.SourceRecord, error) {
+	s.calls++
+	return s.result, s.err
+}
+
 // ── stub publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct {
@@ -168,9 +183,13 @@ func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 }
 
 func newRouter(s *stubStore, gov *stubGovernance, acc *stubAccess, wf *stubWorkflow, pub *stubPublisher) chi.Router {
+	return newRouterWithWorkflowHistory(s, gov, acc, wf, &stubWorkflowHistory{}, pub, &stubAuthz{})
+}
+
+func newRouterWithWorkflowHistory(s *stubStore, gov *stubGovernance, acc *stubAccess, wf *stubWorkflow, wfh *stubWorkflowHistory, pub *stubPublisher, az handler.AuthzChecker) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, gov, acc, wf, pub, &stubAuthz{}, zap.NewNop())
+	h := handler.New(s, gov, acc, wf, wfh, pub, az, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -313,6 +332,64 @@ func TestGenerateManifest_MultipleSources_AllIncluded(t *testing.T) {
 
 	require.Equal(t, http.StatusCreated, rec.Code)
 	require.Len(t, s.records["manifest-1"], 3, "all three source types must be included")
+}
+
+// TestGenerateManifest_WorkflowInstance_IncludesRealHistory is the first
+// real caller of workflow-history-svc anywhere in this codebase — closing
+// the gap workflow-history-svc's own package doc named directly. A
+// requested WorkflowInstanceID must pull both the workflow-svc snapshot
+// AND every real transition event, not just the former.
+func TestGenerateManifest_WorkflowInstance_IncludesRealHistory(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	wf.result = &aggregator.SourceRecord{SourceType: domain.SourceWorkflowInstance, SourceRecordID: "wf-2", RawJSON: []byte(`{"c":3}`)}
+	wfh := &stubWorkflowHistory{result: []aggregator.SourceRecord{
+		{SourceType: domain.SourceWorkflowHistory, SourceRecordID: "evt-1", RawJSON: []byte(`{"event_id":"evt-1"}`)},
+		{SourceType: domain.SourceWorkflowHistory, SourceRecordID: "evt-2", RawJSON: []byte(`{"event_id":"evt-2"}`)},
+	}}
+
+	s := newStubStore()
+	r := newRouterWithWorkflowHistory(s, gov, acc, wf, wfh, pub, &stubAuthz{})
+
+	body, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioLegalDiscovery,
+		WorkflowInstanceIDs: []string{"wf-2"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	require.Len(t, s.records["manifest-1"], 3, "the workflow-svc snapshot plus both real transition events must be included")
+	if wfh.calls != 1 {
+		t.Fatalf("expected exactly one real ListByInstanceID call to workflow-history-svc, got %d", wfh.calls)
+	}
+}
+
+// TestGenerateManifest_WorkflowHistoryUnavailable_FailsClosed verifies the
+// manifest is all-or-nothing — the same fail-closed doctrine every other
+// source already has.
+func TestGenerateManifest_WorkflowHistoryUnavailable_FailsClosed(t *testing.T) {
+	gov, acc, wf, pub := defaultSources()
+	wf.result = &aggregator.SourceRecord{SourceType: domain.SourceWorkflowInstance, SourceRecordID: "wf-3", RawJSON: []byte(`{"c":3}`)}
+	wfh := &stubWorkflowHistory{err: aggregator.ErrSourceUnavailable}
+
+	s := newStubStore()
+	r := newRouterWithWorkflowHistory(s, gov, acc, wf, wfh, pub, &stubAuthz{})
+
+	body, _ := json.Marshal(domain.GenerateManifestRequest{
+		TenantID: "t1", LegalEntityID: "e1", ScenarioType: domain.ScenarioLegalDiscovery,
+		WorkflowInstanceIDs: []string{"wf-3"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/evidence-manifests", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Empty(t, s.records["manifest-1"], "no partial records must be persisted when workflow-history-svc is unavailable")
 }
 
 // ── GetManifest / ListRecords ────────────────────────────────────────────────

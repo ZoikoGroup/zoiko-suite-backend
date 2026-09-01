@@ -17,6 +17,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/domain"
 	"zoiko.io/accounts-payable-svc/internal/handler"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
+	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 )
 
 // tenant_id and legal_entity_id are uuid columns, so the fixtures are UUIDs —
@@ -117,15 +118,34 @@ type stubAuthZ struct {
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+// stubPayables is a stub payable-open-item-svc (AP-08) client — see
+// internal/payableopenitem's package doc.
+type stubPayables struct {
+	fail  bool
+	calls int
+}
+
+func (p *stubPayables) CreatePayableFromApprovedSource(_ context.Context, _, _ string, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
+	p.calls++
+	if p.fail {
+		return nil, payableopenitem.ErrPayableServiceUnavailable
+	}
+	return &payableopenitem.PayableOpenItem{PayableID: "payable-" + req.SourceReference, Status: "OPEN"}, nil
+}
+
 // newRouter mounts TenantContext, which the real server mounts in
 // cmd/server/main.go. It used to be omitted, so every handler under test saw an
 // empty tenant scope and fell back to the query parameter or the body — the very
 // behaviour these tests are supposed to be checking. A handler harness must
 // mount the middleware the handler depends on.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
+	return newRouterWithPayables(s, p, a, &stubPayables{})
+}
+
+func newRouterWithPayables(s *stubStore, p *stubPublisher, a *stubAuthZ, payables *stubPayables) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, a, zap.NewNop())
+	h := handler.New(s, p, a, payables, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -491,6 +511,50 @@ func TestApproveInvoice_FromValidated_Succeeds(t *testing.T) {
 	}
 	if pub.approved != 1 {
 		t.Fatalf("expected vendor.invoice.approved to be published once, got %d", pub.approved)
+	}
+}
+
+// TestApproveInvoice_CreatesRealAP08Payable is the first real consumer
+// payable-open-item-svc (AP-08) has ever had for a vendor invoice — AP-08
+// previously only had expense-claim-svc as a real source.
+func TestApproveInvoice_CreatesRealAP08Payable(t *testing.T) {
+	s := newStubStore()
+	s.invoices["i1"] = &domain.VendorInvoice{
+		InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, VendorID: "vendor-1",
+		Amount: 500, CurrencyCode: "USD", DueDate: time.Now().UTC().Add(30 * 24 * time.Hour),
+		Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator",
+	}
+
+	payables := &stubPayables{}
+	r := newRouterWithPayables(s, &stubPublisher{}, &stubAuthZ{}, payables)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/approve", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if payables.calls != 1 {
+		t.Fatalf("expected exactly one real CreatePayableFromApprovedSource call to AP-08, got %d", payables.calls)
+	}
+}
+
+// TestApproveInvoice_AP08Unavailable_ApprovalStillStands verifies the AP-08
+// call is genuinely best-effort — mirroring expense-claim-svc's own
+// doctrine — and never undoes an approval that already succeeded.
+func TestApproveInvoice_AP08Unavailable_ApprovalStillStands(t *testing.T) {
+	s := newStubStore()
+	s.invoices["i1"] = &domain.VendorInvoice{
+		InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, VendorID: "vendor-1",
+		Amount: 500, CurrencyCode: "USD", DueDate: time.Now().UTC().Add(30 * 24 * time.Hour),
+		Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator",
+	}
+
+	payables := &stubPayables{fail: true}
+	r := newRouterWithPayables(s, &stubPublisher{}, &stubAuthZ{}, payables)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/approve", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 approval to stand despite AP-08 failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.invoices["i1"].Status != domain.InvoiceStatusApproved {
+		t.Fatalf("expected status APPROVED despite AP-08 failure, got %s", s.invoices["i1"].Status)
 	}
 }
 

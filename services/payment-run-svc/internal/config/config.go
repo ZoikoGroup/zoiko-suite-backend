@@ -12,6 +12,8 @@ type Config struct {
 	KafkaEventsTopic               string
 	AuthzServiceURL                string
 	PaymentAuthorizationServiceURL string
+	PaymentInitiationAdapterURL    string
+	PaymentStatusServiceURL        string
 }
 
 func Load() (*Config, error) {
@@ -30,6 +32,8 @@ func Load() (*Config, error) {
 		KafkaEventsTopic:               getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.payment-run.events"),
 		AuthzServiceURL:                getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		PaymentAuthorizationServiceURL: getEnvOrDefault("PAYMENT_AUTHORIZATION_SERVICE_URL", "http://payment-authorization-svc:8160"),
+		PaymentInitiationAdapterURL:    getEnvOrDefault("PAYMENT_INITIATION_ADAPTER_URL", "http://payment-initiation-adapter-svc:8162"),
+		PaymentStatusServiceURL:        getEnvOrDefault("PAYMENT_STATUS_SERVICE_URL", "http://payment-status-svc:8163"),
 	}, nil
 }
 

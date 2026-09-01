@@ -48,6 +48,12 @@ type WorkflowSource interface {
 	GetByID(ctx context.Context, workflowInstanceID string) (*aggregator.SourceRecord, error)
 }
 
+// WorkflowHistorySource closes the gap workflow-history-svc's own package
+// doc named directly — see aggregator.WorkflowHistoryClient's doc comment.
+type WorkflowHistorySource interface {
+	ListByInstanceID(ctx context.Context, workflowInstanceID string) ([]aggregator.SourceRecord, error)
+}
+
 // Action constants passed to authorization-svc as action_type.
 //
 // Two, not one: assembling a manifest and reading one back are different
@@ -66,18 +72,19 @@ type AuthzChecker interface {
 }
 
 type Handler struct {
-	store      Store
-	governance GovernanceSource
-	access     AccessSource
-	workflow   WorkflowSource
-	publisher  Publisher
-	authz      AuthzChecker
-	log        *zap.Logger
+	store           Store
+	governance      GovernanceSource
+	access          AccessSource
+	workflow        WorkflowSource
+	workflowHistory WorkflowHistorySource
+	publisher       Publisher
+	authz           AuthzChecker
+	log             *zap.Logger
 }
 
 func New(store Store, governance GovernanceSource, access AccessSource,
-	workflow WorkflowSource, publisher Publisher, authz AuthzChecker, log *zap.Logger) *Handler {
-	return &Handler{store: store, governance: governance, access: access, workflow: workflow, publisher: publisher, authz: authz, log: log}
+	workflow WorkflowSource, workflowHistory WorkflowHistorySource, publisher Publisher, authz AuthzChecker, log *zap.Logger) *Handler {
+	return &Handler{store: store, governance: governance, access: access, workflow: workflow, workflowHistory: workflowHistory, publisher: publisher, authz: authz, log: log}
 }
 
 // authorize asks authorization-svc whether this principal may perform
@@ -266,6 +273,16 @@ func (h *Handler) collectRecords(ctx context.Context, req domain.GenerateManifes
 			return nil, err
 		}
 		out = append(out, *rec)
+
+		// workflow-history-svc's own transition history for this same
+		// instance — not optional, not a separate request field: an
+		// instance's real history is intrinsically part of its evidence.
+		// See internal/domain's package doc.
+		historyRecs, err := h.workflowHistory.ListByInstanceID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, historyRecs...)
 	}
 	return out, nil
 }

@@ -36,6 +36,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/health"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
 	"zoiko.io/accounts-payable-svc/internal/mtls"
+	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
@@ -181,7 +182,8 @@ func main() {
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	payablesClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, log)
+	h := handler.New(pgStore, publisher, authzClient, payablesClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

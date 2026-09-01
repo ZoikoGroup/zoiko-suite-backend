@@ -372,7 +372,198 @@ Built alongside BNK-06 as its status/finality counterpart. **Unlike BNK-06, this
 
 Registered in `docker-compose.yml`/`init-db.sh` (port 8163, db `payment_status`, depends on `authorization-svc` only).
 
-**Not yet done:** `payment-run-svc` (AP-11, §3.12) does not yet call either of these two services — `SubmitPaymentRun` still only records intent, and `ReconcilePaymentRunStatus` is still caller-attested. Wiring AP-11 to actually call BNK-06's `PrepareAttempt`/`SubmitAttempt` and consume BNK-07's canonical status would close AP-11's two biggest documented gaps for real, moving the domain's one remaining honest gap down to just the Provider Adapter's actual bank/PSP network call. Scoped but deliberately not started in this session — a natural next step, not a silent scope expansion.
+**Update, same day:** the wiring described above as a next step is now done — see §3.15.
+
+---
+
+### 3.15 `payment-run-svc` (AP-11) wired to BNK-06/BNK-07 — closes §3.12's and §3.14's documented gap (2026-09-01)
+
+`SubmitPaymentRun` now really hands every instruction to Banking before transitioning the run itself, and a new `PollInstructionStatus` reconciles from BNK-07's real canonical status — the two pieces §3.12 and §3.14 both explicitly scoped as "not yet done."
+
+**What's real, not fabricated:**
+- `SubmitPaymentRun` calls BNK-06's `PrepareAttempt`+`SubmitAttempt` (via a new `internal/provideradapter` client) for every instruction, then registers the canonical execution record with BNK-07's `RecordPaymentStatus` (via a new `internal/paymentstatus` client) — the first real caller of either service anywhere in this codebase. This happens **before** the run itself transitions from `LOCKED` to `SUBMITTED`, mirroring `LockPaymentRun`'s own "do the real work first, only then transition; any failure raises `EXCEPTION` rather than a silent partial state" discipline. Verified directly: with BNK-06 stubbed to fail, the run is confirmed to move to `EXCEPTION` rather than reaching `SUBMITTED` — disabling that guard and re-running the test showed the run wrongly reaching `SUBMITTED` at `200`, confirmed as a negative control, then restored.
+- The correlation to both services is durable, not just passed through: two new columns on `run_instructions` (`provider_attempt_id`, `bnk07_payment_id`, migration `000004_provider_refs`) are written exactly once and are immutable afterward — enforced by the same database trigger pattern used for every other authorized field on this table.
+- `PollInstructionStatus` (new endpoint, `POST /ap11/instructions/{instructionID}/poll`) queries BNK-07's real `GetPaymentStatus` for the instruction's own `bnk07_payment_id` and reconciles the run from that real answer, sharing the same authorization/idempotent-apply/aggregate-recompute path as the existing `ReconcilePaymentRunStatus` (both now call a common `applyExternalStatus`). A poll while BNK-07 still reports `PREPARED`/`SUBMITTED`/`PENDING` correctly reports `applied: false` rather than fabricating progress — verified directly: forcing the "no news yet" branch to always report news caused the test to genuinely fail, confirmed as a negative control, then restored.
+- `ReconcilePaymentRunStatus` (the old caller-attested command) is deliberately kept, not removed — a manual-override path for an operator recording a real external fact BNK-07 didn't itself capture, the same "record a real external fact a human observed" doctrine used throughout this session.
+- The derived `ProviderEventRef` for a poll (`"<bnk07_payment_id>:<status>"`) is deterministic, so re-polling the same real status twice is idempotent through the exact same database uniqueness constraint `ReconcilePaymentRunStatus` already relies on — no separate idempotency mechanism was needed.
+- `PayerAccountVerified` is asserted `true` when calling BNK-06 — not a new fabrication; AP-09/AP-10 already treat the paying bank account reference as opaque (no real account-status source exists anywhere in this codebase), and this is the exact same caller-attestation gate BNK-06's own package doc defines for that reason.
+
+**What remains the one honest gap, now one layer further down:** BNK-06's own Provider Adapter behind `SubmitAttempt` is a documented stub (§3.13) — no actual bank/PSP network call exists anywhere in this codebase. Wiring AP-11 through BNK-06/BNK-07 for real moves the domain's one remaining honest gap down to exactly that boundary, and no further.
+
+4 new handler tests (real Banking handoff, handoff-failure → `EXCEPTION`, real-status poll settling a run, poll-with-no-news not applying), plus the two negative controls above. Full existing AP-11 suite (17 tests total) still green.
+
+`docker-compose.yml` updated: `payment-run-svc` now depends on `payment-initiation-adapter-svc`/`payment-status-svc` (`service_healthy`) and carries their base URLs (`PAYMENT_INITIATION_ADAPTER_URL`, `PAYMENT_STATUS_SERVICE_URL`). `docker compose config --quiet` validated clean.
+
+---
+
+### 3.16 `payable-open-item-svc` — new service, AP-08 of the Procurement, Expenses & Accounts Payable baseline (2026-09-01) — closes a gap named by both AP-07 (§3.9) and AP-09 (§3.10)
+
+Confirmed directly against the actual spec (section 11, "AP-08 — Payables") before writing any code. Two earlier services in this domain each documented, in their own package docs, that they had no real AP-08 to hand off to: `expense-claim-svc` (AP-07) could only emit an unconsumed `ExpenseClaimPayableRequested` event because `accounts-payable-svc`'s entire model is vendor-invoice-shaped with no claimant/reimbursement concept; `payment-proposal-svc` (AP-09) had to pull its eligible-payable population directly from `accounts-payable-svc`/`expense-claim-svc` rather than through a proper payables ledger, because none existed. This service is that ledger.
+
+**What's real, not fabricated:**
+- `expense-claim-svc`'s `ApproveExpenseClaim` now calls this service's real `CreatePayableFromApprovedSource` (new `internal/payableopenitem` client) instead of emitting an unconsumed event — the first real consumer AP-07 has ever had for its approved claims. The call is deliberately best-effort, mirroring `goods-service-receipt-svc`'s own GRNI-posting doctrine (§3.8): a failure emits `EXPENSE_CLAIM_PAYABLE_CREATE_FAILED` for visibility but never undoes the approval that already succeeded. Verified directly: with the AP-08 client stubbed to fail, the claim's approval still returns `200`/`REIMBURSABLE`, confirmed as a test in its own right.
+- **Negative-path #4** ("AP totals match GL but duplicate/missing open items remain") is enforced by a genuine database uniqueness constraint on `(source_type, source_reference)` — a repeat `CreatePayableFromApprovedSource` call for an already-recorded source returns the existing payable idempotently rather than creating a duplicate.
+- **Negative-path #3** ("confirmed payment applied twice") is enforced by a genuine database uniqueness constraint on `(payable_id, idempotency_ref)`, scoped to `PAYMENT` applications only. A real ordering bug was caught and fixed during testing: the idempotency check must run *before* the state-transition guard, or a payment that fully settles a payable on its first application gets its replay wrongly rejected as "already settled" instead of returned as the idempotent no-op it actually is — caught by the test itself failing on first run, fixed in both the stub store and the real Postgres store, then reverified.
+- **Negative-path #2** ("disputed payable included as eligible payment") is enforced by `GetPaymentEligibility`'s own exclusion of held/disputed payables (`IsEligibleForPayment`) — a dedicated query endpoint AP-09 is meant to call once wired to this service, rather than reimplementing the filter itself. Verified directly: with the exclusion condition disabled, a disputed payable wrongly appeared in the eligible-payment list, confirmed as a negative control, then restored.
+- **Negative-path #1** ("payable residual manually overwritten") is structurally impossible: there is no generic update endpoint; residual only ever changes through the specific settlement-application command handlers, computed server-side from a caller-supplied *delta*, never a caller-supplied absolute value.
+- The residual is allowed to go negative through exactly one path — `ApplySupplierCredit` — matching the spec's own words ("residual cannot go negative except explicit supplier-credit state"); every other settlement application (`ApplyConfirmedPayment`, `ApplyRecovery`) is blocked from taking it negative.
+
+**Two scope decisions of this service's own design, not gaps in a peer** (documented in `internal/domain`'s package doc): `CreatePayableFromApprovedSource` lands the payable directly in `OPEN` rather than a separate `RECOGNIZED` state the spec names but gives no command to leave; `ClosePayable` — in the spec's command list but absent from its own state model and event list, a real inconsistency in the spec text — is modeled as marking an already-fully-`SETTLED`, non-held, non-disputed payable as archived (`ClosedAt` set), the narrowest reading consistent with both facts.
+
+**Honest gaps, left for a natural next step rather than fabricated:**
+- `accounts-payable-svc` (vendor invoices, AP-05/06) is **not yet wired** as this service's second source — only `expense-claim-svc` is, in this build.
+- `payment-proposal-svc` (AP-09) has **not yet been switched over** to source payables from here (`ListOpenPayables`/`GetPaymentEligibility`) — it still sources directly from `accounts-payable-svc`/`expense-claim-svc`. This is the natural next wiring step, the same shape as AP-11's wiring to BNK-06/BNK-07 in §3.15.
+- `ApplyConfirmedPayment` has no real caller yet (would come from AP-11/BNK-07's settlement chain) — caller-attested for now, the same "record a real external fact a human observed" doctrine used throughout this session.
+- `ApplyRecovery` names AP-12 (Supplier Refund/Recovery), which does not exist anywhere in this codebase — its `RecoveryRef` is an opaque, caller-supplied reference, the same pattern as AP-01's `PayeeReference`.
+
+12 handler tests, all passing; two negative controls verified as described above (idempotency-before-state-guard ordering, and disputed/held exclusion from eligibility).
+
+Registered in `docker-compose.yml` (port 8164, db `payable_open_item`, depends only on `authorization-svc`) and `init-db.sh`; `expense-claim-svc` now also depends on it. `docker compose config --quiet` validated clean.
+
+**Update, same day:** the AP-09 switch-over named above as a next step is now done — see §3.17.
+
+---
+
+### 3.17 `payment-proposal-svc` (AP-09) switched to source EXPENSE_CLAIM payables from `payable-open-item-svc` — closes §3.16's own named next step (2026-09-01)
+
+`AddEligiblePayable`'s `EXPENSE_CLAIM` branch now calls AP-08's real `GetPayableBySource` (a new AP-08 query endpoint, added for this exact cross-service correlation need) instead of `expense-claim-svc` directly. `expense-claim-svc` is no longer called from this service at all — its old `internal/expenseclaim` client package is deleted.
+
+**What's real, not fabricated:**
+- The new `internal/payableopenitem` client asks AP-08 for the payable it created for `(EXPENSE_CLAIM, claimID)` and checks its real `Status`/`ResidualAmount` — a materially stronger existence/settlement check than `expense-claim-svc`'s own simple `REIMBURSABLE` status test, since AP-08 is `expense-claim-svc`'s own real payables consumer now (§3.16).
+- **A real parity gap is closed, not just relocated:** `EXPENSE_CLAIM` items now get the exact same `ExceptionRef` hold-override path `AP_INVOICE` items already had — `expense-claim-svc` never had a hold/dispute concept for this service to check at all before AP-08 existed, so this is new coverage, not a rename of an old check. Verified directly: disabling the `IsHeld`/`IsDisputed` check let a held `EXPENSE_CLAIM` payable be added without an exception reference at `201`; restored after confirming the negative control failed as expected.
+- `PayeeRef`/`NetAmount`/`Currency` now come from AP-08's own payable record (`PayeeRef`, `ResidualAmount`, `Currency`) rather than re-summing `expense-claim-svc`'s lines client-side — AP-08 is the authoritative residual now, not a value this service should independently recompute.
+- The design deliberately splits responsibility the same way the `AP_INVOICE` branch already does: the client (`GetEligiblePayable`) only confirms the payable exists, matches the legal entity, and is still a real unsettled liability; whether a held/disputed one may still be force-added is the handler's own SoD decision (`ExceptionRef` + `PAYMENT_PROPOSAL_EXCEPTION_RESOLVE`), never decided unilaterally inside the client.
+
+**Honest gap, unchanged:** `AP_INVOICE` items are still sourced directly from `accounts-payable-svc`, since AP-08 does not yet have vendor invoices wired as a source (§3.16's own remaining gap). Once that wiring exists, this branch would switch too — not started here.
+
+2 new/updated handler tests for the `EXPENSE_CLAIM` branch (basic selection from AP-08, held-without-exception blocked), plus the negative control above. Full existing AP-09 suite still green.
+
+`docker-compose.yml` updated: `payment-proposal-svc` now depends on `payable-open-item-svc` instead of `expense-claim-svc`, and carries `PAYABLE_OPEN_ITEM_SERVICE_URL` in place of `EXPENSE_CLAIM_SERVICE_URL`. `docker compose config --quiet` validated clean.
+
+**Update, same day:** AP-08's remaining source gap (vendor invoices) named in §3.16 is now closed — see §3.18.
+
+---
+
+### 3.18 `accounts-payable-svc` wired to `payable-open-item-svc` (AP-08) — closes AP-08's last documented source gap (2026-09-01)
+
+`ApproveInvoice` (VALIDATED → APPROVED) now calls AP-08's real `CreatePayableFromApprovedSource` — AP-08's first real vendor-invoice source; it previously only had `expense-claim-svc`. This is the last of AP-08's two named upstream sources (vendor invoices, expense claims) now wired for real.
+
+**What's real, not fabricated:**
+- The call is deliberately best-effort, mirroring `expense-claim-svc`'s and `goods-service-receipt-svc`'s own doctrine for a downstream side effect that must never undo a transition that already committed: a failure is logged (`ApproveInvoice: AP-08 payable creation failed`) but never returned to the caller as an error, and the invoice's own `APPROVED` transition — already durable by that point — stands regardless. Verified directly as its own test.
+- `accounts-payable-svc` predates this session (it already had its own mature config/authz/mTLS/telemetry infrastructure, distinct in style from every service built this session) — the new `internal/payableopenitem` client and its wiring were added following this service's own existing conventions (its `Store`/`Publisher`/`AuthZClient` narrow-interface `Handler` pattern) rather than importing this session's newer conventions wholesale.
+- `SourceReference` is the invoice's own `InvoiceID`; `PayeeRef` is `VendorID`; `OriginalAmount`/`Currency`/`DueDate` come directly from the invoice record — no field is invented or re-derived.
+
+2 new handler tests (real AP-08 call on approval, approval stands despite AP-08 failure), plus a verified negative control (disabled the call-counting, confirmed the test genuinely caught the missing call, restored). Full existing `accounts-payable-svc` suite (unrelated to this change) still green — `authz`, `config`, `domain`, `events`, `store` packages all untouched and passing.
+
+**What remains open, not started here:** `payment-proposal-svc` (AP-09)'s `AP_INVOICE` branch still sources directly from `accounts-payable-svc` rather than from AP-08 (§3.17 named this as the one remaining piece of its own switch-over). Now that AP-08 has a real vendor-invoice source, that switch is unblocked but not started in this turn.
+
+`docker-compose.yml` updated: `accounts-payable-svc` now depends on `payable-open-item-svc` and carries `PAYABLE_OPEN_ITEM_SERVICE_URL`. `docker compose config --quiet` validated clean.
+
+**Update, same day:** the remaining piece named above is now done — see §3.19. AP-08's unification across the whole Procurement/Expenses/Accounts Payable payables chain is complete.
+
+---
+
+### 3.19 `payment-proposal-svc` (AP-09) `AP_INVOICE` branch switched to `payable-open-item-svc` (AP-08) — completes AP-08's unification across the domain (2026-09-01)
+
+The last piece named in §3.17: `AddEligiblePayable`'s `AP_INVOICE` branch now also goes through AP-08, using the same `GetEligiblePayable` client already built for `EXPENSE_CLAIM` items (generalized to take a `sourceType` parameter). `accounts-payable-svc` is no longer called from this service at all — the old `internal/accountspayable` client package is deleted, alongside its now-unused `ACCOUNTS_PAYABLE_SERVICE_URL` config entry.
+
+**What's real, not fabricated:**
+- Both `AP_INVOICE` and `EXPENSE_CLAIM` items now flow through one identical eligibility check against AP-08's real open/residual state — `PayeeRef`/`GrossAmount`/`NetAmount`/`Currency`/`DueDate` all come from AP-08's own payable record, not from re-fetching either upstream service's invoice/claim directly. AP-08 is the authoritative residual and identity for both sources now, matching its own stated purpose as the domain's payables ledger.
+- **A second real parity gap is closed:** `AP_INVOICE` items can now be held via AP-08's own `IsHeld`/`IsDisputed` fields, in addition to the pre-existing `supplier-financial-profile-svc` `ON_HOLD` check — previously only the supplier-level signal could hold an invoice item; a payable-level hold recorded directly in AP-08 (e.g. a dispute opened against that specific liability, independent of the supplier's overall standing) now blocks it too, with the same `ExceptionRef` override required either way. Verified directly: disabling the `IsHeld` half of the combined check let an AP-08-held invoice item through at `201` with an otherwise-`ACTIVE` supplier profile; confirmed as a negative control, then restored.
+- `supplier-financial-profile-svc`'s `ON_HOLD` status and `TaxWithholdingRef`/`updated_at` staleness signal are kept as an **additional** real check for `AP_INVOICE` items specifically — a supplier-level concept AP-08 has no way to know about, since AP-08 only tracks one payable at a time. This lookup is correctly skipped for `EXPENSE_CLAIM` items, which have no supplier profile concept at all.
+- A test previously seeded a `RECEIVED` (not yet `APPROVED`) invoice via a stub `accounts-payable-svc` client to exercise "not eligible" — since that upstream is no longer called, the equivalent real scenario is simply an invoice AP-08 has no payable record for yet (because `accounts-payable-svc`'s own `ApproveInvoice` never ran `CreatePayableFromApprovedSource` for it), which is exactly what the rewritten test now exercises — arguably a more accurate simulation of the real gap than the original.
+
+1 new handler test (AP-08-level hold blocking an otherwise-active-supplier invoice item), plus the negative control above. Full AP-09 suite (19 tests) green — every existing `AP_INVOICE` test converted to seed its fixture through the unified `stubPayables` rather than a separate `stubAP`, keyed by `(sourceType, sourceReference)` exactly like the real AP-08.
+
+`docker-compose.yml` updated: `payment-proposal-svc` no longer depends on `accounts-payable-svc` at all; `ACCOUNTS_PAYABLE_SERVICE_URL` removed. `docker compose config --quiet` validated clean.
+
+**Where the domain's payables chain stands now:** `accounts-payable-svc` (AP-05/06) and `expense-claim-svc` (AP-07) both create real AP-08 payables on approval; `payment-proposal-svc` (AP-09) sources exclusively from AP-08 for both source types; `payment-authorization-svc` (AP-10) and `payment-run-svc` (AP-11) consume AP-09's frozen proposals as before. AP-08's own remaining honest gaps (§3.16) — `ApplyConfirmedPayment` having no real caller yet, `ApplyRecovery`'s AP-12 dependency not existing — are unchanged by this turn.
+
+**Update, same day:** AP-12 now exists — see §3.20. `ApplyRecovery`'s "no real caller yet" gap is closed; `ApplyConfirmedPayment` remains open.
+
+---
+
+### 3.20 `supplier-recovery-svc` — new service, AP-12 of the Procurement, Expenses & Accounts Payable baseline (2026-09-01) — the last of AP-01 through AP-12
+
+Confirmed directly against the spec (section 15, "AP-12 — Supplier Refund / Recovery") before writing any code. Closes the last remaining named dependency in the domain: `payable-open-item-svc`'s (AP-08) own `ApplyRecovery` command has had no real caller since AP-08 was built (§3.16) — this service is that caller.
+
+**What's real, not fabricated:**
+- `ApplyApprovedOffset` is the first real caller of AP-08's `ApplyRecovery` anywhere in this codebase — an approved offset genuinely reduces the source payable's residual in AP-08, not a locally-recorded intention. Verified directly as its own test (asserting the real call count).
+- `LinkConfirmedSupplierRefund` is the literal enforcement of negative-path #1 ("supplier refund marked received before bank confirmation"): it calls `bank-reconciliation-svc`'s real `GetStatementLine` and requires that line to already be `MATCHED` — the only real "a bank event genuinely happened" fact available anywhere in this codebase for an inbound receipt. Verified directly: disabling the `MATCHED` check let an `UNMATCHED` statement line be accepted at `200`, confirmed as a negative control, then restored.
+- Negative-path #3 ("recovery write-off self-approved") and the spec's own SoD line ("case owner cannot self-approve material offset/write-off") are enforced via `authorization-svc`'s dynamic own-object SoD layer, applied to both `ApplyApprovedOffset` and `WriteOffRecovery` — reused here because the spec explicitly names self-approval as the exact scenario to block, unlike AP-09/AP-11's own deliberate non-reuse where the spec didn't call for it.
+- Negative-path #4 ("recovery closes while AP/GL/bank difference remains") is enforced structurally: `CloseRecoveryCase` is only reachable once `RecoveredAmount` has reached `TotalAmount` exactly (state `RECOVERED`), computed server-side from the same append-only `RecoveryApplication` ledger every offset/refund is recorded in — never a caller-supplied "yes it's fully recovered" flag. Verified directly: with that guard disabled, a case with `$0` recovered against a `$300` total genuinely closed at `200`; confirmed as a negative control, then restored.
+- **A real gap in AP-08 itself was found and worked around, not silently trusted:** AP-08's own database uniqueness constraint on settlement applications (`uq_settlement_applications_payment_ref`) only covers `PAYMENT`-type applications, not `RECOVERY` — so AP-08 cannot itself reject a duplicate `ApplyRecovery` call. This service therefore checks its own idempotency ledger (`(case_id, application_type, idempotency_ref)`, a real database uniqueness constraint on this service's own side) BEFORE ever calling AP-08, so an ordinary replay never reaches AP-08 a second time. Verified directly: disabling that pre-check caused AP-08 to be called twice for the same replayed reference, confirmed as a negative control, then restored. The one residual, explicitly documented risk: a network failure after AP-08 applies the offset but before this service records the result locally could still cause a duplicate reduction at AP-08 on a caller's retry — narrow, and named in `internal/handler`'s own doc comment rather than assumed away.
+- `CreateSupplierRecoveryCase` verifies the named source payable genuinely exists in AP-08 (`GetPayable`) and belongs to the same legal entity before creating a case against it.
+
+**Scope decisions, not gaps in a peer** (documented in `internal/domain`'s package doc): the spec's state model names a separate `Proposed`/`Approved` pair before `InRecovery`, but there is no command to reach either as a distinct resting state before recovery begins — `ApproveRecoveryPlan` moves a case directly `OPEN → IN_RECOVERY`, the same kind of honest consolidation AP-08 itself used collapsing `Recognized` into `OPEN`. `APPROVED` is kept in the status `CHECK` constraint for forward compatibility only.
+
+**Honest gaps, not fabricated:**
+- No `tax-determination-svc` call is made — the spec names TAX as a dependency for recovery basis/treatment, but gives AP-12 no analogue of AP-07/AP-09's real withholding/reclaim request contract to call. `RecoveryReason` and legal/tax basis are caller-supplied evidence fields, the same "record a real fact a human observed" doctrine used throughout this session.
+- `RecordSupplierCommitment` is entirely caller-attested — no supplier communication channel exists anywhere in this codebase to verify a supplier's own commitment against.
+
+13 handler tests, all passing on first run; three negative controls verified as described above. `go vet`/`gofmt` clean.
+
+Registered in `docker-compose.yml` (port 8165, db `supplier_recovery`, depends on `payable-open-item-svc` and `bank-reconciliation-svc`) and `init-db.sh`. `docker compose config --quiet` validated clean.
+
+**The Procurement, Expenses & Accounts Payable baseline (AP-01 through AP-12) is now complete** — every service the original spec names has a real, tested implementation in this codebase, with every cross-service integration either genuinely real or explicitly, honestly documented as a caller-attested/opaque-reference gap.
+
+---
+
+### 3.21 `payee-banking-identity-svc` — new service, ORG-10 of the Organization, Legal Entity & Global Reference Data baseline (2026-09-01)
+
+Scoped by a dedicated research sweep of this session's own package docs: four already-built services — `supplier-financial-profile-svc` (AP-01), `payable-open-item-svc` (AP-08), `payment-proposal-svc` (AP-09), and `payment-run-svc` (AP-11) — each independently treat a payee/bank-account reference as opaque and caller-supplied, citing the exact same reason: "no such ORG-10 service exists anywhere in this codebase." Confirmed directly against the spec (section 4.10, "Banking Identity / Payee Master") before writing any code — ORG-10 is explicitly scoped to **external** beneficiary/payee banking identity only; a tenant's own bank account remains BNK-01's (`banking-connector-svc`'s) responsibility.
+
+**What's real, not fabricated:**
+- `ProposePayeeDestination` verifies the named party against `counterparty-management-svc`'s real `GET /v1/counterparties/{id}` (ORG-07) — confirms it exists and belongs to the right legal entity before a candidate is ever created against it.
+- The spec's own "Minimum service acceptance" #1 ("invoice-supplied bank data never activates destination") is enforced structurally: a candidate sourced from `INVOICE_OCR` or `EMAIL` can never reach `VERIFIED` through a verification method that isn't genuinely independent of its own source (`domain.CanVerify`). Verified directly: disabling that check let an invoice-sourced candidate verify against its own source method at `200`; confirmed as a negative control, then restored.
+- Maker-checker for `ApprovePayeeDestination` reuses `authorization-svc`'s dynamic own-object SoD layer — the destination's own proposer cannot approve it, the literal enforcement of the spec's own SoD line ("supplier-profile editor cannot alone activate changed beneficiary details").
+- "Only one active version per party/scope" (the spec's own idempotency/concurrency line) is enforced by a real database partial unique index, with activation of a new destination superseding whatever was previously `ACTIVE` for the same party/scope in the same transaction. Verified directly: disabling the in-transaction supersession left two destinations simultaneously `ACTIVE` for the same party; confirmed as a negative control, then restored.
+- A real destination-candidate fingerprint (SHA-256 over institution + account + currency) detects duplicate proposals via a genuine database uniqueness constraint, scoped to non-superseded rows so a legitimately retired-then-reused account isn't permanently blocked.
+- Full account identifiers are masked on every read except through a dedicated, more strongly authorized privileged-read path (`PAYEE_MASTER_PRIVILEGED_READ`) — the literal enforcement of "full account never overexposed."
+
+**Scope decision, not a gap in a peer:** `ApprovePayeeDestination` moves `VERIFIED → APPROVAL_PENDING` — the spec's own state model names `ApprovalPending` but its command list has no separate command to reach it before `Approve`, and no distinct `Approved` state at all; read here as "approved, awaiting the mechanical `ActivateDestination` step," the same kind of consolidation applied throughout this session wherever the spec names a state with no dedicated command.
+
+**Honest gaps, not fabricated:**
+- No real "BNK provider validation" (the spec's own named dependency for independent verification) exists anywhere in this codebase — confirmed during this session's own direct research before BNK-06 was built, and unchanged since. `VerifyPayeeDestination` is therefore caller-attested, requiring real evidence fields, never a fabricated automatic verification call.
+- AP-10's own named dependency — payment authorization consulting this service's active destination fingerprint before authorizing — is **not wired** in this build. Scoped as the natural next step, mirroring exactly how AP-11 was wired to BNK-06/BNK-07 in a later turn after those services were first built standalone.
+- Full account identifiers are stored without field-level encryption via a real KMS/`secret-vault-integration-svc` call — masking is real and enforced at the read layer, but at-rest encryption of the raw value is an honest gap, the same posture every other service handling sensitive reference data in this codebase already has.
+
+10 handler tests, all passing; two negative controls verified as described above.
+
+Registered in `docker-compose.yml` (port 8166, db `payee_banking_identity`, depends on `authorization-svc` and `counterparty-management-svc`) and `init-db.sh`. `docker compose config --quiet` validated clean.
+
+**Update, same day:** the AP-10 wiring named above as ORG-10's own remaining next step is now done — see §3.22.
+
+---
+
+### 3.22 `payment-authorization-svc` (AP-10) wired to `payee-banking-identity-svc` (ORG-10) — closes ORG-10's own named dependency (2026-09-01)
+
+`RequestPaymentAuthorization` and `verifyStillEligible` (the shared re-check run at both `ApprovePayment` and `ConsumePaymentAuthorization`) now consult ORG-10's real `GetActivePayeeDestination` — the first real caller of that endpoint anywhere in this codebase, closing ORG-10's own named dependency ("AP-10 fingerprints active version").
+
+**What's real, not fabricated:**
+- At request time, every AP_INVOICE-sourced payee's `PayeeSnapshot` is extended with `DestinationID`, pinning ORG-10's currently-active destination for that payee. `verifyStillEligible` re-checks it live at both later checkpoints exactly like the existing supplier-profile identity check: a destination that has since been superseded (a different `DestinationID` is now active) or removed entirely (no active destination at all — e.g. suspended with no replacement yet) invalidates the authorization, the same "any protected-field mismatch invalidates" doctrine already governing the fingerprint and payee-identity checks. Verified directly, twice: disabling the changed-destination comparison let an authorization approve at `200` despite the payee's destination having been superseded; disabling the no-active-destination branch caused a genuinely-removed destination to be misreported as a `503` outage instead of correctly invalidating. Both confirmed as negative controls, then restored.
+- The check is deliberately optional at request time and skipped at re-verification when no destination was ever pinned: ORG-10 is a brand-new service and does not yet have every existing payee onboarded, so a payee with no ORG-10 coverage is a real, current gap, not something this change should fabricate coverage for or block on. Verified directly as its own test.
+
+2 new domain columns/fields (`authorization_payee_snapshots.destination_id`, migration `000004_payee_destination`), 4 new handler tests, 2 negative controls verified. Full existing AP-10 suite (19 tests total) still green.
+
+`docker-compose.yml` updated: `payment-authorization-svc` now depends on `payee-banking-identity-svc` and carries `PAYEE_IDENTITY_SERVICE_URL`. `docker compose config --quiet` validated clean.
+
+---
+
+### 3.23 `evidence-manifest-svc` wired to `workflow-history-svc` — closes a gap the LATTER service's own package doc named directly (2026-09-01)
+
+Scoped by a dedicated research sweep outside the completed Procurement/AP/Banking/ORG-10 chains. `workflow-history-svc`'s own handler package doc states the gap in so many words: *"v1 Known Gap: evidence-manifest-svc currently fetches workflow data directly from workflow-svc by workflow_instance_id and is NOT wired to this cross-workflow query endpoint... The endpoint is fully functional; no upstream caller uses it in v1."* This is the first time in this session the *pointing* service (rather than the pointed-to gap) was itself already built and just never connected — both services pre-date this session; only the wiring between them is new.
+
+**What's real, not fabricated:**
+- Every `WorkflowInstanceID` named in a `GenerateManifestRequest` now also calls `workflow-history-svc`'s real `GET /v1/workflows/{id}/history` — the first real caller of that endpoint anywhere in this codebase — producing one `ManifestRecord` (`SourceWorkflowHistory`) per real transition event, in addition to the existing `workflow-svc` instance snapshot. Verified directly: disabling the call let a manifest generate with only the snapshot record; the transition-event records were silently missing. Confirmed as a negative control, then restored.
+- This is deliberately **not** a new opt-in request field: an instance's own transition history is intrinsically part of its evidence, exactly the same stance already taken for governance decisions (never optional). A caller who names a `WorkflowInstanceID` gets its full history automatically.
+- The existing "manifest is all-or-nothing" fail-closed doctrine (already governing the other two sources) applies identically here: a `workflow-history-svc` outage fails the whole manifest generation, never a silently-incomplete one. Verified directly as its own test.
+
+**Honest gap, not fabricated:** `workflow-history-svc`'s own comment actually names its **cross-workflow** query (`GET /v1/workflows/history?legal_entity_id=...&from=...&to=...`) as the unwired endpoint, not the per-instance one used here. That broader, tenant/entity/date-range discovery surface has no analogue in `evidence-manifest-svc`'s own request contract (which only accepts explicit `WorkflowInstanceIDs`, the same shape as its `AccessDecisionIDs`) — wiring it would mean adding a genuinely new discovery capability, not connecting two things that already agree on shape. Scoped but not started here, left as a further, separate next step.
+
+2 new handler tests, all passing on first run; 1 negative control verified. New `SourceType` (`WORKFLOW_HISTORY`), migration `000004_add_workflow_history_source` widening the `source_type` `CHECK` constraint. Full existing `evidence-manifest-svc` suite (aggregator/events/handler/store packages) still green and unaffected — every existing test kept its original call shape via a shared test-harness default.
+
+`docker-compose.yml` updated: `evidence-manifest-svc` now depends on `workflow-history-svc` and carries `WORKFLOW_HISTORY_SERVICE_URL`. `docker compose config --quiet` validated clean.
 
 ---
 

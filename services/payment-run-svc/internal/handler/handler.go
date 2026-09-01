@@ -15,6 +15,8 @@ import (
 	"zoiko.io/payment-run-svc/internal/events"
 	svcmiddleware "zoiko.io/payment-run-svc/internal/middleware"
 	"zoiko.io/payment-run-svc/internal/paymentauthorization"
+	"zoiko.io/payment-run-svc/internal/paymentstatus"
+	"zoiko.io/payment-run-svc/internal/provideradapter"
 	"zoiko.io/payment-run-svc/internal/store"
 )
 
@@ -36,15 +38,17 @@ type AuthzChecker interface {
 }
 
 type Handler struct {
-	store store.Store
-	pub   events.Publisher
-	authz AuthzChecker
-	auth  paymentauthorization.Client
-	log   *zap.Logger
+	store    store.Store
+	pub      events.Publisher
+	authz    AuthzChecker
+	auth     paymentauthorization.Client
+	provider provideradapter.Client
+	status   paymentstatus.Client
+	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, auth paymentauthorization.Client, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, auth: auth, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, auth paymentauthorization.Client, provider provideradapter.Client, status paymentstatus.Client, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, auth: auth, provider: provider, status: status, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -65,6 +69,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 	r.Route("/ap11/instructions", func(r chi.Router) {
 		r.Post("/{instructionID}/reconcile", h.ReconcilePaymentRunStatus)
+		r.Post("/{instructionID}/poll", h.PollInstructionStatus)
 		r.Post("/{instructionID}/retry", h.RetrySafeInstruction)
 	})
 }
@@ -339,12 +344,52 @@ func (h *Handler) LockPaymentRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, updated)
 }
 
-// SubmitPaymentRun does not call any bank — see internal/domain's package
-// doc for the full reasoning. It records that submission was attempted and
-// enforces negative-path scenario #1 (replay after timeout) via a real
-// idempotency-key check: a repeat call with the SAME key on an
-// already-SUBMITTED run is a no-op returning the current state; a
-// DIFFERENT key is rejected outright.
+// submitInstructionToBanking is the REAL handoff to Banking — the first
+// real caller of BNK-06's PrepareAttempt/SubmitAttempt and BNK-07's
+// RecordPaymentStatus anywhere in this codebase. See internal/domain's
+// package doc for what remains honestly stubbed one layer further down
+// (BNK-06's own Provider Adapter).
+func (h *Handler) submitInstructionToBanking(ctx context.Context, tenantID, principalID string, run *domain.PaymentRun, ins domain.RunInstruction) error {
+	attempt, err := h.provider.PrepareAndSubmit(ctx, tenantID, principalID, provideradapter.PrepareAndSubmitRequest{
+		LegalEntityID:   run.LegalEntityID,
+		SourceReference: ins.InstructionID,
+		PayerAccountRef: run.PayingBankAccountRef,
+		PayeeRef:        ins.PayeeRef,
+		Amount:          ins.NetAmount,
+		Currency:        ins.Currency,
+		ExecutionDate:   run.ValueDate,
+		// AP-09/AP-10 already treat the paying bank account reference as
+		// opaque (no real account-status source exists anywhere in this
+		// codebase) — this asserts the same caller-attestation gate BNK-06
+		// itself defines, not a new fabrication. See internal/domain's
+		// package doc.
+		PayerAccountVerified: true,
+		IdempotencyKey:       run.IdempotencyKey + ":" + ins.InstructionID,
+	})
+	if err != nil {
+		return err
+	}
+
+	state, err := h.status.RecordInitialStatus(ctx, tenantID, principalID, paymentstatus.RecordInitialStatusRequest{
+		LegalEntityID:     run.LegalEntityID,
+		ProviderRequestID: attempt.ProviderRequestID,
+		SourceReference:   ins.InstructionID,
+	})
+	if err != nil {
+		return err
+	}
+
+	return h.store.SetInstructionProviderRefs(ctx, ins.InstructionID, attempt.AttemptID, state.PaymentID)
+}
+
+// SubmitPaymentRun now really hands every instruction to Banking (BNK-06
+// then BNK-07) BEFORE transitioning the run itself from LOCKED to
+// SUBMITTED — mirroring LockPaymentRun's own "do the real work first, only
+// then transition; any failure raises EXCEPTION rather than a silent
+// partial state" discipline. It still enforces negative-path scenario #1
+// (replay after timeout) via a real idempotency-key check: a repeat call
+// with the SAME key on an already-SUBMITTED run is a no-op returning the
+// current state; a DIFFERENT key is rejected outright.
 func (h *Handler) SubmitPaymentRun(w http.ResponseWriter, r *http.Request) {
 	runID := chi.URLParam(r, "runID")
 	var req domain.SubmitRunRequest
@@ -380,6 +425,29 @@ func (h *Handler) SubmitPaymentRun(w http.ResponseWriter, r *http.Request) {
 	if !domain.CanSubmit(run.Status) {
 		writeError(w, http.StatusConflict, "run must be LOCKED to submit")
 		return
+	}
+
+	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+	run.IdempotencyKey = req.IdempotencyKey
+	instructions, err := h.store.ListInstructions(r.Context(), runID)
+	if err != nil {
+		h.log.Error("SubmitPaymentRun: failed to list instructions", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+
+	for _, ins := range instructions {
+		if ins.ProviderAttemptID != "" {
+			continue // already submitted to Banking on a prior attempt of this call
+		}
+		if err := h.submitInstructionToBanking(r.Context(), verifiedTenant, principalID, run, ins); err != nil {
+			h.log.Error("SubmitPaymentRun: Banking handoff failed — raising EXCEPTION", zap.String("instruction_id", ins.InstructionID), zap.Error(err))
+			if _, exErr := h.store.MarkRunException(r.Context(), runID, "failed to submit instruction "+ins.InstructionID+" to Banking: "+err.Error(), principalID); exErr != nil {
+				h.log.Error("SubmitPaymentRun: failed to record EXCEPTION", zap.Error(exErr))
+			}
+			writeError(w, http.StatusServiceUnavailable, "failed to hand one or more instructions to Banking; run moved to EXCEPTION")
+			return
+		}
 	}
 
 	updated, err := h.store.SubmitRun(r.Context(), runID, req.IdempotencyKey, principalID)
@@ -488,6 +556,10 @@ func (h *Handler) ClosePaymentRun(w http.ResponseWriter, r *http.Request) {
 // double-applied. Negative-path #3 ("run marks settled from initiation
 // response") holds structurally: this is the ONLY path that can ever move
 // a run's status forward from SUBMITTED, never SubmitPaymentRun itself.
+// ReconcilePaymentRunStatus remains a deliberate, separate manual-override
+// path — an operator recording a real external fact BNK-07's own canonical
+// status didn't (yet) capture — kept alongside the real PollInstructionStatus
+// below rather than removed. See internal/domain's package doc.
 func (h *Handler) ReconcilePaymentRunStatus(w http.ResponseWriter, r *http.Request) {
 	instructionID := chi.URLParam(r, "instructionID")
 	var req domain.ReconcileInstructionRequest
@@ -511,13 +583,93 @@ func (h *Handler) ReconcilePaymentRunStatus(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
+	h.applyExternalStatus(w, r, req, principalID)
+}
+
+// mapBankingExecutionStatus maps BNK-07's real ExecutionStatus to this
+// service's own InstructionStatus. PREPARED/SUBMITTED report nothing new
+// (Banking hasn't reached a status this domain distinguishes yet);
+// RETURNED/CANCELLED after handoff are treated as EXCEPTION — an operator
+// needs to look at those, they are not a normal terminal outcome from
+// AP-11's own point of view.
+func mapBankingExecutionStatus(s string) (domain.InstructionStatus, bool) {
+	switch s {
+	case "ACCEPTED":
+		return domain.InstructionAccepted, true
+	case "SETTLED":
+		return domain.InstructionSettled, true
+	case "REJECTED":
+		return domain.InstructionRejected, true
+	case "RETURNED", "CANCELLED":
+		return domain.InstructionException, true
+	default: // PREPARED, PENDING, SUBMITTED
+		return "", false
+	}
+}
+
+// PollInstructionStatus is the REAL reconciliation path this service
+// previously had no way to offer honestly: it queries BNK-07's own
+// canonical GetPaymentStatus for the instruction's bnk07_payment_id
+// (recorded once at SubmitPaymentRun) and reconciles the run from that real
+// answer, rather than accepting a caller's unverified word for it. The
+// derived ProviderEventRef ("<payment_id>:<status>") is deterministic, so
+// polling the same real status twice is idempotent through the same
+// database uniqueness constraint ReconcilePaymentRunStatus already relies
+// on — no separate idempotency mechanism was needed.
+func (h *Handler) PollInstructionStatus(w http.ResponseWriter, r *http.Request) {
+	instructionID := chi.URLParam(r, "instructionID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	ins, err := h.store.FindInstruction(r.Context(), instructionID)
 	if err != nil {
 		if errors.Is(err, domain.ErrInstructionNotFound) {
 			writeError(w, http.StatusNotFound, "run instruction not found")
 			return
 		}
-		h.log.Error("ReconcilePaymentRunStatus: store unavailable", zap.Error(err))
+		h.log.Error("PollInstructionStatus: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store unavailable")
+		return
+	}
+	if ins.Bnk07PaymentID == "" {
+		writeError(w, http.StatusConflict, domain.ErrInstructionNotSubmitted.Error())
+		return
+	}
+
+	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+	state, err := h.status.GetStatus(r.Context(), verifiedTenant, ins.Bnk07PaymentID)
+	if err != nil {
+		h.log.Error("PollInstructionStatus: payment-status-svc lookup failed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, domain.ErrPaymentStatusUnavailable.Error())
+		return
+	}
+	mapped, hasNews := mapBankingExecutionStatus(state.Status)
+	if !hasNews {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"instruction": ins, "applied": false, "note": "Banking has not reached a status this service reconciles on yet (" + state.Status + ")"})
+		return
+	}
+
+	h.applyExternalStatus(w, r, domain.ReconcileInstructionRequest{
+		InstructionID:    instructionID,
+		ExternalStatus:   mapped,
+		ProviderEventRef: ins.Bnk07PaymentID + ":" + state.Status,
+	}, principalID)
+}
+
+// applyExternalStatus is the shared tail of both ReconcilePaymentRunStatus
+// (caller-attested) and PollInstructionStatus (BNK-07-verified) — the
+// authorization, idempotent application, event publication and run-status
+// recompute are identical either way; only where ExternalStatus/
+// ProviderEventRef came from differs.
+func (h *Handler) applyExternalStatus(w http.ResponseWriter, r *http.Request, req domain.ReconcileInstructionRequest, principalID string) {
+	ins, err := h.store.FindInstruction(r.Context(), req.InstructionID)
+	if err != nil {
+		if errors.Is(err, domain.ErrInstructionNotFound) {
+			writeError(w, http.StatusNotFound, "run instruction not found")
+			return
+		}
+		h.log.Error("applyExternalStatus: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
@@ -535,7 +687,7 @@ func (h *Handler) ReconcilePaymentRunStatus(w http.ResponseWriter, r *http.Reque
 
 	updatedIns, applied, err := h.store.ReconcileInstruction(r.Context(), req, principalID)
 	if err != nil {
-		h.log.Error("ReconcilePaymentRunStatus: store unavailable", zap.Error(err))
+		h.log.Error("applyExternalStatus: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
@@ -545,19 +697,19 @@ func (h *Handler) ReconcilePaymentRunStatus(w http.ResponseWriter, r *http.Reque
 	}
 
 	_ = h.pub.Publish(r.Context(), events.PublishParams{
-		EventType: instructionEventType(req.ExternalStatus), EntityID: instructionID, ActorID: principalID,
+		EventType: instructionEventType(req.ExternalStatus), EntityID: req.InstructionID, ActorID: principalID,
 		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updatedIns,
 	})
 
 	allInstructions, err := h.store.ListInstructions(r.Context(), ins.RunID)
 	if err != nil {
-		h.log.Error("ReconcilePaymentRunStatus: failed to list instructions for aggregate recompute", zap.Error(err))
+		h.log.Error("applyExternalStatus: failed to list instructions for aggregate recompute", zap.Error(err))
 		writeJSON(w, http.StatusOK, map[string]interface{}{"instruction": updatedIns, "applied": true})
 		return
 	}
 	if newStatus, changed := recomputeRunStatus(allInstructions); changed {
 		if _, err := h.store.UpdateRunAggregateStatus(r.Context(), ins.RunID, newStatus, principalID); err != nil {
-			h.log.Error("ReconcilePaymentRunStatus: failed to update run aggregate status", zap.Error(err))
+			h.log.Error("applyExternalStatus: failed to update run aggregate status", zap.Error(err))
 		}
 	}
 
@@ -749,7 +901,7 @@ func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
 		actions = append(actions, "CancelUnsubmittedRun")
 	}
 	if domain.CanReconcile(run.Status) {
-		actions = append(actions, "ReconcilePaymentRunStatus")
+		actions = append(actions, "ReconcilePaymentRunStatus", "PollInstructionStatus")
 	}
 	if domain.CanRetry(run.Status) {
 		actions = append(actions, "RetrySafeInstruction")

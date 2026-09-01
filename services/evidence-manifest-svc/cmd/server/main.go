@@ -79,6 +79,7 @@ func main() {
 	governanceClient := aggregator.NewGovernanceDecisionClient(cfg.GovernanceDecisionLogURL, log)
 	accessClient := aggregator.NewAccessDecisionClient(cfg.AuthorizationServiceURL, log)
 	workflowClient := aggregator.NewWorkflowClient(cfg.WorkflowServiceURL, log)
+	workflowHistoryClient := aggregator.NewWorkflowHistoryClient(cfg.WorkflowHistoryURL, log)
 	publisher := events.NewPublisher(kafkaWriter, log)
 
 	// authorization-svc client. Reuses AuthorizationServiceURL, already
@@ -86,7 +87,7 @@ func main() {
 	// service, different endpoint.
 	authzClient := authz.NewClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, governanceClient, accessClient, workflowClient, publisher, authzClient, log)
+	h := handler.New(pgStore, governanceClient, accessClient, workflowClient, workflowHistoryClient, publisher, authzClient, log)
 	healthH := health.New(pool)
 
 	r := chi.NewRouter()

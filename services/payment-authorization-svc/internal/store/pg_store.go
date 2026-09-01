@@ -138,9 +138,9 @@ func (s *PgStore) RequestAuthorization(ctx context.Context, tenantID string, aut
 		}
 		for _, snap := range snapshots {
 			if _, err := tx.Exec(ctx, `
-				INSERT INTO authorization_payee_snapshots (snapshot_id, tenant_id, authorization_id, payee_ref, payee_snapshot_at)
-				VALUES ($1, $2, $3, $4, $5)`,
-				uuid.New().String(), out.TenantID, id, snap.PayeeRef, snap.PayeeSnapshotAt,
+				INSERT INTO authorization_payee_snapshots (snapshot_id, tenant_id, authorization_id, payee_ref, payee_snapshot_at, destination_id)
+				VALUES ($1, $2, $3, $4, $5, $6)`,
+				uuid.New().String(), out.TenantID, id, snap.PayeeRef, snap.PayeeSnapshotAt, snap.DestinationID,
 			); err != nil {
 				return err
 			}
@@ -178,7 +178,7 @@ func (s *PgStore) ListPayeeSnapshots(ctx context.Context, authorizationID string
 	var out []domain.PayeeSnapshot
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT snapshot_id, tenant_id, authorization_id, payee_ref, payee_snapshot_at, created_at
+			SELECT snapshot_id, tenant_id, authorization_id, payee_ref, payee_snapshot_at, destination_id, created_at
 			FROM authorization_payee_snapshots WHERE authorization_id = $1 ORDER BY created_at ASC`, authorizationID)
 		if err != nil {
 			return err
@@ -186,7 +186,7 @@ func (s *PgStore) ListPayeeSnapshots(ctx context.Context, authorizationID string
 		defer rows.Close()
 		for rows.Next() {
 			var snap domain.PayeeSnapshot
-			if err := rows.Scan(&snap.SnapshotID, &snap.TenantID, &snap.AuthorizationID, &snap.PayeeRef, &snap.PayeeSnapshotAt, &snap.CreatedAt); err != nil {
+			if err := rows.Scan(&snap.SnapshotID, &snap.TenantID, &snap.AuthorizationID, &snap.PayeeRef, &snap.PayeeSnapshotAt, &snap.DestinationID, &snap.CreatedAt); err != nil {
 				return err
 			}
 			out = append(out, snap)

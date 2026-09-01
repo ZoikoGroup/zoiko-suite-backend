@@ -21,6 +21,7 @@ import (
 	"zoiko.io/payment-authorization-svc/internal/handler"
 	"zoiko.io/payment-authorization-svc/internal/health"
 	"zoiko.io/payment-authorization-svc/internal/middleware"
+	"zoiko.io/payment-authorization-svc/internal/payeeidentity"
 	"zoiko.io/payment-authorization-svc/internal/paymentproposal"
 	"zoiko.io/payment-authorization-svc/internal/policy"
 	"zoiko.io/payment-authorization-svc/internal/store"
@@ -65,9 +66,10 @@ func main() {
 	authzClient := authz.NewClient(cfg.AuthzServiceURL)
 	proposalClient := paymentproposal.NewHTTPClient(cfg.PaymentProposalServiceURL, logger)
 	supplierClient := supplierprofile.NewHTTPClient(cfg.SupplierProfileServiceURL, logger)
+	payeeClient := payeeidentity.NewHTTPClient(cfg.PayeeIdentityServiceURL, logger)
 	policyClient := policy.NewHTTPClient(cfg.PolicyServiceURL, logger)
 
-	h := handler.New(pgStore, publisher, authzClient, proposalClient, supplierClient, policyClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, proposalClient, supplierClient, payeeClient, policyClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

@@ -15,12 +15,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"zoiko.io/payment-proposal-svc/internal/accountspayable"
 	authzpkg "zoiko.io/payment-proposal-svc/internal/authz"
 	"zoiko.io/payment-proposal-svc/internal/domain"
 	"zoiko.io/payment-proposal-svc/internal/events"
-	"zoiko.io/payment-proposal-svc/internal/expenseclaim"
 	svcmiddleware "zoiko.io/payment-proposal-svc/internal/middleware"
+	"zoiko.io/payment-proposal-svc/internal/payableopenitem"
 	"zoiko.io/payment-proposal-svc/internal/store"
 	"zoiko.io/payment-proposal-svc/internal/supplierprofile"
 	"zoiko.io/payment-proposal-svc/internal/tax"
@@ -50,15 +49,14 @@ type Handler struct {
 	store    store.Store
 	pub      events.Publisher
 	authz    AuthzChecker
-	ap       accountspayable.Client
-	claims   expenseclaim.Client
+	payables payableopenitem.Client
 	supplier supplierprofile.Client
 	tax      tax.Client
 	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, ap accountspayable.Client, claims expenseclaim.Client, supplier supplierprofile.Client, taxClient tax.Client, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, ap: ap, claims: claims, supplier: supplier, tax: taxClient, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, payables payableopenitem.Client, supplier supplierprofile.Client, taxClient tax.Client, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, payables: payables, supplier: supplier, tax: taxClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -201,12 +199,11 @@ func (h *Handler) ListProposalItems(w http.ResponseWriter, r *http.Request) {
 }
 
 // AddEligiblePayable is where negative-path scenarios #1 and #2 are
-// enforced. #1 (a held payable force-added without exception): the only
-// real hold signal available anywhere upstream is
-// supplier-financial-profile-svc's own ON_HOLD status (accounts-payable-svc
-// has no hold concept of its own) — an AP_INVOICE item whose supplier is
-// ON_HOLD is rejected unless the caller supplies a non-empty ExceptionRef,
-// which itself requires the stronger PAYMENT_PROPOSAL_EXCEPTION_RESOLVE
+// enforced. #1 (a held payable force-added without exception): an
+// AP_INVOICE item whose supplier-financial-profile-svc profile is ON_HOLD,
+// or an EXPENSE_CLAIM item whose AP-08 payable is IsHeld/IsDisputed, is
+// rejected unless the caller supplies a non-empty ExceptionRef, which
+// itself requires the stronger PAYMENT_PROPOSAL_EXCEPTION_RESOLVE
 // authority, not ordinary PAYMENT_PROPOSAL_MANAGE. #2 (duplicate/in-flight
 // payable) is enforced by the store's own database constraint.
 func (h *Handler) AddEligiblePayable(w http.ResponseWriter, r *http.Request) {
@@ -238,75 +235,78 @@ func (h *Handler) AddEligiblePayable(w http.ResponseWriter, r *http.Request) {
 	item := domain.ProposalItem{ProposalID: proposalID, PayableSource: req.PayableSource, PayableID: req.PayableID}
 	isHeldOverride := false
 
+	var sourceType payableopenitem.SourceType
 	switch req.PayableSource {
 	case domain.SourceAPInvoice:
-		inv, err := h.ap.GetEligibleInvoice(r.Context(), verifiedTenant, proposal.LegalEntityID, req.PayableID)
-		if err != nil {
-			h.writePayableErr(w, err)
-			return
-		}
-		profile, err := h.supplier.FindActiveProfile(r.Context(), verifiedTenant, proposal.LegalEntityID, inv.VendorID)
+		sourceType = payableopenitem.SourceSupplierInvoice
+	case domain.SourceExpenseClaim:
+		sourceType = payableopenitem.SourceExpenseClaim
+	}
+	payable, err := h.payables.GetEligiblePayable(r.Context(), verifiedTenant, proposal.LegalEntityID, sourceType, req.PayableID)
+	if err != nil {
+		h.writePayableErr(w, err)
+		return
+	}
+
+	var profile *supplierprofile.Profile
+	if req.PayableSource == domain.SourceAPInvoice {
+		// supplier-financial-profile-svc remains the real source of the
+		// SUPPLIER-level hold concept and withholding reference — AP-08
+		// only knows about this one payable, not the supplier's own
+		// standing, so this lookup stays even though AP-08 is now the
+		// payable's system of record.
+		profile, err = h.supplier.FindActiveProfile(r.Context(), verifiedTenant, proposal.LegalEntityID, payable.PayeeRef)
 		if err != nil {
 			h.writePayeeErr(w, err)
 			return
 		}
-		if profile.Status == "ON_HOLD" {
-			if req.ExceptionRef == "" {
-				writeError(w, http.StatusConflict, "payee is on hold; an exception reference is required to add this payable")
-				return
-			}
-			isHeldOverride = true
-		}
+	}
 
-		var withholding float64
-		var taxDetID string
-		if req.ApplyWithholding {
-			if profile.TaxWithholdingRef == "" {
-				writeError(w, http.StatusBadRequest, "payee has no tax_withholding_ref on file; apply_withholding cannot be used")
-				return
-			}
-			if req.JurisdictionID == "" || req.TaxCategory == "" {
-				writeError(w, http.StatusBadRequest, "jurisdiction_id and tax_category are required when apply_withholding is true")
-				return
-			}
-			result, err := h.tax.Determine(r.Context(), principalID, tax.DetermineRequest{
-				TransactionID: req.PayableID, LegalEntityID: proposal.LegalEntityID, JurisdictionID: req.JurisdictionID,
-				TaxCategory: req.TaxCategory, GrossAmount: inv.Amount, Currency: inv.CurrencyCode,
-				EffectiveFrom: time.Now().UTC().Format("2006-01-02"),
-			})
-			if err != nil {
-				h.log.Warn("AddEligiblePayable: withholding determination failed — blocking", zap.Error(err))
-				writeError(w, http.StatusUnprocessableEntity, "tax determination failed for withholding; payable not added")
-				return
-			}
-			withholding = result.CalculatedTaxAmount
-			taxDetID = result.DeterminationID
-		}
-
-		item.PayeeRef = inv.VendorID
-		item.GrossAmount = inv.Amount
-		item.WithholdingAmount = withholding
-		item.NetAmount = inv.Amount - withholding
-		item.Currency = inv.CurrencyCode
-		item.DueDate = inv.DueDate
-		snapshot := profile.UpdatedAt
-		item.PayeeSnapshotAt = &snapshot
-		item.TaxDeterminationID = taxDetID
-		item.ExceptionRef = req.ExceptionRef
-
-	case domain.SourceExpenseClaim:
-		claim, err := h.claims.GetEligibleClaim(r.Context(), verifiedTenant, proposal.LegalEntityID, req.PayableID)
-		if err != nil {
-			h.writePayableErr(w, err)
+	held := payable.IsHeld || payable.IsDisputed || (profile != nil && profile.Status == "ON_HOLD")
+	if held {
+		if req.ExceptionRef == "" {
+			writeError(w, http.StatusConflict, "payee is on hold; an exception reference is required to add this payable")
 			return
 		}
-		item.PayeeRef = claim.ClaimantPrincipalID
-		item.GrossAmount = claim.TotalAmount
-		item.NetAmount = claim.TotalAmount
-		item.Currency = claim.Currency
-		// expense-claim-svc has no due-date concept for a reimbursement —
-		// the claim became payable the moment it reached REIMBURSABLE.
-		item.DueDate = time.Now().UTC()
+		isHeldOverride = true
+	}
+
+	var withholding float64
+	var taxDetID string
+	if req.ApplyWithholding {
+		if profile == nil || profile.TaxWithholdingRef == "" {
+			writeError(w, http.StatusBadRequest, "payee has no tax_withholding_ref on file; apply_withholding cannot be used")
+			return
+		}
+		if req.JurisdictionID == "" || req.TaxCategory == "" {
+			writeError(w, http.StatusBadRequest, "jurisdiction_id and tax_category are required when apply_withholding is true")
+			return
+		}
+		result, err := h.tax.Determine(r.Context(), principalID, tax.DetermineRequest{
+			TransactionID: req.PayableID, LegalEntityID: proposal.LegalEntityID, JurisdictionID: req.JurisdictionID,
+			TaxCategory: req.TaxCategory, GrossAmount: payable.ResidualAmount, Currency: payable.Currency,
+			EffectiveFrom: time.Now().UTC().Format("2006-01-02"),
+		})
+		if err != nil {
+			h.log.Warn("AddEligiblePayable: withholding determination failed — blocking", zap.Error(err))
+			writeError(w, http.StatusUnprocessableEntity, "tax determination failed for withholding; payable not added")
+			return
+		}
+		withholding = result.CalculatedTaxAmount
+		taxDetID = result.DeterminationID
+	}
+
+	item.PayeeRef = payable.PayeeRef
+	item.GrossAmount = payable.ResidualAmount
+	item.WithholdingAmount = withholding
+	item.NetAmount = payable.ResidualAmount - withholding
+	item.Currency = payable.Currency
+	item.DueDate = payable.DueDate
+	item.TaxDeterminationID = taxDetID
+	item.ExceptionRef = req.ExceptionRef
+	if profile != nil {
+		snapshot := profile.UpdatedAt
+		item.PayeeSnapshotAt = &snapshot
 	}
 
 	requiredAction := ProposalManage

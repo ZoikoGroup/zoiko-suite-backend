@@ -122,6 +122,19 @@ func (s *stubStore) MarkInstructionConsumed(_ context.Context, instructionID str
 	return nil
 }
 
+func (s *stubStore) SetInstructionProviderRefs(_ context.Context, instructionID, providerAttemptID, bnk07PaymentID string) error {
+	i, ok := s.instructions[instructionID]
+	if !ok {
+		return domain.ErrInstructionNotFound
+	}
+	if i.ProviderAttemptID != "" {
+		return domain.ErrInstructionNotFound // already set once — mirrors the real trigger's guard
+	}
+	i.ProviderAttemptID = providerAttemptID
+	i.Bnk07PaymentID = bnk07PaymentID
+	return nil
+}
+
 func (s *stubStore) LockRun(_ context.Context, runID, principalID string) (*domain.PaymentRun, error) {
 	r, ok := s.runs[runID]
 	if !ok || !domain.CanLock(r.Status) {
