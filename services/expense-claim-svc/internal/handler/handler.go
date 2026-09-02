@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/expense-claim-svc/internal/authz"
+	"zoiko.io/expense-claim-svc/internal/configflag"
 	"zoiko.io/expense-claim-svc/internal/documentvault"
 	"zoiko.io/expense-claim-svc/internal/domain"
 	"zoiko.io/expense-claim-svc/internal/employeemaster"
@@ -44,23 +45,48 @@ type AuthzChecker interface {
 // Config is the subset of internal/config the handler needs.
 type Config struct {
 	ReceiptRequiredThreshold float64
+	Environment              string
 }
 
 type Handler struct {
-	store    store.Store
-	pub      events.Publisher
-	authz    AuthzChecker
-	employee employeemaster.Client
-	docs     documentvault.Client
-	tax      tax.Client
-	policy   policy.Client
-	payable  payableopenitem.Client
-	cfg      Config
-	log      *zap.Logger
+	store       store.Store
+	pub         events.Publisher
+	authz       AuthzChecker
+	employee    employeemaster.Client
+	docs        documentvault.Client
+	tax         tax.Client
+	policy      policy.Client
+	payable     payableopenitem.Client
+	configFlags configflag.Client
+	cfg         Config
+	log         *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, emp employeemaster.Client, docs documentvault.Client, taxClient tax.Client, pol policy.Client, payable payableopenitem.Client, cfg Config, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, employee: emp, docs: docs, tax: taxClient, policy: pol, payable: payable, cfg: cfg, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, emp employeemaster.Client, docs documentvault.Client, taxClient tax.Client, pol policy.Client, payable payableopenitem.Client, configFlags configflag.Client, cfg Config, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, employee: emp, docs: docs, tax: taxClient, policy: pol, payable: payable, configFlags: configFlags, cfg: cfg, log: log}
+}
+
+// resolveReceiptThreshold asks configuration-feature-flag-svc for a
+// tenant-specific (falling back to global) RECEIPT_REQUIRED_THRESHOLD
+// override, falling back further to this instance's own static
+// cfg.ReceiptRequiredThreshold when the registry has no override
+// configured, or cannot be reached at all. This is a policy value, not a
+// security gate — an unreachable registry keeps this claim approvable
+// under the value this service already shipped with, rather than
+// blocking approvals platform-wide over a config-lookup outage.
+func (h *Handler) resolveReceiptThreshold(ctx context.Context, tenantID string) float64 {
+	if h.configFlags == nil || tenantID == "" {
+		return h.cfg.ReceiptRequiredThreshold
+	}
+	threshold, found, err := h.configFlags.ResolveReceiptThreshold(ctx, h.cfg.Environment, tenantID)
+	if err != nil {
+		h.log.Warn("configuration-feature-flag-svc unavailable — using static default threshold", zap.Error(err))
+		return h.cfg.ReceiptRequiredThreshold
+	}
+	if !found {
+		return h.cfg.ReceiptRequiredThreshold
+	}
+	return threshold
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -410,8 +436,12 @@ func (h *Handler) ApproveExpenseClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !claim.HasPolicyException {
+		threshold := h.cfg.ReceiptRequiredThreshold
+		if claim.TenantID != nil {
+			threshold = h.resolveReceiptThreshold(r.Context(), *claim.TenantID)
+		}
 		for _, l := range lines {
-			if l.Amount > h.cfg.ReceiptRequiredThreshold && l.ReceiptDocumentID == "" {
+			if l.Amount > threshold && l.ReceiptDocumentID == "" {
 				writeError(w, http.StatusConflict, "one or more expense lines exceed the receipt-required threshold without an attached receipt")
 				return
 			}
