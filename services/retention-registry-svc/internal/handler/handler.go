@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -100,9 +101,11 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/retention-policies", func(r chi.Router) {
 		r.Post("/", h.CreateRetentionPolicy)
+		r.Get("/", h.ListRetentionPolicies)
 	})
 	r.Route("/v1/legal-holds", func(r chi.Router) {
 		r.Post("/", h.CreateLegalHold)
+		r.Get("/", h.ListLegalHolds)
 		r.Get("/{id}", h.GetLegalHold)
 		r.Post("/{id}/release", h.ReleaseLegalHold)
 	})
@@ -222,33 +225,53 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 
 // GetLegalHold handles GET /v1/legal-holds/{id}.
 //
-// The route had no tenant input and no authorization at all, so any caller
-// holding a legal_hold_id could read its scope_description, custodians and
-// authority — learning that another tenant is under a legal hold, and over
-// what. That a customer is under litigation or regulatory investigation is
-// not something their neighbours should be able to enumerate. The store is
-// tenant-scoped (see FindLegalHoldByID); this closes the previously
-// self-documented remaining gap — the missing action-level authorization
-// within a tenant. Fetch-then-authorize, same order as ReleaseLegalHold:
-// the store already refuses another tenant's hold with the same
-// ErrLegalHoldNotFound a genuinely absent id would produce, so authorizing
-// against a caller-supplied scope first would let a caller nominate an
-// entity they hold a grant for and use it to probe for holds outside it.
+// THIS ROUTE HAD NO IDENTITY CHECK OF ANY KIND. It called
+// FindLegalHoldByID(id) with no principal, no tenant, and no authorization —
+// so anything that could reach the port could read any hold in any tenant by
+// id, and a hold names the court or regulator that ordered the freeze, the
+// matter, and the custodians holding the evidence. Reading it now requires a
+// verified principal and is scoped to the caller's tenant.
+//
+// No authz action is checked beyond the tenant scope, matching the create/list
+// posture: a hold in your own tenant is visible to your own principals, and it
+// is the RELEASE that is privileged. Widening that to a per-read grant is a
+// defensible position, but it is a policy change rather than a defect fix and
+// would need the grant seeding to change with it.
+//
+// BOTH GATES ARE NOW PRESENT. The read is scoped to the caller's verified
+// tenant in the store, and it is additionally authorized against LEGAL_HOLD_READ
+// for the hold's own tenant. The tenant scope answers "whose hold is this"; the
+// action grant answers "may this principal read holds at all". Fetch-then-
+// authorize, in that order and matching ReleaseLegalHold: the store already
+// refuses another tenant's hold with the same ErrLegalHoldNotFound a genuinely
+// absent id produces, so authorizing against a caller-supplied scope first would
+// let a caller nominate an entity they hold a grant for and probe for holds
+// outside it.
 func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
-	hld, err := h.store.FindLegalHoldByID(r.Context(), chi.URLParam(r, "id"))
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	hld, err := h.store.FindLegalHoldByID(r.Context(), chi.URLParam(r, "id"), tenantID)
 	if err != nil {
 		if errors.Is(err, domain.ErrLegalHoldNotFound) {
 			writeError(w, http.StatusNotFound, "legal hold not found")
 			return
 		}
+		if errors.Is(err, domain.ErrTenantMissing) {
+			writeError(w, http.StatusUnauthorized, "X-Tenant-Id header is required")
+			return
+		}
+		h.logger.Error("get legal hold failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "failed to get legal hold")
 		return
 	}
 
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
 	scope := ""
 	if hld.TenantID != nil {
 		scope = *hld.TenantID
@@ -258,6 +281,162 @@ func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, hld)
+}
+
+// ListRetentionPolicies handles GET /v1/retention-policies.
+//
+// This service had no list endpoint at all — only create, and resolve for one
+// record class at a time. Resolve answers "may I delete this particular thing";
+// it cannot answer "what retention rules is this tenant operating under", which
+// is the question an operator or auditor actually opens a console to ask.
+func (h *Handler) ListRetentionPolicies(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	q := r.URL.Query()
+	status := q.Get("policy_status")
+	if status != "" && status != "ACTIVE" && status != "SUPERSEDED" && status != "RETIRED" {
+		// Refused rather than ignored. A misspelled filter that is silently
+		// dropped returns the whole register and reads as "no filter applied";
+		// one that is silently honoured as "match nothing" reads as "this tenant
+		// has no policies". Both mislead, in opposite directions.
+		writeError(w, http.StatusBadRequest, "policy_status must be ACTIVE, SUPERSEDED or RETIRED")
+		return
+	}
+
+	limit, offset, ok := pageParams(w, r)
+	if !ok {
+		return
+	}
+
+	policies, err := h.store.ListRetentionPolicies(r.Context(), domain.RetentionPolicyFilter{
+		CallerTenantID: tenantID,
+		RecordClass:    q.Get("record_class"),
+		PolicyStatus:   status,
+		Limit:          limit,
+		Offset:         offset,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidFilter) {
+			writeError(w, http.StatusBadRequest, "limit must be 1-500 and offset must not be negative")
+			return
+		}
+		h.logger.Error("list retention policies failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list retention policies")
+		return
+	}
+	writeJSON(w, http.StatusOK, policies)
+}
+
+// ListLegalHolds handles GET /v1/legal-holds.
+//
+// The register an operator needs before believing any deletion is safe: an
+// active hold overrides every retention policy, and without this endpoint the
+// only way to discover one was to already know its id.
+func (h *Handler) ListLegalHolds(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	q := r.URL.Query()
+	status := q.Get("hold_status")
+	if status != "" && status != "ACTIVE" && status != "RELEASED" {
+		writeError(w, http.StatusBadRequest, "hold_status must be ACTIVE or RELEASED")
+		return
+	}
+
+	limit, offset, ok := pageParams(w, r)
+	if !ok {
+		return
+	}
+
+	holds, err := h.store.ListLegalHolds(r.Context(), domain.LegalHoldFilter{
+		CallerTenantID: tenantID,
+		HoldStatus:     status,
+		RecordClass:    q.Get("record_class"),
+		Limit:          limit,
+		Offset:         offset,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidFilter) {
+			writeError(w, http.StatusBadRequest, "limit must be 1-500 and offset must not be negative")
+			return
+		}
+		h.logger.Error("list legal holds failed", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to list legal holds")
+		return
+	}
+	writeJSON(w, http.StatusOK, holds)
+}
+
+// requireTenant reads the gateway-verified tenant scope.
+//
+// An absent header is 401, never a default. Defaulting it is how a dropped
+// header becomes an unscoped read of every tenant's legal holds — the exact
+// shape of document-vault-svc's tenant filter that "switched itself off when the
+// header was absent".
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "X-Tenant-Id header is required")
+		return "", false
+	}
+	return tenantID, true
+}
+
+// pageParams parses AND range-checks limit/offset.
+//
+// The range check belongs here and not only in the Postgres store. It was
+// briefly in the store alone, and a stub Store implementation then accepted
+// ?limit=5000 and answered 200 — validating a REQUEST parameter inside one
+// persistence implementation means every other implementation, and every test
+// double, silently disagrees about what the API accepts. The store keeps its own
+// bounds check as defence in depth for callers that reach it directly.
+//
+// A non-numeric value is refused rather than treated as absent, and an
+// out-of-range one is refused rather than clamped: a caller who asked for 5000
+// rows and silently received 500 would read a truncated register as a complete
+// one.
+func pageParams(w http.ResponseWriter, r *http.Request) (int, int, bool) {
+	// limit 0 means "not supplied, use the store default". An explicitly
+	// supplied limit=0 is a request for no rows, which is a mistake rather than
+	// an intent, so presence is tracked separately from value — otherwise the
+	// absent sentinel and a real 0 are indistinguishable.
+	limit, offset := 0, 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "limit must be an integer")
+			return 0, 0, false
+		}
+		if v < 1 || v > 500 {
+			writeError(w, http.StatusBadRequest, "limit must be between 1 and 500")
+			return 0, 0, false
+		}
+		limit = v
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "offset must be an integer")
+			return 0, 0, false
+		}
+		if v < 0 {
+			writeError(w, http.StatusBadRequest, "offset must not be negative")
+			return 0, 0, false
+		}
+		offset = v
+	}
+	return limit, offset, true
 }
 
 // ReleaseLegalHold handles POST /v1/legal-holds/{id}/release — doc7 §J3's
@@ -274,7 +453,16 @@ func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existing, err := h.store.FindLegalHoldByID(r.Context(), id)
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	// Scoped by the caller's verified tenant, so a hold in another tenant is a
+	// 404 here and the authorize call below never sees it. The authorization
+	// check against the hold's own tenant remains the real gate; this stops the
+	// lookup that feeds it from reading across tenants in the first place.
+	existing, err := h.store.FindLegalHoldByID(r.Context(), id, tenantID)
 	if err != nil {
 		if errors.Is(err, domain.ErrLegalHoldNotFound) {
 			writeError(w, http.StatusNotFound, "legal hold not found")
@@ -296,7 +484,7 @@ func (h *Handler) ReleaseLegalHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	released, err := h.store.ReleaseLegalHold(r.Context(), id, principalID, req.ReleaseApprovedByPrincipalID)
+	released, err := h.store.ReleaseLegalHold(r.Context(), id, tenantID, principalID, req.ReleaseApprovedByPrincipalID)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrLegalHoldNotFound):

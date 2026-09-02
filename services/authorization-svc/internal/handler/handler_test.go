@@ -24,6 +24,14 @@ type stubStore struct {
 	roleErr     error
 	findRoleErr error // FindRoleByID reuses `role` for its result; set this to override with a not-found/other error
 
+	// setActive records what SetRoleActive was asked for, so a test can assert
+	// that /retire asks for false and /reactivate for true rather than only
+	// that the call happened.
+	setActiveRole   *domain.Role
+	setActiveErr    error
+	setActiveCalls  int
+	setActiveWanted []bool
+
 	bundle    *domain.PermissionBundle
 	bundleErr error
 
@@ -50,6 +58,13 @@ type stubStore struct {
 	delegatedBasis   string
 	delegatedErr     error
 
+	// The tenant each lookup was actually called with. The whole point of
+	// scoping FindGrantedActions is that the handler forwards its VERIFIED
+	// tenant scope rather than leaving the store to evaluate platform-wide,
+	// and that is only observable from the argument.
+	grantedTenantArg   string
+	delegatedTenantArg string
+
 	sodConflictAction string
 	sodHasConflict    bool
 	sodErr            error
@@ -69,6 +84,11 @@ func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*d
 func (s *stubStore) FindRoleByID(_ context.Context, _ string) (*domain.Role, error) {
 	return s.role, s.findRoleErr
 }
+func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool) (*domain.Role, error) {
+	s.setActiveCalls++
+	s.setActiveWanted = append(s.setActiveWanted, active)
+	return s.setActiveRole, s.setActiveErr
+}
 func (s *stubStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
 	return s.bundle, s.bundleErr
 }
@@ -81,19 +101,21 @@ func (s *stubStore) RevokeRoleAssignment(_ context.Context, _, _ string) (*domai
 func (s *stubStore) CreateDelegatedAuthority(_ context.Context, _ domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error) {
 	return s.delegation, s.delegationErr
 }
-func (s *stubStore) FindDelegatedAuthorityByID(_ context.Context, _ string) (*domain.DelegatedAuthority, error) {
+func (s *stubStore) FindDelegatedAuthorityByID(_ context.Context, _, _ string) (*domain.DelegatedAuthority, error) {
 	return s.findDelegation, s.findDelegationErr
 }
-func (s *stubStore) RevokeDelegatedAuthority(_ context.Context, _ string) (*domain.DelegatedAuthority, error) {
+func (s *stubStore) RevokeDelegatedAuthority(_ context.Context, _, _ string) (*domain.DelegatedAuthority, error) {
 	return s.revokedDelegation, s.revokeDelegationErr
 }
 func (s *stubStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	return s.sodRule, s.sodRuleErr
 }
-func (s *stubStore) FindGrantedActions(_ context.Context, _, _ string) ([]string, string, error) {
+func (s *stubStore) FindGrantedActions(_ context.Context, _, _, tenantID string) ([]string, string, error) {
+	s.grantedTenantArg = tenantID
 	return s.rbacActions, s.rbacBasis, s.rbacErr
 }
-func (s *stubStore) FindDelegatedActions(_ context.Context, _, _ string) ([]string, string, error) {
+func (s *stubStore) FindDelegatedActions(_ context.Context, _, _, tenantID string) ([]string, string, error) {
+	s.delegatedTenantArg = tenantID
 	return s.delegatedActions, s.delegatedBasis, s.delegatedErr
 }
 func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _, _ string) (string, bool, error) {
@@ -102,13 +124,13 @@ func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _, _ string)
 func (s *stubStore) CheckOwnObjectSoD(_ context.Context, _, _ string) (bool, error) {
 	return s.ownObjectForbidden, s.ownObjectErr
 }
-func (s *stubStore) RecordAccessDecision(_ context.Context, _, _, _, outcome, basis, _ string) (*domain.AccessDecisionLog, error) {
+func (s *stubStore) RecordAccessDecision(_ context.Context, _ domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
 	if s.decision != nil {
 		return s.decision, s.recordErr
 	}
-	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: outcome, DecisionBasis: basis}, s.recordErr
+	return &domain.AccessDecisionLog{AccessDecisionID: "d-1", DecisionOutcome: "GRANTED", DecisionBasis: "test"}, s.recordErr
 }
-func (s *stubStore) FindAccessDecisionByID(_ context.Context, _ string) (*domain.AccessDecisionLog, error) {
+func (s *stubStore) FindAccessDecisionByID(_ context.Context, _, _ string) (*domain.AccessDecisionLog, error) {
 	return s.findDecision, s.findDecisionErr
 }
 
@@ -145,7 +167,7 @@ func newTestRouter(s *stubStore) chi.Router {
 
 func newTestRouterFull(s *stubStore, p *stubPublisher, v *stubValidator) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), zap.NewNop())
+	h := handler.New(s, p, v, siem.New("", "authorization-svc", zap.NewNop()), "platform-scope-entity", zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -477,6 +499,7 @@ func TestCreateDelegatedAuthority_Created(t *testing.T) {
 	body := `{"delegator_principal_id":"admin-1","delegate_principal_id":"p-2","scope_type":"FULL","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-a")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -494,6 +517,7 @@ func TestCreateDelegatedAuthority_NotOwnAuthority_Refused(t *testing.T) {
 	body := `{"delegator_principal_id":"someone-else","delegate_principal_id":"p-2","scope_type":"FULL","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-a")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -502,14 +526,105 @@ func TestCreateDelegatedAuthority_NotOwnAuthority_Refused(t *testing.T) {
 	}
 }
 
+// ── RetireRole / ReactivateRole ───────────────────────────────────────────────
+//
+// active_flag is the only thing that stops a role granting anything --
+// FindGrantedActions joins through it -- so what these assert is not "the
+// handler returned 200" but "the handler asked for the flag the route name
+// promises". A /retire that set the flag true would still answer 200.
+
+func TestRetireRole_SetsActiveFalse(t *testing.T) {
+	store := &stubStore{
+		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: false},
+	}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.setActiveCalls != 1 {
+		t.Fatalf("expected exactly one SetRoleActive call, got %d", store.setActiveCalls)
+	}
+	if store.setActiveWanted[0] != false {
+		t.Fatalf("/retire asked for active_flag=%v; retiring a role must set it false, or the role keeps granting every action it grants today", store.setActiveWanted[0])
+	}
+}
+
+func TestReactivateRole_SetsActiveTrue(t *testing.T) {
+	store := &stubStore{
+		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: false},
+		setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: true},
+	}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/reactivate", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.setActiveWanted[0] != true {
+		t.Fatalf("/reactivate asked for active_flag=%v, expected true", store.setActiveWanted[0])
+	}
+}
+
+func TestRetireRole_UnknownRoleIs404(t *testing.T) {
+	// 404 and not 503: the store reached the database and answered. Collapsing
+	// the two would make a typo'd role id look like an outage.
+	store := &stubStore{
+		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		setActiveErr: domain.ErrRoleNotFound,
+	}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/does-not-exist/retire", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRetireRole_StoreDownIs503(t *testing.T) {
+	store := &stubStore{
+		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		setActiveErr: domain.ErrStoreUnavailable,
+	}
+	r := newTestRouter(store)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // ── CreateSoDRule with jurisdiction validation ──────────────────────────────
 
 func TestCreateSoDRule_JurisdictionNotFound(t *testing.T) {
 	r := newTestRouterFull(&stubStore{}, &stubPublisher{}, &stubValidator{err: domain.ErrJurisdictionNotFound})
 
-	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","jurisdiction_id":"jur-missing"}`
+	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","jurisdiction_id":"jur-missing","tenant_id":"tenant-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -522,9 +637,10 @@ func TestCreateSoDRule_NoJurisdiction_Created(t *testing.T) {
 	store := &stubStore{sodRule: &domain.SoDRule{SoDRuleID: "sod-1"}}
 	r := newTestRouter(store)
 
-	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE"}`
+	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","tenant_id":"tenant-1"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -561,6 +677,7 @@ func TestRevokeDelegatedAuthority_AlreadyRevoked(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities/d-1/revoke", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-a")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -579,6 +696,7 @@ func TestRevokeDelegatedAuthority_NotDelegator_Refused(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities/d-1/revoke", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-a")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -594,6 +712,8 @@ func TestGetAccessDecision_NotFound(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/access-decisions/missing", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -607,10 +727,124 @@ func TestGetAccessDecision_Found(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/access-decisions/d-1", nil)
+	req.Header.Set("X-Principal-Id", "admin-1")
+	req.Header.Set("X-Tenant-Id", "tenant-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+// TestAuthorize_ForwardsVerifiedTenantScopeToStore is the handler-side guard
+// for the cross-tenant grant leak.
+//
+// The store can only scope the role join to a tenant if the handler gives it
+// one. resolveTenantScope already produced a verified scope immediately above
+// the lookup — it simply was not passed, so every evaluation ran platform-wide.
+// Asserting the ARGUMENT is the only way to catch that regressing: the decision
+// outcome looks identical either way.
+func TestAuthorize_ForwardsVerifiedTenantScopeToStore(t *testing.T) {
+	const tenant = "tenant-a"
+
+	store := &stubStore{
+		rbacActions: []string{"PAYMENT_APPROVE"},
+		rbacBasis:   "rbac:role=FINANCE_APPROVER",
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
+
+	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
+	req.Header.Set("X-Tenant-Id", tenant)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.grantedTenantArg != tenant {
+		t.Fatalf("expected the verified tenant %q to reach FindGrantedActions, got %q — "+
+			"an empty value means the evaluation ran platform-wide", tenant, store.grantedTenantArg)
+	}
+}
+
+// TestAuthorize_NoTenantHeader_FallsBackToPlatformScope pins the other half of
+// the contract. ~60 services call /v1/authorize and most do not forward
+// X-Tenant-Id yet; scoping their evaluations to an empty tenant would match no
+// role at all and deny every one of them. The empty argument is what selects
+// the platform-scope fallback in the store.
+func TestAuthorize_NoTenantHeader_FallsBackToPlatformScope(t *testing.T) {
+	store := &stubStore{
+		rbacActions: []string{"PAYMENT_APPROVE"},
+		rbacBasis:   "rbac:role=FINANCE_APPROVER",
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
+
+	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if store.grantedTenantArg != "" {
+		t.Fatalf("expected an empty tenant to select platform scope, got %q", store.grantedTenantArg)
+	}
+}
+
+// TestDelegationRoutes_RequireTenantScope pins the refusal 000006 makes
+// necessary.
+//
+// delegated_authorities.tenant_id is NOT NULL, and both delegation reads carry
+// a tenant predicate. A caller with no verified scope could therefore only
+// either write a row no policy can match, or ask a question that has no
+// tenant-scoped answer. CreateDelegatedAuthority was the one /v1/admin/* route
+// that never resolved a tenant at all, so this is the guard against it drifting
+// back.
+func TestDelegationRoutes_RequireTenantScope(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{
+			name:   "create",
+			method: http.MethodPost,
+			path:   "/v1/admin/delegated-authorities",
+			body:   `{"delegator_principal_id":"admin-1","delegate_principal_id":"p-2","scope_type":"FULL","effective_from":"2026-01-01T00:00:00Z"}`,
+		},
+		{
+			name:   "revoke",
+			method: http.MethodPost,
+			path:   "/v1/admin/delegated-authorities/d-1/revoke",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &stubStore{
+				delegation:     &domain.DelegatedAuthority{DelegatedAuthorityID: "d-1"},
+				findDelegation: &domain.DelegatedAuthority{DelegatedAuthorityID: "d-1", DelegatorPrincipalID: "admin-1"},
+			}
+			r := newTestRouter(store)
+
+			var req *http.Request
+			if tc.body != "" {
+				req = httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
+			} else {
+				req = httptest.NewRequest(tc.method, tc.path, nil)
+			}
+			// A verified principal, but no verified tenant.
+			req.Header.Set("X-Principal-Id", "admin-1")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			if w.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 without X-Tenant-Id, got %d: %s", w.Code, w.Body.String())
+			}
+		})
 	}
 }

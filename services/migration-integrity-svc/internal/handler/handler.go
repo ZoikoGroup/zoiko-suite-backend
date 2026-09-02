@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 	"zoiko.io/migration-integrity-svc/internal/authz"
 	"zoiko.io/migration-integrity-svc/internal/domain"
+	svcenvelope "zoiko.io/migration-integrity-svc/internal/envelope"
 	"zoiko.io/migration-integrity-svc/internal/events"
 	"zoiko.io/migration-integrity-svc/internal/health"
 	"zoiko.io/migration-integrity-svc/internal/middleware"
@@ -43,6 +44,13 @@ func NewRouter(h *Handler) http.Handler {
 	r.Use(chiMiddleware.RealIP)
 	r.Use(chiMiddleware.Logger)
 	r.Use(chiMiddleware.Recoverer)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer so a refusal is still traced, and ahead of every handler so no
+	// request reaches business logic without a resolved tenant, actor,
+	// correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	// /healthz stays OUTSIDE the tenant gate. Liveness and readiness
 	// probes carry no tenant, so a blanket tenant requirement would 401

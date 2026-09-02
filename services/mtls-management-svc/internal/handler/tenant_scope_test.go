@@ -37,6 +37,7 @@ func provisionCert(t *testing.T, r http.Handler, tenantID, serviceName string) s
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -120,6 +121,7 @@ func TestForeignTenant_CannotRevokeCertificate(t *testing.T) {
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("X-Tenant-ID", "tenant-b")
 		req.Header.Set("X-Principal-Id", "principal-test-01")
+		req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusNotFound {
@@ -130,6 +132,7 @@ func TestForeignTenant_CannotRevokeCertificate(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates/"+certID, nil)
 	req.Header.Set("X-Tenant-ID", "tenant-a")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -167,6 +170,7 @@ func TestForeignTenant_CannotListOthersCertificates(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates?legal_entity_id=le-1", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {

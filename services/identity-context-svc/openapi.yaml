@@ -35,6 +35,90 @@ components:
       bearerFormat: JWT
 
   schemas:
+    AuthenticateRequest:
+      type: object
+      required:
+        - tenant_id
+        - email
+        - password
+      properties:
+        tenant_id:
+          type: string
+          description: |
+            The tenant whose principals to search. Taken from the BODY rather
+            than X-Tenant-Id because this endpoint is exempt from the canonical
+            input contract — see the endpoint description. Naming a tenant
+            selects a search scope and confers nothing.
+          example: "11111111-1111-1111-1111-111111111111"
+        email:
+          type: string
+          format: email
+          description: Matched case-insensitively against an ACTIVE HUMAN principal.
+        password:
+          type: string
+          format: password
+      additionalProperties: false
+
+    AuthenticateResponse:
+      type: object
+      required:
+        - access_token
+        - token_type
+        - expires_in
+        - principal_id
+        - tenant_id
+      properties:
+        access_token:
+          type: string
+          description: |
+            Short-lived bearer token whose `sub` is the principal's
+            identity_provider_subject — NOT its principal_id. Exchange it at
+            POST /v1/context/resolve for a signed identity envelope.
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          description: Token lifetime in seconds.
+          example: 300
+        principal_id:
+          type: string
+        tenant_id:
+          type: string
+        mfa_required:
+          type: boolean
+          description: |
+            Whether a second factor is needed before trust posture can reach
+            MFA_VERIFIED. Always false today — no step-up factor is implemented
+            in the estate, so there is nothing a client could do in response to
+            true.
+
+    JWKSResponse:
+      type: object
+      required:
+        - keys
+      properties:
+        keys:
+          type: array
+          items:
+            type: object
+            properties:
+              kty:
+                type: string
+                example: RSA
+              use:
+                type: string
+                example: sig
+              kid:
+                type: string
+              alg:
+                type: string
+                example: RS256
+              n:
+                type: string
+              e:
+                type: string
+
     ResolveContextRequest:
       type: object
       required:
@@ -105,6 +189,87 @@ components:
           type: string
 
 paths:
+  /v1/authenticate:
+    post:
+      summary: Exchange a password for a bearer token
+      operationId: authenticate
+      security: []
+      description: |
+        The platform's entry point, and the only endpoint on this service
+        reachable without an identity.
+
+        **Exempt from the canonical input contract.** The contract's mandatory
+        fields include X-Tenant-Id and an actor header, which gateway-auth-svc
+        sets only after verifying a signed envelope — the thing this endpoint
+        exists to make obtainable. Requiring them here would be circular and
+        satisfiable only by a caller asserting the identity it has not proven.
+
+        **Rejections are deliberately uniform.** An unknown email, a principal
+        with no password, a locked account and a wrong password all return the
+        same 401 with the same body, and all cost the same wall-clock time. A
+        client able to tell them apart could enumerate accounts and discover
+        which it had already locked. The distinction is preserved in
+        access_decision_log.decision_basis, the emitted event and the SIEM
+        stream.
+
+        Lockout engages at AUTH_MAX_FAILED_ATTEMPTS and lapses on its own after
+        AUTH_LOCK_DURATION_SECONDS.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthenticateRequest"
+      responses:
+        "200":
+          description: Verified — bearer token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthenticateResponse"
+        "400":
+          description: tenant_id, email or password absent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: |
+            Invalid credentials. Covers unknown principal, absent credential,
+            locked account and password mismatch — indistinguishable by design.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: |
+            The attempt could not be decided — credential store unreachable, the
+            stored digest unusable, or the evidence write failed. Distinct from
+            401 on purpose: reporting "we cannot tell" as "you are wrong" sends
+            a user to a password reset that cannot help.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /.well-known/jwks.json:
+    get:
+      summary: Envelope signing public key
+      operationId: getJWKS
+      security: []
+      description: |
+        The RSA public key downstream services use to verify the
+        IdentityContextEnvelope. Envelopes are signed RS256 so verifiers hold no
+        secret; the bearer token from /v1/authenticate is separately HS256 and
+        is not verifiable with this key.
+      responses:
+        "200":
+          description: JSON Web Key Set
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JWKSResponse"
+
   /v1/context/resolve:
     post:
       summary: Resolve identity context
@@ -157,6 +322,15 @@ paths:
           required: true
           schema:
             type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          description: |
+            The caller's verified tenant. Session records are tenant-scoped and
+            a session belonging to another tenant answers 404 — "wrong tenant"
+            would confirm the id exists.
+          schema:
+            type: string
       responses:
         "200":
           content:
@@ -179,6 +353,15 @@ paths:
         - name: sessionContextId
           in: path
           required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          description: |
+            The caller's verified tenant. Session records are tenant-scoped and
+            a session belonging to another tenant answers 404 — "wrong tenant"
+            would confirm the id exists.
           schema:
             type: string
         - name: X-Correlation-ID

@@ -994,3 +994,256 @@ threading them through outbox.Event → the stored row → the Relay's
 publish call. Deliberately not done in this pass to keep the outbox
 pattern's own correctness (the actual point of today's change) isolated
 from a schema migration.
+
+## Resolved (2026-08-25): the ForwardAuth endpoint refused every write on the platform
+
+`gateway-auth-svc`'s router applied the canonical input-contract middleware to
+all its own routes, including `/verify` — the endpoint Traefik's ForwardAuth
+calls. Traefik replays the client's original method there, so any
+POST/PUT/PATCH/DELETE arrived as a material write and was validated against the
+envelope in the default `write-strict` mode. Tenant and actor are exactly what
+that endpoint *derives from the signed token*, so they were absent by
+construction, and every state-changing request on the platform was refused
+`401 envelope_incomplete` (`missing=[tenant_id actor_subject_id request_id
+correlation_id source_channel]`) before its JWT was ever parsed. Reads passed,
+because `write-strict` admits them — which is why nothing looked broken.
+
+The only header set that could have satisfied it was one the client spoofed,
+i.e. precisely what the gateway exists to prevent. This also inverted
+ZS-API-001 §5's mandated pipeline order: "tenant/residency and authorization
+checks occur before... idempotency and concurrency are evaluated before side
+effects."
+
+Nothing caught it because every test in `internal/handler` called
+`Handler.Verify` directly, bypassing the middleware, and all of them used GET.
+
+Fixed by adding a declared `ExemptPaths` to `Policy` (generated per service from
+`EXEMPT_PATHS` in `rollout.sh`, so it survives regeneration) and exempting
+`/verify`. The router moved into `internal/router` so the real middleware stack
+is testable, and `router_wiring_test.go` covers all five methods. Verified the
+test fails without the exemption.
+
+## Resolved (2026-08-25): the tenant registry could not be bootstrapped
+
+`rollout.sh` listed `tenant-entity-registry-svc` as entity-scoped, giving it
+`LegalEntityID: RequiredOnWrite`. It was on that list because
+`internal/domain` carries `legal_entity_id` — but it carries it as *output*.
+This is the service that issues legal entity IDs, so `POST /v1/tenants` (which
+creates the tenant an entity would hang from) and `POST /v1/entities` (which
+mints the identifier itself) could never name one, and neither could
+`/v1/workspaces`, `/v1/residency-policies` or `/v1/entity-hierarchies`.
+
+The entity-scoped routes it does expose all take the entity from the path, where
+the handler already validates it against the tenant, so the header added nothing
+even where it was satisfiable.
+
+Fixed by removing it from `ENTITY_SCOPED`, with the rule recorded there: a
+service is entity-scoped when it *consumes* an entity identifier, never when it
+is the authority that issues one. Guarded by
+`internal/envelope/contract_test.go`, which fails if it is put back.
+
+This matches the position the deployment already took — `AUTHZ_PLATFORM_SCOPE_ID`
+exists in compose precisely because "ProvisionTenant is the one mutation with no
+tenant to scope to".
+
+## Resolved (2026-08-25): the context resolver rejected every newly provisioned tenant
+
+`envelope.Resolver.tenantOperable` allow-listed lifecycle values
+`ACTIVE`, `PROVISIONED`, `LIVE`. `PROVISIONED` and `LIVE` do not exist anywhere
+in the registry. The real enum is
+`ONBOARDING | ACTIVE | SUSPENDED | OFFBOARDING`, and `ProvisionTenant` writes
+`status=ACTIVE, lifecycle=ONBOARDING` — which was not on the list.
+
+Every tenant this platform provisions would therefore have failed context
+resolution, including on `POST /v1/tenants/{id}/lifecycle`, the only call that
+could move it out of `ONBOARDING`. A deadlock, latent only because nothing
+called the resolver (see below).
+
+Fixed to the registry's actual enum, with `ONBOARDING` operable. See the
+divergence recorded below — this is not what the new doc set specifies.
+
+## Resolved (2026-08-25): envelope.Resolver was dead code
+
+`services/_contract/envelope/resolver.go` — 298 lines implementing the
+server-resolved half of the input contract, with tenant-operability checks,
+cross-tenant entity refusal and conflict recording — was vendored into 86
+services and called by none. Every service took the caller's
+`X-Jurisdiction-Context` at face value, and nothing anywhere checked whether a
+tenant was permitted to transact.
+
+Wired into `gateway-auth-svc` as GOV-01 context resolution
+(`internal/tenantctx`), which is where ZS-SVC-A-001 §4 puts it: "resolve the
+trusted tenant and operating context for every request... before business
+processing begins", owning "TenantContextResolution, TenantRoutingHint cache"
+and explicitly not the tenant master.
+
+Implements GOV-01's degradation contract literally — "ambiguous or unresolved
+tenant => deny; stale context may be read only within bounded TTL for
+non-material reads; no fallback to global/default tenant":
+
+- registry says no (unknown/suspended tenant, cross-tenant entity) -> 403,
+  `X-Tenant-Context: denied`, not cached
+- registry unreachable on a write -> 503, `X-Tenant-Context: unresolved`
+- registry unreachable on a read -> bounded-stale cache entry, or 503 if cold
+- resolved -> `X-Jurisdiction-Context`, `X-Timezone`,
+  `X-Residency-Policy-Id` forwarded as server-resolved context
+
+Gated on `TENANT_REGISTRY_URL`; unset disables resolution entirely, matching how
+carta-svc and siem-integration-svc are already made optional here. The new
+headers were added to the ForwardAuth `authResponseHeaders` list — Traefik
+silently drops any header not named there.
+
+## Open: tenant lifecycle vocabulary diverges from the new canonical doc set
+
+`internal/domain/enums.go` documents its values as "verbatim from
+`docs/architecture/04-data-model.md` §05.1" — the *old* six-document series. The
+44-document register uploaded 2026-08-25 renames them. ZS-SVC-I-001 ORG-02
+specifies:
+
+    Provisioning -> Active -> Suspended -> Terminating -> Terminated
+
+against the code's:
+
+    ONBOARDING | ACTIVE | SUSPENDED | OFFBOARDING
+
+Also unimplemented from ORG-02: `FailedProvisioning` (its stated degradation
+state for partial provisioning), and the named commands `CreateTenant`,
+`ActivateTenant`, `SuspendTenant`, `ResumeTenant`, `InitiateTermination`,
+`CompleteTermination` — the code has one generic lifecycle-transition endpoint
+instead.
+
+Not a code defect on its own; it is an unreconciled rename between doc
+generations, and it should be settled before anything else binds to these
+values.
+
+## Open: ONBOARDING is treated as operable, which ORG-02 says it should not be
+
+Deliberate divergence, recorded so it is not mistaken for conformance.
+
+ZS-SVC-I-001 ORG-02 states "never expose partially isolated tenant as Active"
+and its minimum acceptance includes "partially provisioned tenant not active".
+Read strictly, a tenant in `Provisioning`/`ONBOARDING` should not transact.
+
+The doc-aligned design has `ActivateTenant` as a platform-scoped admin command
+on a separate privileged surface — ZS-API-001 §3 requires privileged
+cross-tenant operations to live under `/admin/v1/` and be "isolated from tenant
+public surface" — which would not pass through tenant-context resolution at all.
+
+No such admin surface exists. Every registry route is on the tenant surface, so
+refusing `ONBOARDING` at the gateway would refuse the activation call itself and
+deadlock every new tenant. `ONBOARDING` is therefore operable today.
+
+To close: build the privileged admin surface, move the lifecycle commands onto
+it, then set `ONBOARDING`/`Provisioning` non-operable in
+`envelope.tenantOperable`. Both halves have to land together — flipping the
+resolver first reintroduces the deadlock.
+
+## Resolved (2026-08-25): tenant-entity-registry-svc's HTTP layer had no tests
+
+`internal/handler` was at 0.0% statement coverage — no test file existed at all,
+for any of its 27 routes. The cause was structural rather than neglect:
+`handler.New` took the concrete `*registry.Service` while the interface it
+actually stored was unexported, so the only way to reach a handler from a test
+was to construct a real service over a real store. Nothing about the HTTP layer
+was verifiable in isolation.
+
+The interface is now exported as `handler.Service` and `New` takes it.
+`*registry.Service` satisfies it unchanged, so production wiring in
+`cmd/server/main.go` is untouched.
+
+`internal/handler/handler_test.go` covers the layer at 99.6%, pinning the things
+the HTTP layer alone decides:
+
+- the route table — every declared method+path reaches its handler, which is
+  what catches a route registered on the wrong verb;
+- each route's success status (201 create / 200 read / 204 command), and that
+  204 replies carry no body;
+- the whole `writeErr` sentinel-to-status map, including the pair most often
+  collapsed (`ErrUnauthenticated` 401 vs `ErrUnauthorized` 403) and the two that
+  share 409 for different reasons, plus that an unmapped error becomes a generic
+  500 rather than leaking driver text;
+- the URL parameter each handler extracts. This is the failure a copied handler
+  body produces silently: reading `{entityID}` where the route declares
+  `{tenantID}` yields an empty string, not an error, so the handler appears to
+  work and operates on nothing;
+- `end_date` on the two end-dating routes — required, RFC3339 only. Defaulting a
+  missing value to "now" would close a record the caller meant to keep;
+- correlation-id propagation, including that the transition endpoints take it
+  from the header and overwrite whatever the body claimed.
+
+Verified by mutation: pointing `ListEntities` at the wrong chi parameter and
+remapping `ErrUnauthenticated` to 403 each fail with the message naming the
+defect.
+
+## Resolved (2026-08-25): workspaces were create-only, so a misclassification was permanent
+
+`workspaces` had `CreateWorkspace`, `GetWorkspaceByID` and
+`ListWorkspacesByTenant` and nothing else — no update, no status change. The
+table has carried `updated_at` and `updated_by_principal_id` since
+`000005_add_workspaces.up.sql`, and no write path ever set either, which is what
+identified this as an omission rather than deliberate immutability.
+
+The practical consequence was `billing_classification`. It decides whether a
+workspace may ever produce a live charge, doc7 §T requires it on every
+workspace, and a workspace created under the wrong class stayed wrong for the
+rest of its life — the only remedy being to abandon it and create another,
+orphaning everything already recorded against it.
+
+Added, mirroring the entity paths rather than inventing a second idiom:
+
+- `PATCH /v1/workspaces/{workspaceID}` — name, business unit, billing
+  classification, billing source, commercial account. `tenant_id` and
+  `legal_entity_id` are deliberately not patchable: they are the workspace's
+  position in the tenant hierarchy, and moving it would silently re-attribute
+  everything already booked against it.
+- `POST /v1/workspaces/{workspaceID}/status` — archive and restore, applied as
+  one CTE-guarded `UPDATE` against the allowed prior states, so the
+  state-machine check and the write cannot straddle a concurrent transition.
+  Unlike `TransitionEntityStatus` it returns the prior status, which the CTE
+  already holds, so `workspace.status.changed` can name what the workspace moved
+  away from instead of emitting an empty `previous_status`.
+- `ValidWorkspaceStatusTransitions`, with archiving reversible. Archiving hides
+  a workspace but deletes nothing, so an accidental archive has to be
+  recoverable; making `ARCHIVED` terminal would make a misclick permanent.
+  `ARCHIVED -> ARCHIVED` is not declared, so a repeated archive is refused
+  rather than silently re-stamping the audit columns with a no-op.
+- `workspace.updated` carries the commercial fields, not just the id.
+  commercial-account-svc is in a different plane (doc7 §3), so it has to be told
+  the new classification rather than having to come back and ask.
+- `ValidBillingSources`. The create path defaulted an empty `billing_source` to
+  `NONE` but never validated a non-empty one, so an unrecognised value reached
+  the `VARCHAR(50)` column and would later read back as though it meant
+  something. Now gated on both create and update.
+- `commercial_account_id` is validated as a UUID at the service boundary. It is
+  a `UUID` column, so a malformed value previously reached the driver and
+  surfaced as an unmapped 500 rather than a 400 naming the field.
+
+Store coverage for both statements is in `pg_store_test.go`, including
+cross-tenant refusal and the prior-state guard touching nothing when it does not
+match. Those run against Postgres in CI; they skip locally, so the two SQL
+statements are CI-verified rather than developer-verified.
+
+## Open: tenant-entity-registry-svc still has no admin surface or tenant listing
+
+Recorded together because they are the same missing thing.
+
+There is no `GET /v1/tenants`. A tenant can only be fetched by id, so the
+console shows the caller's own tenant and nothing else. Cross-tenant listing is
+exactly the privileged operation ZS-API-001 §3 puts under `/admin/v1/`, so
+adding it to the tenant surface would be the wrong fix — it belongs on the
+admin surface that does not yet exist, alongside the lifecycle commands, per the
+`ONBOARDING` entry above.
+
+Also still open for this service:
+
+- `internal/store` is at 0.0% coverage locally by construction — every test
+  there is `TEST_DATABASE_URL`-guarded and skips without Postgres. CI supplies
+  it (`ci.yml` lists this service, and it has its own store-isolation step), so
+  the SQL is covered there and nowhere else. A local `go test ./...` reporting
+  `ok` for that package means "skipped", not "verified".
+- `internal/middleware`, `internal/authz`, `internal/jurisdiction`,
+  `internal/classification` and `internal/config` remain at 0.0%.
+  `middleware.Identity` is the component that establishes the verified tenant
+  and principal every other guarantee in the service rests on.
+- The lifecycle vocabulary divergence and `FailedProvisioning` remain as
+  recorded above; nothing here renames an enum value.

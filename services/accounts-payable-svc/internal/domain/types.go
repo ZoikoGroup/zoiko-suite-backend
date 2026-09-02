@@ -9,6 +9,7 @@
 package domain
 
 import (
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -66,6 +67,53 @@ type VendorInvoice struct {
 	DueDate       time.Time     `json:"due_date"`
 	Status        InvoiceStatus `json:"status"`
 
+	// ── AP-05 required business/source inputs (§9.F) ──────────────────────
+
+	// InvoiceDate is the date on the supplier's document. Distinct from
+	// CreatedAt (when we received it) and DueDate (when it must be paid): all
+	// three legitimately differ and each answers a different question.
+	InvoiceDate CalendarDate `json:"invoice_date"`
+
+	// SupplyDate is the tax point — when the supply took place. Drives which
+	// tax period and rule version apply, and is routinely in a different month
+	// from the invoice date on a supply invoiced in arrears.
+	SupplyDate CalendarDate `json:"supply_date"`
+
+	// NetAmount and TaxAmount split the existing Amount, which keeps its
+	// meaning as the gross total payable. The service enforces
+	// net + tax == gross, and that the lines sum to each — the AP equivalent of
+	// a balance check.
+	NetAmount float64 `json:"net_amount"`
+	TaxAmount float64 `json:"tax_amount"`
+
+	// PurchaseOrderID is validated against purchase-order-svc when supplied: it
+	// must exist, belong to the same legal entity and not be closed.
+	//
+	// GoodsReceiptRef is carried unvalidated — AP-04 Goods/Service Receipt does
+	// not exist, so nothing can confirm a receipt happened. Without it there is
+	// no third leg for a three-way match.
+	PurchaseOrderID *string `json:"purchase_order_id,omitempty"`
+	GoodsReceiptRef *string `json:"goods_receipt_ref,omitempty"`
+
+	// POVendorProfileID is copied from the purchase order at intake so a
+	// disagreement between the PO's supplier and this invoice's is visible.
+	// It does not refuse the invoice — see the migration for why.
+	POVendorProfileID *string `json:"po_vendor_profile_id,omitempty"`
+
+	// InvoiceDocumentID is the supplier's actual document in document-vault-svc.
+	// Required to leave RECEIVED, not to enter it: §7 makes a draft an editable
+	// working state and INV-10 requires evidence before COMPLETION, so an
+	// invoice keyed ahead of its scan is legitimate while one VALIDATED without
+	// a document is the audit gap.
+	InvoiceDocumentID *string `json:"invoice_document_id,omitempty"`
+
+	// Lines is populated by the read paths. Nil on a pre-contract invoice
+	// recorded before migration 000006, which is a real historical state rather
+	// than a fault — see IsPreContract.
+	Lines []VendorInvoiceLine `json:"lines,omitempty"`
+
+	// ──────────────────────────────────────────────────────────────────────
+
 	// SourceContractID is nil unless this invoice was issued against a real
 	// contract-lifecycle-svc contract.
 	SourceContractID *string `json:"source_contract_id,omitempty"`
@@ -80,6 +128,51 @@ type VendorInvoice struct {
 	ApprovedAt                    *time.Time `json:"approved_at,omitempty"`
 	PaymentRequestedAt            *time.Time `json:"payment_requested_at,omitempty"`
 }
+
+// VendorInvoiceLine is one line of a supplier invoice — AP-05's "lines" and
+// "tax" inputs.
+//
+// Per-line tax because one invoice routinely carries two treatments: a
+// standard-rated item and a zero-rated one on the same document. A header-only
+// tax figure cannot express that, and cannot be handed to TAX-03 or to account
+// mapping.
+type VendorInvoiceLine struct {
+	InvoiceLineID string `json:"invoice_line_id"`
+	InvoiceID     string `json:"invoice_id"`
+	LineNumber    int    `json:"line_number"`
+
+	Description string  `json:"description"`
+	Quantity    float64 `json:"quantity"`
+	UnitPrice   float64 `json:"unit_price"`
+	NetAmount   float64 `json:"net_amount"`
+
+	TaxCode   *string `json:"tax_code,omitempty"`
+	TaxAmount float64 `json:"tax_amount"`
+
+	// TaxDeterminationID links to the tax-determination-svc determination this
+	// line's tax came from, when one was run. Nil for tax keyed straight from
+	// the supplier's document, which is the common case today — which is why
+	// this is a link rather than a requirement.
+	TaxDeterminationID *string `json:"tax_determination_id,omitempty"`
+
+	// POLineReference is which purchase-order line this answers, for AP-06
+	// Invoice Matching when it exists. Unvalidated: purchase-order-svc exposes
+	// no line detail.
+	POLineReference *string `json:"po_line_reference,omitempty"`
+
+	// Dimensions is free-form for the same reason as general-ledger-svc's
+	// journal line dimensions: REF-08 Financial Dimension Registry does not
+	// exist, so nothing says which dimensions a tenant has defined.
+	Dimensions Dimensions `json:"dimensions,omitempty"`
+}
+
+// IsPreContract reports whether this invoice predates migration 000006, which
+// added AP-05's line and tax inputs.
+//
+// Such an invoice has a gross amount and no account of what it was for. That is
+// a real historical state, not a fault, and the console names it rather than
+// rendering an empty line table as though the data were missing.
+func (v VendorInvoice) IsPreContract() bool { return len(v.Lines) == 0 }
 
 // ── wire types (request bodies) ─────────────────────────────────────────────
 
@@ -129,6 +222,65 @@ func (d CalendarDate) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.Time)
 }
 
+// Value implements driver.Valuer for the DATE columns.
+//
+// Without it pgx has no encoder for this struct: it embeds time.Time but is not
+// one, so a CalendarDate parameter went to Postgres as NULL and a scan of a DATE
+// back into it failed outright with "cannot scan date (OID 1082) in binary
+// format into *domain.CalendarDate". Every read of invoice_date errored.
+//
+// The zero value is NULL rather than year zero, so "no date supplied" stays
+// distinguishable from a real date. Same shape as general-ledger-svc's
+// domain.Date, which is the pattern this follows.
+func (d CalendarDate) Value() (driver.Value, error) {
+	if d.Time.IsZero() {
+		return nil, nil
+	}
+	return d.Time, nil
+}
+
+// Scan implements sql.Scanner for the DATE columns.
+//
+// pgx hands a DATE back as time.Time; the string cases cover a driver configured
+// to return dates as text, which is a supported pgx mode. The day is rebuilt at
+// UTC midnight for the reason the type comment gives - a bare date read in a
+// zone behind Greenwich lands on the previous day.
+func (d *CalendarDate) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		d.Time = time.Time{}
+		return nil
+	case time.Time:
+		d.Time = time.Date(v.Year(), v.Month(), v.Day(), 0, 0, 0, 0, time.UTC)
+		return nil
+	case string:
+		parsed, err := time.Parse(calendarDateLayout, strings.TrimSpace(v))
+		if err != nil {
+			return fmt.Errorf("cannot scan %q into CalendarDate: expected %q", v, calendarDateLayout)
+		}
+		d.Time = parsed.UTC()
+		return nil
+	case []byte:
+		return d.Scan(string(v))
+	default:
+		return fmt.Errorf("cannot scan %T into CalendarDate", src)
+	}
+}
+
+// CreateVendorInvoiceLineInput is one line on the way in.
+type CreateVendorInvoiceLineInput struct {
+	Description string  `json:"description"`
+	Quantity    float64 `json:"quantity,omitempty"`
+	UnitPrice   float64 `json:"unit_price,omitempty"`
+	NetAmount   float64 `json:"net_amount"`
+
+	TaxCode            *string    `json:"tax_code,omitempty"`
+	TaxAmount          float64    `json:"tax_amount,omitempty"`
+	TaxDeterminationID *string    `json:"tax_determination_id,omitempty"`
+	POLineReference    *string    `json:"po_line_reference,omitempty"`
+	Dimensions         Dimensions `json:"dimensions,omitempty"`
+}
+
 type CreateVendorInvoiceRequest struct {
 	TenantID      string       `json:"tenant_id"`
 	LegalEntityID string       `json:"legal_entity_id"`
@@ -138,9 +290,57 @@ type CreateVendorInvoiceRequest struct {
 	CurrencyCode  string       `json:"currency_code"`
 	DueDate       CalendarDate `json:"due_date"`
 	CorrelationID string       `json:"correlation_id"`
+
+	// ── AP-05 required business/source inputs ─────────────────────────────
+
+	InvoiceDate CalendarDate `json:"invoice_date"`
+	SupplyDate  CalendarDate `json:"supply_date"`
+
+	// At least one line. Amount stays the gross total and must equal the lines'
+	// net plus their tax — see ErrInvoiceDoesNotBalance.
+	Lines []CreateVendorInvoiceLineInput `json:"lines"`
+
+	// Optional. PurchaseOrderID is validated against purchase-order-svc when
+	// present; the other two are carried.
+	PurchaseOrderID   *string `json:"purchase_order_id,omitempty"`
+	GoodsReceiptRef   *string `json:"goods_receipt_ref,omitempty"`
+	InvoiceDocumentID *string `json:"invoice_document_id,omitempty"`
+
 	// SourceContractID is optional: the contract-lifecycle-svc contract
 	// this invoice was issued against, when one exists.
 	SourceContractID *string `json:"source_contract_id,omitempty"`
+}
+
+// LineTotals sums the request's lines.
+func (r CreateVendorInvoiceRequest) LineTotals() (net, tax float64) {
+	for _, l := range r.Lines {
+		net += l.NetAmount
+		tax += l.TaxAmount
+	}
+	return net, tax
+}
+
+// Balances reports whether the lines account for the gross amount.
+//
+// Compared in minor units. Summing decimal amounts in binary floating point
+// leaves 0.1 + 0.2 != 0.3, and this comparison decides whether an invoice is
+// accepted — the same reason general-ledger-svc compares exact cents rather
+// than floats for its double-entry check.
+//
+// (The float64 fields are themselves an INV-04 problem this service shares with
+// the ledger; see docs/architecture/input-contract-conformance.md gap G-2.
+// Rounding to cents here is the honest comparison available until the money
+// type changes.)
+func (r CreateVendorInvoiceRequest) Balances() bool {
+	net, tax := r.LineTotals()
+	return cents(net)+cents(tax) == cents(r.Amount)
+}
+
+func cents(v float64) int64 {
+	if v < 0 {
+		return -int64(-v*100 + 0.5)
+	}
+	return int64(v*100 + 0.5)
 }
 
 // ListInvoicesFilter holds optional filters for querying invoices.
@@ -161,6 +361,46 @@ var (
 	ErrInvoiceNotFound   = errorString("vendor invoice not found")
 	ErrInvalidTransition = errorString("invalid invoice status transition")
 	ErrStoreUnavailable  = errorString("accounts payable store unavailable")
+
+	// ── AP-05 input contract ─────────────────────────────────────────────
+
+	ErrNoLines = errorString("a supplier invoice must have at least one line")
+
+	// ErrInvoiceDoesNotBalance is the AP equivalent of the ledger's
+	// double-entry check: what the lines say the invoice is for has to add up
+	// to what it says is payable. Without it a line detail can drift from the
+	// total and nothing downstream — matching, tax, account mapping — would
+	// notice.
+	ErrInvoiceDoesNotBalance = errorString("lines do not account for the invoice amount: sum(net) + sum(tax) must equal amount")
+
+	ErrInvalidLine = errorString("each line needs a description and a net_amount, and neither net_amount nor tax_amount may be negative")
+
+	// ErrSupplyBeforeInvoiceImpossible has no equivalent constraint: a supply
+	// date BEFORE the invoice date is entirely ordinary (invoiced in arrears),
+	// and a supply date after it is also legitimate (invoiced in advance). Only
+	// an absent one is refused. Named here so the absence of a check is a
+	// decision on the record rather than an oversight.
+	ErrInvoiceDateRequired = errorString("invoice_date is required — the date on the supplier's document")
+	ErrSupplyDateRequired  = errorString("supply_date is required — the tax point decides which tax period and rule version apply")
+
+	// ErrInvoiceDocumentRequired enforces INV-10 at the completion boundary
+	// rather than at intake. An invoice keyed ahead of its scan is a legitimate
+	// draft; one VALIDATED with no document is the audit gap.
+	ErrInvoiceDocumentRequired = errorString("invoice_document_id is required to validate: an invoice cannot be asserted complete without the supplier's document")
+
+	// ErrPurchaseOrderUnknown means purchase-order-svc does not recognise the
+	// referenced PO, or it belongs to another legal entity.
+	ErrPurchaseOrderUnknown = errorString("purchase_order_id is not recognised by purchase-order-svc for this legal entity")
+
+	// ErrPurchaseOrderClosed means the PO exists but is no longer open to
+	// invoicing.
+	ErrPurchaseOrderClosed = errorString("purchase order is closed and cannot accept further invoices")
+
+	// ErrPurchaseOrderUnverifiable means purchase-order-svc could not be
+	// reached. Distinct from Unknown on purpose: "cannot answer" is never "no",
+	// and an invoice referencing an unverified PO fails closed rather than
+	// being recorded against a commitment nobody confirmed.
+	ErrPurchaseOrderUnverifiable = errorString("purchase order could not be verified — purchase-order-svc unreachable")
 
 	// ErrDuplicateInvoiceNumber is returned when (tenant_id, vendor_id,
 	// invoice_number) already exists. The table has carried that UNIQUE

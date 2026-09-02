@@ -36,6 +36,7 @@ func newRouterWithAuthz(az handler.AuthzChecker) http.Handler {
 
 func TestHealthCheck(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(r)
 	w := httptest.NewRecorder()
 	newRouter().ServeHTTP(w, r)
 	if w.Code != 200 {
@@ -62,6 +63,7 @@ func TestEvaluateAndListLifecycle(t *testing.T) {
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/carta/evaluate", bytes.NewBuffer(evalBody))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
@@ -94,6 +96,7 @@ func TestEvaluateAndListLifecycle(t *testing.T) {
 		},
 	})
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/carta/evaluate", bytes.NewBuffer(untrustedBody))
+	withEnvelope(req2)
 	req2.Header.Set("X-Tenant-ID", "t1")
 	req2.Header.Set("X-Principal-Id", "principal-test-01")
 	w2 := httptest.NewRecorder()
@@ -109,6 +112,7 @@ func TestEvaluateAndListLifecycle(t *testing.T) {
 
 	// List
 	req3 := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments?legal_entity_id=LE-100&subject_id=USR-77", nil)
+	withEnvelope(req3)
 	req3.Header.Set("X-Tenant-ID", "t1")
 	req3.Header.Set("X-Principal-Id", "principal-test-01")
 	w3 := httptest.NewRecorder()
@@ -121,6 +125,7 @@ func TestEvaluateAndListLifecycle(t *testing.T) {
 func TestValidationErrors(t *testing.T) {
 	evalBody, _ := json.Marshal(domain.EvaluateRequest{LegalEntityID: ""})
 	req := httptest.NewRequest(http.MethodPost, "/v1/carta/evaluate", bytes.NewBuffer(evalBody))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()

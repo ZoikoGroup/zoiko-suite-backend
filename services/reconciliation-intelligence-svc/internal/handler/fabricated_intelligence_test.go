@@ -38,6 +38,7 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 	analyzeReq.Header.Set("Content-Type", "application/json")
 	analyzeReq.Header.Set("X-Tenant-ID", "tenant-rec-fab")
 	analyzeReq.Header.Set("X-Principal-Id", "principal-01")
+	analyzeReq = withEnvelope(analyzeReq) // rest of the canonical envelope; headers already set win
 	analyzeRec := httptest.NewRecorder()
 	router.ServeHTTP(analyzeRec, analyzeReq)
 	if analyzeRec.Code != http.StatusOK && analyzeRec.Code != http.StatusCreated {
@@ -66,6 +67,7 @@ func TestApplyResolution_EmptyHumanNote_PreservesMachineRationale(t *testing.T) 
 	applyReq.Header.Set("Content-Type", "application/json")
 	applyReq.Header.Set("X-Tenant-ID", "tenant-rec-fab")
 	applyReq.Header.Set("X-Principal-Id", "principal-02")
+	applyReq = withEnvelope(applyReq) // rest of the canonical envelope; headers already set win
 	applyRec := httptest.NewRecorder()
 	router.ServeHTTP(applyRec, applyReq)
 	if applyRec.Code != http.StatusOK {
@@ -100,6 +102,7 @@ func TestApplyResolution_HumanNote_AppendedNotOverwritten(t *testing.T) {
 	analyzeReq.Header.Set("Content-Type", "application/json")
 	analyzeReq.Header.Set("X-Tenant-ID", "tenant-rec-fab2")
 	analyzeReq.Header.Set("X-Principal-Id", "principal-01")
+	analyzeReq = withEnvelope(analyzeReq) // rest of the canonical envelope; headers already set win
 	analyzeRec := httptest.NewRecorder()
 	router.ServeHTTP(analyzeRec, analyzeReq)
 
@@ -115,6 +118,7 @@ func TestApplyResolution_HumanNote_AppendedNotOverwritten(t *testing.T) {
 	applyReq.Header.Set("Content-Type", "application/json")
 	applyReq.Header.Set("X-Tenant-ID", "tenant-rec-fab2")
 	applyReq.Header.Set("X-Principal-Id", "principal-02")
+	applyReq = withEnvelope(applyReq) // rest of the canonical envelope; headers already set win
 	applyRec := httptest.NewRecorder()
 	router.ServeHTTP(applyRec, applyReq)
 

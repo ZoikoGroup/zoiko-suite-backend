@@ -31,6 +31,7 @@ import (
 
 	"zoiko.io/tenant-entity-registry-svc/internal/authz"
 	"zoiko.io/tenant-entity-registry-svc/internal/config"
+	svcenvelope "zoiko.io/tenant-entity-registry-svc/internal/envelope"
 	"zoiko.io/tenant-entity-registry-svc/internal/events"
 	"zoiko.io/tenant-entity-registry-svc/internal/handler"
 	"zoiko.io/tenant-entity-registry-svc/internal/health"
@@ -170,6 +171,13 @@ func main() {
 	// base64-decoded out of an unverified JWT.
 	r.Use(svcmiddleware.Identity(log))
 	r.Use(middleware.Logger)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(svc, log)
 	handler.RegisterRoutes(r, h)

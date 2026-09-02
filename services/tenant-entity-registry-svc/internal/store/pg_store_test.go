@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -226,5 +227,212 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	}
 	if foundB {
 		t.Fatal("RLS FAILURE: tenant A's query returned tenant B's entity — tenant isolation is broken")
+	}
+}
+
+// ── Workspace mutation (SQL exercised against real Postgres) ─────────────────
+//
+// These cover the two statements added with the workspace write path: the
+// COALESCE patch and the CTE-guarded status transition. Both are only
+// meaningful against a real database — the CTE's FOR UPDATE and the
+// ANY($n::text[]) prior-state guard have no in-memory equivalent, so a stub
+// reimplementation would be testing the stub.
+
+// seedTenantAndWorkspace creates the minimum rows a workspace needs and
+// returns the tenant id and workspace id.
+func seedTenantAndWorkspace(t *testing.T, ctx context.Context, s *store.PgStore, class domain.BillingClassification) (string, string, context.Context) {
+	t.Helper()
+	tenantID := uuid.New().String()
+	ctx = domain.WithTenant(ctx, tenantID)
+
+	tenant := &domain.Tenant{
+		TenantID: tenantID, TenantCode: "WS" + tenantID[:4], LegalName: "Workspace Co",
+		Status: domain.TenantStatusActive, DefaultCurrencyCode: "USD",
+		PrimaryTimezone: "UTC", PrimaryLocale: "en-US",
+		DefaultDataResidencyPolicyID: uuid.New().String(),
+		LifecycleState:               domain.TenantLifecycleOnboarding,
+		CreatedByPrincipalID:         "test-admin",
+	}
+	if err := s.CreateTenant(ctx, tenant); err != nil {
+		t.Fatalf("CreateTenant: %v", err)
+	}
+
+	wsID := uuid.New().String()
+	unit := "Pilots"
+	if err := s.CreateWorkspace(ctx, &domain.Workspace{
+		WorkspaceID:           wsID,
+		TenantID:              tenantID,
+		Name:                  "Pilot",
+		BusinessUnit:          &unit,
+		BillingClassification: class,
+		BillingSource:         domain.BillingSourceNone,
+		Status:                domain.WorkspaceStatusActive,
+		CreatedAt:             time.Now().UTC(),
+		CreatedByPrincipalID:  "test-admin",
+	}); err != nil {
+		t.Fatalf("CreateWorkspace: %v", err)
+	}
+	return tenantID, wsID, ctx
+}
+
+func TestPgStore_UpdateWorkspace_ReclassifiesAndStampsActor(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	_, wsID, ctx := seedTenantAndWorkspace(t, ctx, s, domain.BillingClassificationInternal)
+
+	name := "Acme Production"
+	class := string(domain.BillingClassificationCommercialStandalone)
+	got, err := s.UpdateWorkspace(ctx, wsID, domain.UpdateWorkspaceRequest{
+		Name:                  &name,
+		BillingClassification: &class,
+		ActorPrincipalID:      "principal-7",
+	})
+	if err != nil {
+		t.Fatalf("UpdateWorkspace: %v", err)
+	}
+	if got.Name != name {
+		t.Errorf("name = %q, want %q", got.Name, name)
+	}
+	if got.BillingClassification != domain.BillingClassificationCommercialStandalone {
+		t.Errorf("classification = %q, want COMMERCIAL_STANDALONE", got.BillingClassification)
+	}
+	if got.UpdatedByPrincipalID != "principal-7" {
+		t.Errorf("updated_by_principal_id = %q, want principal-7", got.UpdatedByPrincipalID)
+	}
+	// This is the COALESCE contract: an omitted column keeps its value.
+	if got.BusinessUnit == nil || *got.BusinessUnit != "Pilots" {
+		t.Errorf("business_unit was not preserved on a partial patch: %v", got.BusinessUnit)
+	}
+}
+
+// A workspace in another tenant must not be reachable, tenant filter and RLS
+// both considered. This is the isolation guarantee the whole registry rests on.
+func TestPgStore_UpdateWorkspace_CrossTenantRefused(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	_, wsID, _ := seedTenantAndWorkspace(t, ctx, s, domain.BillingClassificationInternal)
+
+	// A second tenant, whose context must not reach the first tenant's row.
+	otherTenant := uuid.New().String()
+	otherCtx := domain.WithTenant(context.Background(), otherTenant)
+	if err := s.CreateTenant(otherCtx, &domain.Tenant{
+		TenantID: otherTenant, TenantCode: "OTHER", LegalName: "Other Co",
+		Status: domain.TenantStatusActive, DefaultCurrencyCode: "USD",
+		PrimaryTimezone: "UTC", PrimaryLocale: "en-US",
+		DefaultDataResidencyPolicyID: uuid.New().String(),
+		LifecycleState:               domain.TenantLifecycleOnboarding,
+		CreatedByPrincipalID:         "test-admin",
+	}); err != nil {
+		t.Fatalf("CreateTenant(other): %v", err)
+	}
+
+	name := "Hijacked"
+	got, err := s.UpdateWorkspace(otherCtx, wsID, domain.UpdateWorkspaceRequest{
+		Name: &name, ActorPrincipalID: "attacker",
+	})
+	if err != nil {
+		t.Fatalf("UpdateWorkspace returned an error rather than no-rows: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("a foreign tenant updated another tenant's workspace: %+v", got)
+	}
+}
+
+func TestPgStore_UpdateWorkspace_AbsentReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	_, _, ctx = seedTenantAndWorkspace(t, ctx, s, domain.BillingClassificationInternal)
+
+	name := "Nope"
+	got, err := s.UpdateWorkspace(ctx, uuid.New().String(), domain.UpdateWorkspaceRequest{Name: &name})
+	if err != nil {
+		t.Fatalf("expected no error for a missing row, got %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected nil for a missing workspace, got %+v", got)
+	}
+}
+
+// The guarded transition: it must apply only from an allowed prior state, and
+// report the state it moved away from.
+func TestPgStore_TransitionWorkspaceStatus_ReturnsPreviousStatus(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	_, wsID, ctx := seedTenantAndWorkspace(t, ctx, s, domain.BillingClassificationInternal)
+
+	affected, previous, err := s.TransitionWorkspaceStatus(ctx, wsID,
+		domain.WorkspaceStatusArchived,
+		[]domain.WorkspaceStatus{domain.WorkspaceStatusActive},
+		"principal-7", "corr-1")
+	if err != nil {
+		t.Fatalf("TransitionWorkspaceStatus: %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("rowsAffected = %d, want 1", affected)
+	}
+	if previous != domain.WorkspaceStatusActive {
+		t.Fatalf("previous = %q, want ACTIVE", previous)
+	}
+
+	got, err := s.GetWorkspaceByID(ctx, wsID)
+	if err != nil || got == nil {
+		t.Fatalf("GetWorkspaceByID: %v", err)
+	}
+	if got.Status != domain.WorkspaceStatusArchived {
+		t.Fatalf("status = %q, want ARCHIVED", got.Status)
+	}
+	if got.UpdatedByPrincipalID != "principal-7" {
+		t.Fatalf("updated_by_principal_id = %q, want principal-7", got.UpdatedByPrincipalID)
+	}
+}
+
+// The prior-state guard is the whole point: a transition from a state not in
+// the allowed set must touch nothing and report zero rows.
+func TestPgStore_TransitionWorkspaceStatus_DisallowedPriorTouchesNothing(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	_, wsID, ctx := seedTenantAndWorkspace(t, ctx, s, domain.BillingClassificationInternal)
+
+	// The workspace is ACTIVE; only ARCHIVED is allowed as a prior state here.
+	affected, previous, err := s.TransitionWorkspaceStatus(ctx, wsID,
+		domain.WorkspaceStatusActive,
+		[]domain.WorkspaceStatus{domain.WorkspaceStatusArchived},
+		"principal-7", "corr-1")
+	if err != nil {
+		t.Fatalf("TransitionWorkspaceStatus: %v", err)
+	}
+	if affected != 0 {
+		t.Fatalf("rowsAffected = %d, want 0 for a disallowed prior state", affected)
+	}
+	if previous != "" {
+		t.Fatalf("previous = %q, want empty when nothing was updated", previous)
+	}
+
+	got, _ := s.GetWorkspaceByID(ctx, wsID)
+	if got.UpdatedByPrincipalID == "principal-7" {
+		t.Fatal("a refused transition still stamped updated_by_principal_id")
+	}
+}
+
+func TestPgStore_TransitionWorkspaceStatus_AbsentReturnsZero(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+	_, _, ctx = seedTenantAndWorkspace(t, ctx, s, domain.BillingClassificationInternal)
+
+	affected, _, err := s.TransitionWorkspaceStatus(ctx, uuid.New().String(),
+		domain.WorkspaceStatusArchived,
+		[]domain.WorkspaceStatus{domain.WorkspaceStatusActive},
+		"principal-7", "corr-1")
+	if err != nil {
+		t.Fatalf("expected no error for a missing row, got %v", err)
+	}
+	if affected != 0 {
+		t.Fatalf("rowsAffected = %d, want 0", affected)
 	}
 }

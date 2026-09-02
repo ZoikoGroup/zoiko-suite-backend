@@ -34,7 +34,7 @@ func TestCheckAllowed_CachesGrantedDecision(t *testing.T) {
 	c := NewHTTPClient(srv.URL, zap.NewNop())
 
 	for i := 0; i < 5; i++ {
-		if err := c.CheckAllowed(context.Background(), "principal-1", "entity-1", "POLICY_CREATE"); err != nil {
+		if err := c.CheckAllowed(context.Background(), "principal-1", "entity-1", "POLICY_CREATE", "tenant-1"); err != nil {
 			t.Fatalf("call %d: unexpected error: %v", i, err)
 		}
 	}
@@ -55,7 +55,7 @@ func TestCheckAllowed_CachesDeniedDecision(t *testing.T) {
 	c := NewHTTPClient(srv.URL, zap.NewNop())
 
 	for i := 0; i < 3; i++ {
-		err := c.CheckAllowed(context.Background(), "principal-2", "entity-1", "POLICY_CREATE")
+		err := c.CheckAllowed(context.Background(), "principal-2", "entity-1", "POLICY_CREATE", "tenant-1")
 		if err != domain.ErrAuthorizationDenied {
 			t.Fatalf("call %d: expected ErrAuthorizationDenied, got %v", i, err)
 		}
@@ -74,7 +74,7 @@ func TestCheckAllowed_DoesNotCacheUnavailable(t *testing.T) {
 	c := NewHTTPClient("http://127.0.0.1:1", zap.NewNop()) // nothing listens here
 
 	for i := 0; i < 3; i++ {
-		if err := c.CheckAllowed(context.Background(), "principal-3", "entity-1", "POLICY_CREATE"); err != domain.ErrAuthorizationServiceUnavailable {
+		if err := c.CheckAllowed(context.Background(), "principal-3", "entity-1", "POLICY_CREATE", "tenant-1"); err != domain.ErrAuthorizationServiceUnavailable {
 			t.Fatalf("call %d: expected ErrAuthorizationServiceUnavailable, got %v", i, err)
 		}
 	}
@@ -90,10 +90,10 @@ func TestCheckAllowed_DistinctKeysAreNotConflated(t *testing.T) {
 
 	c := NewHTTPClient(srv.URL, zap.NewNop())
 
-	_ = c.CheckAllowed(context.Background(), "principal-4", "entity-1", "POLICY_CREATE")
-	_ = c.CheckAllowed(context.Background(), "principal-4", "entity-1", "POLICY_VERSION_CREATE")
-	_ = c.CheckAllowed(context.Background(), "principal-4", "entity-2", "POLICY_CREATE")
-	_ = c.CheckAllowed(context.Background(), "principal-5", "entity-1", "POLICY_CREATE")
+	_ = c.CheckAllowed(context.Background(), "principal-4", "entity-1", "POLICY_CREATE", "tenant-1")
+	_ = c.CheckAllowed(context.Background(), "principal-4", "entity-1", "POLICY_VERSION_CREATE", "tenant-1")
+	_ = c.CheckAllowed(context.Background(), "principal-4", "entity-2", "POLICY_CREATE", "tenant-1")
+	_ = c.CheckAllowed(context.Background(), "principal-5", "entity-1", "POLICY_CREATE", "tenant-1")
 
 	if got := atomic.LoadInt64(&hits); got != 4 {
 		t.Fatalf("expected 4 distinct live calls for 4 distinct keys, got %d", got)
@@ -108,7 +108,7 @@ func TestCheckAllowed_ExpiresAfterTTL(t *testing.T) {
 	defer srv.Close()
 
 	c := NewHTTPClient(srv.URL, zap.NewNop())
-	_ = c.CheckAllowed(context.Background(), "principal-6", "entity-1", "POLICY_CREATE")
+	_ = c.CheckAllowed(context.Background(), "principal-6", "entity-1", "POLICY_CREATE", "tenant-1")
 
 	// Force expiry without sleeping decisionCacheTTL in a unit test.
 	c.cacheMu.Lock()
@@ -118,7 +118,7 @@ func TestCheckAllowed_ExpiresAfterTTL(t *testing.T) {
 	}
 	c.cacheMu.Unlock()
 
-	_ = c.CheckAllowed(context.Background(), "principal-6", "entity-1", "POLICY_CREATE")
+	_ = c.CheckAllowed(context.Background(), "principal-6", "entity-1", "POLICY_CREATE", "tenant-1")
 
 	if got := atomic.LoadInt64(&hits); got != 2 {
 		t.Fatalf("expected the second call after expiry to re-hit authorization-svc, got %d live calls", got)

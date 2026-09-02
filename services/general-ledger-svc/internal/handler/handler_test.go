@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
+	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	"zoiko.io/general-ledger-svc/internal/handler"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
@@ -205,6 +207,17 @@ func newRouterWithClose(s *stubStore, p *stubPublisher, a *stubAuthZ, c close.Cl
 	// tenant scope reaching the handler is now part of what these tests cover,
 	// and a bare router would test a request pipeline this service never runs.
 	r.Use(svcmiddleware.TenantContext())
+
+	// The real §4 envelope middleware, pinned to observe mode.
+	//
+	// The handler reads book_id and evidence_refs off the envelope, so it has to
+	// be parsed here or those code paths are never exercised. Observe rather
+	// than the deployed write-strict because these are general-ledger tests:
+	// what the envelope refuses is uniform middleware behaviour, covered once in
+	// internal/envelope, and re-asserting it here would only mean every ledger
+	// test had to carry a full envelope to reach the ledger logic it is about.
+	r.Use(svcenvelope.MiddlewareWithMode(svcenvelope.ServicePolicy(), svcenvelope.ModeObserve, nil))
+
 	h := handler.New(s, p, a, c, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
@@ -222,6 +235,17 @@ func doRequest(r chi.Router, method, path string, body any, principalID string) 
 // An empty tenantID sends no X-Tenant-Id at all — a request that never passed
 // ForwardAuth.
 func doRequestAs(r chi.Router, method, path string, body any, principalID, tenantID string) *httptest.ResponseRecorder {
+	return sendRequest(r, method, path, body, principalID, tenantID, nil)
+}
+
+// doRequestWithHeaders sends a request carrying extra §4 envelope headers, for
+// the tests that cover inputs the handler reads off the envelope rather than
+// the body — book_id and evidence_refs.
+func doRequestWithHeaders(r chi.Router, method, path string, body any, principalID string, headers map[string]string) *httptest.ResponseRecorder {
+	return sendRequest(r, method, path, body, principalID, testTenantID, headers)
+}
+
+func sendRequest(r chi.Router, method, path string, body any, principalID, tenantID string, headers map[string]string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
@@ -233,6 +257,9 @@ func doRequestAs(r chi.Router, method, path string, body any, principalID, tenan
 	}
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
@@ -248,6 +275,15 @@ func validCreateReq() domain.CreateJournalRequest {
 		FiscalPeriod:  "2026-07",
 		Description:   "test journal",
 		CorrelationID: "corr-1",
+
+		// ACC-03 required business/source inputs. Posting date deliberately
+		// later than transaction date — the ordinary case of a document dated
+		// one day and posted another.
+		JournalType:     domain.JournalTypeStandard,
+		TransactionDate: domain.NewDate(2026, time.July, 28),
+		PostingDate:     domain.NewDate(2026, time.July, 31),
+		CurrencyCode:    "GBP",
+
 		Lines: []domain.CreateJournalLineInput{
 			{AccountCode: "1000", DebitAmount: 100},
 			{AccountCode: "4000", CreditAmount: 100},

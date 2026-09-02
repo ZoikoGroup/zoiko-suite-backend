@@ -3998,3 +3998,2914 @@ GRANT SELECT, INSERT         ON policy.control_test_executions  TO zoiko_backend
 
 -- An attestation transitions ACTIVE → CHALLENGED / REVOKED.
 GRANT SELECT, INSERT, UPDATE ON policy.attestations             TO zoiko_backend;
+
+
+-- ============================================================================
+-- FILE: 0022_employee_master_svc.sql
+-- ============================================================================
+
+-- 0022_employee_master_svc.sql
+-- employee-master-svc → schema `employee_master`
+--
+-- Squashed end state of 000001_initial_schema and 000002_hr_profile_fields.
+-- One table: employees.
+--
+-- ── This service is the employee identity other services resolve against ─────
+-- leave-absence-svc, compensation-svc and payroll-run-svc all call
+-- GET /v1/employees/{id} to learn which legal entity an employee belongs to,
+-- and each fails closed when it cannot. That makes this table the root of the
+-- HR domain's scope resolution, which is why it lands before the three
+-- migrations that follow it.
+--
+-- ── Personal data is separated from employment data ──────────────────────────
+-- The Go store reads two different projections: a full one for a single
+-- employee, and a directory one for a listing that deliberately omits date of
+-- birth, gender, personal email and both address fields. A caller enumerating a
+-- legal entity is building a directory or a headcount rollup and needs none of
+-- them.
+--
+-- That split is a projection in the service, not a boundary in the schema, so
+-- it protects nothing here on its own. The `employee_directory` view below
+-- makes it real for anything reaching the table through PostgREST: the
+-- `authenticated` role is granted the view and nothing on the base table.
+--
+-- ── Gender is optional to disclose ───────────────────────────────────────────
+-- NULL and 'UNSPECIFIED' mean different things and both are allowed. NULL is
+-- "never asked"; UNSPECIFIED is a choice the employee made. Collapsing them
+-- would discard the distinction and misreport the second as missing data.
+
+CREATE SCHEMA IF NOT EXISTS employee_master;
+
+COMMENT ON SCHEMA employee_master IS
+    'employee-master-svc. Authoritative employee record and the legal-entity scope other HR services resolve against. Holds personal data — expose employee_directory through PostgREST, not the base table.';
+
+GRANT USAGE ON SCHEMA employee_master TO zoiko_backend, authenticated;
+
+-- ── employees ────────────────────────────────────────────────────────────────
+
+CREATE TABLE employee_master.employees (
+    employee_id         UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id           VARCHAR(255) NOT NULL,
+    legal_entity_id     VARCHAR(255) NOT NULL,
+
+    employee_number     VARCHAR(100) NOT NULL,
+    first_name          VARCHAR(100) NOT NULL,
+    last_name           VARCHAR(100) NOT NULL,
+    email               VARCHAR(255) NOT NULL,
+    phone               VARCHAR(50),
+    job_title           VARCHAR(150) NOT NULL DEFAULT 'Employee',
+
+    department_id       VARCHAR(255),
+    manager_employee_id UUID,
+
+    -- FULL_TIME | PART_TIME | CONTRACTOR
+    worker_type         VARCHAR(50)  NOT NULL,
+    -- ONBOARDING | ACTIVE | SUSPENDED | TERMINATED
+    status              VARCHAR(50)  NOT NULL,
+
+    hire_date           DATE         NOT NULL,
+    termination_date    DATE,
+
+    effective_from      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    effective_to        TIMESTAMPTZ,
+
+    -- ── Personal profile ────────────────────────────────────────────────────
+    date_of_birth       DATE,
+    gender              VARCHAR(30),
+    profile_picture_url VARCHAR(500),
+    personal_email      VARCHAR(255),
+    work_email          VARCHAR(255),
+
+    -- ── Address ─────────────────────────────────────────────────────────────
+    current_address     TEXT,
+    permanent_address   TEXT,
+    city                VARCHAR(100),
+    state               VARCHAR(100),
+    country             VARCHAR(100),
+    postal_code         VARCHAR(20),
+
+    -- ── Org placement ───────────────────────────────────────────────────────
+    -- Reporting labels alongside the authoritative department_id.
+    -- org-structure-svc owns the real hierarchy; these are the free-text
+    -- groupings HR reporting and payroll cost splits need.
+    company             VARCHAR(200),
+    business_unit       VARCHAR(200),
+    division            VARCHAR(200),
+    team                VARCHAR(200),
+    designation_id      VARCHAR(255),
+    confirmation_date   DATE,
+
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- The vocabulary the domain defines, enforced in Go and — before this —
+    -- nowhere else, so any other writer could leave a value no consumer knows
+    -- how to read.
+    CONSTRAINT employees_worker_type_known
+        CHECK (worker_type IN ('FULL_TIME', 'PART_TIME', 'CONTRACTOR')),
+    CONSTRAINT employees_status_known
+        CHECK (status IN ('ONBOARDING', 'ACTIVE', 'SUSPENDED', 'TERMINATED')),
+
+    -- Optional to disclose, so nullable; a controlled vocabulary when given.
+    CONSTRAINT employees_gender_check
+        CHECK (gender IS NULL OR gender IN ('MALE', 'FEMALE', 'NON_BINARY', 'OTHER', 'UNSPECIFIED')),
+
+    -- Nobody was confirmed before they were hired.
+    CONSTRAINT employees_confirmation_after_hire_check
+        CHECK (confirmation_date IS NULL OR confirmation_date >= hire_date),
+
+    -- Nor terminated before they were hired.
+    CONSTRAINT employees_termination_after_hire_check
+        CHECK (termination_date IS NULL OR termination_date >= hire_date),
+
+    -- A TERMINATED employee must say when. Without this, a terminated row is a
+    -- record that somebody left and no account of when — which is the whole
+    -- reason downstream payroll reads the status at all.
+    CONSTRAINT employees_terminated_has_date
+        CHECK (status <> 'TERMINATED' OR termination_date IS NOT NULL),
+
+    -- An employee is not their own manager. A self-reference would make the
+    -- reporting chain a cycle of one and hang any recursive walk of it.
+    CONSTRAINT employees_manager_not_self
+        CHECK (manager_employee_id IS NULL OR manager_employee_id <> employee_id),
+
+    -- The target of the composite self-reference below.
+    CONSTRAINT employees_tenant_id_unique UNIQUE (tenant_id, employee_id)
+);
+
+-- A manager in another tenant is unrepresentable. The single-column form would
+-- have accepted one: nothing made the referenced row's tenant agree with this
+-- one's, and a reporting chain that crosses tenants leaks the org structure of
+-- both.
+ALTER TABLE employee_master.employees
+    ADD CONSTRAINT employees_manager_same_tenant
+    FOREIGN KEY (tenant_id, manager_employee_id)
+    REFERENCES employee_master.employees (tenant_id, employee_id);
+
+CREATE UNIQUE INDEX idx_employees_tenant_email
+    ON employee_master.employees (tenant_id, email);
+CREATE UNIQUE INDEX idx_employees_tenant_number
+    ON employee_master.employees (tenant_id, employee_number);
+
+-- Work email is an addressable identity inside a tenant, so it carries the same
+-- uniqueness guarantee as the primary email. Partial: the many rows with no
+-- work email must not collide with each other.
+CREATE UNIQUE INDEX idx_employees_tenant_work_email
+    ON employee_master.employees (tenant_id, work_email)
+    WHERE work_email IS NOT NULL;
+
+CREATE INDEX idx_employees_tenant_entity_status
+    ON employee_master.employees (tenant_id, legal_entity_id, status);
+CREATE INDEX idx_employees_tenant_dept
+    ON employee_master.employees (tenant_id, department_id);
+CREATE INDEX idx_employees_tenant_manager
+    ON employee_master.employees (tenant_id, manager_employee_id);
+
+-- Reporting rollups filter on these; without them a division-level headcount
+-- query degrades to a full scan of the tenant's employees.
+CREATE INDEX idx_employees_tenant_business_unit
+    ON employee_master.employees (tenant_id, business_unit)
+    WHERE business_unit IS NOT NULL;
+CREATE INDEX idx_employees_tenant_division
+    ON employee_master.employees (tenant_id, division)
+    WHERE division IS NOT NULL;
+CREATE INDEX idx_employees_tenant_designation
+    ON employee_master.employees (tenant_id, designation_id)
+    WHERE designation_id IS NOT NULL;
+
+-- ── Row-level security ───────────────────────────────────────────────────────
+
+ALTER TABLE employee_master.employees ENABLE ROW LEVEL SECURITY;
+ALTER TABLE employee_master.employees FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON employee_master.employees
+    FOR ALL
+    TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+-- ── employee_directory ───────────────────────────────────────────────────────
+--
+-- The directory projection, as a view rather than a convention. This is the
+-- only employee data `authenticated` can reach: date of birth, gender, personal
+-- email and both addresses are absent, and no grant on the base table restores
+-- them.
+--
+-- security_invoker so the view runs under the caller's own privileges and the
+-- table's RLS still applies. Without it the view would run as its owner and
+-- hand every tenant's directory to every caller.
+
+CREATE VIEW employee_master.employee_directory
+WITH (security_invoker = true) AS
+SELECT
+    employee_id,
+    tenant_id,
+    legal_entity_id,
+    employee_number,
+    first_name,
+    last_name,
+    email,
+    work_email,
+    phone,
+    job_title,
+    department_id,
+    manager_employee_id,
+    worker_type,
+    status,
+    hire_date,
+    termination_date,
+    company,
+    business_unit,
+    division,
+    team,
+    designation_id,
+    confirmation_date,
+    created_at,
+    updated_at
+FROM employee_master.employees;
+
+COMMENT ON VIEW employee_master.employee_directory IS
+    'Employment data without personal data. Omits date_of_birth, gender, profile_picture_url, personal_email and both address fields. This is what authenticated callers read; the base table is reachable only by zoiko_backend.';
+
+-- ── Grants ───────────────────────────────────────────────────────────────────
+
+-- No DELETE: an employee record is the basis of every payslip, leave balance
+-- and contract that referenced it. Departure is a status change, and
+-- effective_to closes the row.
+GRANT SELECT, INSERT, UPDATE ON employee_master.employees TO zoiko_backend;
+
+-- Nothing on the base table for authenticated — only the directory view.
+GRANT SELECT ON employee_master.employee_directory TO authenticated;
+
+
+-- ============================================================================
+-- FILE: 0023_leave_absence_svc.sql
+-- ============================================================================
+
+-- 0023_leave_absence_svc.sql
+-- leave-absence-svc → schema `leave_absence`
+--
+-- Squashed end state of 000001_initial_schema, 000002_fix_race_and_idempotency
+-- and 000003_leave_policy_and_holidays. Four tables: leave_types,
+-- leave_balances, leave_requests, holidays.
+--
+-- Depends on 0022: an employee_id here is an employee_master employee, and the
+-- service resolves the employee's legal entity through that service before it
+-- authorizes anything.
+--
+-- ── Leave policy is enforced, not advisory ───────────────────────────────────
+-- Before 000003 a leave type carried an accrual rate and a cap and nothing
+-- else, so every request was reviewed by hand and nothing stopped someone
+-- booking six months starting tomorrow. min_notice_days, max_consecutive_days
+-- and requires_approval are checked by the service at submission time.
+--
+-- requires_approval DEFAULTs true. A leave type that arrives without the column
+-- set must not silently stop being reviewed.
+--
+-- ── Holidays are retired, never deleted ──────────────────────────────────────
+-- Leave approved against last year's calendar has to stay explicable, so a
+-- holiday moves to INACTIVE and the row stays. The uniqueness index is partial
+-- on ACTIVE so a retired date can be declared again.
+
+CREATE SCHEMA IF NOT EXISTS leave_absence;
+
+COMMENT ON SCHEMA leave_absence IS
+    'leave-absence-svc. Leave types and their policy, per-employee balances, requests, and the holiday calendar. Policy on a leave type is enforced at submission, not advisory.';
+
+GRANT USAGE ON SCHEMA leave_absence TO zoiko_backend, authenticated;
+
+-- ── leave_types ──────────────────────────────────────────────────────────────
+
+CREATE TABLE leave_absence.leave_types (
+    leave_type_id           UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id               VARCHAR(255) NOT NULL,
+    legal_entity_id         VARCHAR(255) NOT NULL,
+
+    name                    VARCHAR(255) NOT NULL,
+    -- VACATION | SICK_LEAVE | MATERNITY | PATERNITY | BEREAVEMENT | UNPAID | ...
+    -- Deliberately not a CHECK: a legal entity may define its own statutory
+    -- leave types, and the set is jurisdiction-dependent.
+    code                    VARCHAR(50)  NOT NULL,
+
+    is_paid                 BOOLEAN      NOT NULL DEFAULT true,
+    accrual_rate_per_year   NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+    max_balance             NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+
+    -- ACTIVE | INACTIVE
+    status                  VARCHAR(50)  NOT NULL,
+
+    -- ── Policy ──────────────────────────────────────────────────────────────
+    carry_forward_allowed   BOOLEAN      NOT NULL DEFAULT false,
+    carry_forward_max_hours NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+
+    -- Minimum days between submitting and the leave starting. 0 permits
+    -- same-day and retroactive booking, which is what sick leave needs.
+    min_notice_days         INTEGER      NOT NULL DEFAULT 0,
+
+    -- Longest unbroken span, in calendar days, one request may cover.
+    -- 0 means unlimited.
+    max_consecutive_days    INTEGER      NOT NULL DEFAULT 0,
+
+    -- false auto-approves on submission.
+    requires_approval       BOOLEAN      NOT NULL DEFAULT true,
+
+    -- Display metadata carried for the caller. The service never reads these.
+    color_hex               VARCHAR(7),
+    icon                    VARCHAR(50),
+
+    created_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT leave_types_status_known
+        CHECK (status IN ('ACTIVE', 'INACTIVE')),
+
+    CONSTRAINT leave_types_notice_non_negative_check
+        CHECK (min_notice_days >= 0
+           AND max_consecutive_days >= 0
+           AND carry_forward_max_hours >= 0
+           AND accrual_rate_per_year >= 0
+           AND max_balance >= 0),
+
+    -- Carrying forward with a zero cap would silently discard the whole balance
+    -- at year end, which reads as a policy bug rather than a policy.
+    CONSTRAINT leave_types_carry_forward_cap_check
+        CHECK (NOT carry_forward_allowed OR carry_forward_max_hours > 0),
+
+    CONSTRAINT leave_types_tenant_id_unique UNIQUE (tenant_id, leave_type_id)
+);
+
+-- A leave type code is the stable handle policy is configured against, so it
+-- must not repeat within a legal entity.
+CREATE UNIQUE INDEX idx_leave_types_tenant_entity_code
+    ON leave_absence.leave_types (tenant_id, legal_entity_id, code);
+
+CREATE INDEX idx_leave_types_tenant_entity
+    ON leave_absence.leave_types (tenant_id, legal_entity_id);
+
+-- ── leave_balances ───────────────────────────────────────────────────────────
+
+CREATE TABLE leave_absence.leave_balances (
+    balance_id      UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       VARCHAR(255) NOT NULL,
+    employee_id     UUID         NOT NULL,
+    leave_type_id   UUID         NOT NULL,
+
+    allocated_hours NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+    used_hours      NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+    pending_hours   NUMERIC(10, 2) NOT NULL DEFAULT 0.00,
+
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- A balance in one tenant against another tenant's leave type is
+    -- unrepresentable. The single-column reference in 000001 accepted it.
+    CONSTRAINT leave_balances_type_same_tenant
+        FOREIGN KEY (tenant_id, leave_type_id)
+        REFERENCES leave_absence.leave_types (tenant_id, leave_type_id),
+
+    CONSTRAINT unique_tenant_emp_leave_type
+        UNIQUE (tenant_id, employee_id, leave_type_id),
+
+    -- Hours are quantities, never negative. Used and pending hours that exceed
+    -- what was allocated would report an available balance below zero, which
+    -- the service treats as insufficient and would then never let anyone spend.
+    CONSTRAINT leave_balances_hours_non_negative
+        CHECK (allocated_hours >= 0 AND used_hours >= 0 AND pending_hours >= 0)
+);
+
+CREATE INDEX idx_leave_balances_tenant_emp
+    ON leave_absence.leave_balances (tenant_id, employee_id);
+
+-- ── leave_requests ───────────────────────────────────────────────────────────
+
+CREATE TABLE leave_absence.leave_requests (
+    request_id     UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      VARCHAR(255) NOT NULL,
+    employee_id    UUID         NOT NULL,
+    leave_type_id  UUID         NOT NULL,
+
+    start_date     DATE         NOT NULL,
+    end_date       DATE         NOT NULL,
+    total_hours    NUMERIC(10, 2) NOT NULL,
+    reason         TEXT,
+
+    -- SUBMITTED | APPROVED | REJECTED | CANCELLED
+    status         VARCHAR(50)  NOT NULL,
+
+    reviewer_id    VARCHAR(255),
+    reviewer_notes TEXT,
+    reviewed_at    TIMESTAMPTZ,
+
+    correlation_id VARCHAR(255) NOT NULL DEFAULT '',
+
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT leave_requests_type_same_tenant
+        FOREIGN KEY (tenant_id, leave_type_id)
+        REFERENCES leave_absence.leave_types (tenant_id, leave_type_id),
+
+    CONSTRAINT leave_requests_status_known
+        CHECK (status IN ('SUBMITTED', 'APPROVED', 'REJECTED', 'CANCELLED')),
+
+    -- Leave that ends before it starts is not a span. The service checks this;
+    -- nothing else did.
+    CONSTRAINT leave_requests_end_after_start
+        CHECK (end_date >= start_date),
+
+    CONSTRAINT leave_requests_hours_positive
+        CHECK (total_hours > 0),
+
+    -- A reviewed request must record who reviewed it and when. A row reading
+    -- APPROVED with no reviewer is an approval nobody is accountable for.
+    CONSTRAINT leave_requests_reviewed_has_reviewer
+        CHECK (
+            status IN ('SUBMITTED', 'CANCELLED')
+            OR (reviewer_id IS NOT NULL AND reviewed_at IS NOT NULL)
+        )
+);
+
+-- Idempotency: a retried submit resolves to the original request instead of
+-- creating a duplicate and double-locking pending hours.
+CREATE UNIQUE INDEX idx_leave_requests_tenant_correlation
+    ON leave_absence.leave_requests (tenant_id, correlation_id)
+    WHERE correlation_id <> '';
+
+CREATE INDEX idx_leave_requests_tenant_emp
+    ON leave_absence.leave_requests (tenant_id, employee_id);
+CREATE INDEX idx_leave_requests_tenant_status
+    ON leave_absence.leave_requests (tenant_id, status);
+
+-- ── holidays ─────────────────────────────────────────────────────────────────
+--
+-- Public and company holidays per legal entity. Leave spanning a holiday should
+-- not consume balance for that day, and before 000003 there was nowhere to
+-- record which days those are.
+
+CREATE TABLE leave_absence.holidays (
+    holiday_id      UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       VARCHAR(255) NOT NULL,
+    legal_entity_id VARCHAR(255) NOT NULL,
+
+    name            VARCHAR(150) NOT NULL,
+    holiday_date    DATE         NOT NULL,
+
+    -- PUBLIC | COMPANY | OPTIONAL
+    holiday_type    VARCHAR(50)  NOT NULL DEFAULT 'PUBLIC',
+
+    -- Same calendar day every year.
+    is_recurring    BOOLEAN      NOT NULL DEFAULT false,
+    description     TEXT,
+
+    -- ACTIVE | INACTIVE
+    status          VARCHAR(50)  NOT NULL DEFAULT 'ACTIVE',
+
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT holidays_type_check
+        CHECK (holiday_type IN ('PUBLIC', 'COMPANY', 'OPTIONAL')),
+    CONSTRAINT holidays_status_check
+        CHECK (status IN ('ACTIVE', 'INACTIVE'))
+);
+
+-- One entry per day per entity. Partial on ACTIVE so a day can be retired and
+-- then re-declared without tripping over the old row.
+CREATE UNIQUE INDEX idx_holidays_tenant_entity_date
+    ON leave_absence.holidays (tenant_id, legal_entity_id, holiday_date)
+    WHERE status = 'ACTIVE';
+
+-- The calendar is read by date range far more often than by anything else.
+CREATE INDEX idx_holidays_tenant_entity_range
+    ON leave_absence.holidays (tenant_id, legal_entity_id, holiday_date, status);
+
+-- ── Row-level security ───────────────────────────────────────────────────────
+
+ALTER TABLE leave_absence.leave_types    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leave_absence.leave_types    FORCE  ROW LEVEL SECURITY;
+ALTER TABLE leave_absence.leave_balances ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leave_absence.leave_balances FORCE  ROW LEVEL SECURITY;
+ALTER TABLE leave_absence.leave_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leave_absence.leave_requests FORCE  ROW LEVEL SECURITY;
+ALTER TABLE leave_absence.holidays       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leave_absence.holidays       FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON leave_absence.leave_types
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON leave_absence.leave_balances
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON leave_absence.leave_requests
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON leave_absence.holidays
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+-- Leave types and the holiday calendar are policy an employee is entitled to
+-- read: they say how much notice a request needs and which days are not working
+-- days. Balances and requests are not — those are one employee's own record.
+CREATE POLICY tenant_read ON leave_absence.leave_types
+    FOR SELECT TO authenticated
+    USING (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_read ON leave_absence.holidays
+    FOR SELECT TO authenticated
+    USING (tenant_id = app.current_tenant_id() AND status = 'ACTIVE');
+
+-- ── Grants ───────────────────────────────────────────────────────────────────
+
+-- No DELETE anywhere: a leave request is the record of an absence that was
+-- taken or refused, a balance is the running account behind it, and a holiday
+-- explains a payslip. All three retire by status or end-date instead.
+GRANT SELECT, INSERT, UPDATE ON leave_absence.leave_types    TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE ON leave_absence.leave_balances TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE ON leave_absence.leave_requests TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE ON leave_absence.holidays       TO zoiko_backend;
+
+GRANT SELECT ON leave_absence.leave_types TO authenticated;
+GRANT SELECT ON leave_absence.holidays    TO authenticated;
+
+
+-- ============================================================================
+-- FILE: 0024_compensation_svc.sql
+-- ============================================================================
+
+-- 0024_compensation_svc.sql
+-- compensation-svc → schema `compensation`
+--
+-- Squashed end state of 000001_initial_schema, 000002_fix_race_and_idempotency
+-- and 000003_salary_components. Five tables: compensation_structures,
+-- wage_revisions, bonus_grants, salary_components, structure_components.
+--
+-- Depends on 0022: an employee_id here is an employee_master employee.
+--
+-- ── What 000003 added, and why ───────────────────────────────────────────────
+-- A compensation_structure was a min/max band and nothing else, so nothing
+-- downstream could answer "what is this salary actually made of". Payroll needs
+-- the breakdown: which elements are earnings, which are deductions, which are
+-- taxable, and how each is derived from the base. payroll-run-svc reads it
+-- through /v1/compensation/structures/{id}/breakdown and puts the resulting
+-- lines on the payslip.
+--
+-- ── Derivations are modelled, not evaluated ──────────────────────────────────
+-- zoiko-one, where this was ported from, stored the amount as a free-text
+-- `amount_or_formula VARCHAR(255)`. That does not travel: a governance service
+-- cannot evaluate arbitrary expressions and still explain a payslip. The two
+-- derivations payroll actually needs are declared explicitly instead — a fixed
+-- amount, or a percentage of the base.
+--
+-- Percentages resolve against the base, never against a running total, so the
+-- result does not depend on the order the components happen to be stored in.
+-- That property lives in the service; the schema keeps the inputs honest.
+
+CREATE SCHEMA IF NOT EXISTS compensation;
+
+COMMENT ON SCHEMA compensation IS
+    'compensation-svc. Pay structures and what they are composed of, wage revision history, and bonus grants. The component breakdown is what payroll-run-svc resolves a payslip from.';
+
+GRANT USAGE ON SCHEMA compensation TO zoiko_backend, authenticated;
+
+-- ── compensation_structures ──────────────────────────────────────────────────
+
+CREATE TABLE compensation.compensation_structures (
+    structure_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id           VARCHAR(255) NOT NULL,
+    legal_entity_id     VARCHAR(255) NOT NULL,
+
+    name                VARCHAR(150) NOT NULL,
+    -- SALARY | HOURLY
+    pay_type            VARCHAR(50)  NOT NULL,
+
+    min_amount          NUMERIC(18, 4) NOT NULL,
+    max_amount          NUMERIC(18, 4) NOT NULL,
+    currency            VARCHAR(3)   NOT NULL,
+    overtime_multiplier NUMERIC(5, 2) NOT NULL DEFAULT 1.50,
+
+    correlation_id      VARCHAR(255) NOT NULL DEFAULT '',
+
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT comp_structures_pay_type_known
+        CHECK (pay_type IN ('SALARY', 'HOURLY')),
+
+    -- An inverted band admits no salary at all, and every later "is this wage
+    -- inside its band" check would answer no for every possible amount.
+    CONSTRAINT comp_structures_band_ordered
+        CHECK (max_amount >= min_amount),
+    CONSTRAINT comp_structures_amounts_non_negative
+        CHECK (min_amount >= 0),
+
+    -- Overtime paid below the normal rate is not overtime.
+    CONSTRAINT comp_structures_overtime_at_least_one
+        CHECK (overtime_multiplier >= 1.00),
+
+    CONSTRAINT comp_structures_tenant_id_unique UNIQUE (tenant_id, structure_id)
+);
+
+CREATE UNIQUE INDEX idx_comp_struct_tenant_correlation
+    ON compensation.compensation_structures (tenant_id, correlation_id)
+    WHERE correlation_id <> '';
+
+CREATE INDEX idx_comp_struct_tenant_entity
+    ON compensation.compensation_structures (tenant_id, legal_entity_id);
+
+-- ── wage_revisions ───────────────────────────────────────────────────────────
+
+CREATE TABLE compensation.wage_revisions (
+    revision_id    UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      VARCHAR(255) NOT NULL,
+    employee_id    UUID         NOT NULL,
+    structure_id   UUID,
+
+    -- SALARY | HOURLY
+    pay_type       VARCHAR(50)  NOT NULL,
+    amount         NUMERIC(18, 4) NOT NULL,
+    currency       VARCHAR(3)   NOT NULL,
+
+    effective_from DATE         NOT NULL,
+    effective_to   DATE,
+
+    reason         TEXT         NOT NULL,
+    revised_by     VARCHAR(255) NOT NULL DEFAULT app.current_principal_id(),
+
+    -- ACTIVE | SUPERSEDED
+    status         VARCHAR(50)  NOT NULL,
+
+    correlation_id VARCHAR(255) NOT NULL DEFAULT '',
+
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- A revision against another tenant's structure is unrepresentable.
+    CONSTRAINT wage_revisions_structure_same_tenant
+        FOREIGN KEY (tenant_id, structure_id)
+        REFERENCES compensation.compensation_structures (tenant_id, structure_id),
+
+    CONSTRAINT wage_revisions_pay_type_known
+        CHECK (pay_type IN ('SALARY', 'HOURLY')),
+    CONSTRAINT wage_revisions_status_known
+        CHECK (status IN ('ACTIVE', 'SUPERSEDED')),
+    CONSTRAINT wage_revisions_amount_non_negative
+        CHECK (amount >= 0),
+
+    -- A revision that ends before it starts was never in force.
+    CONSTRAINT wage_revisions_period_ordered
+        CHECK (effective_to IS NULL OR effective_to >= effective_from),
+
+    -- The ACTIVE revision is the one in force now, so it has no end date.
+    -- Without this, a row could read ACTIVE with an effective_to in the past
+    -- and payroll would keep paying it.
+    CONSTRAINT wage_revisions_active_is_open
+        CHECK (status <> 'ACTIVE' OR effective_to IS NULL)
+);
+
+-- At most one ACTIVE wage revision per employee, at the database level. Without
+-- it, two concurrent ReviseWage calls could both pass the application's
+-- supersede-then-insert sequence and leave two ACTIVE rows — and
+-- GetActiveWageRevision (LIMIT 1, no ORDER BY) would hand payroll an arbitrary
+-- one of them.
+CREATE UNIQUE INDEX idx_wage_revisions_one_active
+    ON compensation.wage_revisions (tenant_id, employee_id)
+    WHERE status = 'ACTIVE';
+
+CREATE UNIQUE INDEX idx_wage_rev_tenant_correlation
+    ON compensation.wage_revisions (tenant_id, correlation_id)
+    WHERE correlation_id <> '';
+
+CREATE INDEX idx_wage_rev_tenant_emp
+    ON compensation.wage_revisions (tenant_id, employee_id);
+CREATE INDEX idx_wage_rev_tenant_status
+    ON compensation.wage_revisions (tenant_id, status);
+
+-- ── bonus_grants ─────────────────────────────────────────────────────────────
+
+CREATE TABLE compensation.bonus_grants (
+    grant_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      VARCHAR(255) NOT NULL,
+    employee_id    UUID         NOT NULL,
+
+    -- PERFORMANCE | ANNUAL | SIGNING | RETENTION
+    bonus_type     VARCHAR(50)  NOT NULL,
+    amount         NUMERIC(18, 4) NOT NULL,
+    currency       VARCHAR(3)   NOT NULL,
+    grant_date     DATE         NOT NULL,
+
+    -- PENDING | APPROVED | PAID | CANCELLED
+    status         VARCHAR(50)  NOT NULL,
+    approved_by    VARCHAR(255),
+
+    correlation_id VARCHAR(255) NOT NULL DEFAULT '',
+
+    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT bonus_grants_type_known
+        CHECK (bonus_type IN ('PERFORMANCE', 'ANNUAL', 'SIGNING', 'RETENTION')),
+    CONSTRAINT bonus_grants_status_known
+        CHECK (status IN ('PENDING', 'APPROVED', 'PAID', 'CANCELLED')),
+    CONSTRAINT bonus_grants_amount_non_negative
+        CHECK (amount >= 0),
+
+    -- An approved or paid bonus names who approved it. Money that moved with
+    -- nobody accountable for the decision is the thing this table exists to
+    -- prevent.
+    CONSTRAINT bonus_grants_approved_has_approver
+        CHECK (status NOT IN ('APPROVED', 'PAID') OR approved_by IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX idx_bonus_grants_tenant_correlation
+    ON compensation.bonus_grants (tenant_id, correlation_id)
+    WHERE correlation_id <> '';
+
+CREATE INDEX idx_bonus_grants_tenant_emp
+    ON compensation.bonus_grants (tenant_id, employee_id);
+CREATE INDEX idx_bonus_grants_tenant_status
+    ON compensation.bonus_grants (tenant_id, status);
+
+-- ── salary_components ────────────────────────────────────────────────────────
+--
+-- The catalogue of pay elements a legal entity can compose into its structures.
+
+CREATE TABLE compensation.salary_components (
+    component_id    UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       VARCHAR(255) NOT NULL,
+    legal_entity_id VARCHAR(255) NOT NULL,
+
+    name            VARCHAR(150) NOT NULL,
+    -- HRA, TRANSPORT, PF, PROF_TAX, ... Entity-defined, so no CHECK.
+    code            VARCHAR(50)  NOT NULL,
+
+    -- EARNING | DEDUCTION
+    component_type  VARCHAR(20)  NOT NULL,
+
+    -- Taxable unless stated otherwise. Defaulting the other way would
+    -- under-report income by omission.
+    is_taxable      BOOLEAN      NOT NULL DEFAULT true,
+
+    default_amount  NUMERIC(18, 4),
+    currency        VARCHAR(3)   NOT NULL,
+    description     TEXT,
+
+    -- ACTIVE | INACTIVE
+    status          VARCHAR(50)  NOT NULL DEFAULT 'ACTIVE',
+
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT salary_components_type_check
+        CHECK (component_type IN ('EARNING', 'DEDUCTION')),
+    CONSTRAINT salary_components_status_check
+        CHECK (status IN ('ACTIVE', 'INACTIVE')),
+
+    -- A negative component would flip an earning into a deduction by stealth.
+    CONSTRAINT salary_components_amount_check
+        CHECK (default_amount IS NULL OR default_amount >= 0),
+
+    CONSTRAINT salary_components_tenant_id_unique UNIQUE (tenant_id, component_id)
+);
+
+-- A component code is the stable handle payroll refers to, so it is unique
+-- within a legal entity. Partial on ACTIVE so a retired code can be reissued.
+CREATE UNIQUE INDEX idx_salary_components_entity_code
+    ON compensation.salary_components (tenant_id, legal_entity_id, code)
+    WHERE status = 'ACTIVE';
+
+CREATE INDEX idx_salary_components_tenant_entity
+    ON compensation.salary_components (tenant_id, legal_entity_id, status);
+
+-- ── structure_components ─────────────────────────────────────────────────────
+--
+-- Which components make up a structure, and how each is derived.
+
+CREATE TABLE compensation.structure_components (
+    structure_component_id UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id              VARCHAR(255) NOT NULL,
+    structure_id           UUID         NOT NULL,
+    component_id           UUID         NOT NULL,
+
+    -- FIXED | PERCENT_OF_BASE
+    calculation_method     VARCHAR(30)  NOT NULL,
+    calculation_value      NUMERIC(18, 4) NOT NULL,
+
+    -- Payslip display order.
+    sequence               INTEGER      NOT NULL DEFAULT 0,
+
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- Both parents must be in this row's tenant. A structure composed from
+    -- another entity's components would produce a payslip that crosses a legal
+    -- boundary, and the single-column form would have allowed it.
+    CONSTRAINT structure_components_structure_same_tenant
+        FOREIGN KEY (tenant_id, structure_id)
+        REFERENCES compensation.compensation_structures (tenant_id, structure_id),
+    CONSTRAINT structure_components_component_same_tenant
+        FOREIGN KEY (tenant_id, component_id)
+        REFERENCES compensation.salary_components (tenant_id, component_id),
+
+    CONSTRAINT structure_components_method_check
+        CHECK (calculation_method IN ('FIXED', 'PERCENT_OF_BASE')),
+    CONSTRAINT structure_components_value_check
+        CHECK (calculation_value >= 0),
+
+    -- A percentage over 100 of the base is a data-entry slip, not a policy.
+    CONSTRAINT structure_components_percent_range_check
+        CHECK (calculation_method <> 'PERCENT_OF_BASE' OR calculation_value <= 100),
+
+    -- One line per component per structure; changing the amount updates the row.
+    CONSTRAINT structure_components_unique UNIQUE (structure_id, component_id)
+);
+
+-- Reading a structure's composition is the hot path: payroll does it per
+-- employee per run, always in payslip order.
+CREATE INDEX idx_structure_components_structure
+    ON compensation.structure_components (tenant_id, structure_id, sequence);
+
+-- ── Row-level security ───────────────────────────────────────────────────────
+
+ALTER TABLE compensation.compensation_structures ENABLE ROW LEVEL SECURITY;
+ALTER TABLE compensation.compensation_structures FORCE  ROW LEVEL SECURITY;
+ALTER TABLE compensation.wage_revisions          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE compensation.wage_revisions          FORCE  ROW LEVEL SECURITY;
+ALTER TABLE compensation.bonus_grants            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE compensation.bonus_grants            FORCE  ROW LEVEL SECURITY;
+ALTER TABLE compensation.salary_components       ENABLE ROW LEVEL SECURITY;
+ALTER TABLE compensation.salary_components       FORCE  ROW LEVEL SECURITY;
+ALTER TABLE compensation.structure_components    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE compensation.structure_components    FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON compensation.compensation_structures
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON compensation.wage_revisions
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON compensation.bonus_grants
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON compensation.salary_components
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON compensation.structure_components
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+-- Nothing here is readable by `authenticated`. Every table in this schema is
+-- either an individual's pay or the bands and components that would let one
+-- employee derive a colleague's. Reads go through the service, which resolves
+-- the caller's own employee_id first.
+
+-- ── Grants ───────────────────────────────────────────────────────────────────
+
+-- wage_revisions and bonus_grants take no DELETE and no UPDATE beyond the
+-- supersede/approve transitions the service performs: both are the history of
+-- what somebody was paid and who decided it.
+GRANT SELECT, INSERT, UPDATE ON compensation.compensation_structures TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE ON compensation.wage_revisions          TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE ON compensation.bonus_grants            TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE ON compensation.salary_components       TO zoiko_backend;
+
+-- structure_components is the exception that needs DELETE: a structure's
+-- composition is replaced as a set, and a partial write would leave a structure
+-- computing a payslip nobody intended. The service clears and re-inserts inside
+-- one transaction.
+GRANT SELECT, INSERT, UPDATE, DELETE ON compensation.structure_components TO zoiko_backend;
+
+
+-- ============================================================================
+-- FILE: 0025_payroll_run_svc.sql
+-- ============================================================================
+
+-- 0025_payroll_run_svc.sql
+-- payroll-run-svc → schema `payroll_run`
+--
+-- Squashed end state of 000001_initial_schema, 000002_add_idempotency_index,
+-- 000003_add_finalization_linkage and 000004_payslip_components. Four tables:
+-- payroll_runs, pay_slips, pay_slip_items, shadow_payroll_comparisons.
+--
+-- Depends on 0022 and 0024: the service resolves each employee through
+-- employee-master-svc, takes the base salary from employment-contracts-svc, and
+-- reads the component composition from compensation-svc.
+--
+-- ── What 000004 added, and why ───────────────────────────────────────────────
+-- A pay slip recorded four totals and nothing else, so nobody could answer "why
+-- is my net pay this number". The lines behind the totals now come from
+-- compensation-svc's breakdown endpoint and are stored with the slip that used
+-- them.
+--
+-- ── The lines are copied, not referenced ─────────────────────────────────────
+-- pay_slip_items carries calculation_method and calculation_value rather than
+-- pointing at compensation.structure_components. If a structure changes 40% HRA
+-- to 35% next quarter, this payslip must still show the 40% it was actually
+-- paid on. A foreign key would make the slip re-read as whatever the structure
+-- says today, which is the opposite of what a payslip is for.
+--
+-- That is also why this schema holds no FK into `compensation` at all:
+-- structure_id is recorded as a plain UUID, an audit trail of which structure
+-- was used, not a live join.
+--
+-- ── Finalized runs are immutable ─────────────────────────────────────────────
+-- Two triggers below refuse UPDATE and DELETE of a COMPLETED run, and of any
+-- slip belonging to one. A trigger rather than a grant or a policy because it
+-- binds even a BYPASSRLS role such as Supabase's service_role, which neither of
+-- those does.
+--
+-- They are service-local functions rather than the shared app.reject_mutation()
+-- because these tables are not append-only: a run is updated repeatedly while it
+-- is being calculated, and its slips are cleared and re-derived on every
+-- recalculation. Only mutation AFTER finalization is refused, which is a
+-- conditional the shared function does not express.
+
+CREATE SCHEMA IF NOT EXISTS payroll_run;
+
+COMMENT ON SCHEMA payroll_run IS
+    'payroll-run-svc. Payroll runs, the payslips they produced and the lines behind each payslip. A COMPLETED run and its slips are immutable, enforced by trigger.';
+
+GRANT USAGE ON SCHEMA payroll_run TO zoiko_backend, authenticated;
+
+-- ── payroll_runs ─────────────────────────────────────────────────────────────
+
+CREATE TABLE payroll_run.payroll_runs (
+    run_id                 UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id              VARCHAR(255) NOT NULL,
+    legal_entity_id        VARCHAR(255) NOT NULL,
+
+    run_number             VARCHAR(100) NOT NULL,
+    pay_period_start       DATE         NOT NULL,
+    pay_period_end         DATE         NOT NULL,
+    pay_date               DATE         NOT NULL,
+
+    -- INITIATED | CALCULATED | BLOCKED | COMPLETED
+    status                 VARCHAR(50)  NOT NULL,
+    is_shadow_run          BOOLEAN      NOT NULL DEFAULT false,
+
+    total_gross_pay        NUMERIC(18, 4) NOT NULL DEFAULT 0,
+    total_net_pay          NUMERIC(18, 4) NOT NULL DEFAULT 0,
+    total_tax_deductions   NUMERIC(18, 4) NOT NULL DEFAULT 0,
+    total_other_deductions NUMERIC(18, 4) NOT NULL DEFAULT 0,
+    employee_count         INT          NOT NULL DEFAULT 0,
+
+    correlation_id         VARCHAR(255) NOT NULL DEFAULT '',
+
+    created_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    finalized_at           TIMESTAMPTZ,
+
+    -- Populated only when the caller finalizing the run supplies one; no
+    -- fabricated value when none exists yet.
+    governance_decision_id TEXT,
+    -- Computed by the service over the run's own locked totals at the moment of
+    -- finalization — not invented, not caller-supplied.
+    snapshot_hash          TEXT,
+
+    CONSTRAINT payroll_runs_status_known
+        CHECK (status IN ('INITIATED', 'CALCULATED', 'BLOCKED', 'COMPLETED')),
+
+    -- A pay period that ends before it starts is not a period, and the pay date
+    -- cannot precede the work it pays for.
+    CONSTRAINT payroll_runs_period_ordered
+        CHECK (pay_period_end >= pay_period_start),
+    CONSTRAINT payroll_runs_pay_date_after_period
+        CHECK (pay_date >= pay_period_start),
+
+    CONSTRAINT payroll_runs_totals_non_negative
+        CHECK (total_gross_pay >= 0
+           AND total_tax_deductions >= 0
+           AND total_other_deductions >= 0
+           AND employee_count >= 0),
+
+    -- A COMPLETED run must record when it was finalized and the hash that makes
+    -- it reproducible. Without both, "finalized" is a status with nothing behind
+    -- it and an auditor has only the final numbers to trust.
+    CONSTRAINT payroll_runs_completed_is_evidenced
+        CHECK (
+            status <> 'COMPLETED'
+            OR (finalized_at IS NOT NULL AND snapshot_hash IS NOT NULL)
+        ),
+
+    CONSTRAINT payroll_runs_tenant_id_unique UNIQUE (tenant_id, run_id)
+);
+
+-- Idempotency: a retried initiate (a client timeout on a request that actually
+-- succeeded) resolves to the original run instead of creating a duplicate run
+-- for the same period.
+CREATE UNIQUE INDEX idx_payroll_runs_tenant_correlation
+    ON payroll_run.payroll_runs (tenant_id, correlation_id)
+    WHERE correlation_id <> '';
+
+CREATE INDEX idx_payroll_runs_tenant_entity
+    ON payroll_run.payroll_runs (tenant_id, legal_entity_id);
+CREATE INDEX idx_payroll_runs_tenant_status
+    ON payroll_run.payroll_runs (tenant_id, status);
+
+-- ── pay_slips ────────────────────────────────────────────────────────────────
+
+CREATE TABLE payroll_run.pay_slips (
+    slip_id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id           VARCHAR(255) NOT NULL,
+    run_id              UUID         NOT NULL,
+
+    employee_id         UUID         NOT NULL,
+    employee_number     VARCHAR(100) NOT NULL,
+    employee_name       VARCHAR(200) NOT NULL,
+
+    gross_pay           NUMERIC(18, 4) NOT NULL,
+    tax_withheld        NUMERIC(18, 4) NOT NULL,
+    benefits_deductions NUMERIC(18, 4) NOT NULL,
+    net_pay             NUMERIC(18, 4) NOT NULL,
+
+    currency            VARCHAR(3)   NOT NULL,
+    effective_date      DATE         NOT NULL,
+
+    -- The base tax was actually applied to. Not the same as gross: non-taxable
+    -- earnings are excluded and taxable deductions come off it.
+    taxable_amount      NUMERIC(18, 4) NOT NULL DEFAULT 0,
+
+    -- The compensation structure this slip was computed from. Nullable: an
+    -- employee paid a flat base salary has none, which is a valid state rather
+    -- than missing data. Deliberately not a foreign key — see the header.
+    structure_id        UUID,
+
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- A slip in one tenant against another tenant's run is unrepresentable.
+    -- The single-column reference in 000001 accepted it.
+    CONSTRAINT pay_slips_run_same_tenant
+        FOREIGN KEY (tenant_id, run_id)
+        REFERENCES payroll_run.payroll_runs (tenant_id, run_id) ON DELETE CASCADE,
+
+    -- Gross, tax and deductions are quantities. Net is not: deductions can
+    -- legitimately exceed pay — an advance recovery, say — and reporting that
+    -- as anything other than negative would hide it from the payroll manager
+    -- who has to act on it.
+    CONSTRAINT pay_slips_amounts_non_negative
+        CHECK (gross_pay >= 0
+           AND tax_withheld >= 0
+           AND benefits_deductions >= 0
+           AND taxable_amount >= 0),
+
+    -- Tax cannot be withheld on more than the whole gross.
+    CONSTRAINT pay_slips_taxable_within_gross
+        CHECK (taxable_amount <= gross_pay),
+
+    CONSTRAINT pay_slips_tenant_id_unique UNIQUE (tenant_id, slip_id)
+);
+
+CREATE INDEX idx_pay_slips_tenant_run
+    ON payroll_run.pay_slips (tenant_id, run_id);
+CREATE INDEX idx_pay_slips_tenant_emp
+    ON payroll_run.pay_slips (tenant_id, employee_id);
+
+-- ── pay_slip_items ───────────────────────────────────────────────────────────
+
+CREATE TABLE payroll_run.pay_slip_items (
+    item_id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id          VARCHAR(255) NOT NULL,
+    slip_id            UUID         NOT NULL,
+
+    -- Which catalogue component this came from, for tracing. Not a foreign key
+    -- into `compensation`: the component may be retired later, and this line
+    -- must keep reading the same either way.
+    component_id       UUID,
+
+    component_code     VARCHAR(50)  NOT NULL,
+    component_name     VARCHAR(150) NOT NULL,
+    -- EARNING | DEDUCTION
+    component_type     VARCHAR(20)  NOT NULL,
+    is_taxable         BOOLEAN      NOT NULL DEFAULT true,
+
+    -- FIXED | PERCENT_OF_BASE — copied, so the slip shows the derivation it was
+    -- actually paid on rather than whatever the structure says today.
+    calculation_method VARCHAR(30)  NOT NULL,
+    calculation_value  NUMERIC(18, 4) NOT NULL,
+
+    amount             NUMERIC(18, 4) NOT NULL,
+    sequence           INTEGER      NOT NULL DEFAULT 0,
+
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT pay_slip_items_slip_same_tenant
+        FOREIGN KEY (tenant_id, slip_id)
+        REFERENCES payroll_run.pay_slips (tenant_id, slip_id) ON DELETE CASCADE,
+
+    CONSTRAINT pay_slip_items_type_check
+        CHECK (component_type IN ('EARNING', 'DEDUCTION')),
+    CONSTRAINT pay_slip_items_method_check
+        CHECK (calculation_method IN ('FIXED', 'PERCENT_OF_BASE')),
+    CONSTRAINT pay_slip_items_amount_check
+        CHECK (amount >= 0),
+    CONSTRAINT pay_slip_items_value_check
+        CHECK (calculation_value >= 0),
+    CONSTRAINT pay_slip_items_percent_range_check
+        CHECK (calculation_method <> 'PERCENT_OF_BASE' OR calculation_value <= 100),
+
+    -- One line per component per slip.
+    CONSTRAINT pay_slip_items_unique UNIQUE (slip_id, component_code)
+);
+
+-- Lines are always read for one slip, in payslip order.
+CREATE INDEX idx_pay_slip_items_slip
+    ON payroll_run.pay_slip_items (tenant_id, slip_id, sequence);
+
+-- ── shadow_payroll_comparisons ───────────────────────────────────────────────
+
+CREATE TABLE payroll_run.shadow_payroll_comparisons (
+    comparison_id       UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id           VARCHAR(255) NOT NULL,
+    run_id              UUID         NOT NULL,
+    employee_id         UUID         NOT NULL,
+
+    legacy_gross_pay    NUMERIC(18, 4) NOT NULL,
+    legacy_net_pay      NUMERIC(18, 4) NOT NULL,
+    legacy_tax_withheld NUMERIC(18, 4) NOT NULL,
+
+    zoiko_gross_pay     NUMERIC(18, 4) NOT NULL,
+    zoiko_net_pay       NUMERIC(18, 4) NOT NULL,
+    zoiko_tax_withheld  NUMERIC(18, 4) NOT NULL,
+
+    gross_variance      NUMERIC(18, 4) NOT NULL,
+    net_variance        NUMERIC(18, 4) NOT NULL,
+    tax_variance        NUMERIC(18, 4) NOT NULL,
+    is_equivalent       BOOLEAN      NOT NULL,
+
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT shadow_comparisons_run_same_tenant
+        FOREIGN KEY (tenant_id, run_id)
+        REFERENCES payroll_run.payroll_runs (tenant_id, run_id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_shadow_comp_tenant_run
+    ON payroll_run.shadow_payroll_comparisons (tenant_id, run_id);
+
+-- ── Finalized runs are immutable ─────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION payroll_run.reject_finalized_run_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- On UPDATE, OLD is the row as it stands. A run may be updated freely up to
+    -- the moment it completes; the transition INTO COMPLETED is itself an
+    -- update of a not-yet-completed row, so it passes.
+    IF OLD.status = 'COMPLETED' THEN
+        RAISE EXCEPTION
+            'payroll run % is finalized and immutable: % is not permitted',
+            OLD.run_id, TG_OP;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION payroll_run.reject_finalized_run_mutation() IS
+    'Refuses UPDATE and DELETE of a COMPLETED payroll run. A trigger rather than a grant or policy because it binds even a BYPASSRLS role such as service_role.';
+
+CREATE TRIGGER payroll_runs_finalized_immutable
+    BEFORE UPDATE OR DELETE ON payroll_run.payroll_runs
+    FOR EACH ROW
+    EXECUTE FUNCTION payroll_run.reject_finalized_run_mutation();
+
+CREATE OR REPLACE FUNCTION payroll_run.reject_finalized_slip_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    run_status VARCHAR(50);
+BEGIN
+    SELECT status INTO run_status
+    FROM payroll_run.payroll_runs
+    WHERE run_id = OLD.run_id;
+
+    IF run_status = 'COMPLETED' THEN
+        RAISE EXCEPTION
+            'pay slip % belongs to finalized run %: % is not permitted',
+            OLD.slip_id, OLD.run_id, TG_OP;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION payroll_run.reject_finalized_slip_mutation() IS
+    'Refuses UPDATE and DELETE of a pay slip belonging to a COMPLETED run. Recalculation deletes and reinserts slips, which must stop once the run is finalized.';
+
+CREATE TRIGGER pay_slips_finalized_immutable
+    BEFORE UPDATE OR DELETE ON payroll_run.pay_slips
+    FOR EACH ROW
+    EXECUTE FUNCTION payroll_run.reject_finalized_slip_mutation();
+
+-- ── Row-level security ───────────────────────────────────────────────────────
+
+ALTER TABLE payroll_run.payroll_runs               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payroll_run.payroll_runs               FORCE  ROW LEVEL SECURITY;
+ALTER TABLE payroll_run.pay_slips                  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payroll_run.pay_slips                  FORCE  ROW LEVEL SECURITY;
+ALTER TABLE payroll_run.pay_slip_items             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payroll_run.pay_slip_items             FORCE  ROW LEVEL SECURITY;
+ALTER TABLE payroll_run.shadow_payroll_comparisons ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payroll_run.shadow_payroll_comparisons FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON payroll_run.payroll_runs
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON payroll_run.pay_slips
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON payroll_run.pay_slip_items
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON payroll_run.shadow_payroll_comparisons
+    FOR ALL TO zoiko_backend
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+-- A payslip is addressed to one person, so the read is scoped to that person
+-- rather than to the tenant. This is the same shape as notification-svc's
+-- recipient_read and for the same reason.
+--
+-- It depends on app.current_principal_id() being the employee_id, which is only
+-- true once identity-context principals carry it. Until then this policy
+-- matches nothing, which fails closed — nobody reads a payslip they should not.
+CREATE POLICY own_payslip_read ON payroll_run.pay_slips
+    FOR SELECT TO authenticated
+    USING (
+        tenant_id = app.current_tenant_id()
+        AND employee_id::text = app.current_principal_id()
+    );
+
+CREATE POLICY own_payslip_items_read ON payroll_run.pay_slip_items
+    FOR SELECT TO authenticated
+    USING (
+        tenant_id = app.current_tenant_id()
+        AND EXISTS (
+            SELECT 1 FROM payroll_run.pay_slips s
+            WHERE s.slip_id = pay_slip_items.slip_id
+              AND s.tenant_id = pay_slip_items.tenant_id
+              AND s.employee_id::text = app.current_principal_id()
+        )
+    );
+
+-- ── Grants ───────────────────────────────────────────────────────────────────
+
+-- No DELETE on payroll_runs: a run is the record that payroll was executed for
+-- a period, including one that was blocked.
+GRANT SELECT, INSERT, UPDATE ON payroll_run.payroll_runs TO zoiko_backend;
+
+-- Slips, their lines and shadow comparisons DO take DELETE: recalculating a run
+-- clears and re-derives them inside one transaction. The triggers above stop
+-- that once the run is COMPLETED, which is the point at which the numbers stop
+-- being provisional.
+GRANT SELECT, INSERT, UPDATE, DELETE ON payroll_run.pay_slips                  TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE, DELETE ON payroll_run.pay_slip_items             TO zoiko_backend;
+GRANT SELECT, INSERT, UPDATE, DELETE ON payroll_run.shadow_payroll_comparisons TO zoiko_backend;
+
+GRANT SELECT ON payroll_run.pay_slips      TO authenticated;
+GRANT SELECT ON payroll_run.pay_slip_items TO authenticated;
+
+
+-- ============================================================================
+-- FILE: 0026_policies_apply_to_connecting_role.sql
+-- ============================================================================
+
+-- 0026_policies_apply_to_connecting_role.sql
+-- Platform-wide correction. Creates no tables.
+--
+-- ── The defect ───────────────────────────────────────────────────────────────
+--
+-- Every tenant policy in 0001-0025 is written `FOR ALL TO zoiko_backend`, and
+-- the services do not connect as zoiko_backend. deployments/supabase creates a
+-- role per service — app_identity_context, app_employee_master and so on — and
+-- docker-compose.supabase.yml points each service's DB_USER at its own.
+--
+-- A policy names the roles it applies to. With FORCE ROW LEVEL SECURITY and no
+-- policy applicable to the connecting role, that role reads zero rows and
+-- writes nothing. Verified: as app_employee_master the register returned
+-- `(0 rows)` and an INSERT failed with "new row violates row-level security
+-- policy" — for a row in its own tenant, in its own schema.
+--
+-- ── Why the obvious fix is worse ─────────────────────────────────────────────
+--
+-- GRANT zoiko_backend TO app_employee_master makes the policy match. It also
+-- hands over everything zoiko_backend holds, and every migration grants that
+-- role USAGE and DML on its own schema — so zoiko_backend accumulates access to
+-- all 25. Verified: with that membership, app_employee_master read
+-- payroll_run.pay_slips and inserted a row into it. Tenant isolation survived;
+-- SERVICE isolation did not, and "USAGE on its own schema only" is the property
+-- the role-per-service design exists to provide.
+--
+-- ── The fix ──────────────────────────────────────────────────────────────────
+--
+-- Drop the role restriction. A policy with no TO clause applies to every role,
+-- and isolation comes from the grants that were already there: a role holds
+-- USAGE on one schema and DML on that schema's tables, so it cannot reach
+-- another service's tables whatever the policy says.
+--
+-- Verified on the same probe: own schema readable, a write to another tenant
+-- refused by the policy, and a read of another service's schema refused with
+-- "permission denied for schema payroll_run" — at the grant layer, before RLS
+-- is consulted at all.
+--
+-- Widening to PUBLIC does not expose anything to `anon`. Table privileges are
+-- checked before row security, and no migration grants anon anything, so anon
+-- is refused at the ACL layer and never reaches a policy.
+--
+-- ── Why this is generated rather than written out ────────────────────────────
+--
+-- 58 policies name zoiko_backend across 25 files, plus 4 that name it alongside
+-- `authenticated`. Transcribing 62 DROP/CREATE pairs by hand invites exactly one
+-- typo in exactly one USING clause, which would silently widen a tenant
+-- boundary. Reading each policy's own expression out of pg_policies and putting
+-- it back verbatim cannot drift from what was reviewed.
+--
+-- The 38 policies that name ONLY `authenticated` are left alone. Those are the
+-- deliberate console-session reads — a recipient reading their own notification,
+-- an employee reading the holiday calendar — and they are correctly restricted.
+
+-- ── 1. Policies apply to the connecting role ─────────────────────────────────
+
+DO $$
+DECLARE
+    p        record;
+    stmt     text;
+    changed  int := 0;
+BEGIN
+    FOR p IN
+        SELECT schemaname, tablename, policyname, cmd, qual, with_check
+          FROM pg_policies
+         WHERE 'zoiko_backend' = ANY (roles)
+         ORDER BY schemaname, tablename, policyname
+    LOOP
+        EXECUTE format('DROP POLICY %I ON %I.%I',
+                       p.policyname, p.schemaname, p.tablename);
+
+        -- cmd comes from the catalogue as ALL | SELECT | INSERT | UPDATE |
+        -- DELETE, so it is a keyword rather than anything caller-supplied.
+        stmt := format('CREATE POLICY %I ON %I.%I FOR %s',
+                       p.policyname, p.schemaname, p.tablename, p.cmd);
+
+        -- qual is NULL for an INSERT-only policy and with_check is NULL for a
+        -- SELECT or DELETE one. Emitting only what was there keeps each policy
+        -- legal for its own command without a per-command branch.
+        IF p.qual IS NOT NULL THEN
+            stmt := stmt || format(' USING (%s)', p.qual);
+        END IF;
+        IF p.with_check IS NOT NULL THEN
+            stmt := stmt || format(' WITH CHECK (%s)', p.with_check);
+        END IF;
+
+        EXECUTE stmt;
+        changed := changed + 1;
+    END LOOP;
+
+    RAISE NOTICE 'policies rewritten to apply to the connecting role: %', changed;
+END
+$$;
+
+-- ── 2. Every service role can call the identity helpers ──────────────────────
+--
+-- A policy expression is evaluated as the querying role, so a role that now
+-- matches the policy must also be able to run app.current_tenant_id(). 0001
+-- granted that to zoiko_backend, authenticated and anon only.
+--
+-- Guarded on the role existing: on a fresh project the migrations run before
+-- deployments/supabase creates the roles, and a missing one must not abort the
+-- batch. deployments/supabase performs the same grants, so a later run of it
+-- covers roles created after this migration.
+
+DO $$
+DECLARE
+    r       text;
+    granted int := 0;
+BEGIN
+    FOREACH r IN ARRAY ARRAY[
+        'app_identity_context',
+        'app_tenant_entity_registry',
+        'app_authorization',
+        'app_governance_decision_log',
+        'app_access_control',
+        'app_employee_master',
+        'app_leave_absence',
+        'app_compensation',
+        'app_payroll_run'
+    ]
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            CONTINUE;
+        END IF;
+
+        EXECUTE format('GRANT USAGE ON SCHEMA app TO %I', r);
+        EXECUTE format('GRANT EXECUTE ON FUNCTION app.current_tenant_id() TO %I', r);
+        EXECUTE format('GRANT EXECUTE ON FUNCTION app.current_principal_id() TO %I', r);
+
+        -- Undo the membership if it was granted as a workaround for the defect
+        -- this migration fixes. It is what carried cross-service access, and it
+        -- is no longer needed for the policy to apply.
+        --
+        -- Left INHERIT: it is harmless with no memberships, and a role that is
+        -- NOINHERIT while holding one would need an explicit SET ROLE per
+        -- session, which no service issues.
+        EXECUTE format('REVOKE zoiko_backend FROM %I', r);
+
+        granted := granted + 1;
+    END LOOP;
+
+    RAISE NOTICE 'service roles granted the identity helpers: %', granted;
+END
+$$;
+
+-- ── 3. Verification ──────────────────────────────────────────────────────────
+--
+-- Fails the migration if any policy still carries a role restriction naming
+-- zoiko_backend. Cheaper to find here than as an empty register in a service.
+
+DO $$
+DECLARE leftover int;
+BEGIN
+    SELECT count(*) INTO leftover
+      FROM pg_policies
+     WHERE 'zoiko_backend' = ANY (roles);
+
+    IF leftover > 0 THEN
+        RAISE EXCEPTION
+            '% policies still restricted to zoiko_backend; the rewrite did not complete',
+            leftover;
+    END IF;
+END
+$$;
+
+
+-- ============================================================================
+-- FILE: 0027_tenant_registry_fail_closed.sql
+-- ============================================================================
+
+-- 0027_tenant_registry_fail_closed.sql
+-- tenant-entity-registry-svc → schema `tenant_entity_registry`. Creates no tables.
+--
+-- ── Why this schema is not covered by 0001-0026 ──────────────────────────────
+--
+-- tenant_entity_registry has no migration in this directory. It reached Supabase
+-- by a different route: deployments/supabase applies each service's COMPOSE
+-- migrations into a schema, and those were written for the database-per-service
+-- estate where RLS was decorative — every service connected as the Postgres
+-- superuser, so no policy ever executed.
+--
+-- The result is seven tables carrying the compose-era policy shape, in the
+-- schema that is the root of all scope on this platform. Found by surveying the
+-- live project rather than the migration set:
+--
+--   tenants, workspaces, legal_entities, entity_hierarchies,
+--   entity_jurisdiction_assignments, tax_identity_bundles,
+--   data_residency_policies
+--
+-- ── The defect: the cast raises where it should match nothing ────────────────
+--
+-- All seven policies compare `tenant_id = (current_setting('app.tenant_id', …))::uuid`.
+-- The cast fails on any value that is not a UUID, and the empty string is not a
+-- UUID — so a connection that installed no tenant, or a malformed one, gets
+--
+--     ERROR:  invalid input syntax for type uuid: ""
+--
+-- from every table in the schema, where the intended behaviour is zero rows.
+-- Measured before this migration on a reproduction of the live shape: reads with
+-- no tenant installed, and with a non-UUID tenant, both errored.
+--
+-- That is fail-LOUD, not fail-open, so it is not a leak. It is still wrong: a
+-- service behaving correctly against a connection that has not yet installed a
+-- tenant gets a 500 instead of an empty result, and the failure names a type
+-- cast rather than the missing identity that caused it.
+--
+-- Comparing `tenant_id::text = app.current_tenant_id()` degrades to "matches
+-- nothing" — the same correction 0004 made for accounts_payable, for the same
+-- reason, and the shape every migration in this set uses.
+--
+-- `workspaces` additionally omitted missing_ok — `current_setting('app.tenant_id')`
+-- with no second argument — which would raise on an unset setting even without
+-- the cast. Removing the cast removes both failure modes at once.
+--
+-- ── What WITH CHECK does and does not fix here ────────────────────────────────
+--
+-- The seven policies carried USING and no WITH CHECK, and the obvious reading is
+-- the one 0001 warns about: "with only USING, a caller can INSERT a row into
+-- another tenant that it then cannot see."
+--
+-- That reading is WRONG for these policies, and the reproduction proved it. When
+-- a FOR ALL policy omits WITH CHECK, Postgres applies the USING expression to
+-- the write check as well — so a cross-tenant INSERT was already refused:
+--
+--     ERROR:  new row violates row-level security policy for table "workspaces"
+--
+-- The warning in 0001 holds where a permissive SELECT policy and a separate
+-- INSERT policy exist side by side, not for a single FOR ALL policy. WITH CHECK
+-- is written out below because being explicit is worth having when the next
+-- reader asks the same question — not because it closes a hole.
+--
+-- ── What this migration does NOT do ──────────────────────────────────────────
+--
+-- FORCE is applied for consistency and for the day ownership changes, but on
+-- Supabase today it is close to cosmetic: these tables are owned by `postgres`,
+-- and `postgres` carries BYPASSRLS, which overrides FORCE. The load-bearing
+-- change here is WITH CHECK, which applies to app_tenant_entity_registry — a
+-- NOBYPASSRLS role that RLS already governed on the read side only.
+--
+-- It also leaves alone five tables in this project that have NO row security at
+-- all, because none of them has a tenant_id column to write a policy against:
+--
+--   authorization_svc.principal_role_assignments   (principal_id, legal_entity_id)
+--   authorization_svc.delegated_authorities        (legal_entity_id)
+--   authorization_svc.permission_bundles           (no scope columns)
+--   tenant_entity_registry.residency_regions       (no scope columns)
+--   zoiko_platform.schema_migrations               (bookkeeping)
+--
+-- Giving the authorization_svc tables tenant isolation means ADDING a tenant
+-- dimension, as 0018 had to for obligations. That is a schema change with live
+-- data in the service every write on the platform consults, and it belongs in
+-- its own migration with its own review. Their present exposure is bounded by
+-- grants: only app_authorization can read them, and `authenticated` cannot.
+
+-- ── Rewrite the seven policies ───────────────────────────────────────────────
+--
+-- Generated from the catalogue rather than transcribed. The seven differ from
+-- each other only in table name, and reading each one back out of pg_policies
+-- means the tenant column is discovered rather than assumed — a hand-written set
+-- would invite one wrong column name in one USING clause, which is precisely a
+-- silently widened tenant boundary.
+
+DO $$
+DECLARE
+    p        record;
+    rewrote  int := 0;
+BEGIN
+    FOR p IN
+        SELECT c.relname AS tablename, pol.polname AS policyname
+          FROM pg_policy pol
+          JOIN pg_class c     ON c.oid = pol.polrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'tenant_entity_registry'
+           -- Only tables that actually carry a tenant column. Anything else in
+           -- this schema is reference data and is not touched.
+           AND EXISTS (
+               SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = c.oid AND a.attname = 'tenant_id'
+                  AND a.attnum > 0 AND NOT a.attisdropped
+           )
+         ORDER BY c.relname
+    LOOP
+        EXECUTE format('DROP POLICY %I ON tenant_entity_registry.%I',
+                       p.policyname, p.tablename);
+
+        -- tenant_id::text against app.current_tenant_id():
+        --   - NULL when no tenant is installed, and NULL is not true, so the
+        --     connection sees nothing and can write nothing. Never rewrite as
+        --     "app.current_tenant_id() IS NULL OR ..." — that is a filter which
+        --     switches itself off exactly when identity is absent.
+        --   - No cast on the setting, so a malformed value matches nothing
+        --     rather than raising.
+        EXECUTE format($fmt$
+            CREATE POLICY %I ON tenant_entity_registry.%I
+                FOR ALL
+                USING      (tenant_id::text = app.current_tenant_id())
+                WITH CHECK (tenant_id::text = app.current_tenant_id())
+        $fmt$, p.policyname, p.tablename);
+
+        EXECUTE format('ALTER TABLE tenant_entity_registry.%I ENABLE ROW LEVEL SECURITY', p.tablename);
+        EXECUTE format('ALTER TABLE tenant_entity_registry.%I FORCE  ROW LEVEL SECURITY', p.tablename);
+
+        rewrote := rewrote + 1;
+    END LOOP;
+
+    RAISE NOTICE 'tenant_entity_registry policies given a WITH CHECK and forced: %', rewrote;
+END
+$$;
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+--
+-- Fails the migration rather than leaving a half-applied state to be discovered
+-- later as a write that should have been refused.
+
+DO $$
+DECLARE
+    no_check   int;
+    not_forced int;
+BEGIN
+    SELECT count(*) INTO no_check
+      FROM pg_policies
+     WHERE schemaname = 'tenant_entity_registry' AND with_check IS NULL;
+
+    SELECT count(*) INTO not_forced
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'tenant_entity_registry' AND c.relkind = 'r'
+       AND c.relrowsecurity AND NOT c.relforcerowsecurity;
+
+    IF no_check > 0 THEN
+        RAISE EXCEPTION '% tenant_entity_registry policies still have no WITH CHECK', no_check;
+    END IF;
+    IF not_forced > 0 THEN
+        RAISE EXCEPTION '% tenant_entity_registry tables are enabled but not forced', not_forced;
+    END IF;
+END
+$$;
+
+
+-- ============================================================================
+-- FILE: 0028_authorization_svc_row_security.sql
+-- ============================================================================
+
+-- 0028_authorization_svc_row_security.sql
+-- authorization-svc → schema `authorization_svc`. Creates no tables.
+--
+-- Like tenant_entity_registry in 0027, this schema has no migration in this
+-- directory: it reached the project through deployments/supabase applying the
+-- service compose migrations. Found by surveying the live database.
+--
+-- This is the service every write on the platform is checked against, so each
+-- change below was measured on a faithful reproduction before being written —
+-- including the exact FindGrantedActions query, because a policy that filters
+-- that join makes the platform deny everything.
+--
+-- ── Defect 1: two tables have no row security at all ─────────────────────────
+--
+-- permission_bundles and principal_role_assignments carry no tenant_id, so the
+-- service own 000004_add_rls skipped them and said why. Measured: with a tenant
+-- installed, app_authorization saw BOTH tenants assignments and BOTH tenants
+-- permission bundles.
+--
+-- Neither needs a tenant column. Both carry role_id, and `roles` IS tenant
+-- scoped with RLS already enabled and forced. Scoping them through the parent
+-- role keeps ONE source of truth for which tenant owns a grant, and makes a
+-- bundle that disagrees with its role about the tenant unrepresentable — the
+-- same shape 0019 uses for document_versions and 0009 for replay_manifests.
+--
+-- It also preserves the platform-scope path, which matters more here than
+-- anywhere else. The roles policy honours app.platform_scope = 'true' as
+-- "visible regardless of tenant_id", and FindGrantedActions sets it. Because the
+-- EXISTS subquery reads `roles`, it inherits that behaviour exactly: scoped when
+-- a tenant is installed, unscoped under platform scope. Verified both ways.
+--
+-- ── Defect 2: any tenant could write a GLOBAL row ────────────────────────────
+--
+-- sod_rules and access_decision_log both read
+--
+--     tenant_id IS NULL OR tenant_id = <caller tenant>
+--
+-- with no WITH CHECK. A FOR ALL policy that omits WITH CHECK applies USING to
+-- the write check, and USING permits tenant_id IS NULL — so any tenant could
+-- INSERT a row with a NULL tenant and have it apply platform-wide. Measured: a
+-- connection scoped to one tenant planted a global SoD rule successfully.
+--
+-- On sod_rules that is a segregation-of-duties rule affecting every tenant on
+-- the platform, written by one of them.
+--
+-- The fix is the asymmetric shape 0010, 0020 and 0021 already use for nullable
+-- tenant columns:
+--
+--   USING      — global rows OR my own tenant rows
+--   WITH CHECK — my own tenant rows; a GLOBAL row only from a connection that
+--                has installed NO tenant at all
+--
+-- That grants strictly less than before: a tenant connection can never write a
+-- global, and a no-tenant connection can write ONLY globals, because its own
+-- tenant clause is NULL and NULL is not true. Platform-level rules therefore
+-- require an explicitly platform-level connection.
+--
+-- ── Left alone, deliberately ──────────────────────────────────────────────────
+--
+-- delegated_authorities still has no row security. It carries neither tenant_id
+-- nor role_id, so there is no path to a tenant to write a policy against, and
+-- giving it one means a column the service INSERT does not supply — a change to
+-- authorization-svc, not to its schema. It holds 0 rows today.
+--
+-- Also NOT addressed, because it is a code change and not a schema one:
+-- FindGrantedActions runs under withPlatformScope, so the role join during the
+-- decision that authorizes every platform write is unscoped by tenant. Its own
+-- doc comment says platform scope is "Used ONLY by FindRoleByID", so the comment
+-- and the code disagree. Whether that read should take the caller verified
+-- tenant instead belongs in its own review.
+
+-- ── Why every statement below is guarded ─────────────────────────────────────
+--
+-- `authorization_svc` is not created by anything in this directory. It reaches
+-- a database through deployments/supabase applying the service's own compose
+-- migrations, which happens AFTER the SQL editor has been given the migration
+-- set. So on a fresh project — and in supabase/verify.sh, which applies only
+-- this directory — the schema genuinely is not there yet.
+--
+-- Written as bare DDL, the first ALTER TABLE aborted the whole batch with
+--
+--     ERROR:  schema "authorization_svc" does not exist
+--
+-- which stopped 0029 and everything after it from being applied at all. The
+-- guard makes this file a no-op in that case and leaves the rest of the set to
+-- run; where the schema does exist the executed statements are unchanged, so
+-- the end state is identical. 0027 has the same dependency and survives it only
+-- because it happens to iterate a catalogue, which is empty rather than absent.
+--
+-- Re-run this file after deployments/supabase has created the schema.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0028 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
+-- ── permission_bundles and principal_role_assignments ────────────────────────
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         FORCE  ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments FORCE  ROW LEVEL SECURITY$stmt$;
+
+-- The subquery reads `roles`, which is itself under RLS, so this policy is
+-- whatever the roles policy is: tenant-scoped normally, platform-wide under
+-- app.platform_scope. Do not inline the roles predicate here — duplicating it
+-- would let the two drift, and the platform-scope hatch would have to be
+-- repeated in three places instead of living in one.
+-- Dropped first so this file is re-runnable. The guard above tells you to run
+-- it again once deployments/supabase has created the schema, and on a project
+-- where it HAS already applied a bare CREATE POLICY would fail with "policy
+-- ... already exists" — turning the documented recovery step into an error.
+-- The two policies below are recreated identically, so a re-run is a no-op.
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.permission_bundles$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_via_role ON authorization_svc.permission_bundles
+    FOR ALL
+    USING (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = permission_bundles.role_id))
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = permission_bundles.role_id))
+$stmt$;
+
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.principal_role_assignments$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_via_role ON authorization_svc.principal_role_assignments
+    FOR ALL
+    USING (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = principal_role_assignments.role_id))
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = principal_role_assignments.role_id))
+$stmt$;
+
+-- ── sod_rules and access_decision_log: globals become platform-only ──────────
+
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.sod_rules$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.sod_rules
+    FOR ALL
+    USING (
+        tenant_id IS NULL
+        OR tenant_id::text = app.current_tenant_id()
+    )
+    WITH CHECK (
+        (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
+        OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
+    )
+$stmt$;
+
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.access_decision_log$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log
+    FOR ALL
+    USING (
+        tenant_id IS NULL
+        OR tenant_id::text = app.current_tenant_id()
+    )
+    WITH CHECK (
+        (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
+        OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
+    )
+$stmt$;
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+
+DECLARE unprotected int; no_check int;
+BEGIN
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'authorization_svc' AND c.relkind = 'r'
+       AND c.relname IN ('permission_bundles','principal_role_assignments')
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION '% authorization_svc tables still lack forced row security', unprotected;
+    END IF;
+
+    SELECT count(*) INTO no_check
+      FROM pg_policies
+     WHERE schemaname = 'authorization_svc'
+       AND tablename IN ('sod_rules','access_decision_log')
+       AND with_check IS NULL;
+    IF no_check > 0 THEN
+        RAISE EXCEPTION '% nullable-tenant policies still have no WITH CHECK', no_check;
+    END IF;
+END;
+
+END
+$guard$;
+
+
+-- ============================================================================
+-- FILE: 0029_fix_payroll_immutability_trigger.sql
+-- ============================================================================
+
+-- 0029_fix_payroll_immutability_trigger.sql
+-- Corrects a defect introduced by 0025. Creates no tables.
+--
+-- ── The defect ───────────────────────────────────────────────────────────────
+--
+-- 0025 added two BEFORE UPDATE OR DELETE triggers to keep a finalized payroll
+-- run immutable. Both end with
+--
+--     RETURN NEW;
+--
+-- which is correct for UPDATE and wrong for DELETE. In a BEFORE DELETE trigger
+-- NEW is NULL, and a BEFORE row trigger that returns NULL SILENTLY CANCELS the
+-- operation. So the triggers blocked every delete, not only deletes of a
+-- COMPLETED run.
+--
+-- Measured against the live project: DELETE of runs with status INITIATED and
+-- CALCULATED reported `DELETE 0` while the rows remained, and the same for
+-- pay_slips. No error, no warning — the rows simply stayed.
+--
+-- ── Why this is more than a tidy-up ──────────────────────────────────────────
+--
+-- PgStore.SaveCalculatedResults starts a recalculation by clearing the previous
+-- results:
+--
+--     DELETE FROM pay_slips WHERE run_id = $1 AND tenant_id = $2
+--     DELETE FROM shadow_payroll_comparisons WHERE run_id = $1 AND ...
+--
+-- With the delete cancelled, those statements affect nothing and the INSERTs
+-- that follow mint fresh slip_ids. pay_slips has no unique key over
+-- (run_id, employee_id) — only (tenant_id, slip_id), which never collides — so
+-- nothing rejects the second set. Recalculating a run therefore DUPLICATED its
+-- payslips instead of replacing them, and every recalculation added another
+-- copy. pay_slip_items cascade from pay_slips, so the lines accumulated with
+-- them.
+--
+-- That is silent double-counting in payroll output, which is exactly the class
+-- of error the run/finalize state machine exists to prevent. It was not caught
+-- earlier because every test calculated each run once.
+--
+-- ── The fix ──────────────────────────────────────────────────────────────────
+--
+-- Return OLD for a DELETE and NEW otherwise. CREATE OR REPLACE FUNCTION, so the
+-- existing triggers pick this up with no need to drop and recreate them — and a
+-- fresh project that runs 0025 then this file ends in the same place.
+
+CREATE OR REPLACE FUNCTION payroll_run.reject_finalized_run_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- OLD is the row as it stands. A run may be updated freely up to the moment
+    -- it completes; the transition INTO COMPLETED is itself an update of a
+    -- not-yet-completed row, so it passes.
+    IF OLD.status = 'COMPLETED' THEN
+        RAISE EXCEPTION
+            'payroll run % is finalized and immutable: % is not permitted',
+            OLD.run_id, TG_OP;
+    END IF;
+
+    -- A BEFORE DELETE trigger must return OLD. NEW is NULL for a DELETE, and a
+    -- BEFORE row trigger returning NULL cancels the operation without raising —
+    -- which is what made every delete a silent no-op.
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION payroll_run.reject_finalized_run_mutation() IS
+    'Refuses UPDATE and DELETE of a COMPLETED payroll run, and permits both otherwise. Returns OLD on DELETE: returning NEW there is NULL, which silently cancels the delete.';
+
+CREATE OR REPLACE FUNCTION payroll_run.reject_finalized_slip_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    run_status VARCHAR(50);
+BEGIN
+    SELECT status INTO run_status
+      FROM payroll_run.payroll_runs
+     WHERE run_id = OLD.run_id;
+
+    IF run_status = 'COMPLETED' THEN
+        RAISE EXCEPTION
+            'pay slip % belongs to finalized run %: % is not permitted',
+            OLD.slip_id, OLD.run_id, TG_OP;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION payroll_run.reject_finalized_slip_mutation() IS
+    'Refuses UPDATE and DELETE of a pay slip belonging to a COMPLETED run. Returns OLD on DELETE so a recalculation can clear the previous results; returning NEW cancelled the delete and duplicated payslips instead.';
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+--
+-- Proves both directions on a scratch run rather than trusting the function
+-- body: a non-finalized slip and run must delete, and a finalized one must not.
+
+DO $$
+DECLARE
+    scratch_run  UUID := gen_random_uuid();
+    scratch_slip UUID := gen_random_uuid();
+    scratch_ten  TEXT := 'zzz-0029-verification';
+    removed      int;
+    refused      boolean := false;
+BEGIN
+    -- A run that is not finalized, and one slip on it.
+    INSERT INTO payroll_run.payroll_runs
+        (run_id, tenant_id, legal_entity_id, run_number,
+         pay_period_start, pay_period_end, pay_date, status)
+    VALUES (scratch_run, scratch_ten, 'le-verify', 'VERIFY-0029',
+            '2026-01-01', '2026-01-31', '2026-02-05', 'CALCULATED');
+
+    INSERT INTO payroll_run.pay_slips
+        (slip_id, tenant_id, run_id, employee_id, employee_number, employee_name,
+         gross_pay, tax_withheld, benefits_deductions, net_pay, currency, effective_date)
+    VALUES (scratch_slip, scratch_ten, scratch_run, gen_random_uuid(),
+            'V-1', 'Verify', 100, 0, 0, 100, 'USD', '2026-02-05');
+
+    -- 1. the slip must delete
+    DELETE FROM payroll_run.pay_slips WHERE slip_id = scratch_slip;
+    GET DIAGNOSTICS removed = ROW_COUNT;
+    IF removed <> 1 THEN
+        RAISE EXCEPTION 'delete of a non-finalized pay slip still cancelled (% rows)', removed;
+    END IF;
+
+    -- 2. once the run is COMPLETED, deleting it must be refused
+    UPDATE payroll_run.payroll_runs
+       SET status = 'COMPLETED', finalized_at = NOW(), snapshot_hash = 'verify-0029'
+     WHERE run_id = scratch_run;
+
+    BEGIN
+        DELETE FROM payroll_run.payroll_runs WHERE run_id = scratch_run;
+    EXCEPTION WHEN others THEN
+        refused := true;
+    END;
+    IF NOT refused THEN
+        RAISE EXCEPTION 'delete of a COMPLETED payroll run was permitted';
+    END IF;
+
+    -- 3. clean the scratch row up. It is COMPLETED, so the trigger has to be
+    --    stepped around for the removal — this is why the verification uses its
+    --    own tenant rather than touching anything real.
+    ALTER TABLE payroll_run.payroll_runs DISABLE TRIGGER payroll_runs_finalized_immutable;
+    DELETE FROM payroll_run.payroll_runs WHERE run_id = scratch_run;
+    ALTER TABLE payroll_run.payroll_runs ENABLE TRIGGER payroll_runs_finalized_immutable;
+
+    RAISE NOTICE 'verified: non-finalized deletes proceed, finalized deletes refused';
+END
+$$;
+
+
+-- ============================================================================
+-- FILE: 0030_employment_contracts_svc.sql
+-- ============================================================================
+
+-- 0030_employment_contracts_svc.sql
+-- employment-contracts-svc → schema `employment_contracts`
+--
+-- Squashed end state of 000001_initial_schema and 000002_add_idempotency.
+-- Two tables: employment_contracts, contract_amendments.
+--
+-- ── Why this service, and why now ────────────────────────────────────────────
+--
+-- 0022-0025 brought the HR domain onto Supabase and stopped one step short.
+-- payroll-run-svc resolves every payslip from compensation-svc, but it reaches
+-- that call only after confirming an active salary contract for each employee:
+--
+--     if len(missingContracts) > 0 { ... return }   // handler.go
+--     bd, err := h.compClient.GetBreakdown(..., contracts[emp.EmployeeID].BaseSalaryAmount)
+--
+-- The base amount the breakdown is resolved against IS the contract's, so the
+-- compensation call cannot run before contracts do. With this service absent
+-- from Supabase, every payroll calculation there ends at 422
+-- contract_lookup_failed and the compensation path — written, wired, and
+-- covered by tests — has never executed against the real database.
+--
+-- This migration is what makes that path reachable. It is the fifth and last
+-- service the HR domain needs.
+--
+-- ── What changes relative to the service's own migration ─────────────────────
+--
+-- The service's 000001 is the compose-estate schema, and it carries the two
+-- defects the README names as the reason this move is worth making:
+--
+--   ENABLE without FORCE. The estate's recurring defect — a policy that is
+--   present, correct, and never executed. Every table here gets both.
+--
+--   USING without WITH CHECK. USING governs what is visible; WITH CHECK governs
+--   what may be written. With only USING, a caller can insert a contract into
+--   another tenant that it then cannot see. Both policies below carry both.
+--
+-- It also reads `current_setting('app.tenant_id', true)` directly. That works
+-- only for a service calling set_config, and says nothing for a PostgREST
+-- caller carrying a JWT. app.current_tenant_id() resolves either.
+--
+-- ── Policies carry no TO clause ──────────────────────────────────────────────
+--
+-- 0026 removed the role restriction from all 62 policies that named
+-- zoiko_backend, because the services connect as app_<service>, not as
+-- zoiko_backend, and a policy that names roles applies to those roles only —
+-- under FORCE that means zero rows read and nothing written. This migration
+-- runs after 0026, so writing `TO zoiko_backend` here would reintroduce exactly
+-- what that file repaired, in the one schema it could not have covered.
+--
+-- Isolation comes from the grants instead: app_employment_contracts holds USAGE
+-- on this schema alone.
+
+CREATE SCHEMA IF NOT EXISTS employment_contracts;
+
+COMMENT ON SCHEMA employment_contracts IS
+    'employment-contracts-svc. The authoritative base salary and its effective-dated version history. payroll-run-svc fails closed without it, and resolves every compensation breakdown against the base amount held here.';
+
+GRANT USAGE ON SCHEMA employment_contracts TO zoiko_backend, authenticated;
+
+-- ── employment_contracts ─────────────────────────────────────────────────────
+
+CREATE TABLE employment_contracts.employment_contracts (
+    contract_id        UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id          VARCHAR(255) NOT NULL,
+    legal_entity_id    VARCHAR(255) NOT NULL,
+    employee_id        UUID         NOT NULL,
+
+    contract_number    VARCHAR(100) NOT NULL,
+    version            INT          NOT NULL DEFAULT 1,
+
+    -- FULL_TIME | PART_TIME | FIXED_TERM | EXECUTIVE
+    contract_type      VARCHAR(50)  NOT NULL,
+    -- DRAFT | ACTIVE | SUPERSEDED | TERMINATED | EXPIRED
+    status             VARCHAR(50)  NOT NULL,
+
+    title              VARCHAR(150) NOT NULL,
+    base_salary_amount NUMERIC(18, 4) NOT NULL,
+    currency           VARCHAR(3)   NOT NULL,
+    -- MONTHLY | BIWEEKLY | WEEKLY
+    pay_frequency      VARCHAR(50)  NOT NULL,
+
+    effective_from     DATE         NOT NULL,
+    effective_to       DATE,
+
+    document_vault_ref VARCHAR(255),
+
+    -- Idempotency key for IssueContract. NOT NULL DEFAULT '' rather than
+    -- nullable because the service's ON CONFLICT targets the partial index
+    -- below, and '' is how it spells "this caller sent no key".
+    correlation_id     VARCHAR(255) NOT NULL DEFAULT '',
+
+    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- The vocabularies the domain defines. They live in a Go comment on
+    -- domain.EmploymentContract and nowhere else today, so any other writer —
+    -- a migration, a console, the service_role key — could leave a value no
+    -- consumer knows how to read. payroll-run-svc filters on status = 'ACTIVE'
+    -- to find the salary it pays; a row whose status is misspelled is a salary
+    -- that silently stops being paid.
+    CONSTRAINT contracts_type_known
+        CHECK (contract_type IN ('FULL_TIME', 'PART_TIME', 'FIXED_TERM', 'EXECUTIVE')),
+    CONSTRAINT contracts_status_known
+        CHECK (status IN ('DRAFT', 'ACTIVE', 'SUPERSEDED', 'TERMINATED', 'EXPIRED')),
+    CONSTRAINT contracts_pay_frequency_known
+        CHECK (pay_frequency IN ('MONTHLY', 'BIWEEKLY', 'WEEKLY')),
+
+    -- The handler already refuses base_salary_amount <= 0 on issue. It does not
+    -- re-check it on amend, where the figure is caller-supplied and optional,
+    -- so a negative salary could reach the table by that path alone.
+    CONSTRAINT contracts_salary_positive
+        CHECK (base_salary_amount > 0),
+
+    -- ISO 4217, which is what every consumer assumes when it renders an amount.
+    CONSTRAINT contracts_currency_iso
+        CHECK (currency ~ '^[A-Z]{3}$'),
+
+    -- A contract cannot end before it began. AmendContract closes the prior
+    -- version by setting effective_to to the amendment's effective_from, so
+    -- without this a backdated amendment leaves a negative-length contract.
+    CONSTRAINT contracts_effective_range
+        CHECK (effective_to IS NULL OR effective_to >= effective_from),
+
+    CONSTRAINT contracts_version_positive
+        CHECK (version >= 1),
+
+    -- The target of the composite foreign key from contract_amendments.
+    CONSTRAINT contracts_tenant_id_unique UNIQUE (tenant_id, contract_id)
+);
+
+-- Version history is resolved by contract_number:
+--
+--     SELECT ... WHERE tenant_id = $1 AND contract_number = $2 ORDER BY version
+--
+-- so every row sharing a number is presented as a version of one contract. Two
+-- rows claiming the same version of the same number make that history
+-- ambiguous, and AmendContract — which writes version = old + 1 — has no way to
+-- discover it happened. contract_number is caller-supplied on issue, so nothing
+-- upstream prevents it.
+CREATE UNIQUE INDEX idx_contracts_tenant_number_version
+    ON employment_contracts.employment_contracts (tenant_id, contract_number, version);
+
+-- Idempotency. This index is what the service's ON CONFLICT names:
+--
+--     ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
+--
+-- The predicate has to match this one for the inference to resolve, so the two
+-- are a pair — changing either alone turns a retried IssueContract back into a
+-- duplicate contract. Partial because the many rows carrying no key must not
+-- collide with each other.
+CREATE UNIQUE INDEX idx_contracts_tenant_correlation
+    ON employment_contracts.employment_contracts (tenant_id, correlation_id)
+    WHERE correlation_id <> '';
+
+CREATE INDEX idx_contracts_tenant_employee
+    ON employment_contracts.employment_contracts (tenant_id, employee_id);
+CREATE INDEX idx_contracts_tenant_status
+    ON employment_contracts.employment_contracts (tenant_id, status);
+CREATE INDEX idx_contracts_tenant_entity
+    ON employment_contracts.employment_contracts (tenant_id, legal_entity_id);
+
+-- The payroll hot path. A payroll run calls
+-- GET /v1/contracts/employee/{id}/active once per employee, which is
+--
+--     WHERE tenant_id = $1 AND employee_id = $2 AND status = 'ACTIVE'
+--     ORDER BY version DESC LIMIT 1
+--
+-- Without this, a 500-employee run is 500 scans of the tenant's whole contract
+-- history.
+CREATE INDEX idx_contracts_active_by_employee
+    ON employment_contracts.employment_contracts (tenant_id, employee_id, version DESC)
+    WHERE status = 'ACTIVE';
+
+-- ── contract_amendments ──────────────────────────────────────────────────────
+--
+-- The audit log of why a salary changed. Append-only: an amendment is the
+-- evidence for a pay change, and a pay change whose stated reason can be edited
+-- afterwards is not evidence of anything.
+
+CREATE TABLE employment_contracts.contract_amendments (
+    amendment_id     UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id        VARCHAR(255) NOT NULL,
+    contract_id      UUID         NOT NULL,
+
+    from_version     INT          NOT NULL,
+    to_version       INT          NOT NULL,
+
+    amendment_reason TEXT         NOT NULL,
+    amended_by       VARCHAR(255) NOT NULL,
+    effective_from   DATE         NOT NULL,
+
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+
+    -- An amendment moves a contract forward. Equal or descending versions would
+    -- describe a rollback, which the service has no operation for and no
+    -- consumer would read correctly.
+    CONSTRAINT amendments_version_advances
+        CHECK (to_version > from_version),
+
+    CONSTRAINT amendments_from_version_positive
+        CHECK (from_version >= 1),
+
+    -- An amendment belonging to another tenant's contract is unrepresentable.
+    -- The single-column form the service's own migration uses would have
+    -- accepted one: nothing made the referenced contract's tenant agree with
+    -- the amendment's, and the two are written from separate parameters in
+    -- AmendContract.
+    CONSTRAINT amendments_contract_same_tenant
+        FOREIGN KEY (tenant_id, contract_id)
+        REFERENCES employment_contracts.employment_contracts (tenant_id, contract_id)
+);
+
+CREATE INDEX idx_amendments_tenant_contract
+    ON employment_contracts.contract_amendments (tenant_id, contract_id);
+
+CREATE TRIGGER contract_amendments_append_only
+    BEFORE UPDATE OR DELETE ON employment_contracts.contract_amendments
+    FOR EACH ROW EXECUTE FUNCTION app.reject_mutation();
+
+COMMENT ON TRIGGER contract_amendments_append_only
+    ON employment_contracts.contract_amendments IS
+    'A pay change''s stated reason is evidence. Withholding UPDATE/DELETE stops zoiko_backend; this trigger also binds a BYPASSRLS role such as Supabase''s service_role.';
+
+-- ── Row-level security ───────────────────────────────────────────────────────
+
+ALTER TABLE employment_contracts.employment_contracts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE employment_contracts.employment_contracts FORCE  ROW LEVEL SECURITY;
+ALTER TABLE employment_contracts.contract_amendments  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE employment_contracts.contract_amendments  FORCE  ROW LEVEL SECURITY;
+
+-- No TO clause: see the header. Fails closed on a missing tenant by SQL
+-- semantics — app.current_tenant_id() is NULL with no identity installed, and
+-- `tenant_id = NULL` is NULL, which is not true.
+CREATE POLICY tenant_isolation ON employment_contracts.employment_contracts
+    FOR ALL
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+CREATE POLICY tenant_isolation ON employment_contracts.contract_amendments
+    FOR ALL
+    USING      (tenant_id = app.current_tenant_id())
+    WITH CHECK (tenant_id = app.current_tenant_id());
+
+-- ── Grants ───────────────────────────────────────────────────────────────────
+
+-- No DELETE on contracts: a contract is the basis of every payslip calculated
+-- from it. Ending one is a status change to TERMINATED with effective_to set,
+-- which is what TerminateContract does.
+GRANT SELECT, INSERT, UPDATE ON employment_contracts.employment_contracts TO zoiko_backend;
+
+-- No UPDATE and no DELETE on the log. The service only ever inserts.
+GRANT SELECT, INSERT ON employment_contracts.contract_amendments TO zoiko_backend;
+
+-- ── The service's own login role ─────────────────────────────────────────────
+--
+-- Same shape as 0026 section 2: a policy expression is evaluated as the
+-- querying role, so app_employment_contracts must be able to call
+-- app.current_tenant_id() or every policy above raises instead of filtering.
+--
+-- Guarded on the role existing. On a fresh project the migrations run before
+-- deployments/supabase creates the roles, and a missing one must not abort the
+-- batch; that tool performs the same grants on a later run.
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_employment_contracts') THEN
+        GRANT USAGE ON SCHEMA app TO app_employment_contracts;
+        GRANT EXECUTE ON FUNCTION app.current_tenant_id()    TO app_employment_contracts;
+        GRANT EXECUTE ON FUNCTION app.current_principal_id() TO app_employment_contracts;
+
+        GRANT USAGE ON SCHEMA employment_contracts TO app_employment_contracts;
+        GRANT SELECT, INSERT, UPDATE
+            ON employment_contracts.employment_contracts TO app_employment_contracts;
+        GRANT SELECT, INSERT
+            ON employment_contracts.contract_amendments  TO app_employment_contracts;
+
+        RAISE NOTICE 'app_employment_contracts granted its schema and the identity helpers';
+    ELSE
+        RAISE NOTICE 'role app_employment_contracts absent; deployments/supabase will grant it';
+    END IF;
+END
+$$;
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+--
+-- Proves the properties this migration exists for, rather than asserting them:
+-- both tables forced, both policies carrying WITH CHECK, the idempotency index
+-- actually inferrable by the service's ON CONFLICT, and tenant isolation
+-- binding in both directions.
+--
+-- The isolation probe runs as zoiko_backend rather than as the applying role.
+-- Migrations are applied by a superuser, and a superuser bypasses row security
+-- unconditionally — asserting isolation from here without switching role would
+-- test nothing and fail. zoiko_backend is the NOSUPERUSER NOBYPASSRLS role 0001
+-- creates for exactly this reason. Skipped, not failed, where the applying role
+-- cannot assume it.
+
+DO $$
+DECLARE
+    unprotected int;
+    no_check    int;
+    ten_a       TEXT := 'zzz-0030-tenant-a';
+    ten_b       TEXT := 'zzz-0030-tenant-b';
+    emp         UUID := gen_random_uuid();
+    c1          UUID := gen_random_uuid();
+    inserted    int;
+    leaked      int;
+    refused     boolean := false;
+BEGIN
+    -- 1. Both tables enabled AND forced.
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'employment_contracts' AND c.relkind = 'r'
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION '% employment_contracts tables lack forced row security', unprotected;
+    END IF;
+
+    -- 2. Every policy governs writes as well as reads.
+    SELECT count(*) INTO no_check
+      FROM pg_policies
+     WHERE schemaname = 'employment_contracts' AND with_check IS NULL;
+    IF no_check > 0 THEN
+        RAISE EXCEPTION '% employment_contracts policies have no WITH CHECK', no_check;
+    END IF;
+
+    -- 3. Idempotency. The second INSERT is the retry the service performs
+    --    verbatim; if the ON CONFLICT cannot infer this index the statement
+    --    errors rather than resolving to the original row.
+    PERFORM set_config('app.tenant_id', ten_a, true);
+
+    INSERT INTO employment_contracts.employment_contracts
+        (contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
+         version, contract_type, status, title, base_salary_amount, currency,
+         pay_frequency, effective_from, correlation_id)
+    VALUES (c1, ten_a, 'le-verify', emp, 'VERIFY-0030',
+            1, 'FULL_TIME', 'ACTIVE', 'Verification', 1000, 'USD',
+            'MONTHLY', '2026-01-01', 'corr-0030');
+
+    INSERT INTO employment_contracts.employment_contracts
+        (contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
+         version, contract_type, status, title, base_salary_amount, currency,
+         pay_frequency, effective_from, correlation_id)
+    VALUES (gen_random_uuid(), ten_a, 'le-verify', emp, 'VERIFY-0030-DUP',
+            1, 'FULL_TIME', 'ACTIVE', 'Retry', 1000, 'USD',
+            'MONTHLY', '2026-01-01', 'corr-0030')
+    -- `!=` deliberately, which is how the service spells it. Postgres
+    -- normalises it to `<>` before matching the index predicate, and this
+    -- statement is the proof of that rather than an assumption about it.
+    ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING;
+    GET DIAGNOSTICS inserted = ROW_COUNT;
+    IF inserted <> 0 THEN
+        RAISE EXCEPTION 'a retried IssueContract created a duplicate contract';
+    END IF;
+
+    -- 4 and 5. Isolation, both directions, as a role the policies apply to.
+    IF NOT pg_has_role(current_user, 'zoiko_backend', 'USAGE') THEN
+        RAISE NOTICE 'skipping the isolation probe: % cannot assume zoiko_backend', current_user;
+    ELSE
+        SET LOCAL ROLE zoiko_backend;
+
+        -- 4. The write side is bound. Tenant A must not be able to plant a row
+        --    in tenant B — the gap a USING-only policy leaves open, and the one
+        --    the service's own migration still has.
+        PERFORM set_config('app.tenant_id', ten_a, true);
+        BEGIN
+            INSERT INTO employment_contracts.employment_contracts
+                (contract_id, tenant_id, legal_entity_id, employee_id, contract_number,
+                 version, contract_type, status, title, base_salary_amount, currency,
+                 pay_frequency, effective_from)
+            VALUES (gen_random_uuid(), ten_b, 'le-verify', emp, 'VERIFY-0030-X',
+                    1, 'FULL_TIME', 'ACTIVE', 'Cross tenant', 1000, 'USD',
+                    'MONTHLY', '2026-01-01');
+        EXCEPTION WHEN insufficient_privilege THEN
+            refused := true;
+        END;
+
+        -- A failed subtransaction rolls back the SET LOCAL ROLE with it, so
+        -- re-establish it rather than assuming it survived the handler.
+        SET LOCAL ROLE zoiko_backend;
+
+        IF NOT refused THEN
+            RAISE EXCEPTION 'a tenant-scoped connection wrote a row into another tenant';
+        END IF;
+
+        -- 5. The read side is bound too.
+        PERFORM set_config('app.tenant_id', ten_b, true);
+        SELECT count(*) INTO leaked
+          FROM employment_contracts.employment_contracts
+         WHERE contract_number LIKE 'VERIFY-0030%';
+        IF leaked <> 0 THEN
+            RAISE EXCEPTION 'tenant B read % of tenant A''s contracts', leaked;
+        END IF;
+
+        RESET ROLE;
+    END IF;
+
+    -- 6. Clean up. Contracts carry no DELETE grant for zoiko_backend, so this
+    --    runs after RESET ROLE, as the applying role.
+    DELETE FROM employment_contracts.employment_contracts
+     WHERE contract_number LIKE 'VERIFY-0030%';
+    PERFORM set_config('app.tenant_id', '', true);
+
+    RAISE NOTICE 'verified: forced RLS, WITH CHECK on every policy, idempotent issue, isolation both ways';
+END
+$$;
+
+
+-- ============================================================================
+-- FILE: 0031_delegated_authorities_tenant.sql
+-- ============================================================================
+
+-- 0031_delegated_authorities_tenant.sql
+-- authorization-svc → schema `authorization_svc`. Creates no tables.
+--
+-- The change authorization-svc's own 000006_add_delegation_tenant makes, in the
+-- form this project applies it. Same statements, same end state; whichever runs
+-- first, the other is a no-op.
+--
+-- ── What this closes ─────────────────────────────────────────────────────────
+--
+-- 0028 gave permission_bundles and principal_role_assignments row security
+-- through their parent role, and left one table alone, saying so explicitly:
+--
+--   "delegated_authorities still has no row security. It carries neither
+--    tenant_id nor role_id, so there is no path to a tenant to write a policy
+--    against, and giving it one means a column the service INSERT does not
+--    supply — a change to authorization-svc, not to its schema."
+--
+-- That is exactly right, and it is why this migration ships alongside the
+-- service change rather than on its own. authorization-svc now resolves the
+-- caller's verified tenant on both delegation routes and supplies it on INSERT;
+-- without that, the NOT NULL below would reject every write.
+--
+-- With this applied, delegated_authorities is the last table in this schema to
+-- gain row security — `verify.sh`'s "tables with NO row-level security at all"
+-- check then covers authorization_svc completely.
+--
+-- ── What was exposed ─────────────────────────────────────────────────────────
+--
+-- A delegation says "principal X may act with principal Y's authority". Every
+-- read and write of it ran with no tenant predicate and no policy:
+--
+--   FindDelegatedAuthorityByID   WHERE delegated_authority_id = $1 only
+--   RevokeDelegatedAuthority     WHERE delegated_authority_id = $1 only
+--   FindDelegatedActions         WHERE delegate_principal_id = $1 only
+--
+-- The handler's ownership check (only the delegator may revoke) bounded the
+-- damage. Nothing bounded it by tenant.
+--
+-- ── Guarded, like 0027 and 0028 ──────────────────────────────────────────────
+--
+-- `authorization_svc` is not created by anything in this directory — it arrives
+-- via deployments/supabase applying the service's own migrations. On a fresh
+-- project, and in supabase/verify.sh, the schema is genuinely absent, and bare
+-- DDL would abort the whole batch and silently skip everything numbered after.
+
+DO $guard$
+DECLARE untenanted int;
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0031 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ADD COLUMN IF NOT EXISTS tenant_id UUID$stmt$;
+
+-- NOT NULL because a NULL tenant here is not "global" — it is a row no policy
+-- can ever match, so the delegation exists and silently never grants anything.
+-- The table held 0 rows when this was surveyed; if that has changed, stop
+-- rather than invent a tenant for a row describing who may act for whom.
+SELECT count(*) INTO untenanted
+  FROM authorization_svc.delegated_authorities
+ WHERE tenant_id IS NULL;
+IF untenanted > 0 THEN
+    RAISE EXCEPTION
+        '% delegated_authorities rows have no tenant_id. Backfill them from the delegator''s tenant before re-running: a NULL tenant matches no policy, so those delegations would exist and never grant anything.',
+        untenanted;
+END IF;
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ALTER COLUMN tenant_id SET NOT NULL$stmt$;
+
+-- The evaluation lookup FindDelegatedActions performs, now tenant-first.
+EXECUTE $stmt$
+CREATE INDEX IF NOT EXISTS idx_delegations_tenant_lookup
+    ON authorization_svc.delegated_authorities (tenant_id, delegate_principal_id, revocation_status)
+$stmt$;
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.delegated_authorities FORCE  ROW LEVEL SECURITY$stmt$;
+
+-- app.current_tenant_id() rather than current_setting directly: on this
+-- database a caller may arrive through PostgREST with a JWT instead of through
+-- a service calling set_config, and only the helper resolves both. The service
+-- migration uses current_setting because the app schema does not exist on the
+-- compose estate.
+--
+-- No platform_scope hatch, unlike roles: nothing needs to discover which tenant
+-- owns an unknown delegation_id.
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.delegated_authorities$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.delegated_authorities
+    FOR ALL
+    USING      (tenant_id::text = app.current_tenant_id())
+    WITH CHECK (tenant_id::text = app.current_tenant_id())
+$stmt$;
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+
+DECLARE unprotected int; no_check int;
+BEGIN
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'authorization_svc' AND c.relkind = 'r'
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION
+            '% authorization_svc tables still lack forced row security — delegated_authorities was meant to be the last one', unprotected;
+    END IF;
+
+    SELECT count(*) INTO no_check
+      FROM pg_policies
+     WHERE schemaname = 'authorization_svc'
+       AND tablename = 'delegated_authorities'
+       AND with_check IS NULL;
+    IF no_check > 0 THEN
+        RAISE EXCEPTION 'delegated_authorities policy has no WITH CHECK';
+    END IF;
+
+    RAISE NOTICE 'verified: authorization_svc now has forced row security on every table';
+END;
+
+END
+$guard$;
+
+
+-- ============================================================================
+-- FILE: 0032_notification_recipient_and_read_state.sql
+-- ============================================================================
+
+-- 0032_notification_recipient_and_read_state.sql
+-- notification-svc â†’ schema `notification`. Creates no tables.
+--
+-- The change notification-svc's own 000003_read_state_and_recipient_address
+-- makes, in the form this project applies it. Same statements, same end state;
+-- whichever runs first, the other is a no-op.
+--
+-- â”€â”€ What this closes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- 0007 built this register around a stub delivery adapter. The adapter logged
+-- a line and reported success for every channel, so the schema never needed to
+-- know where a notification went â€” recipient_principal_id was enough to say
+-- who it was for, and nothing was ever actually sent to anybody.
+--
+-- With a real SMTP provider behind EMAIL that is no longer true, and three
+-- facts the register could not previously hold become load-bearing:
+--
+--   recipient_address         where the message was actually delivered
+--   recipient_address_source  where that address came from
+--   provider_response         what accepted it, and under what identifier
+--   read_at                   whether the recipient opened an in-app notice
+--
+-- â”€â”€ Guarded, like 0027, 0028 and 0031 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- `notification` is created by 0007 in this same directory, so in a full-set
+-- apply it is always present. The guard is for the partial paths â€” verify.sh,
+-- and a single-file paste into a project built to a different point â€” where
+-- bare DDL against a missing schema aborts the batch and silently skips
+-- everything numbered after it. That is exactly the failure 0028 shipped with,
+-- and the reason it had to be reissued.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'notification') THEN
+    RAISE NOTICE 'schema notification absent; skipping 0032 â€” re-run it after 0007 has created the schema';
+    RETURN;
+END IF;
+
+-- â”€â”€ Columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- A snapshot, not a reference. Resolving the address again at read time
+-- answers "where would this go today"; a delivery register has to answer
+-- "where did it actually go", and the two differ precisely when somebody's
+-- address has changed â€” which is when the question gets asked.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS recipient_address TEXT$stmt$;
+
+-- ZS-SVC-Y-001 Â§0.4 names "mandatory notices being sent to an unverified or
+-- stale free-text address with no recipient provenance" among the failures
+-- this control plane exists to prevent. Provenance is only a control once it
+-- is written down.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS recipient_address_source VARCHAR(32)$stmt$;
+
+-- Acceptance evidence, and named so it cannot be read as more than that: Â§0.4
+-- forbids treating a provider's "accepted" as proof a person received, read or
+-- was legally served with a notice.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS provider_response TEXT$stmt$;
+
+-- NULL means unread. IN_APP notices are delivered by existing in this table,
+-- so without this column every one of them stayed new forever and no unread
+-- count was expressible.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ$stmt$;
+
+-- â”€â”€ Constraints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- NOT VALID: enforced on every write from here on, without the scan that would
+-- reject the table over rows already recorded. Those rows are the audit trail
+-- of what the service did while the stub was in place; a migration that
+-- rewrites them to fit a new constraint is worse than one that leaves them
+-- visible. VALIDATE CONSTRAINT once the backlog is known clean.
+
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_address_source_known'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_address_source_known
+        CHECK (recipient_address_source IS NULL
+               OR recipient_address_source IN ('IDENTITY_CONTEXT', 'REQUEST')) NOT VALID
+    $stmt$;
+END IF;
+
+-- Both columns are written by one code path, so one without the other means
+-- that path is wrong. Cheaper to hear it from the database than from a dispute
+-- over which address a statutory notice went to.
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_address_has_provenance'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_address_has_provenance
+        CHECK ((recipient_address IS NULL) = (recipient_address_source IS NULL)) NOT VALID
+    $stmt$;
+END IF;
+
+-- This service cannot observe whether an email was opened. A read_at on an
+-- EMAIL row would assert something it has no way to know â€” the same
+-- overstatement as calling provider acceptance a delivery.
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_read_state_is_in_app'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_read_state_is_in_app
+        CHECK (read_at IS NULL OR channel = 'IN_APP') NOT VALID
+    $stmt$;
+END IF;
+
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_read_after_created'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_read_after_created
+        CHECK (read_at IS NULL OR read_at >= created_at) NOT VALID
+    $stmt$;
+END IF;
+
+-- â”€â”€ Index â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- The unread badge is polled by every signed-in session, making it the most
+-- frequent read this service serves. Partial: it answers one question, and the
+-- qualifying rows are a small and shrinking share of the register.
+EXECUTE $stmt$
+CREATE INDEX IF NOT EXISTS idx_notifications_unread
+    ON notification.notifications (tenant_id, recipient_principal_id)
+    WHERE read_at IS NULL AND channel = 'IN_APP'
+$stmt$;
+
+-- â”€â”€ Verification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- Asked as a query rather than trusted from "Success. No rows returned", which
+-- a guarded DO block returns whether it ran every statement or returned at the
+-- first IF.
+
+DECLARE missing text;
+BEGIN
+    SELECT string_agg(c.col, ', ')
+      INTO missing
+      FROM (VALUES ('recipient_address'), ('recipient_address_source'),
+                   ('provider_response'), ('read_at')) AS c(col)
+     WHERE NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'notification'
+           AND table_name   = 'notifications'
+           AND column_name  = c.col);
+
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION '0032 did not add: %', missing;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'notification' AND c.relname = 'idx_notifications_unread') THEN
+        RAISE EXCEPTION '0032 did not create idx_notifications_unread';
+    END IF;
+
+    -- The table was already ENABLE + FORCE before this migration; adding
+    -- columns does not change that, and checking costs nothing next to
+    -- discovering otherwise later.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'notification' AND c.relname = 'notifications'
+           AND c.relrowsecurity AND c.relforcerowsecurity) THEN
+        RAISE EXCEPTION 'notification.notifications does not have forced row security';
+    END IF;
+
+    RAISE NOTICE 'verified: 0032 applied â€” recipient address, provenance, provider evidence and read state present';
+END;
+
+END
+$guard$;
+
+
+-- ============================================================================
+-- FILE: 0033_notification_delivery_retry.sql
+-- ============================================================================
+
+-- 0033_notification_delivery_retry.sql
+-- notification-svc → schema `notification`. Creates no tables.
+--
+-- The change notification-svc's own 000004_delivery_retry makes, in the form
+-- this project applies it. Same statements, same end state; whichever runs
+-- first, the other is a no-op.
+--
+-- ── What this closes ────────────────────────────────────────────────────────
+--
+-- 0032 gave the register somewhere to record that a delivery failure was worth
+-- re-attempting, and nothing re-attempted it. A greylisted payslip notice, a
+-- relay restarting, an identity-context-svc blip: each concluded FAILED on the
+-- first try and stayed that way. The classification existed and was inert.
+--
+-- No new status value. PENDING already means "delivery has not concluded", and
+-- a notification awaiting another attempt has not concluded:
+--
+--   PENDING, next_attempt_at IS NOT NULL  → will be attempted again
+--   PENDING, next_attempt_at IS NULL      → in flight right now
+--   SENT                                  → a provider accepted it
+--   FAILED                                → terminal; no further attempt
+--
+-- A RETRYING status would have meant widening the status vocabulary, updating
+-- every consumer, and leaving FAILED ambiguous for the length of the rollout.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'notification') THEN
+    RAISE NOTICE 'schema notification absent; skipping 0033 — re-run it after 0007 has created the schema';
+    RETURN;
+END IF;
+
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS delivery_attempts INT NOT NULL DEFAULT 0$stmt$;
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ$stmt$;
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ$stmt$;
+
+-- A concluded notification must not be scheduled for another attempt. Without
+-- this, a bug that forgot to clear next_attempt_at on success would have the
+-- worker re-sending a message already delivered — the duplicate-notice failure
+-- ZS-SVC-Y-001 §0.4 names directly.
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_concluded_has_no_retry'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_concluded_has_no_retry
+        CHECK (status = 'PENDING' OR next_attempt_at IS NULL) NOT VALID
+    $stmt$;
+END IF;
+
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_attempts_non_negative'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_attempts_non_negative
+        CHECK (delivery_attempts >= 0) NOT VALID
+    $stmt$;
+END IF;
+
+-- The worker's claim query, and only that. Partial because due retries are a
+-- vanishingly small slice of a register that only grows.
+EXECUTE $stmt$
+CREATE INDEX IF NOT EXISTS idx_notifications_due_retry
+    ON notification.notifications (next_attempt_at)
+    WHERE next_attempt_at IS NOT NULL AND status = 'PENDING'
+$stmt$;
+
+-- ── The cross-tenant problem, and why this is the narrowest answer ──────────
+--
+-- The retry worker is not serving a request. Nobody's tenant is installed on
+-- its connection, and this table is ENABLE + FORCE with a policy keyed on the
+-- caller's tenant — so the worker, correctly, sees nothing, and cannot even
+-- discover which tenants have work waiting.
+--
+-- This is the platform-scope hatch 0028 documents on authorization_svc.roles,
+-- in its narrowest form:
+--
+--   FOR SELECT ONLY. A platform-scoped connection can DISCOVER work. It cannot
+--   insert, update or delete across tenants — every write still requires the
+--   correct tenant, so the retry itself runs tenant-scoped like any request.
+--
+-- RLS cannot restrict columns, so a connection setting this flag can read
+-- message bodies. What bounds that is the caller: the worker's claim query
+-- projects notification_id and tenant_id and nothing else, then drops platform
+-- scope and re-enters per tenant to read the message. No content crosses it.
+--
+-- set_config(..., true) is transaction-local, so the flag cannot survive on a
+-- pooled connection into somebody's request.
+--
+-- current_setting directly rather than an app.* helper: there is no
+-- app.platform_scope() function, and 0028 reads the setting the same way.
+--
+-- NO `TO` CLAUSE, and that is not an oversight.
+--
+-- 0007 wrote this table's policies `TO zoiko_backend`, and the first draft of
+-- this migration copied that. It would have been inert. Services do not
+-- connect as zoiko_backend: deployments/supabase creates a role per service
+-- (app_notification here) and REVOKEs zoiko_backend membership from it
+-- deliberately, because that role accumulates DML on every schema and a member
+-- would inherit the lot — 0026 measured app_employee_master reading and
+-- writing payroll_run.pay_slips through exactly that membership.
+--
+-- 0026's fix was to drop the role restriction platform-wide so policies apply
+-- to whichever role actually connects. A `TO zoiko_backend` policy here would
+-- therefore match nobody, the worker's claim query would return zero rows
+-- forever, and retry would appear to work while silently never firing.
+--
+-- Widening to PUBLIC costs nothing that is not already the case: table
+-- privileges are checked BEFORE row security, `anon` is granted nothing on
+-- this table and never reaches a policy, and `authenticated` already reads its
+-- tenant's rows through tenant_isolation. What this policy adds for
+-- `authenticated` is gated behind app.platform_scope, a GUC PostgREST gives a
+-- client no way to set — it sets only request.* and the role.
+--
+-- The verification block asserts the ABSENCE of a role restriction, because
+-- re-adding one is the change that would break the worker quietly.
+EXECUTE $stmt$DROP POLICY IF EXISTS platform_scope_read_policy ON notification.notifications$stmt$;
+EXECUTE $stmt$DROP POLICY IF EXISTS platform_scope_read ON notification.notifications$stmt$;
+EXECUTE $stmt$
+CREATE POLICY platform_scope_read ON notification.notifications
+    FOR SELECT
+    USING (current_setting('app.platform_scope', true) = 'true')
+$stmt$;
+
+-- ── Verification ────────────────────────────────────────────────────────────
+
+DECLARE missing text; polcount int;
+BEGIN
+    SELECT string_agg(c.col, ', ')
+      INTO missing
+      FROM (VALUES ('delivery_attempts'), ('next_attempt_at'), ('last_attempt_at')) AS c(col)
+     WHERE NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'notification'
+           AND table_name   = 'notifications'
+           AND column_name  = c.col);
+
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION '0033 did not add: %', missing;
+    END IF;
+
+    -- Both of 0007's policies must survive. tenant_isolation is what scopes
+    -- the backend to one tenant; recipient_read is what stops an authenticated
+    -- caller reading a colleague's notification body. A platform-scope policy
+    -- that replaced either would read as a working retry worker and be a loss
+    -- of exactly the isolation this table is careful about.
+    --
+    -- Named `tenant_isolation`, not `tenant_isolation_policy`: this project
+    -- uses the former (49 tables), the compose migrations use the latter. The
+    -- first version of this check looked for the compose name and failed here
+    -- on a correctly-migrated database — the check was wrong, not the schema.
+    SELECT count(*) INTO polcount
+      FROM pg_policies
+     WHERE schemaname = 'notification' AND tablename = 'notifications'
+       AND policyname IN ('tenant_isolation', 'recipient_read');
+    IF polcount <> 2 THEN
+        RAISE EXCEPTION
+            'expected both tenant_isolation and recipient_read on notification.notifications, found % — '
+            'the platform-scope policy must sit ALONGSIDE them, never replace them', polcount;
+    END IF;
+
+    -- The hatch must be SELECT-only...
+    IF EXISTS (
+        SELECT 1 FROM pg_policies
+         WHERE schemaname = 'notification' AND tablename = 'notifications'
+           AND policyname = 'platform_scope_read'
+           AND cmd <> 'SELECT') THEN
+        RAISE EXCEPTION 'platform_scope_read is not SELECT-only — it would permit cross-tenant writes';
+    END IF;
+
+    -- ...and must NOT be restricted to a role.
+    --
+    -- The inverse of the usual check, for the reason 0026 exists: services
+    -- connect as app_notification, which is deliberately not a member of
+    -- zoiko_backend. A role-restricted policy here would match nobody, the
+    -- worker's claim query would return zero rows forever, and the retry
+    -- machinery would look present while never firing — the worst kind of
+    -- failure, because nothing errors.
+    SELECT count(*) INTO polcount
+      FROM pg_policies
+     WHERE schemaname = 'notification' AND tablename = 'notifications'
+       AND policyname = 'platform_scope_read'
+       AND roles = '{public}';
+    IF polcount <> 1 THEN
+        RAISE EXCEPTION
+            'platform_scope_read is role-restricted — it must apply to the connecting role '
+            '(0026), or the retry worker silently sees nothing';
+    END IF;
+
+    RAISE NOTICE 'verified: 0033 applied — retry scheduling present, both 0007 policies intact, hatch is read-only and applies to the connecting role';
+END;
+
+END
+$guard$;

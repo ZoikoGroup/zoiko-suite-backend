@@ -22,6 +22,8 @@
 package authz
 
 import (
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
+	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -187,6 +189,45 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// authorization-svc validates the same canonical envelope contract this
+	// service does and answers 400 envelope_incomplete without it. A non-200 is
+	// treated as unavailable below, so an unforwarded envelope turned EVERY
+	// gated write into a 503 that reads like an outage rather than a missing
+	// header. Same defect, same fix as 3c618c2 (HR) and dbf6e45 (notification).
+	//
+	// The values are the CALLER's, taken from the envelope the middleware
+	// already parsed into this request's context. Minting fresh ones would
+	// satisfy the contract and lose the only thing it is for: a decision in
+	// access_decision_log traceable to the request that caused it.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	// One decision per (request, action): an inbound request may authorize
+	// several actions, and each is its own decision to record.
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("authorization-svc unreachable — failing closed",

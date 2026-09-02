@@ -17,6 +17,7 @@ import (
 
 	"zoiko.io/document-vault-svc/internal/authz"
 	"zoiko.io/document-vault-svc/internal/config"
+	svcenvelope "zoiko.io/document-vault-svc/internal/envelope"
 	"zoiko.io/document-vault-svc/internal/handler"
 	"zoiko.io/document-vault-svc/internal/health"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
@@ -77,6 +78,13 @@ func main() {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Logger)
 	r.Use(svcmiddleware.TenantContext())
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", healthH.Readiness)

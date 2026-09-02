@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/employment-contracts-svc/internal/domain"
@@ -15,6 +16,25 @@ import (
 
 type PgStore struct {
 	pool *pgxpool.Pool
+}
+
+// mapUniqueViolation turns a Postgres 23505 into the domain error naming the
+// constraint that rejected the write, so the handler can answer 409 instead of
+// letting an unmapped driver error surface as a 500.
+//
+// supabase/migrations/0030 adds (tenant_id, contract_number, version) as a
+// unique index. contract_number is caller-supplied on issue, so a caller that
+// reuses one now collides with the existing version history — which is the
+// point, but only if the refusal says so.
+func mapUniqueViolation(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return err
+	}
+	if pgErr.ConstraintName == "idx_contracts_tenant_number_version" {
+		return domain.ErrContractNumberVersionExists
+	}
+	return err
 }
 
 func New(pool *pgxpool.Pool) *PgStore {
@@ -68,7 +88,7 @@ func (s *PgStore) IssueContract(ctx context.Context, c *domain.EmploymentContrac
 			c.Version, c.ContractType, c.Status, c.Title, c.BaseSalaryAmount, c.Currency,
 			c.PayFrequency, c.EffectiveFrom, c.EffectiveTo, c.DocumentVaultRef, c.CorrelationID, c.CreatedAt, c.UpdatedAt)
 		if err != nil {
-			return err
+			return mapUniqueViolation(err)
 		}
 		if tag.RowsAffected() == 0 {
 			row := tx.QueryRow(ctx, `
@@ -279,7 +299,9 @@ func (s *PgStore) AmendContract(ctx context.Context, oldContractID string, newCo
 			newContract.Version, newContract.ContractType, newContract.Status, newContract.Title, newContract.BaseSalaryAmount, newContract.Currency,
 			newContract.PayFrequency, newContract.EffectiveFrom, newContract.EffectiveTo, newContract.DocumentVaultRef, newContract.CreatedAt, newContract.UpdatedAt)
 		if err != nil {
-			return err
+			// A concurrent amend of the same contract reaches the same
+			// (contract_number, version) — 409, not 500.
+			return mapUniqueViolation(err)
 		}
 
 		// 3. Insert amendment log record

@@ -131,6 +131,10 @@ func TestPgStore_CreateJournal_And_GetJournal(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	h := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -181,6 +185,10 @@ func TestPgStore_CreateJournal_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 
 	newHeader := func() *domain.JournalHeader {
 		return &domain.JournalHeader{
+			JournalType:          domain.JournalTypeStandard,
+			TransactionDate:      domain.NewDate(2026, 7, 15),
+			PostingDate:          domain.NewDate(2026, 7, 15),
+			CurrencyCode:         "GBP",
 			JournalID:            uuid.New().String(),
 			TenantID:             tenantID,
 			LegalEntityID:        legalEntityID,
@@ -247,6 +255,10 @@ func TestPgStore_SumLines(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	h := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -289,6 +301,10 @@ func TestPgStore_TransitionJournal_WrongFromStatus_Rejected(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	h := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -325,7 +341,11 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 
 	hA := &domain.JournalHeader{
-		JournalID: uuid.New().String(), TenantID: tenantA, LegalEntityID: uuid.New().String(),
+		JournalType:     domain.JournalTypeStandard,
+		TransactionDate: domain.NewDate(2026, 7, 15),
+		PostingDate:     domain.NewDate(2026, 7, 15),
+		CurrencyCode:    "GBP",
+		JournalID:       uuid.New().String(), TenantID: tenantA, LegalEntityID: uuid.New().String(),
 		FiscalPeriod: "2026-07", Status: domain.JournalStatusPending,
 		Description: "tenant A journal", CreatedByPrincipalID: "admin-a", CorrelationID: "corr-a",
 	}
@@ -352,6 +372,10 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 func newFinalizedJournal(t *testing.T, s *store.PgStore, ctx context.Context, tenantID string) *domain.JournalHeader {
 	t.Helper()
 	h := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -382,6 +406,10 @@ func newFinalizedJournal(t *testing.T, s *store.PgStore, ctx context.Context, te
 func newReversingHeader(tenantID, originalID, correlationID string, original *domain.JournalHeader) *domain.JournalHeader {
 	principal := "reversing-admin"
 	return &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        original.LegalEntityID,
@@ -493,6 +521,10 @@ func TestPgStore_ReverseJournal_NotFinalized_RollsBackBothHalves(t *testing.T) {
 
 	// PENDING, never posted — so the REVERSED transition cannot apply.
 	h := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -557,6 +589,10 @@ func TestPgStore_CreateJournal_Retry_ResolvesFullStoredHeader(t *testing.T) {
 	correlationID := "corr-" + uuid.New().String()
 
 	first := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -581,6 +617,10 @@ func TestPgStore_CreateJournal_Retry_ResolvesFullStoredHeader(t *testing.T) {
 	// The retry arrives after the journal has moved on, and carries different
 	// content — a client that re-sent an edited body under the same key.
 	retry := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -637,6 +677,10 @@ func TestPgStore_GetJournalByCorrelationID(t *testing.T) {
 	correlationID := "corr-" + uuid.New().String()
 
 	h := &domain.JournalHeader{
+		JournalType:          domain.JournalTypeStandard,
+		TransactionDate:      domain.NewDate(2026, 7, 15),
+		PostingDate:          domain.NewDate(2026, 7, 15),
+		CurrencyCode:         "GBP",
 		JournalID:            uuid.New().String(),
 		TenantID:             tenantID,
 		LegalEntityID:        uuid.New().String(),
@@ -718,6 +762,10 @@ func TestPgStore_ListJournals_RespectsLimit(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		h := &domain.JournalHeader{
+			JournalType:          domain.JournalTypeStandard,
+			TransactionDate:      domain.NewDate(2026, 7, 15),
+			PostingDate:          domain.NewDate(2026, 7, 15),
+			CurrencyCode:         "GBP",
 			JournalID:            uuid.New().String(),
 			TenantID:             tenantID,
 			LegalEntityID:        uuid.New().String(),

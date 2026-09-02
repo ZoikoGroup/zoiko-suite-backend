@@ -466,8 +466,20 @@ services:
       DB_USER: zoiko_app
       DB_PASSWORD: zoiko_app_password
       DB_SSLMODE: disable
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
+      # Blank keeps the local `redis` container below. Set REDIS_URL in .env to
+      # a managed endpoint (rediss://default:<token>@<host>.upstash.io:6379) and
+      # REDIS_HOST/REDIS_PORT are ignored entirely — the service reads one or
+      # the other, never a mixture.
+      #
+      # The `redis` container still starts either way: depends_on below is
+      # static, so compose cannot drop it on the strength of a variable. It is
+      # 256m of unused cache when REDIS_URL is set, not a second source of
+      # truth — nothing connects to it.
+      REDIS_URL: "${REDIS_URL:-}"
+      REDIS_HOST: "${REDIS_HOST:-redis}"
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-}"
+      REDIS_TLS_ENABLED: "${REDIS_TLS_ENABLED:-false}"
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "identity-context-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.identity.events"
@@ -475,6 +487,24 @@ services:
       JWT_SIGNING_PRIVATE_KEY_PATH: "/keys/envelope_signing_key.pem"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       JWT_KEY_ID: "local-dev-key-1"
+      # Lifetime of the bearer token POST /v1/authenticate mints. It is an
+      # intermediate credential the caller exchanges immediately for an
+      # identity envelope at /v1/context/resolve, so it is short by design.
+      IDP_TOKEN_TTL_SECONDS: "300"
+      # argon2id cost factors for password hashing (internal/credential).
+      # ARGON2_MEMORY_KIB x ARGON2_MAX_CONCURRENT is the peak memory the login
+      # path can hold at once — 19456 KiB x 4 = 76 MiB against the 256m
+      # mem_limit below. Raising either without checking the other is how a
+      # password-guessing attempt becomes an OOM kill of a Tier 0 service.
+      ARGON2_MEMORY_KIB: "19456"
+      ARGON2_ITERATIONS: "2"
+      ARGON2_PARALLELISM: "1"
+      ARGON2_MAX_CONCURRENT: "4"
+      # Per-credential lockout. Bounds guessing against one account; it does
+      # not bound a spray across many accounts at one guess each — that needs
+      # a gateway-level rate limit on /v1/authenticate.
+      AUTH_MAX_FAILED_ATTEMPTS: "5"
+      AUTH_LOCK_DURATION_SECONDS: "900"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
       ACCESS_CONTROL_URL: "http://identity-svc:8080"
@@ -530,8 +560,27 @@ services:
       # still starts and verifies tokens correctly when phase6 isn't running.
       CARTA_SERVICE_URL: "http://carta-svc:8142"
       SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
+      # GOV-01 tenant context resolution (ZS-SVC-A-001 §4). The gateway reads
+      # the tenant/legal-entity master here to establish that the tenant may
+      # transact and that the entity in the token is its own, then forwards the
+      # server-resolved jurisdiction/timezone/residency downstream.
+      #
+      # Called service-to-service on :8081, deliberately NOT through Traefik —
+      # routing the resolver through the gateway it serves would make every
+      # verification depend on a verification.
+      #
+      # Unset this to disable resolution entirely; the gateway then verifies
+      # tokens and forwards exactly as it did before, rather than failing closed
+      # on a registry the deployment has not configured.
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
+      TENANT_CONTEXT_TTL_SECONDS: "30"
+      # Bounded stale window for NON-MATERIAL READS only, while the registry is
+      # unreachable. Writes are never served from a stale context.
+      TENANT_CONTEXT_STALE_GRACE_SECONDS: "120"
     depends_on:
       identity-svc:
+        condition: service_healthy
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8092/healthz"]
@@ -661,7 +710,14 @@ services:
       - "traefik.http.services.jurisdiction.loadbalancer.server.port=8082"
       - "traefik.http.middlewares.jurisdiction-strip.stripprefix.prefixes=/jurisdiction"
       - "traefik.http.middlewares.gateway-auth.forwardauth.address=http://gateway-auth-svc:8092/verify"
-      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id"
+      # Identity from the verified token, then the GOV-01 server-resolved
+      # context. Traefik OVERWRITES these names on the forwarded request, which
+      # is what makes them authoritative: a client asserting its own
+      # X-Jurisdiction-Context has it replaced by the registry's answer, per §5
+      # provenance class S ("client may request context but cannot override
+      # result"). A header the gateway sets and this list omits is dropped
+      # silently, so any addition in handler.Verify belongs here too.
+      - "traefik.http.middlewares.gateway-auth.forwardauth.authResponseHeaders=X-Principal-Id,X-Tenant-Id,X-Legal-Entity-Id,X-Correlation-Id,X-Jurisdiction-Context,X-Timezone,X-Residency-Policy-Id,X-Tenant-Context-Stale"
       - "traefik.http.routers.jurisdiction.middlewares=gateway-auth,jurisdiction-strip"
 
   # ── 4. governance-decision-log-svc (Port: 8083) ──────────────────────────────
@@ -1535,6 +1591,30 @@ services:
   # wired up on the platform yet. Delivery failure is deliberately never a
   # 5xx to the caller, per the service's own critical constraint: "notification
   # failure must not collapse source operational workflows."
+  # ── Mailpit — local mail catcher for notification-svc ────────────────────────
+  #
+  # Accepts SMTP on 1025 and serves everything it receives at
+  # http://localhost:8025. It delivers nothing onward, which is the point: with
+  # a real relay configured here, running the estate locally would email real
+  # people the first time anyone exercised the approval workflow.
+  #
+  # This is what makes EMAIL testable end to end without an account anywhere.
+  # notification-svc's own tests drive an in-process SMTP server instead, so
+  # this container is for manual verification and demos, not for CI.
+  mailpit:
+    image: axllent/mailpit:v1.21
+    container_name: mailpit
+    mem_limit: 128m
+    cpus: "0.25"
+    ports:
+      - "8025:8025" # web UI
+      - "1025:1025" # SMTP
+    environment:
+      MP_MAX_MESSAGES: "5000"
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    restart: on-failure
+
   notification-svc:
     build:
       context: ../services/notification-svc
@@ -1555,6 +1635,45 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.notification.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+
+      # identity-context-svc owns principals and their contact facts. An EMAIL
+      # notification names its recipient by principal id, so without this the
+      # service has no address to deliver to.
+      IDENTITY_SERVICE_URL: "http://identity-context-svc:8080"
+
+      # Mail provider. Mailpit catches everything locally and serves it at
+      # http://localhost:8025 — nothing leaves the machine, so a developer
+      # running the estate cannot accidentally email a real person.
+      #
+      # SMTP_ALLOW_CLEARTEXT is required because mailpit is a sibling
+      # container rather than loopback, and the provider refuses cleartext to a
+      # non-loopback host without it. config.Load refuses it in production.
+      NOTIFICATION_EMAIL_PROVIDER: "${NOTIFICATION_EMAIL_PROVIDER:-smtp}"
+      NOTIFICATION_EMAIL_FROM: "${NOTIFICATION_EMAIL_FROM:-Zoiko Suite <no-reply@zoiko.local>}"
+      SMTP_HOST: "${SMTP_HOST:-mailpit}"
+      SMTP_PORT: "${SMTP_PORT:-1025}"
+      SMTP_TLS_MODE: "${SMTP_TLS_MODE:-none}"
+      SMTP_ALLOW_CLEARTEXT: "${SMTP_ALLOW_CLEARTEXT:-true}"
+      SMTP_USERNAME: "${SMTP_USERNAME:-}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
+
+      # Opens one SMTP session at startup and sends no mail, so a wrong
+      # credential fails the container here rather than surfacing days later as
+      # a password reset that never arrived. Left on for mailpit too: it costs
+      # a connect, and it proves the relay is actually wired.
+      SMTP_VERIFY_ON_START: "${SMTP_VERIFY_ON_START:-true}"
+
+      # Transient delivery failures — a relay restarting, greylisting, an
+      # identity-context-svc blip — are re-attempted by the in-process worker
+      # rather than concluded FAILED on the first try. Five attempts over
+      # roughly ten minutes; the interval is how often the worker looks, not
+      # how long a notification waits.
+      NOTIFICATION_RETRY_ENABLED: "${NOTIFICATION_RETRY_ENABLED:-true}"
+      NOTIFICATION_RETRY_MAX_ATTEMPTS: "${NOTIFICATION_RETRY_MAX_ATTEMPTS:-5}"
+      NOTIFICATION_RETRY_BASE_DELAY: "${NOTIFICATION_RETRY_BASE_DELAY:-30s}"
+      NOTIFICATION_RETRY_MAX_DELAY: "${NOTIFICATION_RETRY_MAX_DELAY:-8m}"
+      NOTIFICATION_RETRY_INTERVAL: "${NOTIFICATION_RETRY_INTERVAL:-10s}"
+      NOTIFICATION_RETRY_BATCH_SIZE: "${NOTIFICATION_RETRY_BATCH_SIZE:-50}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1562,6 +1681,8 @@ services:
         condition: service_healthy
       authorization-svc:
         condition: service_healthy
+      mailpit:
+        condition: service_started
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
       # dead database pool reads as healthy while every read returns 500.
@@ -2576,7 +2697,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.offboarding.events"
       EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -2617,7 +2738,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.compliance.events"
       EMPLOYEE_MASTER_URL: "http://employee-master-svc:8108"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
     depends_on:
       postgres:
@@ -2654,7 +2775,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.contract.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       GOVERNANCE_LOG_URL: "http://governance-svc:8083"
     depends_on:
       postgres:
@@ -2688,7 +2809,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.clause.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2719,7 +2840,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.obligation-tracking.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2786,7 +2907,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-actions.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       EVIDENCE_REQ_URL: "http://evidence-requirements-svc:8130"
     depends_on:
       postgres:
@@ -2820,7 +2941,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.counterparty.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2910,7 +3031,7 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.tax-rules.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2942,7 +3063,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.tax-determination.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2976,7 +3097,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.vat-gst.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
     depends_on:
       postgres:
         condition: service_healthy
@@ -3010,7 +3131,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.corporate-tax.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       TAX_RULES_SERVICE_URL: "http://tax-rules-svc:8125"
-      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8081"
+      JURISDICTION_RULES_URL: "http://jurisdiction-rules-svc:8082"
       GENERAL_LEDGER_URL: "http://general-ledger-svc:8091"
     depends_on:
       postgres:

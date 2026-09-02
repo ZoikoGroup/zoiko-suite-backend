@@ -41,6 +41,7 @@ func seedExporter(t *testing.T, r http.Handler, tenantID, token string) string {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
 	req.Header.Set("X-Principal-Id", "principal-seed")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -73,6 +74,7 @@ func TestAuthTokenNeverSerialised(t *testing.T) {
 	createReq.Header.Set("Content-Type", "application/json")
 	createReq.Header.Set("X-Tenant-ID", "t1")
 	createReq.Header.Set("X-Principal-Id", "principal-test-01")
+	createReq = withEnvelope(createReq) // rest of the canonical envelope; headers already set win
 	createW := httptest.NewRecorder()
 	r.ServeHTTP(createW, createReq)
 	if createW.Code != http.StatusCreated {
@@ -96,6 +98,7 @@ func TestAuthTokenNeverSerialised(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.Header.Set("X-Tenant-ID", "t1")
 		req.Header.Set("X-Principal-Id", "principal-test-01")
+		req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
@@ -231,6 +234,7 @@ func TestAuthzDenied_RefusedOnGuardedRoutes(t *testing.T) {
 			}
 			req.Header.Set("X-Tenant-ID", "t1")
 			req.Header.Set("X-Principal-Id", "principal-denied")
+			req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -254,6 +258,7 @@ func TestAuthzUnavailable_FailsClosed(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -272,6 +277,7 @@ func TestListEventsRequiresExporterID(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/siem/events", nil)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

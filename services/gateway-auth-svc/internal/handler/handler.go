@@ -16,18 +16,36 @@ import (
 	"zoiko.io/gateway-auth-svc/internal/config"
 	"zoiko.io/gateway-auth-svc/internal/jwks"
 	"zoiko.io/gateway-auth-svc/internal/siem"
+	"zoiko.io/gateway-auth-svc/internal/tenantctx"
 )
 
 type Handler struct {
-	cfg   *config.Config
-	jwks  *jwks.Client
-	carta *carta.Client
-	siem  *siem.Client
-	log   *zap.Logger
+	cfg    *config.Config
+	jwks   *jwks.Client
+	carta  *carta.Client
+	siem   *siem.Client
+	tenant *tenantctx.Resolver
+	log    *zap.Logger
 }
 
-func New(cfg *config.Config, jwksClient *jwks.Client, cartaClient *carta.Client, siemClient *siem.Client, log *zap.Logger) *Handler {
-	return &Handler{cfg: cfg, jwks: jwksClient, carta: cartaClient, siem: siemClient, log: log}
+// New builds the ForwardAuth handler. tenantResolver may be nil, which disables
+// GOV-01 context resolution — see config.TenantRegistryURL.
+func New(
+	cfg *config.Config,
+	jwksClient *jwks.Client,
+	cartaClient *carta.Client,
+	siemClient *siem.Client,
+	tenantResolver *tenantctx.Resolver,
+	log *zap.Logger,
+) *Handler {
+	return &Handler{
+		cfg:    cfg,
+		jwks:   jwksClient,
+		carta:  cartaClient,
+		siem:   siemClient,
+		tenant: tenantResolver,
+		log:    log,
+	}
 }
 
 // envelopeClaims mirrors only the fields this gateway needs to propagate
@@ -129,13 +147,117 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// GOV-01 (ZS-SVC-A-001 §4): resolve the authoritative tenant and operating
+	// context before business processing begins. A valid token proves who is
+	// asking; it does not prove the tenant may transact, nor that the entity
+	// named in the token belongs to that tenant. The registry owns both facts.
+	//
+	// Skipped entirely when unconfigured — see config.TenantRegistryURL.
+	resolved, err := h.tenant.Resolve(ctx,
+		claims.TenantID, claims.LegalEntityID, materialWrite(originalMethod(r)))
+	if err != nil {
+		h.denyResolution(w, r, claims, err)
+		return
+	}
+
 	w.Header().Set("X-Principal-Id", claims.Principal.PrincipalID)
 	w.Header().Set("X-Tenant-Id", claims.TenantID)
 	w.Header().Set("X-Legal-Entity-Id", claims.LegalEntityID)
 	if claims.CorrelationID != "" {
 		w.Header().Set("X-Correlation-Id", claims.CorrelationID)
 	}
+
+	// Server-resolved context, forwarded so backends read authoritative values
+	// instead of the caller's assertions (§5 provenance class S: "client may
+	// request context but cannot override result"). These names match the
+	// envelope's own header constants, so a backend picks them up through the
+	// parser it already runs — and Traefik overwrites whatever the client sent
+	// under the same names, which is what makes the override real.
+	//
+	// Every header set here must also appear in the ForwardAuth middleware's
+	// authResponseHeaders list, or Traefik drops it silently.
+	if h.tenant.Enabled() {
+		setIfPresent(w, "X-Jurisdiction-Context", resolved.JurisdictionContext)
+		setIfPresent(w, "X-Timezone", resolved.Timezone)
+		setIfPresent(w, "X-Residency-Policy-Id", resolved.ResidencyPolicyID)
+		if resolved.Stale {
+			// Named on the response so a backend can tell that its context came
+			// from a cache the registry could not confirm. Only ever set on
+			// non-material reads — writes never reach here on a stale context.
+			w.Header().Set("X-Tenant-Context-Stale", "true")
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
+}
+
+func setIfPresent(w http.ResponseWriter, header, value string) {
+	if value != "" {
+		w.Header().Set(header, value)
+	}
+}
+
+// originalMethod returns the method of the request Traefik is authorising.
+//
+// ForwardAuth replays the client's method onto /verify, but also sets
+// X-Forwarded-Method; the header is preferred because it survives any proxy in
+// front that normalises the probe itself.
+func originalMethod(r *http.Request) string {
+	if m := r.Header.Get("X-Forwarded-Method"); m != "" {
+		return m
+	}
+	return r.Method
+}
+
+// materialWrite mirrors the envelope contract's own definition, so the gateway
+// and the backends agree on which requests are state-changing. PUT and DELETE
+// are included: they are idempotent at the HTTP level, not at the business one.
+func materialWrite(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+
+// denyResolution answers a failed GOV-01 resolution.
+//
+// The two outcomes are deliberately different statuses. ErrDenied is a decision
+// the registry made — the tenant is unknown, suspended, or the entity is not
+// its own — and re-authenticating will not change it, so 403. ErrUnavailable is
+// the absence of a decision; answering 403 would tell the caller it had been
+// refused when in fact nothing could be determined, so 503 with Retry-After.
+func (h *Handler) denyResolution(w http.ResponseWriter, r *http.Request, claims *envelopeClaims, err error) {
+	h.log.Warn("tenant context resolution failed",
+		zap.Error(err),
+		zap.String("principal_id", claims.Principal.PrincipalID),
+		zap.String("tenant_id", claims.TenantID),
+		zap.String("legal_entity_id", claims.LegalEntityID),
+		zap.String("method", originalMethod(r)),
+		zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
+	)
+
+	// Both branches name themselves on the response. Traefik returns an
+	// unsuccessful ForwardAuth reply to the client verbatim — status, body and
+	// headers — so this is what lets a console tell a GOV-01 refusal apart from
+	// the backend service's own 403/503, which mean entirely different things
+	// and have different fixes.
+	if errors.Is(err, tenantctx.ErrUnavailable) {
+		// Fail closed, and say why: no fallback to a global or default tenant,
+		// and no proceeding on a context nobody could confirm.
+		w.Header().Set("X-Tenant-Context", "unresolved")
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("tenant context could not be resolved"))
+		return
+	}
+
+	h.siem.Stream(r.Context(), claims.TenantID, "tenant_context.denied", siem.SeverityHigh,
+		"tenant context denied for principal "+claims.Principal.PrincipalID)
+	w.Header().Set("X-Tenant-Context", "denied")
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte("tenant context denied"))
 }
 
 func severityFor(d carta.Decision) siem.Severity {

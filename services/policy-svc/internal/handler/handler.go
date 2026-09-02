@@ -138,7 +138,9 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 		scope = *legalEntityID
 	}
 
-	err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType)
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+
+	err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType, tenantID)
 	switch {
 	case err == nil:
 		return true
@@ -395,7 +397,12 @@ func (h *Handler) CreatePolicyVersion(w http.ResponseWriter, r *http.Request) {
 	// Authorized in the scope the version will apply to, so a principal
 	// granted POLICY_VERSION_CREATE for one legal entity cannot publish a
 	// version binding another.
-	if !h.authorize(w, r, principalID, authz.ActionPolicyVersionCreate, req.LegalEntityID) {
+	// Global versions (tenant_id == nil) require a distinct platform-wide grant.
+	createAction := authz.ActionPolicyVersionCreate
+	if req.TenantID == nil {
+		createAction = authz.ActionPolicyVersionCreateGlobal
+	}
+	if !h.authorize(w, r, principalID, createAction, req.LegalEntityID) {
 		return
 	}
 
@@ -531,7 +538,12 @@ func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
 	// stored record rather than the request — activation is the moment a
 	// policy starts governing real spend, so it is checked after the version
 	// is resolved and before anything is written.
-	if !h.authorize(w, r, principalID, authz.ActionPolicyVersionActivate, existing.LegalEntityID) {
+	// Global versions (tenant_id == nil) require a distinct platform-wide grant.
+	activateAction := authz.ActionPolicyVersionActivate
+	if existing.TenantID == nil {
+		activateAction = authz.ActionPolicyVersionActivateGlobal
+	}
+	if !h.authorize(w, r, principalID, activateAction, existing.LegalEntityID) {
 		return
 	}
 

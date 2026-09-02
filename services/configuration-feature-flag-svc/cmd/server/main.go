@@ -34,6 +34,7 @@ import (
 
 	"zoiko.io/configuration-feature-flag-svc/internal/authz"
 	"zoiko.io/configuration-feature-flag-svc/internal/config"
+	svcenvelope "zoiko.io/configuration-feature-flag-svc/internal/envelope"
 	"zoiko.io/configuration-feature-flag-svc/internal/events"
 	"zoiko.io/configuration-feature-flag-svc/internal/handler"
 	"zoiko.io/configuration-feature-flag-svc/internal/health"
@@ -145,6 +146,13 @@ func main() {
 	// written came from a query parameter or a request body.
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, cfg.AuthZPlatformScopeID, log)
 	handler.RegisterRoutes(r, h)

@@ -74,6 +74,7 @@ type UpdateRoleRequest struct {
 	LegalEntityID string `json:"legal_entity_id"`
 	RoleName      string `json:"role_name,omitempty"`
 	Status        string `json:"status,omitempty"`
+	CorrelationID string `json:"correlation_id"`
 }
 
 type CreateBundleRequest struct {
@@ -102,9 +103,12 @@ var (
 	// been actually provisioned for enforcement.
 	ErrAuthzAdminUnavailable = errorString("authorization-svc admin API unavailable")
 
-	// ErrIdentityMissing is returned when a mutation request carries no
-	// resolved identity (no X-Principal-Id header) — the request never
-	// passed through gateway-auth-svc's ForwardAuth verification. Fail
-	// closed, same pattern as every other service in this platform.
+// ErrIdentityMissing is returned when a mutation request carries no
+// resolved identity (no X-Principal-Id header) — the request never
+// passed through gateway-auth-svc's ForwardAuth verification. Fail
+// closed, same pattern as every other service in this platform.
 	ErrIdentityMissing = errorString("caller identity missing")
+
+	// ErrTenantMissing is returned when a request carries no X-Tenant-Id header.
+	ErrTenantMissing = errorString("caller tenant scope missing")
 )
