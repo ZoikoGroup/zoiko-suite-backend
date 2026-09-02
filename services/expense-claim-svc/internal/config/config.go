@@ -18,6 +18,9 @@ type Config struct {
 	PolicyServiceURL           string
 	PayableOpenItemServiceURL  string
 	ReceiptRequiredThreshold   float64
+
+	ConfigFeatureFlagServiceURL string
+	Environment                 string
 }
 
 func Load() (*Config, error) {
@@ -41,6 +44,9 @@ func Load() (*Config, error) {
 		PolicyServiceURL:           getEnvOrDefault("POLICY_SERVICE_URL", "http://policy-svc:8085"),
 		PayableOpenItemServiceURL:  getEnvOrDefault("PAYABLE_OPEN_ITEM_SERVICE_URL", "http://payable-open-item-svc:8164"),
 		ReceiptRequiredThreshold:   getEnvFloatOrDefault("RECEIPT_REQUIRED_THRESHOLD", 25.0),
+
+		ConfigFeatureFlagServiceURL: getEnvOrDefault("CONFIG_FEATURE_FLAG_SERVICE_URL", "http://configuration-feature-flag-svc:8086"),
+		Environment:                 getEnvOrDefault("ENVIRONMENT", "production"),
 	}, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/expense-claim-svc/internal/authz"
+	"zoiko.io/expense-claim-svc/internal/configflag"
 	"zoiko.io/expense-claim-svc/internal/documentvault"
 	"zoiko.io/expense-claim-svc/internal/domain"
 	"zoiko.io/expense-claim-svc/internal/employeemaster"
@@ -165,6 +166,25 @@ func (p *stubPayable) CreatePayableFromApprovedSource(_ context.Context, _, _ st
 
 var _ payableopenitem.Client = (*stubPayable)(nil)
 
+// ── stub configuration-feature-flag-svc client ──────────────────────────────
+
+// stubConfigFlags defaults to "no override found," so every pre-existing
+// test keeps exercising only the static handler.Config.ReceiptRequiredThreshold
+// fallback, exactly as before this integration existed.
+type stubConfigFlags struct {
+	threshold float64
+	found     bool
+	err       error
+	calls     int
+}
+
+func (c *stubConfigFlags) ResolveReceiptThreshold(_ context.Context, _, _ string) (float64, bool, error) {
+	c.calls++
+	return c.threshold, c.found, c.err
+}
+
+var _ configflag.Client = (*stubConfigFlags)(nil)
+
 // ── test harness ─────────────────────────────────────────────────────────────
 
 const testTenant = "tenant-ap07-1"
@@ -172,8 +192,12 @@ const testLegalEntity = "le-ap07-1"
 const testClaimant = "principal-claimant"
 
 func newTestRouterWithPayable(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy, payable *stubPayable) chi.Router {
+	return newTestRouterFull(st, pub, az, emp, docs, tx, pol, payable, &stubConfigFlags{})
+}
+
+func newTestRouterFull(st *stubStore, pub *stubPublisher, az *stubAuthz, emp *stubEmployee, docs *stubDocs, tx *stubTax, pol *stubPolicy, payable *stubPayable, cf *stubConfigFlags) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, emp, docs, tx, pol, payable, handler.Config{ReceiptRequiredThreshold: 25.0}, logger)
+	h := handler.New(st, pub, az, emp, docs, tx, pol, payable, cf, handler.Config{ReceiptRequiredThreshold: 25.0, Environment: "test"}, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -436,6 +460,65 @@ func TestApproveExpenseClaim_OverThresholdNoReceipt_Blocked(t *testing.T) {
 	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 missing required receipt, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestApproveExpenseClaim_ConfigRegistryLowersThreshold_Blocks proves the
+// registry override actually takes effect, not just that it's consulted:
+// a $15 line has no receipt and would clear the static 25.0 default, but
+// a tenant-specific 10.0 override from configuration-feature-flag-svc
+// must block it instead.
+func TestApproveExpenseClaim_ConfigRegistryLowersThreshold_Blocks(t *testing.T) {
+	emp := newStubEmployee()
+	cf := &stubConfigFlags{threshold: 10.0, found: true}
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, &stubPayable{}, cf)
+	c := createClaim(t, r, emp)
+	addLine(t, r, c.ClaimID, newLineReq(15)) // under the static 25.0 default, over a 10.0 override
+	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+
+	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 — the 10.0 tenant override should have blocked this, got %d: %s", w.Code, w.Body.String())
+	}
+	if cf.calls == 0 {
+		t.Fatalf("expected the configuration-feature-flag-svc client to actually be consulted")
+	}
+}
+
+// TestApproveExpenseClaim_ConfigRegistryRaisesThreshold_Allows is the
+// mirror: a $100 line has no receipt and would be blocked by the static
+// 25.0 default (see TestApproveExpenseClaim_OverThresholdNoReceipt_Blocked
+// above), but a 200.0 tenant override must let it through.
+func TestApproveExpenseClaim_ConfigRegistryRaisesThreshold_Allows(t *testing.T) {
+	emp := newStubEmployee()
+	cf := &stubConfigFlags{threshold: 200.0, found: true}
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, &stubPayable{}, cf)
+	c := createClaim(t, r, emp)
+	addLine(t, r, c.ClaimID, newLineReq(100))
+	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+
+	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 — the 200.0 tenant override should have allowed this, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestApproveExpenseClaim_ConfigRegistryUnavailable_FallsBackToStaticDefault
+// confirms this integration fails OPEN, not closed — unlike the
+// kill-switch integration, a config-lookup outage must not block claim
+// approval; it falls back to the static default exactly as if the
+// registry had never been wired in at all.
+func TestApproveExpenseClaim_ConfigRegistryUnavailable_FallsBackToStaticDefault(t *testing.T) {
+	emp := newStubEmployee()
+	cf := &stubConfigFlags{err: configflag.ErrServiceUnavailable}
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, emp, newStubDocs(), &stubTax{}, &stubPolicy{}, &stubPayable{}, cf)
+	c := createClaim(t, r, emp)
+	addLine(t, r, c.ClaimID, newLineReq(100)) // over the static 25.0 default
+	doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/submit", nil, testTenant, testClaimant)
+
+	w := doRequestAs(r, http.MethodPost, "/ap07/expense-claims/"+c.ClaimID+"/approve", nil, testTenant, "principal-approver")
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 from the static default despite the registry being unreachable, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
