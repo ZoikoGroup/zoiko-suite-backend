@@ -633,6 +633,49 @@ func (c *Clients) UploadCloseEvidence(ctx context.Context, tenantID, legalEntity
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", principalID) // the creator recorded on the document
 	req.Header.Set("X-Tenant-Id", tenantID)       // tenant scope, as every other call here sends
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	// document-vault-svc validates the same canonical envelope contract this
+	// service does and answers 400 envelope_incomplete without it — and because
+	// every non-2xx below maps to ErrVaultServiceUnavailable, a missing header
+	// surfaced as a 503 blaming the vault for a fault in this client, so the
+	// close died at its final step with nothing wrong downstream. Same defect
+	// and same fix as the authorization-svc call above.
+	//
+	// The values are the CALLER's, taken from the envelope the middleware
+	// already parsed into this request's context. Minting fresh ones would
+	// satisfy the contract and lose the only thing it is for: close evidence
+	// traceable to the close that produced it.
+	vaultRequestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	vaultSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.RequestID != "" {
+			vaultRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			vaultSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	if req.Header.Get("X-Correlation-ID") == "" {
+		req.Header.Set("X-Correlation-ID", vaultRequestID)
+	}
+	req.Header.Set("X-Request-Id", vaultRequestID)
+	req.Header.Set("X-Source-Channel", vaultSourceChannel)
+	// The trial balance is governed financial content, so the vault requires a
+	// stated reason for access before it will hold it.
+	req.Header.Set("X-Purpose-Context", "financial_close_evidence")
+	// One evidence document per (close attempt, period): a retry of the SAME
+	// close must not file a second trial balance, while a genuinely new attempt
+	// carries a new request id and is a distinct document.
+	req.Header.Set("Idempotency-Key", vaultRequestID+":close-evidence:"+periodName)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -642,6 +685,9 @@ func (c *Clients) UploadCloseEvidence(ctx context.Context, tenantID, legalEntity
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		// The status is logged because the two failure modes need different
+		// responses and the error type alone cannot tell them apart: a 4xx is a
+		// fault in this request, a 5xx is the vault genuinely being down.
 		c.log.Error("document-vault-svc returned non-200/201 status", zap.Int("status", resp.StatusCode))
 		return "", domain.ErrVaultServiceUnavailable
 	}
