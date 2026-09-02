@@ -18,6 +18,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/handler"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
 	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
+	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 )
 
 // tenant_id and legal_entity_id are uuid columns, so the fixtures are UUIDs —
@@ -130,23 +131,38 @@ func (p *stubPO) Verify(_ context.Context, _, _, _, _ string) (*purchaseorder.Pu
 	return p.po, p.err
 }
 
+// stubPayables is a stub payable-open-item-svc (AP-08) client — see
+// internal/payableopenitem's package doc.
+type stubPayables struct {
+	fail  bool
+	calls int
+}
+
+func (p *stubPayables) CreatePayableFromApprovedSource(_ context.Context, _, _ string, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
+	p.calls++
+	if p.fail {
+		return nil, payableopenitem.ErrPayableServiceUnavailable
+	}
+	return &payableopenitem.PayableOpenItem{PayableID: "payable-" + req.SourceReference, Status: "OPEN"}, nil
+}
+
 // newRouter mounts TenantContext, which the real server mounts in
 // cmd/server/main.go. It used to be omitted, so every handler under test saw an
 // empty tenant scope and fell back to the query parameter or the body — the very
 // behaviour these tests are supposed to be checking. A handler harness must
 // mount the middleware the handler depends on.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ) chi.Router {
-	return newRouterPO(s, p, a, &stubPO{})
+	return newRouterWith(s, p, a, &stubPO{}, &stubPayables{})
 }
 
-// newRouterPO is newRouter with the purchase-order verifier made explicit, for
-// the tests that key an invoice against a PO. The two are separate so that the
-// tests which never set purchase_order_id — the large majority, which never
-// reach Verify at all — do not each have to name a stub they do not use.
-func newRouterPO(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO) chi.Router {
+// newRouterWith is newRouter with both downstream stubs made explicit. Most
+// tests never set purchase_order_id and never reach Verify, and most never
+// post an open item either, so they should not each have to name stubs they
+// do not use — hence the two thin wrappers below.
+func newRouterWith(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO, payables *stubPayables) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, a, po, zap.NewNop())
+	h := handler.New(s, p, a, po, payables, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -528,6 +544,50 @@ func TestApproveInvoice_FromValidated_Succeeds(t *testing.T) {
 	}
 }
 
+// TestApproveInvoice_CreatesRealAP08Payable is the first real consumer
+// payable-open-item-svc (AP-08) has ever had for a vendor invoice — AP-08
+// previously only had expense-claim-svc as a real source.
+func TestApproveInvoice_CreatesRealAP08Payable(t *testing.T) {
+	s := newStubStore()
+	s.invoices["i1"] = &domain.VendorInvoice{
+		InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, VendorID: "vendor-1",
+		Amount: 500, CurrencyCode: "USD", DueDate: time.Now().UTC().Add(30 * 24 * time.Hour),
+		Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator",
+	}
+
+	payables := &stubPayables{}
+	r := newRouterWithPay(s, &stubPublisher{}, &stubAuthZ{}, payables)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/approve", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if payables.calls != 1 {
+		t.Fatalf("expected exactly one real CreatePayableFromApprovedSource call to AP-08, got %d", payables.calls)
+	}
+}
+
+// TestApproveInvoice_AP08Unavailable_ApprovalStillStands verifies the AP-08
+// call is genuinely best-effort — mirroring expense-claim-svc's own
+// doctrine — and never undoes an approval that already succeeded.
+func TestApproveInvoice_AP08Unavailable_ApprovalStillStands(t *testing.T) {
+	s := newStubStore()
+	s.invoices["i1"] = &domain.VendorInvoice{
+		InvoiceID: "i1", TenantID: tenantA, LegalEntityID: entityA, VendorID: "vendor-1",
+		Amount: 500, CurrencyCode: "USD", DueDate: time.Now().UTC().Add(30 * 24 * time.Hour),
+		Status: domain.InvoiceStatusValidated, CreatedByPrincipalID: "principal-creator",
+	}
+
+	payables := &stubPayables{fail: true}
+	r := newRouterWithPay(s, &stubPublisher{}, &stubAuthZ{}, payables)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/approve", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 approval to stand despite AP-08 failure, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.invoices["i1"].Status != domain.InvoiceStatusApproved {
+		t.Fatalf("expected status APPROVED despite AP-08 failure, got %s", s.invoices["i1"].Status)
+	}
+}
+
 func TestApproveInvoice_BySameCreator_Returns403(t *testing.T) {
 	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
 	// the principal who created the invoice may not be the one approving it.
@@ -741,7 +801,7 @@ func poInvoiceBody(poID string) string {
 }
 
 func TestCreateInvoice_PurchaseOrderUnknown_Rejected(t *testing.T) {
-	r := newRouterPO(newStubStore(), &stubPublisher{}, &stubAuthZ{},
+	r := newRouterWithPO(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		&stubPO{err: domain.ErrPurchaseOrderUnknown})
 
 	rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", poInvoiceBody("po-1"), "principal-1")
@@ -755,7 +815,7 @@ func TestCreateInvoice_PurchaseOrderUnknown_Rejected(t *testing.T) {
 }
 
 func TestCreateInvoice_PurchaseOrderClosed_Rejected(t *testing.T) {
-	r := newRouterPO(newStubStore(), &stubPublisher{}, &stubAuthZ{},
+	r := newRouterWithPO(newStubStore(), &stubPublisher{}, &stubAuthZ{},
 		&stubPO{err: domain.ErrPurchaseOrderClosed})
 
 	rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", poInvoiceBody("po-1"), "principal-1")
@@ -774,7 +834,7 @@ func TestCreateInvoice_PurchaseOrderClosed_Rejected(t *testing.T) {
 func TestCreateInvoice_PurchaseOrderUnverifiable_FailsClosed(t *testing.T) {
 	store := newStubStore()
 	pub := &stubPublisher{}
-	r := newRouterPO(store, pub, &stubAuthZ{}, &stubPO{err: errors.New("dial tcp: connection refused")})
+	r := newRouterWithPO(store, pub, &stubAuthZ{}, &stubPO{err: errors.New("dial tcp: connection refused")})
 
 	rec := doRawRequest(r, http.MethodPost, "/v1/invoices/", poInvoiceBody("po-1"), "principal-1")
 
@@ -792,7 +852,7 @@ func TestCreateInvoice_PurchaseOrderUnverifiable_FailsClosed(t *testing.T) {
 // The PO's supplier identifier is recorded on the invoice, not enforced against
 // vendor_id: the two identifiers are not known to share a space.
 func TestCreateInvoice_PurchaseOrderVerified_RecordsVendorProfile(t *testing.T) {
-	r := newRouterPO(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubPO{
+	r := newRouterWithPO(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubPO{
 		po: &purchaseorder.PurchaseOrder{
 			PurchaseOrderID: "po-1",
 			TenantID:        tenantA,
@@ -817,4 +877,14 @@ func TestCreateInvoice_PurchaseOrderVerified_RecordsVendorProfile(t *testing.T) 
 	if *got.POVendorProfileID != "vendor-profile-9" {
 		t.Fatalf("po_vendor_profile_id = %q, want vendor-profile-9", *got.POVendorProfileID)
 	}
+}
+
+// newRouterWithPO keys an invoice against a purchase order (AP-05).
+func newRouterWithPO(s *stubStore, p *stubPublisher, a *stubAuthZ, po *stubPO) chi.Router {
+	return newRouterWith(s, p, a, po, &stubPayables{})
+}
+
+// newRouterWithPay exercises the AP-08 open-item posting path.
+func newRouterWithPay(s *stubStore, p *stubPublisher, a *stubAuthZ, payables *stubPayables) chi.Router {
+	return newRouterWith(s, p, a, &stubPO{}, payables)
 }

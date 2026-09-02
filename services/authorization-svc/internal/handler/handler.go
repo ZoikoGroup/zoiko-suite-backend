@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -30,6 +31,14 @@ type AuthorizationStore interface {
 	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 	FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
+	// Satya's own-object Segregation-of-Duties check (ef4cc2c), kept as-is.
+	CheckOwnObjectSoD(ctx context.Context, actionType, tenantID string) (bool, error)
+
+	// TENANT-SCOPED SIGNATURES, DELIBERATELY. main carried the pre-f931093
+	// shapes: RecordAccessDecision took positional args and FindAccessDecisionByID
+	// took no tenant at all. Taking main's side here compiles perfectly and
+	// silently reverts the cross-tenant fix — a tenant-wide assignment in tenant A
+	// was granting actions against a legal entity in tenant B.
 	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
 	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
 }
@@ -875,6 +884,15 @@ type authorizeRequest struct {
 	// callers that do not forward X-Tenant-Id yet. See resolveTenantScope:
 	// the header wins, and a body that disagrees with it is refused.
 	TenantID string `json:"tenant_id,omitempty"`
+	// ResourceOwnerPrincipalID is optional: the principal who prepared or
+	// created the specific object action_type is being performed against
+	// (e.g. an invoice's preparer), supplied by the calling service. Until
+	// this field existed there was no resource-attribute input to
+	// /v1/authorize at all — ZS-IAM-001 §10.2's dynamic Segregation-of-
+	// Duties layer ("a preparer cannot approve their own object") had
+	// nothing to evaluate against. Omitting it preserves today's
+	// behavior: no own-object check is attempted.
+	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
 }
 
 type authorizeResponse struct {
@@ -890,8 +908,16 @@ type authorizeResponse struct {
 //     in legal_entity_id?
 //  2. Delegated access — if not, does the principal have an active
 //     delegation from someone who holds that grant?
-//  3. SoD — if granted by either layer, does granting it conflict with
-//     anything else the principal already holds (RBAC ∪ delegated)?
+//  3. Static SoD — if granted by either layer, does granting it conflict
+//     with anything else the principal already holds (RBAC ∪ delegated)?
+//  4. Dynamic (own-object) SoD — if still granted, and the caller supplied
+//     ResourceOwnerPrincipalID, does the principal own the object they are
+//     acting on, for an action_type a data-declared rule forbids
+//     self-performing? ZS-IAM-001 §10.2's example: a preparer cannot
+//     approve their own object. This is independent of layer 3 — it is
+//     one action against one object's ownership, not a pair of actions
+//     held simultaneously — so it needs its own store query
+//     (CheckOwnObjectSoD) rather than reusing CheckSoDConflict.
 //
 // Every evaluation — grant or deny — is written to access_decision_log
 // before the response is returned (critical constraint: no material action
@@ -899,8 +925,9 @@ type authorizeResponse struct {
 // denial, never a silent allow (fail-closed) — see the deferred-write
 // comment below for the one exception, which is documented, not silent.
 //
-// ABAC is deliberately not implemented in v1 — no attribute-condition
-// rules exist anywhere in the architecture docs to encode; see progress.md.
+// Full attribute-condition ABAC beyond the own-object case is deliberately
+// not implemented in v1 — no other attribute-condition rules exist
+// anywhere in the architecture docs to encode; see progress.md.
 //
 // The tenant scope of the evaluation comes from the verified X-Tenant-Id
 // header when the caller sends one — see resolveTenantScope for why that
@@ -1037,6 +1064,24 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		} else {
 			outcome = "GRANTED"
 		}
+
+		// Dynamic (own-object) SoD: only reachable once static SoD has
+		// already granted, and only evaluated when the caller supplied a
+		// resource owner — a request with no ResourceOwnerPrincipalID has
+		// nothing to compare against and behaves exactly as before this
+		// layer existed.
+		if outcome == "GRANTED" && req.ResourceOwnerPrincipalID != "" && req.ResourceOwnerPrincipalID == req.PrincipalID {
+			isOwnObjectForbidden, err := h.store.CheckOwnObjectSoD(r.Context(), req.ActionType, req.TenantID)
+			if err != nil {
+				h.log.Error("Authorize: store unavailable (own-object sod check)", zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+			if isOwnObjectForbidden {
+				outcome = "DENIED"
+				basis = "sod:own_object_forbidden"
+			}
+		}
 	}
 
 	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
@@ -1068,14 +1113,23 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		// mutating request platform-wide), and streaming every success would
 		// bury the actionable signal in noise rather than surface it.
 		severity := siem.SeverityMedium
-		isSoD := len(basis) > len("sod:conflict_with=") && basis[:len("sod:conflict_with=")] == "sod:conflict_with="
+		// Any "sod:" basis is a SoD violation now, not just the static
+		// conflict_with= shape — own-object denials share the same prefix
+		// convention so they get the same elevated severity and event.
+		isSoD := strings.HasPrefix(basis, "sod:")
 		if isSoD {
 			severity = siem.SeverityHigh
 		}
 		h.siem.Stream(r.Context(), tenantScope, "authorization.denied", severity,
 			"Authorization denied for principal "+req.PrincipalID+", action "+req.ActionType+": "+basis)
 		if isSoD {
-			conflictingAction := basis[len("sod:conflict_with="):]
+			// conflict_with= names the other held action; an own-object
+			// denial has no "other action" — the conflict is the action
+			// itself against a resource the principal also owns.
+			conflictingAction := req.ActionType
+			if strings.HasPrefix(basis, "sod:conflict_with=") {
+				conflictingAction = basis[len("sod:conflict_with="):]
+			}
 			if pubErr := h.publisher.PublishSoDViolationDetected(r.Context(), *decision, conflictingAction); pubErr != nil {
 				h.log.Error("Authorize: failed to publish sod.violation.detected", zap.String("correlation_id", correlationID), zap.Error(pubErr))
 			}

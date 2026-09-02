@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -57,6 +58,37 @@ func populateAliases(conn *domain.BankConnection) {
 	if conn.IBAN == "" {
 		conn.IBAN = conn.AccountNumber
 	}
+}
+
+// maskDigits keeps only the last 4 characters of a bank identifier visible,
+// replacing everything before them with "*". A value of 4 characters or
+// fewer is masked entirely rather than left in the clear.
+func maskDigits(s string) string {
+	if s == "" {
+		return s
+	}
+	if len(s) <= 4 {
+		return strings.Repeat("*", len(s))
+	}
+	return strings.Repeat("*", len(s)-4) + s[len(s)-4:]
+}
+
+// maskSensitiveFields redacts AccountNumber and IBAN before a connection is
+// returned from a read path (get-by-id, list) that a principal other than
+// the one who submitted the number may reach. The master register's
+// ZS-SVC-F-001-derived invariant #2 forbids these fields appearing in the
+// clear in list/read APIs. CreateConnection's own response is left
+// unmasked deliberately: that response echoes the value back to the same
+// caller who just submitted it, so masking it there would create no
+// security benefit while breaking any client that expects to see what it
+// sent. The underlying stored value is never touched — only the copy
+// serialized onto the wire here.
+func maskSensitiveFields(conn *domain.BankConnection) {
+	if conn == nil {
+		return
+	}
+	conn.AccountNumber = maskDigits(conn.AccountNumber)
+	conn.IBAN = maskDigits(conn.IBAN)
 }
 
 func (h *Handler) CreateConnection(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +163,7 @@ func (h *Handler) GetConnectionByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	populateAliases(conn)
+	maskSensitiveFields(conn)
 	writeJSON(w, http.StatusOK, conn)
 }
 
@@ -143,6 +176,7 @@ func (h *Handler) ListConnections(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range conns {
 		populateAliases(&conns[i])
+		maskSensitiveFields(&conns[i])
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"connections": conns,

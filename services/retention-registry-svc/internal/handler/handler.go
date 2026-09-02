@@ -15,6 +15,7 @@ import (
 	authzpkg "zoiko.io/retention-registry-svc/internal/authz"
 	"zoiko.io/retention-registry-svc/internal/domain"
 	"zoiko.io/retention-registry-svc/internal/events"
+	svcmiddleware "zoiko.io/retention-registry-svc/internal/middleware"
 	"zoiko.io/retention-registry-svc/internal/store"
 )
 
@@ -24,6 +25,7 @@ const (
 	RetentionPolicyCreate = "RETENTION_POLICY_CREATE"
 	LegalHoldCreate       = "LEGAL_HOLD_CREATE"
 	LegalHoldRelease      = "LEGAL_HOLD_RELEASE"
+	LegalHoldRead         = "LEGAL_HOLD_READ"
 )
 
 type AuthzChecker interface {
@@ -48,6 +50,36 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// resolveTenantScope returns the tenant dimension for the resolve read,
+// taken from the verified X-Tenant-Id rather than the caller's query
+// string.
+//
+// Resolve used to read ?tenant_id= directly with no authorization, so any
+// caller could ask what retention rules and — more sensitively — what legal
+// holds applied to any tenant's record class. A hold is evidence of
+// litigation or investigation.
+//
+// A NIL return is legitimate and is NOT the fail-closed case, which makes
+// this service behave like kill-switch-registry-svc rather than
+// evidence-manifest-svc. A nil tenant means "the platform-level question",
+// and under migration 000002's policy a caller with no verified tenant
+// still sees every tenant_id IS NULL row — platform-wide retention rules
+// and platform-wide holds — and nobody's tenant-specific ones. Hiding those
+// is precisely the failure that would permit deleting records under a
+// platform-wide hold, so middleware.TenantContext stays permissive here.
+//
+// A ?tenant_id= that disagrees with the verified header is refused rather
+// than ignored.
+func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, declared string) (*string, bool) {
+	verified := svcmiddleware.TenantFromContext(r.Context())
+	if declared != "" && declared != verified {
+		writeError(w, http.StatusForbidden,
+			"tenant_id does not match the verified X-Tenant-Id")
+		return nil, false
+	}
+	return strPtrOrNil(verified), true
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, tenantID, actionType string) bool {
@@ -205,8 +237,19 @@ func (h *Handler) CreateLegalHold(w http.ResponseWriter, r *http.Request) {
 // is the RELEASE that is privileged. Widening that to a per-read grant is a
 // defensible position, but it is a policy change rather than a defect fix and
 // would need the grant seeding to change with it.
+//
+// BOTH GATES ARE NOW PRESENT. The read is scoped to the caller's verified
+// tenant in the store, and it is additionally authorized against LEGAL_HOLD_READ
+// for the hold's own tenant. The tenant scope answers "whose hold is this"; the
+// action grant answers "may this principal read holds at all". Fetch-then-
+// authorize, in that order and matching ReleaseLegalHold: the store already
+// refuses another tenant's hold with the same ErrLegalHoldNotFound a genuinely
+// absent id produces, so authorizing against a caller-supplied scope first would
+// let a caller nominate an entity they hold a grant for and probe for holds
+// outside it.
 func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 	tenantID, ok := h.requireTenant(w, r)
@@ -228,6 +271,15 @@ func (h *Handler) GetLegalHold(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to get legal hold")
 		return
 	}
+
+	scope := ""
+	if hld.TenantID != nil {
+		scope = *hld.TenantID
+	}
+	if !h.authorize(w, r, principalID, scope, LegalHoldRead) {
+		return
+	}
+
 	writeJSON(w, http.StatusOK, hld)
 }
 
@@ -469,8 +521,12 @@ func (h *Handler) Resolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jurisdictionCode := strPtrOrNil(q.Get("jurisdiction_code"))
-	tenantID := strPtrOrNil(q.Get("tenant_id"))
 	entityRef := strPtrOrNil(q.Get("entity_ref"))
+
+	tenantID, ok := h.resolveTenantScope(w, r, q.Get("tenant_id"))
+	if !ok {
+		return
+	}
 
 	result, err := h.store.Resolve(r.Context(), recordClass, jurisdictionCode, tenantID, entityRef)
 	if err != nil {

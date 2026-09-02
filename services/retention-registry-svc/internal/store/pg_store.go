@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/retention-registry-svc/internal/domain"
+	svcmiddleware "zoiko.io/retention-registry-svc/internal/middleware"
 )
 
 type Store interface {
@@ -38,6 +39,41 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 	return &PgStore{pool: pool}
 }
 
+// withTenant runs fn inside a transaction with app.tenant_id set from the
+// request context, so migration 000002's policies have a value to enforce
+// against.
+//
+// A transaction is required rather than incidental: set_config's third
+// argument is is_local, and only a transaction-local setting is safe on a
+// pooled connection. Setting it session-wide would leak one request's
+// tenant into whichever request acquires that connection next.
+//
+// The tenant comes from context (set by middleware.TenantContext from a
+// gateway-verified X-Tenant-Id) and never from a query parameter, which is
+// where Resolve used to take it. It returns "" when absent, and "" is
+// meaningful HERE rather than merely fail-closed: under migration 000002's
+// policy, "" matches no tenant-specific row but still matches every
+// tenant_id IS NULL row. That is the correct answer to a platform-level
+// retention question — see the policy header for why hiding those rows
+// would permit deletion of records under a platform-wide hold.
+func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx),
+	); err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // ── retention_policies ───────────────────────────────────────────────────────
 
 const policyColumns = `
@@ -58,16 +94,19 @@ func scanPolicy(row pgx.Row) (*domain.RetentionPolicy, error) {
 }
 
 func (s *PgStore) CreateRetentionPolicy(ctx context.Context, p *domain.RetentionPolicy) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO retention_policies (
-			retention_policy_id, record_class, jurisdiction_code, tenant_id,
-			min_retention_days, max_retention_days, legal_regulatory_basis,
-			source_rights_basis, privacy_basis, effective_from, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`, p.RetentionPolicyID, p.RecordClass, p.JurisdictionCode, p.TenantID,
-		p.MinRetentionDays, p.MaxRetentionDays, p.LegalRegulatoryBasis,
-		p.SourceRightsBasis, p.PrivacyBasis, p.EffectiveFrom, p.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO retention_policies (
+				retention_policy_id, record_class, jurisdiction_code, tenant_id,
+				min_retention_days, max_retention_days, legal_regulatory_basis,
+				source_rights_basis, privacy_basis, effective_from, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, p.RetentionPolicyID, p.RecordClass, p.JurisdictionCode, p.TenantID,
+			p.MinRetentionDays, p.MaxRetentionDays, p.LegalRegulatoryBasis,
+			p.SourceRightsBasis, p.PrivacyBasis, p.EffectiveFrom, p.CreatedByPrincipalID,
+		)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("insert retention policy: %w", err)
 	}
@@ -92,8 +131,12 @@ func (s *PgStore) FindApplicableRetentionPolicy(ctx context.Context, recordClass
 			effective_from DESC
 		LIMIT 1;`
 
-	row := s.pool.QueryRow(ctx, query, recordClass, jurisdictionCode, tenantID)
-	p, err := scanPolicy(row)
+	var p *domain.RetentionPolicy
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		p, scanErr = scanPolicy(tx.QueryRow(ctx, query, recordClass, jurisdictionCode, tenantID))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -136,14 +179,22 @@ func (s *PgStore) CreateLegalHold(ctx context.Context, h *domain.LegalHold) erro
 	if err != nil {
 		return fmt.Errorf("marshal custodians_objects: %w", err)
 	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO legal_holds (
-			legal_hold_id, scope_description, custodians_objects, authority,
-			record_class, tenant_id, entity_ref, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, h.LegalHoldID, h.ScopeDescription, custodiansJSON, h.Authority,
-		h.RecordClass, h.TenantID, h.EntityRef, h.CreatedByPrincipalID,
-	)
+	// A platform-wide hold (tenant_id NULL) passes WITH CHECK for any
+	// caller, and that is the SAFE direction of this asymmetry: an
+	// unauthorized extra hold blocks a deletion, it never permits one. The
+	// dangerous operation is release, and release is authz-gated against
+	// the hold's own tenant. See migration 000002's header.
+	err = s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO legal_holds (
+				legal_hold_id, scope_description, custodians_objects, authority,
+				record_class, tenant_id, entity_ref, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`, h.LegalHoldID, h.ScopeDescription, custodiansJSON, h.Authority,
+			h.RecordClass, h.TenantID, h.EntityRef, h.CreatedByPrincipalID,
+		)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("insert legal hold: %w", err)
 	}
@@ -152,21 +203,27 @@ func (s *PgStore) CreateLegalHold(ctx context.Context, h *domain.LegalHold) erro
 
 // FindLegalHoldByID returns one hold, scoped to the caller's verified tenant.
 //
-// THE TENANT PREDICATE IS NEW AND IT IS THE POINT. This query was
-// `WHERE legal_hold_id = $1` and the handler above it required no principal at
-// all, so anything that could reach the port could read any hold in any tenant
-// by id. What a hold discloses is not incidental: `authority` names the court or
-// regulator that ordered the freeze, `scope_description` describes the matter,
-// and `custodians_objects` lists the people and systems holding the evidence.
-// That is the existence and subject of another tenant's legal proceeding.
+// THE TENANT PREDICATE IS THE POINT. This query was `WHERE legal_hold_id = $1`
+// and the handler above it required no principal at all, so anything that could
+// reach the port could read any hold in any tenant by id. What a hold discloses
+// is not incidental: `authority` names the court or regulator that ordered the
+// freeze, `scope_description` describes the matter, and `custodians_objects`
+// lists the people and systems holding the evidence. That is the existence and
+// subject of another tenant's legal proceeding.
 //
 // Platform-wide holds (tenant_id IS NULL) stay readable by every tenant, because
 // they apply to every tenant — a caller unable to see the hold freezing its own
 // records would conclude deletion was safe.
 //
 // A hold belonging to another tenant answers ErrLegalHoldNotFound rather than a
-// forbidden, so a probe cannot confirm that an id exists. The same posture
-// tenant-entity-registry-svc adopted for the same reason.
+// forbidden, so a probe cannot confirm that an id exists.
+//
+// TWO GATES, AND NEITHER IS REDUNDANT. The predicate is in the SQL *and* the
+// read runs inside withTenant so migration 000002's policy applies too. The
+// policy binds app_retention_registry on Supabase and binds nothing at all on
+// the compose estate, where services connect as the Postgres superuser and a
+// superuser bypasses row security unconditionally. A predicate-only fix leaves
+// the policy unexercised; a policy-only fix leaves compose wide open.
 func (s *PgStore) FindLegalHoldByID(ctx context.Context, id, callerTenantID string) (*domain.LegalHold, error) {
 	if callerTenantID == "" {
 		return nil, domain.ErrTenantMissing
@@ -178,8 +235,12 @@ func (s *PgStore) FindLegalHoldByID(ctx context.Context, id, callerTenantID stri
 		WHERE legal_hold_id = $1
 		  AND (tenant_id IS NULL OR tenant_id = $2::uuid);`
 
-	row := s.pool.QueryRow(ctx, query, id, callerTenantID)
-	h, err := scanHold(row)
+	var h *domain.LegalHold
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		h, scanErr = scanHold(tx.QueryRow(ctx, query, id, callerTenantID))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, domain.ErrLegalHoldNotFound
 	}
@@ -311,8 +372,12 @@ func (s *PgStore) ReleaseLegalHold(ctx context.Context, id, callerTenantID, rele
 		  AND (tenant_id IS NULL OR tenant_id = $4::uuid)
 		RETURNING ` + holdColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query, releasedBy, releaseApprovedBy, id, callerTenantID)
-	h, err := scanHold(row)
+	var h *domain.LegalHold
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		h, scanErr = scanHold(tx.QueryRow(ctx, query, releasedBy, releaseApprovedBy, id, callerTenantID))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		if _, findErr := s.FindLegalHoldByID(ctx, id, callerTenantID); findErr != nil {
 			return nil, findErr
@@ -341,8 +406,12 @@ func (s *PgStore) FindActiveHoldForScope(ctx context.Context, recordClass, tenan
 			started_at DESC
 		LIMIT 1;`
 
-	row := s.pool.QueryRow(ctx, query, recordClass, tenantID, entityRef)
-	h, err := scanHold(row)
+	var h *domain.LegalHold
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		h, scanErr = scanHold(tx.QueryRow(ctx, query, recordClass, tenantID, entityRef))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

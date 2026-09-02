@@ -14,6 +14,7 @@ import (
 	authzpkg "zoiko.io/kill-switch-registry-svc/internal/authz"
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
 	"zoiko.io/kill-switch-registry-svc/internal/events"
+	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
 	"zoiko.io/kill-switch-registry-svc/internal/store"
 )
 
@@ -49,6 +50,37 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// resolveTenantScope returns the tenant dimension for a read, taken from
+// the verified X-Tenant-Id rather than from the caller's query string.
+//
+// Both read routes used to read ?tenant_id= directly, so any caller could
+// ask about any tenant: whether that tenant's commercial charging had been
+// stopped, whether its automation was halted, and the reason text on the
+// event. During an incident that is a live feed of another customer's
+// operational trouble.
+//
+// A NIL return is legitimate here and is NOT the fail-closed case, which
+// makes this different from every other service in this sweep. A nil tenant
+// means "resolve the platform-level question", and under migration 000002's
+// policy a caller with no verified tenant still sees every tenant_id IS
+// NULL row — the platform-wide switches — and nobody's tenant-specific
+// ones. That is the correct answer to the platform-level question, and it
+// is why middleware.TenantContext here does not refuse tenant-less
+// requests the way evidence-manifest-svc's does.
+//
+// A ?tenant_id= that disagrees with the verified header is refused rather
+// than ignored, so a caller asking about someone else gets an error instead
+// of a silently reinterpreted answer about itself.
+func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, declared string) (*string, bool) {
+	verified := svcmiddleware.TenantFromContext(r.Context())
+	if declared != "" && declared != verified {
+		writeError(w, http.StatusForbidden,
+			"tenant_id does not match the verified X-Tenant-Id")
+		return nil, false
+	}
+	return strPtrOrNil(verified), true
 }
 
 // authorize checks actionType against tenantID's scope if given, otherwise
@@ -214,7 +246,11 @@ func (h *Handler) ResolveKillSwitch(w http.ResponseWriter, r *http.Request) {
 	plane := strPtrOrNil(q.Get("plane"))
 	domainName := strPtrOrNil(q.Get("domain"))
 	providerCode := strPtrOrNil(q.Get("provider_code"))
-	tenantID := strPtrOrNil(q.Get("tenant_id"))
+
+	tenantID, ok := h.resolveTenantScope(w, r, q.Get("tenant_id"))
+	if !ok {
+		return
+	}
 
 	result, err := h.store.ResolveKillSwitch(r.Context(), plane, domainName, providerCode, tenantID)
 	if err != nil {
@@ -247,7 +283,11 @@ func (h *Handler) ListHistoryForScope(w http.ResponseWriter, r *http.Request) {
 	plane := strPtrOrNil(q.Get("plane"))
 	domainName := strPtrOrNil(q.Get("domain"))
 	providerCode := strPtrOrNil(q.Get("provider_code"))
-	tenantID := strPtrOrNil(q.Get("tenant_id"))
+
+	tenantID, ok := h.resolveTenantScope(w, r, q.Get("tenant_id"))
+	if !ok {
+		return
+	}
 
 	history, err := h.store.ListHistoryForScope(r.Context(), plane, domainName, providerCode, tenantID)
 	if err != nil {

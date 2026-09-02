@@ -131,8 +131,12 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 	runRec := httptest.NewRecorder()
 	router.ServeHTTP(runRec, runReq)
 
-	if runRec.Code != http.StatusCreated {
-		t.Fatalf("expected 201 Created on run, got %d: %s", runRec.Code, runRec.Body.String())
+	// 202, not 201: the run is recorded, not completed. There is no real
+	// cross-service aggregation in this service (see
+	// domain.OrchestratReportRun) — claiming 201/COMPLETED with a fabricated
+	// row count was the fabrication removed by this fix.
+	if runRec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 Accepted on run (recorded, not completed), got %d: %s", runRec.Code, runRec.Body.String())
 	}
 
 	var run domain.ReportRun
@@ -142,14 +146,14 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 	if run.ID == "" {
 		t.Fatal("expected non-empty run ID")
 	}
-	if run.Status != domain.RunStatusCompleted {
-		t.Fatalf("expected run status COMPLETED, got %s", run.Status)
+	if run.Status != domain.RunStatusNotImplemented {
+		t.Fatalf("FABRICATION: expected run status NOT_IMPLEMENTED (honest — no real aggregation exists), got %s", run.Status)
 	}
-	if run.RowCount == 0 {
-		t.Fatal("expected non-zero row_count after orchestration")
+	if run.RowCount != 0 {
+		t.Fatalf("FABRICATION: expected row_count 0 (nothing was aggregated), got %d", run.RowCount)
 	}
-	if run.OutputLocation == "" {
-		t.Fatal("expected non-empty output_location")
+	if run.OutputLocation != "" {
+		t.Fatalf("FABRICATION: expected no output_location (nothing was written), got %q", run.OutputLocation)
 	}
 
 	// 5. Get Run by ID

@@ -89,8 +89,12 @@ func TestListSubmissions_NoFilter_DoesNotLeakOtherTenants(t *testing.T) {
 	fReq.Header.Set("X-Principal-Id", "principal-01")
 	fW := httptest.NewRecorder()
 	r.ServeHTTP(fW, fReq)
-	if fW.Code != http.StatusCreated && fW.Code != http.StatusAccepted {
-		t.Fatalf("submit filing: expected 201/202, got %d: %s", fW.Code, fW.Body.String())
+	// 202 only, now that this endpoint records the filing honestly (PENDING,
+	// no fabricated ack) instead of claiming a transmission that never
+	// happened. This assertion used to tolerate 201 too, which is how the
+	// fabricated-success defect passed unnoticed.
+	if fW.Code != http.StatusAccepted {
+		t.Fatalf("submit filing: expected 202, got %d: %s", fW.Code, fW.Body.String())
 	}
 
 	// Tenant B lists filings with no filter at all — the exact call that leaked.

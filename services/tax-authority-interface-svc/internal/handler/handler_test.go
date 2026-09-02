@@ -86,7 +86,11 @@ func TestTaxAuthorityFlow(t *testing.T) {
 	subW := httptest.NewRecorder()
 	r.ServeHTTP(subW, subHTTP)
 
-	if subW.Code != http.StatusCreated {
-		t.Fatalf("expected status 201 on filing submit, got %d: %s", subW.Code, subW.Body.String())
+	// 202, not 201: the filing is recorded, not transmitted. No real
+	// transmission mechanism exists in this service (see handler.go), so
+	// claiming 201 Created on the submitted-and-acknowledged resource would
+	// itself be the fabrication this fix removes.
+	if subW.Code != http.StatusAccepted {
+		t.Fatalf("expected status 202 on filing submit (recorded, not transmitted), got %d: %s", subW.Code, subW.Body.String())
 	}
 }

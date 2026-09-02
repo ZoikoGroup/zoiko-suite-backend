@@ -2,6 +2,7 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,8 +14,24 @@ import (
 	"zoiko.io/carta-svc/internal/store"
 )
 
+// stubAuthz is a test double for handler.AuthzChecker. It GRANTS by default
+// so the behavioural tests keep exercising the real path; tests that need the
+// deny or unavailable branch set err.
+type stubAuthz struct {
+	err error
+}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return s.err
+}
+
 func newRouter() http.Handler {
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), zap.NewNop()))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), &stubAuthz{}, zap.NewNop()))
+}
+
+// newRouterWithAuthz is newRouter with an injectable authorization decision.
+func newRouterWithAuthz(az handler.AuthzChecker) http.Handler {
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), az, zap.NewNop()))
 }
 
 func TestHealthCheck(t *testing.T) {
@@ -48,6 +65,7 @@ func TestEvaluateAndListLifecycle(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/carta/evaluate", bytes.NewBuffer(evalBody))
 	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != 201 {
@@ -80,6 +98,7 @@ func TestEvaluateAndListLifecycle(t *testing.T) {
 	req2 := httptest.NewRequest(http.MethodPost, "/v1/carta/evaluate", bytes.NewBuffer(untrustedBody))
 	withEnvelope(req2)
 	req2.Header.Set("X-Tenant-ID", "t1")
+	req2.Header.Set("X-Principal-Id", "principal-test-01")
 	w2 := httptest.NewRecorder()
 	router.ServeHTTP(w2, req2)
 	if w2.Code != 201 {
@@ -92,9 +111,10 @@ func TestEvaluateAndListLifecycle(t *testing.T) {
 	}
 
 	// List
-	req3 := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments?subject_id=USR-77", nil)
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/carta/assessments?legal_entity_id=LE-100&subject_id=USR-77", nil)
 	withEnvelope(req3)
 	req3.Header.Set("X-Tenant-ID", "t1")
+	req3.Header.Set("X-Principal-Id", "principal-test-01")
 	w3 := httptest.NewRecorder()
 	router.ServeHTTP(w3, req3)
 	if w3.Code != 200 {
@@ -107,6 +127,7 @@ func TestValidationErrors(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/carta/evaluate", bytes.NewBuffer(evalBody))
 	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	newRouter().ServeHTTP(w, req)
 	if w.Code != 400 {

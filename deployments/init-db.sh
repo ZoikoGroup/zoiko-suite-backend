@@ -73,6 +73,22 @@ capability_registry:capability-registry
 ai_governance:ai-governance
 kill_switch_registry:kill-switch-registry
 retention_registry:retention-registry
+privacy_purpose_registry:privacy-purpose-registry
+privacy_consent:privacy-consent
+privacy_decision:privacy-decision
+privacy_rights:privacy-rights
+privacy_transfer:privacy-transfer
+supplier_financial_profile:supplier-financial-profile
+goods_service_receipt:goods-service-receipt
+payable_open_item:payable-open-item
+supplier_recovery:supplier-recovery
+payee_banking_identity:payee-banking-identity
+expense_claim:expense-claim
+payment_proposal:payment-proposal
+payment_authorization:payment-authorization
+payment_run:payment-run
+payment_initiation_adapter:payment-initiation-adapter
+payment_status:payment-status
 metric_registry:metric-registry
 source_authority:source-authority
 jurisdiction_rules:jurisdiction-rules
@@ -213,12 +229,13 @@ for db in \
     clause_template commercial_account compensation configuration_feature_flag consolidation_svc \
     contract_lifecycle corporate_actions corporate_tax counterparty_management decision_support \
     delegated_authority document_vault employee_master employment_contracts evidence_manifest \
-    evidence_requirements financial_close general_ledger governance_decision_log identity_context \
+    evidence_requirements expense_claim financial_close general_ledger goods_service_receipt governance_decision_log identity_context \
     intercompany_accounting invoice_approval jurisdiction_rules kill_switch_registry leave_absence \
     metric_registry notification obligation_tracking obligations offboarding_severance org_structure \
-    payroll_exceptions payroll_run payroll_tax performance_review policy procurement_workflow \
+    payable_open_item payee_banking_identity payment_authorization payment_initiation_adapter payment_proposal payment_run payment_status payroll_exceptions payroll_run payroll_tax performance_review policy privacy_consent \
+    privacy_decision privacy_purpose_registry privacy_rights privacy_transfer procurement_workflow \
     purchase_order purchase_request retention_registry schema_registry secret_vault_integration \
-    source_authority spend_controls tax_determination tax_rules tenant_entity_registry treasury \
+    source_authority spend_controls supplier_financial_profile supplier_recovery tax_determination tax_rules tenant_entity_registry treasury \
     vat_gst vendor_due_diligence workflow workflow_history workforce_compliance; do
     if [ "$(psql -tAX --username "$POSTGRES_USER" --dbname postgres \
             -c "SELECT 1 FROM pg_roles WHERE rolname = 'app_${db}'")" = "1" ]; then

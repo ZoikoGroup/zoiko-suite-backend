@@ -9,10 +9,12 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"zoiko.io/commercial-account-svc/internal/domain"
+	svcmiddleware "zoiko.io/commercial-account-svc/internal/middleware"
 )
 
 func newSubscriptionTestRouter(h *Handler) *chi.Mux {
 	r := chi.NewRouter()
+	r.Use(svcmiddleware.TenantContext())
 	RegisterRoutes(r, h)
 	RegisterSubscriptionRoutes(r, h)
 	return r

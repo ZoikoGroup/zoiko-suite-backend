@@ -17,11 +17,13 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/evidence-manifest-svc/internal/aggregator"
+	"zoiko.io/evidence-manifest-svc/internal/authz"
 	"zoiko.io/evidence-manifest-svc/internal/config"
 	svcenvelope "zoiko.io/evidence-manifest-svc/internal/envelope"
 	"zoiko.io/evidence-manifest-svc/internal/events"
 	"zoiko.io/evidence-manifest-svc/internal/handler"
 	"zoiko.io/evidence-manifest-svc/internal/health"
+	svcmiddleware "zoiko.io/evidence-manifest-svc/internal/middleware"
 	"zoiko.io/evidence-manifest-svc/internal/store"
 )
 
@@ -78,9 +80,15 @@ func main() {
 	governanceClient := aggregator.NewGovernanceDecisionClient(cfg.GovernanceDecisionLogURL, log)
 	accessClient := aggregator.NewAccessDecisionClient(cfg.AuthorizationServiceURL, log)
 	workflowClient := aggregator.NewWorkflowClient(cfg.WorkflowServiceURL, log)
+	workflowHistoryClient := aggregator.NewWorkflowHistoryClient(cfg.WorkflowHistoryURL, log)
 	publisher := events.NewPublisher(kafkaWriter, log)
 
-	h := handler.New(pgStore, governanceClient, accessClient, workflowClient, publisher, log)
+	// authorization-svc client. Reuses AuthorizationServiceURL, already
+	// configured for the access-decision aggregator client above — same
+	// service, different endpoint.
+	authzClient := authz.NewClient(cfg.AuthorizationServiceURL)
+
+	h := handler.New(pgStore, governanceClient, accessClient, workflowClient, workflowHistoryClient, publisher, authzClient, log)
 	healthH := health.New(pool)
 
 	r := chi.NewRouter()
@@ -98,7 +106,15 @@ func main() {
 
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", healthH.Readiness)
-	handler.RegisterRoutes(r, h)
+
+	// The tenant requirement is mounted on the API routes only, not on the
+	// router as a whole: /healthz and /readyz are probed by the platform with
+	// no tenant identity, and a blanket middleware would fail every probe and
+	// take the service out of its own load balancer.
+	r.Group(func(r chi.Router) {
+		r.Use(svcmiddleware.TenantContext())
+		handler.RegisterRoutes(r, h)
+	})
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),

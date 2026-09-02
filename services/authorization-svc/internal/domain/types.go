@@ -120,6 +120,22 @@ type SoDRule struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+// ConflictTypeOwnObjectForbidden is the conflict_type convention for a
+// dynamic, own-object Separation-of-Duties rule (ZS-IAM-001 §10.2): a
+// principal who prepared/owns a resource must not also perform ActionType
+// against that same resource (the spec's own example: "a preparer cannot
+// approve their own object" — resource.preparer_id == subject_id AND
+// action == approve → DENY). Expressed as a self-referential SoDRule row
+// (ActionA == ActionB == the guarded action) rather than a new table or
+// column: conflict_type is already documented as data only, so a new
+// value needs no schema change, and CheckSoDConflict's existing
+// held-actions-pair query cannot accidentally match it — that query
+// excludes the candidate action from the caller's "other held actions"
+// set before searching, so a self-referential row is invisible to it. The
+// evaluation path for this convention is CheckOwnObjectSoD, a distinct
+// query keyed on the action alone.
+const ConflictTypeOwnObjectForbidden = "OWN_OBJECT_FORBIDDEN"
+
 // AccessDecisionLog is the append-only evidence record for every
 // authorization evaluation — grant or deny. Critical constraint: "no
 // material action executes without an authorization decision artifact."

@@ -2,6 +2,7 @@ package handler_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -17,16 +18,38 @@ import (
 	"zoiko.io/mtls-management-svc/internal/store"
 )
 
-// newRouter builds a router backed by a real CA persisted under a
-// per-test temp directory — every test gets its own isolated CA, so tests
-// can't interfere with each other's issued certificates.
+// stubAuthz is a test double for handler.AuthzChecker. It GRANTS by default
+// so the existing behavioural tests keep exercising the real path; tests that
+// need the deny or unavailable branch set err.
+type stubAuthz struct {
+	err error
+}
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
+	return s.err
+}
+
+// newRouterWithAuthz is newRouter with an injectable authorization decision.
+func newRouterWithAuthz(t *testing.T, az handler.AuthzChecker) http.Handler {
+	t.Helper()
+	c, err := internalca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create test CA: %v", err)
+	}
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), az, zap.NewNop()))
+}
+
+// newRouter builds a router backed by a real CA persisted under a per-test
+// temp directory — every test gets its own isolated CA, so tests cannot
+// interfere with each other's issued certificates. Authorization GRANTS by
+// default here; see newRouterWithAuthz to inject a decision.
 func newRouter(t *testing.T) http.Handler {
 	t.Helper()
 	c, err := internalca.LoadOrCreate(t.TempDir())
 	if err != nil {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), zap.NewNop()))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop()))
 }
 
 // mustParsePEMCertificate fails the test if pemBytes is not a real,
@@ -73,6 +96,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
 	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != 201 {
@@ -115,6 +139,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates/"+cert.ID, nil)
 	withEnvelope(req2)
 	req2.Header.Set("X-Tenant-ID", "t1")
+	req2.Header.Set("X-Principal-Id", "principal-test-01")
 	w2 := httptest.NewRecorder()
 	router.ServeHTTP(w2, req2)
 	if w2.Code != 200 {
@@ -128,6 +153,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	req3 := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates?legal_entity_id=LE-1", nil)
 	withEnvelope(req3)
 	req3.Header.Set("X-Tenant-ID", "t1")
+	req3.Header.Set("X-Principal-Id", "principal-test-01")
 	w3 := httptest.NewRecorder()
 	router.ServeHTTP(w3, req3)
 	if w3.Code != 200 {
@@ -146,6 +172,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	req4 := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates/"+cert.ID+"/rotate", nil)
 	withEnvelope(req4)
 	req4.Header.Set("X-Tenant-ID", "t1")
+	req4.Header.Set("X-Principal-Id", "principal-test-01")
 	w4 := httptest.NewRecorder()
 	router.ServeHTTP(w4, req4)
 	if w4.Code != 200 {
@@ -173,6 +200,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	req5 := httptest.NewRequest(http.MethodPost, "/v1/mtls/policies", bytes.NewBuffer(polBody))
 	withEnvelope(req5)
 	req5.Header.Set("X-Tenant-ID", "t1")
+	req5.Header.Set("X-Principal-Id", "principal-test-01")
 	w5 := httptest.NewRecorder()
 	router.ServeHTTP(w5, req5)
 	if w5.Code != 201 {
@@ -183,6 +211,7 @@ func TestProvisionRotateRevoke(t *testing.T) {
 	req6 := httptest.NewRequest(http.MethodDelete, "/v1/mtls/certificates/"+cert.ID, nil)
 	withEnvelope(req6)
 	req6.Header.Set("X-Tenant-ID", "t1")
+	req6.Header.Set("X-Principal-Id", "principal-test-01")
 	w6 := httptest.NewRecorder()
 	router.ServeHTTP(w6, req6)
 	if w6.Code != 200 {
@@ -195,6 +224,7 @@ func TestValidationError(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
 	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
 	w := httptest.NewRecorder()
 	newRouter(t).ServeHTTP(w, req)
 	if w.Code != 400 {

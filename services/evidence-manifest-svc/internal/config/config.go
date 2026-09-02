@@ -31,6 +31,7 @@ type Config struct {
 	GovernanceDecisionLogURL string
 	AuthorizationServiceURL  string
 	WorkflowServiceURL       string
+	WorkflowHistoryURL       string
 }
 
 func Load() (*Config, error) {
@@ -60,6 +61,7 @@ func Load() (*Config, error) {
 		GovernanceDecisionLogURL: strEnv("GOVERNANCE_DECISION_LOG_SERVICE_URL", "http://governance-svc:8083"),
 		AuthorizationServiceURL:  strEnv("AUTHORIZATION_SERVICE_URL", "http://authorization-svc:8089"),
 		WorkflowServiceURL:       strEnv("WORKFLOW_SERVICE_URL", "http://workflow-svc:8090"),
+		WorkflowHistoryURL:       strEnv("WORKFLOW_HISTORY_SERVICE_URL", "http://workflow-history-svc:8097"),
 	}, nil
 }
 

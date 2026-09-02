@@ -218,6 +218,13 @@ func main() {
 	siemClient := siem.New(cfg.SIEMServiceURL, "identity-context-svc", log)
 
 	// ── AuthZ client ───────────────────────────────────────────────────────
+	// Fail fast rather than starting and 503-ing every guarded route. An empty
+	// base URL builds requests that always fail, so CheckAllowed refuses —
+	// correctly, but at request time rather than at boot, which hides a
+	// deployment mistake until a user finds it.
+	if cfg.AuthzServiceURL == "" {
+		log.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
+	}
 	authzClient, err := authz.NewClient(cfg.AuthzEnv, cfg.AuthzServiceURL, log)
 	if err != nil {
 		log.Fatal("failed to initialize authz client", zap.Error(err))

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/kill-switch-registry-svc/internal/domain"
+	svcmiddleware "zoiko.io/kill-switch-registry-svc/internal/middleware"
 )
 
 type Store interface {
@@ -48,6 +49,41 @@ func NewPgStore(pool *pgxpool.Pool) *PgStore {
 	return &PgStore{pool: pool}
 }
 
+// withTenant runs fn inside a transaction with app.tenant_id set from the
+// request context, so migration 000002's policy has a value to enforce
+// against.
+//
+// A transaction is required rather than incidental: set_config's third
+// argument is is_local, and only a transaction-local setting is safe on a
+// pooled connection. Setting it session-wide would leak one request's
+// tenant into whichever request acquires that connection next.
+//
+// The tenant comes from context (set by middleware.TenantContext from a
+// gateway-verified X-Tenant-Id) and never from a query parameter, which is
+// where ResolveKillSwitch and ListHistoryForScope used to take it. It
+// returns "" when absent, and "" is meaningful HERE rather than merely
+// fail-closed: under the policy in migration 000002, "" matches no
+// tenant-specific row but still matches every tenant_id IS NULL row. That
+// is exactly right for a platform-level resolution — see the policy's own
+// header for why hiding those rows would be a silent safety bypass.
+func (s *PgStore) withTenant(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx,
+		"SELECT set_config('app.tenant_id', $1, true)", svcmiddleware.TenantFromContext(ctx),
+	); err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 const eventColumns = `
 	kill_switch_event_id, plane, domain, provider_code, tenant_id,
 	action, reason, reconciliation_procedure_ref,
@@ -68,17 +104,29 @@ func scanEvent(row pgx.Row) (*domain.KillSwitchEvent, error) {
 	return e, nil
 }
 
+// AppendEvent records an ENGAGE or DISENGAGE. Never an UPDATE — the
+// append-only doctrine is structural.
+//
+// Note what RLS does and does not guard here. A tenant-scoped event must
+// belong to the caller's tenant (WITH CHECK enforces that). A PLATFORM-WIDE
+// event — tenant_id NULL — passes WITH CHECK for any caller, because the
+// policy must keep the IS NULL branch for reads. The control on that path
+// is the handler's authorization at platform scope, not this. See migration
+// 000002's header, which says so at length rather than leaving it implied.
 func (s *PgStore) AppendEvent(ctx context.Context, e *domain.KillSwitchEvent) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO kill_switch_events (
-			kill_switch_event_id, plane, domain, provider_code, tenant_id,
-			action, reason, reconciliation_procedure_ref,
-			approved_by_principal_id, created_at, created_by_principal_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-	`, e.KillSwitchEventID, e.Plane, e.Domain, e.ProviderCode, e.TenantID,
-		string(e.Action), e.Reason, e.ReconciliationProcedureRef,
-		e.ApprovedByPrincipalID, e.CreatedAt, e.CreatedByPrincipalID,
-	)
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO kill_switch_events (
+				kill_switch_event_id, plane, domain, provider_code, tenant_id,
+				action, reason, reconciliation_procedure_ref,
+				approved_by_principal_id, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, e.KillSwitchEventID, e.Plane, e.Domain, e.ProviderCode, e.TenantID,
+			string(e.Action), e.Reason, e.ReconciliationProcedureRef,
+			e.ApprovedByPrincipalID, e.CreatedAt, e.CreatedByPrincipalID,
+		)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("insert kill switch event: %w", err)
 	}
@@ -101,8 +149,12 @@ func (s *PgStore) LatestEventForScope(ctx context.Context, plane, domainName, pr
 		ORDER BY event_seq DESC
 		LIMIT 1;`
 
-	row := s.pool.QueryRow(ctx, query, plane, domainName, providerCode, tenantID)
-	e, err := scanEvent(row)
+	var e *domain.KillSwitchEvent
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		e, scanErr = scanEvent(tx.QueryRow(ctx, query, plane, domainName, providerCode, tenantID))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -143,8 +195,12 @@ func (s *PgStore) ResolveKillSwitch(ctx context.Context, plane, domainName, prov
 			created_at DESC
 		LIMIT 1;`
 
-	row := s.pool.QueryRow(ctx, query, plane, domainName, providerCode, tenantID)
-	e, err := scanEvent(row)
+	var e *domain.KillSwitchEvent
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		e, scanErr = scanEvent(tx.QueryRow(ctx, query, plane, domainName, providerCode, tenantID))
+		return scanErr
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &domain.KillSwitchResolution{Blocked: false}, nil
 	}
@@ -164,23 +220,29 @@ func (s *PgStore) ListCurrentStates(ctx context.Context) ([]domain.KillSwitchSta
 		FROM kill_switch_events
 		ORDER BY plane, domain, provider_code, tenant_id, event_seq DESC;`
 
-	rows, err := s.pool.Query(ctx, query)
+	var out []domain.KillSwitchState
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var st domain.KillSwitchState
+			var action string
+			if err := rows.Scan(&st.Plane, &st.Domain, &st.ProviderCode, &st.TenantID, &action, &st.Reason, &st.LatestEventAt); err != nil {
+				return err
+			}
+			st.Action = domain.KillSwitchAction(action)
+			out = append(out, st)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list current states: %w", err)
 	}
-	defer rows.Close()
-
-	var out []domain.KillSwitchState
-	for rows.Next() {
-		var st domain.KillSwitchState
-		var action string
-		if err := rows.Scan(&st.Plane, &st.Domain, &st.ProviderCode, &st.TenantID, &action, &st.Reason, &st.LatestEventAt); err != nil {
-			return nil, fmt.Errorf("scan current state: %w", err)
-		}
-		st.Action = domain.KillSwitchAction(action)
-		out = append(out, st)
-	}
-	return out, rows.Err()
+	return out, nil
 }
 
 func (s *PgStore) ListHistoryForScope(ctx context.Context, plane, domainName, providerCode, tenantID *string) ([]domain.KillSwitchEvent, error) {
@@ -193,19 +255,25 @@ func (s *PgStore) ListHistoryForScope(ctx context.Context, plane, domainName, pr
 		  AND tenant_id IS NOT DISTINCT FROM $4::uuid
 		ORDER BY event_seq DESC;`
 
-	rows, err := s.pool.Query(ctx, query, plane, domainName, providerCode, tenantID)
+	var out []domain.KillSwitchEvent
+	err := s.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, plane, domainName, providerCode, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			e, err := scanEvent(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *e)
+		}
+		return rows.Err()
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list history for scope: %w", err)
 	}
-	defer rows.Close()
-
-	var out []domain.KillSwitchEvent
-	for rows.Next() {
-		e, err := scanEvent(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan history event: %w", err)
-		}
-		out = append(out, *e)
-	}
-	return out, rows.Err()
+	return out, nil
 }

@@ -38,6 +38,7 @@ import (
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
 	"zoiko.io/accounts-payable-svc/internal/mtls"
 	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
+	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
@@ -194,7 +195,10 @@ func main() {
 	// purchase order; an invoice with none is ordinary.
 	poClient := purchaseorder.NewClient(cfg.PurchaseOrderServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, poClient, log)
+	// AP-08's open-item posting.
+	payablesClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, log)
+
+	h := handler.New(pgStore, publisher, authzClient, poClient, payablesClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

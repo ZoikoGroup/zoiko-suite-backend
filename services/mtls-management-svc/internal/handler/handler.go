@@ -1,13 +1,16 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+	authzpkg "zoiko.io/mtls-management-svc/internal/authz"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
 	svcenvelope "zoiko.io/mtls-management-svc/internal/envelope"
@@ -19,23 +22,124 @@ type ctxKey string
 
 const tenantKey ctxKey = "tenant_id"
 
-func getTenant(r *http.Request) string {
-	t := r.Header.Get("X-Tenant-ID")
-	if t == "" {
-		return "default-tenant"
+// requireTenant returns the gateway-verified tenant, or refuses the
+// request. It replaces a getTenant helper that substituted the literal
+// string "default-tenant" when X-Tenant-ID was absent.
+//
+// A missing check makes a request fail; a fabricated tenant makes it
+// SUCCEED, into one synthetic bucket shared by every header-less caller.
+// The store is correctly scoped, so it enforced that shared bucket
+// faithfully — meaning header-less callers could read each other's
+// certificate records and, through RevokeCert and ReplaceCertMaterial,
+// REVOKE or re-issue each other's mTLS certificates. Revoking a
+// certificate breaks the service-to-service authentication that depends on
+// it, so the fabricated identity turned a correct store into a shared
+// control plane over the platform's mutual-TLS trust.
+func requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":   "missing_tenant_scope",
+			"message": "X-Tenant-ID is required — the gateway sets it from a verified identity envelope",
+		})
+		return "", false
 	}
-	return t
+	return tenantID, true
+}
+
+// Action constants passed to authorization-svc as action_type.
+//
+// Split by consequence, not by HTTP verb. Revocation gets its own action
+// because it is the destructive one: revoking a certificate breaks the
+// service-to-service authentication that depends on it, so it is closer to
+// a kill switch than to an edit. Rotation is separated from provisioning
+// for the same reason — re-issuing material for an existing service
+// identity is a different privilege from minting a new one.
+const (
+	MtlsCertProvision = "MTLS_CERT_PROVISION"
+	MtlsCertRead      = "MTLS_CERT_READ"
+	MtlsCertRotate    = "MTLS_CERT_ROTATE"
+	MtlsCertRevoke    = "MTLS_CERT_REVOKE"
+	MtlsPolicyWrite   = "MTLS_POLICY_WRITE"
+	MtlsPolicyRead    = "MTLS_POLICY_READ"
+)
+
+// AuthzChecker is the authorization-svc contract this handler depends on.
+type AuthzChecker interface {
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
 type Handler struct {
 	store  store.Store
 	ca     *ca.CA
 	siem   *siem.Client
+	authz  AuthzChecker
 	logger *zap.Logger
 }
 
-func New(s store.Store, c *ca.CA, siemClient *siem.Client, l *zap.Logger) *Handler {
-	return &Handler{store: s, ca: c, siem: siemClient, logger: l}
+func New(s store.Store, c *ca.CA, siemClient *siem.Client, az AuthzChecker, l *zap.Logger) *Handler {
+	return &Handler{store: s, ca: c, siem: siemClient, authz: az, logger: l}
+}
+
+// requirePrincipal returns the gateway-verified principal, or refuses the
+// request. This service had no notion of a calling principal at all before
+// now — nothing read X-Principal-Id on any route.
+func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
+	principalID := r.Header.Get("X-Principal-Id")
+	if principalID == "" {
+		h.errJSON(w, http.StatusUnauthorized,
+			"X-Principal-Id is required — the gateway sets it from a verified identity envelope")
+		return "", false
+	}
+	return principalID, true
+}
+
+// authorize asks authorization-svc whether this principal may perform
+// actionType within scopeID, and fails CLOSED.
+//
+// Priority 1b gave this service a verified TENANT. That closed the
+// cross-tenant hole but left an intra-tenant one: any principal holding any
+// valid envelope for the tenant could list every certificate in it, and
+// revoke or rotate any of them. On a service that issues the platform's
+// mutual-TLS material, "any principal in the tenant" is the wrong audience
+// for a revoke button.
+//
+// ── On the scope argument, deliberately ────────────────────────────────
+//
+// This service passes TWO different identifiers into authorization-svc's
+// single legal_entity_id parameter, and that needs justifying because
+// tracker row 84a records exactly that pattern as a defect elsewhere.
+//
+// Certificate routes pass the certificate's legal_entity_id. Certificates
+// carry one (domain.MtlsCertificate.LegalEntityID, required on issue), it is
+// the natural granularity for "who may mint material for this entity", and
+// it matches the parameter's own name.
+//
+// Policy routes pass the tenant id, because domain.CommunicationPolicy has
+// no legal entity at all — a communication policy governs service-to-service
+// traffic across the whole tenant. There is no finer scope to pass, and
+// inventing one would be worse than naming the real one.
+//
+// The difference from row 84a is that this is two resource GRANULARITIES,
+// each scoped at the level it actually exists at, and documented. Row 84a is
+// one resource scoped inconsistently — organization_id on some routes and
+// commercial_account_id on others for the same commercial account — where a
+// grant recorded in one namespace can never match a check in the other.
+// Whoever seeds grants for this service needs to know both facts, so this
+// comment is the contract.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, scopeID, actionType string) bool {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, scopeID, actionType); err != nil {
+		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
+			h.errJSON(w, http.StatusForbidden, "not authorized to perform this action")
+			return false
+		}
+		h.logger.Error("authorization check failed", zap.Error(err))
+		h.errJSON(w, http.StatusServiceUnavailable, "authorization service unavailable")
+		return false
+	}
+	return true
 }
 
 func NewRouter(h *Handler) http.Handler {
@@ -65,7 +169,10 @@ func NewRouter(h *Handler) http.Handler {
 }
 
 func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	var req domain.ProvisionCertRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.errJSON(w, 400, "invalid body")
@@ -73,6 +180,14 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := req.Validate(); err != nil {
 		h.errJSON(w, 400, err.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, req.LegalEntityID, MtlsCertProvision) {
 		return
 	}
 
@@ -119,18 +234,58 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) GetCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	cert, err := h.store.GetCertByID(r.Context(), tenantID, chi.URLParam(r, "id"))
 	if err != nil {
 		h.errJSON(w, 404, "certificate not found")
 		return
 	}
+	// Authorized against the certificate row own legal entity, never a
+	// caller-supplied scope: the store is already tenant-scoped, so a
+	// foreign cert is a 404 here, and authorizing against something the
+	// caller nominated would let them name an entity they do hold a grant
+	// for and read a cert belonging to another.
+	if !h.authorize(w, r, principalID, cert.LegalEntityID, MtlsCertRead) {
+		return
+	}
 	h.okJSON(w, 200, cert)
 }
 
+// ListCerts now REQUIRES legal_entity_id rather than treating it as an
+// optional filter.
+//
+// That is a deliberate API tightening, for the same reason the connector
+// services' self-disabling filters were made mandatory: legal_entity_id is
+// now the authorization scope, and an optional scope parameter is a scope
+// that disables itself. Omitting it used to return every certificate in the
+// tenant across all entities, which is precisely the request that has no
+// single scope to authorize against.
 func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
-	certs, _ := h.store.ListCerts(r.Context(), tenantID, r.URL.Query().Get("legal_entity_id"), r.URL.Query().Get("status"))
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		h.errJSON(w, http.StatusBadRequest,
+			"legal_entity_id query parameter is required — it is the authorization scope for this listing")
+		return
+	}
+	if !h.authorize(w, r, principalID, legalEntityID, MtlsCertRead) {
+		return
+	}
+	certs, _ := h.store.ListCerts(r.Context(), tenantID, legalEntityID, r.URL.Query().Get("status"))
 	if certs == nil {
 		certs = []domain.MtlsCertificate{}
 	}
@@ -138,12 +293,23 @@ func (h *Handler) ListCerts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 
 	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
 	if err != nil {
 		h.errJSON(w, 404, "certificate not found")
+		return
+	}
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, MtlsCertRotate) {
 		return
 	}
 
@@ -175,8 +341,30 @@ func (h *Handler) RotateCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	id := chi.URLParam(r, "id")
+
+	// Read before revoking, purely to obtain the certificate's own legal
+	// entity to authorize against. RevokeCert alone would tell us nothing
+	// about who owns the row until after it had already acted on it, and
+	// revocation is the destructive operation here: it breaks whatever
+	// service-to-service authentication depends on this certificate.
+	existing, err := h.store.GetCertByID(r.Context(), tenantID, id)
+	if err != nil {
+		h.errJSON(w, 404, "certificate not found")
+		return
+	}
+	if !h.authorize(w, r, principalID, existing.LegalEntityID, MtlsCertRevoke) {
+		return
+	}
+
 	if err := h.store.RevokeCert(r.Context(), tenantID, id); err != nil {
 		h.errJSON(w, 404, "certificate not found")
 		return
@@ -186,10 +374,24 @@ func (h *Handler) RevokeCert(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
 	var req domain.CreatePolicyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PolicyName == "" {
 		h.errJSON(w, 400, "policy_name is required")
+		return
+	}
+	// Scoped at the tenant, not a legal entity: a CommunicationPolicy has no
+	// legal_entity_id — it governs service-to-service traffic across the
+	// whole tenant. See the authorize() doc comment for why this service
+	// passes two different identifiers and why that is not row 84a.
+	if !h.authorize(w, r, principalID, tenantID, MtlsPolicyWrite) {
 		return
 	}
 	pol := &domain.CommunicationPolicy{
@@ -204,7 +406,17 @@ func (h *Handler) CreatePolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ListPolicies(w http.ResponseWriter, r *http.Request) {
-	tenantID := getTenant(r)
+	tenantID, ok := requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, principalID, tenantID, MtlsPolicyRead) {
+		return
+	}
 	pols, _ := h.store.ListPolicies(r.Context(), tenantID)
 	if pols == nil {
 		pols = []domain.CommunicationPolicy{}

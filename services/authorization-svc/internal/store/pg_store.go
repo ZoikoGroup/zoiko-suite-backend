@@ -740,6 +740,40 @@ func (s *PgStore) CheckSoDConflict(ctx context.Context, grantedActions []string,
 	return conflicting, hasConflict, nil
 }
 
+// CheckOwnObjectSoD reports whether an active sod_rules row declares
+// actionType a dynamic, own-object conflict — see
+// domain.ConflictTypeOwnObjectForbidden. Unlike CheckSoDConflict, this is
+// not a held-actions-pair lookup: it answers a single question, "does any
+// rule forbid the same principal from both preparing and performing
+// actionType on one object," independent of anything else the principal
+// holds.
+func (s *PgStore) CheckOwnObjectSoD(ctx context.Context, actionType, tenantID string) (bool, error) {
+	const query = `
+		SELECT 1
+		FROM sod_rules
+		WHERE active_flag
+		  AND conflict_type = 'OWN_OBJECT_FORBIDDEN'
+		  AND action_a = $1 AND action_b = $1
+		  AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)
+		LIMIT 1;`
+
+	var forbidden bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, actionType, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		forbidden = rows.Next()
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg CheckOwnObjectSoD failed", zap.Error(err))
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return forbidden, nil
+}
+
 // ── access_decision_log ──────────────────────────────────────────────────────
 
 const accessDecisionColumns = `access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, tenant_id, correlation_id, decided_at`

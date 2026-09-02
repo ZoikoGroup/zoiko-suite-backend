@@ -16,6 +16,7 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/domain"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
 	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
+	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
 )
 
 // Store is the persistence contract the handler depends on.
@@ -57,16 +58,22 @@ type PurchaseOrderVerifier interface {
 	Verify(ctx context.Context, tenantID, legalEntityID, correlationID, purchaseOrderID string) (*purchaseorder.PurchaseOrder, error)
 }
 
+// Two downstream clients, two different jobs, and they are not alternatives.
+// purchaseOrders answers AP-05 ("does the PO this invoice names exist and is it
+// open") at invoice creation; payables carries AP-08's open-item posting. They
+// arrived on separate branches against the same constructor, which is the only
+// reason they ever looked like a choice.
 type Handler struct {
 	store          Store
 	publisher      Publisher
 	authz          AuthZClient
 	purchaseOrders PurchaseOrderVerifier
+	payables       payableopenitem.Client
 	log            *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, po PurchaseOrderVerifier, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, purchaseOrders: po, log: log}
+func New(store Store, publisher Publisher, authz AuthZClient, po PurchaseOrderVerifier, payables payableopenitem.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, authz: authz, purchaseOrders: po, payables: payables, log: log}
 }
 
 // linesFromRequest maps the wire lines onto domain lines. Line numbers are
@@ -399,6 +406,14 @@ func (h *Handler) ValidateInvoice(w http.ResponseWriter, r *http.Request) {
 // approval-state and evidence-state validation") — this transition is only
 // reachable from VALIDATED, so by the time an invoice is APPROVED it has
 // necessarily passed validation too.
+//
+// Once approved, this is the first real caller payable-open-item-svc
+// (AP-08) has ever had for a vendor invoice — AP-08 previously only had
+// expense-claim-svc as a real source. The call is deliberately
+// best-effort, mirroring expense-claim-svc's and
+// goods-service-receipt-svc's own doctrine for a downstream side effect
+// that must never undo a transition that already committed: a failure is
+// logged, never returned to the caller as an error.
 func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 	invoiceID := chi.URLParam(r, "invoice_id")
 	inv, err := h.store.GetInvoice(r.Context(), invoiceID)
@@ -443,6 +458,16 @@ func (h *Handler) ApproveInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.publisher.PublishVendorInvoiceApproved(r.Context(), *inv)
+
+	if payable, err := h.payables.CreatePayableFromApprovedSource(r.Context(), inv.TenantID, principalID, payableopenitem.CreatePayableRequest{
+		LegalEntityID: inv.LegalEntityID, SourceType: payableopenitem.SourceSupplierInvoice, SourceReference: inv.InvoiceID,
+		PayeeRef: inv.VendorID, OriginalAmount: inv.Amount, Currency: inv.CurrencyCode, DueDate: inv.DueDate,
+	}); err != nil {
+		h.log.Warn("ApproveInvoice: AP-08 payable creation failed — approval stands", zap.String("invoice_id", inv.InvoiceID), zap.Error(err))
+	} else {
+		h.log.Info("ApproveInvoice: AP-08 payable created", zap.String("invoice_id", inv.InvoiceID), zap.String("payable_id", payable.PayableID))
+	}
+
 	writeJSON(w, http.StatusOK, inv)
 }
 

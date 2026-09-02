@@ -34,6 +34,40 @@ import (
 	"zoiko.io/workflow-history-svc/internal/store"
 )
 
+// grantingAuthz satisfies handler.AuthzChecker and always grants.
+//
+// This suite exercises health probes and store wiring against real Postgres,
+// not the authorization decision — the deny and unavailable branches are
+// covered by internal/handler/history_test.go. A denying stub here would mask
+// what this suite is actually testing.
+type grantingAuthz struct{}
+
+func (grantingAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return nil }
+
+// getAs issues a GET carrying the identity headers the gateway sets from a
+// verified envelope.
+//
+// The read API used to take its tenant from a tenant_id QUERY PARAMETER, so
+// every subtest below called http.Get with no headers at all. That was the
+// defect, not a test shortcut: the value went straight into
+// set_config('app.tenant_id', ...) and the RLS policy read it back, so a
+// caller chose which tenant's history to read by editing the URL. These
+// requests now have to carry a verified tenant like any real caller.
+//
+// http.Get cannot set headers, which is why this helper exists rather than
+// each subtest being adjusted in place. It returns (resp, err) rather than
+// just resp so each call site stayed a one-line change, keeping its existing
+// require.NoError(t, err).
+func getAs(url, tenantID string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", "principal-integration-test")
+	return http.DefaultClient.Do(req)
+}
+
 // freePort returns an OS-assigned free TCP port on localhost.
 func freePort(t *testing.T) int {
 	t.Helper()
@@ -108,7 +142,10 @@ func TestIntegration(t *testing.T) {
 	log := zap.NewNop()
 	pgStore := store.NewPgStore(pool, log)
 	healthH := health.New(pool, log)
-	historyH := handler.New(pgStore, log)
+	// A granting authorization stub. This suite exercises health probes and
+	// store wiring against real Postgres, not the authorization decision —
+	// a denying stub here would mask what it is actually testing.
+	historyH := handler.New(pgStore, grantingAuthz{}, log)
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
@@ -138,17 +175,36 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("GET /v1/workflows/{id}/history NotFound", func(t *testing.T) {
-		resp, err := http.Get(srv.URL + "/v1/workflows/wf-does-not-exist/history?tenant_id=t-001")
+		resp, err := getAs(srv.URL+"/v1/workflows/wf-does-not-exist/history", "t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 	})
 
-	t.Run("GET /v1/workflows/{id}/history Missing tenant_id", func(t *testing.T) {
+	// Renamed and re-expected deliberately. This used to assert 400 for a
+	// missing tenant_id QUERY PARAMETER. The tenant is no longer a query
+	// parameter at all, so the equivalent request is one with no identity
+	// headers, and the correct answer is 401 — an unauthenticated request,
+	// not a malformed one.
+	t.Run("GET /v1/workflows/{id}/history without identity headers is 401", func(t *testing.T) {
 		resp, err := http.Get(srv.URL + "/v1/workflows/wf-does-not-exist/history")
 		require.NoError(t, err)
 		defer resp.Body.Close()
-		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	})
+
+	// A query tenant_id that disagrees with the verified header is refused
+	// rather than silently reinterpreted. This is the request that used to be
+	// the whole vulnerability: naming another tenant in the URL.
+	t.Run("GET /v1/workflows/{id}/history query tenant_id cannot override the header", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/v1/workflows/wf-001/history?tenant_id=t-001", nil)
+		require.NoError(t, err)
+		req.Header.Set("X-Tenant-Id", "t-OTHER")
+		req.Header.Set("X-Principal-Id", "principal-integration-test")
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 	})
 
 	t.Run("GET /v1/workflows/{id}/history Returns Stored Events", func(t *testing.T) {
@@ -186,7 +242,7 @@ func TestIntegration(t *testing.T) {
 			require.NoError(t, pgStore.Append(ctx, e))
 		}
 
-		resp, err := http.Get(srv.URL + "/v1/workflows/wf-001/history?tenant_id=t-001")
+		resp, err := getAs(srv.URL+"/v1/workflows/wf-001/history", "t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -204,7 +260,7 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("GET /v1/workflows/{id}/history Scoped To Wrong Tenant Returns 404", func(t *testing.T) {
-		resp, err := http.Get(srv.URL + "/v1/workflows/wf-001/history?tenant_id=t-OTHER")
+		resp, err := getAs(srv.URL+"/v1/workflows/wf-001/history", "t-OTHER")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode, "wf-001 belongs to t-001, not t-OTHER")
@@ -223,7 +279,7 @@ func TestIntegration(t *testing.T) {
 		require.NoError(t, pgStore.Append(ctx, e))
 		require.NoError(t, pgStore.Append(ctx, e)) // duplicate
 
-		resp, err := http.Get(srv.URL + "/v1/workflows/wf-idem/history?tenant_id=t-001")
+		resp, err := getAs(srv.URL+"/v1/workflows/wf-idem/history", "t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -260,7 +316,7 @@ func TestIntegration(t *testing.T) {
 		url := fmt.Sprintf("%s/v1/workflows/history?tenant_id=t-001&legal_entity_id=e-001&from=%s&to=%s",
 			srv.URL, from, to)
 
-		resp, err := http.Get(url)
+		resp, err := getAs(url, "t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
@@ -279,7 +335,7 @@ func TestIntegration(t *testing.T) {
 	})
 
 	t.Run("GET /v1/workflows/history Missing Params", func(t *testing.T) {
-		resp, err := http.Get(srv.URL + "/v1/workflows/history?tenant_id=t-001")
+		resp, err := getAs(srv.URL+"/v1/workflows/history", "t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -291,7 +347,7 @@ func TestIntegration(t *testing.T) {
 		url := fmt.Sprintf("%s/v1/workflows/history?tenant_id=t-001&legal_entity_id=e-001&from=%s&to=%s",
 			srv.URL, from, to)
 
-		resp, err := http.Get(url)
+		resp, err := getAs(url, "t-001")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)

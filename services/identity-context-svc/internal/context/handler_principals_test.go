@@ -17,18 +17,21 @@ import (
 	"zoiko.io/identity-context-svc/internal/domain"
 )
 
-// mockAuthzClient is a test stub that always permits.
-type mockAuthzClient struct{}
-
-func (m *mockAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
-	return nil
+// stubAuthz is a test double for identityctx.AuthzChecker. It GRANTS by
+// default so these tenant-scoping tests keep exercising what they were
+// written for; the deny and unavailable branches are covered in
+// handler_authz_test.go.
+type stubAuthz struct {
+	err error
 }
+
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _, _ string) error { return s.err }
 
 func newPrincipalsRouter(store *mockPrincipalStore) chi.Router {
 	r := chi.NewRouter()
 	// Resolver and authenticator are nil: these tests exercise only the
 	// /v1/principals routes, which touch neither.
-	h := identityctx.NewHandler(nil, nil, nil, store, &mockAuthzClient{}, zap.NewNop())
+	h := identityctx.NewHandler(nil, nil, nil, store, &stubAuthz{}, zap.NewNop())
 	identityctx.RegisterRoutes(r, h)
 	return r
 }
@@ -49,7 +52,9 @@ func TestPrincipalRoutes_MissingTenantHeader_Rejected(t *testing.T) {
 		req := httptest.NewRequest(c.method, c.path, nil)
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
-		// Now returns 401 (Unauthorized) instead of 400 for missing tenant
+		// 401, not 400. Changed deliberately: a request with no verified
+		// tenant is unauthenticated, not malformed, and the distinction
+		// matters to a client deciding whether to retry or re-authenticate.
 		if w.Code != 401 {
 			t.Errorf("%s %s with no X-Tenant-Id: got %d, want 401", c.method, c.path, w.Code)
 		}
@@ -62,7 +67,10 @@ func TestGetPrincipal_TenantHeaderPresent_ReachesStore(t *testing.T) {
 
 	req := httptest.NewRequest("GET", "/v1/principals/p-1", nil)
 	req.Header.Set("X-Tenant-Id", "tenant-a")
-	req.Header.Set("X-Principal-Id", "principal-1")
+	// The caller is the same principal being read, so this exercises the
+	// self-exemption path — no authorization round-trip needed for your own
+	// principal, which is ordinary platform traffic.
+	req.Header.Set("X-Principal-Id", "p-1")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

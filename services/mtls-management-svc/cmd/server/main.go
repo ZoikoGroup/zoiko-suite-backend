@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	"zoiko.io/mtls-management-svc/internal/authz"
 	"zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/handler"
 	"zoiko.io/mtls-management-svc/internal/siem"
@@ -39,7 +40,19 @@ func main() {
 
 	s := store.NewMemoryStore()
 	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "mtls-management-svc", logger)
-	h := handler.New(s, internalCA, siemClient, logger)
+	// Fail fast rather than starting and 503-ing every guarded route.
+	// authz.NewClient("") builds requests against an empty base URL, so every
+	// CheckAllowed fails and the client — correctly — refuses. That posture is
+	// right at request time but wrong at boot: a service that starts and then
+	// rejects all authorized traffic hides a deployment mistake until a user
+	// finds it. This dependency was added in Priority 2b and was missing from
+	// docker-compose.yml for two services, which is exactly how that happens.
+	authzURL := os.Getenv("AUTHZ_SERVICE_URL")
+	if authzURL == "" {
+		logger.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
+	}
+	authzClient := authz.NewClient(authzURL)
+	h := handler.New(s, internalCA, siemClient, authzClient, logger)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{Addr: ":" + port, Handler: router, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}

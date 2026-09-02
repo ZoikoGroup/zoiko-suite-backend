@@ -12,7 +12,9 @@ import (
 type Store interface {
 	SaveAssessment(ctx context.Context, tenantID string, asm *domain.CartaAssessment) error
 	GetAssessmentByID(ctx context.Context, tenantID, id string) (*domain.CartaAssessment, error)
-	ListAssessments(ctx context.Context, tenantID, subjectID string) ([]domain.CartaAssessment, error)
+	// legalEntityID is MANDATORY: it is the authorization scope for a
+	// listing. subjectID stays optional and narrows WITHIN that scope.
+	ListAssessments(ctx context.Context, tenantID, legalEntityID, subjectID string) ([]domain.CartaAssessment, error)
 }
 
 type MemoryStore struct {
@@ -43,12 +45,21 @@ func (m *MemoryStore) GetAssessmentByID(ctx context.Context, tenantID, id string
 	return asm, nil
 }
 
-func (m *MemoryStore) ListAssessments(ctx context.Context, tenantID, subjectID string) ([]domain.CartaAssessment, error) {
+func (m *MemoryStore) ListAssessments(ctx context.Context, tenantID, legalEntityID, subjectID string) ([]domain.CartaAssessment, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var result []domain.CartaAssessment
 	for _, a := range m.assessments {
 		if a.TenantID != tenantID {
+			continue
+		}
+		// Tenant AND legal entity are both mandatory; subject narrows within
+		// them. Written as a plain equality rather than an
+		// "empty means match everything" branch on purpose — that shape is
+		// the self-disabling filter found across the six connector services,
+		// and here legalEntityID is also the authorization scope, so a
+		// self-disabling version would disable the scope itself.
+		if a.LegalEntityID != legalEntityID {
 			continue
 		}
 		if subjectID != "" && a.SubjectID != subjectID {
