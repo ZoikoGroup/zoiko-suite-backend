@@ -3119,12 +3119,15 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      KILL_SWITCH_REGISTRY_SERVICE_URL: "http://kill-switch-registry-svc:8147"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      kill-switch-registry-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -3672,6 +3675,8 @@ services:
       TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
       PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
+      CONFIG_FEATURE_FLAG_SERVICE_URL: "http://configuration-feature-flag-svc:8086"
+      ENVIRONMENT: "production"
     depends_on:
       postgres:
         condition: service_healthy
@@ -3688,6 +3693,8 @@ services:
       policy-svc:
         condition: service_healthy
       payable-open-item-svc:
+        condition: service_healthy
+      configuration-feature-flag-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]

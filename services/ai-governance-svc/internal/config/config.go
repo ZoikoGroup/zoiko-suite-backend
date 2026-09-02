@@ -19,6 +19,8 @@ type Config struct {
 	AuthzMTLSEnabled         bool
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
+
+	KillSwitchRegistryServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -40,6 +42,8 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: getEnvOrDefault("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+
+		KillSwitchRegistryServiceURL: getEnvOrDefault("KILL_SWITCH_REGISTRY_SERVICE_URL", "http://kill-switch-registry-svc:8147"),
 	}, nil
 }
 

@@ -20,6 +20,7 @@ import (
 	"zoiko.io/ai-governance-svc/internal/events"
 	"zoiko.io/ai-governance-svc/internal/handler"
 	"zoiko.io/ai-governance-svc/internal/health"
+	"zoiko.io/ai-governance-svc/internal/killswitch"
 	"zoiko.io/ai-governance-svc/internal/middleware"
 	"zoiko.io/ai-governance-svc/internal/mtls"
 	"zoiko.io/ai-governance-svc/internal/store"
@@ -77,7 +78,9 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	killswitchClient := killswitch.NewClient(cfg.KillSwitchRegistryServiceURL)
+
+	h := handler.New(pgStore, publisher, authzClient, killswitchClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
