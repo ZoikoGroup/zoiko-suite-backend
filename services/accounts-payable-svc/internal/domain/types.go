@@ -9,6 +9,7 @@
 package domain
 
 import (
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -219,6 +220,51 @@ func (d *CalendarDate) UnmarshalJSON(data []byte) error {
 // already reads due_date has to change. Only the accepted INPUT widened.
 func (d CalendarDate) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.Time)
+}
+
+// Value implements driver.Valuer for the DATE columns.
+//
+// Without it pgx has no encoder for this struct: it embeds time.Time but is not
+// one, so a CalendarDate parameter went to Postgres as NULL and a scan of a DATE
+// back into it failed outright with "cannot scan date (OID 1082) in binary
+// format into *domain.CalendarDate". Every read of invoice_date errored.
+//
+// The zero value is NULL rather than year zero, so "no date supplied" stays
+// distinguishable from a real date. Same shape as general-ledger-svc's
+// domain.Date, which is the pattern this follows.
+func (d CalendarDate) Value() (driver.Value, error) {
+	if d.Time.IsZero() {
+		return nil, nil
+	}
+	return d.Time, nil
+}
+
+// Scan implements sql.Scanner for the DATE columns.
+//
+// pgx hands a DATE back as time.Time; the string cases cover a driver configured
+// to return dates as text, which is a supported pgx mode. The day is rebuilt at
+// UTC midnight for the reason the type comment gives - a bare date read in a
+// zone behind Greenwich lands on the previous day.
+func (d *CalendarDate) Scan(src any) error {
+	switch v := src.(type) {
+	case nil:
+		d.Time = time.Time{}
+		return nil
+	case time.Time:
+		d.Time = time.Date(v.Year(), v.Month(), v.Day(), 0, 0, 0, 0, time.UTC)
+		return nil
+	case string:
+		parsed, err := time.Parse(calendarDateLayout, strings.TrimSpace(v))
+		if err != nil {
+			return fmt.Errorf("cannot scan %q into CalendarDate: expected %q", v, calendarDateLayout)
+		}
+		d.Time = parsed.UTC()
+		return nil
+	case []byte:
+		return d.Scan(string(v))
+	default:
+		return fmt.Errorf("cannot scan %T into CalendarDate", src)
+	}
 }
 
 // CreateVendorInvoiceLineInput is one line on the way in.

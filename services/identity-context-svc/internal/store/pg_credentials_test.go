@@ -11,6 +11,8 @@ package store_test
 import (
 	"context"
 	"errors"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -354,19 +356,87 @@ func TestPgStore_AuthAttempts_AppendToAccessDecisionLog(t *testing.T) {
 	}
 }
 
+// ordinaryRolePool returns a pool connected as a purpose-created role that is
+// NOSUPERUSER and NOBYPASSRLS.
+//
+// This exists because TEST_DATABASE_URL points at the postgres superuser both
+// locally and in CI, and a superuser bypasses row security unconditionally -
+// FORCE included. An RLS assertion made over that connection proves nothing: it
+// never reaches the policy at all. The same trap is recorded in
+// docs/architecture/backend-completion-tracker.md as the first lesson of
+// Priority 1, and it is why this test asserted a property it could not observe.
+func ordinaryRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+
+	const role = "identity_rls_test"
+	const password = "identity_rls_test_pw"
+
+	if _, err := admin.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+role+`') THEN
+			CREATE ROLE `+role+` LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $do$;`); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	for _, stmt := range []string{
+		`ALTER ROLE ` + role + ` WITH LOGIN PASSWORD '` + password + `' NOSUPERUSER NOBYPASSRLS`,
+		`GRANT USAGE ON SCHEMA public TO ` + role,
+		`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ` + role,
+	} {
+		if _, err := admin.Exec(ctx, stmt); err != nil {
+			t.Fatalf("grant (%s): %v", stmt, err)
+		}
+	}
+
+	u, err := url.Parse(os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("parse TEST_DATABASE_URL: %v", err)
+	}
+	u.User = url.UserPassword(role, password)
+	pool, err := pgxpool.New(ctx, u.String())
+	if err != nil {
+		t.Fatalf("connect as %s: %v", role, err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
 // An unscoped connection must read no credential rows at all. This is the
 // backstop for the explicit tenant predicate in every query above: if one were
 // ever dropped, RLS still returns nothing rather than every tenant's digests.
 func TestPgStore_CredentialsAreRLSProtected(t *testing.T) {
 	ctx := context.Background()
-	pool := openTestPool(t)
-	s := store.New(pool, zap.NewNop())
+	admin := openTestPool(t)
+	s := store.New(admin, zap.NewNop())
 
-	seedCredential(t, ctx, pool, s, "p-1", "t-1", "idp|alice")
+	seedCredential(t, ctx, admin, s, "p-1", "t-1", "idp|alice")
+
+	// Read back as an ordinary role. Seeding stays on the admin pool: the point
+	// under test is the read, and a role that cannot bypass RLS also cannot
+	// insert the row to be hidden.
+	pool := ordinaryRolePool(t, admin)
+
+	// Negative control. Without it this test would also pass against a role that
+	// simply cannot see the table at all, which is a different failure wearing
+	// the same result.
+	var scoped int
+	if err := pool.QueryRow(ctx,
+		`SELECT set_config('app.tenant_id', 't-1', false)`).Scan(new(string)); err != nil {
+		t.Fatalf("set tenant scope: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM principal_credentials`).Scan(&scoped); err != nil {
+		t.Fatalf("scoped count failed: %v", err)
+	}
+	if scoped != 1 {
+		t.Fatalf("the credential's own tenant must see it, got %d - the policy is "+
+			"too restrictive, or the role cannot read the table at all", scoped)
+	}
 
 	// No app.tenant_id set on this connection.
+	unscoped := ordinaryRolePool(t, admin)
 	var count int
-	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM principal_credentials`).Scan(&count); err != nil {
+	if err := unscoped.QueryRow(ctx, `SELECT COUNT(*) FROM principal_credentials`).Scan(&count); err != nil {
 		t.Fatalf("unscoped count failed: %v", err)
 	}
 	if count != 0 {

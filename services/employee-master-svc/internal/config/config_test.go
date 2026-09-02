@@ -8,6 +8,12 @@ import (
 // A compose deployment sets no schema and no options: the service owns a whole
 // database and its tables sit in that database's public schema.
 func TestDSN_OmitsSchemaAndOptionsWhenUnset(t *testing.T) {
+	// DSN() returns TEST_DATABASE_URL verbatim when it is set, which CI always
+	// sets. Without clearing it these tests assert against the CI database URL
+	// instead of a constructed DSN, and fail for a reason unrelated to what they
+	// check. TestDSN_TestDatabaseURLWins covers that precedence deliberately.
+	t.Setenv("TEST_DATABASE_URL", "")
+
 	d := DBConfig{
 		Host: "localhost", Port: 5432, Name: "employee_master",
 		User: "postgres", Password: "secret", SSLMode: "disable",
@@ -24,6 +30,12 @@ func TestDSN_OmitsSchemaAndOptionsWhenUnset(t *testing.T) {
 
 // A Supabase deployment has one database, so isolation comes from the schema.
 func TestDSN_EmitsSearchPathWhenSchemaSet(t *testing.T) {
+	// DSN() returns TEST_DATABASE_URL verbatim when it is set, which CI always
+	// sets. Without clearing it these tests assert against the CI database URL
+	// instead of a constructed DSN, and fail for a reason unrelated to what they
+	// check. TestDSN_TestDatabaseURLWins covers that precedence deliberately.
+	t.Setenv("TEST_DATABASE_URL", "")
+
 	d := DBConfig{
 		Host: "db.example.supabase.co", Port: 6543, Name: "postgres",
 		User: "app_employee_master.abcdef", Password: "secret",
@@ -39,6 +51,12 @@ func TestDSN_EmitsSearchPathWhenSchemaSet(t *testing.T) {
 // DB_OPTIONS carries the pgx settings the transaction pooler needs. Appended
 // verbatim, and last, so it can override anything built above it.
 func TestDSN_AppendsOptionsVerbatim(t *testing.T) {
+	// DSN() returns TEST_DATABASE_URL verbatim when it is set, which CI always
+	// sets. Without clearing it these tests assert against the CI database URL
+	// instead of a constructed DSN, and fail for a reason unrelated to what they
+	// check. TestDSN_TestDatabaseURLWins covers that precedence deliberately.
+	t.Setenv("TEST_DATABASE_URL", "")
+
 	opts := "default_query_exec_mode=exec statement_cache_capacity=0"
 	d := DBConfig{
 		Host: "h", Port: 6543, Name: "postgres", User: "u", Password: "p",
@@ -56,6 +74,12 @@ func TestDSN_AppendsOptionsVerbatim(t *testing.T) {
 // DSN that pgx then reported as an authentication failure — pointing at the
 // credential rather than at the encoding of it.
 func TestDSN_QuotesPasswordSafely(t *testing.T) {
+	// DSN() returns TEST_DATABASE_URL verbatim when it is set, which CI always
+	// sets. Without clearing it these tests assert against the CI database URL
+	// instead of a constructed DSN, and fail for a reason unrelated to what they
+	// check. TestDSN_TestDatabaseURLWins covers that precedence deliberately.
+	t.Setenv("TEST_DATABASE_URL", "")
+
 	for _, tc := range []struct {
 		name     string
 		password string

@@ -212,7 +212,12 @@ func (s *PgStore) RecordAuthFailure(
 			)
 			UPDATE principal_credentials c
 			SET failed_attempt_count = computed.next_count,
-			    locked_until = CASE WHEN computed.next_count >= $2 THEN $3 ELSE NULL END,
+			    -- $3 is cast explicitly. Both arms of this CASE are otherwise
+			    -- untyped - a bare parameter and a bare NULL - so Postgres
+			    -- resolves the expression to text and the UPDATE fails with
+			    -- "column locked_until is of type timestamp with time zone but
+			    -- expression is of type text". Every lockout write errored.
+			    locked_until = CASE WHEN computed.next_count >= $2 THEN $3::timestamptz ELSE NULL END,
 			    updated_at = $1
 			FROM computed
 			WHERE c.credential_id = computed.credential_id AND c.tenant_id = $5

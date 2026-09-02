@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"testing"
 	"time"
 
@@ -32,20 +33,32 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS principal_credentials, access_decision_log, delegated_authorities, principal_role_assignments, principals CASCADE;`)
+	// Reset the whole schema, not a named table list. The list had the same defect
+	// the migration list did: it names what existed when it was written, so a
+	// migration that adds a table leaves that table behind and the next run fails
+	// with "already exists" - or worse, succeeds against stale rows.
+	_, _ = pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
 
-	for _, mFile := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_data_classification.up.sql",
-		"000003_add_rls.up.sql",
-		"000004_add_principal_credentials.up.sql",
-	} {
-		migSQL, err := os.ReadFile(filepath.Join(migDir, mFile))
+	// EVERY *.up.sql, BY GLOB, NOT A HARDCODED LIST. A named list quietly stops
+	// applying migrations the moment one is added, so the suite runs green against
+	// a schema missing exactly the newest thing anyone wrote. Same failure mode
+	// found in leave-absence-svc, notification-svc and evidence-manifest-svc.
+	migrations, err := filepath.Glob(filepath.Join(migDir, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("globbing migrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatal("no *.up.sql found - these tests would run against an empty schema")
+	}
+	sort.Strings(migrations)
+
+	for _, mFile := range migrations {
+		migSQL, err := os.ReadFile(mFile)
 		if err != nil {
-			t.Fatalf("failed to read migration file %s: %v", mFile, err)
+			t.Fatalf("failed to read migration file %s: %v", filepath.Base(mFile), err)
 		}
 		if _, err := pool.Exec(ctx, string(migSQL)); err != nil {
-			t.Fatalf("failed to execute migration %s: %v", mFile, err)
+			t.Fatalf("failed to execute migration %s: %v", filepath.Base(mFile), err)
 		}
 	}
 

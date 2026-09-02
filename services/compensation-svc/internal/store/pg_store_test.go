@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -37,18 +38,32 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS bonus_grants, wage_revisions, compensation_structures CASCADE;`)
+	// Reset the whole schema, not a named table list. The list had the same defect
+	// the migration list did: it names what existed when it was written, so a
+	// migration that adds a table leaves that table behind and the next run fails
+	// with "already exists" - or worse, succeeds against stale rows.
+	_, _ = pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_fix_race_and_idempotency.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
+	// EVERY *.up.sql, BY GLOB, NOT A HARDCODED LIST. A named list quietly stops
+	// applying migrations the moment one is added, so the suite runs green against
+	// a schema missing exactly the newest thing anyone wrote. Same failure mode
+	// found in leave-absence-svc, notification-svc and evidence-manifest-svc.
+	migrations, err := filepath.Glob(filepath.Join(base, "../../deployments/migrations", "*.up.sql"))
+	if err != nil {
+		t.Fatalf("globbing migrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatal("no *.up.sql found - these tests would run against an empty schema")
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", migration, err)
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(migration), err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", migration, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(migration), err)
 		}
 	}
 
