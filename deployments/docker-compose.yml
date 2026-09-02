@@ -1620,6 +1620,12 @@ services:
       SMTP_USERNAME: "${SMTP_USERNAME:-}"
       SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
 
+      # Opens one SMTP session at startup and sends no mail, so a wrong
+      # credential fails the container here rather than surfacing days later as
+      # a password reset that never arrived. Left on for mailpit too: it costs
+      # a connect, and it proves the relay is actually wired.
+      SMTP_VERIFY_ON_START: "${SMTP_VERIFY_ON_START:-true}"
+
       # Transient delivery failures — a relay restarting, greylisting, an
       # identity-context-svc blip — are re-attempted by the in-process worker
       # rather than concluded FAILED on the first try. Five attempts over
