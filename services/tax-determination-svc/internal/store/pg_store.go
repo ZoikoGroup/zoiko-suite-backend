@@ -35,6 +35,42 @@ func (s *PgStore) setRLS(ctx context.Context, tx pgx.Tx) error {
 	return err
 }
 
+// determinationColumns is the read SELECT list, and scanDeterminationTargets
+// below is derived from it in the same order.
+//
+// A single const because there are two read paths over the same columns and
+// migration 000003 took the list from 22 columns to 38. Two hand-maintained
+// copies of a 38-column list is how a determination comes back with its supply
+// type in its currency field.
+const determinationColumns = `determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
+		       COALESCE(rule_id,''), tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage,
+		       calculated_tax_amount, exempt_amount, currency, status, effective_from, effective_to,
+		       evaluated_at, evaluated_by, created_at, updated_at,
+		       seller_party_id, buyer_party_id, seller_establishment_id, buyer_establishment_id,
+		       ship_from_jurisdiction_id, ship_to_jurisdiction_id,
+		       supply_jurisdiction_id, supply_date, place_of_supply_basis,
+		       product_classification, supply_kind, supply_type, buyer_tax_registration_id,
+		       exemption_reason, exemption_certificate_ref,
+		       seller_registration_id, seller_registration_status`
+
+// scanDeterminationTargets returns scan destinations matching
+// determinationColumns, column for column. status is scanned into a plain
+// string and converted by the caller, as it was before.
+func scanDeterminationTargets(d *domain.TaxDetermination, status *string) []any {
+	return []any{
+		&d.DeterminationID, &d.TenantID, &d.TransactionID, &d.SourceModule, &d.LegalEntityID, &d.JurisdictionID,
+		&d.RuleID, &d.TaxLogicSnapshotID, &d.TaxCategory, &d.GrossAmount, &d.TaxableAmount, &d.TaxRatePercentage,
+		&d.CalculatedTaxAmount, &d.ExemptAmount, &d.Currency, status, &d.EffectiveFrom, &d.EffectiveTo,
+		&d.EvaluatedAt, &d.EvaluatedBy, &d.CreatedAt, &d.UpdatedAt,
+		&d.SellerPartyID, &d.BuyerPartyID, &d.SellerEstablishmentID, &d.BuyerEstablishmentID,
+		&d.ShipFromJurisdictionID, &d.ShipToJurisdictionID,
+		&d.SupplyJurisdictionID, &d.SupplyDate, &d.PlaceOfSupplyBasis,
+		&d.ProductClassification, &d.SupplyKind, &d.SupplyType, &d.BuyerTaxRegistrationID,
+		&d.ExemptionReason, &d.ExemptionCertificateRef,
+		&d.SellerRegistrationID, &d.SellerRegistrationStatus,
+	}
+}
+
 func (s *PgStore) CreateDetermination(ctx context.Context, d *domain.TaxDetermination) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -65,12 +101,25 @@ func (s *PgStore) CreateDetermination(ctx context.Context, d *domain.TaxDetermin
 			(determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
 			 rule_id, tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage, calculated_tax_amount,
 			 exempt_amount, currency, status, effective_from, effective_to, evaluated_at, evaluated_by,
-			 created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
+			 created_at, updated_at,
+			 seller_party_id, buyer_party_id, seller_establishment_id, buyer_establishment_id,
+			 ship_from_jurisdiction_id, ship_to_jurisdiction_id,
+			 supply_jurisdiction_id, supply_date, place_of_supply_basis,
+			 product_classification, supply_kind, supply_type, buyer_tax_registration_id,
+			 exemption_reason, exemption_certificate_ref,
+			 seller_registration_id, seller_registration_status)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,
+		        $23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39)`,
 		d.DeterminationID, d.TenantID, d.TransactionID, d.SourceModule, d.LegalEntityID, d.JurisdictionID,
 		d.RuleID, d.TaxLogicSnapshotID, d.TaxCategory, d.GrossAmount, d.TaxableAmount, d.TaxRatePercentage, d.CalculatedTaxAmount,
 		d.ExemptAmount, d.Currency, string(d.Status), d.EffectiveFrom, d.EffectiveTo, d.EvaluatedAt, d.EvaluatedBy,
 		d.CreatedAt, d.UpdatedAt,
+		d.SellerPartyID, d.BuyerPartyID, d.SellerEstablishmentID, d.BuyerEstablishmentID,
+		d.ShipFromJurisdictionID, d.ShipToJurisdictionID,
+		d.SupplyJurisdictionID, d.SupplyDate, string(d.PlaceOfSupplyBasis),
+		d.ProductClassification, string(d.SupplyKind), string(d.SupplyType), d.BuyerTaxRegistrationID,
+		d.ExemptionReason, d.ExemptionCertificateRef,
+		d.SellerRegistrationID, d.SellerRegistrationStatus,
 	)
 	if err != nil {
 		return fmt.Errorf("insert tax determination: %w", err)
@@ -93,16 +142,10 @@ func (s *PgStore) GetDetermination(ctx context.Context, id string) (*domain.TaxD
 	var d domain.TaxDetermination
 	var status string
 	err = tx.QueryRow(ctx, `
-		SELECT determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
-		       COALESCE(rule_id,''), tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage,
-		       calculated_tax_amount, exempt_amount, currency, status, effective_from, effective_to,
-		       evaluated_at, evaluated_by, created_at, updated_at
+		SELECT `+determinationColumns+`
 		FROM tax_determinations WHERE determination_id = $1 AND tenant_id = $2`, id, tenantID,
 	).Scan(
-		&d.DeterminationID, &d.TenantID, &d.TransactionID, &d.SourceModule, &d.LegalEntityID, &d.JurisdictionID,
-		&d.RuleID, &d.TaxLogicSnapshotID, &d.TaxCategory, &d.GrossAmount, &d.TaxableAmount, &d.TaxRatePercentage,
-		&d.CalculatedTaxAmount, &d.ExemptAmount, &d.Currency, &status, &d.EffectiveFrom, &d.EffectiveTo,
-		&d.EvaluatedAt, &d.EvaluatedBy, &d.CreatedAt, &d.UpdatedAt,
+		scanDeterminationTargets(&d, &status)...,
 	)
 	if err != nil {
 		if errorsIs(err, pgx.ErrNoRows) {
@@ -127,10 +170,7 @@ func (s *PgStore) ListDeterminations(ctx context.Context, transactionID, jurisdi
 
 	tenantID := middleware.GetTenantID(ctx)
 	rows, err := tx.Query(ctx, `
-		SELECT determination_id, tenant_id, transaction_id, source_module, legal_entity_id, jurisdiction_id,
-		       COALESCE(rule_id,''), tax_logic_snapshot_id, tax_category, gross_amount, taxable_amount, tax_rate_percentage,
-		       calculated_tax_amount, exempt_amount, currency, status, effective_from, effective_to,
-		       evaluated_at, evaluated_by, created_at, updated_at
+		SELECT `+determinationColumns+`
 		FROM tax_determinations
 		WHERE tenant_id = $4
 		  AND ($1 = '' OR transaction_id = $1)
@@ -148,10 +188,7 @@ func (s *PgStore) ListDeterminations(ctx context.Context, transactionID, jurisdi
 		var d domain.TaxDetermination
 		var stat string
 		if err := rows.Scan(
-			&d.DeterminationID, &d.TenantID, &d.TransactionID, &d.SourceModule, &d.LegalEntityID, &d.JurisdictionID,
-			&d.RuleID, &d.TaxLogicSnapshotID, &d.TaxCategory, &d.GrossAmount, &d.TaxableAmount, &d.TaxRatePercentage,
-			&d.CalculatedTaxAmount, &d.ExemptAmount, &d.Currency, &stat, &d.EffectiveFrom, &d.EffectiveTo,
-			&d.EvaluatedAt, &d.EvaluatedBy, &d.CreatedAt, &d.UpdatedAt,
+			scanDeterminationTargets(&d, &stat)...,
 		); err != nil {
 			return nil, err
 		}

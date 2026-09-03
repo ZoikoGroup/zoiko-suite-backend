@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -56,6 +57,7 @@ func registerKey(t *testing.T, r http.Handler, tenantID, alias string) string {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -127,6 +129,7 @@ func TestForeignTenant_CannotDisableKey(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, route, nil)
 		req.Header.Set("X-Tenant-ID", "tenant-b")
 		req.Header.Set("X-Principal-Id", "principal-test-01")
+		req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 		if w.Code != http.StatusNotFound {
@@ -138,6 +141,7 @@ func TestForeignTenant_CannotDisableKey(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/keys/"+keyID, nil)
 	req.Header.Set("X-Tenant-ID", "tenant-a")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -172,6 +176,7 @@ func TestForeignTenant_CannotListOthersKeys(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/keys?legal_entity_id=le-1", nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
@@ -226,3 +231,35 @@ func TestTwoHeaderlessCallersDoNotShareANamespace(t *testing.T) {
 		t.Fatalf("ISOLATION FAILURE: a header-less caller saw another header-less caller's key: %s", listW.Body.String())
 	}
 }
+
+// withEnvelope fills the canonical input contract headers this file's setup
+// requests do not set. It duplicates the helper in envelope_contract_test.go
+// deliberately: that file is in package handler_test and this one is in
+// package handler, so the identifier is not shared.
+//
+// Only absent fields are filled, so the negative cases here - foreign tenant,
+// missing principal - still say exactly what they mean.
+func withEnvelope(r *http.Request) *http.Request {
+	set := func(k, v string) {
+		if r.Header.Get(k) == "" {
+			r.Header.Set(k, v)
+		}
+	}
+	set("X-Tenant-Id", "tenant-test")
+	set("X-Principal-Id", "principal-test")
+	set("X-Legal-Entity-Id", "entity-test")
+	set("X-Request-Id", "req-test")
+	set("X-Correlation-ID", "corr-test")
+	set("X-Source-Channel", "api")
+	set("X-Purpose-Context", "AUTOMATED_TEST")
+
+	// A fresh key per request: reusing one would make the second call a replay,
+	// which is what INV-08 asks the service to collapse.
+	if r.Header.Get("Idempotency-Key") == "" {
+		scopeIdempotencySeq++
+		r.Header.Set("Idempotency-Key", fmt.Sprintf("idem-scope-%d", scopeIdempotencySeq))
+	}
+	return r
+}
+
+var scopeIdempotencySeq int

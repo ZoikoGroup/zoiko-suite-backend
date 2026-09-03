@@ -25,11 +25,13 @@ type stubAuthz struct {
 	err error
 }
 
-func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return s.err }
+func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _, _ string) error { return s.err }
 
 func newPrincipalsRouter(store *mockPrincipalStore) chi.Router {
 	r := chi.NewRouter()
-	h := identityctx.NewHandler(nil, nil, store, &stubAuthz{}, zap.NewNop())
+	// Resolver and authenticator are nil: these tests exercise only the
+	// /v1/principals routes, which touch neither.
+	h := identityctx.NewHandler(nil, nil, nil, store, &stubAuthz{}, zap.NewNop())
 	identityctx.RegisterRoutes(r, h)
 	return r
 }

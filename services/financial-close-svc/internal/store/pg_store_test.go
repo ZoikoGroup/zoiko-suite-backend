@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -41,12 +42,27 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS close_evidences, fiscal_periods CASCADE;`)
 
-	sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations/000001_initial_schema.up.sql"))
-	if err != nil {
-		t.Fatalf("failed to read migration: %v", err)
+	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
+	//
+	// This applied 000001 alone and the service has two, so 000002_force_rls was
+	// never present. That matters most for TestPgStore_RLS_TenantIsolation in
+	// this file: it asserts row-level isolation against a schema where FORCE ROW
+	// LEVEL SECURITY had not been applied, so it could pass with the policy
+	// bound to nobody.
+	migrations, err := filepath.Glob(filepath.Join(base, "../../deployments/migrations/*.up.sql"))
+	if err != nil || len(migrations) == 0 {
+		t.Fatalf("no *.up.sql under deployments/migrations: %v", err)
 	}
-	if _, err := pool.Exec(ctx, string(sql)); err != nil {
-		t.Fatalf("failed to apply migration: %v", err)
+	sort.Strings(migrations)
+
+	for _, path := range migrations {
+		sql, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(path), readErr)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(path), err)
+		}
 	}
 
 	return pool

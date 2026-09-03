@@ -41,6 +41,7 @@ func createExporter(t *testing.T, r http.Handler, tenantID, name, token string) 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -114,6 +115,7 @@ func TestForeignTenant_CannotReadExporterAuthToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters/"+expID, nil)
 	req.Header.Set("X-Tenant-ID", "tenant-b")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -127,6 +129,7 @@ func TestForeignTenant_CannotReadExporterAuthToken(t *testing.T) {
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters", nil)
 	listReq.Header.Set("X-Tenant-ID", "tenant-b")
 	listReq.Header.Set("X-Principal-Id", "principal-test-01")
+	listReq = withEnvelope(listReq) // rest of the canonical envelope; headers already set win
 	listW := httptest.NewRecorder()
 	r.ServeHTTP(listW, listReq)
 	if listW.Code != http.StatusOK {
@@ -142,6 +145,7 @@ func TestForeignTenant_CannotReadExporterAuthToken(t *testing.T) {
 	ownReq := httptest.NewRequest(http.MethodGet, "/v1/siem/exporters/"+expID, nil)
 	ownReq.Header.Set("X-Tenant-ID", "tenant-a")
 	ownReq.Header.Set("X-Principal-Id", "principal-test-01")
+	ownReq = withEnvelope(ownReq) // rest of the canonical envelope; headers already set win
 	ownW := httptest.NewRecorder()
 	r.ServeHTTP(ownW, ownReq)
 	if ownW.Code != http.StatusOK {
@@ -165,6 +169,7 @@ func TestForeignTenant_CannotReadOthersSecurityEvents(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-a")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -186,6 +191,7 @@ func TestForeignTenant_CannotReadOthersSecurityEvents(t *testing.T) {
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/events?exporter_id="+expID, nil)
 	listReq.Header.Set("X-Tenant-ID", "tenant-b")
 	listReq.Header.Set("X-Principal-Id", "principal-test-01")
+	listReq = withEnvelope(listReq) // rest of the canonical envelope; headers already set win
 	listW := httptest.NewRecorder()
 	r.ServeHTTP(listW, listReq)
 	if listW.Code != http.StatusNotFound {
@@ -200,6 +206,7 @@ func TestForeignTenant_CannotReadOthersSecurityEvents(t *testing.T) {
 	ownList := httptest.NewRequest(http.MethodGet, "/v1/siem/events?exporter_id="+expID, nil)
 	ownList.Header.Set("X-Tenant-ID", "tenant-a")
 	ownList.Header.Set("X-Principal-Id", "principal-test-01")
+	ownList = withEnvelope(ownList) // rest of the canonical envelope; headers already set win
 	ownListW := httptest.NewRecorder()
 	r.ServeHTTP(ownListW, ownList)
 	if ownListW.Code != http.StatusOK {
@@ -237,6 +244,7 @@ func TestForeignTenant_CannotStreamIntoOthersExporter(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-b")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	// Assert 404 specifically, not merely "not 201". An earlier draft of this
@@ -253,6 +261,7 @@ func TestForeignTenant_CannotStreamIntoOthersExporter(t *testing.T) {
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/siem/events", nil)
 	listReq.Header.Set("X-Tenant-ID", "tenant-a")
 	listReq.Header.Set("X-Principal-Id", "principal-test-01")
+	listReq = withEnvelope(listReq) // rest of the canonical envelope; headers already set win
 	listW := httptest.NewRecorder()
 	r.ServeHTTP(listW, listReq)
 	if bytes.Contains(listW.Body.Bytes(), []byte("forged-by-tenant-b")) {

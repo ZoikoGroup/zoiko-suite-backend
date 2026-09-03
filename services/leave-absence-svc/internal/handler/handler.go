@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -27,6 +28,11 @@ type Store interface {
 	ListLeaveRequests(ctx context.Context, employeeID, status string) ([]domain.LeaveRequest, error)
 	ApproveLeaveRequest(ctx context.Context, requestID, reviewerID, notes string) error
 	RejectLeaveRequest(ctx context.Context, requestID, reviewerID, notes string) error
+
+	CreateHoliday(ctx context.Context, h *domain.Holiday) error
+	ListHolidays(ctx context.Context, f domain.HolidayFilter) ([]domain.Holiday, error)
+	GetHoliday(ctx context.Context, holidayID string) (*domain.Holiday, error)
+	DeactivateHoliday(ctx context.Context, holidayID string) error
 }
 
 type Publisher interface {
@@ -53,7 +59,18 @@ const (
 	actionLeaveRequestView    = "LEAVE_REQUEST_VIEW"
 	actionLeaveRequestApprove = "LEAVE_REQUEST_APPROVE"
 	actionLeaveRequestReject  = "LEAVE_REQUEST_REJECT"
+	actionHolidayCreate       = "HOLIDAY_CREATE"
+	actionHolidayView         = "HOLIDAY_VIEW"
+	actionHolidayDeactivate   = "HOLIDAY_DEACTIVATE"
 )
+
+// dateLayout is the only accepted wire format for a calendar date.
+const dateLayout = "2006-01-02"
+
+// autoApprovalReviewerID attributes an auto-approval to the policy rather than
+// to the submitting principal, so the audit trail never shows someone approving
+// their own leave.
+const autoApprovalReviewerID = "system:leave-policy-auto-approval"
 
 type Handler struct {
 	store     Store
@@ -86,6 +103,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/requests/{id}", h.GetLeaveRequest)
 		r.Post("/requests/{id}/approve", h.ApproveLeaveRequest)
 		r.Post("/requests/{id}/reject", h.RejectLeaveRequest)
+
+		r.Post("/holidays", h.CreateHoliday)
+		r.Get("/holidays", h.ListHolidays)
+		r.Delete("/holidays/{id}", h.DeactivateHoliday)
 	})
 }
 
@@ -103,6 +124,20 @@ func (h *Handler) CreateLeaveType(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.MinNoticeDays < 0 || req.MaxConsecutiveDays < 0 || req.CarryForwardMaxHours < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_policy",
+			string(domain.ErrInvalidPolicy)+": min_notice_days, max_consecutive_days and carry_forward_max_hours must not be negative")
+		return
+	}
+
+	// Carrying forward with a zero cap would discard the whole balance at year
+	// end, which is a configuration mistake rather than a policy.
+	if req.CarryForwardAllowed && req.CarryForwardMaxHours <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_policy",
+			string(domain.ErrInvalidPolicy)+": carry_forward_max_hours must be positive when carry_forward_allowed is true")
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -111,6 +146,13 @@ func (h *Handler) CreateLeaveType(w http.ResponseWriter, r *http.Request) {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionLeaveTypeCreate); err != nil {
 		h.writeAuthzErr(w, err)
 		return
+	}
+
+	// Approval is required unless the caller explicitly says otherwise, so an
+	// older client that does not know the field keeps its leave reviewed.
+	requiresApproval := true
+	if req.RequiresApproval != nil {
+		requiresApproval = *req.RequiresApproval
 	}
 
 	tenantID := svcmiddleware.TenantFromContext(r.Context())
@@ -125,11 +167,23 @@ func (h *Handler) CreateLeaveType(w http.ResponseWriter, r *http.Request) {
 		AccrualRatePerYear: req.AccrualRatePerYear,
 		MaxBalance:         req.MaxBalance,
 		Status:             "ACTIVE",
-		CreatedAt:          now,
-		UpdatedAt:          now,
+
+		CarryForwardAllowed:  req.CarryForwardAllowed,
+		CarryForwardMaxHours: req.CarryForwardMaxHours,
+		MinNoticeDays:        req.MinNoticeDays,
+		MaxConsecutiveDays:   req.MaxConsecutiveDays,
+		RequiresApproval:     requiresApproval,
+		ColorHex:             req.ColorHex,
+		Icon:                 req.Icon,
+
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
-	if err := h.store.CreateLeaveType(r.Context(), lt); err != nil {
+	if err := h.store.CreateLeaveType(r.Context(), lt); errors.Is(err, domain.ErrLeaveTypeCodeExists) {
+		writeError(w, http.StatusConflict, "leave_type_code_exists", err.Error())
+		return
+	} else if err != nil {
 		h.log.Error("failed to create leave type", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
@@ -279,6 +333,24 @@ func (h *Handler) SubmitLeaveRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The leave type carries the policy, so it has to be read before the request
+	// is persisted — a request that violates policy must never reach the store.
+	leaveType, err := h.store.GetLeaveType(r.Context(), req.LeaveTypeID)
+	if errors.Is(err, domain.ErrLeaveTypeNotFound) {
+		writeError(w, http.StatusNotFound, "leave_type_not_found", err.Error())
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch leave type for policy check", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if code, msg := checkLeavePolicy(*leaveType, req.StartDate, req.EndDate, time.Now().UTC()); code != "" {
+		writeError(w, http.StatusBadRequest, code, msg)
+		return
+	}
+
 	lr, err := h.store.SubmitLeaveRequest(r.Context(), &req)
 	if errors.Is(err, domain.ErrInsufficientBalance) {
 		writeError(w, http.StatusBadRequest, "insufficient_balance", err.Error())
@@ -293,7 +365,74 @@ func (h *Handler) SubmitLeaveRequest(w http.ResponseWriter, r *http.Request) {
 	correlationID := getCorrelationID(r)
 	h.publisher.PublishLeaveRequested(r.Context(), correlationID, legalEntityID, principalID, *lr)
 
+	// A leave type configured not to require approval is approved here rather
+	// than left sitting in SUBMITTED for a reviewer who is never coming.
+	if !leaveType.RequiresApproval {
+		if err := h.store.ApproveLeaveRequest(r.Context(), lr.RequestID, autoApprovalReviewerID, "auto-approved by leave type policy"); err != nil {
+			// The request itself is valid and stored; it simply stays in
+			// SUBMITTED for manual review. Report success with the state the
+			// caller can actually see rather than failing the submission.
+			h.log.Error("auto-approval failed, leaving request in SUBMITTED",
+				zap.String("request_id", lr.RequestID), zap.Error(err))
+			writeJSON(w, http.StatusCreated, lr)
+			return
+		}
+
+		approved, err := h.store.GetLeaveRequest(r.Context(), lr.RequestID)
+		if err != nil {
+			h.log.Error("failed to re-read auto-approved request", zap.Error(err))
+			writeJSON(w, http.StatusCreated, lr)
+			return
+		}
+
+		h.publisher.PublishLeaveApproved(r.Context(), correlationID, legalEntityID, *approved)
+		writeJSON(w, http.StatusCreated, approved)
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, lr)
+}
+
+// checkLeavePolicy validates a proposed leave span against the leave type.
+// It returns an empty code when the request is acceptable; otherwise an error
+// code and message ready for a 400.
+//
+// now is passed rather than read so the notice-period boundary is testable.
+func checkLeavePolicy(lt domain.LeaveType, startDate, endDate string, now time.Time) (string, string) {
+	start, err := time.Parse(dateLayout, startDate)
+	if err != nil {
+		return "invalid_date", "start_date " + string(domain.ErrInvalidDate)
+	}
+	end, err := time.Parse(dateLayout, endDate)
+	if err != nil {
+		return "invalid_date", "end_date " + string(domain.ErrInvalidDate)
+	}
+
+	if end.Before(start) {
+		return "invalid_range", string(domain.ErrEndBeforeStart)
+	}
+
+	if lt.MaxConsecutiveDays > 0 {
+		// Inclusive of both endpoints: a single-day request spans one day.
+		spanDays := int(end.Sub(start).Hours()/24) + 1
+		if spanDays > lt.MaxConsecutiveDays {
+			return "span_too_long", fmt.Sprintf("%s: %d days requested, %d allowed",
+				string(domain.ErrSpanTooLong), spanDays, lt.MaxConsecutiveDays)
+		}
+	}
+
+	if lt.MinNoticeDays > 0 {
+		// Compare whole days: a request submitted at 23:00 for leave starting
+		// two days later gives two days of notice, not one and a fraction.
+		today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+		noticeDays := int(start.Sub(today).Hours() / 24)
+		if noticeDays < lt.MinNoticeDays {
+			return "notice_too_short", fmt.Sprintf("%s: %d days notice given, %d required",
+				string(domain.ErrNoticeTooShort), noticeDays, lt.MinNoticeDays)
+		}
+	}
+
+	return "", ""
 }
 
 // ── GET /v1/leave/requests ────────────────────────────────────────────────────────

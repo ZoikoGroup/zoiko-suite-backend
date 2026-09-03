@@ -24,10 +24,15 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
 
-// svc is the interface slice of service methods consumed by the handler.
-// Using the concrete *registry.Service here keeps wiring simple; an interface
-// can be extracted later if multiple service implementations are needed.
-type svc interface {
+// Service is the set of registry operations the HTTP layer consumes.
+//
+// Exported, and taken by New, so a handler can be built against a stub. New
+// used to take the concrete *registry.Service while this interface stayed
+// unexported, which meant the only way to reach a handler from a test was to
+// construct a real Service over a real store — and so none of the routes
+// registered below had a single test. The concrete *registry.Service satisfies
+// this unchanged, so production wiring is unaffected.
+type Service interface {
 	// Tenant
 	ProvisionTenant(ctx context.Context, req domain.ProvisionTenantRequest, correlationID string) (*domain.Tenant, error)
 	GetTenant(ctx context.Context, tenantID string) (*domain.Tenant, error)
@@ -40,6 +45,8 @@ type svc interface {
 	CreateWorkspace(ctx context.Context, req domain.CreateWorkspaceRequest) (*domain.Workspace, error)
 	GetWorkspace(ctx context.Context, workspaceID string) (*domain.Workspace, error)
 	ListWorkspaces(ctx context.Context, tenantID string) ([]*domain.Workspace, error)
+	UpdateWorkspace(ctx context.Context, workspaceID string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error)
+	TransitionWorkspaceStatus(ctx context.Context, workspaceID string, req domain.TransitionWorkspaceStatusRequest) error
 	UpdateEntity(ctx context.Context, legalEntityID string, req domain.UpdateEntityRequest) (*domain.LegalEntity, error)
 	GetEntityStatus(ctx context.Context, legalEntityID string) (*domain.EntityStatusResponse, error)
 	TransitionEntityStatus(ctx context.Context, legalEntityID string, req domain.TransitionEntityStatusRequest) error
@@ -75,12 +82,12 @@ type svc interface {
 
 // Handler holds all HTTP handler methods.
 type Handler struct {
-	svc svc
+	svc Service
 	log *zap.Logger
 }
 
 // New constructs a Handler.
-func New(s *registry.Service, log *zap.Logger) *Handler {
+func New(s Service, log *zap.Logger) *Handler {
 	return &Handler{svc: s, log: log}
 }
 
@@ -101,6 +108,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/tenants/{tenantID}/workspaces", h.ListWorkspaces)
 		r.Post("/workspaces", h.CreateWorkspace)
 		r.Get("/workspaces/{workspaceID}", h.GetWorkspace)
+		r.Patch("/workspaces/{workspaceID}", h.UpdateWorkspace)
+		r.Post("/workspaces/{workspaceID}/status", h.TransitionWorkspaceStatus)
 		r.Post("/entities", h.CreateEntity)
 		r.Get("/entities/{entityID}", h.GetEntity)
 		r.Patch("/entities/{entityID}", h.UpdateEntity)
@@ -246,6 +255,41 @@ func (h *Handler) ListWorkspaces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, workspaces)
+}
+
+// UpdateWorkspace — PATCH /v1/workspaces/{workspaceID}
+//
+// The correlation id is taken from the header rather than the body. It is a
+// mandatory envelope field the gateway propagates, so the header is its
+// authoritative source; accepting the body's value would let a caller detach
+// its own write from the trace an operator follows.
+func (h *Handler) UpdateWorkspace(w http.ResponseWriter, r *http.Request) {
+	var req domain.UpdateWorkspaceRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	req.CorrelationID = correlationID(r)
+	ws, err := h.svc.UpdateWorkspace(r.Context(), chi.URLParam(r, "workspaceID"), req)
+	if err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ws)
+}
+
+// TransitionWorkspaceStatus — POST /v1/workspaces/{workspaceID}/status
+// Archives or restores a workspace and publishes workspace.status.changed.
+func (h *Handler) TransitionWorkspaceStatus(w http.ResponseWriter, r *http.Request) {
+	var req domain.TransitionWorkspaceStatusRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	req.CorrelationID = correlationID(r)
+	if err := h.svc.TransitionWorkspaceStatus(r.Context(), chi.URLParam(r, "workspaceID"), req); err != nil {
+		h.writeErr(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) UpdateEntity(w http.ResponseWriter, r *http.Request) {

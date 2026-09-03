@@ -24,14 +24,15 @@ import (
 type Store interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
+	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error)
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
 
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
-	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
-	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
+	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 
@@ -39,13 +40,17 @@ type Store interface {
 	// currently-active role assignment + bundle for principalID in
 	// legalEntityID, plus a human-readable basis string naming the
 	// role(s) that granted them (empty slice + "" basis if none).
-	FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
+	//
+	// tenantID scopes the role join. Empty means "no verified tenant" and
+	// falls back to platform scope — see the implementation for why that
+	// fallback still exists and what it costs.
+	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 
 	// FindDelegatedActions returns the union of actions available to
 	// principalID in legalEntityID via active, non-expired delegations —
 	// i.e. actions the delegator(s) hold, that principalID may act on
-	// their behalf for.
-	FindDelegatedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
+	// their behalf for. tenantID scopes it exactly as above.
+	FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 
 	// CheckSoDConflict returns the conflicting action name and true if
 	// grantedActions already contains an action that conflicts with
@@ -54,8 +59,12 @@ type Store interface {
 	// the caller's tenant to also bring that tenant's own SoD rules in.
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
 
-	RecordAccessDecision(ctx context.Context, principalID, legalEntityID, actionType, outcome, basis, correlationID string) (*domain.AccessDecisionLog, error)
-	FindAccessDecisionByID(ctx context.Context, accessDecisionID string) (*domain.AccessDecisionLog, error)
+	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
+
+	// FindAccessDecisionByID returns the decision only if it was recorded in
+	// tenantID scope. A decision recorded without a tenant is not readable
+	// here at all - see RecordAccessDecisionParams.TenantID.
+	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -93,15 +102,23 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) 
 
 // withPlatformScope runs fn inside a transaction flagged as platform
 // scope, which the roles policy treats as visible regardless of
-// tenant_id. Used ONLY by FindRoleByID, whose entire purpose is to
-// discover which tenant an unknown role_id belongs to — the caller
-// cannot know the tenant to scope the read by until after this read
-// returns, so this read structurally cannot be tenant-scoped without
-// being pointless (same reasoning as secret-vault-integration-svc's
-// FindSecretPolicyVersionByID). Safety comes from the caller (handler.go)
-// always comparing the returned role's TenantID against the verified
-// caller's own scope and refusing on mismatch — this function's result is
-// never trusted as pre-authorized.
+// tenant_id.
+//
+// Two callers, for different reasons:
+//
+// FindRoleByID, whose entire purpose is to discover which tenant an unknown
+// role_id belongs to — the caller cannot know the tenant to scope the read by
+// until after this read returns, so this read structurally cannot be
+// tenant-scoped without being pointless (same reasoning as
+// secret-vault-integration-svc's FindSecretPolicyVersionByID). Safety comes
+// from the caller (handler.go) always comparing the returned role's TenantID
+// against the verified caller's own scope and refusing on mismatch — this
+// function's result is never trusted as pre-authorized.
+//
+// FindGrantedActions, but ONLY when its caller supplied no tenant at all. That
+// is a compatibility fallback for callers still on the pre-header convention,
+// not a property of the query — see its own comment for what the unconditional
+// form leaked. Anything else reaching for this should scope by tenant instead.
 func (s *PgStore) withPlatformScope(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -144,6 +161,60 @@ func (s *PgStore) FindRoleByID(ctx context.Context, roleID string) (*domain.Role
 			return nil, domain.ErrRoleNotFound
 		}
 		s.log.Error("pg FindRoleByID failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
+}
+
+// SetRoleActive flips a role's active_flag and returns the role as it now
+// stands. This is the ONLY way to stop a role being enforced.
+//
+// WHY THIS EXISTS. active_flag has been on the roles table since the initial
+// schema, and FindGrantedActions has always joined through it
+// (`JOIN roles r ON ... AND r.active_flag`), so a false flag genuinely removes
+// every action the role granted. What was missing was any route that could set
+// it: this service could create a role and revoke an ASSIGNMENT, but never
+// retire the role itself. access-control-svc, the governed authoring layer in
+// front of this admin API, could therefore mark a role RETIRED in its own
+// catalogue while every principal holding it kept the access — a retirement
+// that was a label and not a control.
+//
+// Idempotent: retiring an already-retired role returns it unchanged with no
+// error, because the caller's intent (this role must not grant anything) is
+// already satisfied and a 409 would make a safe retry look like a failure.
+// A missing role is still ErrRoleNotFound — that is a different fact.
+//
+// Deliberately does not touch principal_role_assignments. The assignments
+// remain, and reactivating restores exactly the access that was suspended;
+// cascading revocation would be irreversible and is a separate decision from
+// "stop enforcing this role for now".
+//
+// TENANT SCOPE. tenantID is the caller's VERIFIED scope, and both controls
+// that isolate it are applied: the explicit tenant_id predicate, and withRLS
+// so the tenant_isolation_policy on `roles` has a value to enforce against.
+// This UPDATE previously ran on s.pool with neither. Against a NOBYPASSRLS
+// role - which is what zoiko_app is - app.tenant_id was never set, the FORCE
+// policy predicate evaluated to NULL, and the statement matched zero rows, so
+// every retire/reactivate answered 404 and role retirement did not work at
+// all. Against an owner or superuser connection the same statement retired
+// ANY tenant's role by id. One missing scope, two opposite failures.
+func (s *PgStore) SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error) {
+	const query = `
+		UPDATE roles SET active_flag = $3
+		WHERE role_id = $1 AND tenant_id = $2::uuid
+		RETURNING ` + roleColumns + `;`
+
+	var r *domain.Role
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		r, scanErr = scanRole(tx.QueryRow(ctx, query, roleID, tenantID, active))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrRoleNotFound
+		}
+		s.log.Error("pg SetRoleActive failed", zap.Error(err), zap.String("role_id", roleID), zap.Bool("active", active))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return r, nil
@@ -302,11 +373,11 @@ func (s *PgStore) RevokeRoleAssignment(ctx context.Context, assignmentID, tenant
 
 // ── delegated_authorities ────────────────────────────────────────────────────
 
-const delegationColumns = `delegated_authority_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, effective_from, effective_to, revocation_status, created_at`
+const delegationColumns = `delegated_authority_id, tenant_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, effective_from, effective_to, revocation_status, created_at`
 
 func scanDelegation(row pgx.Row) (*domain.DelegatedAuthority, error) {
 	d := &domain.DelegatedAuthority{}
-	err := row.Scan(&d.DelegatedAuthorityID, &d.DelegatorPrincipalID, &d.DelegatePrincipalID, &d.ScopeType, &d.LegalEntityID,
+	err := row.Scan(&d.DelegatedAuthorityID, &d.TenantID, &d.DelegatorPrincipalID, &d.DelegatePrincipalID, &d.ScopeType, &d.LegalEntityID,
 		&d.AuthorityLimitType, &d.AuthorityLimitValue, &d.EffectiveFrom, &d.EffectiveTo, &d.RevocationStatus, &d.CreatedAt)
 	return d, err
 }
@@ -316,14 +387,22 @@ func (s *PgStore) CreateDelegatedAuthority(ctx context.Context, params domain.Cr
 		params.DelegatedAuthorityID = uuid.New().String()
 	}
 
+	if params.TenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+
 	const query = `
-		INSERT INTO delegated_authorities (delegated_authority_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, effective_from, effective_to)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO delegated_authorities (delegated_authority_id, tenant_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, effective_from, effective_to)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING ` + delegationColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query, params.DelegatedAuthorityID, params.DelegatorPrincipalID, params.DelegatePrincipalID,
-		params.ScopeType, params.LegalEntityID, params.AuthorityLimitType, params.AuthorityLimitValue, params.EffectiveFrom, params.EffectiveTo)
-	d, err := scanDelegation(row)
+	var d *domain.DelegatedAuthority
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanDelegation(tx.QueryRow(ctx, query, params.DelegatedAuthorityID, params.TenantID, params.DelegatorPrincipalID, params.DelegatePrincipalID,
+			params.ScopeType, params.LegalEntityID, params.AuthorityLimitType, params.AuthorityLimitValue, params.EffectiveFrom, params.EffectiveTo))
+		return scanErr
+	})
 	if err != nil {
 		s.log.Error("pg CreateDelegatedAuthority failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -336,10 +415,22 @@ func (s *PgStore) CreateDelegatedAuthority(ctx context.Context, params domain.Cr
 // verify the caller is the delegator before revoking (that check must
 // happen BEFORE the transition, not after, same doctrine as
 // secret-vault-integration-svc's RevokeLease).
-func (s *PgStore) FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error) {
-	const query = `SELECT ` + delegationColumns + ` FROM delegated_authorities WHERE delegated_authority_id = $1;`
-	row := s.pool.QueryRow(ctx, query, delegatedAuthorityID)
-	d, err := scanDelegation(row)
+// A delegation belonging to another tenant is reported as
+// ErrDelegatedAuthorityNotFound, so a probe cannot distinguish "not yours"
+// from "does not exist". The predicate is explicit rather than left to the
+// policy: on the compose estate the service connects as a superuser, which
+// bypasses row security entirely.
+func (s *PgStore) FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+	const query = `SELECT ` + delegationColumns + ` FROM delegated_authorities WHERE delegated_authority_id = $1 AND tenant_id = $2::uuid;`
+	var d *domain.DelegatedAuthority
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanDelegation(tx.QueryRow(ctx, query, delegatedAuthorityID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrDelegatedAuthorityNotFound
@@ -350,8 +441,11 @@ func (s *PgStore) FindDelegatedAuthorityByID(ctx context.Context, delegatedAutho
 	return d, nil
 }
 
-func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error) {
-	current, err := s.FindDelegatedAuthorityByID(ctx, delegatedAuthorityID)
+func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+	current, err := s.FindDelegatedAuthorityByID(ctx, delegatedAuthorityID, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -359,15 +453,25 @@ func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthori
 		return nil, domain.ErrInvalidTransition
 	}
 
+	// tenant_id in the WHERE as well as in the fetch above: the fetch proves
+	// the row is ours, this keeps the write from touching anything else if the
+	// two ever drift apart.
 	const query = `
 		UPDATE delegated_authorities
 		SET revocation_status = 'REVOKED'
-		WHERE delegated_authority_id = $1
+		WHERE delegated_authority_id = $1 AND tenant_id = $2::uuid
 		RETURNING ` + delegationColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query, delegatedAuthorityID)
-	d, err := scanDelegation(row)
+	var d *domain.DelegatedAuthority
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanDelegation(tx.QueryRow(ctx, query, delegatedAuthorityID, tenantID))
+		return scanErr
+	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrDelegatedAuthorityNotFound
+		}
 		s.log.Error("pg RevokeDelegatedAuthority failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
@@ -409,17 +513,48 @@ func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRule
 // tenant-wide assignment (pra.legal_entity_id IS NULL) matches regardless
 // of which legal entity is being evaluated.
 //
-// Platform-scoped (bypasses roles' RLS), deliberately: this is the core
-// /v1/authorize evaluation path, called on nearly every mutating request
-// platform-wide, and the caller of /v1/authorize is not required to
-// supply — and generally does not know — which tenant owns principalID.
-// tenant_id is simply not this query's scoping variable; principal_id +
-// legal_entity_id + active_flag + the effective-dated window already are,
-// exactly as before RLS existed on this table. Scoping this by tenant
-// would not add security, it would silently deny every real grant look-up
-// once zoiko_app (the platform's actual non-superuser runtime role) makes
-// FORCE ROW LEVEL SECURITY bite for real.
-func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error) {
+// Scoped to tenantID when there is one, platform-scoped when there is not.
+//
+// This used to be platform-scoped unconditionally, on the reasoning that the
+// caller of /v1/authorize "is not required to supply — and generally does not
+// know — which tenant owns principalID". The handler contradicts that: it
+// resolves a verified tenant scope from X-Tenant-Id immediately before calling
+// this. What it did not do was pass it.
+//
+// The cost was a cross-tenant privilege escalation, measured on a faithful
+// reproduction. A principal holding a TENANT-WIDE assignment
+// (principal_role_assignments.legal_entity_id IS NULL) in tenant A, evaluated
+// against a legal entity in tenant B:
+//
+//	role_code        | role_owner_tenant | permitted_actions
+//	TENANT_B_VIEWER  | ...tenant B       | ["REPORT_VIEW"]
+//	TENANT_A_ADMIN   | ...tenant A       | ["PAYROLL_RUN_FINALIZE","GL_JOURNAL_POST"]
+//
+// The IS NULL half of the assignment predicate matches regardless of entity,
+// and platform scope made tenant A's role visible to join against — so
+// /v1/authorize granted PAYROLL_RUN_FINALIZE in tenant B on the strength of a
+// role belonging to tenant A. With the tenant installed instead, the same query
+// returns only TENANT_B_VIEWER.
+//
+// The fallback stays because the warning in the old comment was also true: with
+// neither a tenant installed nor platform scope, the same query returns zero
+// rows, which would deny every authorization check platform-wide. Callers that
+// do not yet forward X-Tenant-Id are on the pre-header calling convention, and
+// resolveTenantScope already logs each one so they can be found and fixed.
+// Removing this fallback is safe only once that log is silent.
+func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error) {
+	// The tenant predicate is in the SQL, not left to the roles policy alone.
+	//
+	// RLS is the backstop, not the mechanism: it binds app_authorization on
+	// Supabase, and it binds nothing at all on the compose estate, where every
+	// service connects as the Postgres superuser and a superuser bypasses row
+	// security unconditionally. A fix that lived only in withRLS would close
+	// this on one deployment and leave it wide open on the other — verified,
+	// by this exact query returning tenant A's PAYROLL_RUN_FINALIZE against a
+	// superuser connection with tenant B installed.
+	//
+	// $3 = '' is the no-verified-tenant fallback, and it is the ONLY path that
+	// still evaluates across tenants.
 	const query = `
 		SELECT r.role_code, pb.permitted_actions
 		FROM principal_role_assignments pra
@@ -427,14 +562,16 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 		JOIN permission_bundles pb ON pb.role_id = r.role_id AND pb.active_flag
 		WHERE pra.principal_id = $1
 		  AND (pra.legal_entity_id = $2 OR pra.legal_entity_id IS NULL)
+		  AND ($3 = '' OR r.tenant_id::text = $3)
 		  AND pra.effective_from <= NOW()
 		  AND (pra.effective_to IS NULL OR pra.effective_to > NOW());`
 
 	seen := map[string]bool{}
 	var actions []string
 	var roleCodes []string
-	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, principalID, legalEntityID)
+
+	evaluate := func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, principalID, legalEntityID, tenantID)
 		if err != nil {
 			return err
 		}
@@ -457,7 +594,17 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 			}
 		}
 		return rows.Err()
-	})
+	}
+
+	// withRLS installs app.tenant_id, which is what the roles policy filters
+	// on; withPlatformScope sets the flag that policy treats as "visible
+	// regardless of tenant_id". The choice between them IS the fix.
+	var err error
+	if tenantID != "" {
+		err = s.withRLS(ctx, tenantID, evaluate)
+	} else {
+		err = s.withPlatformScope(ctx, evaluate)
+	}
 	if err != nil {
 		s.log.Error("pg FindGrantedActions failed", zap.Error(err))
 		return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -477,17 +624,22 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 // principalID in legalEntityID, and returns the union of each delegator's
 // own currently-granted actions. A tenant-wide delegation (legal_entity_id
 // IS NULL) matches regardless of which legal entity is being evaluated.
-func (s *PgStore) FindDelegatedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error) {
+func (s *PgStore) FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error) {
+	// $3 = '' keeps the no-verified-tenant fallback that FindGrantedActions
+	// has, for the same reason: most callers of /v1/authorize do not forward
+	// X-Tenant-Id yet, and scoping them to an empty tenant would silently drop
+	// every delegation rather than evaluate it.
 	const query = `
 		SELECT delegator_principal_id
 		FROM delegated_authorities
 		WHERE delegate_principal_id = $1
 		  AND (legal_entity_id = $2 OR legal_entity_id IS NULL)
+		  AND ($3 = '' OR tenant_id::text = $3)
 		  AND revocation_status = 'ACTIVE'
 		  AND effective_from <= NOW()
 		  AND (effective_to IS NULL OR effective_to > NOW());`
 
-	rows, err := s.pool.Query(ctx, query, principalID, legalEntityID)
+	rows, err := s.pool.Query(ctx, query, principalID, legalEntityID, tenantID)
 	if err != nil {
 		s.log.Error("pg FindDelegatedActions failed", zap.Error(err))
 		return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -510,7 +662,10 @@ func (s *PgStore) FindDelegatedActions(ctx context.Context, principalID, legalEn
 	var actions []string
 	var basis string
 	for _, delegator := range delegators {
-		delegatorActions, _, err := s.FindGrantedActions(ctx, delegator, legalEntityID)
+		// Same tenant as the delegation itself: a delegator's authority is
+		// whatever they hold in the tenant the delegation was made in, not
+		// whatever they hold anywhere on the platform.
+		delegatorActions, _, err := s.FindGrantedActions(ctx, delegator, legalEntityID, tenantID)
 		if err != nil {
 			return nil, "", err
 		}
@@ -621,30 +776,70 @@ func (s *PgStore) CheckOwnObjectSoD(ctx context.Context, actionType, tenantID st
 
 // ── access_decision_log ──────────────────────────────────────────────────────
 
-func (s *PgStore) RecordAccessDecision(ctx context.Context, principalID, legalEntityID, actionType, outcome, basis, correlationID string) (*domain.AccessDecisionLog, error) {
-	const query = `
-		INSERT INTO access_decision_log (principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id, decided_at;`
+const accessDecisionColumns = `access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, tenant_id, correlation_id, decided_at`
 
-	row := s.pool.QueryRow(ctx, query, principalID, legalEntityID, actionType, outcome, basis, correlationID)
+func scanAccessDecision(row pgx.Row) (*domain.AccessDecisionLog, error) {
 	d := &domain.AccessDecisionLog{}
-	if err := row.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID, &d.ActionType, &d.DecisionOutcome, &d.DecisionBasis, &d.CorrelationID, &d.DecidedAt); err != nil {
+	err := row.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID, &d.ActionType,
+		&d.DecisionOutcome, &d.DecisionBasis, &d.TenantID, &d.CorrelationID, &d.DecidedAt)
+	return d, err
+}
+
+// RecordAccessDecision appends the decision artifact for one evaluation.
+//
+// params.TenantID is written as SQL NULL when empty, which is the honest
+// record of a caller that supplied no tenant - see
+// domain.RecordAccessDecisionParams.TenantID for why /v1/authorize cannot
+// simply require one. The insert runs inside withRLS so the WITH CHECK on
+// access_decision_log's policy has a value to test; that policy admits a NULL
+// tenant_id deliberately, and the read path below is what keeps a NULL-tenant
+// row from being served to an arbitrary tenant.
+func (s *PgStore) RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
+	const query = `
+		INSERT INTO access_decision_log (principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id, tenant_id)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::uuid)
+		RETURNING ` + accessDecisionColumns + `;`
+
+	var d *domain.AccessDecisionLog
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanAccessDecision(tx.QueryRow(ctx, query,
+			params.PrincipalID, params.LegalEntityID, params.ActionType,
+			params.Outcome, params.Basis, params.CorrelationID, params.TenantID))
+		return scanErr
+	})
+	if err != nil {
 		s.log.Error("pg RecordAccessDecision failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return d, nil
 }
 
-func (s *PgStore) FindAccessDecisionByID(ctx context.Context, accessDecisionID string) (*domain.AccessDecisionLog, error) {
+// FindAccessDecisionByID reads one decision, scoped to tenantID.
+//
+// The explicit tenant_id predicate is the control here, not the RLS policy:
+// the policy admits NULL-tenant rows (it has to, so RecordAccessDecision can
+// write one), and this predicate is what excludes them. Before this, the read
+// carried no tenant or entity predicate at all and the route required no
+// authentication, so decision ids could be walked to read every tenant's
+// principal_id / legal_entity_id / action_type / decision_basis - including
+// the sod:conflict_with basis, which names where the SoD tripwires are.
+//
+// A row belonging to another tenant, and a row recorded with no tenant, are
+// both reported as ErrAccessDecisionNotFound - the handler answers 404, so a
+// probe cannot distinguish "not yours" from "does not exist".
+func (s *PgStore) FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error) {
 	const query = `
-		SELECT access_decision_id, principal_id, legal_entity_id, action_type, decision_outcome, decision_basis, correlation_id, decided_at
+		SELECT ` + accessDecisionColumns + `
 		FROM access_decision_log
-		WHERE access_decision_id = $1;`
+		WHERE access_decision_id = $1 AND tenant_id = $2::uuid;`
 
-	row := s.pool.QueryRow(ctx, query, accessDecisionID)
-	d := &domain.AccessDecisionLog{}
-	err := row.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID, &d.ActionType, &d.DecisionOutcome, &d.DecisionBasis, &d.CorrelationID, &d.DecidedAt)
+	var d *domain.AccessDecisionLog
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanAccessDecision(tx.QueryRow(ctx, query, accessDecisionID, tenantID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, domain.ErrAccessDecisionNotFound

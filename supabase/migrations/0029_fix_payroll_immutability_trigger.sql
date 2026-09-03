@@ -1,0 +1,156 @@
+-- 0029_fix_payroll_immutability_trigger.sql
+-- Corrects a defect introduced by 0025. Creates no tables.
+--
+-- ── The defect ───────────────────────────────────────────────────────────────
+--
+-- 0025 added two BEFORE UPDATE OR DELETE triggers to keep a finalized payroll
+-- run immutable. Both end with
+--
+--     RETURN NEW;
+--
+-- which is correct for UPDATE and wrong for DELETE. In a BEFORE DELETE trigger
+-- NEW is NULL, and a BEFORE row trigger that returns NULL SILENTLY CANCELS the
+-- operation. So the triggers blocked every delete, not only deletes of a
+-- COMPLETED run.
+--
+-- Measured against the live project: DELETE of runs with status INITIATED and
+-- CALCULATED reported `DELETE 0` while the rows remained, and the same for
+-- pay_slips. No error, no warning — the rows simply stayed.
+--
+-- ── Why this is more than a tidy-up ──────────────────────────────────────────
+--
+-- PgStore.SaveCalculatedResults starts a recalculation by clearing the previous
+-- results:
+--
+--     DELETE FROM pay_slips WHERE run_id = $1 AND tenant_id = $2
+--     DELETE FROM shadow_payroll_comparisons WHERE run_id = $1 AND ...
+--
+-- With the delete cancelled, those statements affect nothing and the INSERTs
+-- that follow mint fresh slip_ids. pay_slips has no unique key over
+-- (run_id, employee_id) — only (tenant_id, slip_id), which never collides — so
+-- nothing rejects the second set. Recalculating a run therefore DUPLICATED its
+-- payslips instead of replacing them, and every recalculation added another
+-- copy. pay_slip_items cascade from pay_slips, so the lines accumulated with
+-- them.
+--
+-- That is silent double-counting in payroll output, which is exactly the class
+-- of error the run/finalize state machine exists to prevent. It was not caught
+-- earlier because every test calculated each run once.
+--
+-- ── The fix ──────────────────────────────────────────────────────────────────
+--
+-- Return OLD for a DELETE and NEW otherwise. CREATE OR REPLACE FUNCTION, so the
+-- existing triggers pick this up with no need to drop and recreate them — and a
+-- fresh project that runs 0025 then this file ends in the same place.
+
+CREATE OR REPLACE FUNCTION payroll_run.reject_finalized_run_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- OLD is the row as it stands. A run may be updated freely up to the moment
+    -- it completes; the transition INTO COMPLETED is itself an update of a
+    -- not-yet-completed row, so it passes.
+    IF OLD.status = 'COMPLETED' THEN
+        RAISE EXCEPTION
+            'payroll run % is finalized and immutable: % is not permitted',
+            OLD.run_id, TG_OP;
+    END IF;
+
+    -- A BEFORE DELETE trigger must return OLD. NEW is NULL for a DELETE, and a
+    -- BEFORE row trigger returning NULL cancels the operation without raising —
+    -- which is what made every delete a silent no-op.
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION payroll_run.reject_finalized_run_mutation() IS
+    'Refuses UPDATE and DELETE of a COMPLETED payroll run, and permits both otherwise. Returns OLD on DELETE: returning NEW there is NULL, which silently cancels the delete.';
+
+CREATE OR REPLACE FUNCTION payroll_run.reject_finalized_slip_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    run_status VARCHAR(50);
+BEGIN
+    SELECT status INTO run_status
+      FROM payroll_run.payroll_runs
+     WHERE run_id = OLD.run_id;
+
+    IF run_status = 'COMPLETED' THEN
+        RAISE EXCEPTION
+            'pay slip % belongs to finalized run %: % is not permitted',
+            OLD.slip_id, OLD.run_id, TG_OP;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+COMMENT ON FUNCTION payroll_run.reject_finalized_slip_mutation() IS
+    'Refuses UPDATE and DELETE of a pay slip belonging to a COMPLETED run. Returns OLD on DELETE so a recalculation can clear the previous results; returning NEW cancelled the delete and duplicated payslips instead.';
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+--
+-- Proves both directions on a scratch run rather than trusting the function
+-- body: a non-finalized slip and run must delete, and a finalized one must not.
+
+DO $$
+DECLARE
+    scratch_run  UUID := gen_random_uuid();
+    scratch_slip UUID := gen_random_uuid();
+    scratch_ten  TEXT := 'zzz-0029-verification';
+    removed      int;
+    refused      boolean := false;
+BEGIN
+    -- A run that is not finalized, and one slip on it.
+    INSERT INTO payroll_run.payroll_runs
+        (run_id, tenant_id, legal_entity_id, run_number,
+         pay_period_start, pay_period_end, pay_date, status)
+    VALUES (scratch_run, scratch_ten, 'le-verify', 'VERIFY-0029',
+            '2026-01-01', '2026-01-31', '2026-02-05', 'CALCULATED');
+
+    INSERT INTO payroll_run.pay_slips
+        (slip_id, tenant_id, run_id, employee_id, employee_number, employee_name,
+         gross_pay, tax_withheld, benefits_deductions, net_pay, currency, effective_date)
+    VALUES (scratch_slip, scratch_ten, scratch_run, gen_random_uuid(),
+            'V-1', 'Verify', 100, 0, 0, 100, 'USD', '2026-02-05');
+
+    -- 1. the slip must delete
+    DELETE FROM payroll_run.pay_slips WHERE slip_id = scratch_slip;
+    GET DIAGNOSTICS removed = ROW_COUNT;
+    IF removed <> 1 THEN
+        RAISE EXCEPTION 'delete of a non-finalized pay slip still cancelled (% rows)', removed;
+    END IF;
+
+    -- 2. once the run is COMPLETED, deleting it must be refused
+    UPDATE payroll_run.payroll_runs
+       SET status = 'COMPLETED', finalized_at = NOW(), snapshot_hash = 'verify-0029'
+     WHERE run_id = scratch_run;
+
+    BEGIN
+        DELETE FROM payroll_run.payroll_runs WHERE run_id = scratch_run;
+    EXCEPTION WHEN others THEN
+        refused := true;
+    END;
+    IF NOT refused THEN
+        RAISE EXCEPTION 'delete of a COMPLETED payroll run was permitted';
+    END IF;
+
+    -- 3. clean the scratch row up. It is COMPLETED, so the trigger has to be
+    --    stepped around for the removal — this is why the verification uses its
+    --    own tenant rather than touching anything real.
+    ALTER TABLE payroll_run.payroll_runs DISABLE TRIGGER payroll_runs_finalized_immutable;
+    DELETE FROM payroll_run.payroll_runs WHERE run_id = scratch_run;
+    ALTER TABLE payroll_run.payroll_runs ENABLE TRIGGER payroll_runs_finalized_immutable;
+
+    RAISE NOTICE 'verified: non-finalized deletes proceed, finalized deletes refused';
+END
+$$;

@@ -42,6 +42,7 @@ func TestHealthCheck(t *testing.T) {
 	router := setupTestRouter(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(req)
 	rec := httptest.NewRecorder()
 
 	router.ServeHTTP(rec, req)
@@ -78,6 +79,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 
 	body, _ := json.Marshal(genReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/forecasts/generate", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-test-123")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", "principal-01")
@@ -109,6 +111,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 
 	// 2. Get Forecast by ID
 	getReq := httptest.NewRequest(http.MethodGet, "/v1/forecasts/"+createdModel.ID, nil)
+	withEnvelope(getReq)
 	getReq.Header.Set("X-Tenant-ID", "tenant-test-123")
 	getRec := httptest.NewRecorder()
 
@@ -120,6 +123,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 
 	// 3. List Forecasts
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/forecasts?legal_entity_id=LE-1001", nil)
+	withEnvelope(listReq)
 	listReq.Header.Set("X-Tenant-ID", "tenant-test-123")
 	listRec := httptest.NewRecorder()
 
@@ -141,6 +145,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 		ScenarioType:         domain.ScenarioOptimistic,
 	})
 	recalcReq := httptest.NewRequest(http.MethodPost, "/v1/forecasts/"+createdModel.ID+"/recalculate", bytes.NewBuffer(recalcReqBody))
+	withEnvelope(recalcReq)
 	recalcReq.Header.Set("X-Tenant-ID", "tenant-test-123")
 	recalcReq.Header.Set("Content-Type", "application/json")
 	recalcReq.Header.Set("X-Principal-Id", "principal-01")
@@ -154,6 +159,7 @@ func TestGenerateAndLifecycleForecast(t *testing.T) {
 
 	// 5. Archive Forecast
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/forecasts/"+createdModel.ID, nil)
+	withEnvelope(delReq)
 	delReq.Header.Set("X-Tenant-ID", "tenant-test-123")
 	delReq.Header.Set("X-Principal-Id", "principal-01")
 	delRec := httptest.NewRecorder()
@@ -175,6 +181,7 @@ func TestValidationErrors(t *testing.T) {
 
 	body, _ := json.Marshal(invalidReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/forecasts/generate", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-test-123")
 	rec := httptest.NewRecorder()
 

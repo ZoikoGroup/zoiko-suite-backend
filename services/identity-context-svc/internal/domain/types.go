@@ -2,7 +2,10 @@
 // Field names are verbatim from docs/architecture/04-data-model.md §06.1.
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // ---------------------------------------------------------------------------
 // Principal  (data-model §06.1)
@@ -71,8 +74,18 @@ type SessionContext struct {
 	TrustPosture     TrustPosture `json:"trust_posture"`
 	// MFAVerified is a point-in-time attestation only.
 	// AuthZ Service evaluates sufficiency; no callback into this service required (Q4).
-	MFAVerified      bool `json:"mfa_verified"`
-	DeviceTrustScore int  `json:"device_trust_score"`
+	MFAVerified bool `json:"mfa_verified"`
+	// DeviceTrustScore is nil when no device signal was available, which is
+	// every session today — no device fingerprint reaches this service.
+	//
+	// A pointer rather than an int because 0 is the WORST possible score, not
+	// the absence of one. Persisting a literal 0 said "this device was assessed
+	// and found maximally untrustworthy" about every session ever issued.
+	//
+	// Risk uses a source sentinel (UNAVAILABLE) instead of nil because a risk
+	// score has several possible producers worth naming. Device trust has one,
+	// so present-or-absent carries the whole distinction.
+	DeviceTrustScore *int `json:"device_trust_score"`
 	// AdaptiveRiskScore is sourced from RiskSignalCache ONLY.
 	// resolve() NEVER calls the Intelligence Plane or any Tier 2/3 service (Q3).
 	AdaptiveRiskScore int    `json:"adaptive_risk_score"`
@@ -211,9 +224,122 @@ type UpdateStatusRequest struct {
 	Reason string          `json:"reason,omitempty"`
 }
 
+// ---------------------------------------------------------------------------
+// Authentication  (the credential exchange that precedes resolution)
+// ---------------------------------------------------------------------------
+
+// AuthenticateRequest is a human presenting a password.
+//
+// TenantID is mandatory rather than derived from the email address. Every
+// store method on this service takes a tenant scope because the tables enforce
+// RLS against app.tenant_id, and a global email lookup would have to run
+// unscoped — reading across every tenant's principals to decide which tenant
+// the caller belongs to. That is precisely the query RLS exists to prevent, so
+// the caller names its tenant and the lookup stays inside it. A console knows
+// its own tenant; a caller that does not is not yet in a position to
+// authenticate.
+type AuthenticateRequest struct {
+	TenantID      string `json:"tenant_id"`
+	Email         string `json:"email"`
+	Password      string `json:"password"`
+	CorrelationID string `json:"correlation_id"`
+}
+
+// AuthenticateResponse carries the IdP-shaped bearer token that
+// POST /v1/context/resolve accepts.
+//
+// This is NOT the identity envelope and confers no access on its own: it
+// attests "this human proved possession of this principal's password" and
+// nothing else. The caller exchanges it for an envelope by calling
+// /v1/context/resolve with a legal_entity_id, which is where tenant lifecycle,
+// entity scope, role profile, delegated authority and trust posture are
+// actually resolved. Keeping the two steps separate is what stops a password
+// from being sufficient to act.
+type AuthenticateResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+	PrincipalID string `json:"principal_id"`
+	TenantID    string `json:"tenant_id"`
+	// MFARequired reports that the principal must complete a second factor
+	// before its trust posture can reach MFA_VERIFIED. Advisory:
+	// authorization-svc, not this service, decides whether a posture is
+	// sufficient for an action.
+	//
+	// FALSE for every principal today, and that is accurate rather than
+	// permissive: no step-up factor is implemented anywhere in the estate, so
+	// there is nothing a client could do in response to true. It becomes a real
+	// per-principal answer when a factor lands.
+	MFARequired bool `json:"mfa_required"`
+}
+
+// PrincipalCredential is the stored password material for one principal.
+// SecretHash is a PHC-encoded argon2id digest and is never serialised — the
+// struct carries no JSON tags for exactly that reason.
+type PrincipalCredential struct {
+	CredentialID        string
+	PrincipalID         string
+	TenantID            string
+	CredentialType      string
+	SecretHash          string
+	Algorithm           string
+	Status              string
+	FailedAttemptCount  int
+	LockedUntil         *time.Time
+	LastAuthenticatedAt *time.Time
+}
+
+// CredentialStatus values. A RETIRED credential is kept rather than deleted so
+// a rotation leaves a trail (doctrine §2.11).
+const (
+	CredentialStatusActive  = "ACTIVE"
+	CredentialStatusRetired = "RETIRED"
+)
+
+// CredentialTypePassword is the only factor issued today.
+const CredentialTypePassword = "PASSWORD"
+
+// ErrPrincipalNotFound is returned when a principal does not exist in the caller's tenant scope.
+var ErrPrincipalNotFound = errors.New("principal not found")
+
+// EntityScope is what Dimension 3 resolves about a legal entity: whether the
+// principal's tenant may act as it, and the residency policy it carries.
+//
+// The residency policy arrives on the same response as the authorization
+// answer, so returning a bare bool meant re-fetching it or — as was the case —
+// dropping it and persisting an empty value into every SessionContext.
+type EntityScope struct {
+	Authorized            bool
+	DataResidencyPolicyID string
+}
+
+// ErrSessionNotFound is returned when a session does not exist, has expired, or
+// belongs to another tenant — the three are deliberately one answer, because
+// distinguishing "wrong tenant" from "no such session" confirms the id exists.
+//
+// Separate from a store failure so the handler can answer 404 for absence and
+// 503 for "we could not tell". Reporting an unreachable store as "not found"
+// would send an operator looking at session expiry for a database outage — the
+// same category error the authenticator's ErrAuthUnavailable exists to avoid.
+var ErrSessionNotFound = errors.New("session not found or expired")
+
+// ErrCredentialNotFound is returned when a principal exists but holds no
+// active credential of the requested type.
+//
+// Callers must not surface this to a client as distinct from a wrong password.
+// A client that can tell "no such account" from "wrong password" is a client
+// that can enumerate every account on the platform one request at a time.
+var ErrCredentialNotFound = errors.New("credential not found")
+
 // VerifiedClaims is the parsed output of a verified IdP token.
 type VerifiedClaims struct {
 	Subject  string
 	TenantID string
 	MFADone  bool
 }
+
+// ErrAuthorizationDenied is returned when the caller is not authorized for the requested action.
+var ErrAuthorizationDenied = errors.New("authorization denied")
+
+// ErrAuthorizationServiceUnavailable is returned when authorization-svc cannot be reached.
+var ErrAuthorizationServiceUnavailable = errors.New("authorization service unavailable")

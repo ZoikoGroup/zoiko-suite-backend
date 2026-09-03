@@ -18,6 +18,7 @@ import (
 	"zoiko.io/offboarding-severance-svc/internal/authz"
 	"zoiko.io/offboarding-severance-svc/internal/config"
 	"zoiko.io/offboarding-severance-svc/internal/employee"
+	svcenvelope "zoiko.io/offboarding-severance-svc/internal/envelope"
 	"zoiko.io/offboarding-severance-svc/internal/events"
 	"zoiko.io/offboarding-severance-svc/internal/handler"
 	"zoiko.io/offboarding-severance-svc/internal/health"
@@ -88,6 +89,13 @@ func main() {
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(middleware.TenantContextMiddleware)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))

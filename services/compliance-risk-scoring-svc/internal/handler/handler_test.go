@@ -36,6 +36,7 @@ func TestHealthCheck(t *testing.T) {
 	router := setupTestRouter()
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(req)
 	rec := httptest.NewRecorder()
 
 	router.ServeHTTP(rec, req)
@@ -70,6 +71,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 
 	body, _ := json.Marshal(calcReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/risk-scores/calculate", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-risk-99")
 	req.Header.Set("X-Principal-Id", "principal-1")
 	req.Header.Set("Content-Type", "application/json")
@@ -100,6 +102,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 
 	// 2. Get Assessment by ID
 	getReq := httptest.NewRequest(http.MethodGet, "/v1/risk-scores/"+createdAssessment.ID, nil)
+	withEnvelope(getReq)
 	getReq.Header.Set("X-Tenant-ID", "tenant-risk-99")
 	getRec := httptest.NewRecorder()
 
@@ -111,6 +114,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 
 	// 3. List Assessments
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/risk-scores?legal_entity_id=LE-2002", nil)
+	withEnvelope(listReq)
 	listReq.Header.Set("X-Tenant-ID", "tenant-risk-99")
 	listRec := httptest.NewRecorder()
 
@@ -136,6 +140,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 	}
 	ruleBody, _ := json.Marshal(ruleReq)
 	ruleHTTPReq := httptest.NewRequest(http.MethodPost, "/v1/risk-scores/thresholds", bytes.NewBuffer(ruleBody))
+	withEnvelope(ruleHTTPReq)
 	ruleHTTPReq.Header.Set("X-Tenant-ID", "tenant-risk-99")
 	ruleHTTPReq.Header.Set("X-Principal-Id", "principal-1")
 	ruleHTTPReq.Header.Set("Content-Type", "application/json")
@@ -149,6 +154,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 
 	// 5. List Threshold Rules
 	listRuleReq := httptest.NewRequest(http.MethodGet, "/v1/risk-scores/thresholds", nil)
+	withEnvelope(listRuleReq)
 	listRuleReq.Header.Set("X-Tenant-ID", "tenant-risk-99")
 	listRuleRec := httptest.NewRecorder()
 
@@ -160,6 +166,7 @@ func TestCalculateAndLifecycleRiskScore(t *testing.T) {
 
 	// 6. Archive Assessment
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/risk-scores/"+createdAssessment.ID, nil)
+	withEnvelope(delReq)
 	delReq.Header.Set("X-Tenant-ID", "tenant-risk-99")
 	delReq.Header.Set("X-Principal-Id", "principal-1")
 	delRec := httptest.NewRecorder()
@@ -180,6 +187,7 @@ func TestValidationErrors(t *testing.T) {
 
 	body, _ := json.Marshal(invalidReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/risk-scores/calculate", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-risk-99")
 	rec := httptest.NewRecorder()
 

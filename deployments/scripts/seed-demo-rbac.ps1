@@ -357,6 +357,38 @@ $BUNDLES = @(
             "JURISDICTION_RULE_CREATE", "JURISDICTION_RULE_TRANSITION",
             "JURISDICTION_RULE_RECORD_DRIFT"
         )
+    },
+    @{
+        # access-control-svc is the governed authoring layer in front of
+        # authorization-svc's own admin API. Without this grant the /admin/
+        # access-control page reads fine and every write 403s, which looks like
+        # a broken page rather than an ungranted action.
+        #
+        # Entity-scoped, not platform: the service authorizes ROLE_MANAGE
+        # against the legal_entity_id in the request body.
+        Code    = "ACCESS_CONTROL_FULL"
+        Service = "access-control-svc"
+        Actions = @("ROLE_MANAGE")
+    },
+    @{
+        # retention-registry-svc. LEGAL_HOLD_RELEASE is deliberately in the same
+        # bundle as LEGAL_HOLD_CREATE for the demo principal only because this
+        # seeds a DEVELOPMENT stack -- in a real deployment engaging a freeze and
+        # lifting one are exactly the pair you would want held by different
+        # people, since releasing a hold unblocks deletion of records an
+        # authority ordered frozen.
+        #
+        # NOTE ON SCOPE. This service passes the request's tenant_id as the
+        # authorization scope rather than a legal_entity_id, and falls back to the
+        # platform scope when it is absent. The role below is assigned on both the
+        # legal entity AND the tenant, so a tenant-scoped hold is covered without
+        # anything special here. A PLATFORM-WIDE hold or policy sends no tenant
+        # and so authorizes against the platform scope, which is why this bundle
+        # is also listed in $PLATFORM_SCOPED_ACTION_CODES -- the console offers
+        # that as a checkbox, so both paths are reachable from the UI.
+        Code    = "RETENTION_FULL"
+        Service = "retention-registry-svc"
+        Actions = @("RETENTION_POLICY_CREATE", "LEGAL_HOLD_CREATE", "LEGAL_HOLD_RELEASE")
     }
 )
 
@@ -376,7 +408,11 @@ $ALL_ACTIONS = $BUNDLES | ForEach-Object { $_.Actions } | Sort-Object -Unique
 # platform scope. It then reported success and had granted nothing.
 $PLATFORM_SCOPED_ACTION_CODES = @(
     "GOVERNANCE_FULL", "CONFIG_FULL", "VAULT_FULL", "POLICY_FULL",
-    "SCHEMA_FULL", "JURISDICTION_FULL")
+    "SCHEMA_FULL", "JURISDICTION_FULL",
+    # retention-registry-svc falls back to the platform scope when a hold or
+    # policy names no tenant -- the console offers that as a "platform-wide"
+    # checkbox, so the grant has to exist on that scope too.
+    "RETENTION_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }
@@ -587,10 +623,18 @@ foreach ($bundle in $BUNDLES) {
 # carry the grant: evidence's "tenant-wide" requirement option, spend-controls'
 # unfiltered registers, and vendor-due-diligence's unfiltered screening register.
 # All three authorize against the tenant when no entity is named.
+#
+# retention-registry-svc is the fourth, and it is not a fallback there but the
+# normal case: that service passes the request's tenant_id as the authorization
+# scope rather than a legal_entity_id, so a tenant-scoped hold or policy is ALWAYS
+# checked against the tenant. Verified here rather than assumed from the tenant
+# role assignment, because "the role is assigned on the tenant" and "this action
+# is granted on the tenant" have come apart before.
 $TENANT_SCOPED_ACTIONS = @(
     ($BUNDLES | Where-Object { $_.Code -eq "EVIDENCE_FULL" }).Actions
     "SPEND_POLICY_VIEW"
     "VENDOR_DD_VIEW"
+    ($BUNDLES | Where-Object { $_.Code -eq "RETENTION_FULL" }).Actions
 ) | ForEach-Object { $_ }
 
 Write-Host "Verifying the tenant-scoped fallback:" -ForegroundColor Cyan

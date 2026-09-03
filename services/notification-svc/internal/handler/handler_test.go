@@ -1,4 +1,4 @@
-package handler_test
+﻿package handler_test
 
 import (
 	"bytes"
@@ -15,14 +15,16 @@ import (
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/retry"
 )
 
-// ── stubs ─────────────────────────────────────────────────────────────────────
+// â”€â”€ stubs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 type stubStore struct {
 	byID       map[string]*domain.Notification
 	byCorr     map[string]string // correlation_id -> notification_id
 	lastFilter domain.ListFilter
+	scheduled  []scheduledRetry
 }
 
 func newStubStore() *stubStore {
@@ -63,20 +65,73 @@ func (s *stubStore) ListNotifications(_ context.Context, f domain.ListFilter) ([
 		if f.Status != "" && n.Status != f.Status {
 			continue
 		}
+		if f.UnreadOnly && (n.ReadAt != nil || n.Channel != domain.ChannelInApp) {
+			continue
+		}
 		out = append(out, *n)
 	}
 	return out, nil
 }
 
-func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason string, sentAt *time.Time) error {
+func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error {
 	n, ok := s.byID[id]
 	if !ok {
 		return domain.ErrNotificationNotFound
 	}
 	n.Status = newStatus
 	n.FailureReason = failureReason
+	n.ProviderResponse = providerResponse
 	n.SentAt = sentAt
 	return nil
+}
+
+// MarkRead mirrors the store's COALESCE: the first read is kept, so a repeated
+// mark does not move read_at forward.
+// scheduledRetry records what ScheduleRetry was asked to do, so a test can
+// assert that a transient failure was rescheduled rather than concluded.
+type scheduledRetry struct {
+	reason        string
+	nextAttemptAt time.Time
+}
+
+func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, attemptedAt, nextAttemptAt time.Time) error {
+	n, ok := s.byID[id]
+	if !ok {
+		return domain.ErrNotificationNotFound
+	}
+	// Mirrors the SQL: the notification stays PENDING, the attempt count goes
+	// up, and the schedule is what makes it retryable. A stub that concluded
+	// the notification here would let a handler bug that marks it FAILED pass
+	// unnoticed.
+	n.Status = "PENDING"
+	n.FailureReason = failureReason
+	n.DeliveryAttempts++
+	n.LastAttemptAt = &attemptedAt
+	n.NextAttemptAt = &nextAttemptAt
+	s.scheduled = append(s.scheduled, scheduledRetry{reason: failureReason, nextAttemptAt: nextAttemptAt})
+	return nil
+}
+
+func (s *stubStore) MarkRead(_ context.Context, id, recipientPrincipalID string, readAt time.Time) error {
+	n, ok := s.byID[id]
+	if !ok || n.RecipientPrincipalID != recipientPrincipalID || n.Channel != domain.ChannelInApp {
+		return domain.ErrNotificationNotFound
+	}
+	if n.ReadAt == nil {
+		n.ReadAt = &readAt
+	}
+	return nil
+}
+
+func (s *stubStore) CountUnread(_ context.Context, recipientPrincipalID string) (int, error) {
+	count := 0
+	for _, n := range s.byID {
+		if n.RecipientPrincipalID == recipientPrincipalID &&
+			n.Channel == domain.ChannelInApp && n.ReadAt == nil {
+			count++
+		}
+	}
+	return count, nil
 }
 
 type stubPublisher struct {
@@ -100,23 +155,57 @@ func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, actionType string) err
 
 // stubDeliverer drives the delivery outcome from the test rather than from the
 // channel name, so the FAILED path is exercised by a provider that genuinely
-// refuses — which is what a real adapter failing looks like.
+// refuses â€” which is what a real adapter failing looks like.
 type stubDeliverer struct {
 	delivered bool
 	reason    string
+
+	// retryable makes the refusal a transient one, which the handler must
+	// schedule rather than conclude.
+	retryable bool
+
+	// seen records the notification handed over, so a test can assert what the
+	// transport was actually given â€” the resolved address in particular, which
+	// is the difference between a message addressed to somebody and one the
+	// service merely recorded.
+	seen *domain.Notification
 }
 
-func (d stubDeliverer) Deliver(_ context.Context, _ domain.Notification) (bool, string) {
-	return d.delivered, d.reason
+func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain.DeliveryOutcome {
+	d.seen = &n
+	if !d.delivered {
+		return domain.DeliveryOutcome{Reason: d.reason, Retryable: d.retryable}
+	}
+	return domain.DeliveryOutcome{Delivered: true, ProviderResponse: d.reason}
 }
 
-// ── router factory ─────────────────────────────────────────────────────────────
+// stubResolver stands in for identity-context-svc.
+type stubResolver struct {
+	email string
+	err   error
+	calls int
+}
+
+func (s *stubResolver) ResolveEmail(_ context.Context, _, _, _ string) (string, error) {
+	s.calls++
+	return s.email, s.err
+}
+
+// â”€â”€ router factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
-	return newRouterWith(s, pub, authz, stubDeliverer{delivered: true, reason: "delivered via stub"}, "tenant-abc")
+	return newRouterWith(s, pub, authz, &stubDeliverer{delivered: true, reason: "delivered via stub"}, "tenant-abc")
 }
 
+// newRouterWith supplies a resolver that always succeeds, so the tests that
+// predate recipient resolution keep testing what they were written to test.
+// The resolution paths have their own tests below, which pass an explicit one.
 func newRouterWith(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handler.Deliverer, tenantID string) chi.Router {
+	return newRouterFull(s, pub, authz, del, &stubResolver{email: "recipient@example.com"}, tenantID)
+}
+
+func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handler.Deliverer,
+	res handler.RecipientResolver, tenantID string) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -126,7 +215,18 @@ func newRouterWith(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handl
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, del, zap.NewNop())
+	h := handler.New(handler.Deps{
+		Store:     s,
+		Publisher: pub,
+		AuthZ:     authz,
+		Deliverer: del,
+		Recipient: res,
+		// The default policy for these tests. Retryable failures therefore
+		// schedule rather than conclude, which is what the service does — the
+		// retry-specific cases below pin the policy explicitly.
+		RetryPolicy: retry.DefaultPolicy,
+		Log:         zap.NewNop(),
+	})
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -146,7 +246,7 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	return rr
 }
 
-// ── SendNotification tests ─────────────────────────────────────────────────────
+// â”€â”€ SendNotification tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestSendNotification_MissingPrincipal(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
@@ -208,7 +308,7 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 }
 
 // An unrecognised channel is a caller mistake caught at the boundary. It used
-// to reach the delivery adapter, which reported it as a delivery failure — so
+// to reach the delivery adapter, which reported it as a delivery failure â€” so
 // a typo produced a stored FAILED record and a notification.failed event,
 // evidence of an attempt no provider ever saw.
 func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelivery(t *testing.T) {
@@ -236,12 +336,12 @@ func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelive
 }
 
 // A genuine delivery failure still answers 201: the service's own critical
-// constraint (03-microservices.md §9.7) is that a notification failure must
+// constraint (03-microservices.md Â§9.7) is that a notification failure must
 // not collapse the workflow that raised it.
 func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newRouterWith(newStubStore(), pub, &stubAuthZ{},
-		stubDeliverer{delivered: false, reason: "provider rejected the recipient address"}, "tenant-abc")
+		&stubDeliverer{delivered: false, reason: "provider rejected the recipient address"}, "tenant-abc")
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -264,6 +364,95 @@ func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T)
 	}
 	if pub.failed != 1 || pub.sent != 0 {
 		t.Errorf("expected 1 failed event, 0 sent, got sent=%d failed=%d", pub.sent, pub.failed)
+	}
+}
+
+// A transient refusal must NOT conclude the notification. It stays PENDING
+// with a schedule on it for internal/retry's worker to pick up, and publishes
+// nothing — a notification.failed here followed by a notification.sent two
+// minutes later would have consumers react to an outcome that never happened.
+//
+// This is the behaviour the Retryable flag existed for and did not have: before
+// the worker landed, deliver classified transient failures faithfully and the
+// handler concluded every one of them FAILED regardless.
+func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T) {
+	store := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouterWith(store, pub, &stubAuthZ{},
+		&stubDeliverer{delivered: false, retryable: true, reason: "dial tcp: connection refused"},
+		"tenant-abc")
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
+		"recipient_principal_id": "principal-2",
+		"legal_entity_id":        "le-us",
+		"channel":                "EMAIL",
+		"subject":                "Payslip available",
+		"correlation_id":         "corr-transient",
+	}, "principal-1")
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+
+	if n.Status != "PENDING" {
+		t.Errorf("status = %q, want PENDING — a scheduled retry has not concluded", n.Status)
+	}
+	if n.NextAttemptAt == nil {
+		t.Error("next_attempt_at is nil; nothing would ever re-attempt this notification")
+	}
+	if !n.Retrying() {
+		t.Error("Retrying() is false for a notification that is PENDING with a schedule")
+	}
+	if n.FailureReason == "" {
+		t.Error("the reason for the failed attempt should still be on the record")
+	}
+	if n.DeliveryAttempts != 1 {
+		t.Errorf("delivery_attempts = %d, want 1", n.DeliveryAttempts)
+	}
+	if len(store.scheduled) != 1 {
+		t.Fatalf("store.scheduled = %v, want exactly one scheduled retry", store.scheduled)
+	}
+	if pub.sent != 0 || pub.failed != 0 {
+		t.Errorf("published sent=%d failed=%d, want nothing published while a retry is pending",
+			pub.sent, pub.failed)
+	}
+}
+
+// A settled refusal — a mailbox that does not exist — must conclude at once
+// rather than consume the retry budget waiting for an answer that will not
+// change.
+func TestSendNotification_SettledFailure_ConcludesImmediately(t *testing.T) {
+	store := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouterWith(store, pub, &stubAuthZ{},
+		&stubDeliverer{delivered: false, retryable: false, reason: "550 no such mailbox"},
+		"tenant-abc")
+
+	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
+		"recipient_principal_id": "principal-2",
+		"legal_entity_id":        "le-us",
+		"channel":                "EMAIL",
+		"subject":                "Payslip available",
+		"correlation_id":         "corr-settled",
+	}, "principal-1")
+
+	var n domain.Notification
+	_ = json.NewDecoder(rr.Body).Decode(&n)
+
+	if n.Status != "FAILED" {
+		t.Errorf("status = %q, want FAILED", n.Status)
+	}
+	if n.NextAttemptAt != nil {
+		t.Error("a permanent refusal must not be scheduled for another attempt")
+	}
+	if len(store.scheduled) != 0 {
+		t.Errorf("store.scheduled = %v, want nothing scheduled", store.scheduled)
+	}
+	if pub.failed != 1 {
+		t.Errorf("published failed=%d, want 1 for a concluded failure", pub.failed)
 	}
 }
 
@@ -293,13 +482,13 @@ func TestSendNotification_IdempotentReplay(t *testing.T) {
 	if n2.NotificationID != n1.NotificationID {
 		t.Fatalf("retried send resolved to a different notification_id (%s) than the original (%s)", n2.NotificationID, n1.NotificationID)
 	}
-	// A retry must not re-send — exactly one sent event across both requests.
+	// A retry must not re-send â€” exactly one sent event across both requests.
 	if pub.sent != 1 {
 		t.Errorf("expected exactly 1 sent event across both requests, got %d", pub.sent)
 	}
 }
 
-// ── GetNotification / ListNotifications tests ─────────────────────────────────
+// â”€â”€ GetNotification / ListNotifications tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestGetNotification_NotFound(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
@@ -320,10 +509,10 @@ func TestListNotifications_EmptyIsEmptyArrayNotNull(t *testing.T) {
 	}
 }
 
-// ── the gaps closed in this pass ──────────────────────────────────────────────
+// â”€â”€ the gaps closed in this pass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 // The authorization used to be conditional on the filter, so omitting
-// legal_entity_id — the easier request — returned the whole tenant's
+// legal_entity_id â€” the easier request â€” returned the whole tenant's
 // notifications to a principal holding no grant at all.
 func TestListNotifications_WithoutLegalEntity_IsScopedToCallersOwnInbox(t *testing.T) {
 	store := newStubStore()
@@ -361,10 +550,10 @@ func TestListNotifications_WithLegalEntity_IsAuthorized(t *testing.T) {
 }
 
 // A missing tenant scope used to be noticed first by the store, which reported
-// it as 503 store_unavailable — an outage status for a forgotten header.
+// it as 503 store_unavailable â€” an outage status for a forgotten header.
 func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
 	r := newRouterWith(newStubStore(), &stubPublisher{}, &stubAuthZ{},
-		stubDeliverer{delivered: true}, "")
+		&stubDeliverer{delivered: true}, "")
 
 	for _, tc := range []struct{ name, method, path string }{
 		{"list", http.MethodGet, "/v1/notifications/"},

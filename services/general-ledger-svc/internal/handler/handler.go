@@ -6,9 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"time"
-
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -16,6 +15,7 @@ import (
 
 	"zoiko.io/general-ledger-svc/internal/close"
 	"zoiko.io/general-ledger-svc/internal/domain"
+	svcenvelope "zoiko.io/general-ledger-svc/internal/envelope"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 )
 
@@ -116,10 +116,29 @@ type Handler struct {
 	authz       AuthZClient
 	closeClient close.Client
 	log         *zap.Logger
+
+	// clock supplies the reversal posting date. Injectable because a test that
+	// asserts which day a reversal posts to cannot do so against time.Now, and
+	// a reversal landing in the wrong period is exactly the bug worth a test.
+	// Nil means time.Now — see Handler.now.
+	clock func() time.Time
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, closeClient close.Client, log *zap.Logger) *Handler {
 	return &Handler{store: store, publisher: publisher, authz: authz, closeClient: closeClient, log: log}
+}
+
+// WithClock returns h with its clock replaced, for tests.
+func (h *Handler) WithClock(clock func() time.Time) *Handler {
+	h.clock = clock
+	return h
+}
+
+func (h *Handler) now() time.Time {
+	if h.clock != nil {
+		return h.clock()
+	}
+	return time.Now()
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -157,6 +176,10 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	if missing := requiredJournalFieldMissing(req); missing != "" {
 		writeError(w, http.StatusBadRequest, "missing_field", missing)
+		return
+	}
+	if code, detail := invalidJournalInput(req); code != "" {
+		writeError(w, http.StatusBadRequest, code, detail)
 		return
 	}
 	if len(req.Lines) == 0 {
@@ -215,6 +238,18 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ACC-03's book input. §4 makes book_id server-resolvable, so an envelope
+	// value is preferred over the body's — the header is set by the gateway
+	// from verified context, the body by whoever wrote the JSON.
+	env := svcenvelope.MustFromContext(r.Context())
+	bookID, reportingBasis := req.BookID, req.ReportingBasis
+	if env.BookID != "" {
+		bookID = &env.BookID
+	}
+	if env.ReportingBasis != "" {
+		reportingBasis = &env.ReportingBasis
+	}
+
 	header := &domain.JournalHeader{
 		JournalID:            uuid.NewString(),
 		TenantID:             req.TenantID,
@@ -226,6 +261,14 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:        req.CorrelationID,
 		SourceEventID:        req.SourceEventID,
 		GovernanceDecisionID: req.GovernanceDecisionID,
+
+		JournalType:     req.JournalType,
+		TransactionDate: req.TransactionDate,
+		PostingDate:     req.PostingDate,
+		CurrencyCode:    req.CurrencyCode,
+		BookID:          bookID,
+		ReportingBasis:  reportingBasis,
+		EvidenceRefs:    mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
 	}
 	lines := make([]domain.JournalLine, len(req.Lines))
 	for i, l := range req.Lines {
@@ -236,6 +279,7 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 			Description:        l.Description,
 			TaxCode:            l.TaxCode,
 			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
+			Dimensions:         l.Dimensions,
 		}
 	}
 
@@ -910,6 +954,23 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reversalID := journalID
+
+	// The reversing journal inherits the original's ACC-03 inputs rather than
+	// taking new ones. A reversal is not an independent business event: it must
+	// land in the same book, the same currency and against the same source
+	// document, or it does not net the original out. The two fields that do
+	// differ are journal_type, which is REVERSAL by definition, and
+	// posting_date — the reversal reaches the ledger today, not on the day the
+	// entry it reverses did. transaction_date stays the original's, because the
+	// underlying document has not changed.
+	reversalPostingDate := domain.Date{Time: h.now().UTC().Truncate(24 * time.Hour)}
+	if reversalPostingDate.Before(header.TransactionDate.Time) {
+		// Only reachable for a journal whose document is dated in the future.
+		// Posting before the document exists would trip the same invariant
+		// CreateJournal refuses, so the reversal follows the document instead.
+		reversalPostingDate = header.TransactionDate
+	}
+
 	reversingHeader := &domain.JournalHeader{
 		JournalID:            uuid.NewString(),
 		TenantID:             header.TenantID,
@@ -921,6 +982,14 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: principalID,
 		PostedByPrincipalID:  &principalID,
 		CorrelationID:        req.CorrelationID,
+
+		JournalType:     domain.JournalTypeReversal,
+		TransactionDate: header.TransactionDate,
+		PostingDate:     reversalPostingDate,
+		CurrencyCode:    header.CurrencyCode,
+		BookID:          header.BookID,
+		ReportingBasis:  header.ReportingBasis,
+		EvidenceRefs:    header.EvidenceRefs,
 	}
 	reversingLines := make([]domain.JournalLine, len(lines))
 	for i, l := range lines {
@@ -931,6 +1000,7 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 			Description:        l.Description,
 			TaxCode:            l.TaxCode, // same tax basis as the line being reversed
 			TaxLogicSnapshotID: l.TaxLogicSnapshotID,
+			Dimensions:         l.Dimensions, // reverse against the same analysis axes
 		}
 	}
 
@@ -1028,13 +1098,73 @@ func requiredJournalFieldMissing(req domain.CreateJournalRequest) string {
 		// double-posting a journal. An idempotency key nobody's required
 		// to send protects nobody.
 		return "correlation_id"
+
+	// ACC-03 required business/source inputs. Reported the same way as the
+	// fields above so a caller adopting the contract gets one consistent
+	// missing_field answer rather than two different refusal shapes.
+	case req.JournalType == "":
+		return "journal_type"
+	case req.TransactionDate.IsZero():
+		return "transaction_date"
+	case req.PostingDate.IsZero():
+		return "posting_date"
+	case req.CurrencyCode == "":
+		return "currency_code"
 	default:
 		return ""
 	}
 }
 
+// invalidJournalInput checks the ACC-03 inputs that are present but wrong,
+// as opposed to absent. Returns an empty code when the request is acceptable.
+//
+// Separate from requiredJournalFieldMissing because "you did not send
+// journal_type" and "ACRUAL is not a journal type" are different mistakes and
+// a caller can only fix the second if it is told which value was rejected.
+func invalidJournalInput(req domain.CreateJournalRequest) (code, detail string) {
+	if !domain.ValidJournalType(req.JournalType) {
+		return "invalid_journal_type", domain.ErrInvalidJournalType.Error()
+	}
+	if !domain.ValidCurrencyCode(req.CurrencyCode) {
+		return "invalid_currency_code", domain.ErrInvalidCurrency.Error()
+	}
+	if req.PostingDate.Before(req.TransactionDate.Time) {
+		return "invalid_posting_date", domain.ErrPostingBeforeTransaction.Error()
+	}
+	return "", ""
+}
+
 func exactlyOneNonZero(debit, credit float64) bool {
 	return (debit > 0 && credit == 0) || (credit > 0 && debit == 0)
+}
+
+// mergeEvidenceRefs unions the body's evidence_refs with the §4 envelope's
+// X-Evidence-Refs, preserving first-seen order and dropping duplicates.
+//
+// Union rather than "header wins": the two carry different things in practice.
+// A caller posting an invoice-derived journal puts the invoice document on the
+// envelope for the whole request, and names the specific supporting schedules
+// in the body. Taking only one of them would drop real evidence, and INV-10
+// makes evidence a completion condition rather than a nice-to-have.
+func mergeEvidenceRefs(body, envelope []string) []string {
+	if len(body) == 0 && len(envelope) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(body)+len(envelope))
+	out := make([]string, 0, len(body)+len(envelope))
+	for _, group := range [][]string{body, envelope} {
+		for _, ref := range group {
+			if ref == "" || seen[ref] {
+				continue
+			}
+			seen[ref] = true
+			out = append(out, ref)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // requirePrincipal reads the caller's identity from X-Principal-Id — set by

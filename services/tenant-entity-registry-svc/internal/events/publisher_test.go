@@ -110,3 +110,90 @@ func TestPublishEntityUpdated_RepeatEventsOnSameEntity_GetDistinctEventIDs(t *te
 	second := decode(t, w.msgs[1])
 	assert.NotEqual(t, first.EventID, second.EventID)
 }
+
+// ── Workspace mutation events ────────────────────────────────────────────────
+
+// A reclassified workspace changes whether it may ever be charged, and
+// commercial-account-svc sits in a different plane — so workspace.updated has
+// to carry the new classification rather than only the id, or the consumer has
+// to come back and ask.
+func TestPublishWorkspaceUpdated_CarriesCommercialFields(t *testing.T) {
+	fw := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.entity.events", fw)
+
+	entity := "entity-9"
+	account := "acct-42"
+	p.PublishWorkspaceUpdated(context.Background(), &domain.Workspace{
+		WorkspaceID:           "ws-1",
+		TenantID:              "tenant-1",
+		LegalEntityID:         &entity,
+		Name:                  "Acme Production",
+		BillingClassification: domain.BillingClassificationCommercialStandalone,
+		BillingSource:         domain.BillingSourceDirect,
+		CommercialAccountID:   &account,
+		UpdatedByPrincipalID:  "principal-7",
+	}, "corr-1")
+
+	require.Len(t, fw.msgs, 1)
+	env := decode(t, fw.msgs[0])
+	assert.Equal(t, "workspace.updated", env.EventType)
+	assert.Equal(t, "tenant-1", env.TenantID)
+	assert.Equal(t, "entity-9", env.LegalEntityID)
+	assert.Equal(t, "principal-7", env.ActorID, "the actor must be the principal that made the change")
+	assert.Equal(t, "corr-1", env.CorrelationID)
+
+	var payload struct {
+		WorkspaceID           string `json:"workspace_id"`
+		BillingClassification string `json:"billing_classification"`
+		BillingSource         string `json:"billing_source"`
+		CommercialAccountID   string `json:"commercial_account_id"`
+	}
+	require.NoError(t, json.Unmarshal(fw.msgs[0].Value, &struct {
+		Payload interface{} `json:"payload"`
+	}{Payload: &payload}))
+	assert.Equal(t, "ws-1", payload.WorkspaceID)
+	assert.Equal(t, "COMMERCIAL_STANDALONE", payload.BillingClassification)
+	assert.Equal(t, "DIRECT", payload.BillingSource)
+	assert.Equal(t, "acct-42", payload.CommercialAccountID)
+}
+
+// A workspace with no legal entity is a tenant-level object; the envelope's
+// legal_entity_id must be empty rather than the string "<nil>".
+func TestPublishWorkspaceUpdated_NoLegalEntity_EmptyEnvelopeField(t *testing.T) {
+	fw := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.entity.events", fw)
+
+	p.PublishWorkspaceUpdated(context.Background(), &domain.Workspace{
+		WorkspaceID: "ws-1", TenantID: "tenant-1",
+		BillingClassification: domain.BillingClassificationInternal,
+	}, "corr-1")
+
+	require.Len(t, fw.msgs, 1)
+	assert.Equal(t, "", decode(t, fw.msgs[0]).LegalEntityID)
+}
+
+// Unlike entity.status.changed, this event knows what it moved away from —
+// the transition reads the prior status in the same statement.
+func TestPublishWorkspaceStatusChanged_CarriesPreviousStatus(t *testing.T) {
+	fw := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.entity.events", fw)
+
+	p.PublishWorkspaceStatusChanged(context.Background(),
+		"tenant-1", "ws-1", "principal-7",
+		domain.WorkspaceStatusActive, domain.WorkspaceStatusArchived, "corr-1")
+
+	require.Len(t, fw.msgs, 1)
+	env := decode(t, fw.msgs[0])
+	assert.Equal(t, "workspace.status.changed", env.EventType)
+	assert.Equal(t, "principal-7", env.ActorID)
+
+	var payload struct {
+		PreviousStatus string `json:"previous_status"`
+		NewStatus      string `json:"new_status"`
+	}
+	require.NoError(t, json.Unmarshal(fw.msgs[0].Value, &struct {
+		Payload interface{} `json:"payload"`
+	}{Payload: &payload}))
+	assert.Equal(t, "ACTIVE", payload.PreviousStatus)
+	assert.Equal(t, "ARCHIVED", payload.NewStatus)
+}

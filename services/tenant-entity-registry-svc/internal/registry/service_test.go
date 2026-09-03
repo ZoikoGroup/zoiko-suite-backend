@@ -138,6 +138,55 @@ func (m *memStore) GetWorkspaceByID(_ context.Context, id string) (*domain.Works
 func (m *memStore) ListWorkspacesByTenant(_ context.Context, _ string) ([]*domain.Workspace, error) {
 	return []*domain.Workspace{}, nil
 }
+func (m *memStore) UpdateWorkspace(_ context.Context, id string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error) {
+	w, ok := m.workspaces[id]
+	if !ok {
+		return nil, nil
+	}
+	// COALESCE semantics: an omitted field keeps its value.
+	if req.Name != nil {
+		w.Name = *req.Name
+	}
+	if req.BusinessUnit != nil {
+		w.BusinessUnit = req.BusinessUnit
+	}
+	if req.BillingClassification != nil {
+		w.BillingClassification = domain.BillingClassification(*req.BillingClassification)
+	}
+	if req.BillingSource != nil {
+		w.BillingSource = domain.BillingSource(*req.BillingSource)
+	}
+	if req.CommercialAccountID != nil {
+		w.CommercialAccountID = req.CommercialAccountID
+	}
+	w.UpdatedByPrincipalID = req.ActorPrincipalID
+	return w, nil
+}
+
+// Mirrors the guarded UPDATE: the write only lands if the current status is in
+// allowedPriors, and the prior value is reported back.
+func (m *memStore) TransitionWorkspaceStatus(
+	_ context.Context,
+	id string,
+	newStatus domain.WorkspaceStatus,
+	allowedPriors []domain.WorkspaceStatus,
+	actorID, _ string,
+) (int64, domain.WorkspaceStatus, error) {
+	w, ok := m.workspaces[id]
+	if !ok {
+		return 0, "", nil
+	}
+	for _, p := range allowedPriors {
+		if w.Status == p {
+			prev := w.Status
+			w.Status = newStatus
+			w.UpdatedByPrincipalID = actorID
+			return 1, prev, nil
+		}
+	}
+	return 0, "", nil
+}
+
 func (m *memStore) CreateHierarchy(_ context.Context, _ *domain.EntityHierarchy) error { return nil }
 func (m *memStore) EndDateHierarchy(_ context.Context, _ string, _ time.Time, _, _ string) error {
 	return nil
@@ -202,6 +251,9 @@ func (noopPublisher) PublishTenantCreated(_ context.Context, _ *domain.Tenant, _
 func (noopPublisher) PublishEntityCreated(_ context.Context, _ *domain.LegalEntity, _ string)  {}
 func (noopPublisher) PublishEntityUpdated(_ context.Context, _ *domain.LegalEntity, _ string)  {}
 func (noopPublisher) PublishWorkspaceCreated(_ context.Context, _ *domain.Workspace, _ string) {}
+func (noopPublisher) PublishWorkspaceUpdated(_ context.Context, _ *domain.Workspace, _ string) {}
+func (noopPublisher) PublishWorkspaceStatusChanged(_ context.Context, _, _, _ string, _, _ domain.WorkspaceStatus, _ string) {
+}
 func (noopPublisher) PublishEntityStatusChanged(_ context.Context, _, _, _ string, _, _ domain.EntityStatus, _ string) {
 }
 func (noopPublisher) PublishEntityHierarchyChanged(_ context.Context, _ *domain.EntityHierarchy, _ string, _ string) {
@@ -902,4 +954,208 @@ func TestUpdateEntity_RefusesWhenNoVerifiedPrincipal(t *testing.T) {
 	require.ErrorIs(t, err, registry.ErrUnauthenticated)
 	assert.Empty(t, ms.lastUpdateActor,
 		"no write should reach the store without a verified principal")
+}
+
+// ---------------------------------------------------------------------------
+// Workspace mutation tests
+//
+// Workspaces were create-only: the table carried updated_at and
+// updated_by_principal_id from the first migration, but no write path ever set
+// them, so billing_classification — the field that decides whether a workspace
+// may ever produce a live charge — was uncorrectable once wrong.
+// ---------------------------------------------------------------------------
+
+// seedWorkspace puts an ACTIVE, non-billable workspace in the store, which is
+// the state a mistakenly-classified workspace is discovered in.
+func seedWorkspace(ms *memStore, id, tenant string) *domain.Workspace {
+	w := &domain.Workspace{
+		WorkspaceID:           id,
+		TenantID:              tenant,
+		Name:                  "Pilot",
+		BillingClassification: domain.BillingClassificationInternal,
+		BillingSource:         domain.BillingSourceNone,
+		Status:                domain.WorkspaceStatusActive,
+	}
+	ms.workspaces[id] = w
+	return w
+}
+
+func strPtr(s string) *string { return &s }
+
+func TestUpdateWorkspace_ReclassifiesAndRecordsActor(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+
+	got, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		Name:                  strPtr("Acme Production"),
+		BillingClassification: strPtr(string(domain.BillingClassificationCommercialStandalone)),
+		BillingSource:         strPtr(string(domain.BillingSourceDirect)),
+		CorrelationID:         "corr-1",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, domain.BillingClassificationCommercialStandalone, got.BillingClassification)
+	assert.Equal(t, domain.BillingSourceDirect, got.BillingSource)
+	assert.Equal(t, "Acme Production", got.Name)
+	// The actor must come from the verified context, never the request body.
+	assert.Equal(t, testPrincipal, got.UpdatedByPrincipalID)
+}
+
+// An omitted field must keep its value rather than being blanked.
+func TestUpdateWorkspace_OmittedFieldsUnchanged(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+
+	got, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		Name: strPtr("Renamed"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, domain.BillingClassificationInternal, got.BillingClassification,
+		"classification changed on a name-only patch")
+}
+
+// The column is text, so an unrecognised class would persist and later be read
+// back as though it meant something.
+func TestUpdateWorkspace_RejectsUnknownBillingClassification(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+
+	_, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		BillingClassification: strPtr("COMMERCIAL_MAYBE"),
+	})
+	assert.ErrorIs(t, err, registry.ErrInvalidInput)
+	assert.Equal(t, domain.BillingClassificationInternal, ms.workspaces["ws-1"].BillingClassification,
+		"a refused patch still changed the stored classification")
+}
+
+func TestUpdateWorkspace_RejectsUnknownBillingSource(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+
+	_, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		BillingSource: strPtr("INVOICE_BY_CARRIER_PIGEON"),
+	})
+	assert.ErrorIs(t, err, registry.ErrInvalidInput)
+}
+
+func TestUpdateWorkspace_AbsentWorkspaceIsNotFound(t *testing.T) {
+	svc, _ := baseSvc(t)
+
+	_, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "nope", domain.UpdateWorkspaceRequest{})
+	assert.ErrorIs(t, err, registry.ErrNotFound)
+}
+
+func TestUpdateWorkspace_AuthorizationDenied(t *testing.T) {
+	ms := newMemStore()
+	seedWorkspace(ms, "ws-1", "tenant-1")
+	svc := newSvc(t, ms, denyAllAuthZ{}, acceptAllJurisd{})
+
+	_, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		Name: strPtr("Renamed"),
+	})
+	assert.ErrorIs(t, err, registry.ErrUnauthorized)
+	assert.Equal(t, "Pilot", ms.workspaces["ws-1"].Name, "workspace modified despite denial")
+}
+
+// An unreachable authorization service must refuse the write, not allow it.
+func TestUpdateWorkspace_AuthorizationUnavailableFailsClosed(t *testing.T) {
+	ms := newMemStore()
+	seedWorkspace(ms, "ws-1", "tenant-1")
+	svc := newSvc(t, ms, unavailableAuthZ{}, acceptAllJurisd{})
+
+	_, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		Name: strPtr("Renamed"),
+	})
+	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
+	assert.Equal(t, "Pilot", ms.workspaces["ws-1"].Name,
+		"workspace modified while authorization was unavailable")
+}
+
+func TestTransitionWorkspaceStatus_ArchiveThenRestore(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+	ctx := tenantCtx("tenant-1")
+
+	require.NoError(t, svc.TransitionWorkspaceStatus(ctx, "ws-1", domain.TransitionWorkspaceStatusRequest{
+		NewStatus: domain.WorkspaceStatusArchived,
+	}))
+	assert.Equal(t, domain.WorkspaceStatusArchived, ms.workspaces["ws-1"].Status)
+
+	// Archiving hides a workspace; it deletes nothing, so an accidental archive
+	// has to be recoverable.
+	require.NoError(t, svc.TransitionWorkspaceStatus(ctx, "ws-1", domain.TransitionWorkspaceStatusRequest{
+		NewStatus: domain.WorkspaceStatusActive,
+	}))
+	assert.Equal(t, domain.WorkspaceStatusActive, ms.workspaces["ws-1"].Status)
+}
+
+// Re-archiving is refused rather than silently re-stamping the audit columns
+// with a no-op — ARCHIVED->ARCHIVED is not a declared transition.
+func TestTransitionWorkspaceStatus_RepeatedArchiveIsInvalid(t *testing.T) {
+	svc, ms := baseSvc(t)
+	w := seedWorkspace(ms, "ws-1", "tenant-1")
+	w.Status = domain.WorkspaceStatusArchived
+
+	err := svc.TransitionWorkspaceStatus(tenantCtx("tenant-1"), "ws-1", domain.TransitionWorkspaceStatusRequest{
+		NewStatus: domain.WorkspaceStatusArchived,
+	})
+	assert.ErrorIs(t, err, registry.ErrInvalidTransition)
+}
+
+func TestTransitionWorkspaceStatus_UnknownStatusRejected(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+
+	err := svc.TransitionWorkspaceStatus(tenantCtx("tenant-1"), "ws-1", domain.TransitionWorkspaceStatusRequest{
+		NewStatus: domain.WorkspaceStatus("DELETED"),
+	})
+	assert.ErrorIs(t, err, registry.ErrInvalidInput)
+	assert.Equal(t, domain.WorkspaceStatusActive, ms.workspaces["ws-1"].Status,
+		"an unrecognised target status still changed the stored status")
+}
+
+func TestTransitionWorkspaceStatus_AbsentWorkspaceIsInvalidTransition(t *testing.T) {
+	svc, _ := baseSvc(t)
+
+	err := svc.TransitionWorkspaceStatus(tenantCtx("tenant-1"), "nope", domain.TransitionWorkspaceStatusRequest{
+		NewStatus: domain.WorkspaceStatusArchived,
+	})
+	assert.ErrorIs(t, err, registry.ErrInvalidTransition)
+}
+
+func TestTransitionWorkspaceStatus_AuthorizationDenied(t *testing.T) {
+	ms := newMemStore()
+	seedWorkspace(ms, "ws-1", "tenant-1")
+	svc := newSvc(t, ms, denyAllAuthZ{}, acceptAllJurisd{})
+
+	err := svc.TransitionWorkspaceStatus(tenantCtx("tenant-1"), "ws-1", domain.TransitionWorkspaceStatusRequest{
+		NewStatus: domain.WorkspaceStatusArchived,
+	})
+	assert.ErrorIs(t, err, registry.ErrUnauthorized)
+	assert.Equal(t, domain.WorkspaceStatusActive, ms.workspaces["ws-1"].Status,
+		"status changed despite the authorization denial")
+}
+
+// commercial_account_id is a UUID column; a malformed value must be a named 400
+// rather than reaching the driver and surfacing as an unmapped 500.
+func TestUpdateWorkspace_RejectsNonUUIDCommercialAccount(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+
+	_, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		CommercialAccountID: strPtr("not-a-uuid"),
+	})
+	assert.ErrorIs(t, err, registry.ErrInvalidInput)
+}
+
+func TestUpdateWorkspace_AcceptsValidCommercialAccount(t *testing.T) {
+	svc, ms := baseSvc(t)
+	seedWorkspace(ms, "ws-1", "tenant-1")
+
+	acct := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	got, err := svc.UpdateWorkspace(tenantCtx("tenant-1"), "ws-1", domain.UpdateWorkspaceRequest{
+		CommercialAccountID: strPtr(acct),
+	})
+	require.NoError(t, err)
+	require.NotNil(t, got.CommercialAccountID)
+	assert.Equal(t, acct, *got.CommercialAccountID)
 }

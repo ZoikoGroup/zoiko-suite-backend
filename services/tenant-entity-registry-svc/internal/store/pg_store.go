@@ -392,6 +392,117 @@ func (s *PgStore) GetWorkspaceByID(ctx context.Context, workspaceID string) (*do
 	return &w, err
 }
 
+// UpdateWorkspace patches the mutable workspace fields.
+//
+// COALESCE means an omitted field keeps its value; it also means a nullable
+// field cannot be set back to NULL through this path, the same limitation
+// UpdateEntity has with trading_name. Clearing business_unit or
+// commercial_account_id needs an explicit tri-state representation, which is
+// not worth introducing until something asks for it.
+func (s *PgStore) UpdateWorkspace(ctx context.Context, workspaceID string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error) {
+	s.log.Debug("store.UpdateWorkspace", zap.String("workspace_id", workspaceID))
+	tid := domain.TenantFromContext(ctx)
+
+	var updated domain.Workspace
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		query := `
+			UPDATE workspaces
+			SET
+				name                    = COALESCE($1, name),
+				business_unit           = COALESCE($2, business_unit),
+				billing_classification  = COALESCE($3, billing_classification),
+				billing_source          = COALESCE($4, billing_source),
+				commercial_account_id   = COALESCE($5, commercial_account_id),
+				updated_at              = $6,
+				updated_by_principal_id = $7
+			WHERE workspace_id = $8 AND tenant_id = $9
+			RETURNING workspace_id, tenant_id, legal_entity_id, name, business_unit,
+			          billing_classification, billing_source, commercial_account_id, status,
+			          created_at, updated_at, created_by_principal_id, updated_by_principal_id
+		`
+		return tx.QueryRow(ctx, query,
+			req.Name, req.BusinessUnit, req.BillingClassification,
+			req.BillingSource, req.CommercialAccountID,
+			time.Now().UTC(), req.ActorPrincipalID,
+			workspaceID, tid,
+		).Scan(
+			&updated.WorkspaceID, &updated.TenantID, &updated.LegalEntityID,
+			&updated.Name, &updated.BusinessUnit,
+			&updated.BillingClassification, &updated.BillingSource,
+			&updated.CommercialAccountID, &updated.Status,
+			&updated.CreatedAt, &updated.UpdatedAt,
+			&updated.CreatedByPrincipalID, &updated.UpdatedByPrincipalID,
+		)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return &updated, err
+}
+
+// TransitionWorkspaceStatus archives or restores a workspace in one statement.
+//
+// The CTE reads the current status under FOR UPDATE and the UPDATE joins to it,
+// so the state-machine check and the write cannot straddle a concurrent
+// transition — the same reasoning as TransitionEntityStatus. Unlike that
+// method it also returns the prior status, which the CTE already has in hand,
+// so the emitted event can name what the workspace moved away from.
+func (s *PgStore) TransitionWorkspaceStatus(
+	ctx context.Context,
+	workspaceID string,
+	newStatus domain.WorkspaceStatus,
+	allowedPriorStates []domain.WorkspaceStatus,
+	actorID, correlationID string,
+) (int64, domain.WorkspaceStatus, error) {
+	s.log.Debug("store.TransitionWorkspaceStatus",
+		zap.String("workspace_id", workspaceID),
+		zap.String("new_status", string(newStatus)),
+	)
+	tid := domain.TenantFromContext(ctx)
+
+	priors := make([]string, len(allowedPriorStates))
+	for i, p := range allowedPriorStates {
+		priors[i] = string(p)
+	}
+
+	var rowsAffected int64
+	var previous string
+
+	err := s.withRLS(ctx, tid, func(tx pgx.Tx) error {
+		query := `
+			WITH prev AS (
+				SELECT workspace_id, status
+				FROM workspaces
+				WHERE workspace_id = $4 AND tenant_id = $6
+				FOR UPDATE
+			)
+			UPDATE workspaces w
+			SET status = $1, updated_at = $2, updated_by_principal_id = $3
+			FROM prev
+			WHERE w.workspace_id = prev.workspace_id
+			  AND prev.status = ANY($5::text[])
+			RETURNING prev.status
+		`
+		row := tx.QueryRow(ctx, query,
+			string(newStatus), time.Now().UTC(), actorID,
+			workspaceID, priors, tid,
+		)
+		if err := row.Scan(&previous); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				rowsAffected = 0
+				return nil // caller distinguishes via rowsAffected
+			}
+			return err
+		}
+		rowsAffected = 1
+		return nil
+	})
+	if err != nil {
+		return 0, "", err
+	}
+	return rowsAffected, domain.WorkspaceStatus(previous), nil
+}
+
 func (s *PgStore) ListWorkspacesByTenant(ctx context.Context, tenantID string) ([]*domain.Workspace, error) {
 	s.log.Debug("store.ListWorkspacesByTenant", zap.String("tenant_id", tenantID))
 	tid := tenantFromCtxOrFallback(ctx, tenantID)

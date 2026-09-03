@@ -14,6 +14,8 @@
 package authz
 
 import (
+	svcenvelope "zoiko.io/policy-svc/internal/envelope"
+	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -33,10 +35,12 @@ import (
 // Client is the narrow interface the handler depends on.
 type Client interface {
 	// CheckAllowed returns nil if principalID is authorized to perform
-	// actionType within legalEntityID. Returns domain.ErrAuthorizationDenied
+	// actionType within legalEntityID and tenantID. Returns domain.ErrAuthorizationDenied
 	// on a DENIED decision, or domain.ErrAuthorizationServiceUnavailable if
 	// no decision could be obtained — callers must fail closed on the latter.
-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+	// tenantID is the caller's verified tenant scope (from X-Tenant-Id header).
+	// Empty string means no tenant scope (global-only SoD rules).
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error
 }
 
 // Action types this service asks authorization-svc about. These must exist
@@ -46,6 +50,14 @@ const (
 	ActionPolicyCreate          = "POLICY_CREATE"
 	ActionPolicyVersionCreate   = "POLICY_VERSION_CREATE"
 	ActionPolicyVersionActivate = "POLICY_VERSION_ACTIVATE"
+
+	// Global-scope actions are distinct from tenant-scoped ones because
+	// publishing a version that applies to EVERY tenant is a platform-wide
+	// governance act with a much larger blast radius. A principal holding
+	// only the tenant-scoped grant must not be able to create/activate a
+	// global version by simply omitting tenant_id.
+	ActionPolicyVersionCreateGlobal   = "POLICY_VERSION_CREATE_GLOBAL"
+	ActionPolicyVersionActivateGlobal = "POLICY_VERSION_ACTIVATE_GLOBAL"
 
 	ActionControlTestDefinitionCreate = "CONTROL_TEST_DEFINITION_CREATE"
 	ActionControlTestExecutionRecord  = "CONTROL_TEST_EXECUTION_RECORD"
@@ -110,6 +122,7 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
+	TenantID      string `json:"tenant_id,omitempty"`
 }
 
 // authorizeResponse matches authorization-svc's response. Both GRANTED and
@@ -121,14 +134,14 @@ type authorizeResponse struct {
 	AccessDecisionID string `json:"access_decision_id"`
 }
 
-func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
+	key := principalID + "|" + legalEntityID + "|" + actionType + "|" + tenantID
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType, tenantID)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -178,11 +191,12 @@ func (c *HTTPClient) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType, tenantID string) error {
 	body, err := json.Marshal(authorizeRequest{
 		PrincipalID:   principalID,
 		LegalEntityID: legalEntityID,
 		ActionType:    actionType,
+		TenantID:      tenantID,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
@@ -194,6 +208,45 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// authorization-svc validates the same canonical envelope contract this
+	// service does and answers 400 envelope_incomplete without it. A non-200 is
+	// treated as unavailable below, so an unforwarded envelope turned EVERY
+	// gated write into a 503 that reads like an outage rather than a missing
+	// header. Same defect, same fix as 3c618c2 (HR) and dbf6e45 (notification).
+	//
+	// The values are the CALLER's, taken from the envelope the middleware
+	// already parsed into this request's context. Minting fresh ones would
+	// satisfy the contract and lose the only thing it is for: a decision in
+	// access_decision_log traceable to the request that caused it.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	// One decision per (request, action): an inbound request may authorize
+	// several actions, and each is its own decision to record.
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		c.log.Error("authorization-svc unreachable — failing closed",
@@ -242,7 +295,7 @@ type PermitAllClient struct{ log *zap.Logger }
 
 func NewPermitAllClient(log *zap.Logger) *PermitAllClient { return &PermitAllClient{log: log} }
 
-func (c *PermitAllClient) CheckAllowed(_ context.Context, principalID, _, actionType string) error {
+func (c *PermitAllClient) CheckAllowed(_ context.Context, principalID, _, actionType, _ string) error {
 	c.log.Debug("authz stub — permitted (local development only)",
 		zap.String("principal_id", principalID),
 		zap.String("action_type", actionType),

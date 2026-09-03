@@ -10,7 +10,6 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
-	"zoiko.io/identity-context-svc/internal/authz"
 	identityctx "zoiko.io/identity-context-svc/internal/context"
 	"zoiko.io/identity-context-svc/internal/domain"
 )
@@ -39,7 +38,7 @@ func sessionRouter(t *testing.T, sessions *mockSessionCache, az identityctx.Auth
 	f := defaultFixture()
 	f.sessions = sessions
 	r := chi.NewRouter()
-	h := identityctx.NewHandler(f.build(), sessions, f.principals, az, zap.NewNop())
+	h := identityctx.NewHandler(f.build(), nil, sessions, f.principals, az, zap.NewNop())
 	identityctx.RegisterRoutes(r, h)
 	return r
 }
@@ -94,7 +93,7 @@ func TestGetSession_ForeignTenant_CannotObtainEnvelope(t *testing.T) {
 func TestGetSession_OwnSession_Succeeds(t *testing.T) {
 	sessions := newMockSessionCache()
 	seedSession(sessions, "sess-a", "tenant-a", "p-a", "tenant-a-envelope-jwt")
-	r := sessionRouter(t, sessions, &stubAuthz{err: authz.ErrAuthorizationDenied})
+	r := sessionRouter(t, sessions, &stubAuthz{err: domain.ErrAuthorizationDenied})
 
 	// Note the DENYING stub: reading your own session must not consult
 	// authorization at all, so a denial must not affect it.
@@ -115,7 +114,7 @@ func TestGetSession_OtherPrincipalSameTenant_RequiresGrant(t *testing.T) {
 	sessions := newMockSessionCache()
 	seedSession(sessions, "sess-a", "tenant-a", "p-a", "tenant-a-envelope-jwt")
 
-	denied := sessionRouter(t, sessions, &stubAuthz{err: authz.ErrAuthorizationDenied})
+	denied := sessionRouter(t, sessions, &stubAuthz{err: domain.ErrAuthorizationDenied})
 	w := getSession(denied, "sess-a", "tenant-a", "p-OTHER")
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 reading another principal's session without a grant, got %d: %s", w.Code, w.Body.String())
@@ -219,7 +218,7 @@ func TestInvalidateSession_RecordsVerifiedActor(t *testing.T) {
 func TestUpdatePrincipalStatus_NoSelfExemption(t *testing.T) {
 	store := &mockPrincipalStore{principal: &domain.Principal{PrincipalID: "p-1", TenantID: "tenant-a"}}
 	r := chi.NewRouter()
-	h := identityctx.NewHandler(nil, nil, store, &stubAuthz{err: authz.ErrAuthorizationDenied}, zap.NewNop())
+	h := identityctx.NewHandler(nil, nil, nil, store, &stubAuthz{err: domain.ErrAuthorizationDenied}, zap.NewNop())
 	identityctx.RegisterRoutes(r, h)
 
 	body, _ := json.Marshal(domain.UpdateStatusRequest{Status: domain.PrincipalStatusActive})
@@ -240,7 +239,7 @@ func TestUpdatePrincipalStatus_NoSelfExemption(t *testing.T) {
 func TestPrincipalRead_OtherPrincipal_RequiresGrant(t *testing.T) {
 	store := &mockPrincipalStore{principal: &domain.Principal{PrincipalID: "p-1", TenantID: "tenant-a"}}
 	r := chi.NewRouter()
-	h := identityctx.NewHandler(nil, nil, store, &stubAuthz{err: authz.ErrAuthorizationDenied}, zap.NewNop())
+	h := identityctx.NewHandler(nil, nil, nil, store, &stubAuthz{err: domain.ErrAuthorizationDenied}, zap.NewNop())
 	identityctx.RegisterRoutes(r, h)
 
 	for _, path := range []string{
@@ -274,7 +273,7 @@ func TestPrincipalRead_OtherPrincipal_RequiresGrant(t *testing.T) {
 // instead of the platform's authentication path silently breaking.
 func TestResolveDoesNotRequireIdentityHeaders(t *testing.T) {
 	sessions := newMockSessionCache()
-	r := sessionRouter(t, sessions, &stubAuthz{err: authz.ErrAuthorizationDenied})
+	r := sessionRouter(t, sessions, &stubAuthz{err: domain.ErrAuthorizationDenied})
 
 	body, _ := json.Marshal(domain.ResolveRequest{
 		BearerToken:   "a-token",

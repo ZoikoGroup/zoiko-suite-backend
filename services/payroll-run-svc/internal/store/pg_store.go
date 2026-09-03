@@ -17,10 +17,31 @@ import (
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// schema is applied as a transaction-local search_path on every withRLS
+	// transaction. Empty means the server default, which is what a
+	// database-per-service deployment wants.
+	//
+	// It is set per transaction rather than once per connection because neither
+	// connection-level mechanism survives a transaction pooler:
+	//
+	//   - The DSN's " search_path=x" is a startup option, and Supavisor in
+	//     transaction mode drops startup options - a pooled server connection
+	//     is shared, so it cannot carry per-client session state.
+	//   - ALTER ROLE ... SET search_path is applied by Postgres at SESSION
+	//     start, and the pooler reuses server connections whose sessions began
+	//     before the change. Measured: of four roles altered at the same
+	//     moment, one picked it up and three were still on "$user", public
+	//     five minutes and many connections later, with no way to force a
+	//     recycle from the client.
+	//
+	// A transaction-local set_config is re-applied every transaction, so it
+	// holds whichever pooled connection serves it.
+	schema string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+func New(pool *pgxpool.Pool, schema string) *PgStore {
+	return &PgStore{pool: pool, schema: schema}
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
@@ -31,6 +52,14 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	// Before anything reads a table: an unqualified name resolves against
+	// search_path, and the pooler cannot be relied on to have carried it.
+	if s.schema != "" {
+		if _, err := tx.Exec(ctx, "SELECT set_config('search_path', $1, true)", s.schema); err != nil {
+			return fmt.Errorf("set search_path: %w", err)
+		}
+	}
 
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		return fmt.Errorf("set tenant context: %w", err)
@@ -217,19 +246,37 @@ func (s *PgStore) SaveCalculatedResults(ctx context.Context, runID string, total
 			return err
 		}
 
-		// 3. Insert payslips
+		// 3. Insert payslips, and the lines behind each one.
+		//
+		// pay_slip_items cascades on slip_id, so the DELETE above already
+		// cleared the previous calculation's lines.
 		for _, slip := range slips {
 			_, err := tx.Exec(ctx, `
 				INSERT INTO pay_slips (
 					slip_id, tenant_id, run_id, employee_id, employee_number,
 					employee_name, gross_pay, tax_withheld, benefits_deductions,
-					net_pay, currency, effective_date, created_at
-				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+					net_pay, currency, effective_date, taxable_amount, structure_id, created_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 			`, slip.SlipID, tenantID, runID, slip.EmployeeID, slip.EmployeeNumber,
 				slip.EmployeeName, slip.GrossPay, slip.TaxWithheld, slip.BenefitsDeductions,
-				slip.NetPay, slip.Currency, slip.EffectiveDate, slip.CreatedAt)
+				slip.NetPay, slip.Currency, slip.EffectiveDate, slip.TaxableAmount,
+				slip.StructureID, slip.CreatedAt)
 			if err != nil {
 				return err
+			}
+
+			for _, item := range slip.Items {
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO pay_slip_items (
+						item_id, tenant_id, slip_id, component_id, component_code,
+						component_name, component_type, is_taxable, calculation_method,
+						calculation_value, amount, sequence, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				`, item.ItemID, tenantID, slip.SlipID, item.ComponentID, item.ComponentCode,
+					item.ComponentName, item.ComponentType, item.IsTaxable, item.CalculationMethod,
+					item.CalculationValue, item.Amount, item.Sequence, item.CreatedAt); err != nil {
+					return err
+				}
 			}
 		}
 
@@ -278,7 +325,8 @@ func (s *PgStore) GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.
 		rows, err := tx.Query(ctx, `
 			SELECT slip_id, tenant_id, run_id, employee_id, employee_number,
 			       employee_name, gross_pay, tax_withheld, benefits_deductions,
-			       net_pay, currency, effective_date::text, created_at
+			       net_pay, currency, effective_date::text, taxable_amount,
+			       structure_id::text, created_at
 			FROM pay_slips
 			WHERE run_id = $1 AND tenant_id = $2
 			ORDER BY employee_name ASC
@@ -293,11 +341,52 @@ func (s *PgStore) GetPaySlipsByRun(ctx context.Context, runID string) ([]domain.
 			if err := rows.Scan(
 				&slip.SlipID, &slip.TenantID, &slip.RunID, &slip.EmployeeID, &slip.EmployeeNumber,
 				&slip.EmployeeName, &slip.GrossPay, &slip.TaxWithheld, &slip.BenefitsDeductions,
-				&slip.NetPay, &slip.Currency, &slip.EffectiveDate, &slip.CreatedAt,
+				&slip.NetPay, &slip.Currency, &slip.EffectiveDate, &slip.TaxableAmount,
+				&slip.StructureID, &slip.CreatedAt,
 			); err != nil {
 				return err
 			}
 			out = append(out, slip)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+
+		// Attach the lines. Done in one query for the whole run rather than one
+		// per slip: a monthly run for a large entity would otherwise issue
+		// hundreds of round trips to render a single page.
+		itemRows, err := tx.Query(ctx, `
+			SELECT i.item_id, i.tenant_id, i.slip_id, i.component_id::text, i.component_code,
+			       i.component_name, i.component_type, i.is_taxable, i.calculation_method,
+			       i.calculation_value, i.amount, i.sequence, i.created_at
+			FROM pay_slip_items i
+			JOIN pay_slips s ON s.slip_id = i.slip_id
+			WHERE s.run_id = $1 AND i.tenant_id = $2
+			ORDER BY i.sequence ASC, i.component_code ASC
+		`, runID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer itemRows.Close()
+
+		bySlip := make(map[string][]domain.PaySlipItem)
+		for itemRows.Next() {
+			var item domain.PaySlipItem
+			if err := itemRows.Scan(
+				&item.ItemID, &item.TenantID, &item.SlipID, &item.ComponentID, &item.ComponentCode,
+				&item.ComponentName, &item.ComponentType, &item.IsTaxable, &item.CalculationMethod,
+				&item.CalculationValue, &item.Amount, &item.Sequence, &item.CreatedAt,
+			); err != nil {
+				return err
+			}
+			bySlip[item.SlipID] = append(bySlip[item.SlipID], item)
+		}
+		if err := itemRows.Err(); err != nil {
+			return err
+		}
+
+		for i := range out {
+			out[i].Items = bySlip[out[i].SlipID]
 		}
 		return nil
 	})

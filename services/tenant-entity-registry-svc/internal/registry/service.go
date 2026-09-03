@@ -342,6 +342,116 @@ func (s *Service) CreateWorkspace(
 	return w, nil
 }
 
+// UpdateWorkspace patches a workspace's descriptive and commercial fields.
+//
+// billing_classification and billing_source are validated here rather than
+// trusted, for the same reason CreateWorkspace validates classification: the
+// column is text, so an unrecognised class would otherwise persist and later be
+// read back as though it meant something.
+func (s *Service) UpdateWorkspace(
+	ctx context.Context,
+	workspaceID string,
+	req domain.UpdateWorkspaceRequest,
+) (*domain.Workspace, error) {
+	if err := s.authorize(ctx, "workspace", "update"); err != nil {
+		return nil, err
+	}
+
+	if req.BillingClassification != nil {
+		if !domain.ValidBillingClassifications[domain.BillingClassification(*req.BillingClassification)] {
+			return nil, fmt.Errorf("%w: unrecognized billing_classification %q", ErrInvalidInput, *req.BillingClassification)
+		}
+	}
+	if req.BillingSource != nil {
+		if !domain.ValidBillingSources[domain.BillingSource(*req.BillingSource)] {
+			return nil, fmt.Errorf("%w: unrecognized billing_source %q", ErrInvalidInput, *req.BillingSource)
+		}
+	}
+	// commercial_account_id is a UUID column. Checked here so a malformed value
+	// is a 400 naming the field, rather than reaching the driver and surfacing
+	// as an unmapped 500.
+	if req.CommercialAccountID != nil && *req.CommercialAccountID != "" {
+		if _, err := uuid.Parse(*req.CommercialAccountID); err != nil {
+			return nil, fmt.Errorf("%w: commercial_account_id must be a UUID", ErrInvalidInput)
+		}
+	}
+
+	req.ActorPrincipalID = domain.PrincipalFromContext(ctx)
+
+	w, err := s.store.UpdateWorkspace(ctx, workspaceID, req)
+	if err != nil {
+		return nil, fmt.Errorf("store.UpdateWorkspace: %w", err)
+	}
+	if w == nil {
+		return nil, ErrNotFound
+	}
+
+	go s.events.PublishWorkspaceUpdated(ctx, w, req.CorrelationID)
+
+	s.log.Info("workspace updated",
+		zap.String("workspace_id", w.WorkspaceID),
+		zap.String("tenant_id", w.TenantID),
+		zap.String("billing_classification", string(w.BillingClassification)),
+		zap.String("correlation_id", req.CorrelationID),
+	)
+	return w, nil
+}
+
+// TransitionWorkspaceStatus archives or restores a workspace.
+//
+// Prior states are derived by inverting ValidWorkspaceStatusTransitions. The
+// target is deliberately NOT added to the allowed priors: ACTIVE -> ACTIVE is
+// not a declared transition, so re-archiving an archived workspace is refused
+// as an invalid transition rather than silently re-stamping
+// updated_by_principal_id with a no-op.
+func (s *Service) TransitionWorkspaceStatus(
+	ctx context.Context,
+	workspaceID string,
+	req domain.TransitionWorkspaceStatusRequest,
+) error {
+	if err := s.authorize(ctx, "workspace", "status.transition"); err != nil {
+		return err
+	}
+
+	if _, ok := domain.ValidWorkspaceStatusTransitions[req.NewStatus]; !ok {
+		return fmt.Errorf("%w: unrecognized workspace status %q", ErrInvalidInput, req.NewStatus)
+	}
+
+	var allowedPriors []domain.WorkspaceStatus
+	for fromState, targets := range domain.ValidWorkspaceStatusTransitions {
+		for _, t := range targets {
+			if t == req.NewStatus {
+				allowedPriors = append(allowedPriors, fromState)
+				break
+			}
+		}
+	}
+
+	actor := domain.PrincipalFromContext(ctx)
+	affected, previous, err := s.store.TransitionWorkspaceStatus(
+		ctx, workspaceID, req.NewStatus, allowedPriors, actor, req.CorrelationID,
+	)
+	if err != nil {
+		return fmt.Errorf("store.TransitionWorkspaceStatus: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%w: workspace %s cannot transition to %s from its current state",
+			ErrInvalidTransition, workspaceID, req.NewStatus)
+	}
+
+	go s.events.PublishWorkspaceStatusChanged(
+		ctx, domain.TenantFromContext(ctx), workspaceID, actor, previous, req.NewStatus, req.CorrelationID,
+	)
+
+	s.log.Info("workspace status transitioned",
+		zap.String("workspace_id", workspaceID),
+		zap.String("previous_status", string(previous)),
+		zap.String("new_status", string(req.NewStatus)),
+		zap.String("correlation_id", req.CorrelationID),
+	)
+	return nil
+}
+
 // GetWorkspace retrieves a workspace by ID. Returns ErrNotFound if absent.
 func (s *Service) GetWorkspace(ctx context.Context, workspaceID string) (*domain.Workspace, error) {
 	w, err := s.store.GetWorkspaceByID(ctx, workspaceID)

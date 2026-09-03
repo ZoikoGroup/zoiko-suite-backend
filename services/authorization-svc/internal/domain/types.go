@@ -68,6 +68,11 @@ type PrincipalRoleAssignment struct {
 type DelegatedAuthority struct {
 	DelegatedAuthorityID string `json:"delegated_authority_id"`
 
+	// TenantID is the tenant the delegation belongs to. NOT NULL in the schema
+	// since 000006: a NULL tenant matches no policy, so such a row would be a
+	// delegation that exists and can never grant anything.
+	TenantID string `json:"tenant_id"`
+
 	DelegatorPrincipalID string `json:"delegator_principal_id"`
 	DelegatePrincipalID  string `json:"delegate_principal_id"`
 
@@ -150,6 +155,11 @@ type AccessDecisionLog struct {
 	// PAYMENT_INITIATE", "no_grant") — never just "denied" with no reason.
 	DecisionBasis string `json:"decision_basis"`
 
+	// TenantID is the tenant the decision was made in scope of. Nullable
+	// because /v1/authorize cannot require it without breaking every caller
+	// that predates it — see RecordAccessDecisionParams.TenantID.
+	TenantID *string `json:"tenant_id,omitempty"`
+
 	CorrelationID string    `json:"correlation_id"`
 	DecidedAt     time.Time `json:"decided_at"`
 }
@@ -186,6 +196,10 @@ type CreateRoleAssignmentParams struct {
 
 type CreateDelegatedAuthorityParams struct {
 	DelegatedAuthorityID string
+	// TenantID is the caller's VERIFIED tenant scope, from X-Tenant-Id.
+	// Required — the store refuses rather than writing a row no policy can
+	// match, behind the handler's own requireTenant.
+	TenantID             string
 	DelegatorPrincipalID string
 	DelegatePrincipalID  string
 	ScopeType            string
@@ -221,10 +235,39 @@ type EvaluateParams struct {
 
 // ── errors ───────────────────────────────────────────────────────────────────
 
+// RecordAccessDecisionParams is the write shape for access_decision_log.
+// A struct rather than seven positional strings, because tenant_id was the
+// seventh and adding it positionally is exactly how a caller ends up passing
+// the correlation ID as the tenant.
+type RecordAccessDecisionParams struct {
+	PrincipalID   string
+	LegalEntityID string
+	ActionType    string
+	Outcome       string
+	Basis         string
+	CorrelationID string
+
+	// TenantID is the caller's verified tenant scope, empty when the caller
+	// supplied none. Stored as SQL NULL when empty: /v1/authorize is called
+	// by ~60 services and most do not send a tenant yet, so requiring one
+	// would deny every one of those callers rather than record an
+	// unattributed decision. A NULL-tenant row is deliberately NOT readable
+	// through GET /v1/access-decisions/{id}, which is tenant-scoped.
+	TenantID string
+}
+
 var ErrRoleNotFound = errorString("role not found")
 var ErrRoleAssignmentNotFound = errorString("role assignment not found")
 var ErrLegalEntityRequiredForRoleScope = errorString("legal_entity_id is required: this role's scope_type is not TENANT")
 var ErrDelegatedAuthorityNotFound = errorString("delegated authority not found")
+
+// ErrTenantScopeRequired means a delegation operation was attempted without a
+// verified tenant. Since 000006 delegated_authorities.tenant_id is NOT NULL and
+// every read carries a tenant predicate, so a tenantless call could only either
+// write a row no policy can match or read across tenants. Refusing is the only
+// correct outcome — this is a defence-in-depth guard behind the handler's own
+// requireTenant, not the primary check.
+var ErrTenantScopeRequired = errorString("delegation operations require a verified tenant scope")
 var ErrAccessDecisionNotFound = errorString("access decision not found")
 var ErrInvalidTransition = errorString("invalid revocation status transition")
 var ErrConflict = errorString("conflict: record already exists with differing attributes")

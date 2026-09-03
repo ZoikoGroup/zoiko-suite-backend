@@ -25,6 +25,7 @@ import (
 	"zoiko.io/invoice-approval-svc/internal/clients"
 	"zoiko.io/invoice-approval-svc/internal/config"
 	"zoiko.io/invoice-approval-svc/internal/domain"
+	svcenvelope "zoiko.io/invoice-approval-svc/internal/envelope"
 	"zoiko.io/invoice-approval-svc/internal/events"
 	"zoiko.io/invoice-approval-svc/internal/handler"
 	"zoiko.io/invoice-approval-svc/internal/health"
@@ -138,6 +139,45 @@ func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, leg
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// authorization-svc validates the same canonical envelope contract this
+	// service does and answers 400 envelope_incomplete without it. A non-200 is
+	// treated as unavailable below, so an unforwarded envelope turned EVERY
+	// gated write into a 503 that reads like an outage rather than a missing
+	// header. Same defect, same fix as 3c618c2 (HR) and dbf6e45 (notification).
+	//
+	// The values are the CALLER's, taken from the envelope the middleware
+	// already parsed into this request's context. Minting fresh ones would
+	// satisfy the contract and lose the only thing it is for: a decision in
+	// access_decision_log traceable to the request that caused it.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	authzRequestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when the envelope carries one.
+	authzSourceChannel := "system"
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			req.Header.Set("X-Tenant-Id", env.TenantID)
+		}
+		if env.RequestID != "" {
+			authzRequestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			authzSourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+	req.Header.Set("X-Request-Id", authzRequestID)
+	req.Header.Set("X-Source-Channel", authzSourceChannel)
+	// One decision per (request, action): an inbound request may authorize
+	// several actions, and each is its own decision to record.
+	req.Header.Set("Idempotency-Key", authzRequestID+":"+actionType)
 	resp, err := a.client.Do(req)
 	if err != nil {
 		a.log.Error("failed to call authorization-svc", zap.Error(err))
@@ -275,6 +315,13 @@ func main() {
 	r.Use(correlationIDMiddleware)
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, domainClients, log)
 	handler.RegisterRoutes(r, h)
