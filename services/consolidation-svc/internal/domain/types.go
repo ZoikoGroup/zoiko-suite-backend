@@ -27,6 +27,21 @@ type BalanceSnapshot struct {
 	GeneratedAt         time.Time `json:"generated_at"`
 }
 
+// BalanceContribution is the ACC-13 entity-to-group provenance record this
+// domain was missing: one row per (run, account_code, source child entity),
+// recorded BEFORE elimination — exactly what that child's own trial balance
+// reported, so a later reader can answer "which entities make up this group
+// line" without re-running the whole consolidation.
+type BalanceContribution struct {
+	BalanceContributionID string    `json:"balance_contribution_id"`
+	TenantID              string    `json:"tenant_id"`
+	ConsolidationRunID    string    `json:"consolidation_run_id"`
+	AccountCode           string    `json:"account_code"`
+	SourceLegalEntityID   string    `json:"source_legal_entity_id"`
+	GrossAmount           float64   `json:"gross_amount"`
+	GeneratedAt           time.Time `json:"generated_at"`
+}
+
 type StartConsolidationRequest struct {
 	GroupLegalEntityID  string   `json:"group_legal_entity_id"`
 	ChildLegalEntityIDs []string `json:"child_legal_entity_ids"`
