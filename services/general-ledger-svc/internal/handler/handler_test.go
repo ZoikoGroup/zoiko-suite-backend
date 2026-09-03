@@ -40,13 +40,31 @@ type stubStore struct {
 	// test can assert the tenant the handler passed down rather than only the
 	// rows that came back.
 	lastListFilter domain.ListJournalsFilter
+
+	trialBalances map[string]*domain.TrialBalanceSnapshot // by snapshot id
+	compileErr    error
+	getTBErr      error
+	// lastCompileArgs records what CompileTrialBalance was actually asked
+	// for, so a test can assert the handler passed the right scope down.
+	lastCompileLegalEntityID, lastCompileFiscalPeriod string
+
+	accounts         map[string]*domain.Account // by account_id
+	accountsByCode   map[string]*domain.Account // by "tenant|code"
+	createAccountErr error
+
+	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
+	setMappingErr   error
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		journals:      map[string]*domain.JournalHeader{},
-		lines:         map[string][]domain.JournalLine{},
-		byCorrelation: map[string]string{},
+		journals:        map[string]*domain.JournalHeader{},
+		lines:           map[string][]domain.JournalLine{},
+		byCorrelation:   map[string]string{},
+		trialBalances:   map[string]*domain.TrialBalanceSnapshot{},
+		accounts:        map[string]*domain.Account{},
+		accountsByCode:  map[string]*domain.Account{},
+		currentMappings: map[string]*domain.AccountMapping{},
 	}
 }
 
@@ -160,6 +178,133 @@ func (s *stubStore) ReverseJournal(
 
 func (s *stubStore) SumLines(_ context.Context, _, _ string) (int64, int64, error) {
 	return s.debitTotal, s.creditTotal, s.sumErr
+}
+
+// CompileTrialBalance mirrors the real store's own filtering rule (only
+// FINALIZED/REVERSED journals contribute) and aggregation (net = debit -
+// credit per account) against the stub's own journals/lines, rather than
+// returning a canned result — a stub that faked this would let a handler
+// regression that passes the wrong scope down go uncaught.
+func (s *stubStore) CompileTrialBalance(_ context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (*domain.TrialBalanceSnapshot, error) {
+	s.lastCompileLegalEntityID, s.lastCompileFiscalPeriod = legalEntityID, fiscalPeriod
+	if s.compileErr != nil {
+		return nil, s.compileErr
+	}
+	snap := &domain.TrialBalanceSnapshot{
+		TrialBalanceSnapshotID: "tb-" + legalEntityID + "-" + fiscalPeriod,
+		TenantID:               tenantID,
+		LegalEntityID:          legalEntityID,
+		FiscalPeriod:           fiscalPeriod,
+		CompiledByPrincipalID:  principalID,
+	}
+	balances := map[string]float64{}
+	for _, h := range s.journals {
+		if h.TenantID != tenantID || h.LegalEntityID != legalEntityID || h.FiscalPeriod != fiscalPeriod {
+			continue
+		}
+		if h.Status != domain.JournalStatusFinalized && h.Status != domain.JournalStatusReversed {
+			continue
+		}
+		snap.LedgerWatermark++
+		for _, l := range s.lines[h.JournalID] {
+			balances[l.AccountCode] += l.DebitAmount - l.CreditAmount
+		}
+	}
+	for code, bal := range balances {
+		snap.Lines = append(snap.Lines, domain.TrialBalanceLine{AccountCode: code, NetBalance: bal})
+	}
+	s.trialBalances[snap.TrialBalanceSnapshotID] = snap
+	return snap, nil
+}
+
+func (s *stubStore) GetTrialBalance(_ context.Context, tenantID, snapshotID string) (*domain.TrialBalanceSnapshot, error) {
+	if s.getTBErr != nil {
+		return nil, s.getTBErr
+	}
+	snap, ok := s.trialBalances[snapshotID]
+	if !ok || snap.TenantID != tenantID {
+		return nil, domain.ErrTrialBalanceNotFound
+	}
+	return snap, nil
+}
+
+func (s *stubStore) CreateAccount(_ context.Context, a *domain.Account) error {
+	if s.createAccountErr != nil {
+		return s.createAccountErr
+	}
+	if a.ParentAccountID != nil {
+		if _, ok := s.accounts[*a.ParentAccountID]; !ok {
+			return domain.ErrParentAccountNotFound
+		}
+	}
+	key := a.TenantID + "|" + a.AccountCode
+	if _, exists := s.accountsByCode[key]; exists {
+		return domain.ErrAccountAlreadyExists
+	}
+	s.accounts[a.AccountID] = a
+	s.accountsByCode[key] = a
+	return nil
+}
+
+func (s *stubStore) GetAccountByCode(_ context.Context, tenantID, accountCode string) (*domain.Account, error) {
+	a, ok := s.accountsByCode[tenantID+"|"+accountCode]
+	if !ok {
+		return nil, domain.ErrAccountNotFound
+	}
+	return a, nil
+}
+
+func (s *stubStore) ListAccounts(_ context.Context, tenantID string) ([]domain.Account, error) {
+	var out []domain.Account
+	for _, a := range s.accounts {
+		if a.TenantID == tenantID {
+			out = append(out, *a)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) DeactivateAccount(_ context.Context, tenantID, accountCode string) error {
+	a, ok := s.accountsByCode[tenantID+"|"+accountCode]
+	if !ok {
+		return domain.ErrAccountNotFound
+	}
+	a.Status = "INACTIVE"
+	return nil
+}
+
+// SetAccountMapping mirrors the real store's own validation rule (the
+// target account must exist and be ACTIVE) against the stub's own
+// accounts, rather than trusting the caller — a stub that skipped this
+// would let a handler regression that forgets to validate go uncaught.
+func (s *stubStore) SetAccountMapping(_ context.Context, m *domain.AccountMapping) error {
+	if s.setMappingErr != nil {
+		return s.setMappingErr
+	}
+	a, ok := s.accountsByCode[m.TenantID+"|"+m.AccountCode]
+	if !ok || a.Status != "ACTIVE" {
+		return domain.ErrMappingTargetAccountInvalid
+	}
+	s.currentMappings[m.TenantID+"|"+m.MappingKey] = m
+	return nil
+}
+
+func (s *stubStore) GetCurrentAccountMapping(_ context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error) {
+	m, ok := s.currentMappings[tenantID+"|"+mappingKey]
+	if !ok {
+		return nil, domain.ErrAccountMappingNotFound
+	}
+	return m, nil
+}
+
+func (s *stubStore) ListAccountMappings(_ context.Context, tenantID string) ([]domain.AccountMapping, error) {
+	var out []domain.AccountMapping
+	for _, m := range s.currentMappings {
+		if m.TenantID == tenantID {
+			out = append(out, *m)
+		}
+	}
+	return out, nil
 }
 
 // Compile-time proof the stub still satisfies the contract the handler
@@ -714,5 +859,323 @@ func TestReverseJournal_RetriedCorrelationID_ReturnsStoredReversalNotAFreshID(t 
 	}
 	if pub.reversed != 1 {
 		t.Fatalf("journal.reversed must publish once across a retry, got %d", pub.reversed)
+	}
+}
+
+// ── Trial Balance (ACC-15) ────────────────────────────────────────────────────
+
+// createFinalizedJournal drives a journal through the real Create -> Validate
+// -> Post lifecycle over HTTP (not a shortcut that writes FINALIZED directly
+// into the stub) — so a trial balance test genuinely exercises "only
+// FINALIZED/REVERSED journals contribute," not a fixture that assumes it.
+func createFinalizedJournal(t *testing.T, r chi.Router, req domain.CreateJournalRequest) string {
+	t.Helper()
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var created domain.JournalWithLines
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	recV := doRequest(r, http.MethodPost, "/v1/journals/"+created.JournalID+"/validate", nil, "principal-1")
+	if recV.Code != http.StatusOK {
+		t.Fatalf("validate: expected 200, got %d: %s", recV.Code, recV.Body.String())
+	}
+	recP := doRequest(r, http.MethodPost, "/v1/journals/"+created.JournalID+"/post", nil, "principal-1")
+	if recP.Code != http.StatusOK {
+		t.Fatalf("post: expected 200, got %d: %s", recP.Code, recP.Body.String())
+	}
+	return created.JournalID
+}
+
+func TestCompileTrialBalance_OnlyFinalizedJournalsContribute(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+
+	// One FINALIZED journal (100 debit to 1000, 100 credit to 4000)...
+	createFinalizedJournal(t, r, validCreateReq())
+
+	// ...and one left PENDING (never validated/posted) — must NOT contribute.
+	pendingReq := validCreateReq()
+	pendingReq.CorrelationID = "corr-pending"
+	doRequest(r, http.MethodPost, "/v1/journals/", pendingReq, "principal-1")
+
+	rec := doRequest(r, http.MethodPost, "/v1/trial-balance/compile",
+		domain.CompileTrialBalanceRequest{LegalEntityID: "e1", FiscalPeriod: "2026-07"}, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var snap domain.TrialBalanceSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if snap.LedgerWatermark != 1 {
+		t.Errorf("expected watermark reflecting exactly 1 included journal, got %d", snap.LedgerWatermark)
+	}
+	byAccount := map[string]float64{}
+	for _, l := range snap.Lines {
+		byAccount[l.AccountCode] = l.NetBalance
+	}
+	if byAccount["1000"] != 100 || byAccount["4000"] != -100 {
+		t.Errorf("expected only the FINALIZED journal's lines counted, got %+v", byAccount)
+	}
+}
+
+func TestCompileTrialBalance_MissingFields_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/trial-balance/compile",
+		domain.CompileTrialBalanceRequest{LegalEntityID: "e1"}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCompileTrialBalance_AuthorizationDenied_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied})
+	rec := doRequest(r, http.MethodPost, "/v1/trial-balance/compile",
+		domain.CompileTrialBalanceRequest{LegalEntityID: "e1", FiscalPeriod: "2026-07"}, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", rec.Code)
+	}
+}
+
+func TestGetTrialBalance_RoundTrip(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createFinalizedJournal(t, r, validCreateReq())
+
+	compileRec := doRequest(r, http.MethodPost, "/v1/trial-balance/compile",
+		domain.CompileTrialBalanceRequest{LegalEntityID: "e1", FiscalPeriod: "2026-07"}, "principal-1")
+	var snap domain.TrialBalanceSnapshot
+	_ = json.Unmarshal(compileRec.Body.Bytes(), &snap)
+
+	rec := doRequest(r, http.MethodGet, "/v1/trial-balance/"+snap.TrialBalanceSnapshotID, nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var fetched domain.TrialBalanceSnapshot
+	if err := json.Unmarshal(rec.Body.Bytes(), &fetched); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if fetched.TrialBalanceSnapshotID != snap.TrialBalanceSnapshotID || len(fetched.Lines) != len(snap.Lines) {
+		t.Errorf("expected the fetched snapshot to match what was compiled, got %+v", fetched)
+	}
+}
+
+func TestGetTrialBalance_NotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/trial-balance/does-not-exist", nil, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
+	}
+}
+
+// ── Chart of Accounts (ACC-01) ────────────────────────────────────────────────
+
+func TestCreateAccount_Success(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/", domain.CreateAccountRequest{
+		AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset,
+	}, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateAccount_InvalidType_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/", domain.CreateAccountRequest{
+		AccountCode: "1000-Cash", AccountName: "Cash", AccountType: "NOT_A_REAL_TYPE",
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}
+
+func TestCreateAccount_DuplicateCode_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	req := domain.CreateAccountRequest{AccountCode: "1000-Cash", AccountName: "Cash", AccountType: domain.AccountTypeAsset}
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/", req, "principal-1")
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/", req, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", rec.Code)
+	}
+}
+
+// createAccount is a test helper that drives the real HTTP endpoint rather
+// than writing into the stub directly — so downstream tests genuinely
+// exercise "this account was registered through the real API," not a
+// fixture that assumes the registration path works.
+func createAccount(t *testing.T, r chi.Router, req domain.CreateAccountRequest) {
+	t.Helper()
+	rec := doRequest(r, http.MethodPost, "/v1/chart-of-accounts/", req, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("createAccount: expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateJournal_UnregisteredAccountCode_StillAllowed proves the
+// deliberate bootstrap gap: an account code the chart has never heard of
+// must NOT block posting — every existing caller platform-wide posts using
+// codes nothing has ever validated, and this must not become a flag day.
+func TestCreateJournal_UnregisteredAccountCode_StillAllowed(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", validCreateReq(), "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (unregistered account codes must not block posting), got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateJournal_InactiveAccount_Returns422 proves a REGISTERED but
+// deactivated account genuinely blocks posting — unlike the unregistered
+// case above, this is a real, deliberate fact someone recorded.
+func TestCreateJournal_InactiveAccount_Returns422(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/1000/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", validCreateReq(), "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 posting to an INACTIVE registered account, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCreateJournal_ControlAccountRestricted_BlocksWithoutOverride and its
+// pair below are the direct test of invariant #7: "Control accounts cannot
+// be bypassed by ordinary manual journals where policy restricts direct
+// posting."
+func TestCreateJournal_ControlAccountRestricted_BlocksWithoutOverride(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", validCreateReq(), "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 blocking direct posting to a restricted control account, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateJournal_ControlAccountRestricted_OverrideRequiresAuthorization(t *testing.T) {
+	s := newStubStore()
+	// Denies specifically the override action — proves the override needs
+	// its OWN authorization, not merely the ordinary journal-create grant.
+	denyOverride := &stubAuthZ{}
+	r := newRouter(s, &stubPublisher{}, denyOverride)
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	req := validCreateReq()
+	req.OverrideControlAccountRestriction = true
+	denyOverride.err = domain.ErrAuthorizationDenied
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when the override itself is denied, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateJournal_ControlAccountRestricted_OverrideSucceeds(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}) // grants by default
+	createAccount(t, r, domain.CreateAccountRequest{
+		AccountCode: "1000", AccountName: "Cash", AccountType: domain.AccountTypeAsset,
+		IsControlAccount: true, DirectPostingRestricted: true,
+	})
+
+	req := validCreateReq()
+	req.OverrideControlAccountRestriction = true
+	rec := doRequest(r, http.MethodPost, "/v1/journals/", req, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 with a granted override, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── Account Mapping (ACC-02) ─────────────────────────────────────────────────
+
+func TestSetAccountMapping_Success(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "6100-Meals", AccountName: "Meals Expense", AccountType: domain.AccountTypeExpense})
+
+	rec := doRequest(r, http.MethodPost, "/v1/account-mappings/", domain.SetAccountMappingRequest{
+		MappingKey: "EXPENSE_CATEGORY:MEALS", AccountCode: "6100-Meals",
+	}, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSetAccountMapping_TargetAccountDoesNotExist_Returns400 proves ACC-02
+// cannot map a business concept onto an account the chart doesn't know
+// about — unlike CreateJournal's own deliberate bootstrap allowance for
+// unregistered codes, a NEW mapping is an explicit administrative act with
+// no such backward-compatibility need, so it's validated strictly.
+func TestSetAccountMapping_TargetAccountDoesNotExist_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodPost, "/v1/account-mappings/", domain.SetAccountMappingRequest{
+		MappingKey: "EXPENSE_CATEGORY:MEALS", AccountCode: "does-not-exist",
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSetAccountMapping_TargetAccountInactive_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "6100-Meals", AccountName: "Meals Expense", AccountType: domain.AccountTypeExpense})
+	doRequest(r, http.MethodPost, "/v1/chart-of-accounts/6100-Meals/deactivate", nil, "principal-1")
+
+	rec := doRequest(r, http.MethodPost, "/v1/account-mappings/", domain.SetAccountMappingRequest{
+		MappingKey: "EXPENSE_CATEGORY:MEALS", AccountCode: "6100-Meals",
+	}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 mapping onto an INACTIVE account, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestSetAccountMapping_SecondMapping_SupersedesRatherThanDuplicates proves
+// the effective-dated versioning: setting a new mapping for a key already
+// mapped must replace what GetAccountMapping resolves as current, not
+// create two simultaneously "current" answers.
+func TestSetAccountMapping_SecondMapping_SupersedesRatherThanDuplicates(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "6100-Meals", AccountName: "Meals Expense", AccountType: domain.AccountTypeExpense})
+	createAccount(t, r, domain.CreateAccountRequest{AccountCode: "6200-Meals-New", AccountName: "Meals Expense v2", AccountType: domain.AccountTypeExpense})
+
+	doRequest(r, http.MethodPost, "/v1/account-mappings/", domain.SetAccountMappingRequest{
+		MappingKey: "EXPENSE_CATEGORY:MEALS", AccountCode: "6100-Meals",
+	}, "principal-1")
+	doRequest(r, http.MethodPost, "/v1/account-mappings/", domain.SetAccountMappingRequest{
+		MappingKey: "EXPENSE_CATEGORY:MEALS", AccountCode: "6200-Meals-New",
+	}, "principal-1")
+
+	rec := doRequest(r, http.MethodGet, "/v1/account-mappings/EXPENSE_CATEGORY:MEALS", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var m domain.AccountMapping
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if m.AccountCode != "6200-Meals-New" {
+		t.Fatalf("expected the current mapping to be the newer one (6200-Meals-New), got %q", m.AccountCode)
+	}
+}
+
+func TestGetAccountMapping_NotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rec := doRequest(r, http.MethodGet, "/v1/account-mappings/does-not-exist", nil, "principal-1")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", rec.Code)
 	}
 }

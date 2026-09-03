@@ -38,7 +38,15 @@ type provisionResult struct {
 // mtls-management-svc and returns an *http.Client whose Transport presents
 // that certificate and trusts the issuing CA — ready to call a peer that
 // requires client certificates (e.g. authorization-svc's mTLS listener).
-func NewClientHTTPClient(ctx context.Context, mtlsServiceURL, serviceName, platformScopeID string) (*http.Client, error) {
+//
+// bootstrapToken authenticates this self-provisioning request — at this
+// point in startup this service has no principal, no session, and no prior
+// credential of its own to present. It is read from a file
+// mtls-management-svc's own mtls-bootstrap-keygen init container also
+// populates (see deployments/docker-compose.yml), never minted or verified
+// by this service. An empty bootstrapToken sends no header at all, which
+// falls through to mtls-management-svc's normal principal/authorize path.
+func NewClientHTTPClient(ctx context.Context, mtlsServiceURL, serviceName, platformScopeID, bootstrapToken string) (*http.Client, error) {
 	reqBody, err := json.Marshal(provisionRequest{
 		LegalEntityID: platformScopeID,
 		ServiceName:   serviceName,
@@ -54,6 +62,10 @@ func NewClientHTTPClient(ctx context.Context, mtlsServiceURL, serviceName, platf
 		return nil, fmt.Errorf("build provision request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-ID", platformScopeID)
+	if bootstrapToken != "" {
+		req.Header.Set("X-Mtls-Bootstrap-Token", bootstrapToken)
+	}
 
 	provisionClient := &http.Client{Timeout: 10 * time.Second}
 	resp, err := provisionClient.Do(req)

@@ -21,14 +21,17 @@ import (
 // ── stubs ─────────────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	runs      map[string]*domain.ConsolidationRun
-	snapshots map[string][]domain.BalanceSnapshot
+	runs          map[string]*domain.ConsolidationRun
+	snapshots     map[string][]domain.BalanceSnapshot
+	contributions map[string][]domain.BalanceContribution
+	contribErr    error
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		runs:      make(map[string]*domain.ConsolidationRun),
-		snapshots: make(map[string][]domain.BalanceSnapshot),
+		runs:          make(map[string]*domain.ConsolidationRun),
+		snapshots:     make(map[string][]domain.BalanceSnapshot),
+		contributions: make(map[string][]domain.BalanceContribution),
 	}
 }
 
@@ -85,6 +88,26 @@ func (s *stubStore) ListSnapshotsByRun(_ context.Context, runID string) ([]domai
 	return snaps, nil
 }
 
+func (s *stubStore) CreateBalanceContributions(_ context.Context, contributions []domain.BalanceContribution) error {
+	if s.contribErr != nil {
+		return s.contribErr
+	}
+	if len(contributions) == 0 {
+		return nil
+	}
+	runID := contributions[0].ConsolidationRunID
+	s.contributions[runID] = append(s.contributions[runID], contributions...)
+	return nil
+}
+
+func (s *stubStore) ListContributionsByRun(_ context.Context, runID string) ([]domain.BalanceContribution, error) {
+	c, ok := s.contributions[runID]
+	if !ok {
+		return []domain.BalanceContribution{}, nil
+	}
+	return c, nil
+}
+
 type stubPublisher struct {
 	started, completed, exceptions int
 }
@@ -106,6 +129,16 @@ func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { retu
 type stubClients struct {
 	glBalances map[string]map[string]float64
 	glErr      error
+
+	intercompanyEntries []clients.IntercompanyEntry
+	intercompanyErr     error
+	principalIDReceived string // captures what FetchMatchedIntercompanyEntries was called with
+
+	// journalLines maps journal_id -> its real posted lines, for the
+	// elimination path (FetchJournalLines). journalLinesErr, keyed the
+	// same way, lets a test simulate one specific journal's lookup failing.
+	journalLines    map[string][]clients.JournalLine
+	journalLinesErr map[string]error
 }
 
 func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ string) (map[string]float64, error) {
@@ -120,8 +153,19 @@ func (c *stubClients) FetchTrialBalance(_ context.Context, _, legalEntityID, _ s
 	return map[string]float64{"1000-Cash": 10000.0}, nil
 }
 
-func (c *stubClients) FetchMatchedIntercompanyEntries(_ context.Context, _ string) ([]clients.IntercompanyEntry, error) {
-	return []clients.IntercompanyEntry{}, nil
+func (c *stubClients) FetchMatchedIntercompanyEntries(_ context.Context, _, principalID string) ([]clients.IntercompanyEntry, error) {
+	c.principalIDReceived = principalID
+	if c.intercompanyErr != nil {
+		return nil, c.intercompanyErr
+	}
+	return c.intercompanyEntries, nil
+}
+
+func (c *stubClients) FetchJournalLines(_ context.Context, _, journalID string) ([]clients.JournalLine, error) {
+	if err, ok := c.journalLinesErr[journalID]; ok {
+		return nil, err
+	}
+	return c.journalLines[journalID], nil
 }
 
 // ── router factory ─────────────────────────────────────────────────────────────
@@ -229,6 +273,195 @@ func TestStartRun_HappyPath(t *testing.T) {
 	}
 	if pub.completed != 1 {
 		t.Errorf("expected 1 completed event got %d", pub.completed)
+	}
+}
+
+// TestStartRun_ElimatesMatchedIntercompanyEntry proves ACC-12 elimination
+// actually happens, not just that the fetch is called: le-us posted a
+// 500.0 intercompany receivable to a child, le-uk posted the offsetting
+// 500.0 payable, and once matched, both legs' real net contribution must
+// be subtracted from the group total — leaving only the genuinely
+// external cash balances.
+func TestStartRun_EliminatesMatchedIntercompanyEntry(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	tgtJournal := "journal-uk-1"
+	cl := &stubClients{
+		glBalances: map[string]map[string]float64{
+			"le-us": {"1000-Cash": 5000.0, "1500-IC-Receivable": 500.0},
+			"le-uk": {"1000-Cash": 3000.0, "2500-IC-Payable": -500.0},
+		},
+		intercompanyEntries: []clients.IntercompanyEntry{
+			{
+				IntercompanyEntryID: "ic-1",
+				SourceLegalEntityID: "le-us",
+				TargetLegalEntityID: "le-uk",
+				SourceJournalID:     "journal-us-1",
+				TargetJournalID:     &tgtJournal,
+				Amount:              500.0,
+				MatchStatus:         "MATCHED",
+			},
+		},
+		journalLines: map[string][]clients.JournalLine{
+			"journal-us-1": {{AccountCode: "1500-IC-Receivable", DebitAmount: 500.0, CreditAmount: 0}},
+			"journal-uk-1": {{AccountCode: "2500-IC-Payable", DebitAmount: 0, CreditAmount: 500.0}},
+		},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
+		"group_legal_entity_id":  "le-group",
+		"child_legal_entity_ids": []string{"le-us", "le-uk"},
+		"fiscal_period":          "2024-Q1",
+		"target_currency":        "USD",
+	}, "principal-1")
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.ConsolidationRunResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ExceptionCount != 0 {
+		t.Fatalf("expected 0 elimination exceptions, got %d", resp.ExceptionCount)
+	}
+
+	byAccount := map[string]float64{}
+	for _, snap := range resp.Snapshots {
+		byAccount[snap.AccountCode] = snap.ConsolidatedBalance
+	}
+	// 500 (US receivable) - 500 (eliminated) = 0 — must NOT still show 500.
+	if got := byAccount["1500-IC-Receivable"]; got != 0 {
+		t.Errorf("expected 1500-IC-Receivable eliminated to 0, got %v", got)
+	}
+	// -500 (UK payable) - (-500) (eliminated) = 0 — must NOT still show -500.
+	if got := byAccount["2500-IC-Payable"]; got != 0 {
+		t.Errorf("expected 2500-IC-Payable eliminated to 0, got %v", got)
+	}
+	// Genuinely external cash must be untouched by elimination.
+	if got := byAccount["1000-Cash"]; got != 8000.0 {
+		t.Errorf("expected cash unaffected by elimination (8000), got %v", got)
+	}
+	if cl.principalIDReceived != "principal-1" {
+		t.Errorf("expected the caller's own principal forwarded to intercompany-accounting-svc, got %q", cl.principalIDReceived)
+	}
+}
+
+// TestStartRun_EliminationFetchFailure_RecordsVisibleException proves a
+// failed elimination leg surfaces as a real, visible exception on the run
+// — never a silent warning, and never a run that reports 0 exceptions
+// while quietly having skipped elimination.
+func TestStartRun_EliminationFetchFailure_RecordsVisibleException(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	tgtJournal := "journal-uk-1"
+	cl := &stubClients{
+		glBalances: map[string]map[string]float64{
+			"le-us": {"1000-Cash": 5000.0},
+			"le-uk": {"1000-Cash": 3000.0},
+		},
+		intercompanyEntries: []clients.IntercompanyEntry{
+			{
+				IntercompanyEntryID: "ic-1",
+				SourceJournalID:     "journal-us-1",
+				TargetJournalID:     &tgtJournal,
+				Amount:              500.0,
+				MatchStatus:         "MATCHED",
+			},
+		},
+		journalLinesErr: map[string]error{
+			"journal-us-1": domain.ErrGLServiceUnavailable,
+		},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
+		"group_legal_entity_id":  "le-group",
+		"child_legal_entity_ids": []string{"le-us", "le-uk"},
+		"fiscal_period":          "2024-Q1",
+		"target_currency":        "USD",
+	}, "principal-1")
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (run still completes) got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.ConsolidationRunResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ExceptionCount != 1 {
+		t.Fatalf("expected 1 visible elimination exception, got %d", resp.ExceptionCount)
+	}
+	if pub.exceptions != 1 {
+		t.Errorf("expected PublishExceptionDetected to fire once, got %d calls", pub.exceptions)
+	}
+}
+
+// TestStartRun_RecordsEntityToGroupProvenance proves ACC-13's missing
+// provenance is now real: each child entity's own gross (pre-elimination)
+// contribution to each account is persisted and independently retrievable,
+// not just summed in memory and discarded.
+func TestStartRun_RecordsEntityToGroupProvenance(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		glBalances: map[string]map[string]float64{
+			"le-us": {"1000-Cash": 5000.0},
+			"le-uk": {"1000-Cash": 3000.0},
+		},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
+		"group_legal_entity_id":  "le-group",
+		"child_legal_entity_ids": []string{"le-us", "le-uk"},
+		"fiscal_period":          "2024-Q1",
+		"target_currency":        "USD",
+	}, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.ConsolidationRunResponse
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+
+	rrc := doReq(r, http.MethodGet, "/v1/consolidation/runs/"+resp.ConsolidationRunID+"/contributions", nil, "principal-1")
+	if rrc.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rrc.Code, rrc.Body.String())
+	}
+	var contributions []domain.BalanceContribution
+	if err := json.NewDecoder(rrc.Body).Decode(&contributions); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(contributions) != 2 {
+		t.Fatalf("expected 2 contribution rows (one per child entity), got %d", len(contributions))
+	}
+	byEntity := map[string]float64{}
+	for _, c := range contributions {
+		if c.AccountCode != "1000-Cash" {
+			t.Errorf("unexpected account code %q", c.AccountCode)
+		}
+		byEntity[c.SourceLegalEntityID] = c.GrossAmount
+	}
+	if byEntity["le-us"] != 5000.0 || byEntity["le-uk"] != 3000.0 {
+		t.Errorf("expected per-entity gross amounts preserved, got %+v", byEntity)
+	}
+}
+
+// TestStartRun_ContributionRecordingFails_RunFailsVisibly proves a failure
+// to persist provenance is never silently ignored — the run itself fails,
+// rather than completing and reporting COMPLETED balances nobody can trace
+// back to a source entity.
+func TestStartRun_ContributionRecordingFails_RunFailsVisibly(t *testing.T) {
+	s := newStubStore()
+	s.contribErr = domain.ErrStoreUnavailable
+	cl := &stubClients{glBalances: map[string]map[string]float64{"le-us": {"1000-Cash": 5000.0}}}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, cl)
+	rr := doReq(r, http.MethodPost, "/v1/consolidation/runs/", map[string]any{
+		"group_legal_entity_id":  "le-group",
+		"child_legal_entity_ids": []string{"le-us"},
+		"fiscal_period":          "2024-Q1",
+		"target_currency":        "USD",
+	}, "principal-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

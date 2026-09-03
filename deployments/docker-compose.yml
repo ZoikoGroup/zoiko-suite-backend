@@ -288,6 +288,35 @@ services:
         chmod 644 /keys/envelope_signing_key.pem
     restart: "no"
 
+  # ── One-shot: generate the shared mTLS self-provisioning bootstrap token ──
+  # mtls-management-svc requires a verified principal + authorize() decision
+  # for every certificate request EXCEPT this one bootstrap path: a service
+  # requesting its own first certificate has no principal or session yet to
+  # present (the standard PKI bootstrap problem — see
+  # docs/architecture/master-register-findings-2026-08-27.md §3.28). This
+  # generates one random token into a shared volume, exactly like
+  # identity-svc-keygen above; never used in staging/production, where a
+  # real value is injected via the secrets manager.
+  mtls-bootstrap-keygen:
+    image: alpine:3.19
+    container_name: mtls-bootstrap-keygen
+    mem_limit: 128m
+    cpus: "0.25"
+    volumes:
+      - mtls_bootstrap_token:/bootstrap
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /bootstrap/token ]; then
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /bootstrap/token
+          echo "Generated throwaway dev mTLS bootstrap token"
+        else
+          echo "Dev mTLS bootstrap token already present, skipping"
+        fi
+        chmod 644 /bootstrap/token
+    restart: "no"
+
   # ── Docker socket proxy ──────────────────────────────────────────────────────
   # Traefik's bundled Go Docker client is hardcoded to send its initial
   # handshake as GET /v1.24/version, regardless of DOCKER_API_VERSION or
@@ -944,6 +973,7 @@ services:
     cpus: "0.5"
     ports:
       - "8089:8089"
+      - "8449:8449" # mTLS pilot listener — see MTLS_ENABLED below
     environment:
       PORT: "8089"
       DB_HOST: postgres
@@ -961,11 +991,27 @@ services:
       # only when that file is up alongside this one. Streaming degrades to
       # a no-op otherwise (see internal/siem's doc comment).
       SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
+      # mTLS pilot (material-path only) — see internal/mtls's doc comment.
+      # authorization-svc is the highest-value pilot target since every
+      # authorization decision in the platform routes through it. Enabled
+      # here as the proof-of-concept slice; the other ~70 inter-service
+      # clients remain on the plain port (master-register-findings-
+      # 2026-08-27.md §3.28).
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      - mtls_bootstrap_token:/bootstrap:ro
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      mtls-management-svc:
+        condition: service_healthy
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
       interval: 10s
@@ -1825,8 +1871,18 @@ services:
       PORT: "8140"
       CA_DATA_DIR: "/data/ca"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Enables the self-provisioning bootstrap path on ProvisionCert — see
+      # master-register-findings-2026-08-27.md §3.28. Empty/unset leaves
+      # that path disabled, requiring every caller to present a real
+      # principal (which mtls-bootstrap-keygen's own consumers cannot, at
+      # their own startup — this is what makes the pilot actually usable).
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
       - mtls_ca_data:/data/ca
+      - mtls_bootstrap_token:/bootstrap:ro
+    depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -3120,6 +3176,16 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       KILL_SWITCH_REGISTRY_SERVICE_URL: "http://kill-switch-registry-svc:8147"
+      # mTLS pilot (material-path only) — ai-governance-svc is the one
+      # client wired to authorization-svc's mTLS listener for this pilot
+      # slice (master-register-findings-2026-08-27.md §3.28). Plain
+      # AUTHZ_SERVICE_URL above stops being used once this is true.
+      AUTHZ_MTLS_ENABLED: "true"
+      AUTHZ_MTLS_URL: "https://authorization-svc:8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      - mtls_bootstrap_token:/bootstrap:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -3129,6 +3195,10 @@ services:
         condition: service_healthy
       kill-switch-registry-svc:
         condition: service_healthy
+      mtls-management-svc:
+        condition: service_healthy
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -4059,3 +4129,4 @@ volumes:
   opensearch_data:
   document_vault_storage:
   mtls_ca_data:
+  mtls_bootstrap_token:

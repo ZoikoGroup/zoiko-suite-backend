@@ -553,3 +553,342 @@ func (s *PgStore) SumLines(ctx context.Context, tenantID, journalID string) (deb
 	}
 	return debitTotal, creditTotal, nil
 }
+
+// CompileTrialBalance is ACC-15's real, durable trial-balance capability —
+// see migration 000006's doc comment. It computes the watermark (the
+// highest journal_seq among the FINALIZED/REVERSED journals actually
+// included) and each account's net balance in ONE query each, inside the
+// same transaction the snapshot is written in — never N+1 per-journal
+// fetches, and never a page-size limit to be truncated by (unlike
+// ListJournals, which exists for a paginated UI, this reads everything
+// that matches directly from the store it already owns).
+func (s *PgStore) CompileTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (*domain.TrialBalanceSnapshot, error) {
+	snap := &domain.TrialBalanceSnapshot{
+		TrialBalanceSnapshotID: uuid.NewString(),
+		TenantID:               tenantID,
+		LegalEntityID:          legalEntityID,
+		FiscalPeriod:           fiscalPeriod,
+		CompiledAt:             time.Now().UTC(),
+		CompiledByPrincipalID:  principalID,
+	}
+
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(MAX(journal_seq), 0)
+			FROM journal_headers
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND fiscal_period = $3
+			  AND status IN ('FINALIZED', 'REVERSED')
+		`, tenantID, legalEntityID, fiscalPeriod).Scan(&snap.LedgerWatermark); err != nil {
+			return mapPgError(err)
+		}
+
+		rows, err := tx.Query(ctx, `
+			SELECT jl.account_code, SUM(jl.debit_amount - jl.credit_amount) AS net_balance
+			FROM journal_lines jl
+			JOIN journal_headers jh ON jh.journal_id = jl.journal_id
+			WHERE jh.tenant_id = $1 AND jh.legal_entity_id = $2 AND jh.fiscal_period = $3
+			  AND jh.status IN ('FINALIZED', 'REVERSED') AND jl.tenant_id = $1
+			GROUP BY jl.account_code
+			ORDER BY jl.account_code ASC
+		`, tenantID, legalEntityID, fiscalPeriod)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var line domain.TrialBalanceLine
+			if err := rows.Scan(&line.AccountCode, &line.NetBalance); err != nil {
+				return mapPgError(err)
+			}
+			snap.Lines = append(snap.Lines, line)
+		}
+		if err := mapPgError(rows.Err()); err != nil {
+			return err
+		}
+
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO trial_balance_snapshots (
+				trial_balance_snapshot_id, tenant_id, legal_entity_id, fiscal_period,
+				ledger_watermark, compiled_at, compiled_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7)
+		`, snap.TrialBalanceSnapshotID, tenantID, legalEntityID, fiscalPeriod,
+			snap.LedgerWatermark, snap.CompiledAt, principalID); err != nil {
+			return mapPgError(err)
+		}
+
+		for _, line := range snap.Lines {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO trial_balance_lines (trial_balance_snapshot_id, tenant_id, account_code, net_balance)
+				VALUES ($1, $2, $3, $4)
+			`, snap.TrialBalanceSnapshotID, tenantID, line.AccountCode, line.NetBalance); err != nil {
+				return mapPgError(err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return snap, nil
+}
+
+// GetTrialBalance returns one previously-compiled snapshot by id, with its
+// lines, or domain.ErrTrialBalanceNotFound.
+func (s *PgStore) GetTrialBalance(ctx context.Context, tenantID, snapshotID string) (*domain.TrialBalanceSnapshot, error) {
+	var snap domain.TrialBalanceSnapshot
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT trial_balance_snapshot_id, tenant_id, legal_entity_id, fiscal_period,
+			       ledger_watermark, compiled_at, compiled_by_principal_id
+			FROM trial_balance_snapshots
+			WHERE trial_balance_snapshot_id = $1 AND tenant_id = $2
+		`, snapshotID, tenantID).Scan(
+			&snap.TrialBalanceSnapshotID, &snap.TenantID, &snap.LegalEntityID, &snap.FiscalPeriod,
+			&snap.LedgerWatermark, &snap.CompiledAt, &snap.CompiledByPrincipalID,
+		); err != nil {
+			return mapPgError(err)
+		}
+
+		rows, err := tx.Query(ctx, `
+			SELECT account_code, net_balance FROM trial_balance_lines
+			WHERE trial_balance_snapshot_id = $1 AND tenant_id = $2
+			ORDER BY account_code ASC
+		`, snapshotID, tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var line domain.TrialBalanceLine
+			if err := rows.Scan(&line.AccountCode, &line.NetBalance); err != nil {
+				return mapPgError(err)
+			}
+			snap.Lines = append(snap.Lines, line)
+		}
+		return mapPgError(rows.Err())
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTrialBalanceNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
+// ── ACC-01 Chart of Accounts ─────────────────────────────────────────────────
+
+const accountColumns = `account_id, tenant_id, account_code, account_name, account_type,
+	parent_account_id, is_control_account, direct_posting_restricted, status,
+	created_at, created_by_principal_id`
+
+func scanAccount(row pgx.Row) (*domain.Account, error) {
+	var a domain.Account
+	var accountType, status string
+	if err := row.Scan(
+		&a.AccountID, &a.TenantID, &a.AccountCode, &a.AccountName, &accountType,
+		&a.ParentAccountID, &a.IsControlAccount, &a.DirectPostingRestricted, &status,
+		&a.CreatedAt, &a.CreatedByPrincipalID,
+	); err != nil {
+		return nil, err
+	}
+	a.AccountType = domain.AccountType(accountType)
+	a.Status = status
+	return &a, nil
+}
+
+func (s *PgStore) CreateAccount(ctx context.Context, a *domain.Account) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		// The parent, if named, must actually exist in this tenant's chart
+		// — a dangling parent_account_id would make the hierarchy this
+		// invariant exists to model unreliable from the moment it's created.
+		if a.ParentAccountID != nil {
+			var exists bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM chart_of_accounts WHERE account_id = $1 AND tenant_id = $2)`,
+				*a.ParentAccountID, tenantID).Scan(&exists); err != nil {
+				return mapPgError(err)
+			}
+			if !exists {
+				return domain.ErrParentAccountNotFound
+			}
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO chart_of_accounts (
+				account_id, tenant_id, account_code, account_name, account_type,
+				parent_account_id, is_control_account, direct_posting_restricted, status,
+				created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`, a.AccountID, tenantID, a.AccountCode, a.AccountName, string(a.AccountType),
+			a.ParentAccountID, a.IsControlAccount, a.DirectPostingRestricted, a.Status,
+			a.CreatedAt, a.CreatedByPrincipalID)
+		return mapPgError(err)
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return domain.ErrAccountAlreadyExists
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *PgStore) GetAccountByCode(ctx context.Context, tenantID, accountCode string) (*domain.Account, error) {
+	var a *domain.Account
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+accountColumns+` FROM chart_of_accounts WHERE tenant_id = $1 AND account_code = $2`,
+			tenantID, accountCode)
+		var err error
+		a, err = scanAccount(row)
+		return mapPgError(err)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAccountNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+func (s *PgStore) ListAccounts(ctx context.Context, tenantID string) ([]domain.Account, error) {
+	var out []domain.Account
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+accountColumns+` FROM chart_of_accounts WHERE tenant_id = $1 ORDER BY account_code ASC`, tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			a, err := scanAccount(rows)
+			if err != nil {
+				return mapPgError(err)
+			}
+			out = append(out, *a)
+		}
+		return mapPgError(rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ── ACC-02 Account Mapping ───────────────────────────────────────────────────
+
+// SetAccountMapping records a new effective-dated mapping for mappingKey,
+// atomically superseding any prior current mapping for the same key —
+// never a destructive overwrite (migration 000008's doc comment). Fails
+// if accountCode does not name an existing ACTIVE account: ACC-02 must
+// never map a business concept onto an account that can't be posted to.
+func (s *PgStore) SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var status string
+		err := tx.QueryRow(ctx, `SELECT status FROM chart_of_accounts WHERE tenant_id = $1 AND account_code = $2`,
+			tenantID, m.AccountCode).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrMappingTargetAccountInvalid
+		}
+		if err != nil {
+			return mapPgError(err)
+		}
+		if status != "ACTIVE" {
+			return domain.ErrMappingTargetAccountInvalid
+		}
+
+		if _, err := tx.Exec(ctx, `
+			UPDATE account_mappings SET effective_to = $1
+			WHERE tenant_id = $2 AND mapping_key = $3 AND effective_to IS NULL
+		`, m.EffectiveFrom, tenantID, m.MappingKey); err != nil {
+			return mapPgError(err)
+		}
+
+		_, err = tx.Exec(ctx, `
+			INSERT INTO account_mappings (
+				account_mapping_id, tenant_id, mapping_key, account_code,
+				effective_from, effective_to, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, NULL, $6, $7)
+		`, m.AccountMappingID, tenantID, m.MappingKey, m.AccountCode,
+			m.EffectiveFrom, m.CreatedAt, m.CreatedByPrincipalID)
+		return mapPgError(err)
+	})
+}
+
+func (s *PgStore) GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error) {
+	var m domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return mapPgError(tx.QueryRow(ctx, `
+			SELECT account_mapping_id, tenant_id, mapping_key, account_code,
+			       effective_from, effective_to, created_at, created_by_principal_id
+			FROM account_mappings
+			WHERE tenant_id = $1 AND mapping_key = $2 AND effective_to IS NULL
+		`, tenantID, mappingKey).Scan(
+			&m.AccountMappingID, &m.TenantID, &m.MappingKey, &m.AccountCode,
+			&m.EffectiveFrom, &m.EffectiveTo, &m.CreatedAt, &m.CreatedByPrincipalID,
+		))
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrAccountMappingNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+func (s *PgStore) ListAccountMappings(ctx context.Context, tenantID string) ([]domain.AccountMapping, error) {
+	var out []domain.AccountMapping
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT account_mapping_id, tenant_id, mapping_key, account_code,
+			       effective_from, effective_to, created_at, created_by_principal_id
+			FROM account_mappings
+			WHERE tenant_id = $1 AND effective_to IS NULL
+			ORDER BY mapping_key ASC
+		`, tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m domain.AccountMapping
+			if err := rows.Scan(
+				&m.AccountMappingID, &m.TenantID, &m.MappingKey, &m.AccountCode,
+				&m.EffectiveFrom, &m.EffectiveTo, &m.CreatedAt, &m.CreatedByPrincipalID,
+			); err != nil {
+				return mapPgError(err)
+			}
+			out = append(out, m)
+		}
+		return mapPgError(rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode string) error {
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `UPDATE chart_of_accounts SET status = 'INACTIVE' WHERE tenant_id = $1 AND account_code = $2`,
+			tenantID, accountCode)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if res.RowsAffected() == 0 {
+			return domain.ErrAccountNotFound
+		}
+		return nil
+	})
+	return err
+}

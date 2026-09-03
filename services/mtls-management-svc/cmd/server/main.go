@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 	"zoiko.io/mtls-management-svc/internal/authz"
@@ -16,6 +17,29 @@ import (
 	"zoiko.io/mtls-management-svc/internal/siem"
 	"zoiko.io/mtls-management-svc/internal/store"
 )
+
+// loadBootstrapToken reads the shared mTLS self-provisioning bootstrap
+// secret from a file (see deployments/docker-compose.yml's
+// mtls-bootstrap-keygen init container) rather than an env var, so the
+// value never appears in `docker inspect`/process-list output the way a
+// plain environment variable would. Returns "" (bootstrap path disabled)
+// when the path is unset or unreadable — this service must still start
+// and serve the normal human/admin-authorized provisioning path even if
+// the bootstrap file was never mounted.
+func loadBootstrapToken(logger *zap.Logger) string {
+	path := os.Getenv("MTLS_BOOTSTRAP_TOKEN_PATH")
+	if path == "" {
+		logger.Info("MTLS_BOOTSTRAP_TOKEN_PATH not set — self-provisioning bootstrap path disabled")
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		logger.Warn("failed to read mtls bootstrap token file — self-provisioning bootstrap path disabled",
+			zap.String("path", path), zap.Error(err))
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
 
 func main() {
 	logger, _ := zap.NewProduction()
@@ -52,7 +76,8 @@ func main() {
 		logger.Fatal("AUTHZ_SERVICE_URL is required: every authorized route would return 503 without it")
 	}
 	authzClient := authz.NewClient(authzURL)
-	h := handler.New(s, internalCA, siemClient, authzClient, logger)
+	bootstrapToken := loadBootstrapToken(logger)
+	h := handler.New(s, internalCA, siemClient, authzClient, logger, bootstrapToken)
 	router := handler.NewRouter(h)
 
 	srv := &http.Server{Addr: ":" + port, Handler: router, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}

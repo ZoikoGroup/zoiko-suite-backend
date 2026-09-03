@@ -275,41 +275,383 @@ func (c *Clients) GetUnpostedJournalsCount(ctx context.Context, tenantID, legalE
 // silently mattered.
 const ledgerPageLimit = 1000
 
-// postedStatuses are the journal states whose lines are ON the books.
+// tbCompileRequest/tbCompileResponse mirror general-ledger-svc's own
+// domain.CompileTrialBalanceRequest/TrialBalanceSnapshot wire shapes —
+// duplicated rather than imported, same posture this file already takes
+// with glJournal/glJournalLine, since these two services share no Go
+// module.
+type tbCompileRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
+}
+
+type tbLine struct {
+	AccountCode string  `json:"account_code"`
+	NetBalance  float64 `json:"net_balance"`
+}
+
+type tbSnapshot struct {
+	TrialBalanceSnapshotID string   `json:"trial_balance_snapshot_id"`
+	LedgerWatermark        int64    `json:"ledger_watermark"`
+	Lines                  []tbLine `json:"lines"`
+}
+
+// CompileTrialBalance asks general-ledger-svc's own authoritative,
+// watermarked trial-balance endpoint to compile the period — replacing
+// what used to be this service re-deriving one client-side by paging raw
+// journals itself (see master-register-findings-2026-08-27.md §3.32).
+// general-ledger-svc owns the "FINALIZED alone double-counts a reversal"
+// correctness rule now — this client's only job is to ask and parse the
+// answer, not re-implement ledger semantics a second time.
 //
-// FINALIZED alone is NOT the answer, and using it was an accounting defect that
-// mis-stated the trial balance by exactly double the value of every reversal.
-// A reversal in general-ledger-svc does not erase anything: the original moves
-// to REVERSED and keeps its lines, and a NEW journal is posted FINALIZED
-// carrying the exact inverse. Both entries are real postings and they net to
-// zero. Filtering to FINALIZED dropped the original while keeping its inverse,
-// so a reversed 100.00 debit read as a 100.00 CREDIT on the trial balance
-// instead of as nothing at all — and that balance is what gets hashed, signed
-// and locked as the period's evidence.
-var postedStatuses = []string{"FINALIZED", "REVERSED"}
+// principalID is forwarded as X-Principal-Id: the new endpoint records who
+// compiled each durable snapshot, and there is no separate "financial-
+// close-svc" system identity anywhere on this platform to invent — the
+// principal already driving this close is the real caller.
+func (c *Clients) CompileTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, principalID string) (map[string]float64, error) {
+	body, err := json.Marshal(tbCompileRequest{LegalEntityID: legalEntityID, FiscalPeriod: fiscalPeriod})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/trial-balance/compile", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
 
-// CompileTrialBalance sums every posted line for the period into per-account
-// net balances (debit positive, credit negative).
-func (c *Clients) CompileTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (map[string]float64, error) {
-	balances := make(map[string]float64)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to compile trial balance via general-ledger-svc", zap.Error(err))
+		return nil, domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
 
-	for _, status := range postedStatuses {
-		journals, err := c.listJournals(ctx, tenantID, legalEntityID, fiscalPeriod, status)
-		if err != nil {
-			return nil, err
-		}
-		for _, j := range journals {
-			lines, err := c.getJournalLines(ctx, tenantID, j.JournalID)
-			if err != nil {
-				return nil, err
-			}
-			for _, line := range lines {
-				balances[line.AccountCode] += line.DebitAmount - line.CreditAmount
-			}
-		}
+	if resp.StatusCode != http.StatusCreated {
+		c.log.Error("general-ledger-svc refused to compile trial balance",
+			zap.Int("status", resp.StatusCode), zap.String("fiscal_period", fiscalPeriod))
+		return nil, domain.ErrGLServiceUnavailable
 	}
 
+	var snap tbSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+		return nil, err
+	}
+
+	balances := make(map[string]float64, len(snap.Lines))
+	for _, l := range snap.Lines {
+		balances[l.AccountCode] = l.NetBalance
+	}
 	return balances, nil
+}
+
+// glAccountMapping mirrors general-ledger-svc's ACC-02
+// domain.AccountMapping wire shape — only the field this client needs.
+type glAccountMapping struct {
+	AccountCode string `json:"account_code"`
+}
+
+// GetControlAccountCode resolves an ACC-06 caller-declared
+// control_account_mapping_key to the real, chart-registered account code
+// it currently names, via general-ledger-svc's ACC-02 mapping endpoint.
+// ACC-06 must never guess or hardcode which GL account a subledger
+// reconciles against — the mapping is the single source of truth, same
+// doctrine CompileTrialBalance already applies to journal semantics.
+func (c *Clients) GetControlAccountCode(ctx context.Context, tenantID, mappingKey string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ledgerURL+"/v1/account-mappings/"+url.PathEscape(mappingKey), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", domain.ErrControlAccountMappingNotFound
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", domain.ErrGLServiceUnavailable
+	}
+
+	var m glAccountMapping
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return "", err
+	}
+	return m.AccountCode, nil
+}
+
+// glCreateJournalRequest/glJournalLineInput/glJournalCreateResponse mirror
+// general-ledger-svc's own CreateJournalRequest/CreateJournalLineInput/
+// journal-create response wire shapes.
+type glCreateJournalRequest struct {
+	TenantID      string               `json:"tenant_id"`
+	LegalEntityID string               `json:"legal_entity_id"`
+	FiscalPeriod  string               `json:"fiscal_period"`
+	Description   string               `json:"description"`
+	CorrelationID string               `json:"correlation_id"`
+	Lines         []glJournalLineInput `json:"lines"`
+}
+
+type glJournalLineInput struct {
+	AccountCode  string  `json:"account_code"`
+	DebitAmount  float64 `json:"debit_amount,omitempty"`
+	CreditAmount float64 `json:"credit_amount,omitempty"`
+	Description  string  `json:"description,omitempty"`
+}
+
+type glJournalCreateResponse struct {
+	JournalID string `json:"journal_id"`
+	Status    string `json:"status"`
+}
+
+// PostAccrualRecognitionJournal creates, validates and posts a balanced
+// journal entry for one period's accrual recognition — ACC-07 "must never
+// own: Direct ledger writes," so this is the ONLY way a recognition
+// becomes an accounting fact: through general-ledger-svc's own
+// Create/Validate/Post lifecycle, same as goods-service-receipt-svc's
+// PostGRNI client and every other capability that posts to the ledger.
+//
+// correlationID is the caller's idempotency key (this schedule's own
+// schedule_id + fiscal_period). general-ledger-svc's CreateJournal is
+// itself idempotent on correlation_id — a replayed recognition run for an
+// already-posted period gets the SAME journal back (created=false)
+// instead of a duplicate, satisfying the spec's own negative-path
+// requirement for "Recognition run replay" without this client needing to
+// implement replay detection itself.
+func (c *Clients) PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error) {
+	body := glCreateJournalRequest{
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		FiscalPeriod:  fiscalPeriod,
+		Description:   description,
+		CorrelationID: correlationID,
+		Lines: []glJournalLineInput{
+			{AccountCode: debitAccountCode, DebitAmount: amount, Description: description},
+			{AccountCode: creditAccountCode, CreditAmount: amount, Description: description},
+		},
+	}
+	journal, err := c.createGLJournal(ctx, tenantID, principalID, body)
+	if err != nil {
+		return "", err
+	}
+	if journal.Status == "PENDING" {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "validate"); err != nil {
+			return "", err
+		}
+		journal.Status = "VALIDATED"
+	}
+	if journal.Status == "VALIDATED" {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "post"); err != nil {
+			return "", err
+		}
+	}
+	return journal.JournalID, nil
+}
+
+func (c *Clients) createGLJournal(ctx context.Context, tenantID, principalID string, body glCreateJournalRequest) (*glJournalCreateResponse, error) {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/journals", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, domain.ErrJournalPostingFailed
+	}
+	var out glJournalCreateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if out.JournalID == "" {
+		return nil, domain.ErrGLServiceUnavailable
+	}
+	return &out, nil
+}
+
+func (c *Clients) transitionGLJournal(ctx context.Context, tenantID, principalID, journalID, action string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/journals/"+journalID+"/"+action, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return domain.ErrJournalPostingFailed
+	}
+	return nil
+}
+
+// glAccountLookup mirrors general-ledger-svc's own ACC-01 domain.Account
+// wire shape — only the fields this client needs.
+type glAccountLookup struct {
+	AccountCode string `json:"account_code"`
+	Status      string `json:"status"`
+}
+
+// GetAccountStatus resolves an account code against GL's own ACC-01 Chart
+// of Accounts — ACC-09 uses this to validate a driver's
+// recipient_account_code at rule approval time (the spec's own negative
+// path, "Recipient dimension invalid," made a real, blocking check rather
+// than trusting whatever code the caller typed).
+func (c *Clients) GetAccountStatus(ctx context.Context, tenantID, principalID, accountCode string) (status string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ledgerURL+"/v1/chart-of-accounts/"+url.PathEscape(accountCode), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", domain.ErrRecipientAccountInvalid
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	var a glAccountLookup
+	if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
+		return "", err
+	}
+	return a.Status, nil
+}
+
+// PostAllocationJournal posts ONE balanced journal crediting the
+// allocation's source account for the full amount and debiting every
+// recipient for its computed share — a genuine multi-line posting, unlike
+// ACC-07/08's fixed two-line PostAccrualRecognitionJournal, reusing the
+// same underlying createGLJournal/transitionGLJournal Create-Validate-Post
+// primitives rather than duplicating them.
+func (c *Clients) PostAllocationJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, sourceAccountCode string, sourceAmount float64, debitLines []domain.AllocationJournalLine) (journalID string, err error) {
+	lines := make([]glJournalLineInput, 0, len(debitLines)+1)
+	for _, l := range debitLines {
+		lines = append(lines, glJournalLineInput{AccountCode: l.AccountCode, DebitAmount: l.Amount, Description: description})
+	}
+	lines = append(lines, glJournalLineInput{AccountCode: sourceAccountCode, CreditAmount: sourceAmount, Description: description})
+
+	body := glCreateJournalRequest{
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		FiscalPeriod:  fiscalPeriod,
+		Description:   description,
+		CorrelationID: correlationID,
+		Lines:         lines,
+	}
+	journal, err := c.createGLJournal(ctx, tenantID, principalID, body)
+	if err != nil {
+		return "", err
+	}
+	if journal.Status == "PENDING" {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "validate"); err != nil {
+			return "", err
+		}
+		journal.Status = "VALIDATED"
+	}
+	if journal.Status == "VALIDATED" {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "post"); err != nil {
+			return "", err
+		}
+	}
+	return journal.JournalID, nil
+}
+
+// GetAccountType resolves an account's AccountType (ASSET, LIABILITY,
+// EQUITY, REVENUE, EXPENSE) via GL's own ACC-01 Chart of Accounts —
+// ACC-10 uses this to enforce its own negative path, "Non-monetary item
+// included": only ASSET/LIABILITY accounts carry a monetary balance
+// subject to revaluation.
+func (c *Clients) GetAccountType(ctx context.Context, tenantID, principalID, accountCode string) (accountType string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.ledgerURL+"/v1/chart-of-accounts/"+url.PathEscape(accountCode), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", domain.ErrNonMonetaryItemIncluded
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	var a struct {
+		AccountType string `json:"account_type"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&a); err != nil {
+		return "", err
+	}
+	return a.AccountType, nil
+}
+
+// PostMultiLineJournal posts one journal with arbitrary mixed debit/credit
+// lines — ACC-10's FX revaluation needs both signs in a single posting
+// (some monetary items move by a debit, others by a credit), unlike
+// ACC-09's fixed all-debits-plus-one-credit shape. Reuses the same
+// createGLJournal/transitionGLJournal Create-Validate-Post primitives
+// every other ACC posting client in this file already relies on.
+func (c *Clients) PostMultiLineJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description string, lines []domain.JournalLineInput) (journalID string, err error) {
+	glLines := make([]glJournalLineInput, len(lines))
+	for i, l := range lines {
+		glLines[i] = glJournalLineInput{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: description}
+	}
+	body := glCreateJournalRequest{
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		FiscalPeriod:  fiscalPeriod,
+		Description:   description,
+		CorrelationID: correlationID,
+		Lines:         glLines,
+	}
+	journal, err := c.createGLJournal(ctx, tenantID, principalID, body)
+	if err != nil {
+		return "", err
+	}
+	if journal.Status == "PENDING" {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "validate"); err != nil {
+			return "", err
+		}
+		journal.Status = "VALIDATED"
+	}
+	if journal.Status == "VALIDATED" {
+		if err := c.transitionGLJournal(ctx, tenantID, principalID, journal.JournalID, "post"); err != nil {
+			return "", err
+		}
+	}
+	return journal.JournalID, nil
 }
 
 // listJournals fetches one page of journals and REFUSES a full page.
@@ -401,6 +743,71 @@ type apInvoice struct {
 	// DueDate is the only business date accounts-payable-svc carries — there is
 	// no invoice_date column — so it is what places an invoice in a period.
 	DueDate time.Time `json:"due_date"`
+	Amount  float64   `json:"amount"`
+}
+
+// subledgerPageLimit is the largest page AP/AR will serve one request
+// (each service's own maxLimit). Asked for explicitly, same reasoning as
+// ledgerPageLimit above: a caller that never asks silently gets the
+// service's default page instead.
+const subledgerPageLimit = 500
+
+// GetAPSubledgerTotal sums the OUTSTANDING (not yet PAYMENT_REQUESTED)
+// balance of every payable for the legal entity — the AP subledger's own
+// total, the other half of ACC-06's reconciliation. Unlike
+// GetUnsettledAPInvoicesCount, this is NOT period-bounded by due date: a
+// control account balance is a point-in-time total of everything still
+// open, not just what happens to fall due within the period being closed.
+//
+// A full page is refused rather than summed, same doctrine as
+// listJournals: a control run is recorded as permanent evidence, and a
+// total that might be understated must never be persisted as if it were
+// complete.
+func (c *Clients) GetAPSubledgerTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error) {
+	u, err := url.Parse(c.apURL + "/v1/invoices")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("tenant_id", tenantID)
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("limit", strconv.Itoa(subledgerPageLimit))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, domain.ErrAPServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrAPServiceUnavailable
+	}
+
+	var list []apInvoice
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return 0, err
+	}
+
+	if len(list) >= subledgerPageLimit {
+		c.log.Error("AP invoice page came back full — the subledger total may be incomplete",
+			zap.String("legal_entity_id", legalEntityID), zap.Int("returned", len(list)))
+		return 0, domain.ErrSubledgerPageTruncated
+	}
+
+	var total float64
+	for _, inv := range list {
+		if inv.Status != "PAYMENT_REQUESTED" {
+			total += inv.Amount
+		}
+	}
+	return total, nil
 }
 
 // GetUnsettledAPInvoicesCount counts payables belonging to THIS period that have
@@ -495,6 +902,58 @@ type arInvoice struct {
 	InvoiceID string    `json:"invoice_id"`
 	Status    string    `json:"status"`
 	DueDate   time.Time `json:"due_date"`
+	Amount    float64   `json:"amount"`
+}
+
+// GetARSubledgerTotal sums the OUTSTANDING (not yet PAID) balance of every
+// receivable for the legal entity — the AR half of ACC-06, same posture as
+// GetAPSubledgerTotal: not period-bounded by due date, and a full page is
+// refused rather than summed.
+func (c *Clients) GetARSubledgerTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error) {
+	u, err := url.Parse(c.arURL + "/v1/invoices")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("tenant_id", tenantID)
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("limit", strconv.Itoa(subledgerPageLimit))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, domain.ErrARServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrARServiceUnavailable
+	}
+
+	var list []arInvoice
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return 0, err
+	}
+
+	if len(list) >= subledgerPageLimit {
+		c.log.Error("AR invoice page came back full — the subledger total may be incomplete",
+			zap.String("legal_entity_id", legalEntityID), zap.Int("returned", len(list)))
+		return 0, domain.ErrSubledgerPageTruncated
+	}
+
+	var total float64
+	for _, inv := range list {
+		if inv.Status != "PAID" {
+			total += inv.Amount
+		}
+	}
+	return total, nil
 }
 
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that
