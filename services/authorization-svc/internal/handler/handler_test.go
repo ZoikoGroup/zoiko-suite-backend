@@ -40,8 +40,12 @@ type stubStore struct {
 	revokedAssign   *domain.PrincipalRoleAssignment
 	revokeAssignErr error
 
-	delegation          *domain.DelegatedAuthority
-	delegationErr       error
+	delegation    *domain.DelegatedAuthority
+	delegationErr error
+	// The params CreateDelegatedAuthority was called with. Recorded because
+	// the store gained delegated_actions and the HTTP request struct did not,
+	// and the only place that is visible is the argument.
+	gotCreateDelegation domain.CreateDelegatedAuthorityParams
 	findDelegation      *domain.DelegatedAuthority // pre-revoke fetch result for RevokeDelegatedAuthority's ownership check
 	findDelegationErr   error
 	revokedDelegation   *domain.DelegatedAuthority
@@ -49,6 +53,20 @@ type stubStore struct {
 
 	sodRule    *domain.SoDRule
 	sodRuleErr error
+
+	// List* results, plus the filters each was called with, so a test can
+	// assert the handler forwarded the query params rather than only that a
+	// list came back.
+	listAssignments     []domain.PrincipalRoleAssignment
+	listAssignmentsErr  error
+	gotAssignTenant     string
+	gotAssignPrincipal  string
+	gotAssignRole       string
+	gotAssignActiveOnly bool
+
+	listSoDRules    []domain.SoDRule
+	listSoDRulesErr error
+	gotSoDTenant    string
 
 	rbacActions []string
 	rbacBasis   string
@@ -71,11 +89,38 @@ type stubStore struct {
 
 	ownObjectForbidden bool
 	ownObjectErr       error
+	// The tenant CheckOwnObjectSoD was called with. Recorded for the same
+	// reason grantedTenantArg is: the handler used to pass the raw BODY
+	// tenant to this one read while passing the resolved scope to every
+	// other, and the only way that is visible is from the argument.
+	ownObjectTenantArg string
+
+	// ABAC — layer 5. abacRules is what FindABACRules returns;
+	// abacActionArg / abacTenantArg record what it was asked for.
+	abacRules     []domain.ABACRule
+	abacErr       error
+	abacActionArg string
+	abacTenantArg string
+
+	abacRule          *domain.ABACRule
+	abacRuleErr       error
+	setABACActiveRule *domain.ABACRule
+	setABACActiveErr  error
+	setABACActiveWant []bool
+	listABACRules     []domain.ABACRule
+	listABACRulesErr  error
+	gotABACListTenant string
+	gotABACListAction string
+	gotCreateABACRule domain.CreateABACRuleParams
 
 	decision        *domain.AccessDecisionLog
 	recordErr       error
 	findDecision    *domain.AccessDecisionLog
 	findDecisionErr error
+	// The params RecordAccessDecision was called with — the decision artifact
+	// is the evidence, so what it records is worth asserting rather than
+	// assuming.
+	recordedParams domain.RecordAccessDecisionParams
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -98,7 +143,8 @@ func (s *stubStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleA
 func (s *stubStore) RevokeRoleAssignment(_ context.Context, _, _ string) (*domain.PrincipalRoleAssignment, error) {
 	return s.revokedAssign, s.revokeAssignErr
 }
-func (s *stubStore) CreateDelegatedAuthority(_ context.Context, _ domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error) {
+func (s *stubStore) CreateDelegatedAuthority(_ context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error) {
+	s.gotCreateDelegation = params
 	return s.delegation, s.delegationErr
 }
 func (s *stubStore) FindDelegatedAuthorityByID(_ context.Context, _, _ string) (*domain.DelegatedAuthority, error) {
@@ -107,6 +153,25 @@ func (s *stubStore) FindDelegatedAuthorityByID(_ context.Context, _, _ string) (
 func (s *stubStore) RevokeDelegatedAuthority(_ context.Context, _, _ string) (*domain.DelegatedAuthority, error) {
 	return s.revokedDelegation, s.revokeDelegationErr
 }
+func (s *stubStore) ListRoleAssignments(_ context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error) {
+	s.gotAssignTenant = tenantID
+	s.gotAssignPrincipal = principalID
+	s.gotAssignRole = roleID
+	s.gotAssignActiveOnly = activeOnly
+	if s.listAssignmentsErr != nil {
+		return nil, s.listAssignmentsErr
+	}
+	return s.listAssignments, nil
+}
+
+func (s *stubStore) ListSoDRules(_ context.Context, tenantID string) ([]domain.SoDRule, error) {
+	s.gotSoDTenant = tenantID
+	if s.listSoDRulesErr != nil {
+		return nil, s.listSoDRulesErr
+	}
+	return s.listSoDRules, nil
+}
+
 func (s *stubStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	return s.sodRule, s.sodRuleErr
 }
@@ -121,10 +186,38 @@ func (s *stubStore) FindDelegatedActions(_ context.Context, _, _, tenantID strin
 func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _, _ string) (string, bool, error) {
 	return s.sodConflictAction, s.sodHasConflict, s.sodErr
 }
-func (s *stubStore) CheckOwnObjectSoD(_ context.Context, _, _ string) (bool, error) {
+func (s *stubStore) CheckOwnObjectSoD(_ context.Context, _, tenantID string) (bool, error) {
+	s.ownObjectTenantArg = tenantID
 	return s.ownObjectForbidden, s.ownObjectErr
 }
-func (s *stubStore) RecordAccessDecision(_ context.Context, _ domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
+
+func (s *stubStore) FindABACRules(_ context.Context, actionType, tenantID string) ([]domain.ABACRule, error) {
+	s.abacActionArg = actionType
+	s.abacTenantArg = tenantID
+	return s.abacRules, s.abacErr
+}
+
+func (s *stubStore) CreateABACRule(_ context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error) {
+	s.gotCreateABACRule = params
+	return s.abacRule, s.abacRuleErr
+}
+
+func (s *stubStore) SetABACRuleActive(_ context.Context, _, _ string, active bool) (*domain.ABACRule, error) {
+	s.setABACActiveWant = append(s.setABACActiveWant, active)
+	return s.setABACActiveRule, s.setABACActiveErr
+}
+
+func (s *stubStore) ListABACRules(_ context.Context, tenantID, actionType string) ([]domain.ABACRule, error) {
+	s.gotABACListTenant = tenantID
+	s.gotABACListAction = actionType
+	if s.listABACRulesErr != nil {
+		return nil, s.listABACRulesErr
+	}
+	return s.listABACRules, nil
+}
+
+func (s *stubStore) RecordAccessDecision(_ context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
+	s.recordedParams = params
 	if s.decision != nil {
 		return s.decision, s.recordErr
 	}

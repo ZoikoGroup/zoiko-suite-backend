@@ -185,16 +185,40 @@ calendar belong here, there, or split — has to be settled before the entity
 is built. The other three §8.2 events (jurisdiction.rule.updated,
 jurisdiction.rule.activated, legal.drift.detected) are published.
 
-## Open: authorization scope for platform-wide reference data
+## Resolved: authorization scope for platform-wide reference data
 Jurisdiction data has no tenant_id and no owning legal entity, but
 authorization-svc's POST /v1/authorize rejects an empty legal_entity_id with
-400. jurisdiction-rules-svc therefore presents a single synthetic
+400. jurisdiction-rules-svc therefore presented a single synthetic
 platform-scope entity (AUTHZ_PLATFORM_SCOPE_ID) on every decision, and role
-assignments granting JURISDICTION_* / JURISDICTION_RULE_* actions must use
-that same id. This is a workaround for a missing concept: authorization-svc
-has no notion of a platform-scoped, non-entity resource. Any other
-platform-wide service will hit the same wall.
-seed-demo-rbac.ps1 does not grant these actions.
+assignments granting JURISDICTION_* / JURISDICTION_RULE_* actions had to use
+that same id. That was a workaround for a missing concept, and any other
+platform-wide service hit the same wall.
+
+authorization-svc now has the concept. POST /v1/authorize accepts
+legal_entity_id: "PLATFORM" (handler.PlatformScopeSentinel), which resolves to
+AUTHZ_PLATFORM_SCOPE_ENTITY_ID — the same id requirePlatformAction already
+authorizes that service's own platform-wide acts against. One id, configured in
+one place, instead of each caller inventing its own: jurisdiction-rules-svc
+carried AUTHZ_PLATFORM_SCOPE_ID, authorization-svc's own main.go hardcodes a
+DIFFERENT constant for its mTLS identity, and a grant seeded against one was
+invisible to a check made against the other — silently, and fail-closed, so it
+read as no_grant rather than as a mismatch.
+
+Deliberately a sentinel rather than accepting an empty legal_entity_id: an
+omitted field is far more often a caller bug than a platform-scope request, so
+omitting it still answers 400. A deployment with no
+AUTHZ_PLATFORM_SCOPE_ENTITY_ID answers 400 platform_scope_not_configured rather
+than inventing an id — and that variable was never set in docker-compose.yml,
+so on that stack every platform-wide act was refused and a platform-wide SoD
+rule could not be authored at all. It is now set to the
+00000000-0000-0000-0000-00000000f001 every calling service already carries.
+
+The existing AUTHZ_PLATFORM_SCOPE_ID callers are unaffected and need no change:
+they pass a real uuid, which is still evaluated exactly as before. Migrating
+one to the sentinel is worth doing only when its synthetic id turns out to
+disagree with the platform one.
+
+Still open: seed-demo-rbac.ps1 does not grant the JURISDICTION_* actions.
 
 ## Resolved: jurisdiction-rules-svc authorized nothing
 HTTPAuthZClient.Authorize was a TODO that logged a warning and returned nil,
@@ -1247,3 +1271,160 @@ Also still open for this service:
   and principal every other guarantee in the service rests on.
 - The lifecycle vocabulary divergence and `FailedProvisioning` remain as
   recorded above; nothing here renames an enum value.
+
+## Resolved: authorization-svc's delegated-access layer granted nothing
+POST /v1/authorize documents four evaluation layers, and the second —
+delegated access — resolved an empty action set on every request, on every
+deployment where row security actually binds. PgStore.FindDelegatedActions read
+delegated_authorities on the bare pool, outside both withRLS and
+withPlatformScope, while migration 000006 had given that table a policy with no
+app.platform_scope hatch. A connection that installs neither setting matches no
+rows: current_setting returns NULL, the policy's NULLIF of it is NULL, and
+tenant_id = NULL is NULL, never true.
+
+It failed CLOSED, which is why nothing surfaced: a delegate was denied with
+basis no_grant, indistinguishable from having no delegation at all. Measured on
+PostgreSQL 16.15 as a NOSUPERUSER NOBYPASSRLS role with one ACTIVE, in-date,
+correctly-tenanted delegation present — 0 rows with neither setting, 1 with
+app.tenant_id installed, 0 with platform scope alone.
+
+Two independent fixes, each proven load-bearing by removing it and watching one
+specific subtest fail: routing the query through withRLS/withPlatformScope
+fixes the tenant-supplied path, and migration 000008's platform-scope hatch
+(USING only, never WITH CHECK) fixes the tenantless path. 000006's stated
+reason for omitting the hatch, that "FindDelegatedActions is reached from
+/v1/authorize which resolves one", was simply false.
+
+Which of the two is load-bearing today, stated exactly: the canonical
+input-contract middleware defaults to write-strict and treats tenant_id as
+unconditionally mandatory, so a tenantless POST /v1/authorize is refused 401
+before the handler runs. The routing fix is therefore the one that restores
+delegated access for callers that get through. The hatch covers observe mode —
+a documented migration state in which the branch is reachable — and keeps the
+store's documented "an empty tenant evaluates across tenants" contract from
+being silently false, which is how this defect survived review in the first
+place.
+
+Worth generalising, because this is the second time it has bitten this platform
+(obligations-svc had nine pool-direct queries): a store method that reaches
+s.pool instead of the tenant-scoped helper is not a style problem on a table
+with FORCE ROW LEVEL SECURITY. It returns zero rows, and whether that reads as
+an outage or as a silent absence of permission depends entirely on what the
+caller does with an empty result. Here it read as "correctly denied".
+
+And the reason no test caught it: the store suite connected only as the
+migration user, which on the local stack is a superuser, and a superuser
+bypasses row security unconditionally. Every isolation assertion in that suite
+was vacuous. internal/store/rls_delegation_test.go now runs through a
+purpose-created ordinary role and asserts its own non-superuser status before
+asserting anything else, so a misconfigured instance fails loudly rather than
+passing for the wrong reason.
+
+## Open: /v1/authorize refuses most of its callers on the canonical input contract
+Found while verifying the delegation fix end-to-end, and pre-existing rather
+than caused by it.
+
+authorization-svc mounts the canonical input-contract middleware ahead of every
+route. ZS_ENVELOPE_ENFORCEMENT defaults to write-strict and nothing in
+deployments/ sets it, so POST /v1/authorize counts as a material state change
+and requires X-Tenant-Id, X-Principal-Id, X-Legal-Entity-Id, X-Request-Id,
+X-Source-Channel and Idempotency-Key. tenant_id and actor_subject_id are
+unconditionally mandatory and deliberately not expressible per service — Policy
+covers only the conditional §4 fields.
+
+Measured against the running container, sending exactly what each client sends:
+
+  obligations-svc's authz client        (Content-Type, X-Correlation-ID)  401
+  jurisdiction-rules-svc's authz client (Content-Type)                    401
+  policy-svc's authz client             (full envelope)                   200
+
+A sweep of every non-test Go file that builds a request to /v1/authorize gives
+22 conformant clients and 75 that are not. Those clients fail closed on a
+non-200 — which was the right fix when it was made — so the visible effect is
+that the writes they guard are denied, and the reason reported is an
+authorization failure rather than a missing header.
+
+Two candidate fixes, both decisions rather than cleanups:
+
+  * Relax authorization-svc's own ServicePolicy: a MaterialWrite override so
+    /v1/authorize is not classed as a material write, which is the case
+    Policy.MaterialWrite's own doc comment describes ("a search or evaluate
+    endpoint"). Against it: this endpoint does write the decision artifact, and
+    relaxing a control on the platform's authorization path is a contract
+    decision.
+  * Migrate the 75 clients. Doctrinally correct, and 75 services of edits.
+
+Checked, and the answer is no, on three independent grounds.
+
+  1. Service-to-service authz calls never traverse the gateway. All 99
+     AUTHZ_SERVICE_URL values in deployments/ dial authorization-svc:8089 (or
+     :80) directly. The gateway-auth ForwardAuth middleware is attached to
+     Traefik routers — north-south browser traffic — not to east-west service
+     calls.
+  2. Even on the gateway path it would cover only 4 of the 6 fields. The
+     middleware's authResponseHeaders lists X-Principal-Id, X-Tenant-Id,
+     X-Legal-Entity-Id, X-Correlation-Id, X-Jurisdiction-Context, X-Timezone,
+     X-Residency-Policy-Id and X-Tenant-Context-Stale. X-Request-Id,
+     X-Source-Channel and Idempotency-Key are absent, and gateway-auth-svc's
+     /verify sets none of them — those three come from the original client,
+     which is the console. A service calling another service has no such
+     origin.
+  3. The local Traefik config carries no auth middleware at all.
+     traefik-dynamic/all-services.yml gives svc-authorization-svc only a
+     stripPrefix, and says so itself: "LOCAL DEVELOPMENT ONLY. These routes
+     carry NO gateway-auth middleware, so every service is reachable
+     unauthenticated through this port."
+
+So the 401s are real and nothing upstream fills the gap. The choice between the
+two fixes above is unchanged by the investigation.
+
+Related, and the reason this was found: the tenantless branch of
+resolveTenantScope, the store's `$3 = ''` fallbacks and migration 000008's
+platform-scope hatch all exist for callers that reach the handler without a
+tenant. While this middleware is at write-strict, no such caller reaches the
+handler over HTTP. Those paths are not dead — observe mode reaches them, and
+the store documents the contract — but they are not the live path, and the
+comments that said otherwise have been corrected.
+
+## Resolved: /v1/authorize paid 850ms per denial for a SIEM service that was absent
+Found while trying to reproduce a 1.07s authorize call that had been attributed
+to missing caching and a synchronous decision-log insert. It was neither.
+
+internal/siem's package comment promised the streaming was "deliberately
+fire-and-forget ... a slow or unreachable siem-integration-svc must never delay
+or fail the request that triggered the security event". Stream did the exporter
+lookup and the POSTs inline, on the caller's goroutine, on the caller's request
+context, with a 2s HTTP timeout. authorization-svc calls it on every DENIED
+decision.
+
+And the absent service is the compose default: docker-compose.yml sets
+SIEM_SERVICE_URL to siem-integration-svc, which lives in
+docker-compose.phase6.yml, so any stack without phase6 up paid it on every
+denial. Measured on POST /v1/authorize returning DENIED, n=8 sequential,
+everything else held constant:
+
+  SIEM_SERVICE_URL empty (streaming off)                  median  11 ms
+  SIEM_SERVICE_URL set, service not running (the default)  median 850 ms
+  after the fix, service still not running                 median  12 ms
+
+Stream now enqueues onto a bounded queue and returns. Four workers deliver on
+their own goroutines with their own background context — not the request
+context, which is cancelled as the response is written and would cancel every
+event. A full queue drops and counts the drop rather than blocking or growing
+without limit: an unbounded queue turns a SIEM outage into the service's memory
+problem, and blocking is the behaviour being removed. Close drains on shutdown
+so a SIGTERM does not discard an accepted event.
+
+The general lesson, because this platform has the shape in several places: a
+package comment asserting a property is not the property. This one said
+"fire-and-forget" and was called synchronously; delegated_authorities' policy
+comment said "nothing needs to discover which tenant owns an unknown
+delegation_id" and something did; FindDelegatedActions documented an empty
+tenant as evaluating across tenants and it returned nothing. In all three cases
+the comment was the thing that stopped anyone looking.
+
+Worth checking, NOT done here: four other services vendor a copy of this
+internal/siem client — gateway-auth-svc, identity-context-svc,
+key-management-svc, mtls-management-svc (the five listed in the item-84d
+writeup). The inline shape is presumably identical in each. Only
+authorization-svc's copy was changed.

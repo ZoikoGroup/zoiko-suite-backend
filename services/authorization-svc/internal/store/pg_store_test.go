@@ -28,7 +28,29 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	// access_decision_log is PARTITIONED since 000009, so its partitions must
+	// go too — DROP TABLE on the parent takes them, but a partition left over
+	// from a previous run under a different name would collide with the
+	// migration's CREATE. The two helper functions and the view are dropped
+	// for the same reason: 000009 creates them, and CREATE OR REPLACE FUNCTION
+	// cannot change a function's return type, so a stale definition from an
+	// earlier schema version fails the migration rather than being replaced.
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP VIEW IF EXISTS access_decision_log_retention_status;")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS detach_access_decision_log_partitions_before(DATE);")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS create_access_decision_log_partition(DATE);")
+	// Detached partitions are no longer children of the parent, so DROP TABLE
+	// on it does not reach them.
+	_, _ = pool.Exec(ctx, `DO $$
+		DECLARE t text;
+		BEGIN
+			FOR t IN SELECT tablename FROM pg_tables
+			          WHERE schemaname = current_schema()
+			            AND tablename LIKE 'access_decision_log%'
+			LOOP
+				EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', t);
+			END LOOP;
+		END $$;`)
 
 	// Every up migration, in order. This was five copy-pasted blocks naming
 	// four files, and 000005 was never added when it landed — so
@@ -42,6 +64,14 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000004_add_rls.up.sql",
 		"000005_add_access_decision_tenant.up.sql",
 		"000006_add_delegation_tenant.up.sql",
+		// 000007 was landed but never added here, so every test in this file
+		// ran against a schema where permission_bundles and
+		// principal_role_assignments had no row security at all — which is
+		// most of what the RLS tests below are about.
+		"000007_add_rls_bundles_assignments.up.sql",
+		"000008_fix_delegation_evaluation.up.sql",
+		"000009_partition_access_decision_log.up.sql",
+		"000010_add_abac_rules.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + name)
 		if err != nil {

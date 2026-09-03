@@ -86,6 +86,30 @@ type DelegatedAuthority struct {
 	AuthorityLimitType  *string `json:"authority_limit_type"`
 	AuthorityLimitValue *string `json:"authority_limit_value"`
 
+	// DelegatedActions is the subset of the delegator's authority this
+	// delegation confers. Nil means the delegator's FULL authority, which is
+	// what every row written before migration 000008 means.
+	//
+	// It exists because ScopeType has always accepted "ACTION_SUBSET" and
+	// nothing ever read it: a delegation recorded as a subset conferred the
+	// delegator's entire grant set anyway. The subset is intersected with the
+	// delegator's LIVE grants at evaluation time, so a delegation can never
+	// confer an action the delegator does not currently hold — see
+	// Store.FindDelegatedActions.
+	DelegatedActions []string `json:"delegated_actions,omitempty"`
+
+	// SourceService and SourceDelegationID are set only on a row PROJECTED
+	// from the authoritative Delegated Authority Service's authority.*
+	// events. Both nil means the delegation was authored through this
+	// service's own admin API.
+	//
+	// Doc 03 §9.3 names delegated-authority-svc as the owner of the concept
+	// (tracker item 81), and this is how the two stop being rival write
+	// models: that service remains authoritative, and this table is the
+	// evaluation read-model /v1/authorize resolves against.
+	SourceService      *string `json:"source_service,omitempty"`
+	SourceDelegationID *string `json:"source_delegation_id,omitempty"`
+
 	EffectiveFrom time.Time  `json:"effective_from"`
 	EffectiveTo   *time.Time `json:"effective_to"`
 
@@ -93,6 +117,108 @@ type DelegatedAuthority struct {
 	RevocationStatus string `json:"revocation_status"`
 
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// ── ABAC ─────────────────────────────────────────────────────────────────────
+
+// ABACRule is one declared attribute condition guarding one action —
+// evaluated as layer 5 of /v1/authorize, after RBAC, delegation, static SoD
+// and own-object SoD have all already granted.
+//
+// DENY-ONLY. A rule can remove an action the earlier layers granted; it can
+// never add one. That is what keeps the layers composable (RBAC answers "does
+// the principal hold this", ABAC answers "may it be exercised here, now,
+// against this") and it keeps a malformed rule narrowing access rather than
+// widening it.
+//
+// The TABLE ships empty. Every concrete rule — which attribute, which
+// threshold, which action — is a business decision this service has no
+// standing to invent, so with no rows this layer is a no-op and /v1/authorize
+// behaves exactly as it did before it existed. What is implemented here is the
+// mechanism the spec assigns this service, not a guess at the policy.
+type ABACRule struct {
+	ABACRuleID string `json:"abac_rule_id"`
+
+	// TenantID is nil for a rule that applies across every tenant — same
+	// convention as SoDRule.TenantID.
+	TenantID *string `json:"tenant_id"`
+
+	// RuleCode is the stable identifier DecisionBasis names on a denial, so
+	// the rule that caused it is findable from the log.
+	RuleCode string `json:"rule_code"`
+
+	// ActionType is the action this condition guards.
+	ActionType string `json:"action_type"`
+
+	// Effect is EffectRequire or EffectForbid — data only.
+	Effect string `json:"effect"`
+
+	// AttributeKey names the attribute the calling service sends in
+	// /v1/authorize's `attributes` map.
+	AttributeKey string `json:"attribute_key"`
+
+	// Operator is data only; the evaluator implements the set named by
+	// ABACOperators and refuses an unrecognised one at creation.
+	Operator string `json:"operator"`
+
+	// AttributeValue is the comparison operand, nil for the operators that
+	// take none (exists / not_exists).
+	AttributeValue *string `json:"attribute_value"`
+
+	ActiveFlag           bool      `json:"active_flag"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// The two ABAC effects.
+//
+//	EffectRequire — the condition MUST hold, or the action is denied. An
+//	                attribute the caller did not send therefore DENIES: a
+//	                required condition that cannot be evaluated has not been
+//	                satisfied, and treating absence as a pass would let any
+//	                caller bypass a rule by omitting a JSON field.
+//	EffectForbid  — the condition must NOT hold, or the action is denied. An
+//	                absent attribute here PASSES, because a condition that
+//	                cannot be met cannot be violated.
+const (
+	EffectRequire = "REQUIRE"
+	EffectForbid  = "FORBID"
+)
+
+// ABACOperators is the set of comparison operators the evaluator implements.
+//
+// The column is VARCHAR and operators are data, same doctrine as
+// role_scope_type and conflict_type — but unlike those, an operator has to be
+// executed by code, so one the evaluator does not implement is refused when
+// the rule is CREATED rather than discovered when a request is denied by it.
+// The value is the number of operands the operator takes: 0 for the presence
+// checks, 1 for everything else.
+var ABACOperators = map[string]int{
+	"eq":         1,
+	"ne":         1,
+	"in":         1,
+	"not_in":     1,
+	"lt":         1,
+	"lte":        1,
+	"gt":         1,
+	"gte":        1,
+	"contains":   1,
+	"exists":     0,
+	"not_exists": 0,
+}
+
+type CreateABACRuleParams struct {
+	ABACRuleID string
+	// TenantID is nil for a platform-wide rule, which the handler gates
+	// behind the platform-scope grant.
+	TenantID             *string
+	RuleCode             string
+	ActionType           string
+	Effect               string
+	AttributeKey         string
+	Operator             string
+	AttributeValue       *string
+	CreatedByPrincipalID string
 }
 
 // SoDRule expresses a Separation-of-Duties conflict: a principal holding a
@@ -207,8 +333,39 @@ type CreateDelegatedAuthorityParams struct {
 	LegalEntityID       *string
 	AuthorityLimitType  *string
 	AuthorityLimitValue *string
-	EffectiveFrom       time.Time
-	EffectiveTo         *time.Time
+	// DelegatedActions is the subset conferred. Nil means the delegator's
+	// full authority — see DelegatedAuthority.DelegatedActions.
+	DelegatedActions []string
+	EffectiveFrom    time.Time
+	EffectiveTo      *time.Time
+
+	// SourceService / SourceDelegationID identify the upstream record when
+	// this row is projected from delegated-authority-svc's events rather
+	// than authored here. Both empty for a locally-authored delegation.
+	SourceService      string
+	SourceDelegationID string
+}
+
+// ProjectDelegationParams is the write shape used by the authority.* event
+// consumer. Distinct from CreateDelegatedAuthorityParams because a projection
+// is an UPSERT keyed on the UPSTREAM id — the broker redelivers, and a
+// consumer that inserted on every delivery would multiply one delegation into
+// several rows that /v1/authorize would then union.
+type ProjectDelegationParams struct {
+	SourceService        string
+	SourceDelegationID   string
+	TenantID             string
+	DelegatorPrincipalID string
+	DelegatePrincipalID  string
+	// LegalEntityID is nil for a tenant-wide delegation.
+	LegalEntityID *string
+	// DelegatedActions is the action set the upstream event named. Upstream
+	// delegates ONE action per grant, so this normally holds exactly one —
+	// which is precisely the subset case that had no representation in this
+	// table before 000008.
+	DelegatedActions []string
+	EffectiveFrom    time.Time
+	EffectiveTo      *time.Time
 }
 
 type CreateSoDRuleParams struct {
@@ -269,6 +426,32 @@ var ErrDelegatedAuthorityNotFound = errorString("delegated authority not found")
 // requireTenant, not the primary check.
 var ErrTenantScopeRequired = errorString("delegation operations require a verified tenant scope")
 var ErrAccessDecisionNotFound = errorString("access decision not found")
+
+// ErrProjectionSourceRequired means a projection write arrived without the
+// upstream (service, id) pair it is keyed on. Such a row could not be
+// deduplicated on redelivery or revoked by a later event, so it is refused
+// rather than written — see Store.ProjectDelegation.
+var ErrProjectionSourceRequired = errorString("projected delegation requires source_service and source_delegation_id")
+
+// ErrABACRuleNotFound means no abac_rules row with that id exists in the
+// caller's tenant scope.
+var ErrABACRuleNotFound = errorString("abac rule not found")
+
+// ErrUnsupportedABACOperator means the rule named an operator the evaluator
+// does not implement. Refused at creation (400) rather than discovered when a
+// request is denied by a rule nobody can evaluate — see ABACOperators.
+var ErrUnsupportedABACOperator = errorString("unsupported abac operator")
+
+// ErrABACOperandRequired means a comparison operator was given no operand to
+// compare against. Under REQUIRE such a rule denies every request for the
+// action; under FORBID it permits every one. Both are silent, so the rule is
+// refused rather than stored.
+var ErrABACOperandRequired = errorString("this abac operator requires attribute_value")
+
+// ErrUnsupportedABACEffect means the rule named neither REQUIRE nor FORBID.
+// There is no third, safe interpretation of an unknown effect on a deny-only
+// layer, so it is refused at creation.
+var ErrUnsupportedABACEffect = errorString("unsupported abac effect: expected REQUIRE or FORBID")
 var ErrInvalidTransition = errorString("invalid revocation status transition")
 var ErrConflict = errorString("conflict: record already exists with differing attributes")
 var ErrStoreUnavailable = errorString("authorization store unavailable")

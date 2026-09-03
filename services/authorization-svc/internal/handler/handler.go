@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/authorization-svc/internal/abac"
 	"zoiko.io/authorization-svc/internal/domain"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
 	"zoiko.io/authorization-svc/internal/siem"
@@ -24,10 +26,21 @@ type AuthorizationStore interface {
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
+	ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error)
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
 	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
+	ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error)
+
+	// ABAC — the attribute-condition layer. CreateABACRule/SetABACRuleActive/
+	// ListABACRules are the admin surface; FindABACRules is the evaluation
+	// read, called on the /v1/authorize path.
+	CreateABACRule(ctx context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error)
+	SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error)
+	ListABACRules(ctx context.Context, tenantID, actionType string) ([]domain.ABACRule, error)
+	FindABACRules(ctx context.Context, actionType, tenantID string) ([]domain.ABACRule, error)
+
 	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 	FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
@@ -83,10 +96,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/roles/{role_id}/reactivate", h.ReactivateRole)
 	r.Post("/v1/admin/roles/{role_id}/permission-bundles", h.CreatePermissionBundle)
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
+	r.Get("/v1/admin/role-assignments", h.ListRoleAssignments)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
 	r.Post("/v1/admin/delegated-authorities", h.CreateDelegatedAuthority)
 	r.Post("/v1/admin/delegated-authorities/{delegation_id}/revoke", h.RevokeDelegatedAuthority)
 	r.Post("/v1/admin/sod-rules", h.CreateSoDRule)
+	r.Get("/v1/admin/sod-rules", h.ListSoDRules)
+	r.Post("/v1/admin/abac-rules", h.CreateABACRule)
+	r.Get("/v1/admin/abac-rules", h.ListABACRules)
+	r.Post("/v1/admin/abac-rules/{abac_rule_id}/retire", h.RetireABACRule)
+	r.Post("/v1/admin/abac-rules/{abac_rule_id}/reactivate", h.ReactivateABACRule)
 
 	r.Post("/v1/authorize", h.Authorize)
 	r.Get("/v1/access-decisions/{access_decision_id}", h.GetAccessDecision)
@@ -612,12 +631,29 @@ type createDelegationRequest struct {
 	ScopeType            string `json:"scope_type"`
 	// LegalEntityID is optional: omit it for a delegation that applies
 	// across the whole tenant rather than one entity.
-	LegalEntityID       string     `json:"legal_entity_id,omitempty"`
-	AuthorityLimitType  *string    `json:"authority_limit_type,omitempty"`
-	AuthorityLimitValue *string    `json:"authority_limit_value,omitempty"`
-	EffectiveFrom       time.Time  `json:"effective_from"`
-	EffectiveTo         *time.Time `json:"effective_to,omitempty"`
+	LegalEntityID       string  `json:"legal_entity_id,omitempty"`
+	AuthorityLimitType  *string `json:"authority_limit_type,omitempty"`
+	AuthorityLimitValue *string `json:"authority_limit_value,omitempty"`
+	// DelegatedActions is the subset of the delegator's authority to confer.
+	// Omit it — or send an empty array — for the delegator's FULL authority,
+	// which is what every delegation created before this field existed means.
+	//
+	// Required when ScopeType is ACTION_SUBSET: that value has always been
+	// accepted and, until migration 000008, nothing ever read it, so a
+	// delegation recorded as a subset conferred the delegator's entire grant
+	// set. Accepting ACTION_SUBSET with no subset would recreate exactly that
+	// — a row that reads as restricted in the register and is not — so it is
+	// refused. See missingField.
+	DelegatedActions []string   `json:"delegated_actions,omitempty"`
+	EffectiveFrom    time.Time  `json:"effective_from"`
+	EffectiveTo      *time.Time `json:"effective_to,omitempty"`
 }
+
+// ScopeTypeActionSubset is the scope_type value that declares a delegation to
+// confer only part of the delegator's authority. Data, like every other
+// scope_type value — but this one the evaluation reads, so the handler checks
+// that a delegation claiming it actually names its subset.
+const ScopeTypeActionSubset = "ACTION_SUBSET"
 
 func (req createDelegationRequest) missingField() string {
 	switch {
@@ -627,6 +663,8 @@ func (req createDelegationRequest) missingField() string {
 		return "delegate_principal_id"
 	case req.ScopeType == "":
 		return "scope_type"
+	case req.ScopeType == ScopeTypeActionSubset && len(req.DelegatedActions) == 0:
+		return "delegated_actions"
 	case req.EffectiveFrom.IsZero():
 		return "effective_from"
 	default:
@@ -636,7 +674,19 @@ func (req createDelegationRequest) missingField() string {
 
 // CreateDelegatedAuthority handles POST /v1/admin/delegated-authorities.
 //
-// Response: 201 created / 400 missing field / 503 unavailable.
+// delegated_actions names the subset of the delegator's authority to confer;
+// omitting it confers all of it. A scope_type of ACTION_SUBSET without one is
+// refused rather than quietly stored as full authority — that combination is
+// exactly what shipped before migration 000008 and it read as restricted in
+// the register while conferring everything.
+//
+// The subset is a CEILING, not a grant: it is intersected with the delegator's
+// live grants at evaluation time, so naming an action the delegator does not
+// hold confers nothing. That is checked in the query rather than here, because
+// what the delegator holds can change after the delegation is written.
+//
+// Response: 201 created / 400 missing field / 401 missing principal or tenant
+// scope / 403 delegator is not the caller / 503 unavailable.
 func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -689,7 +739,8 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 		DelegatedAuthorityID: req.DelegatedAuthorityID, DelegatorPrincipalID: req.DelegatorPrincipalID,
 		DelegatePrincipalID: req.DelegatePrincipalID, ScopeType: req.ScopeType, LegalEntityID: legalEntityID,
 		AuthorityLimitType: req.AuthorityLimitType, AuthorityLimitValue: req.AuthorityLimitValue,
-		EffectiveFrom: req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
+		DelegatedActions: req.DelegatedActions,
+		EffectiveFrom:    req.EffectiveFrom, EffectiveTo: req.EffectiveTo,
 	})
 	if err != nil {
 		h.log.Error("CreateDelegatedAuthority: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
@@ -874,6 +925,268 @@ func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, rule)
 }
 
+// ── /v1/admin/abac-rules ─────────────────────────────────────────────────────
+
+// ActionABACRuleManageGlobal is the action a principal must hold, against the
+// platform-scope legal entity, to author an attribute condition that applies
+// to every tenant. Exactly the same posture as ActionSoDRuleManageGlobal, and
+// for exactly the same reason: a platform-wide rule on a deny-only layer can
+// deny an action for every principal on the estate, so authoring one is a
+// distinct grant rather than a side effect of omitting tenant_id.
+const ActionABACRuleManageGlobal = "ABAC_RULE_MANAGE_GLOBAL"
+
+type createABACRuleRequest struct {
+	RuleCode       string  `json:"rule_code"`
+	ActionType     string  `json:"action_type"`
+	Effect         string  `json:"effect"`
+	AttributeKey   string  `json:"attribute_key"`
+	Operator       string  `json:"operator"`
+	AttributeValue *string `json:"attribute_value,omitempty"`
+	// TenantID is optional — omit for a rule that applies across every
+	// tenant, matching sod_rules' convention. Omitting it requires
+	// ActionABACRuleManageGlobal at platform scope.
+	TenantID *string `json:"tenant_id,omitempty"`
+}
+
+func (req createABACRuleRequest) missingField() string {
+	switch {
+	case req.RuleCode == "":
+		return "rule_code"
+	case req.ActionType == "":
+		return "action_type"
+	case req.Effect == "":
+		return "effect"
+	case req.AttributeKey == "":
+		return "attribute_key"
+	case req.Operator == "":
+		return "operator"
+	default:
+		return ""
+	}
+}
+
+// CreateABACRule handles POST /v1/admin/abac-rules — declare one attribute
+// condition guarding one action.
+//
+// This is the surface that makes the ABAC layer real without this service
+// inventing a policy: the engine is in internal/abac, and every rule it
+// evaluates arrives through here from somebody who knows the business. The
+// table ships empty, so until this route is used /v1/authorize behaves exactly
+// as it did before the layer existed.
+//
+// effect and operator are validated against the sets the evaluator actually
+// implements, and refused with 400 naming the supported values. An operator
+// the evaluator cannot execute would deny the action for everybody holding it
+// — a 400 at authoring time is very much cheaper than discovering that from a
+// decision log.
+//
+// Response: 201 created / 400 missing or unsupported field / 401 missing
+// principal or tenant scope / 403 foreign tenant, or not authorized for a
+// platform-wide rule / 409 rule_code already used in this scope /
+// 503 unavailable.
+func (h *Handler) CreateABACRule(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	var req createABACRuleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+	if missing := req.missingField(); missing != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
+		return
+	}
+
+	if req.Effect != domain.EffectRequire && req.Effect != domain.EffectForbid {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":     "unsupported_effect",
+			"field":     "effect",
+			"supported": domain.EffectRequire + "," + domain.EffectForbid,
+		})
+		return
+	}
+	operands, known := domain.ABACOperators[req.Operator]
+	if !known {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":     "unsupported_operator",
+			"field":     "operator",
+			"supported": supportedOperators(),
+		})
+		return
+	}
+	if operands == 1 && (req.AttributeValue == nil || *req.AttributeValue == "") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "missing_field",
+			"field":   "attribute_value",
+			"message": "operator " + req.Operator + " compares against a value; only exists/not_exists take none",
+		})
+		return
+	}
+
+	// A tenant scope is required to reach this route at all, whether or not the
+	// body names one — the same reasoning CreateSoDRule carries. Without it, a
+	// request holding nothing but a principal header could store a rule with
+	// tenant_id NULL that denies an action for every tenant on the platform.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if req.TenantID != nil && *req.TenantID != "" {
+		if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
+			return
+		}
+	} else {
+		if !h.requirePlatformAction(w, r, principalID, ActionABACRuleManageGlobal) {
+			return
+		}
+	}
+
+	rule, err := h.store.CreateABACRule(r.Context(), domain.CreateABACRuleParams{
+		TenantID:             req.TenantID,
+		RuleCode:             req.RuleCode,
+		ActionType:           req.ActionType,
+		Effect:               req.Effect,
+		AttributeKey:         req.AttributeKey,
+		Operator:             req.Operator,
+		AttributeValue:       req.AttributeValue,
+		CreatedByPrincipalID: principalID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrConflict):
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "abac_rule_code_conflict", "rule_code": req.RuleCode})
+		case errors.Is(err, domain.ErrUnsupportedABACEffect), errors.Is(err, domain.ErrUnsupportedABACOperator), errors.Is(err, domain.ErrABACOperandRequired):
+			// Reachable only if the store's validation is stricter than the
+			// handler's, which would be a defect in one of them; reported as
+			// 400 rather than 503 because it is the request that is wrong.
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_abac_rule", "message": err.Error()})
+		default:
+			h.log.Error("CreateABACRule: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	h.log.Info("abac rule created",
+		zap.String("abac_rule_id", rule.ABACRuleID),
+		zap.String("rule_code", rule.RuleCode),
+		zap.String("action_type", rule.ActionType),
+		zap.String("effect", rule.Effect),
+		zap.Bool("platform_wide", rule.TenantID == nil),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusCreated, rule)
+}
+
+// ListABACRules handles GET /v1/admin/abac-rules — read the attribute
+// conditions that will deny requests in this tenant.
+//
+// Returns the tenant's own rules AND the platform-wide ones (tenant_id NULL),
+// on the same reasoning as ListSoDRules: the platform-wide ones deny just as
+// hard and cannot be edited from the tenant, so hiding them would make a
+// denial unexplainable from the console.
+//
+// Optional action_type query param narrows the list.
+//
+// Response: 200 the rules (possibly empty) / 401 missing principal or tenant
+// scope / 503 unavailable.
+func (h *Handler) ListABACRules(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	rules, err := h.store.ListABACRules(r.Context(), tenantScope, strings.TrimSpace(r.URL.Query().Get("action_type")))
+	if err != nil {
+		h.log.Error("ListABACRules: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if rules == nil {
+		rules = []domain.ABACRule{}
+	}
+	writeJSON(w, http.StatusOK, rules)
+}
+
+// RetireABACRule handles POST /v1/admin/abac-rules/{abac_rule_id}/retire.
+//
+// Retiring is how a rule stops denying: active_flag is in FindABACRules'
+// predicate, so the next evaluation ignores it. The row stays, because a
+// decision the rule already caused has to remain explainable.
+//
+// Idempotent — retiring an already-retired rule is 200, not 409. The caller
+// asked for a state and that state holds.
+//
+// Response: 200 retired / 401 missing principal or tenant scope / 404 not
+// found or owned by another scope / 503 unavailable.
+func (h *Handler) RetireABACRule(w http.ResponseWriter, r *http.Request) {
+	h.setABACRuleActive(w, r, false)
+}
+
+// ReactivateABACRule handles POST /v1/admin/abac-rules/{abac_rule_id}/reactivate.
+// Restores exactly the denials the retirement suspended. Response shape
+// matches RetireABACRule.
+func (h *Handler) ReactivateABACRule(w http.ResponseWriter, r *http.Request) {
+	h.setABACRuleActive(w, r, true)
+}
+
+func (h *Handler) setABACRuleActive(w http.ResponseWriter, r *http.Request, active bool) {
+	abacRuleID := chi.URLParam(r, "abac_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	// The store's predicate is `tenant_id = $3` with no IS NULL branch, so a
+	// PLATFORM-WIDE rule answers 404 here rather than being retired from one
+	// tenant's console. That is deliberate and is the point: a rule binding
+	// every tenant must not be disableable by any one of them.
+	rule, err := h.store.SetABACRuleActive(r.Context(), abacRuleID, tenantScope, active)
+	if err != nil {
+		if errors.Is(err, domain.ErrABACRuleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "abac_rule_not_found"})
+			return
+		}
+		h.log.Error("setABACRuleActive: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	h.log.Info("abac rule active flag set",
+		zap.String("abac_rule_id", rule.ABACRuleID),
+		zap.String("rule_code", rule.RuleCode),
+		zap.Bool("active", rule.ActiveFlag),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, rule)
+}
+
+// supportedOperators renders domain.ABACOperators for a 400 body, sorted so
+// the message is stable rather than in Go's randomised map order.
+func supportedOperators() string {
+	ops := make([]string, 0, len(domain.ABACOperators))
+	for op := range domain.ABACOperators {
+		ops = append(ops, op)
+	}
+	sort.Strings(ops)
+	return strings.Join(ops, ",")
+}
+
 // ── POST /v1/authorize ────────────────────────────────────────────────────────
 
 type authorizeRequest struct {
@@ -893,7 +1206,50 @@ type authorizeRequest struct {
 	// nothing to evaluate against. Omitting it preserves today's
 	// behavior: no own-object check is attempted.
 	ResourceOwnerPrincipalID string `json:"resource_owner_principal_id,omitempty"`
+
+	// Attributes are the request/resource attributes the ABAC layer evaluates
+	// declared conditions against — an amount, a channel, a classification,
+	// whatever the rules in abac_rules name. Supplied by the calling service,
+	// which is the only party that knows them.
+	//
+	// Omitting it is the normal case and changes nothing unless a REQUIRE rule
+	// exists for the action: an attribute a rule requires and the caller did
+	// not send is a denial, because a required condition that cannot be
+	// evaluated has not been satisfied. See domain.EffectRequire.
+	//
+	// Values are strings even when they represent numbers. The comparison
+	// operators parse both sides numerically when they can (see
+	// internal/abac.compare), so "10000" orders as a number, and a caller does
+	// not have to know which of its attributes a rule will treat as ordered.
+	Attributes map[string]string `json:"attributes,omitempty"`
 }
+
+// PlatformScopeSentinel is the legal_entity_id a caller sends to have a
+// PLATFORM-WIDE act evaluated — one with no owning legal entity at all.
+//
+// WHY THIS EXISTS. legal_entity_id is required, and every scope this service
+// evaluates is a legal entity, so a caller authorizing something that belongs
+// to the platform rather than to an entity had nowhere to put it. Tracker item
+// 67: "authorization-svc has no platform-scoped, non-entity resource concept —
+// services fake a synthetic legal_entity_id as a workaround." They do, and
+// each one picks its own: jurisdiction-rules-svc carries
+// AUTHZ_PLATFORM_SCOPE_ID, this service's own main.go hardcodes a different
+// constant for its mTLS identity, and a grant seeded against one of those is
+// invisible to a check made against the other. Silent, and fail-closed, so it
+// reads as "no grant" rather than as a mismatch.
+//
+// A SENTINEL rather than accepting an empty legal_entity_id, deliberately. An
+// omitted field is far more often a bug in the caller than a platform-scope
+// request, and quietly promoting it to platform scope would turn that bug into
+// an evaluation against the wrong scope. Omitting the field still answers 400.
+// Naming the sentinel is an explicit statement of intent.
+//
+// It resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID, so the platform scope is ONE
+// id configured in one place — the same id requirePlatformAction already
+// authorizes this service's own platform-wide acts against. An unset config
+// refuses these requests rather than inventing an id, which is the same
+// fail-closed direction requirePlatformAction takes.
+const PlatformScopeSentinel = "PLATFORM"
 
 type authorizeResponse struct {
 	DecisionOutcome  string `json:"decision_outcome"`
@@ -918,25 +1274,36 @@ type authorizeResponse struct {
 //     one action against one object's ownership, not a pair of actions
 //     held simultaneously — so it needs its own store query
 //     (CheckOwnObjectSoD) rather than reusing CheckSoDConflict.
+//  5. ABAC — if still granted, do the attribute conditions declared for
+//     this action in abac_rules hold for the attributes the caller sent?
+//     Deny-only: a rule removes an action the earlier layers conferred and
+//     can never add one. See internal/abac for the engine and
+//     domain.ABACRule for the semantics. abac_rules ships EMPTY, so this
+//     layer changes no outcome until somebody declares a rule.
+//
+// Layers 1 and 2 are cached (internal/cache); 3, 4 and 5 are cached too.
+// The DECISION is not, and neither is the artifact — see below.
 //
 // Every evaluation — grant or deny — is written to access_decision_log
 // before the response is returned (critical constraint: no material action
-// without a decision artifact). On any internal error, the result is a
-// denial, never a silent allow (fail-closed) — see the deferred-write
-// comment below for the one exception, which is documented, not silent.
-//
-// Full attribute-condition ABAC beyond the own-object case is deliberately
-// not implemented in v1 — no other attribute-condition rules exist
-// anywhere in the architecture docs to encode; see progress.md.
+// without a decision artifact). That insert is NOT cached, batched or
+// deferred on any path: a cache hit removes database reads, never the
+// evidence. On any internal error, the result is a denial, never a silent
+// allow (fail-closed) — see the deferred-write comment below for the one
+// exception, which is documented, not silent.
 //
 // The tenant scope of the evaluation comes from the verified X-Tenant-Id
 // header when the caller sends one — see resolveTenantScope for why that
 // matters more than it looks.
 //
+// A PLATFORM-WIDE act — one with no owning legal entity — is requested by
+// sending legal_entity_id=PLATFORM; see PlatformScopeSentinel.
+//
 // Response: 200 with decision_outcome GRANTED|DENIED (both are 200 — the
 // HTTP status reflects "the evaluation succeeded", not the outcome) /
-// 400 missing field / 403 body tenant_id disagrees with the verified header /
-// 503 store unavailable (fail-closed, no decision recorded).
+// 400 missing field, or legal_entity_id=PLATFORM on a deployment with no
+// platform-scope entity configured / 403 body tenant_id disagrees with the
+// verified header / 503 store unavailable (fail-closed, no decision recorded).
 // resolveTenantScope decides which tenant's SoD rules apply to this
 // evaluation: the verified X-Tenant-Id header if the caller forwards one,
 // otherwise the body's tenant_id, otherwise none.
@@ -1010,12 +1377,31 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// PLATFORM resolves to the one configured platform-scope entity, so a
+	// platform-wide act is evaluated against the same id everywhere instead of
+	// against whichever synthetic uuid each calling service invented. Fails
+	// closed on an unconfigured deployment: a 400 naming the missing config,
+	// not a guess.
+	evaluationEntityID := req.LegalEntityID
+	if evaluationEntityID == PlatformScopeSentinel {
+		if h.platformScopeEntityID == "" {
+			h.log.Error("Authorize: platform scope requested but AUTHZ_PLATFORM_SCOPE_ENTITY_ID is unset",
+				zap.String("correlation_id", correlationID))
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "platform_scope_not_configured",
+				"message": "legal_entity_id=PLATFORM requires AUTHZ_PLATFORM_SCOPE_ENTITY_ID to be configured on authorization-svc",
+			})
+			return
+		}
+		evaluationEntityID = h.platformScopeEntityID
+	}
+
 	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID)
 	if !ok {
 		return
 	}
 
-	rbacActions, rbacBasis, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, req.LegalEntityID, tenantScope)
+	rbacActions, rbacBasis, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope)
 	if err != nil {
 		// Fail-closed: the store is unreachable, so no decision can be made
 		// or recorded. Returning 503 here (rather than a recorded DENIED)
@@ -1032,7 +1418,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	allHeldActions := append([]string{}, rbacActions...)
 
 	if !granted {
-		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, req.LegalEntityID, tenantScope)
+		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, evaluationEntityID, tenantScope)
 		if err != nil {
 			h.log.Error("Authorize: store unavailable (delegation lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -1071,7 +1457,18 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		// nothing to compare against and behaves exactly as before this
 		// layer existed.
 		if outcome == "GRANTED" && req.ResourceOwnerPrincipalID != "" && req.ResourceOwnerPrincipalID == req.PrincipalID {
-			isOwnObjectForbidden, err := h.store.CheckOwnObjectSoD(r.Context(), req.ActionType, req.TenantID)
+			// tenantScope, NOT req.TenantID. This read used the raw BODY
+			// tenant while every other layer used the resolved scope, so a
+			// caller that correctly forwarded X-Tenant-Id and left tenant_id
+			// out of the body — which is the convention resolveTenantScope
+			// exists to encourage — had this check run with an empty tenant.
+			// CheckOwnObjectSoD's predicate is
+			// `tenant_id IS NULL OR tenant_id = NULLIF($2,'')`, so an empty
+			// tenant narrows it to platform-wide rules and a tenant's own
+			// own-object rule silently never fired for its best-behaved
+			// callers. Same class of bug resolveTenantScope was written to fix,
+			// one layer further down.
+			isOwnObjectForbidden, err := h.store.CheckOwnObjectSoD(r.Context(), req.ActionType, tenantScope)
 			if err != nil {
 				h.log.Error("Authorize: store unavailable (own-object sod check)", zap.String("correlation_id", correlationID), zap.Error(err))
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -1082,11 +1479,50 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 				basis = "sod:own_object_forbidden"
 			}
 		}
+
+		// Layer 5 — ABAC. Attribute conditions declared in abac_rules, only
+		// reachable once every earlier layer has already granted, and
+		// DENY-ONLY: a rule can take away what RBAC or delegation conferred,
+		// never add to it (see internal/abac and domain.ABACRule).
+		//
+		// The store read happens whether or not the caller sent attributes,
+		// because whether a rule exists is a property of the ACTION, not of
+		// the request — skipping the read when Attributes is empty is exactly
+		// how a caller would bypass a REQUIRE rule by sending no attributes.
+		// With no rules declared it is one cached, almost always empty read.
+		if outcome == "GRANTED" {
+			rules, err := h.store.FindABACRules(r.Context(), req.ActionType, tenantScope)
+			if err != nil {
+				h.log.Error("Authorize: store unavailable (abac lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+				return
+			}
+			if denial, denied := abac.Evaluate(rules, req.Attributes); denied {
+				outcome = "DENIED"
+				basis = denial.Basis()
+				if denial.Unevaluable {
+					// A defect in the RULE, not in the request: the effect or
+					// operator is one this build cannot execute, so the rule
+					// denies its action for every principal until it is fixed.
+					// Logged at Error so it surfaces as an operator problem
+					// rather than as a run of ordinary denials.
+					h.log.Error("Authorize: abac rule could not be evaluated — it denies this action for every principal until corrected",
+						zap.String("rule_code", denial.RuleCode),
+						zap.String("action_type", req.ActionType),
+						zap.String("correlation_id", correlationID))
+				}
+			}
+		}
 	}
 
 	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
-		PrincipalID:   req.PrincipalID,
-		LegalEntityID: req.LegalEntityID,
+		PrincipalID: req.PrincipalID,
+		// The RESOLVED entity, not the sentinel the caller may have sent.
+		// legal_entity_id is UUID NOT NULL in access_decision_log, so writing
+		// "PLATFORM" would fail the insert — and the evidence has to name the
+		// scope the decision was actually evaluated in, which is what a later
+		// audit of a platform-wide act needs to see.
+		LegalEntityID: evaluationEntityID,
 		ActionType:    req.ActionType,
 		Outcome:       outcome,
 		Basis:         basis,
@@ -1144,6 +1580,96 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, http.StatusOK, authorizeResponse{DecisionOutcome: outcome, DecisionBasis: basis, AccessDecisionID: decision.AccessDecisionID})
+}
+
+// ── GET /v1/admin/role-assignments ──────────────────────────────────────────
+
+// ListRoleAssignments handles GET /v1/admin/role-assignments — read the
+// grants that actually exist.
+//
+// Added because every write path here had no read to match it: an assignment
+// could be created and revoked, but never listed, so the only way to see who
+// held what was to query the database directly. The console consequently had
+// no way to offer "revoke" at all — it could not learn the assignment_id.
+//
+// Authenticated and tenant-scoped, on the same footing as every other admin
+// route: an assignment names a principal and the role they hold, which is
+// precisely the who-can-do-what map that GetAccessDecision was hardened to
+// stop leaking.
+//
+// Query params, all optional: principal_id and role_id narrow the list;
+// include_expired=true adds revoked and not-yet-effective rows (default is
+// active only, which is what a revoke decision needs).
+//
+// Response: 200 the assignments (possibly empty) / 401 missing principal or
+// tenant scope / 503 unavailable.
+func (h *Handler) ListRoleAssignments(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	principalFilter := strings.TrimSpace(r.URL.Query().Get("principal_id"))
+	roleFilter := strings.TrimSpace(r.URL.Query().Get("role_id"))
+	activeOnly := r.URL.Query().Get("include_expired") != "true"
+
+	// A malformed role_id must not read as an outage — same posture as
+	// validScope on the authorize path. role_id is compared as ::text in the
+	// query, so a non-UUID is a valid comparison that matches nothing rather
+	// than a driver error; nothing to reject here, and nothing to 503 over.
+
+	assignments, err := h.store.ListRoleAssignments(r.Context(), tenantScope, principalFilter, roleFilter, activeOnly)
+	if err != nil {
+		h.log.Error("ListRoleAssignments: store unavailable",
+			zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if assignments == nil {
+		assignments = []domain.PrincipalRoleAssignment{}
+	}
+	writeJSON(w, http.StatusOK, assignments)
+}
+
+// ── GET /v1/admin/sod-rules ─────────────────────────────────────────────────
+
+// ListSoDRules handles GET /v1/admin/sod-rules — read the conflict rules
+// that will deny requests in this tenant.
+//
+// Returns the tenant's own rules AND the globally-applicable ones
+// (tenant_id NULL), because both deny identically and the global ones are
+// the set a tenant operator cannot edit but will still be blocked by. Hiding
+// them would make a denial unexplainable from the console.
+//
+// Response: 200 the rules (possibly empty) / 401 missing principal or tenant
+// scope / 503 unavailable.
+func (h *Handler) ListSoDRules(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	rules, err := h.store.ListSoDRules(r.Context(), tenantScope)
+	if err != nil {
+		h.log.Error("ListSoDRules: store unavailable",
+			zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if rules == nil {
+		rules = []domain.SoDRule{}
+	}
+	writeJSON(w, http.StatusOK, rules)
 }
 
 // ── GET /v1/access-decisions/{access_decision_id} ───────────────────────────

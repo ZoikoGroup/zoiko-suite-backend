@@ -14,13 +14,21 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"zoiko.io/authorization-svc/internal/domain"
 )
 
-// Store is the interface consumed by the handler.
+// Store is the full read/write surface PgStore implements.
+//
+// Documentation, not a dependency: the handler declares its own narrower
+// handler.AuthorizationStore and nothing references this one. It is kept
+// because it is the one place the whole surface is listed with its contracts
+// — but a method added to PgStore and not to this list makes the list a lie,
+// which is the failure mode the comment it used to carry ("the interface
+// consumed by the handler") already had.
 type Store interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
@@ -30,11 +38,37 @@ type Store interface {
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 
+	// ListRoleAssignments returns the assignments in tenantID scope, newest
+	// first. principalID and roleID are optional filters — empty means "any".
+	// activeOnly drops assignments that have already been revoked or have not
+	// come into effect yet, which is what an operator deciding whether to
+	// revoke needs to see; false returns the history too.
+	//
+	// Exists because there was no way to READ an assignment. Every write path
+	// existed, so the console could create a grant and then never show it,
+	// and revoking one required knowing an id that nothing surfaced.
+	ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error)
+
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
 	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 
+	// ProjectDelegation and RevokeProjectedDelegation maintain the projection
+	// of delegated-authority-svc's authority.* events — that service is the
+	// authoritative owner of the concept (Doc 03 §9.3), and these are how this
+	// table becomes the evaluation read-model rather than a rival write model.
+	// Only internal/events.Consumer calls them; the admin API never does.
+	ProjectDelegation(ctx context.Context, params domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error)
+	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error)
+
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
+
+	// ListSoDRules returns the SoD rules that apply in tenantID scope: the
+	// tenant's own rules plus the globally-applicable ones (tenant_id NULL),
+	// which is exactly the set CheckSoDConflict evaluates against. Listing
+	// only the tenant's own would show an operator a shorter rule set than
+	// the one actually denying their requests.
+	ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error)
 
 	// FindGrantedActions returns the union of permitted_actions from every
 	// currently-active role assignment + bundle for principalID in
@@ -58,6 +92,24 @@ type Store interface {
 	// rules (tenant_id IS NULL) are considered when tenantID is "" — pass
 	// the caller's tenant to also bring that tenant's own SoD rules in.
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
+
+	// CheckOwnObjectSoD reports whether a data-declared rule forbids the same
+	// principal both owning and performing actionType — the dynamic SoD layer.
+	CheckOwnObjectSoD(ctx context.Context, actionType, tenantID string) (bool, error)
+
+	// The ABAC surface. CreateABACRule validates effect and operator against
+	// what internal/abac can actually execute and refuses anything else, so a
+	// condition nobody can evaluate cannot be stored — such a rule denies its
+	// action for every principal holding it.
+	CreateABACRule(ctx context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error)
+	SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error)
+	ListABACRules(ctx context.Context, tenantID, actionType string) ([]domain.ABACRule, error)
+
+	// FindABACRules returns the ACTIVE conditions guarding actionType in
+	// tenantID scope — the tenant's own plus the platform-wide ones. This is
+	// the evaluation read, and it returns an empty slice until somebody
+	// declares a rule, which is what makes layer 5 a no-op by default.
+	FindABACRules(ctx context.Context, actionType, tenantID string) ([]domain.ABACRule, error)
 
 	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
 
@@ -267,15 +319,20 @@ func (s *PgStore) CreateRole(ctx context.Context, params domain.CreateRoleParams
 // ── permission_bundles ───────────────────────────────────────────────────────
 
 func (s *PgStore) CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
-	if _, err := s.FindRoleByID(ctx, params.RoleID); err != nil {
+	// The role is fetched for existence, and its tenant is what scopes the
+	// INSERT below. permission_bundles carries no tenant_id of its own, so
+	// the owning tenant is only knowable through this FK — which is also
+	// exactly how 000007's policy reads it.
+	role, err := s.FindRoleByID(ctx, params.RoleID)
+	if err != nil {
 		return nil, err
 	}
 	if params.PermissionBundleID == "" {
 		params.PermissionBundleID = uuid.New().String()
 	}
-	actionsJSON, err := json.Marshal(params.PermittedActions)
-	if err != nil {
-		return nil, fmt.Errorf("marshal permitted_actions: %w", err)
+	actionsJSON, marshalErr := json.Marshal(params.PermittedActions)
+	if marshalErr != nil {
+		return nil, fmt.Errorf("marshal permitted_actions: %w", marshalErr)
 	}
 
 	const query = `
@@ -284,10 +341,19 @@ func (s *PgStore) CreatePermissionBundle(ctx context.Context, params domain.Crea
 		ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions
 		RETURNING permission_bundle_id, role_id, bundle_code, permitted_actions, active_flag, created_at;`
 
-	row := s.pool.QueryRow(ctx, query, params.PermissionBundleID, params.RoleID, params.BundleCode, actionsJSON)
+	// withRLS, not s.pool directly. This query went straight to the pool
+	// until 000007 gave permission_bundles a policy, at which point every
+	// INSERT began failing with SQLSTATE 42501 — app.tenant_id was never
+	// set, so the policy's WITH CHECK could not match and refused the row.
+	// The same shape obligations-svc had (nine pool-direct queries) and the
+	// reason it only joined create-app-roles.sh after being fixed.
 	b := &domain.PermissionBundle{}
 	var rawActions []byte
-	if err := row.Scan(&b.PermissionBundleID, &b.RoleID, &b.BundleCode, &rawActions, &b.ActiveFlag, &b.CreatedAt); err != nil {
+	err = s.withRLS(ctx, role.TenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, query, params.PermissionBundleID, params.RoleID, params.BundleCode, actionsJSON).
+			Scan(&b.PermissionBundleID, &b.RoleID, &b.BundleCode, &rawActions, &b.ActiveFlag, &b.CreatedAt)
+	})
+	if err != nil {
 		s.log.Error("pg CreatePermissionBundle failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
@@ -326,8 +392,18 @@ func (s *PgStore) CreateRoleAssignment(ctx context.Context, params domain.Create
 		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING ` + assignmentColumns + `;`
 
-	row := s.pool.QueryRow(ctx, query, params.PrincipalRoleAssignmentID, params.PrincipalID, params.RoleID, params.LegalEntityID, params.EffectiveFrom, params.AssignedBy)
-	a, err := scanAssignment(row)
+	// Scoped to the role's tenant, for the reason CreatePermissionBundle
+	// above is: principal_role_assignments has no tenant_id column, so
+	// 000007's policy resolves the tenant through this same role FK, and the
+	// INSERT needs app.tenant_id installed to satisfy its WITH CHECK.
+	var a *domain.PrincipalRoleAssignment
+	err = s.withRLS(ctx, role.TenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		a, scanErr = scanAssignment(tx.QueryRow(ctx, query,
+			params.PrincipalRoleAssignmentID, params.PrincipalID, params.RoleID,
+			params.LegalEntityID, params.EffectiveFrom, params.AssignedBy))
+		return scanErr
+	})
 	if err != nil {
 		s.log.Error("pg CreateRoleAssignment failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
@@ -371,15 +447,93 @@ func (s *PgStore) RevokeRoleAssignment(ctx context.Context, assignmentID, tenant
 	return a, nil
 }
 
+// ListRoleAssignments implements Store.
+//
+// Scoped the same way RevokeRoleAssignment is — through the role's tenant,
+// since principal_role_assignments carries no tenant_id of its own. As of
+// migration 000007 the table also has its own RLS policy reading the same
+// FK, so this is now defended twice: drop the predicate below and the policy
+// still returns nothing rather than everything.
+func (s *PgStore) ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error) {
+	// $2/$3 are optional filters: the NULLIF-style '' check keeps this one
+	// query rather than four, and pgx sends the empty string as a real
+	// parameter so there is no SQL assembled from input anywhere here.
+	query := `
+		SELECT ` + assignmentColumns + `
+		  FROM principal_role_assignments
+		 WHERE role_id IN (SELECT role_id FROM roles WHERE tenant_id = $1)
+		   AND ($2 = '' OR principal_id = $2)
+		   AND ($3 = '' OR role_id::text = $3)`
+	if activeOnly {
+		query += `
+		   AND effective_from <= NOW()
+		   AND (effective_to IS NULL OR effective_to > NOW())`
+	}
+	query += `
+		 ORDER BY created_at DESC
+		 LIMIT 500;`
+
+	var out []domain.PrincipalRoleAssignment
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, tenantID, principalID, roleID)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var a domain.PrincipalRoleAssignment
+			if scanErr := rows.Scan(&a.PrincipalRoleAssignmentID, &a.PrincipalID, &a.RoleID,
+				&a.LegalEntityID, &a.EffectiveFrom, &a.EffectiveTo, &a.AssignedBy, &a.CreatedAt); scanErr != nil {
+				return scanErr
+			}
+			out = append(out, a)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListRoleAssignments failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
 // ── delegated_authorities ────────────────────────────────────────────────────
 
-const delegationColumns = `delegated_authority_id, tenant_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, effective_from, effective_to, revocation_status, created_at`
+const delegationColumns = `delegated_authority_id, tenant_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, delegated_actions, source_service, source_delegation_id, effective_from, effective_to, revocation_status, created_at`
 
 func scanDelegation(row pgx.Row) (*domain.DelegatedAuthority, error) {
 	d := &domain.DelegatedAuthority{}
+	// delegated_actions is JSONB and nullable, so it is scanned as raw bytes
+	// rather than into []string directly: pgx maps SQL NULL to a nil slice
+	// only for array types, and this column is jsonb — a nil destination
+	// would be an error instead of "full authority".
+	var rawActions []byte
 	err := row.Scan(&d.DelegatedAuthorityID, &d.TenantID, &d.DelegatorPrincipalID, &d.DelegatePrincipalID, &d.ScopeType, &d.LegalEntityID,
-		&d.AuthorityLimitType, &d.AuthorityLimitValue, &d.EffectiveFrom, &d.EffectiveTo, &d.RevocationStatus, &d.CreatedAt)
+		&d.AuthorityLimitType, &d.AuthorityLimitValue, &rawActions, &d.SourceService, &d.SourceDelegationID,
+		&d.EffectiveFrom, &d.EffectiveTo, &d.RevocationStatus, &d.CreatedAt)
+	if err == nil && len(rawActions) > 0 {
+		_ = json.Unmarshal(rawActions, &d.DelegatedActions)
+	}
 	return d, err
+}
+
+// marshalActionSubset renders a delegated-actions subset for the JSONB column.
+// A nil or empty slice becomes SQL NULL, which is "the delegator's full
+// authority" — the same meaning every row written before 000008 carries.
+//
+// Empty is folded into NULL deliberately: a JSON `[]` would be a delegation
+// that confers precisely nothing, which is not a thing anyone means to create,
+// and it would be indistinguishable in the register from one that confers
+// everything.
+func marshalActionSubset(actions []string) any {
+	if len(actions) == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(actions)
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 func (s *PgStore) CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error) {
@@ -392,19 +546,129 @@ func (s *PgStore) CreateDelegatedAuthority(ctx context.Context, params domain.Cr
 	}
 
 	const query = `
-		INSERT INTO delegated_authorities (delegated_authority_id, tenant_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, effective_from, effective_to)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO delegated_authorities (delegated_authority_id, tenant_id, delegator_principal_id, delegate_principal_id, scope_type, legal_entity_id, authority_limit_type, authority_limit_value, delegated_actions, source_service, source_delegation_id, effective_from, effective_to)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULLIF($10, ''), NULLIF($11, ''), $12, $13)
 		RETURNING ` + delegationColumns + `;`
 
 	var d *domain.DelegatedAuthority
 	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
 		var scanErr error
 		d, scanErr = scanDelegation(tx.QueryRow(ctx, query, params.DelegatedAuthorityID, params.TenantID, params.DelegatorPrincipalID, params.DelegatePrincipalID,
-			params.ScopeType, params.LegalEntityID, params.AuthorityLimitType, params.AuthorityLimitValue, params.EffectiveFrom, params.EffectiveTo))
+			params.ScopeType, params.LegalEntityID, params.AuthorityLimitType, params.AuthorityLimitValue,
+			marshalActionSubset(params.DelegatedActions), params.SourceService, params.SourceDelegationID,
+			params.EffectiveFrom, params.EffectiveTo))
 		return scanErr
 	})
 	if err != nil {
 		s.log.Error("pg CreateDelegatedAuthority failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return d, nil
+}
+
+// ProjectDelegation upserts the delegation described by an upstream
+// authority.delegated event, keyed on (source_service, source_delegation_id).
+//
+// UPSERT, not INSERT. Kafka redelivers, consumers restart, and an INSERT per
+// delivery would turn one upstream delegation into several rows that
+// FindDelegatedActions would then union — a duplicate grant, arrived at by
+// retry. The unique partial index from 000008 is what ON CONFLICT targets.
+//
+// A projected row that arrives again with a LATER effective_to (upstream
+// extended the delegation) is updated; the update also resets
+// revocation_status to ACTIVE, because upstream re-emitting a delegated event
+// for an id it had revoked means it has re-granted it, and upstream is the
+// authority on that.
+func (s *PgStore) ProjectDelegation(ctx context.Context, params domain.ProjectDelegationParams) (*domain.DelegatedAuthority, error) {
+	if params.TenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+	if params.SourceService == "" || params.SourceDelegationID == "" {
+		return nil, domain.ErrProjectionSourceRequired
+	}
+
+	// scope_type is ACTION_SUBSET whenever the event named actions, which it
+	// always does — upstream delegates one action_type per grant. FULL is the
+	// honest label only for a delegation that confers everything.
+	scopeType := "FULL"
+	if len(params.DelegatedActions) > 0 {
+		scopeType = "ACTION_SUBSET"
+	}
+
+	const query = `
+		INSERT INTO delegated_authorities (
+			tenant_id, delegator_principal_id, delegate_principal_id, scope_type,
+			legal_entity_id, delegated_actions, source_service, source_delegation_id,
+			effective_from, effective_to)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (source_service, source_delegation_id)
+			WHERE source_delegation_id IS NOT NULL
+		DO UPDATE SET
+			delegator_principal_id = EXCLUDED.delegator_principal_id,
+			delegate_principal_id  = EXCLUDED.delegate_principal_id,
+			scope_type             = EXCLUDED.scope_type,
+			legal_entity_id        = EXCLUDED.legal_entity_id,
+			delegated_actions      = EXCLUDED.delegated_actions,
+			effective_from         = EXCLUDED.effective_from,
+			effective_to           = EXCLUDED.effective_to,
+			revocation_status      = 'ACTIVE'
+		RETURNING ` + delegationColumns + `;`
+
+	var d *domain.DelegatedAuthority
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanDelegation(tx.QueryRow(ctx, query,
+			params.TenantID, params.DelegatorPrincipalID, params.DelegatePrincipalID, scopeType,
+			params.LegalEntityID, marshalActionSubset(params.DelegatedActions),
+			params.SourceService, params.SourceDelegationID,
+			params.EffectiveFrom, params.EffectiveTo))
+		return scanErr
+	})
+	if err != nil {
+		s.log.Error("pg ProjectDelegation failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return d, nil
+}
+
+// RevokeProjectedDelegation ends a projected delegation on an upstream
+// authority.revoked or authority.expired event.
+//
+// Returns ErrDelegatedAuthorityNotFound when no projected row matches, which
+// the consumer treats as already-handled rather than as an error: the event
+// may be a redelivery of one already applied, or may name a delegation
+// created before this projection existed. It never falls back to revoking a
+// LOCALLY-authored row — source_delegation_id IS NOT NULL is in the
+// predicate — because an upstream id colliding with a local delegation must
+// not let one service revoke another's grant.
+func (s *PgStore) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+	if sourceService == "" || sourceDelegationID == "" {
+		return nil, domain.ErrProjectionSourceRequired
+	}
+
+	const query = `
+		UPDATE delegated_authorities
+		   SET revocation_status = 'REVOKED'
+		 WHERE source_service = $1
+		   AND source_delegation_id = $2
+		   AND source_delegation_id IS NOT NULL
+		   AND tenant_id = $3::uuid
+		RETURNING ` + delegationColumns + `;`
+
+	var d *domain.DelegatedAuthority
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		d, scanErr = scanDelegation(tx.QueryRow(ctx, query, sourceService, sourceDelegationID, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrDelegatedAuthorityNotFound
+		}
+		s.log.Error("pg RevokeProjectedDelegation failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return d, nil
@@ -504,6 +768,227 @@ func (s *PgStore) CreateSoDRule(ctx context.Context, params domain.CreateSoDRule
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return r, nil
+}
+
+// ListSoDRules implements Store.
+//
+// `tenant_id IS NULL OR tenant_id = $1` mirrors sod_rules' own RLS policy
+// from 000004 and CheckSoDConflict's predicate: a NULL tenant means a
+// globally-applicable rule that binds every tenant. An operator has to see
+// those, because they deny requests just as hard as the tenant's own and are
+// the ones nobody in the tenant can edit.
+func (s *PgStore) ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error) {
+	const query = `
+		SELECT sod_rule_id, domain_code, action_a, action_b, conflict_type,
+		       jurisdiction_id, tenant_id, active_flag, created_at
+		  FROM sod_rules
+		 WHERE tenant_id IS NULL
+		    OR tenant_id = NULLIF($1, '')::uuid
+		 ORDER BY active_flag DESC, domain_code, action_a
+		 LIMIT 500;`
+
+	var out []domain.SoDRule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, tenantID)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r domain.SoDRule
+			if scanErr := rows.Scan(&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB,
+				&r.ConflictType, &r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt); scanErr != nil {
+				return scanErr
+			}
+			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListSoDRules failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+// ── abac_rules ───────────────────────────────────────────────────────────────
+
+const abacRuleColumns = `abac_rule_id, tenant_id, rule_code, action_type, effect, attribute_key, operator, attribute_value, active_flag, created_at, created_by_principal_id`
+
+func scanABACRule(row pgx.Row) (*domain.ABACRule, error) {
+	r := &domain.ABACRule{}
+	err := row.Scan(&r.ABACRuleID, &r.TenantID, &r.RuleCode, &r.ActionType, &r.Effect,
+		&r.AttributeKey, &r.Operator, &r.AttributeValue, &r.ActiveFlag, &r.CreatedAt, &r.CreatedByPrincipalID)
+	return r, err
+}
+
+// CreateABACRule declares one attribute condition.
+//
+// Effect and Operator are validated HERE as well as in the handler. The
+// handler's check is what produces a 400 with a useful message; this one is
+// what stops a row the evaluator cannot execute from existing at all,
+// whichever path wrote it. An unevaluable condition on a deny-only layer
+// denies the action for everybody, so the cheapest place to catch it is
+// before it is stored.
+func (s *PgStore) CreateABACRule(ctx context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error) {
+	if params.ABACRuleID == "" {
+		params.ABACRuleID = uuid.New().String()
+	}
+	if params.Effect != domain.EffectRequire && params.Effect != domain.EffectForbid {
+		return nil, domain.ErrUnsupportedABACEffect
+	}
+	operands, ok := domain.ABACOperators[params.Operator]
+	if !ok {
+		return nil, domain.ErrUnsupportedABACOperator
+	}
+	// A one-operand operator with no operand compares against nothing. Under
+	// REQUIRE that denies every request for the action; under FORBID it
+	// permits every one. Neither is what the author meant, and both are silent.
+	if operands == 1 && (params.AttributeValue == nil || *params.AttributeValue == "") {
+		return nil, domain.ErrABACOperandRequired
+	}
+
+	const query = `
+		INSERT INTO abac_rules (abac_rule_id, tenant_id, rule_code, action_type, effect, attribute_key, operator, attribute_value, created_by_principal_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		RETURNING ` + abacRuleColumns + `;`
+
+	var tenantID string
+	if params.TenantID != nil {
+		tenantID = *params.TenantID
+	}
+	var r *domain.ABACRule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		r, scanErr = scanABACRule(tx.QueryRow(ctx, query, params.ABACRuleID, params.TenantID, params.RuleCode,
+			params.ActionType, params.Effect, params.AttributeKey, params.Operator, params.AttributeValue,
+			params.CreatedByPrincipalID))
+		return scanErr
+	})
+	if err != nil {
+		// A duplicate rule_code in the same scope is a conflict, not an
+		// outage — the two partial unique indexes from 000010 are what raise
+		// it, one per scope.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, domain.ErrConflict
+		}
+		s.log.Error("pg CreateABACRule failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
+}
+
+// SetABACRuleActive retires or reactivates a rule. Retiring is how a rule
+// stops denying: active_flag is in FindABACRules' predicate, so the next
+// evaluation ignores it. No hard delete, same as roles — the rule has to stay
+// resolvable for any decision it already caused.
+func (s *PgStore) SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error) {
+	// tenant_id = $3 with no IS NULL branch, deliberately: retiring a
+	// PLATFORM-WIDE rule from a tenant's own scope would let one tenant
+	// disable a control binding every other one. Those are authored behind the
+	// platform-scope grant and must be retired the same way.
+	const query = `
+		UPDATE abac_rules
+		   SET active_flag = $2
+		 WHERE abac_rule_id = $1 AND tenant_id = $3::uuid
+		RETURNING ` + abacRuleColumns + `;`
+
+	var r *domain.ABACRule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		var scanErr error
+		r, scanErr = scanABACRule(tx.QueryRow(ctx, query, abacRuleID, active, tenantID))
+		return scanErr
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrABACRuleNotFound
+		}
+		s.log.Error("pg SetABACRuleActive failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
+}
+
+// ListABACRules returns the rules that apply in tenantID scope: the tenant's
+// own plus the platform-wide ones (tenant_id NULL), exactly the set
+// FindABACRules evaluates against.
+//
+// Same reasoning as ListSoDRules: an operator has to see the platform-wide
+// rules they cannot edit, because those deny just as hard and a denial
+// attributable to a rule the console hides is unexplainable.
+func (s *PgStore) ListABACRules(ctx context.Context, tenantID, actionType string) ([]domain.ABACRule, error) {
+	const query = `
+		SELECT ` + abacRuleColumns + `
+		  FROM abac_rules
+		 WHERE (tenant_id IS NULL OR tenant_id = NULLIF($1, '')::uuid)
+		   AND ($2 = '' OR action_type = $2)
+		 ORDER BY active_flag DESC, action_type, rule_code
+		 LIMIT 500;`
+
+	var out []domain.ABACRule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, tenantID, actionType)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, scanErr := scanABACRule(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			out = append(out, *r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListABACRules failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+// FindABACRules returns the ACTIVE attribute conditions guarding actionType in
+// tenantID scope — the evaluation read, called from /v1/authorize's layer 5.
+//
+// `tenant_id IS NULL OR tenant_id = $2` mirrors CheckSoDConflict's predicate
+// and abac_rules' own policy: a NULL-tenant rule binds every tenant, so an
+// empty tenantID narrows this to platform-wide rules only rather than matching
+// nothing.
+//
+// Returning an empty slice is the overwhelmingly common case and the reason
+// this layer costs nothing until somebody declares a rule.
+func (s *PgStore) FindABACRules(ctx context.Context, actionType, tenantID string) ([]domain.ABACRule, error) {
+	const query = `
+		SELECT ` + abacRuleColumns + `
+		  FROM abac_rules
+		 WHERE active_flag
+		   AND action_type = $1
+		   AND (tenant_id IS NULL OR tenant_id = NULLIF($2, '')::uuid)
+		 ORDER BY rule_code;`
+
+	var out []domain.ABACRule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, actionType, tenantID)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, scanErr := scanABACRule(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			out = append(out, *r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg FindABACRules failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
 }
 
 // ── evaluation queries ───────────────────────────────────────────────────────
@@ -622,62 +1107,153 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 
 // FindDelegatedActions resolves active, non-expired delegations to
 // principalID in legalEntityID, and returns the union of each delegator's
-// own currently-granted actions. A tenant-wide delegation (legal_entity_id
-// IS NULL) matches regardless of which legal entity is being evaluated.
+// own currently-granted actions — intersected with the delegation's own
+// delegated_actions subset when it declares one. A tenant-wide delegation
+// (legal_entity_id IS NULL) matches regardless of which legal entity is
+// being evaluated.
+//
+// ── THIS LAYER GRANTED NOTHING AT ALL BEFORE 000008 ─────────────────────────
+//
+// The query below used to run on s.pool directly, outside both withRLS and
+// withPlatformScope. 000006 had given delegated_authorities RLS with no
+// app.platform_scope hatch, so a connection that installs neither setting
+// matches no rows: current_setting returns NULL, the policy's NULLIF of it
+// is NULL, and `tenant_id = NULL` is NULL, never true. Layer 2 of /v1/authorize
+// therefore returned an empty action set for every request on any deployment
+// where the policy actually binds — which is compose (DB_USER=zoiko_app,
+// NOSUPERUSER NOBYPASSRLS) and Supabase (app_authorization) both.
+//
+// It failed CLOSED, which is why nothing broke visibly: a delegate was simply
+// denied with basis `no_grant`, indistinguishable from having no delegation.
+// Measured on Postgres 16.15 as a NOBYPASSRLS role with one ACTIVE, in-date,
+// correctly-tenanted delegation present: 0 rows with neither setting, 1 row
+// with app.tenant_id installed.
+//
+// The store-level tests did not catch it because they run as the migration
+// user, and a superuser bypasses row security unconditionally.
+//
+// Which of the two branches below is load-bearing depends on the deployment,
+// and it is worth being exact. On a default one the canonical input-contract
+// middleware treats tenant_id as unconditionally mandatory and answers 401
+// before this is reached, so the withRLS branch is the live path. The
+// platform-scope branch serves observe mode — a documented migration state —
+// and keeps this function's documented contract ("an empty tenant evaluates
+// across tenants") true rather than silently returning nothing, which is
+// precisely how the original defect survived review.
+//
+// ── ONE QUERY, NOT 1 + N ────────────────────────────────────────────────────
+//
+// This also used to run one transaction to list delegators and then a separate
+// FindGrantedActions — itself another transaction — per delegator. Five
+// delegators meant six transactions on the platform's hottest read path. The
+// join below is one, inside one transaction, and returns the same set.
+//
+// ── THE DELEGATOR'S ROLES ARE BOUND TO THE DELEGATION'S OWN TENANT ──────────
+//
+// `r.tenant_id = da.tenant_id` is the predicate that makes this honest, and it
+// is not redundant. When a tenant IS supplied, RLS plus the explicit tenant
+// predicates already confine both sides to that tenant. When one is NOT — the
+// fallback path, most callers — this whole query runs under platform scope,
+// where roles and delegations from every tenant are visible; without this
+// predicate a delegation made in tenant A would resolve against the
+// delegator's roles in tenant B. That is exactly the cross-tenant escalation
+// FindGrantedActions' own comment documents, arriving by a different route.
+// delegated_authorities.tenant_id is NOT NULL since 000006, so the delegation
+// always has a tenant to bind to.
+//
+// ── ACTION SUBSETS ARE HONOURED ─────────────────────────────────────────────
+//
+// scope_type has always accepted 'ACTION_SUBSET' and nothing ever read it, so
+// a delegation recorded as a subset conferred the delegator's FULL authority.
+// da.delegated_actions (000008) is the subset, and the CASE below intersects
+// it with what the delegator actually holds. NULL means full authority, which
+// is what every row written before 000008 means. A delegation can never
+// confer an action its delegator does not hold — the intersection is with the
+// delegator's live grants, resolved right here, not with a snapshot.
 func (s *PgStore) FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error) {
 	// $3 = '' keeps the no-verified-tenant fallback that FindGrantedActions
 	// has, for the same reason: most callers of /v1/authorize do not forward
 	// X-Tenant-Id yet, and scoping them to an empty tenant would silently drop
 	// every delegation rather than evaluate it.
+	//
+	// The delegator's half of the predicate is FindGrantedActions' WHERE clause
+	// verbatim, so "what the delegator holds" cannot drift between the two
+	// paths.
 	const query = `
-		SELECT delegator_principal_id
-		FROM delegated_authorities
-		WHERE delegate_principal_id = $1
-		  AND (legal_entity_id = $2 OR legal_entity_id IS NULL)
-		  AND ($3 = '' OR tenant_id::text = $3)
-		  AND revocation_status = 'ACTIVE'
-		  AND effective_from <= NOW()
-		  AND (effective_to IS NULL OR effective_to > NOW());`
-
-	rows, err := s.pool.Query(ctx, query, principalID, legalEntityID, tenantID)
-	if err != nil {
-		s.log.Error("pg FindDelegatedActions failed", zap.Error(err))
-		return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
-	var delegators []string
-	for rows.Next() {
-		var d string
-		if err := rows.Scan(&d); err != nil {
-			rows.Close()
-			return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-		}
-		delegators = append(delegators, d)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
-	}
+		SELECT da.delegator_principal_id,
+		       CASE
+		         WHEN da.delegated_actions IS NULL THEN pb.permitted_actions
+		         ELSE (
+		           SELECT COALESCE(jsonb_agg(a), '[]'::jsonb)
+		             FROM jsonb_array_elements(pb.permitted_actions) a
+		            WHERE da.delegated_actions @> jsonb_build_array(a)
+		         )
+		       END AS effective_actions
+		  FROM delegated_authorities da
+		  JOIN principal_role_assignments pra
+		    ON pra.principal_id = da.delegator_principal_id
+		  JOIN roles r
+		    ON r.role_id = pra.role_id AND r.active_flag
+		  JOIN permission_bundles pb
+		    ON pb.role_id = r.role_id AND pb.active_flag
+		 WHERE da.delegate_principal_id = $1
+		   AND (da.legal_entity_id = $2 OR da.legal_entity_id IS NULL)
+		   AND ($3 = '' OR da.tenant_id::text = $3)
+		   AND da.revocation_status = 'ACTIVE'
+		   AND da.effective_from <= NOW()
+		   AND (da.effective_to IS NULL OR da.effective_to > NOW())
+		   AND r.tenant_id = da.tenant_id
+		   AND (pra.legal_entity_id = $2 OR pra.legal_entity_id IS NULL)
+		   AND pra.effective_from <= NOW()
+		   AND (pra.effective_to IS NULL OR pra.effective_to > NOW())
+		 ORDER BY da.delegator_principal_id;`
 
 	seen := map[string]bool{}
 	var actions []string
 	var basis string
-	for _, delegator := range delegators {
-		// Same tenant as the delegation itself: a delegator's authority is
-		// whatever they hold in the tenant the delegation was made in, not
-		// whatever they hold anywhere on the platform.
-		delegatorActions, _, err := s.FindGrantedActions(ctx, delegator, legalEntityID, tenantID)
+
+	evaluate := func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, principalID, legalEntityID, tenantID)
 		if err != nil {
-			return nil, "", err
+			return err
 		}
-		if len(delegatorActions) > 0 && basis == "" {
-			basis = fmt.Sprintf("delegated:from=%s", delegator)
-		}
-		for _, a := range delegatorActions {
-			if !seen[a] {
-				seen[a] = true
-				actions = append(actions, a)
+		defer rows.Close()
+
+		for rows.Next() {
+			var delegator string
+			var rawActions []byte
+			if err := rows.Scan(&delegator, &rawActions); err != nil {
+				return err
+			}
+			var bundleActions []string
+			_ = json.Unmarshal(rawActions, &bundleActions)
+			if len(bundleActions) > 0 && basis == "" {
+				basis = fmt.Sprintf("delegated:from=%s", delegator)
+			}
+			for _, a := range bundleActions {
+				if !seen[a] {
+					seen[a] = true
+					actions = append(actions, a)
+				}
 			}
 		}
+		return rows.Err()
+	}
+
+	// The same choice FindGrantedActions makes, and the same reason it is a
+	// choice rather than always withRLS: an empty tenant installed as
+	// app.tenant_id matches no delegation row, whereas platform scope matches
+	// every tenant's and lets the r.tenant_id = da.tenant_id predicate above
+	// keep the resolution within one tenant.
+	var err error
+	if tenantID != "" {
+		err = s.withRLS(ctx, tenantID, evaluate)
+	} else {
+		err = s.withPlatformScope(ctx, evaluate)
+	}
+	if err != nil {
+		s.log.Error("pg FindDelegatedActions failed", zap.Error(err))
+		return nil, "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return actions, basis, nil
 }

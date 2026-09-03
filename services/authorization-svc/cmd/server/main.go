@@ -29,6 +29,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/authorization-svc/internal/cache"
 	"zoiko.io/authorization-svc/internal/config"
 	svcenvelope "zoiko.io/authorization-svc/internal/envelope"
 	"zoiko.io/authorization-svc/internal/events"
@@ -107,6 +108,20 @@ func main() {
 
 	pgStore := store.New(pool, log)
 
+	// The evaluation reads on the /v1/authorize path go through a short-lived
+	// in-process cache. It invalidates itself on every write that passes
+	// through it, so a grant changed via this service's own admin API takes
+	// effect on the next request; the TTL is what bounds a change made
+	// elsewhere. It does NOT cache the decision or the decision-log insert —
+	// see internal/cache's package comment, which is the part worth reading
+	// before changing this line.
+	authzStore := cache.New(pgStore, cfg.CacheTTL, log)
+	if authzStore.Enabled() {
+		log.Info("authorization read cache enabled", zap.Duration("ttl", cfg.CacheTTL))
+	} else {
+		log.Info("authorization read cache DISABLED — every evaluation reads the database")
+	}
+
 	// AllowAutoTopicCreation is required even though the broker itself has
 	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
 	// this to false and never asks the broker to auto-create in its
@@ -141,8 +156,21 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "authorization-svc", log)
-	h := handler.New(pgStore, publisher, jurisdictionValidator, siemClient, cfg.PlatformScopeEntityID, log)
+	// Drains the SIEM queue on shutdown. Streaming is fire-and-forget, so
+	// without this a SIGTERM would discard security events already accepted
+	// from a request that has long since been answered.
+	defer siemClient.Close()
+	h := handler.New(authzStore, publisher, jurisdictionValidator, siemClient, cfg.PlatformScopeEntityID, log)
 	handler.RegisterRoutes(r, h)
+
+	if cfg.PlatformScopeEntityID == "" {
+		// Not fatal, but worth one loud line at boot: without it every
+		// platform-wide act (authoring a platform-wide SoD or ABAC rule) is
+		// refused, and every /v1/authorize call naming
+		// handler.PlatformScopeSentinel answers 400. That is the correct
+		// fail-closed default, and it is also invisible from the outside.
+		log.Warn("AUTHZ_PLATFORM_SCOPE_ENTITY_ID is unset — platform-wide rule authoring and legal_entity_id=PLATFORM requests will be refused")
+	}
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
@@ -196,6 +224,44 @@ func main() {
 		}()
 	}
 
+	// ── delegation projection consumer ──────────────────────────────────────
+	//
+	// Consumes delegated-authority-svc's authority.delegated /
+	// authority.revoked / authority.expired into this service's own
+	// delegated_authorities table, so /v1/authorize's delegation layer
+	// resolves the grants the authoritative service actually made. See
+	// internal/events.Consumer for why these three events and not the other
+	// four v1 declined to consume.
+	//
+	// Started in a goroutine and never allowed to be fatal: this is the
+	// platform's authorization engine and it must answer whether or not a
+	// broker is reachable. An unreachable broker means the projection goes
+	// stale, which the consumer logs; it does not mean requests stop being
+	// evaluated.
+	consumerCtx, stopConsumer := context.WithCancel(context.Background())
+	defer stopConsumer()
+	if cfg.Kafka.DelegationTopic == "" {
+		log.Info("delegation projection disabled (KAFKA_DELEGATION_TOPIC empty) — delegated_authorities is fed only by this service's own admin API")
+	} else {
+		reader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: cfg.Kafka.Brokers,
+			GroupID: cfg.Kafka.DelegationGroupID,
+			Topic:   cfg.Kafka.DelegationTopic,
+			// A consumer group commits offsets, so a restart resumes where it
+			// stopped rather than replaying the whole topic — and the writes
+			// are idempotent either way (upsert on the upstream delegation
+			// id), so a replay converges instead of duplicating grants.
+			MinBytes: 1,
+			MaxBytes: 10e6,
+			MaxWait:  500 * time.Millisecond,
+		})
+		// authzStore, not pgStore: a projected delegation must invalidate the
+		// cached delegation lookups, or an upstream revocation would keep
+		// granting for up to a TTL after it was applied.
+		consumer := events.NewConsumer(log, authzStore)
+		go consumer.Run(consumerCtx, reader)
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	select {
@@ -204,6 +270,10 @@ func main() {
 	case sig := <-quit:
 		log.Info("shutdown signal received", zap.String("signal", sig.String()))
 	}
+
+	// Stop consuming before the HTTP servers drain, so no message is applied
+	// against a pool that is about to close.
+	stopConsumer()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
