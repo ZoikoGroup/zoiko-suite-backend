@@ -40,7 +40,24 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS close_evidences, fiscal_periods CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
+		close_evidences, fiscal_periods, period_reopen_events,
+		subledger_control_runs,
+		accrual_recognition_instances, accrual_schedules,
+		prepayment_recognition_instances, prepayment_schedules,
+		allocation_run_result_lines, allocation_runs, allocation_rule_drivers, allocation_rules,
+		fx_revaluation_items, fx_revaluation_runs,
+		migration_crosswalk_entries, migration_batches,
+		financial_snapshots,
+		lineage_edges, lineage_projection_status
+		CASCADE;`)
+
+	// The DROP list above must be kept in sync with every CREATE TABLE the
+	// glob below picks up: most of those CREATE TABLEs have no IF NOT EXISTS
+	// guard (append-only evidence tables never need an idempotent create),
+	// so a second test in this package re-running every migration against a
+	// table this list forgot fails with "relation already exists" instead of
+	// getting a genuinely clean schema.
 
 	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
 	//

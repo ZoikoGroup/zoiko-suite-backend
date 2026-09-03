@@ -52,6 +52,7 @@ type traefikHeaders struct {
 var untrustedInboundHeaders = []string{
 	"X-Zoiko-Tenant",
 	"X-Zoiko-Resolved-Tenant",
+	"X-Zoiko-Resolved-Tenant-Id",
 	"X-Zoiko-Resolved-Region",
 	"X-Zoiko-Residency-Policy",
 	"X-Zoiko-Route-Decision",
@@ -127,12 +128,19 @@ func Emit(m RoutingMap, cat RegionCatalog) traefikConfig {
 		// Per-tenant context middleware: set trusted internal headers AFTER the
 		// strip middleware removed any client-supplied copies. The resolved
 		// region is the ACTIVE region, so backend region assertion matches.
+		//
+		// X-Zoiko-Resolved-Tenant-Id carries the canonical tenant_id (not the
+		// human-readable slug) alongside the existing slug header — added so
+		// gateway-auth-svc can compare a session token's tenant_id claim
+		// directly against the hostname-resolved tenant (acceptance test O,
+		// decision doc §6.2/§11) without needing a live slug-to-id lookup.
 		cfg.HTTP.Middlewares[ctxMW] = traefikMiddleware{Headers: &traefikHeaders{
 			CustomRequestHeaders: map[string]string{
-				"X-Zoiko-Resolved-Tenant":  slug,
-				"X-Zoiko-Resolved-Region":  resolvedRegion,
-				"X-Zoiko-GTRM-Map-Version": strconv.Itoa(m.MapVersion),
-				"X-Zoiko-GTRM-State":       gtrmState,
+				"X-Zoiko-Resolved-Tenant":    slug,
+				"X-Zoiko-Resolved-Tenant-Id": t.TenantID,
+				"X-Zoiko-Resolved-Region":    resolvedRegion,
+				"X-Zoiko-GTRM-Map-Version":   strconv.Itoa(m.MapVersion),
+				"X-Zoiko-GTRM-State":         gtrmState,
 			},
 		}}
 

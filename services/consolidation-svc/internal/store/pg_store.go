@@ -223,3 +223,69 @@ func (s *PgStore) ListSnapshotsByRun(ctx context.Context, runID string) ([]domai
 	}
 	return out, nil
 }
+
+// CreateBalanceContributions persists the ACC-13 entity-to-group provenance
+// records — see migration 000002's doc comment for why this exists.
+func (s *PgStore) CreateBalanceContributions(ctx context.Context, contributions []domain.BalanceContribution) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	if len(contributions) == 0 {
+		return nil
+	}
+
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		for _, c := range contributions {
+			_, err := tx.Exec(ctx, `
+				INSERT INTO balance_contributions (
+					balance_contribution_id, tenant_id, consolidation_run_id,
+					account_code, source_legal_entity_id, gross_amount, generated_at
+				) VALUES ($1, $2, $3, $4, $5, $6, $7)
+			`, c.BalanceContributionID, tenantID, c.ConsolidationRunID,
+				c.AccountCode, c.SourceLegalEntityID, c.GrossAmount, c.GeneratedAt)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *PgStore) ListContributionsByRun(ctx context.Context, runID string) ([]domain.BalanceContribution, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.BalanceContribution
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT balance_contribution_id, tenant_id, consolidation_run_id,
+			       account_code, source_legal_entity_id, gross_amount, generated_at
+			FROM balance_contributions
+			WHERE consolidation_run_id = $1 AND tenant_id = $2
+			ORDER BY account_code ASC, source_legal_entity_id ASC
+		`, runID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var c domain.BalanceContribution
+			if err := rows.Scan(
+				&c.BalanceContributionID, &c.TenantID, &c.ConsolidationRunID,
+				&c.AccountCode, &c.SourceLegalEntityID, &c.GrossAmount, &c.GeneratedAt,
+			); err != nil {
+				return err
+			}
+			out = append(out, c)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}

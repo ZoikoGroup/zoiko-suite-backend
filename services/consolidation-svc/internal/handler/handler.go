@@ -28,6 +28,8 @@ type Store interface {
 	CompleteRun(ctx context.Context, id, status string, exceptionCount int, completedAt time.Time) error
 	CreateBalanceSnapshots(ctx context.Context, snapshots []domain.BalanceSnapshot) error
 	ListSnapshotsByRun(ctx context.Context, runID string) ([]domain.BalanceSnapshot, error)
+	CreateBalanceContributions(ctx context.Context, contributions []domain.BalanceContribution) error
+	ListContributionsByRun(ctx context.Context, runID string) ([]domain.BalanceContribution, error)
 }
 
 type Publisher interface {
@@ -42,7 +44,8 @@ type AuthZClient interface {
 
 type DomainClients interface {
 	FetchTrialBalance(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (map[string]float64, error)
-	FetchMatchedIntercompanyEntries(ctx context.Context, tenantID string) ([]clients.IntercompanyEntry, error)
+	FetchMatchedIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]clients.IntercompanyEntry, error)
+	FetchJournalLines(ctx context.Context, tenantID, journalID string) ([]clients.JournalLine, error)
 }
 
 const (
@@ -74,6 +77,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListRuns)
 		r.Get("/{id}", h.GetRun)
 		r.Get("/{id}/snapshots", h.ListSnapshots)
+		r.Get("/{id}/contributions", h.ListContributions)
 	})
 }
 
@@ -126,8 +130,13 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 
 	h.publisher.PublishRunStarted(r.Context(), correlationID, principalID, *run)
 
-	// Step 1: Query GL Trial Balances across all child legal entities
+	// Step 1: Query GL Trial Balances across all child legal entities.
+	// Each child's own contribution to each account is recorded (ACC-13
+	// entity-to-group provenance) BEFORE elimination touches
+	// consolidatedBalances — this is exactly what that entity's trial
+	// balance reported, not the post-elimination group figure.
 	consolidatedBalances := make(map[string]float64)
+	var contributions []domain.BalanceContribution
 	for _, childID := range req.ChildLegalEntityIDs {
 		bal, err := h.clients.FetchTrialBalance(r.Context(), tenantID, childID, req.FiscalPeriod)
 		if err != nil {
@@ -138,13 +147,52 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		}
 		for accountCode, amount := range bal {
 			consolidatedBalances[accountCode] += amount
+			contributions = append(contributions, domain.BalanceContribution{
+				BalanceContributionID: uuid.NewString(),
+				ConsolidationRunID:    runID,
+				AccountCode:           accountCode,
+				SourceLegalEntityID:   childID,
+				GrossAmount:           amount,
+				GeneratedAt:           now,
+			})
 		}
 	}
+	if err := h.store.CreateBalanceContributions(r.Context(), contributions); err != nil {
+		// Provenance is the whole point of this fix (see
+		// master-register-findings-2026-08-27.md §3.31) — a run that
+		// completes without it recorded would silently repeat the same
+		// "claimed but not actually done" shape §3.29 already fixed once.
+		h.log.Error("failed to record balance contributions", zap.Error(err))
+		_ = h.store.CompleteRun(r.Context(), runID, "FAILED", 1, time.Now().UTC())
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "failed to record entity-to-group provenance: "+err.Error())
+		return
+	}
 
-	// Step 2: Query matched intercompany entries for balance elimination
-	_, err := h.clients.FetchMatchedIntercompanyEntries(r.Context(), tenantID)
+	// Step 2: Eliminate matched intercompany balances so a transaction
+	// between two group entities isn't double-counted in the group total.
+	// Elimination reverses the REAL posted net contribution (debit-credit)
+	// of both legs' actual journal lines — never a guessed elimination
+	// account, since no intercompany-to-account mapping exists anywhere on
+	// this platform (IntercompanyEntry itself carries no account_code).
+	// A leg that can't be fetched is a real, visible exception on the run
+	// — never a silent warning a caller of this API would never see (this
+	// replaces a prior version of this step that fetched matched entries
+	// and then discarded the result entirely; see
+	// master-register-findings-2026-08-27.md §3.29).
+	var eliminationExceptions []string
+	matchedEntries, err := h.clients.FetchMatchedIntercompanyEntries(r.Context(), tenantID, principalID)
 	if err != nil {
-		h.log.Warn("intercompany entries fetch failed — proceeding with uneliminated consolidation", zap.Error(err))
+		h.log.Error("failed to fetch intercompany entries for elimination", zap.Error(err))
+		eliminationExceptions = append(eliminationExceptions, "intercompany entries unavailable: "+err.Error())
+	} else {
+		for _, entry := range matchedEntries {
+			if elimErr := h.eliminateMatchedEntry(r.Context(), tenantID, entry, consolidatedBalances); elimErr != nil {
+				h.log.Error("failed to eliminate matched intercompany entry",
+					zap.String("intercompany_entry_id", entry.IntercompanyEntryID), zap.Error(elimErr))
+				eliminationExceptions = append(eliminationExceptions,
+					fmt.Sprintf("intercompany entry %s: %s", entry.IntercompanyEntryID, elimErr.Error()))
+			}
+		}
 	}
 
 	// Step 3: Produce signed BalanceSnapshots
@@ -186,13 +234,23 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	completedAt := time.Now().UTC()
-	if err := h.store.CompleteRun(r.Context(), runID, "COMPLETED", 0, completedAt); err != nil {
+	exceptionCount := len(eliminationExceptions)
+	if err := h.store.CompleteRun(r.Context(), runID, "COMPLETED", exceptionCount, completedAt); err != nil {
 		h.log.Error("failed to mark consolidation run completed", zap.Error(err))
 	}
 
 	run.Status = "COMPLETED"
 	run.CompletedAt = &completedAt
+	run.ExceptionCount = exceptionCount
 
+	if exceptionCount > 0 {
+		// Visible, not silent: a run whose elimination step partially or
+		// fully failed still completes (the balances it DID compute are
+		// real), but callers must be able to see that some intercompany
+		// legs were not eliminated, not infer it from a suspiciously round
+		// group total.
+		h.publisher.PublishExceptionDetected(r.Context(), correlationID, principalID, *run, eliminationExceptions)
+	}
 	h.publisher.PublishCompleted(r.Context(), correlationID, principalID, *run, len(snapshots))
 
 	writeJSON(w, http.StatusCreated, domain.ConsolidationRunResponse{
@@ -200,10 +258,40 @@ func (h *Handler) StartRun(w http.ResponseWriter, r *http.Request) {
 		GroupLegalEntityID: req.GroupLegalEntityID,
 		FiscalPeriod:       req.FiscalPeriod,
 		Status:             "COMPLETED",
-		ExceptionCount:     0,
+		ExceptionCount:     exceptionCount,
 		StartedAt:          now,
 		Snapshots:          snapshots,
 	})
+}
+
+// eliminateMatchedEntry subtracts entry's real, posted net contribution
+// (debit - credit, both legs) from balances in place — the same sign
+// convention FetchTrialBalance itself uses when building consolidatedBalances,
+// so eliminating a leg here exactly reverses what it originally added.
+func (h *Handler) eliminateMatchedEntry(ctx context.Context, tenantID string, entry clients.IntercompanyEntry, balances map[string]float64) error {
+	sourceLines, err := h.clients.FetchJournalLines(ctx, tenantID, entry.SourceJournalID)
+	if err != nil {
+		return fmt.Errorf("source journal %s: %w", entry.SourceJournalID, err)
+	}
+	for _, l := range sourceLines {
+		balances[l.AccountCode] -= l.DebitAmount - l.CreditAmount
+	}
+
+	if entry.TargetJournalID == nil || *entry.TargetJournalID == "" {
+		// MatchEntry requires a target_journal_id to reach MATCHED status
+		// (see intercompany-accounting-svc's MatchEntryRequest) — a MATCHED
+		// entry with no target journal would itself be a defect in that
+		// service, not something to silently tolerate here.
+		return fmt.Errorf("matched entry has no target_journal_id")
+	}
+	targetLines, err := h.clients.FetchJournalLines(ctx, tenantID, *entry.TargetJournalID)
+	if err != nil {
+		return fmt.Errorf("target journal %s: %w", *entry.TargetJournalID, err)
+	}
+	for _, l := range targetLines {
+		balances[l.AccountCode] -= l.DebitAmount - l.CreditAmount
+	}
+	return nil
 }
 
 // ── GET /v1/consolidation/runs ────────────────────────────────────────────────────
@@ -302,6 +390,47 @@ func (h *Handler) ListSnapshots(w http.ResponseWriter, r *http.Request) {
 		snapshots = []domain.BalanceSnapshot{}
 	}
 	writeJSON(w, http.StatusOK, snapshots)
+}
+
+// ListContributions answers ACC-13's entity-to-group provenance question
+// directly: which child entities' balances actually summed into this run's
+// group-level numbers, before elimination. Same authz posture as
+// ListSnapshots — a run's provenance is exactly as sensitive as its result.
+func (h *Handler) ListContributions(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	run, err := h.store.GetRun(r.Context(), id)
+	if errors.Is(err, domain.ErrRunNotFound) {
+		writeError(w, http.StatusNotFound, "run_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch consolidation run", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, run.GroupLegalEntityID, actionRunView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	contributions, err := h.store.ListContributionsByRun(r.Context(), id)
+	if err != nil {
+		h.log.Error("failed to list balance contributions", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if contributions == nil {
+		contributions = []domain.BalanceContribution{}
+	}
+	writeJSON(w, http.StatusOK, contributions)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────

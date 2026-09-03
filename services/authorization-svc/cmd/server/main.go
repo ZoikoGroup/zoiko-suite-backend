@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -171,7 +172,8 @@ func main() {
 	// every caller still on the plain port above keeps working unchanged.
 	var mtlsSrv *http.Server
 	if cfg.MTLSEnabled {
-		identity, err := mtls.ProvisionServerIdentity(context.Background(), cfg.MTLSManagementServiceURL, "authorization-svc", platformScopeID)
+		bootstrapToken := loadMTLSBootstrapToken(cfg.MTLSBootstrapTokenPath, log)
+		identity, err := mtls.ProvisionServerIdentity(context.Background(), cfg.MTLSManagementServiceURL, "authorization-svc", platformScopeID, bootstrapToken)
 		if err != nil {
 			log.Fatal("mtls: failed to provision server identity", zap.Error(err))
 		}
@@ -226,4 +228,23 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Correlation-ID", r.Header.Get("X-Correlation-ID"))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// loadMTLSBootstrapToken reads the shared mTLS self-provisioning secret
+// from a file (see deployments/docker-compose.yml's mtls-bootstrap-keygen)
+// rather than an env var, so the value never appears in `docker inspect`/
+// process-list output. Returns "" when unset or unreadable — the
+// provisioning call this feeds then falls through to mtls-management-svc's
+// normal principal/authorize path and fails loudly, the same way it would
+// have before this bootstrap path existed.
+func loadMTLSBootstrapToken(path string, log *zap.Logger) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Warn("failed to read mtls bootstrap token file", zap.String("path", path), zap.Error(err))
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }

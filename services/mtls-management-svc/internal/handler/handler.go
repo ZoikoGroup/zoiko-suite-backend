@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -72,15 +73,20 @@ type AuthzChecker interface {
 }
 
 type Handler struct {
-	store  store.Store
-	ca     *ca.CA
-	siem   *siem.Client
-	authz  AuthzChecker
-	logger *zap.Logger
+	store          store.Store
+	ca             *ca.CA
+	siem           *siem.Client
+	authz          AuthzChecker
+	logger         *zap.Logger
+	bootstrapToken string
 }
 
-func New(s store.Store, c *ca.CA, siemClient *siem.Client, az AuthzChecker, l *zap.Logger) *Handler {
-	return &Handler{store: s, ca: c, siem: siemClient, authz: az, logger: l}
+// New constructs a Handler. bootstrapToken, when non-empty, enables the
+// self-provisioning bootstrap path on ProvisionCert (see its doc comment) —
+// leave it empty to disable that path entirely and require every caller to
+// go through the normal human/admin principal + authorize flow.
+func New(s store.Store, c *ca.CA, siemClient *siem.Client, az AuthzChecker, l *zap.Logger, bootstrapToken string) *Handler {
+	return &Handler{store: s, ca: c, siem: siemClient, authz: az, logger: l, bootstrapToken: bootstrapToken}
 }
 
 // requirePrincipal returns the gateway-verified principal, or refuses the
@@ -183,6 +189,36 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Self-provisioning bootstrap path: a service requesting its OWN first
+	// certificate has no principal, no session, and no prior credential to
+	// present — the standard PKI bootstrap problem. h.bootstrapToken is a
+	// shared secret distributed to trusted services out-of-band (a
+	// docker-compose-provisioned file, same pattern as identity-svc's JWT
+	// signing key — see deployments/docker-compose.yml's
+	// mtls-bootstrap-keygen), never through this platform's own vault
+	// service: secret-vault-integration-svc's Broker deliberately never
+	// discloses raw secret material to a caller (see its own doc comment),
+	// so it cannot be the delivery mechanism for a value a caller needs to
+	// present elsewhere. A caller presenting the correct shared token is
+	// authenticated AS req.ServiceName for this one provisioning call only —
+	// it grants no other capability on this service and bypasses no other
+	// route's principal/authorize check.
+	if h.bootstrapToken != "" {
+		if presented := r.Header.Get("X-Mtls-Bootstrap-Token"); presented != "" &&
+			subtle.ConstantTimeCompare([]byte(presented), []byte(h.bootstrapToken)) == 1 {
+			h.logger.Info("mtls: self-provisioning via bootstrap token",
+				zap.String("service_name", req.ServiceName), zap.String("common_name", req.CommonName))
+			issued, err := h.ca.IssueLeaf(req.CommonName, []string{req.ServiceName}, time.Duration(req.RotationDays)*24*time.Hour)
+			if err != nil {
+				h.logger.Error("failed to issue leaf certificate", zap.String("common_name", req.CommonName), zap.Error(err))
+				h.errJSON(w, 500, "failed to issue certificate")
+				return
+			}
+			h.recordAndRespond(w, r, tenantID, "bootstrap:"+req.ServiceName, req, issued)
+			return
+		}
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -197,7 +233,15 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 		h.errJSON(w, 500, "failed to issue certificate")
 		return
 	}
+	h.recordAndRespond(w, r, tenantID, principalID, req, issued)
+}
 
+// recordAndRespond persists an issued leaf certificate and writes the
+// provisioning response — the tail shared by both ProvisionCert's normal
+// human/admin-authorized path and its bootstrap self-provisioning path.
+// issuedByPrincipalID is audit metadata only (recorded nowhere yet beyond
+// logs/SIEM); it is never re-authorized here.
+func (h *Handler) recordAndRespond(w http.ResponseWriter, r *http.Request, tenantID, issuedByPrincipalID string, req domain.ProvisionCertRequest, issued *ca.IssuedCertificate) {
 	now := time.Now()
 	cert := &domain.MtlsCertificate{
 		TenantID:       tenantID,
@@ -224,7 +268,7 @@ func (h *Handler) ProvisionCert(w http.ResponseWriter, r *http.Request) {
 	// Doc 05 §13.2 names "certificate issuance/rotation events" as a
 	// required SIEM signal.
 	h.siem.Stream(r.Context(), tenantID, "certificate.issued", siem.SeverityLow,
-		"Certificate issued for "+req.ServiceName+" ("+req.CommonName+")")
+		"Certificate issued for "+req.ServiceName+" ("+req.CommonName+") by "+issuedByPrincipalID)
 
 	h.okJSON(w, 201, domain.ProvisionCertResult{
 		Certificate:   *cert,

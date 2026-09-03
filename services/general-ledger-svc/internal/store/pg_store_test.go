@@ -43,7 +43,11 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS journal_lines, journal_headers CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
+		journal_lines, journal_headers,
+		trial_balance_lines, trial_balance_snapshots,
+		account_mappings, chart_of_accounts
+		CASCADE;`)
 
 	// Every *.up.sql, sorted, rather than a list written out here.
 	//
@@ -51,7 +55,11 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	// schema no deployment has: 000004 is the one that FORCEs row-level
 	// security, which is the migration a store test most needs applied — the
 	// tests could not have caught the policy being wrong because the policy was
-	// never in force. Globbing means the next migration lands here too.
+	// never in force. Globbing means the next migration lands here too — and
+	// the DROP list above must grow with it: 000006-000008 each CREATE TABLE
+	// with no IF NOT EXISTS guard, so a second test in the same package
+	// re-running every migration against a table this DROP forgot fails with
+	// "relation already exists" rather than a fresh schema.
 	migrationDir := filepath.Join(base, "../../deployments/migrations")
 	migrations, err := filepath.Glob(filepath.Join(migrationDir, "*.up.sql"))
 	if err != nil {

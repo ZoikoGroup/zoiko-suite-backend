@@ -307,6 +307,58 @@ func TestVerify_CartaDeny_Returns403(t *testing.T) {
 	assert.Equal(t, "DENY", rec.Header().Get("X-Carta-Decision"))
 }
 
+// TestVerify_ResolvedTenantMismatch_Returns403 proves acceptance test O:
+// a validly-signed token claiming tenant-abc, presented against a request
+// GTRM's per-tenant routing already resolved to a DIFFERENT tenant, must be
+// rejected even though the token itself verifies cleanly.
+func TestVerify_ResolvedTenantMismatch_Returns403(t *testing.T) {
+	h, key, _ := newTestEnv(t)
+	tok := mintEnvelope(t, key, testKid, validClaims()) // tenant_id = "tenant-abc"
+
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Zoiko-Resolved-Tenant-Id", "tenant-xyz") // hostname resolved to a DIFFERENT tenant
+	rec := httptest.NewRecorder()
+
+	h.Verify(rec, req)
+
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Equal(t, "tenant_hostname_mismatch", rec.Header().Get("X-Carta-Decision"))
+}
+
+// TestVerify_ResolvedTenantMatches_Returns200 proves the matching case is
+// NOT a false positive — the same tenant on both sides passes normally.
+func TestVerify_ResolvedTenantMatches_Returns200(t *testing.T) {
+	h, key, _ := newTestEnv(t)
+	tok := mintEnvelope(t, key, testKid, validClaims()) // tenant_id = "tenant-abc"
+
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Zoiko-Resolved-Tenant-Id", "tenant-abc") // same tenant
+	rec := httptest.NewRecorder()
+
+	h.Verify(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// TestVerify_NoResolvedTenantHeader_Returns200 proves this is an honest,
+// additive check — a route GTRM hasn't onboarded yet (no header at all)
+// must behave exactly as before this defense existed, not fail closed on
+// an absent signal it was never given.
+func TestVerify_NoResolvedTenantHeader_Returns200(t *testing.T) {
+	h, key, _ := newTestEnv(t)
+	tok := mintEnvelope(t, key, testKid, validClaims())
+
+	req := httptest.NewRequest(http.MethodGet, "/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+
+	h.Verify(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
 func TestVerify_MissingPrincipalID_Returns401(t *testing.T) {
 	h, key, _ := newTestEnv(t)
 	claims := validClaims()
