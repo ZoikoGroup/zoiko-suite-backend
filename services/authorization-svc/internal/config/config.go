@@ -34,6 +34,13 @@ type Config struct {
 	MTLSEnabled              bool
 	MTLSPort                 int
 	MTLSManagementServiceURL string
+	// MTLSBootstrapTokenPath points at the shared self-provisioning secret
+	// (see deployments/docker-compose.yml's mtls-bootstrap-keygen). Empty
+	// means this service presents no bootstrap token and falls back to
+	// mtls-management-svc's normal principal/authorize path (which will
+	// fail, since this service has no principal at startup) — MTLSEnabled
+	// should not be turned on without this also being set.
+	MTLSBootstrapTokenPath string
 
 	// SIEMServiceURL is siem-integration-svc. Empty disables streaming —
 	// see internal/siem's doc comment.
@@ -95,6 +102,7 @@ func Load() (*Config, error) {
 		MTLSEnabled:              envBool("MTLS_ENABLED", false),
 		MTLSPort:                 envInt("MTLS_PORT", 8449),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSBootstrapTokenPath:   env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
 		SIEMServiceURL:           env("SIEM_SERVICE_URL", ""),
 	}, nil
 }

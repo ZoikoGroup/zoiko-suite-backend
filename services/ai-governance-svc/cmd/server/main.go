@@ -68,7 +68,8 @@ func main() {
 	publisher := events.NewKafkaPublisher(brokers, cfg.KafkaEventsTopic, logger)
 	var authzClient *authz.Client
 	if cfg.AuthzMTLSEnabled {
-		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "ai-governance-svc", platformScopeID)
+		bootstrapToken := loadMTLSBootstrapToken(cfg.MTLSBootstrapTokenPath, logger)
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(ctx, cfg.MTLSManagementServiceURL, "ai-governance-svc", platformScopeID, bootstrapToken)
 		if err != nil {
 			logger.Fatal("mtls: failed to provision client identity", zap.Error(err))
 		}
@@ -123,4 +124,20 @@ func main() {
 		pool.Close()
 	}
 	logger.Info("server stopped cleanly")
+}
+
+// loadMTLSBootstrapToken reads the shared mTLS self-provisioning secret
+// from a file (see deployments/docker-compose.yml's mtls-bootstrap-keygen)
+// rather than an env var, so the value never appears in `docker inspect`/
+// process-list output. Returns "" when unset or unreadable.
+func loadMTLSBootstrapToken(path string, log *zap.Logger) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Warn("failed to read mtls bootstrap token file", zap.String("path", path), zap.Error(err))
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }

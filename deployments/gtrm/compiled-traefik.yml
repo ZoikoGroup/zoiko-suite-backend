@@ -5,8 +5,8 @@
 #
 #   map_version:      47
 #   compiler_version: 0.1.0
-#   commit:           ce0a838
-#   generated_at:     2026-07-13T09:40:02Z
+#   commit:           613b7b1
+#   generated_at:     2026-09-03T11:49:03Z
 # ─────────────────────────────────────────────────────────────────────────────
 http:
     routers:
@@ -60,6 +60,7 @@ http:
                     X-Zoiko-GTRM-State: normal
                     X-Zoiko-Resolved-Region: eu
                     X-Zoiko-Resolved-Tenant: acme
+                    X-Zoiko-Resolved-Tenant-Id: tenant_acme_eu
         gtrm-ctx-atlas:
             headers:
                 customRequestHeaders:
@@ -67,6 +68,7 @@ http:
                     X-Zoiko-GTRM-State: normal
                     X-Zoiko-Resolved-Region: eu
                     X-Zoiko-Resolved-Tenant: atlas
+                    X-Zoiko-Resolved-Tenant-Id: tenant_atlas_multi
         gtrm-ctx-globex:
             headers:
                 customRequestHeaders:
@@ -74,6 +76,7 @@ http:
                     X-Zoiko-GTRM-State: normal
                     X-Zoiko-Resolved-Region: us
                     X-Zoiko-Resolved-Tenant: globex
+                    X-Zoiko-Resolved-Tenant-Id: tenant_globex_us
         gtrm-edge-strip:
             headers:
                 customRequestHeaders:
@@ -82,5 +85,6 @@ http:
                     X-Zoiko-Residency-Policy: ""
                     X-Zoiko-Resolved-Region: ""
                     X-Zoiko-Resolved-Tenant: ""
+                    X-Zoiko-Resolved-Tenant-Id: ""
                     X-Zoiko-Route-Decision: ""
                     X-Zoiko-Tenant: ""

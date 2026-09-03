@@ -88,6 +88,37 @@ func (h *Handler) Verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Token/hostname tenant mismatch defense — GTRM decision doc §6.2/§11
+	// (acceptance test O), which explicitly assigns this check to the
+	// application layer, not the router: "the app must reject a session
+	// token whose tenant/workspace claim ≠ hostname-resolved tenant."
+	//
+	// X-Zoiko-Resolved-Tenant-Id is set by GTRM's per-tenant Traefik context
+	// middleware AFTER stripping any externally-supplied copy of the same
+	// header (see gtrm/compiler/emit.go's untrustedInboundHeaders) — a
+	// client cannot forge it, only Traefik's own middleware chain can. When
+	// present, it is the canonical tenant_id the caller's HOSTNAME resolved
+	// to; if a validly-signed token nonetheless claims a different tenant,
+	// this is exactly the spoofing shape doc §6.2 names (a token minted for
+	// tenant A presented against tenant B's hostname) and must be rejected
+	// even though the token itself verified correctly.
+	//
+	// The header is only present for requests GTRM's per-tenant routers have
+	// resolved — today that's the GTRM Phase 1 proof slice, not yet every
+	// backend service's router. Its absence is not itself suspicious: it
+	// means this particular route hasn't been onboarded onto GTRM-resolved
+	// routing yet, so no comparison is made (an honest, not a fabricated,
+	// pass).
+	if resolvedTenantID := r.Header.Get("X-Zoiko-Resolved-Tenant-Id"); resolvedTenantID != "" && resolvedTenantID != claims.TenantID {
+		h.log.Warn("token/hostname tenant mismatch — rejecting",
+			zap.String("token_tenant_id", claims.TenantID),
+			zap.String("resolved_tenant_id", resolvedTenantID),
+			zap.String("forwarded_uri", r.Header.Get("X-Forwarded-Uri")),
+		)
+		h.denyWithReason(w, "token tenant does not match the hostname-resolved tenant", "tenant_hostname_mismatch")
+		return
+	}
+
 	// Continuous session-risk assessment (Doc 05 §3.11) — JWT verification
 	// above only proves the token was validly issued; this asks whether THIS
 	// request, right now, looks risky. A nil assessment means carta-svc is
