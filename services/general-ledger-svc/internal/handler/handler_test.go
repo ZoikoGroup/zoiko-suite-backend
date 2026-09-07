@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -54,17 +55,25 @@ type stubStore struct {
 
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
+
+	postingExecutions map[string]*domain.PostingExecution // by execution_id
+	bySourceEvent     map[string]string                   // "tenant|source_event_id" -> execution_id
+	createExecErr     error
+	markCommittedErr  error
+	markFailedErr     error
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		journals:        map[string]*domain.JournalHeader{},
-		lines:           map[string][]domain.JournalLine{},
-		byCorrelation:   map[string]string{},
-		trialBalances:   map[string]*domain.TrialBalanceSnapshot{},
-		accounts:        map[string]*domain.Account{},
-		accountsByCode:  map[string]*domain.Account{},
-		currentMappings: map[string]*domain.AccountMapping{},
+		journals:          map[string]*domain.JournalHeader{},
+		lines:             map[string][]domain.JournalLine{},
+		byCorrelation:     map[string]string{},
+		trialBalances:     map[string]*domain.TrialBalanceSnapshot{},
+		accounts:          map[string]*domain.Account{},
+		accountsByCode:    map[string]*domain.Account{},
+		currentMappings:   map[string]*domain.AccountMapping{},
+		postingExecutions: map[string]*domain.PostingExecution{},
+		bySourceEvent:     map[string]string{},
 	}
 }
 
@@ -305,6 +314,57 @@ func (s *stubStore) ListAccountMappings(_ context.Context, tenantID string) ([]d
 		}
 	}
 	return out, nil
+}
+
+func (s *stubStore) CreatePostingExecution(_ context.Context, e *domain.PostingExecution) error {
+	if s.createExecErr != nil {
+		return s.createExecErr
+	}
+	s.postingExecutions[e.ExecutionID] = e
+	if e.SourceEventID != nil {
+		s.bySourceEvent[e.TenantID+"|"+*e.SourceEventID] = e.ExecutionID
+	}
+	return nil
+}
+
+func (s *stubStore) GetPostingExecution(_ context.Context, tenantID, executionID string) (*domain.PostingExecution, error) {
+	e, ok := s.postingExecutions[executionID]
+	if !ok {
+		return nil, domain.ErrPostingExecutionNotFound
+	}
+	return e, nil
+}
+
+func (s *stubStore) GetPostingExecutionBySource(_ context.Context, tenantID, sourceEventID string) (*domain.PostingExecution, error) {
+	executionID, ok := s.bySourceEvent[tenantID+"|"+sourceEventID]
+	if !ok {
+		return nil, domain.ErrPostingExecutionNotFound
+	}
+	return s.postingExecutions[executionID], nil
+}
+
+func (s *stubStore) MarkPostingExecutionCommitted(_ context.Context, tenantID, executionID, journalID string, committedAt time.Time) error {
+	if s.markCommittedErr != nil {
+		return s.markCommittedErr
+	}
+	e, ok := s.postingExecutions[executionID]
+	if !ok {
+		return domain.ErrPostingExecutionNotFound
+	}
+	e.Status, e.JournalID, e.CommittedAt, e.FailureReason = domain.PostingExecutionStatusCommitted, &journalID, &committedAt, nil
+	return nil
+}
+
+func (s *stubStore) MarkPostingExecutionFailed(_ context.Context, tenantID, executionID, status, reason string) error {
+	if s.markFailedErr != nil {
+		return s.markFailedErr
+	}
+	e, ok := s.postingExecutions[executionID]
+	if !ok {
+		return domain.ErrPostingExecutionNotFound
+	}
+	e.Status, e.FailureReason = status, &reason
+	return nil
 }
 
 // Compile-time proof the stub still satisfies the contract the handler

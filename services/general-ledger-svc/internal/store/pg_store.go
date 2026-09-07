@@ -892,3 +892,110 @@ func (s *PgStore) DeactivateAccount(ctx context.Context, tenantID, accountCode s
 	})
 	return err
 }
+
+// ── ACC-04 (Posting Engine) ───────────────────────────────────────────────────
+
+const postingExecutionColumns = `
+	execution_id, tenant_id, legal_entity_id, kind, source_event_id, idempotency_key,
+	status, journal_id, calculation_trace::text, failure_reason, correlation_id,
+	created_at, created_by_principal_id, committed_at`
+
+func scanPostingExecution(row pgx.Row) (*domain.PostingExecution, error) {
+	var e domain.PostingExecution
+	if err := row.Scan(
+		&e.ExecutionID, &e.TenantID, &e.LegalEntityID, &e.Kind, &e.SourceEventID, &e.IdempotencyKey,
+		&e.Status, &e.JournalID, &e.CalculationTrace, &e.FailureReason, &e.CorrelationID,
+		&e.CreatedAt, &e.CreatedByPrincipalID, &e.CommittedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+// CreatePostingExecution inserts a new execution in SUBMITTED status.
+// Idempotent on the migration's own UNIQUE(tenant_id, source_event_id)
+// partial index — a replayed PostAccountingEvent for the same
+// source_event_id is caught by GetPostingExecutionBySource before this is
+// ever called, so this method itself simply fails loudly (mapPgError) on
+// the rare race where two concurrent callers both lost that check.
+func (s *PgStore) CreatePostingExecution(ctx context.Context, e *domain.PostingExecution) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return domain.ErrIdentityMissing
+	}
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO posting_executions (
+				execution_id, tenant_id, legal_entity_id, kind, source_event_id, idempotency_key,
+				status, calculation_trace, correlation_id, created_at, created_by_principal_id
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)
+		`, e.ExecutionID, tenantID, e.LegalEntityID, e.Kind, e.SourceEventID, e.IdempotencyKey,
+			e.Status, e.CalculationTrace, e.CorrelationID, e.CreatedAt, e.CreatedByPrincipalID)
+		return mapPgError(err)
+	})
+}
+
+func (s *PgStore) GetPostingExecution(ctx context.Context, tenantID, executionID string) (*domain.PostingExecution, error) {
+	var e *domain.PostingExecution
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+postingExecutionColumns+` FROM posting_executions WHERE tenant_id = $1 AND execution_id = $2`, tenantID, executionID)
+		var err error
+		e, err = scanPostingExecution(row)
+		return mapPgError(err)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrPostingExecutionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// GetPostingExecutionBySource is ACC-04's own idempotency check — the
+// spec's own negative path, "Duplicate source event," relies on this
+// returning the PRIOR execution rather than a caller creating a second
+// one for the same source_event_id.
+func (s *PgStore) GetPostingExecutionBySource(ctx context.Context, tenantID, sourceEventID string) (*domain.PostingExecution, error) {
+	var e *domain.PostingExecution
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+postingExecutionColumns+` FROM posting_executions WHERE tenant_id = $1 AND source_event_id = $2`, tenantID, sourceEventID)
+		var err error
+		e, err = scanPostingExecution(row)
+		return mapPgError(err)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrPostingExecutionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return e, nil
+}
+
+// MarkPostingExecutionCommitted records the terminal success outcome —
+// the journal this execution produced. No fromStatus guard: this is
+// always the one terminal write a given execution makes, called exactly
+// once per successful attempt (initial or reprocessed).
+func (s *PgStore) MarkPostingExecutionCommitted(ctx context.Context, tenantID, executionID, journalID string, committedAt time.Time) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE posting_executions SET status = $1, journal_id = $2, committed_at = $3, failure_reason = NULL
+			WHERE tenant_id = $4 AND execution_id = $5
+		`, domain.PostingExecutionStatusCommitted, journalID, committedAt, tenantID, executionID)
+		return mapPgError(err)
+	})
+}
+
+// MarkPostingExecutionFailed records a failed or quarantined outcome —
+// never left silently in an intermediate status, per the spec's own
+// state model ("no partial committed state").
+func (s *PgStore) MarkPostingExecutionFailed(ctx context.Context, tenantID, executionID, status, reason string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE posting_executions SET status = $1, failure_reason = $2
+			WHERE tenant_id = $3 AND execution_id = $4
+		`, status, reason, tenantID, executionID)
+		return mapPgError(err)
+	})
+}

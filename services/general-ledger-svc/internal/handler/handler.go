@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -54,6 +55,13 @@ type Store interface {
 	SetAccountMapping(ctx context.Context, m *domain.AccountMapping) error
 	GetCurrentAccountMapping(ctx context.Context, tenantID, mappingKey string) (*domain.AccountMapping, error)
 	ListAccountMappings(ctx context.Context, tenantID string) ([]domain.AccountMapping, error)
+
+	// ACC-04 Posting Engine — see migration 000009's doc comment.
+	CreatePostingExecution(ctx context.Context, e *domain.PostingExecution) error
+	GetPostingExecution(ctx context.Context, tenantID, executionID string) (*domain.PostingExecution, error)
+	GetPostingExecutionBySource(ctx context.Context, tenantID, sourceEventID string) (*domain.PostingExecution, error)
+	MarkPostingExecutionCommitted(ctx context.Context, tenantID, executionID, journalID string, committedAt time.Time) error
+	MarkPostingExecutionFailed(ctx context.Context, tenantID, executionID, status, reason string) error
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -100,6 +108,21 @@ const (
 	// ACC-02 Account Mapping actions.
 	actionSetAccountMapping  = "COA_MAPPING_SET"
 	actionViewAccountMapping = "COA_MAPPING_VIEW"
+
+	// ACC-04 Posting Engine actions. The spec names a single execute action
+	// literally ("accounting.post.execute internal") and requires it never
+	// be reachable by ordinary human bypass of source approval/SoD — this
+	// platform enforces WHICH identities hold an action via
+	// authorization-svc's own role grants, so actionPostingExecute is the
+	// namespaced action a deployment would grant ONLY to internal service
+	// identities, never a general human role. actionPostingReverse is
+	// deliberately separate ("reversal requires authorized correction
+	// command") — a correction is a materially more sensitive act than an
+	// ordinary posting.
+	actionPostingExecute   = "GL_POSTING_EXECUTE"
+	actionPostingReverse   = "GL_POSTING_REVERSE"
+	actionPostingReprocess = "GL_POSTING_REPROCESS"
+	actionPostingView      = "GL_POSTING_VIEW"
 )
 
 // coaPlatformScopeID is the legal_entity_id presented to authorization-svc
@@ -145,6 +168,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.SetAccountMapping)
 		r.Get("/", h.ListAccountMappings)
 		r.Get("/{mapping_key}", h.GetAccountMapping)
+	})
+	r.Route("/v1/postings", func(r chi.Router) {
+		r.Post("/events", h.PostAccountingEvent)
+		r.Post("/journals", h.PostApprovedJournal)
+		r.Post("/reversals", h.CreateReversalPosting)
+		r.Get("/by-source", h.GetPostingBySource)
+		r.Get("/verify-uniqueness", h.VerifyPostingUniqueness)
+		r.Get("/{execution_id}", h.GetPostingExecution)
+		r.Get("/{execution_id}/explain", h.ExplainPosting)
+		r.Post("/{execution_id}/reprocess", h.ReprocessFailedPosting)
 	})
 }
 
@@ -990,6 +1023,568 @@ func (h *Handler) reversalReplay(ctx context.Context, header *domain.JournalHead
 		return nil, nil, false
 	}
 	return existing, lines, true
+}
+
+// ── ACC-04 (Posting Engine) ───────────────────────────────────────────────────
+//
+// "owns PostingExecution, calculation trace, rule resolution, posting
+// batch and consequence uniqueness record; ledger entries are committed
+// to ACC-05." In this platform's own co-located deployment, ACC-05 IS
+// this same service's journal_headers/journal_lines — so ACC-04
+// deliberately ORCHESTRATES the existing Create/Validate/Post primitives
+// (checkAccountRestrictions, closeClient.CheckPeriodOpen, store.CreateJournal,
+// store.SumLines, store.TransitionJournal, store.ReverseJournal) rather than
+// re-implementing ledger writes, exactly matching the spec's own boundary:
+// "must never own: Source business fact, tax determination" — a caller
+// still supplies the business fact (which accounts, which amounts); ACC-04
+// only decides HOW that gets committed, atomically, exactly once.
+
+// resolvePostingLines turns caller-declared PostingEventLineInput lines
+// into real journal lines, resolving any mapping_key via ACC-02. The
+// spec's own negative path, "Posting rule ambiguity," is enforced here: a
+// line naming neither or both of account_code/mapping_key, or a
+// mapping_key with no current mapping, is refused rather than guessed.
+func (h *Handler) resolvePostingLines(ctx context.Context, tenantID string, lines []domain.PostingEventLineInput) ([]domain.CreateJournalLineInput, map[string]string, error) {
+	resolved := make([]domain.CreateJournalLineInput, len(lines))
+	trace := make(map[string]string, len(lines))
+	for i, l := range lines {
+		hasCode := l.AccountCode != nil && *l.AccountCode != ""
+		hasMapping := l.MappingKey != nil && *l.MappingKey != ""
+		if hasCode == hasMapping { // both or neither
+			return nil, nil, domain.ErrPostingRuleAmbiguous
+		}
+		accountCode := ""
+		if hasCode {
+			accountCode = *l.AccountCode
+			trace[fmt.Sprintf("line_%d", i)] = "account_code:" + accountCode
+		} else {
+			m, err := h.store.GetCurrentAccountMapping(ctx, tenantID, *l.MappingKey)
+			if err != nil {
+				return nil, nil, domain.ErrPostingRuleAmbiguous
+			}
+			accountCode = m.AccountCode
+			trace[fmt.Sprintf("line_%d", i)] = "mapping_key:" + *l.MappingKey + " -> account_code:" + accountCode
+		}
+		if !exactlyOneNonZero(l.DebitAmount, l.CreditAmount) {
+			return nil, nil, domain.ErrInvalidLine
+		}
+		resolved[i] = domain.CreateJournalLineInput{
+			AccountCode:  accountCode,
+			DebitAmount:  l.DebitAmount,
+			CreditAmount: l.CreditAmount,
+			Description:  l.Description,
+		}
+	}
+	return resolved, trace, nil
+}
+
+// commitJournal drives an already-created PENDING journal through the
+// exact same Validate and Post transitions ValidateJournal/PostJournal's
+// own handlers use — including a period-lock re-check immediately before
+// the FINALIZED transition, the spec's own negative path, "Closed period
+// race during commit": a period locked AFTER this journal was created but
+// BEFORE it is actually posted must still block the commit.
+func (h *Handler) commitJournal(ctx context.Context, header *domain.JournalHeader, principalID string) error {
+	debitTotal, creditTotal, err := h.store.SumLines(ctx, header.TenantID, header.JournalID)
+	if err != nil {
+		return err
+	}
+	if debitTotal != creditTotal {
+		return domain.ErrUnbalancedJournal
+	}
+	if err := h.store.TransitionJournal(ctx, header.TenantID, header.JournalID,
+		domain.JournalStatusPending, domain.JournalStatusValidated, principalID); err != nil {
+		return err
+	}
+	if err := h.closeClient.CheckPeriodOpen(ctx, header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+		return err
+	}
+	return h.store.TransitionJournal(ctx, header.TenantID, header.JournalID,
+		domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID)
+}
+
+// PostAccountingEvent is ACC-04's primary command: given a caller-declared
+// accounting event, resolve its lines, create the journal, and commit it —
+// atomically, exactly once per source_event_id.
+func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
+	var req domain.PostAccountingEventRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.FiscalPeriod == "" || req.SourceEventID == "" || req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id, fiscal_period, source_event_id and correlation_id are required")
+		return
+	}
+	if len(req.Lines) == 0 {
+		writeError(w, http.StatusBadRequest, "no_lines", domain.ErrNoLines.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionPostingExecute); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// Duplicate source event: return the PRIOR execution, never a second
+	// posting consequence for the same source fact.
+	if existing, err := h.store.GetPostingExecutionBySource(r.Context(), tenantID, req.SourceEventID); err == nil {
+		writeJSON(w, http.StatusOK, existing)
+		return
+	} else if !errors.Is(err, domain.ErrPostingExecutionNotFound) {
+		h.log.Error("PostAccountingEvent: failed to check for an existing execution", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	resolvedLines, trace, err := h.resolvePostingLines(r.Context(), tenantID, req.Lines)
+	if err != nil {
+		if errors.Is(err, domain.ErrPostingRuleAmbiguous) {
+			writeError(w, http.StatusUnprocessableEntity, "posting_rule_ambiguous", err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid_line", err.Error())
+		}
+		return
+	}
+
+	journalReq := domain.CreateJournalRequest{
+		TenantID: tenantID, LegalEntityID: req.LegalEntityID, FiscalPeriod: req.FiscalPeriod,
+		Description: req.Description, Lines: resolvedLines, CorrelationID: req.CorrelationID,
+		SourceEventID: &req.SourceEventID,
+	}
+	if err := h.closeClient.CheckPeriodOpen(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod); err != nil {
+		h.writePeriodErr(w, err)
+		return
+	}
+	if !h.checkAccountRestrictions(w, r, journalReq, principalID) {
+		return
+	}
+
+	traceJSON, _ := json.Marshal(trace)
+	sourceEventID := req.SourceEventID
+	exec := &domain.PostingExecution{
+		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID, Kind: domain.PostingExecutionKindEvent,
+		SourceEventID: &sourceEventID, Status: domain.PostingExecutionStatusSubmitted,
+		CalculationTrace: string(traceJSON), CorrelationID: req.CorrelationID,
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	}
+	if err := h.store.CreatePostingExecution(r.Context(), exec); err != nil {
+		h.log.Error("PostAccountingEvent: failed to record posting execution", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	header := &domain.JournalHeader{
+		JournalID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
+		FiscalPeriod: req.FiscalPeriod, Status: domain.JournalStatusPending, Description: req.Description,
+		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID, SourceEventID: &sourceEventID,
+	}
+	lines := make([]domain.JournalLine, len(resolvedLines))
+	for i, l := range resolvedLines {
+		lines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount, Description: l.Description}
+	}
+	if _, _, err := h.store.CreateJournal(r.Context(), header, lines); err != nil {
+		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	if err := h.commitJournal(r.Context(), header, principalID); err != nil {
+		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+		h.writePeriodErr(w, err)
+		return
+	}
+
+	now := time.Now().UTC()
+	if err := h.store.MarkPostingExecutionCommitted(r.Context(), tenantID, exec.ExecutionID, header.JournalID, now); err != nil {
+		h.log.Error("journal committed but the posting execution could not be marked COMMITTED",
+			zap.String("execution_id", exec.ExecutionID), zap.String("journal_id", header.JournalID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "execution_not_recorded",
+			"the journal IS finalized ("+header.JournalID+"), but the posting execution could not be marked COMMITTED.")
+		return
+	}
+	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &header.JournalID, &now
+	h.publisher.PublishJournalPosted(r.Context(), *header)
+	writeJSON(w, http.StatusCreated, exec)
+}
+
+// failExecution marks an execution FAILED (or QUARANTINED for an
+// ambiguous/unbalanced posting rule, which needs a human to resolve
+// rather than a simple retry) with the underlying error as its permanent,
+// evidenced reason — the spec's own state model, "no partial committed
+// state": an execution is never left silently stuck in SUBMITTED.
+func (h *Handler) failExecution(ctx context.Context, tenantID, executionID string, cause error) {
+	status := domain.PostingExecutionStatusFailed
+	if errors.Is(cause, domain.ErrPostingRuleAmbiguous) || errors.Is(cause, domain.ErrUnbalancedJournal) {
+		status = domain.PostingExecutionStatusQuarantined
+	}
+	if err := h.store.MarkPostingExecutionFailed(ctx, tenantID, executionID, status, cause.Error()); err != nil {
+		h.log.Error("failed to record posting execution failure", zap.String("execution_id", executionID), zap.Error(err))
+	}
+}
+
+func (h *Handler) writePeriodErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, domain.ErrPeriodLocked) {
+		writeError(w, http.StatusPreconditionFailed, "period_locked", err.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrUnbalancedJournal) {
+		writeError(w, http.StatusUnprocessableEntity, "unbalanced_journal", err.Error())
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, "close_check_failed", err.Error())
+}
+
+// PostApprovedJournal wraps the final VALIDATED -> FINALIZED commit of an
+// already-existing journal (created via the ordinary journal API, e.g.
+// ACC-03's own approval flow) in a PostingExecution audit record — the
+// spec's "approved journal" input is this platform's VALIDATED status;
+// posting a still-PENDING journal is refused rather than silently
+// validating it first, since that is a separate, distinctly-authorized
+// step this command must not fold in unannounced.
+func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
+	var req domain.PostApprovedJournalRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.JournalID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "journal_id")
+		return
+	}
+	header, _, err := h.store.GetJournal(r.Context(), req.JournalID)
+	if err != nil {
+		h.log.Error("PostApprovedJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionPostingExecute); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if header.Status != domain.JournalStatusValidated {
+		writeError(w, http.StatusUnprocessableEntity, "journal_not_validated",
+			"journal must be VALIDATED before it can be posted through the posting engine; current status: "+string(header.Status))
+		return
+	}
+
+	exec := &domain.PostingExecution{
+		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: header.LegalEntityID, Kind: domain.PostingExecutionKindApprovedJournal,
+		Status: domain.PostingExecutionStatusSubmitted, CalculationTrace: "{}", CorrelationID: header.CorrelationID,
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	}
+	if err := h.store.CreatePostingExecution(r.Context(), exec); err != nil {
+		h.log.Error("PostApprovedJournal: failed to record posting execution", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+		h.writePeriodErr(w, err)
+		return
+	}
+	if err := h.store.TransitionJournal(r.Context(), header.TenantID, req.JournalID,
+		domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {
+		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	now := time.Now().UTC()
+	if err := h.store.MarkPostingExecutionCommitted(r.Context(), tenantID, exec.ExecutionID, req.JournalID, now); err != nil {
+		h.log.Error("journal finalized but the posting execution could not be marked COMMITTED", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "execution_not_recorded",
+			"the journal IS finalized ("+req.JournalID+"), but the posting execution could not be marked COMMITTED.")
+		return
+	}
+	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &req.JournalID, &now
+	header.Status = domain.JournalStatusFinalized
+	h.publisher.PublishJournalPosted(r.Context(), *header)
+	writeJSON(w, http.StatusOK, exec)
+}
+
+// CreateReversalPosting wraps the existing ReverseJournal store primitive
+// in its own PostingExecution record. Deliberately its own authorization
+// action (actionPostingReverse) — the spec's own words: "reversal
+// requires authorized correction command."
+func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateReversalPostingRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.OriginalJournalID == "" || req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "original_journal_id and reason are required")
+		return
+	}
+
+	header, _, err := h.store.GetJournal(r.Context(), req.OriginalJournalID)
+	if err != nil {
+		h.log.Error("CreateReversalPosting: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionPostingReverse); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if header.Status != domain.JournalStatusFinalized {
+		writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible", domain.ErrOnlyFinalizedReversible.Error())
+		return
+	}
+	if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+		h.writePeriodErr(w, err)
+		return
+	}
+
+	correlationID := "posting-reversal:" + req.OriginalJournalID
+	exec := &domain.PostingExecution{
+		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: header.LegalEntityID, Kind: domain.PostingExecutionKindReversal,
+		Status: domain.PostingExecutionStatusSubmitted, CalculationTrace: "{}", CorrelationID: correlationID,
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
+	}
+	if err := h.store.CreatePostingExecution(r.Context(), exec); err != nil {
+		h.log.Error("CreateReversalPosting: failed to record posting execution", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	reversalID := req.OriginalJournalID
+	reversingHeader := &domain.JournalHeader{
+		JournalID: uuid.NewString(), TenantID: header.TenantID, LegalEntityID: header.LegalEntityID,
+		FiscalPeriod: header.FiscalPeriod, Status: domain.JournalStatusFinalized, ReversalOfJournalID: &reversalID,
+		Description: "Reversal of " + req.OriginalJournalID + ": " + req.Reason, CreatedByPrincipalID: principalID,
+		PostedByPrincipalID: &principalID, CorrelationID: correlationID,
+	}
+	_, originalLines, err := h.store.GetJournal(r.Context(), req.OriginalJournalID)
+	if err != nil {
+		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	reversingLines := make([]domain.JournalLine, len(originalLines))
+	for i, l := range originalLines {
+		reversingLines[i] = domain.JournalLine{AccountCode: l.AccountCode, DebitAmount: l.CreditAmount, CreditAmount: l.DebitAmount, Description: l.Description}
+	}
+
+	_, _, err = h.store.ReverseJournal(r.Context(), header.TenantID, req.OriginalJournalID, reversingHeader, reversingLines, principalID)
+	if err != nil {
+		h.failExecution(r.Context(), tenantID, exec.ExecutionID, err)
+		if errors.Is(err, domain.ErrInvalidTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "only_finalized_reversible", domain.ErrOnlyFinalizedReversible.Error())
+			return
+		}
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	now := time.Now().UTC()
+	if err := h.store.MarkPostingExecutionCommitted(r.Context(), tenantID, exec.ExecutionID, reversingHeader.JournalID, now); err != nil {
+		h.log.Error("reversal posted but the posting execution could not be marked COMMITTED", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "execution_not_recorded",
+			"the reversal journal IS finalized ("+reversingHeader.JournalID+"), but the posting execution could not be marked COMMITTED.")
+		return
+	}
+	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &reversingHeader.JournalID, &now
+	h.publisher.PublishJournalReversed(r.Context(), *header, reversingHeader.JournalID)
+	writeJSON(w, http.StatusCreated, exec)
+}
+
+// ReprocessFailedPosting retries a FAILED/QUARANTINED execution.
+// Deliberately scoped to executions that already produced a journal (the
+// original create step succeeded but commit failed, e.g. a transient
+// period-lock race) — an execution that failed before any journal ever
+// existed carries no persisted original request to safely replay, and
+// resubmitting as a brand-new PostAccountingEvent is the honest path
+// rather than fabricating a retry from data this record never kept.
+func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request) {
+	executionID := chi.URLParam(r, "execution_id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	exec, err := h.store.GetPostingExecution(r.Context(), tenantID, executionID)
+	if err != nil {
+		h.writePostingExecutionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, exec.LegalEntityID, actionPostingReprocess); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if exec.Status == domain.PostingExecutionStatusCommitted {
+		writeError(w, http.StatusUnprocessableEntity, "already_committed", domain.ErrPostingAlreadyCommitted.Error())
+		return
+	}
+	if exec.Status != domain.PostingExecutionStatusFailed && exec.Status != domain.PostingExecutionStatusQuarantined {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidPostingTransition.Error())
+		return
+	}
+	if exec.JournalID == nil {
+		writeError(w, http.StatusUnprocessableEntity, "no_journal_to_reprocess",
+			"this execution failed before any journal was created; resubmit as a new posting request")
+		return
+	}
+
+	header, _, err := h.store.GetJournal(r.Context(), *exec.JournalID)
+	if err != nil || header == nil {
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header.Status == domain.JournalStatusPending {
+		if err := h.commitJournal(r.Context(), header, principalID); err != nil {
+			h.failExecution(r.Context(), tenantID, executionID, err)
+			h.writePeriodErr(w, err)
+			return
+		}
+	} else if header.Status == domain.JournalStatusValidated {
+		if err := h.closeClient.CheckPeriodOpen(r.Context(), header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
+			h.failExecution(r.Context(), tenantID, executionID, err)
+			h.writePeriodErr(w, err)
+			return
+		}
+		if err := h.store.TransitionJournal(r.Context(), header.TenantID, header.JournalID,
+			domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {
+			h.failExecution(r.Context(), tenantID, executionID, err)
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+			return
+		}
+	}
+
+	now := time.Now().UTC()
+	if err := h.store.MarkPostingExecutionCommitted(r.Context(), tenantID, executionID, *exec.JournalID, now); err != nil {
+		h.log.Error("journal committed on reprocess but the posting execution could not be marked COMMITTED", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "execution_not_recorded", "")
+		return
+	}
+	exec.Status, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &now
+	writeJSON(w, http.StatusOK, exec)
+}
+
+func (h *Handler) GetPostingExecution(w http.ResponseWriter, r *http.Request) {
+	executionID := chi.URLParam(r, "execution_id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	exec, err := h.store.GetPostingExecution(r.Context(), tenantID, executionID)
+	if err != nil {
+		h.writePostingExecutionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, exec.LegalEntityID, actionPostingView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, exec)
+}
+
+// ExplainPosting answers ACC-04's own ExplainPosting query — the same
+// record GetPostingExecution returns, since CalculationTrace (the "why"
+// this execution resolved the way it did) is already carried on the
+// execution itself rather than computed separately.
+func (h *Handler) ExplainPosting(w http.ResponseWriter, r *http.Request) {
+	h.GetPostingExecution(w, r)
+}
+
+func (h *Handler) GetPostingBySource(w http.ResponseWriter, r *http.Request) {
+	sourceEventID := r.URL.Query().Get("source_event_id")
+	if sourceEventID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "source_event_id")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	exec, err := h.store.GetPostingExecutionBySource(r.Context(), tenantID, sourceEventID)
+	if err != nil {
+		h.writePostingExecutionErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, exec.LegalEntityID, actionPostingView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, exec)
+}
+
+// VerifyPostingUniqueness answers whether a source_event_id has already
+// produced a posting execution — a plain boolean, never itself the full
+// record (GetPostingBySource is the read for that).
+func (h *Handler) VerifyPostingUniqueness(w http.ResponseWriter, r *http.Request) {
+	sourceEventID := r.URL.Query().Get("source_event_id")
+	if sourceEventID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "source_event_id")
+		return
+	}
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	_, err := h.store.GetPostingExecutionBySource(r.Context(), tenantID, sourceEventID)
+	if err != nil && !errors.Is(err, domain.ErrPostingExecutionNotFound) {
+		h.log.Error("VerifyPostingUniqueness: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"exists": err == nil})
+}
+
+func (h *Handler) writePostingExecutionErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, domain.ErrPostingExecutionNotFound) {
+		writeError(w, http.StatusNotFound, "posting_execution_not_found", "")
+		return
+	}
+	h.log.Error("posting execution store unavailable", zap.Error(err))
+	writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

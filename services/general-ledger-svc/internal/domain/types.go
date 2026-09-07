@@ -206,6 +206,85 @@ type SetAccountMappingRequest struct {
 	AccountCode string `json:"account_code"`
 }
 
+// Posting execution lifecycle states (ACC-04's state model, verbatim from
+// spec: "Submitted → Validating → Ready → Committed or Failed/Quarantined;
+// no partial committed state").
+const (
+	PostingExecutionStatusSubmitted   = "SUBMITTED"
+	PostingExecutionStatusValidating  = "VALIDATING"
+	PostingExecutionStatusReady       = "READY"
+	PostingExecutionStatusCommitted   = "COMMITTED"
+	PostingExecutionStatusFailed      = "FAILED"
+	PostingExecutionStatusQuarantined = "QUARANTINED"
+)
+
+// PostingExecutionKind distinguishes which ACC-04 command created a
+// posting_executions row.
+const (
+	PostingExecutionKindEvent           = "EVENT"
+	PostingExecutionKindApprovedJournal = "APPROVED_JOURNAL"
+	PostingExecutionKindReversal        = "REVERSAL"
+)
+
+// PostingExecution is ACC-04's own authority — "PostingExecution,
+// calculation trace, rule resolution, posting batch and consequence
+// uniqueness record; ledger entries are committed to ACC-05," explicitly
+// never "Source business fact, tax determination": every posting
+// execution's REQUIRED input is an already-approved journal or event —
+// ACC-04 orchestrates the commit, it never decides what should be posted.
+type PostingExecution struct {
+	ExecutionID          string     `json:"execution_id"`
+	TenantID             string     `json:"tenant_id"`
+	LegalEntityID        string     `json:"legal_entity_id"`
+	Kind                 string     `json:"kind"`
+	SourceEventID        *string    `json:"source_event_id,omitempty"`
+	IdempotencyKey       *string    `json:"idempotency_key,omitempty"`
+	Status               string     `json:"status"`
+	JournalID            *string    `json:"journal_id,omitempty"`
+	CalculationTrace     string     `json:"calculation_trace"` // raw JSON — see ExplainPosting
+	FailureReason        *string    `json:"failure_reason,omitempty"`
+	CorrelationID        string     `json:"correlation_id"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	CommittedAt          *time.Time `json:"committed_at,omitempty"`
+}
+
+// PostingEventLineInput is one line of a caller-declared accounting event.
+// Exactly one of AccountCode/MappingKey must be set — both or neither is
+// the spec's own negative path, "Posting rule ambiguity."
+type PostingEventLineInput struct {
+	AccountCode  *string `json:"account_code,omitempty"`
+	MappingKey   *string `json:"mapping_key,omitempty"`
+	DebitAmount  float64 `json:"debit_amount,omitempty"`
+	CreditAmount float64 `json:"credit_amount,omitempty"`
+	Description  string  `json:"description,omitempty"`
+}
+
+// PostAccountingEventRequest is ACC-04's PostAccountingEvent command input
+// — the required source inputs the spec names: "approved accounting
+// event/journal; entity/book; source amounts; dimensions; tax result;
+// source references; idempotency key." (Tax result and dimensions are
+// accepted as opaque, caller-declared pass-through fields where this
+// platform has no owning service for them yet, same posture as ACC-03's
+// own book_id/reporting_basis fields.)
+type PostAccountingEventRequest struct {
+	LegalEntityID string                  `json:"legal_entity_id"`
+	FiscalPeriod  string                  `json:"fiscal_period"`
+	Description   string                  `json:"description"`
+	SourceEventID string                  `json:"source_event_id"`
+	CorrelationID string                  `json:"correlation_id"`
+	Lines         []PostingEventLineInput `json:"lines"`
+}
+
+type PostApprovedJournalRequest struct {
+	JournalID string `json:"journal_id"`
+}
+
+type CreateReversalPostingRequest struct {
+	OriginalJournalID string `json:"original_journal_id"`
+	Reason            string `json:"reason"`
+}
+
 type CompileTrialBalanceRequest struct {
 	LegalEntityID string `json:"legal_entity_id"`
 	FiscalPeriod  string `json:"fiscal_period"`
@@ -329,4 +408,20 @@ var (
 	// exists but is INACTIVE — ACC-02 must never map a business concept
 	// onto an account that can't legitimately be posted to.
 	ErrMappingTargetAccountInvalid = errorString("account_code does not name an existing ACTIVE account in the Chart of Accounts")
+
+	ErrPostingExecutionNotFound = errorString("posting execution not found")
+
+	// ErrPostingRuleAmbiguous is returned when a posting line names neither
+	// or both of account_code/mapping_key, or a named mapping_key resolves
+	// to no current mapping — the spec's own negative path, "Posting rule
+	// ambiguity": ACC-04 must never guess which account a line posts to.
+	ErrPostingRuleAmbiguous = errorString("posting rule is ambiguous: each line must name exactly one of account_code or mapping_key, and a mapping_key must resolve")
+
+	ErrInvalidPostingTransition = errorString("posting execution is not in a status that allows this action")
+
+	// ErrPostingAlreadyCommitted is returned by ReprocessFailedPosting when
+	// the named execution already reached COMMITTED — a committed posting
+	// consequence is permanent; reprocessing exists for FAILED/QUARANTINED
+	// executions only, never to retry one that already succeeded.
+	ErrPostingAlreadyCommitted = errorString("posting execution is already COMMITTED and cannot be reprocessed")
 )
