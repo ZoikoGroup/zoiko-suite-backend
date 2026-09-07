@@ -293,6 +293,9 @@ func TestPostApprovedJournal_ValidatedJournal_CommitsWithExecutionRecord(t *test
 	s.journals["j-validated"] = &domain.JournalHeader{
 		JournalID: "j-validated", TenantID: testTenantID, LegalEntityID: "e1",
 		FiscalPeriod: "2026-07", Status: domain.JournalStatusValidated,
+		// Completed ACC-03's own approval workflow — the real precondition
+		// PostApprovedJournal now checks, not just JournalStatus.
+		ApprovalStatus: domain.ApprovalStatusPostingRequested,
 	}
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
 
@@ -304,8 +307,37 @@ func TestPostApprovedJournal_ValidatedJournal_CommitsWithExecutionRecord(t *test
 	if s.journals["j-validated"].Status != domain.JournalStatusFinalized {
 		t.Errorf("expected FINALIZED, got %q", s.journals["j-validated"].Status)
 	}
+	// The ACC-03/ACC-04 integration point: committing the ledger entry
+	// must also close the loop back to ACC-03's own lifecycle.
+	if s.journals["j-validated"].ApprovalStatus != domain.ApprovalStatusPosted {
+		t.Errorf("expected ApprovalStatus POSTED, got %q", s.journals["j-validated"].ApprovalStatus)
+	}
 	if len(s.postingExecutions) != 1 {
 		t.Fatalf("expected the commit to leave a posting execution record, got %d", len(s.postingExecutions))
+	}
+}
+
+// The real ACC-03/ACC-04 integration point: a VALIDATED journal that never
+// went through ACC-03's RequestPosting step must be refused, not silently
+// posted. Before this gate existed, PostApprovedJournal accepted ANY
+// VALIDATED journal — the spec's own "Dependencies: ... ACC-04" line
+// requires the posting engine actually depend on ACC-03 having run.
+func TestPostApprovedJournal_ValidatedButNeverRequestedPosting_Refused(t *testing.T) {
+	s := newStubStore()
+	s.journals["j-validated"] = &domain.JournalHeader{
+		JournalID: "j-validated", TenantID: testTenantID, LegalEntityID: "e1",
+		FiscalPeriod: "2026-07", Status: domain.JournalStatusValidated,
+		ApprovalStatus: domain.ApprovalStatusApproved, // approved, but RequestPosting never called
+	}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+
+	rec := doRequest(r, http.MethodPost, "/v1/postings/journals",
+		domain.PostApprovedJournalRequest{JournalID: "j-validated"}, "svc-ap")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.journals["j-validated"].Status != domain.JournalStatusValidated {
+		t.Error("the journal must be left untouched")
 	}
 }
 

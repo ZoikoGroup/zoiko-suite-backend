@@ -368,6 +368,71 @@ func (s *stubStore) MarkPostingExecutionFailed(_ context.Context, tenantID, exec
 	return nil
 }
 
+func (s *stubStore) SubmitJournalForApproval(_ context.Context, _, journalID, principalID string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusDraft {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.SubmittedAt, h.SubmittedByPrincipalID = domain.ApprovalStatusPendingApproval, &now, &principalID
+	return nil
+}
+
+func (s *stubStore) ApproveJournal(_ context.Context, _, journalID, principalID, fingerprint string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusPendingApproval {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.ApprovedAt, h.ApprovedByPrincipalID, h.ApprovalFingerprint = domain.ApprovalStatusApproved, &now, &principalID, &fingerprint
+	return nil
+}
+
+func (s *stubStore) RejectJournal(_ context.Context, _, journalID, principalID, reason string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusPendingApproval {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.RejectedAt, h.RejectedByPrincipalID, h.RejectionReason = domain.ApprovalStatusRejected, &now, &principalID, &reason
+	return nil
+}
+
+func (s *stubStore) RequestJournalPosting(_ context.Context, _, journalID, principalID string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusApproved {
+		return domain.ErrInvalidApprovalTransition
+	}
+	now := time.Now().UTC()
+	h.ApprovalStatus, h.PostingRequestedAt, h.PostingRequestedByPrincipalID = domain.ApprovalStatusPostingRequested, &now, &principalID
+	return nil
+}
+
+func (s *stubStore) MarkJournalPosted(_ context.Context, _, journalID string) error {
+	h, ok := s.journals[journalID]
+	if !ok || h.ApprovalStatus != domain.ApprovalStatusPostingRequested {
+		return domain.ErrInvalidApprovalTransition
+	}
+	h.ApprovalStatus = domain.ApprovalStatusPosted
+	return nil
+}
+
+func (s *stubStore) AmendDraftJournal(_ context.Context, _, journalID string, updated *domain.JournalHeader, lines []domain.JournalLine) error {
+	h, ok := s.journals[journalID]
+	if !ok || (h.ApprovalStatus != domain.ApprovalStatusDraft && h.ApprovalStatus != domain.ApprovalStatusPendingApproval) {
+		return domain.ErrInvalidApprovalTransition
+	}
+	h.Description, h.JournalType, h.TransactionDate, h.PostingDate = updated.Description, updated.JournalType, updated.TransactionDate, updated.PostingDate
+	h.CurrencyCode, h.BookID, h.ReportingBasis, h.EvidenceRefs = updated.CurrencyCode, updated.BookID, updated.ReportingBasis, updated.EvidenceRefs
+	h.ApprovalStatus = domain.ApprovalStatusDraft
+	for i := range lines {
+		lines[i].JournalID = journalID
+		lines[i].LineNumber = i + 1
+	}
+	s.lines[journalID] = lines
+	return nil
+}
+
 // Compile-time proof the stub still satisfies the contract the handler
 // depends on — a stub that has silently fallen behind the interface is how a
 // green test suite stops meaning anything.

@@ -44,6 +44,38 @@ var ValidJournalTransitions = map[JournalStatus][]JournalStatus{
 	JournalStatusReversed:  {},
 }
 
+// ApprovalStatus implements ACC-03's own state model (verbatim from spec):
+// "Draft → PendingApproval → Approved → PostingRequested → Posted;
+// rejected/cancelled before posting; corrections create new journals."
+// See migration 000010's doc comment for why this is a separate lifecycle
+// from JournalStatus.
+type ApprovalStatus string
+
+const (
+	ApprovalStatusDraft            ApprovalStatus = "DRAFT"
+	ApprovalStatusPendingApproval  ApprovalStatus = "PENDING_APPROVAL"
+	ApprovalStatusApproved         ApprovalStatus = "APPROVED"
+	ApprovalStatusPostingRequested ApprovalStatus = "POSTING_REQUESTED"
+	ApprovalStatusPosted           ApprovalStatus = "POSTED"
+	ApprovalStatusRejected         ApprovalStatus = "REJECTED"
+	ApprovalStatusCancelled        ApprovalStatus = "CANCELLED"
+)
+
+// ValidApprovalTransitions enumerates the only legal ApprovalStatus moves.
+// PENDING_APPROVAL -> DRAFT models AmendDraftJournal being called on a
+// submitted-but-not-yet-approved journal — editing it withdraws it from
+// approval rather than silently leaving a stale approval request pending
+// against content that changed underneath it.
+var ValidApprovalTransitions = map[ApprovalStatus][]ApprovalStatus{
+	ApprovalStatusDraft:            {ApprovalStatusPendingApproval, ApprovalStatusCancelled},
+	ApprovalStatusPendingApproval:  {ApprovalStatusDraft, ApprovalStatusApproved, ApprovalStatusRejected},
+	ApprovalStatusApproved:         {ApprovalStatusPostingRequested},
+	ApprovalStatusPostingRequested: {ApprovalStatusPosted},
+	ApprovalStatusPosted:           {},
+	ApprovalStatusRejected:         {},
+	ApprovalStatusCancelled:        {},
+}
+
 // JournalType is ACC-03's "journal type" input.
 //
 // The set is deliberately closed. The type decides how a posting is read by
@@ -159,6 +191,38 @@ type JournalHeader struct {
 	ValidatedAt            *time.Time `json:"validated_at,omitempty"`
 	PostedAt               *time.Time `json:"posted_at,omitempty"`
 	ReversedAt             *time.Time `json:"reversed_at,omitempty"`
+
+	// ── ACC-03 journal proposal/approval lifecycle (§6) ─────────────────────
+	//
+	// A SEPARATE lifecycle from Status above — Status is ACC-04/05's own
+	// Tri-Phase Commit for the actual ledger write; ApprovalStatus is
+	// whether this proposal is even ELIGIBLE to reach the posting engine.
+	// See migration 000010's doc comment.
+	ApprovalStatus ApprovalStatus `json:"approval_status"`
+
+	// ApprovalFingerprint is the spec's own named evidence: a permanent
+	// hash of exactly what content was approved, captured at ApproveJournal
+	// time. Never used to gate anything after the fact — no endpoint edits
+	// a journal once it leaves DRAFT/PENDING_APPROVAL, so there is nothing
+	// for it to detect a mismatch against; it exists purely so an audit can
+	// prove what a human actually signed off on.
+	ApprovalFingerprint *string `json:"approval_fingerprint,omitempty"`
+
+	SubmittedAt                   *time.Time `json:"submitted_at,omitempty"`
+	SubmittedByPrincipalID        *string    `json:"submitted_by_principal_id,omitempty"`
+	ApprovedAt                    *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID         *string    `json:"approved_by_principal_id,omitempty"`
+	RejectedAt                    *time.Time `json:"rejected_at,omitempty"`
+	RejectedByPrincipalID         *string    `json:"rejected_by_principal_id,omitempty"`
+	RejectionReason               *string    `json:"rejection_reason,omitempty"`
+	PostingRequestedAt            *time.Time `json:"posting_requested_at,omitempty"`
+	PostingRequestedByPrincipalID *string    `json:"posting_requested_by_principal_id,omitempty"`
+
+	// CorrectionOfJournalID is the spec's own "correction chain": set only
+	// on a journal created via RequestCorrection, pointing at the original
+	// it corrects. "Corrections create new journals" — never an in-place
+	// edit of a posted one.
+	CorrectionOfJournalID *string `json:"correction_of_journal_id,omitempty"`
 }
 
 // JournalLine is one debit or credit line within a journal. Exactly one of
@@ -445,6 +509,60 @@ type ReverseJournalRequest struct {
 	CorrelationID string `json:"correlation_id"`
 }
 
+// AmendDraftJournalRequest is ACC-03's AmendDraftJournal command — a full
+// replace of the header's editable business fields and every line. Only
+// legal while ApprovalStatus is DRAFT or PENDING_APPROVAL (see
+// ValidApprovalTransitions); the spec's own negative paths #2 ("journal
+// changed after approval") and #4 ("attempt edit after posting") are
+// satisfied by there being no other status this succeeds from.
+type AmendDraftJournalRequest struct {
+	Description     string                   `json:"description"`
+	JournalType     JournalType              `json:"journal_type"`
+	TransactionDate Date                     `json:"transaction_date"`
+	PostingDate     Date                     `json:"posting_date"`
+	CurrencyCode    string                   `json:"currency_code"`
+	BookID          *string                  `json:"book_id,omitempty"`
+	ReportingBasis  *string                  `json:"reporting_basis,omitempty"`
+	EvidenceRefs    []string                 `json:"evidence_refs,omitempty"`
+	Lines           []CreateJournalLineInput `json:"lines"`
+}
+
+// ApproveJournalRequest carries nothing today beyond the implicit actor —
+// its own type exists so a future policy_version/approval-note field has
+// somewhere to land without changing the handler's signature.
+type ApproveJournalRequest struct{}
+
+type RejectJournalRequest struct {
+	Reason string `json:"reason"`
+}
+
+type RequestCorrectionRequest struct {
+	Reason      string                   `json:"reason"`
+	Description string                   `json:"description"`
+	Lines       []CreateJournalLineInput `json:"lines"`
+}
+
+// AvailableActions answers ACC-03's own GetAvailableActions query — which
+// of the lifecycle commands are legal to call on this journal right now,
+// derived directly from ValidApprovalTransitions rather than a second,
+// separately-maintained rulebook that could drift from the one the
+// handlers actually enforce.
+type AvailableActions struct {
+	JournalID string   `json:"journal_id"`
+	Actions   []string `json:"actions"`
+}
+
+// JournalHistoryEntry is one step of ACC-03's own GetJournalHistory query
+// — derived from the header's own timestamp/actor columns, never a
+// separate events table this v1 didn't build; an entry appears only if
+// its corresponding timestamp is actually set.
+type JournalHistoryEntry struct {
+	Event       string    `json:"event"`
+	At          time.Time `json:"at"`
+	PrincipalID string    `json:"principal_id"`
+	Detail      string    `json:"detail,omitempty"`
+}
+
 // ListJournalsFilter holds optional filters for querying journals.
 type ListJournalsFilter struct {
 	TenantID      string
@@ -557,6 +675,37 @@ var (
 	// own source document exists is a data-entry error every time, and catching
 	// it here is cheaper than finding it in a period reconciliation.
 	ErrPostingBeforeTransaction = errorString("posting_date cannot precede transaction_date")
+
+	// ── ACC-03 journal proposal/approval lifecycle ──────────────────────
+
+	// ErrInvalidApprovalTransition covers every ACC-03 lifecycle command
+	// called against a journal not in the one status it requires — the
+	// spec's own negative paths #2 ("journal changed after approval") and
+	// #4 ("attempt edit after posting") both resolve to this: there is no
+	// status other than DRAFT/PENDING_APPROVAL from which AmendDraftJournal
+	// succeeds.
+	ErrInvalidApprovalTransition = errorString("journal is not in a status that allows this action")
+
+	// ErrJournalUnbalancedAtSubmit is SubmitJournal's own check — the
+	// spec's own negative path #1 ("debit/credit imbalance"), caught
+	// before an approver's time is spent reviewing a proposal that could
+	// never post.
+	ErrJournalUnbalancedAtSubmit = errorString("journal debits and credits do not balance and cannot be submitted for approval")
+
+	// ErrSelfApprovalNotPermitted is the spec's own negative path #3,
+	// verbatim scenario: "Preparer self-approves protected journal." No
+	// journal-class configuration service exists to say which journals are
+	// "protected" (the spec's own word), so this v1 treats every journal as
+	// protected — maker/checker applies universally, not selectively.
+	ErrSelfApprovalNotPermitted = errorString("the principal who submitted this journal may not also approve it")
+
+	ErrRejectReasonRequired = errorString("reason is required to reject a journal")
+
+	// ErrCorrectionSourceNotPosted is RequestCorrection's own guard — the
+	// spec's own state model, "corrections create new journals," presumes
+	// there is a posted fact to correct; a draft or rejected journal has
+	// nothing yet to correct.
+	ErrCorrectionSourceNotPosted = errorString("only a POSTED journal may be corrected")
 )
 
 // ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic

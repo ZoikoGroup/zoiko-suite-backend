@@ -55,16 +55,23 @@ const journalHeaderColumns = `
 	correlation_id, created_at, validated_at, posted_at, reversed_at,
 	source_event_id, governance_decision_id,
 	journal_type, transaction_date, posting_date, currency_code,
-	book_id, reporting_basis, evidence_refs`
+	book_id, reporting_basis, evidence_refs,
+	approval_status, approval_fingerprint,
+	submitted_at, submitted_by_principal_id,
+	approved_at, approved_by_principal_id,
+	rejected_at, rejected_by_principal_id, rejection_reason,
+	posting_requested_at, posting_requested_by_principal_id,
+	correction_of_journal_id`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
-// column for column. status is scanned into a plain string and converted by
-// the caller — domain.JournalStatus has no sql.Scanner.
+// column for column. status and approvalStatus are scanned into plain
+// strings and converted by the caller — domain.JournalStatus/ApprovalStatus
+// have no sql.Scanner.
 //
 // journal_type does have one (domain.JournalType.Scan), so it scans directly
 // rather than adding a second out-parameter to a signature four read paths
 // already share.
-func scanHeaderTargets(h *domain.JournalHeader, status *string) []any {
+func scanHeaderTargets(h *domain.JournalHeader, status, approvalStatus *string) []any {
 	return []any{
 		&h.JournalID, &h.TenantID, &h.LegalEntityID, &h.FiscalPeriod, status,
 		&h.ReversalOfJournalID, &h.Description, &h.CreatedByPrincipalID,
@@ -73,6 +80,12 @@ func scanHeaderTargets(h *domain.JournalHeader, status *string) []any {
 		&h.SourceEventID, &h.GovernanceDecisionID,
 		&h.JournalType, &h.TransactionDate, &h.PostingDate, &h.CurrencyCode,
 		&h.BookID, &h.ReportingBasis, &h.EvidenceRefs,
+		approvalStatus, &h.ApprovalFingerprint,
+		&h.SubmittedAt, &h.SubmittedByPrincipalID,
+		&h.ApprovedAt, &h.ApprovedByPrincipalID,
+		&h.RejectedAt, &h.RejectedByPrincipalID, &h.RejectionReason,
+		&h.PostingRequestedAt, &h.PostingRequestedByPrincipalID,
+		&h.CorrectionOfJournalID,
 	}
 }
 
@@ -175,6 +188,21 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		postedAt := now
 		h.PostedAt = &postedAt
 	}
+	// ACC-03's own approval lifecycle defaults to DRAFT — the honest
+	// starting state for a proposal nobody has acted on yet. Callers that
+	// mean to skip the human workflow set ApprovalStatus explicitly before
+	// calling this, so the fallback here never overrides a deliberate
+	// choice. A journal born FINALIZED — only a reversal is — is likewise
+	// born POSTED: it is itself an authoritative posting the instant it is
+	// written, never a draft proposal awaiting approval, matching the
+	// PostedAt stamping just above.
+	if h.ApprovalStatus == "" {
+		if h.Status == domain.JournalStatusFinalized {
+			h.ApprovalStatus = domain.ApprovalStatusPosted
+		} else {
+			h.ApprovalStatus = domain.ApprovalStatusDraft
+		}
+	}
 
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO journal_headers (
@@ -184,9 +212,9 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			correlation_id, created_at, validated_at, posted_at, reversed_at,
 			source_event_id, governance_decision_id,
 			journal_type, transaction_date, posting_date, currency_code,
-			book_id, reporting_basis, evidence_refs
+			book_id, reporting_basis, evidence_refs, approval_status
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-		          $19, $20, $21, $22, $23, $24, $25)
+		          $19, $20, $21, $22, $23, $24, $25, $26)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
@@ -194,7 +222,7 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		h.CorrelationID, h.CreatedAt, h.ValidatedAt, h.PostedAt, h.ReversedAt,
 		h.SourceEventID, h.GovernanceDecisionID,
 		h.JournalType, h.TransactionDate, h.PostingDate, h.CurrencyCode,
-		h.BookID, h.ReportingBasis, h.EvidenceRefs)
+		h.BookID, h.ReportingBasis, h.EvidenceRefs, string(h.ApprovalStatus))
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -203,15 +231,16 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 		// Conflict: an earlier call with this correlation_id already created a
 		// journal. Resolve h to that journal in full rather than inserting a
 		// duplicate.
-		var status string
+		var status, approvalStatus string
 		row := tx.QueryRow(ctx, `
 			SELECT `+journalHeaderColumns+`
 			FROM journal_headers WHERE tenant_id = $1 AND correlation_id = $2
 		`, tenantID, h.CorrelationID)
-		if err := row.Scan(scanHeaderTargets(h, &status)...); err != nil {
+		if err := row.Scan(scanHeaderTargets(h, &status, &approvalStatus)...); err != nil {
 			return nil, false, mapPgError(err)
 		}
 		h.Status = domain.JournalStatus(status)
+		h.ApprovalStatus = domain.ApprovalStatus(approvalStatus)
 
 		existing, err := queryLines(ctx, tx, tenantID, h.JournalID)
 		if err != nil {
@@ -375,7 +404,7 @@ func (s *PgStore) GetJournal(ctx context.Context, journalID string) (*domain.Jou
 	}
 
 	var h domain.JournalHeader
-	var status string
+	var status, approvalStatus string
 	var lines []domain.JournalLine
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -383,10 +412,11 @@ func (s *PgStore) GetJournal(ctx context.Context, journalID string) (*domain.Jou
 			SELECT `+journalHeaderColumns+`
 			FROM journal_headers WHERE journal_id = $1 AND tenant_id = $2
 		`, journalID, tenantID)
-		if err := row.Scan(scanHeaderTargets(&h, &status)...); err != nil {
+		if err := row.Scan(scanHeaderTargets(&h, &status, &approvalStatus)...); err != nil {
 			return mapPgError(err)
 		}
 		h.Status = domain.JournalStatus(status)
+		h.ApprovalStatus = domain.ApprovalStatus(approvalStatus)
 
 		// Read in the same transaction as the header. Two transactions could
 		// see a journal's header from before a write and its lines from after.
@@ -419,7 +449,7 @@ func (s *PgStore) GetJournalByCorrelationID(ctx context.Context, tenantID, corre
 	}
 
 	var h domain.JournalHeader
-	var status string
+	var status, approvalStatus string
 	var lines []domain.JournalLine
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
@@ -427,10 +457,11 @@ func (s *PgStore) GetJournalByCorrelationID(ctx context.Context, tenantID, corre
 			SELECT `+journalHeaderColumns+`
 			FROM journal_headers WHERE tenant_id = $1 AND correlation_id = $2
 		`, tenantID, correlationID)
-		if err := row.Scan(scanHeaderTargets(&h, &status)...); err != nil {
+		if err := row.Scan(scanHeaderTargets(&h, &status, &approvalStatus)...); err != nil {
 			return mapPgError(err)
 		}
 		h.Status = domain.JournalStatus(status)
+		h.ApprovalStatus = domain.ApprovalStatus(approvalStatus)
 
 		var err error
 		lines, err = queryLines(ctx, tx, tenantID, h.JournalID)
@@ -475,11 +506,12 @@ func (s *PgStore) ListJournals(ctx context.Context, filter domain.ListJournalsFi
 		defer rows.Close()
 		for rows.Next() {
 			var h domain.JournalHeader
-			var status string
-			if err := rows.Scan(scanHeaderTargets(&h, &status)...); err != nil {
+			var status, approvalStatus string
+			if err := rows.Scan(scanHeaderTargets(&h, &status, &approvalStatus)...); err != nil {
 				return mapPgError(err)
 			}
 			h.Status = domain.JournalStatus(status)
+			h.ApprovalStatus = domain.ApprovalStatus(approvalStatus)
 			out = append(out, h)
 		}
 		return mapPgError(rows.Err())
@@ -1010,5 +1042,157 @@ func (s *PgStore) MarkPostingExecutionFailed(ctx context.Context, tenantID, exec
 			WHERE tenant_id = $3 AND execution_id = $4
 		`, status, reason, tenantID, executionID)
 		return mapPgError(err)
+	})
+}
+
+// ── ACC-03 (Journal Entry: proposal/approval lifecycle) ──────────────────────
+
+// SubmitJournalForApproval moves DRAFT -> PENDING_APPROVAL, stamping who
+// submitted it and when.
+func (s *PgStore) SubmitJournalForApproval(ctx context.Context, tenantID, journalID, principalID string) error {
+	return s.transitionApproval(ctx, tenantID, journalID,
+		domain.ApprovalStatusDraft, domain.ApprovalStatusPendingApproval,
+		"submitted_by_principal_id", "submitted_at", principalID)
+}
+
+// ApproveJournal moves PENDING_APPROVAL -> APPROVED, recording the
+// spec's own named evidence — a permanent fingerprint of exactly what
+// content was approved (see migration 000010's doc comment).
+func (s *PgStore) ApproveJournal(ctx context.Context, tenantID, journalID, principalID, fingerprint string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE journal_headers
+			SET approval_status = $1, approved_by_principal_id = $2, approved_at = $3, approval_fingerprint = $4
+			WHERE journal_id = $5 AND approval_status = $6 AND tenant_id = $7
+		`, string(domain.ApprovalStatusApproved), principalID, time.Now().UTC(), fingerprint,
+			journalID, string(domain.ApprovalStatusPendingApproval), tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidApprovalTransition
+		}
+		return nil
+	})
+}
+
+// RejectJournal moves PENDING_APPROVAL -> REJECTED, a terminal state —
+// "rejected/cancelled before posting," per the spec's own state model.
+func (s *PgStore) RejectJournal(ctx context.Context, tenantID, journalID, principalID, reason string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE journal_headers
+			SET approval_status = $1, rejected_by_principal_id = $2, rejected_at = $3, rejection_reason = $4
+			WHERE journal_id = $5 AND approval_status = $6 AND tenant_id = $7
+		`, string(domain.ApprovalStatusRejected), principalID, time.Now().UTC(), reason,
+			journalID, string(domain.ApprovalStatusPendingApproval), tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidApprovalTransition
+		}
+		return nil
+	})
+}
+
+// RequestJournalPosting moves APPROVED -> POSTING_REQUESTED — the
+// handoff signal to ACC-04: only a POSTING_REQUESTED journal is eligible
+// for PostApprovedJournal to actually commit.
+func (s *PgStore) RequestJournalPosting(ctx context.Context, tenantID, journalID, principalID string) error {
+	return s.transitionApproval(ctx, tenantID, journalID,
+		domain.ApprovalStatusApproved, domain.ApprovalStatusPostingRequested,
+		"posting_requested_by_principal_id", "posting_requested_at", principalID)
+}
+
+// MarkJournalPosted moves POSTING_REQUESTED -> POSTED — called by ACC-04's
+// own PostApprovedJournal once it actually finalizes the journal, closing
+// the loop between the two capabilities. No actor/timestamp columns of
+// its own: PostedByPrincipalID/PostedAt (JournalStatus's own fields,
+// already stamped by TransitionJournal) already answer who/when.
+func (s *PgStore) MarkJournalPosted(ctx context.Context, tenantID, journalID string) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE journal_headers SET approval_status = $1
+			WHERE journal_id = $2 AND approval_status = $3 AND tenant_id = $4
+		`, string(domain.ApprovalStatusPosted), journalID, string(domain.ApprovalStatusPostingRequested), tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidApprovalTransition
+		}
+		return nil
+	})
+}
+
+// transitionApproval is the shared guarded UPDATE every simple
+// ApprovalStatus move uses — mirrors TransitionJournal's own pattern.
+func (s *PgStore) transitionApproval(ctx context.Context, tenantID, journalID string, from, to domain.ApprovalStatus, actorColumn, timeColumn, principalID string) error {
+	query := fmt.Sprintf(`
+		UPDATE journal_headers
+		SET approval_status = $1, %s = $2, %s = $3
+		WHERE journal_id = $4 AND approval_status = $5 AND tenant_id = $6
+	`, actorColumn, timeColumn)
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, query, string(to), principalID, time.Now().UTC(), journalID, string(from), tenantID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidApprovalTransition
+		}
+		return nil
+	})
+}
+
+// AmendDraftJournal replaces a journal's editable header fields and every
+// line, in one transaction. Only succeeds from DRAFT or PENDING_APPROVAL
+// (enforced by the WHERE clause, not just the handler) — the spec's own
+// negative paths #2 ("journal changed after approval") and #4 ("attempt
+// edit after posting") are satisfied by there being no other status this
+// UPDATE ever matches. Amending a PENDING_APPROVAL journal always resets
+// it to DRAFT (see ValidApprovalTransitions's own doc comment) —
+// withdrawing a stale approval request rather than leaving one pending
+// against content an approver never actually saw.
+func (s *PgStore) AmendDraftJournal(ctx context.Context, tenantID, journalID string, h *domain.JournalHeader, lines []domain.JournalLine) error {
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE journal_headers
+			SET description = $1, journal_type = $2, transaction_date = $3, posting_date = $4,
+			    currency_code = $5, book_id = $6, reporting_basis = $7, evidence_refs = $8,
+			    approval_status = $9
+			WHERE journal_id = $10 AND tenant_id = $11 AND approval_status IN ($12, $13)
+		`, h.Description, h.JournalType, h.TransactionDate, h.PostingDate,
+			h.CurrencyCode, h.BookID, h.ReportingBasis, h.EvidenceRefs,
+			string(domain.ApprovalStatusDraft),
+			journalID, tenantID, string(domain.ApprovalStatusDraft), string(domain.ApprovalStatusPendingApproval))
+		if err != nil {
+			return mapPgError(err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidApprovalTransition
+		}
+
+		if _, err := tx.Exec(ctx, `DELETE FROM journal_lines WHERE journal_id = $1 AND tenant_id = $2`, journalID, tenantID); err != nil {
+			return mapPgError(err)
+		}
+		for i := range lines {
+			lines[i].JournalLineID = uuid.NewString()
+			lines[i].JournalID = journalID
+			lines[i].LineNumber = i + 1
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO journal_lines (
+					journal_line_id, journal_id, tenant_id, line_number,
+					account_code, debit_amount, credit_amount, description,
+					tax_code, tax_logic_snapshot_id, dimensions
+				) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			`, lines[i].JournalLineID, journalID, tenantID, lines[i].LineNumber,
+				lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description,
+				lines[i].TaxCode, lines[i].TaxLogicSnapshotID, lines[i].Dimensions); err != nil {
+				return mapPgError(err)
+			}
+		}
+		return nil
 	})
 }

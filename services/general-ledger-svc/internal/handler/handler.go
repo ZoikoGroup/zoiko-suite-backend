@@ -3,11 +3,14 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -62,6 +65,15 @@ type Store interface {
 	GetPostingExecutionBySource(ctx context.Context, tenantID, sourceEventID string) (*domain.PostingExecution, error)
 	MarkPostingExecutionCommitted(ctx context.Context, tenantID, executionID, journalID string, committedAt time.Time) error
 	MarkPostingExecutionFailed(ctx context.Context, tenantID, executionID, status, reason string) error
+
+	// ACC-03 journal proposal/approval lifecycle — see migration 000010's
+	// doc comment.
+	SubmitJournalForApproval(ctx context.Context, tenantID, journalID, principalID string) error
+	ApproveJournal(ctx context.Context, tenantID, journalID, principalID, fingerprint string) error
+	RejectJournal(ctx context.Context, tenantID, journalID, principalID, reason string) error
+	RequestJournalPosting(ctx context.Context, tenantID, journalID, principalID string) error
+	MarkJournalPosted(ctx context.Context, tenantID, journalID string) error
+	AmendDraftJournal(ctx context.Context, tenantID, journalID string, h *domain.JournalHeader, lines []domain.JournalLine) error
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -123,6 +135,22 @@ const (
 	actionPostingReverse   = "GL_POSTING_REVERSE"
 	actionPostingReprocess = "GL_POSTING_REPROCESS"
 	actionPostingView      = "GL_POSTING_VIEW"
+
+	// ACC-03 journal proposal/approval lifecycle actions. The spec's own
+	// permissions field: "journal.create; journal.submit; journal.approve;
+	// journal.post.request" — mapped onto this platform's GL_JOURNAL_*
+	// namespace rather than the doc's dotted form, matching every other
+	// action name in this file. actionApproveJournalProposal is
+	// deliberately distinct from actionSubmitJournal — segregation of
+	// duties is what SoD MEANS, and collapsing the two into one grantable
+	// action would make maker/checker unenforceable at the authorization
+	// layer no matter what the handler itself checks.
+	actionSubmitJournal          = "GL_JOURNAL_SUBMIT"
+	actionApproveJournalProposal = "GL_JOURNAL_APPROVE"
+	actionRejectJournal          = "GL_JOURNAL_REJECT"
+	actionRequestPosting         = "GL_JOURNAL_POST_REQUEST"
+	actionAmendDraftJournal      = "GL_JOURNAL_AMEND"
+	actionRequestCorrection      = "GL_JOURNAL_CORRECT"
 )
 
 // coaPlatformScopeID is the legal_entity_id presented to authorization-svc
@@ -172,6 +200,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{journal_id}/validate", h.ValidateJournal)
 		r.Post("/{journal_id}/post", h.PostJournal)
 		r.Post("/{journal_id}/reverse", h.ReverseJournal)
+
+		// ACC-03 journal proposal/approval lifecycle.
+		r.Post("/{journal_id}/amend", h.AmendDraftJournal)
+		r.Post("/{journal_id}/submit", h.SubmitJournal)
+		r.Post("/{journal_id}/approve", h.ApproveJournal)
+		r.Post("/{journal_id}/reject", h.RejectJournal)
+		r.Post("/{journal_id}/request-posting", h.RequestPosting)
+		r.Post("/{journal_id}/correct", h.RequestCorrection)
+		r.Get("/{journal_id}/available-actions", h.GetAvailableActions)
+		r.Get("/{journal_id}/history", h.GetJournalHistory)
 	})
 	r.Route("/v1/trial-balance", func(r chi.Router) {
 		r.Post("/compile", h.CompileTrialBalance)
@@ -302,6 +340,12 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		BookID:          bookID,
 		ReportingBasis:  reportingBasis,
 		EvidenceRefs:    mergeEvidenceRefs(req.EvidenceRefs, env.EvidenceRefs),
+
+		// ACC-03: every ordinary journal a human creates starts as a
+		// proposal nobody has acted on yet — explicit here rather than
+		// left to a store-layer default, since the handler is where this
+		// service's actual intent belongs.
+		ApprovalStatus: domain.ApprovalStatusDraft,
 	}
 	lines := make([]domain.JournalLine, len(req.Lines))
 	for i, l := range req.Lines {
@@ -1095,6 +1139,506 @@ func (h *Handler) reversalReplay(ctx context.Context, header *domain.JournalHead
 	return existing, lines, true
 }
 
+// ── ACC-03 (Journal Entry: proposal/approval lifecycle) ──────────────────────
+//
+// "owns JournalHeader, JournalLine proposal, journal lifecycle state,
+// approval subject fingerprint and posting reference. Must never own:
+// Append-only ledger truth." State model (verbatim): "Draft →
+// PendingApproval → Approved → PostingRequested → Posted; rejected/
+// cancelled before posting; corrections create new journals." This is a
+// SEPARATE lifecycle from journal_headers.status — see
+// domain.ApprovalStatus's own doc comment and migration 000010.
+
+// AmendDraftJournal replaces a journal's editable fields and every line.
+// Legal only from DRAFT or PENDING_APPROVAL — the store's own WHERE
+// clause is the real enforcement (see AmendDraftJournal's store-layer doc
+// comment), satisfying the spec's own negative paths #2 ("journal changed
+// after approval") and #4 ("attempt edit after posting") structurally:
+// there is no other status this ever succeeds from.
+func (h *Handler) AmendDraftJournal(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "journal_id")
+	var req domain.AmendDraftJournalRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.Lines) == 0 {
+		writeError(w, http.StatusBadRequest, "no_lines", domain.ErrNoLines.Error())
+		return
+	}
+	for _, l := range req.Lines {
+		if !exactlyOneNonZero(l.DebitAmount, l.CreditAmount) {
+			writeError(w, http.StatusBadRequest, "invalid_line", domain.ErrInvalidLine.Error())
+			return
+		}
+	}
+	if !domain.ValidJournalType(req.JournalType) {
+		writeError(w, http.StatusBadRequest, "invalid_journal_type", domain.ErrInvalidJournalType.Error())
+		return
+	}
+	if !domain.ValidCurrencyCode(req.CurrencyCode) {
+		writeError(w, http.StatusBadRequest, "invalid_currency_code", domain.ErrInvalidCurrency.Error())
+		return
+	}
+	if req.PostingDate.Before(req.TransactionDate.Time) {
+		writeError(w, http.StatusBadRequest, "invalid_posting_date", domain.ErrPostingBeforeTransaction.Error())
+		return
+	}
+
+	header, _, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("AmendDraftJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionAmendDraftJournal); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	newHeader := &domain.JournalHeader{
+		Description: req.Description, JournalType: req.JournalType,
+		TransactionDate: req.TransactionDate, PostingDate: req.PostingDate,
+		CurrencyCode: req.CurrencyCode, BookID: req.BookID, ReportingBasis: req.ReportingBasis,
+		EvidenceRefs: req.EvidenceRefs,
+	}
+	lines := make([]domain.JournalLine, len(req.Lines))
+	for i, l := range req.Lines {
+		lines[i] = domain.JournalLine{
+			AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount,
+			Description: l.Description, TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID,
+			Dimensions: l.Dimensions,
+		}
+	}
+	if err := h.store.AmendDraftJournal(r.Context(), tenantID, journalID, newHeader, lines); err != nil {
+		if errors.Is(err, domain.ErrInvalidApprovalTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidApprovalTransition.Error())
+			return
+		}
+		h.log.Error("AmendDraftJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	updated, lines2, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil || updated == nil {
+		h.log.Error("AmendDraftJournal: failed to reload amended journal", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, domain.JournalWithLines{JournalHeader: *updated, Lines: lines2})
+}
+
+// SubmitJournal moves DRAFT -> PENDING_APPROVAL. The spec's own negative
+// path #1, "Debit/credit imbalance," is caught HERE — before an
+// approver's time is spent reviewing a proposal that could never post —
+// not only later at ValidateJournal's own balance check.
+func (h *Handler) SubmitJournal(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "journal_id")
+	header, _, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("SubmitJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionSubmitJournal); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	debitTotal, creditTotal, err := h.store.SumLines(r.Context(), tenantID, journalID)
+	if err != nil {
+		h.log.Error("SubmitJournal: failed to sum lines", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if debitTotal != creditTotal {
+		writeError(w, http.StatusUnprocessableEntity, "unbalanced_journal", domain.ErrJournalUnbalancedAtSubmit.Error())
+		return
+	}
+
+	if err := h.store.SubmitJournalForApproval(r.Context(), tenantID, journalID, principalID); err != nil {
+		if errors.Is(err, domain.ErrInvalidApprovalTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidApprovalTransition.Error())
+			return
+		}
+		h.log.Error("SubmitJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	now := time.Now().UTC()
+	header.ApprovalStatus, header.SubmittedAt, header.SubmittedByPrincipalID = domain.ApprovalStatusPendingApproval, &now, &principalID
+	writeJSON(w, http.StatusOK, header)
+}
+
+// ApproveJournal moves PENDING_APPROVAL -> APPROVED. The spec's own
+// negative path #3, "Preparer self-approves protected journal": no
+// journal-class configuration exists to say which journals are
+// "protected" (see domain.ErrSelfApprovalNotPermitted's own doc comment),
+// so maker/checker applies universally — the principal who submitted a
+// journal may never also approve it.
+func (h *Handler) ApproveJournal(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "journal_id")
+	header, _, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("ApproveJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionApproveJournalProposal); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if header.SubmittedByPrincipalID != nil && *header.SubmittedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_approval_not_permitted", domain.ErrSelfApprovalNotPermitted.Error())
+		return
+	}
+
+	_, lines, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("ApproveJournal: failed to load lines for fingerprint", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	fingerprint := computeApprovalFingerprint(*header, lines)
+
+	if err := h.store.ApproveJournal(r.Context(), tenantID, journalID, principalID, fingerprint); err != nil {
+		if errors.Is(err, domain.ErrInvalidApprovalTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidApprovalTransition.Error())
+			return
+		}
+		h.log.Error("ApproveJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	now := time.Now().UTC()
+	header.ApprovalStatus, header.ApprovedAt, header.ApprovedByPrincipalID, header.ApprovalFingerprint = domain.ApprovalStatusApproved, &now, &principalID, &fingerprint
+	writeJSON(w, http.StatusOK, header)
+}
+
+// computeApprovalFingerprint hashes exactly the content an approver is
+// signing off on — the spec's own named evidence field, "approval subject
+// fingerprint." Deterministic and order-sensitive (lines are already
+// stored in line_number order), so the same content always produces the
+// same fingerprint.
+func computeApprovalFingerprint(h domain.JournalHeader, lines []domain.JournalLine) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s|%s|%s|%s|%s|%s|%s\n", h.LegalEntityID, h.FiscalPeriod, h.Description,
+		h.JournalType, h.TransactionDate.String(), h.PostingDate.String(), h.CurrencyCode)
+	for _, l := range lines {
+		fmt.Fprintf(&b, "%d:%s:%.2f:%.2f\n", l.LineNumber, l.AccountCode, l.DebitAmount, l.CreditAmount)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func (h *Handler) RejectJournal(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "journal_id")
+	var req domain.RejectJournalRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	header, _, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("RejectJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionRejectJournal); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason_required", domain.ErrRejectReasonRequired.Error())
+		return
+	}
+	if err := h.store.RejectJournal(r.Context(), tenantID, journalID, principalID, req.Reason); err != nil {
+		if errors.Is(err, domain.ErrInvalidApprovalTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidApprovalTransition.Error())
+			return
+		}
+		h.log.Error("RejectJournal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	now := time.Now().UTC()
+	header.ApprovalStatus, header.RejectedAt, header.RejectedByPrincipalID, header.RejectionReason = domain.ApprovalStatusRejected, &now, &principalID, &req.Reason
+	writeJSON(w, http.StatusOK, header)
+}
+
+// RequestPosting moves APPROVED -> POSTING_REQUESTED — the handoff to
+// ACC-04. Only a POSTING_REQUESTED journal is eligible for
+// PostApprovedJournal to actually commit (see that handler's own check).
+func (h *Handler) RequestPosting(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "journal_id")
+	header, _, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("RequestPosting: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, header.LegalEntityID, actionRequestPosting); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if err := h.store.RequestJournalPosting(r.Context(), tenantID, journalID, principalID); err != nil {
+		if errors.Is(err, domain.ErrInvalidApprovalTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidApprovalTransition.Error())
+			return
+		}
+		h.log.Error("RequestPosting: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+
+	now := time.Now().UTC()
+	header.ApprovalStatus, header.PostingRequestedAt, header.PostingRequestedByPrincipalID = domain.ApprovalStatusPostingRequested, &now, &principalID
+	writeJSON(w, http.StatusOK, header)
+}
+
+// RequestCorrection implements the spec's own state model literally:
+// "corrections create new journals" — never an in-place edit of a POSTED
+// one. Creates a brand-new DRAFT journal, CorrectionOfJournalID pointing
+// at the original, ready to go through the full lifecycle again.
+func (h *Handler) RequestCorrection(w http.ResponseWriter, r *http.Request) {
+	originalID := chi.URLParam(r, "journal_id")
+	var req domain.RequestCorrectionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "reason")
+		return
+	}
+	if len(req.Lines) == 0 {
+		writeError(w, http.StatusBadRequest, "no_lines", domain.ErrNoLines.Error())
+		return
+	}
+	for _, l := range req.Lines {
+		if !exactlyOneNonZero(l.DebitAmount, l.CreditAmount) {
+			writeError(w, http.StatusBadRequest, "invalid_line", domain.ErrInvalidLine.Error())
+			return
+		}
+	}
+
+	original, _, err := h.store.GetJournal(r.Context(), originalID)
+	if err != nil {
+		h.log.Error("RequestCorrection: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if original == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, original.LegalEntityID, actionRequestCorrection); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if original.ApprovalStatus != domain.ApprovalStatusPosted {
+		writeError(w, http.StatusUnprocessableEntity, "correction_source_not_posted", domain.ErrCorrectionSourceNotPosted.Error())
+		return
+	}
+
+	correctionOf := originalID
+	newHeader := &domain.JournalHeader{
+		JournalID: uuid.NewString(), TenantID: tenantID, LegalEntityID: original.LegalEntityID,
+		FiscalPeriod: original.FiscalPeriod, Status: domain.JournalStatusPending,
+		JournalType: original.JournalType, TransactionDate: original.TransactionDate, PostingDate: original.PostingDate,
+		CurrencyCode: original.CurrencyCode, BookID: original.BookID, ReportingBasis: original.ReportingBasis,
+		Description: "Correction of " + originalID + ": " + req.Reason, CreatedByPrincipalID: principalID,
+		CorrelationID:         "correction:" + originalID + ":" + uuid.NewString(),
+		CorrectionOfJournalID: &correctionOf,
+		// "Corrections create new journals" — a correction is a brand-new
+		// proposal, starting DRAFT and going through the full ACC-03
+		// lifecycle again, exactly like any other journal a human creates.
+		ApprovalStatus: domain.ApprovalStatusDraft,
+	}
+	lines := make([]domain.JournalLine, len(req.Lines))
+	for i, l := range req.Lines {
+		lines[i] = domain.JournalLine{
+			AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount,
+			Description: l.Description, TaxCode: l.TaxCode, TaxLogicSnapshotID: l.TaxLogicSnapshotID,
+			Dimensions: l.Dimensions,
+		}
+	}
+	if _, _, err := h.store.CreateJournal(r.Context(), newHeader, lines); err != nil {
+		h.log.Error("RequestCorrection: failed to create correcting journal", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusCreated, newHeader)
+}
+
+// GetAvailableActions answers ACC-03's own GetAvailableActions query,
+// derived directly from ValidApprovalTransitions — the same rulebook
+// every lifecycle handler above actually enforces, so this can never
+// advertise an action that would then be refused.
+func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "journal_id")
+	header, _, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("GetAvailableActions: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	actionsByTarget := map[domain.ApprovalStatus]string{
+		domain.ApprovalStatusPendingApproval:  "submit",
+		domain.ApprovalStatusApproved:         "approve",
+		domain.ApprovalStatusRejected:         "reject",
+		domain.ApprovalStatusPostingRequested: "request_posting",
+		domain.ApprovalStatusCancelled:        "cancel",
+	}
+	var actions []string
+	for _, to := range domain.ValidApprovalTransitions[header.ApprovalStatus] {
+		if name, ok := actionsByTarget[to]; ok {
+			actions = append(actions, name)
+		}
+	}
+	if header.ApprovalStatus == domain.ApprovalStatusDraft || header.ApprovalStatus == domain.ApprovalStatusPendingApproval {
+		actions = append(actions, "amend")
+	}
+	if header.ApprovalStatus == domain.ApprovalStatusPosted {
+		actions = append(actions, "correct")
+	}
+	if actions == nil {
+		actions = []string{}
+	}
+	writeJSON(w, http.StatusOK, domain.AvailableActions{JournalID: journalID, Actions: actions})
+}
+
+// GetJournalHistory answers ACC-03's own GetJournalHistory query, derived
+// from the header's own timestamp/actor columns — never a separate events
+// table this v1 didn't build; an entry appears only if its corresponding
+// timestamp is actually set.
+func (h *Handler) GetJournalHistory(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "journal_id")
+	header, _, err := h.store.GetJournal(r.Context(), journalID)
+	if err != nil {
+		h.log.Error("GetJournalHistory: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if header == nil {
+		writeError(w, http.StatusNotFound, "journal_not_found", "")
+		return
+	}
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	history := []domain.JournalHistoryEntry{
+		{Event: "created", At: header.CreatedAt, PrincipalID: header.CreatedByPrincipalID},
+	}
+	if header.SubmittedAt != nil {
+		history = append(history, domain.JournalHistoryEntry{Event: "submitted", At: *header.SubmittedAt, PrincipalID: derefString(header.SubmittedByPrincipalID)})
+	}
+	if header.ApprovedAt != nil {
+		history = append(history, domain.JournalHistoryEntry{Event: "approved", At: *header.ApprovedAt, PrincipalID: derefString(header.ApprovedByPrincipalID), Detail: derefString(header.ApprovalFingerprint)})
+	}
+	if header.RejectedAt != nil {
+		history = append(history, domain.JournalHistoryEntry{Event: "rejected", At: *header.RejectedAt, PrincipalID: derefString(header.RejectedByPrincipalID), Detail: derefString(header.RejectionReason)})
+	}
+	if header.PostingRequestedAt != nil {
+		history = append(history, domain.JournalHistoryEntry{Event: "posting_requested", At: *header.PostingRequestedAt, PrincipalID: derefString(header.PostingRequestedByPrincipalID)})
+	}
+	if header.PostedAt != nil {
+		history = append(history, domain.JournalHistoryEntry{Event: "posted", At: *header.PostedAt, PrincipalID: derefString(header.PostedByPrincipalID)})
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
 // ── ACC-04 (Posting Engine) ───────────────────────────────────────────────────
 //
 // "owns PostingExecution, calculation trace, rule resolution, posting
@@ -1169,8 +1713,20 @@ func (h *Handler) commitJournal(ctx context.Context, header *domain.JournalHeade
 	if err := h.closeClient.CheckPeriodOpen(ctx, header.TenantID, header.LegalEntityID, header.FiscalPeriod); err != nil {
 		return err
 	}
-	return h.store.TransitionJournal(ctx, header.TenantID, header.JournalID,
-		domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID)
+	if err := h.store.TransitionJournal(ctx, header.TenantID, header.JournalID,
+		domain.JournalStatusValidated, domain.JournalStatusFinalized, principalID); err != nil {
+		return err
+	}
+	// Close the loop with ACC-03: the ledger commit above is the primary
+	// fact and has already happened, so a failure here is logged, not
+	// fatal to the overall post — the same posture this file already takes
+	// with every other "secondary evidence write after the real fact
+	// already landed" case (e.g. posting execution records).
+	if err := h.store.MarkJournalPosted(ctx, header.TenantID, header.JournalID); err != nil {
+		h.log.Error("journal finalized but ApprovalStatus could not be advanced to POSTED",
+			zap.String("journal_id", header.JournalID), zap.Error(err))
+	}
+	return nil
 }
 
 // PostAccountingEvent is ACC-04's primary command: given a caller-declared
@@ -1255,6 +1811,13 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 		JournalID: uuid.NewString(), TenantID: tenantID, LegalEntityID: req.LegalEntityID,
 		FiscalPeriod: req.FiscalPeriod, Status: domain.JournalStatusPending, Description: req.Description,
 		CreatedByPrincipalID: principalID, CorrelationID: req.CorrelationID, SourceEventID: &sourceEventID,
+		// System-originated: this bypasses ACC-03's human Draft/Submit/
+		// Approve workflow entirely (already gated by actionPostingExecute,
+		// which a deployment grants only to internal service identities —
+		// see that action's own doc comment), landing directly at
+		// POSTING_REQUESTED so commitJournal's own MarkJournalPosted call
+		// has a valid ApprovalStatus to advance from.
+		ApprovalStatus: domain.ApprovalStatusPostingRequested,
 	}
 	lines := make([]domain.JournalLine, len(resolvedLines))
 	for i, l := range resolvedLines {
@@ -1356,6 +1919,16 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 			"journal must be VALIDATED before it can be posted through the posting engine; current status: "+string(header.Status))
 		return
 	}
+	// ACC-03 gate: this is no longer "any VALIDATED journal" — only one
+	// that actually completed the human proposal/approval workflow and had
+	// RequestPosting called on it may enter the posting engine. This is
+	// the real integration point between ACC-03 and ACC-04 the spec's own
+	// "Dependencies: ... ACC-04" line names.
+	if header.ApprovalStatus != domain.ApprovalStatusPostingRequested {
+		writeError(w, http.StatusUnprocessableEntity, "posting_not_requested",
+			"journal must have completed ACC-03's approval workflow and had posting requested; current approval_status: "+string(header.ApprovalStatus))
+		return
+	}
 
 	exec := &domain.PostingExecution{
 		ExecutionID: uuid.NewString(), TenantID: tenantID, LegalEntityID: header.LegalEntityID, Kind: domain.PostingExecutionKindApprovedJournal,
@@ -1379,6 +1952,13 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
 	}
+	// Close the loop with ACC-03 — same posture as commitJournal's own
+	// call: the ledger commit above is the primary fact and has already
+	// happened, so a failure here is logged, not fatal to the response.
+	if err := h.store.MarkJournalPosted(r.Context(), header.TenantID, req.JournalID); err != nil {
+		h.log.Error("journal finalized but ApprovalStatus could not be advanced to POSTED",
+			zap.String("journal_id", req.JournalID), zap.Error(err))
+	}
 
 	now := time.Now().UTC()
 	if err := h.store.MarkPostingExecutionCommitted(r.Context(), tenantID, exec.ExecutionID, req.JournalID, now); err != nil {
@@ -1389,6 +1969,7 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 	}
 	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &req.JournalID, &now
 	header.Status = domain.JournalStatusFinalized
+	header.ApprovalStatus = domain.ApprovalStatusPosted
 	h.publisher.PublishJournalPosted(r.Context(), *header)
 	writeJSON(w, http.StatusOK, exec)
 }
@@ -1554,6 +2135,10 @@ func (h *Handler) ReprocessFailedPosting(w http.ResponseWriter, r *http.Request)
 			h.failExecution(r.Context(), tenantID, executionID, err)
 			writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 			return
+		}
+		if err := h.store.MarkJournalPosted(r.Context(), header.TenantID, header.JournalID); err != nil {
+			h.log.Error("journal finalized on reprocess but ApprovalStatus could not be advanced to POSTED",
+				zap.String("journal_id", header.JournalID), zap.Error(err))
 		}
 	}
 
