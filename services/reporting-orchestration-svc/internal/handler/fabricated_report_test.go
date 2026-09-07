@@ -40,6 +40,7 @@ func TestTriggerRun_DoesNotFabricateCompletion(t *testing.T) {
 	defReq.Header.Set("Content-Type", "application/json")
 	defReq.Header.Set("X-Tenant-ID", "tenant-report-fab")
 	defReq.Header.Set("X-Principal-Id", "principal-01")
+	defReq = withEnvelope(defReq) // rest of the canonical envelope; headers already set win
 	defRec := httptest.NewRecorder()
 	router.ServeHTTP(defRec, defReq)
 	if defRec.Code != http.StatusCreated {
@@ -57,6 +58,7 @@ func TestTriggerRun_DoesNotFabricateCompletion(t *testing.T) {
 	runReq.Header.Set("Content-Type", "application/json")
 	runReq.Header.Set("X-Tenant-ID", "tenant-report-fab")
 	runReq.Header.Set("X-Principal-Id", "principal-01")
+	runReq = withEnvelope(runReq) // rest of the canonical envelope; headers already set win
 	runRec := httptest.NewRecorder()
 	router.ServeHTTP(runRec, runReq)
 
@@ -123,6 +125,7 @@ func TestTriggerRun_SameFabricationForEveryReportType(t *testing.T) {
 			defReq.Header.Set("Content-Type", "application/json")
 			defReq.Header.Set("X-Tenant-ID", "tenant-report-fab2")
 			defReq.Header.Set("X-Principal-Id", "principal-01")
+			defReq = withEnvelope(defReq) // rest of the canonical envelope; headers already set win
 			defRec := httptest.NewRecorder()
 			router.ServeHTTP(defRec, defReq)
 			var def domain.ReportDefinition
@@ -133,6 +136,7 @@ func TestTriggerRun_SameFabricationForEveryReportType(t *testing.T) {
 			runReq.Header.Set("Content-Type", "application/json")
 			runReq.Header.Set("X-Tenant-ID", "tenant-report-fab2")
 			runReq.Header.Set("X-Principal-Id", "principal-01")
+			runReq = withEnvelope(runReq) // rest of the canonical envelope; headers already set win
 			runRec := httptest.NewRecorder()
 			router.ServeHTTP(runRec, runReq)
 

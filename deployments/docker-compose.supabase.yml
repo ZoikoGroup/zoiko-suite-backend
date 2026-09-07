@@ -1,0 +1,194 @@
+# Supabase override — points the LOGIN PATH services at a hosted Postgres.
+#
+#   docker compose -f deployments/docker-compose.yml \
+#                  -f deployments/docker-compose.supabase.yml up -d
+#
+# Layered as an override rather than edited into docker-compose.yml so the
+# all-local stack keeps working untouched: drop the second -f and every service
+# is back on the postgres container.
+#
+# WHAT THIS COVERS AND WHAT IT DOES NOT
+#
+# Four services. The other 59 stay on the local postgres container, which is why
+# that container is still started — the base file's depends_on is deliberately
+# left in place. Those four are all the login path touches:
+#
+#   identity-svc        principals, password credentials, the identity envelope
+#   tenant-svc          the root of all scope; resolve fails closed without it
+#   authorization-svc   consulted by every write on the platform
+#   governance-svc      read by the console's landing page
+#
+# gateway-auth-svc has no database at all, so there is nothing here for it.
+#
+# EVERY SERVICE POINTS AT THE SAME DATABASE. Supabase gives a project one
+# database, so the isolation that used to come from 63 separate databases now
+# comes from DB_SCHEMA plus a role holding USAGE on that schema and no other.
+# Run deployments/supabase to create both.
+#
+# Values come from the backend root .env.local (or .env for a deployed
+# environment), passed with --env-file. See the header of either file. The `:?`
+# entries have no default on purpose: a missing one stops compose with a named
+# error instead of silently starting a service pointed at the wrong database.
+
+services:
+  identity-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      # 6543 is the transaction pooler. The direct port (5432 on
+      # db.<ref>.supabase.co) is IPv6-only on newer projects and caps out around
+      # 60 connections, which one service's pool of 20 would eat a third of.
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      # Always "postgres" — a Supabase project has exactly one database, and the
+      # per-service separation has moved to DB_SCHEMA below.
+      DB_NAME: "postgres"
+      # Through a Supabase pooler the username is ROLE.PROJECT_REF. A bare role
+      # name is rejected as a password failure, which sends you looking at the
+      # wrong thing entirely.
+      DB_USER: "app_identity_context.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      # Supabase refuses plaintext. The base file sets `disable` for the local
+      # container; this has to override it.
+      DB_SSLMODE: require
+      DB_SCHEMA: identity_context
+      # pgx defaults to cached NAMED prepared statements. PgBouncer in
+      # transaction mode prepares them on one server connection and executes on
+      # another, so they fail intermittently under concurrency only — passing
+      # every smoke test first.
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  tenant-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_tenant_entity_registry.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: tenant_entity_registry
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  authorization-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_authorization.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: authorization_svc
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  governance-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_governance_decision_log.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: governance_decision_log
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  # ── HR domain (supabase migrations 0022-0025) ───────────────────────────────
+  #
+  # Four more services, added when the HR domain moved over. Same shape as the
+  # four above: one schema each, a role scoped to that schema, and the pooler's
+  # prepared-statement workaround.
+  #
+  # These four also talk to EACH OTHER over HTTP, and that is unaffected by
+  # anything here — leave-absence-svc resolves an employee through
+  # employee-master-svc, and payroll-run-svc reads a breakdown from
+  # compensation-svc, both by service name on the compose network. Only their
+  # database endpoints move.
+  #
+  # Roles: run deployments/supabase to create app_employee_master,
+  # app_leave_absence, app_compensation and app_payroll_run, each holding USAGE
+  # on its own schema and nothing else. A role that does not exist arrives as a
+  # password failure, which sends you looking at APP_DB_PASSWORD instead.
+
+  employee-master-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_employee_master.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: employee_master
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  leave-absence-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_leave_absence.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: leave_absence
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  compensation-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_compensation.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: compensation
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  employment-contracts-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_employment_contracts.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: employment_contracts
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  payroll-run-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_payroll_run.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: payroll_run
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"
+
+  # ── Notification (supabase migrations 0007, 0032, 0033) ─────────────────────
+  #
+  # The register of every person-directed notice and whether it actually went
+  # out. Added when read state, recipient provenance and delivery retry landed.
+  #
+  # Two things here are unlike the services above.
+  #
+  # It is the only service in this file with an OUTBOUND dependency that is not
+  # another Zoiko service: a mail relay. The SMTP_* variables are inherited from
+  # the base compose file, which points them at the local mailpit container —
+  # that is wrong for anything but a developer's machine, so a real deployment
+  # must override them with a provider's relay and set SMTP_TLS_MODE=starttls.
+  # Left inherited rather than pinned here because the credential belongs in the
+  # environment, not in a file under version control. The service verifies them
+  # at startup and logs the result.
+  #
+  # It is also the only one whose background worker reads across tenants. That
+  # runs under 0033's SELECT-only platform-scope policy and projects notification
+  # ids alone, so app_notification needs no privilege the other roles lack — but
+  # it does mean this service must not be pointed at a schema that has not had
+  # 0033 applied, or the retry worker silently finds nothing.
+  notification-svc:
+    environment:
+      DB_HOST: "${SUPABASE_DB_HOST:?set SUPABASE_DB_HOST in .env.local}"
+      DB_PORT: "${SUPABASE_DB_PORT:-6543}"
+      DB_NAME: "postgres"
+      DB_USER: "app_notification.${SUPABASE_PROJECT_REF:?set SUPABASE_PROJECT_REF in .env.local}"
+      DB_PASSWORD: "${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env.local}"
+      DB_SSLMODE: require
+      DB_SCHEMA: notification
+      DB_OPTIONS: "default_query_exec_mode=exec statement_cache_capacity=0"

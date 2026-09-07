@@ -32,6 +32,7 @@ import (
 	"zoiko.io/evidence-requirements-svc/internal/authz"
 	"zoiko.io/evidence-requirements-svc/internal/config"
 	"zoiko.io/evidence-requirements-svc/internal/documentvault"
+	svcenvelope "zoiko.io/evidence-requirements-svc/internal/envelope"
 	"zoiko.io/evidence-requirements-svc/internal/events"
 	"zoiko.io/evidence-requirements-svc/internal/handler"
 	"zoiko.io/evidence-requirements-svc/internal/health"
@@ -173,6 +174,13 @@ func main() {
 	// why RLS alone is not sufficient here.
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(pgStore, publisher, authzClient, docsClient, log)
 	handler.RegisterRoutes(r, h)

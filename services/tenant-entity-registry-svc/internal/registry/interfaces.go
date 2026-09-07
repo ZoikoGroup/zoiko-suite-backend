@@ -54,6 +54,14 @@ type Store interface {
 	CreateWorkspace(ctx context.Context, w *domain.Workspace) error
 	GetWorkspaceByID(ctx context.Context, workspaceID string) (*domain.Workspace, error)
 	ListWorkspacesByTenant(ctx context.Context, tenantID string) ([]*domain.Workspace, error)
+	UpdateWorkspace(ctx context.Context, workspaceID string, req domain.UpdateWorkspaceRequest) (*domain.Workspace, error)
+	// TransitionWorkspaceStatus applies an archive or restore as a single
+	// guarded UPDATE, the same shape as TransitionEntityStatus.
+	// Returns (rowsAffected, previousStatus, error). rowsAffected == 0 means the
+	// workspace is absent or its current status was not in allowedPriorStates.
+	// previousStatus is read in the same statement, so a consumer of the event
+	// learns what the workspace moved away from.
+	TransitionWorkspaceStatus(ctx context.Context, workspaceID string, newStatus domain.WorkspaceStatus, allowedPriorStates []domain.WorkspaceStatus, actorID, correlationID string) (int64, domain.WorkspaceStatus, error)
 
 	// ── EntityHierarchy ─────────────────────────────────────────────────────
 
@@ -103,6 +111,8 @@ type EventPublisher interface {
 	PublishEntityHierarchyChanged(ctx context.Context, hierarchy *domain.EntityHierarchy, changeType string, correlationID string)
 	PublishEntityJurisdictionChanged(ctx context.Context, assignment *domain.EntityJurisdictionAssignment, changeType string, correlationID string)
 	PublishWorkspaceCreated(ctx context.Context, workspace *domain.Workspace, correlationID string)
+	PublishWorkspaceUpdated(ctx context.Context, workspace *domain.Workspace, correlationID string)
+	PublishWorkspaceStatusChanged(ctx context.Context, tenantID, workspaceID, actorID string, previousStatus, newStatus domain.WorkspaceStatus, correlationID string)
 }
 
 // ---------------------------------------------------------------------------

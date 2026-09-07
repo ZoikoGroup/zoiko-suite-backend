@@ -1,0 +1,172 @@
+-- 0032_notification_recipient_and_read_state.sql
+-- notification-svc â†’ schema `notification`. Creates no tables.
+--
+-- The change notification-svc's own 000003_read_state_and_recipient_address
+-- makes, in the form this project applies it. Same statements, same end state;
+-- whichever runs first, the other is a no-op.
+--
+-- â”€â”€ What this closes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- 0007 built this register around a stub delivery adapter. The adapter logged
+-- a line and reported success for every channel, so the schema never needed to
+-- know where a notification went â€” recipient_principal_id was enough to say
+-- who it was for, and nothing was ever actually sent to anybody.
+--
+-- With a real SMTP provider behind EMAIL that is no longer true, and three
+-- facts the register could not previously hold become load-bearing:
+--
+--   recipient_address         where the message was actually delivered
+--   recipient_address_source  where that address came from
+--   provider_response         what accepted it, and under what identifier
+--   read_at                   whether the recipient opened an in-app notice
+--
+-- â”€â”€ Guarded, like 0027, 0028 and 0031 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- `notification` is created by 0007 in this same directory, so in a full-set
+-- apply it is always present. The guard is for the partial paths â€” verify.sh,
+-- and a single-file paste into a project built to a different point â€” where
+-- bare DDL against a missing schema aborts the batch and silently skips
+-- everything numbered after it. That is exactly the failure 0028 shipped with,
+-- and the reason it had to be reissued.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'notification') THEN
+    RAISE NOTICE 'schema notification absent; skipping 0032 â€” re-run it after 0007 has created the schema';
+    RETURN;
+END IF;
+
+-- â”€â”€ Columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- A snapshot, not a reference. Resolving the address again at read time
+-- answers "where would this go today"; a delivery register has to answer
+-- "where did it actually go", and the two differ precisely when somebody's
+-- address has changed â€” which is when the question gets asked.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS recipient_address TEXT$stmt$;
+
+-- ZS-SVC-Y-001 Â§0.4 names "mandatory notices being sent to an unverified or
+-- stale free-text address with no recipient provenance" among the failures
+-- this control plane exists to prevent. Provenance is only a control once it
+-- is written down.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS recipient_address_source VARCHAR(32)$stmt$;
+
+-- Acceptance evidence, and named so it cannot be read as more than that: Â§0.4
+-- forbids treating a provider's "accepted" as proof a person received, read or
+-- was legally served with a notice.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS provider_response TEXT$stmt$;
+
+-- NULL means unread. IN_APP notices are delivered by existing in this table,
+-- so without this column every one of them stayed new forever and no unread
+-- count was expressible.
+EXECUTE $stmt$ALTER TABLE notification.notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ$stmt$;
+
+-- â”€â”€ Constraints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- NOT VALID: enforced on every write from here on, without the scan that would
+-- reject the table over rows already recorded. Those rows are the audit trail
+-- of what the service did while the stub was in place; a migration that
+-- rewrites them to fit a new constraint is worse than one that leaves them
+-- visible. VALIDATE CONSTRAINT once the backlog is known clean.
+
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_address_source_known'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_address_source_known
+        CHECK (recipient_address_source IS NULL
+               OR recipient_address_source IN ('IDENTITY_CONTEXT', 'REQUEST')) NOT VALID
+    $stmt$;
+END IF;
+
+-- Both columns are written by one code path, so one without the other means
+-- that path is wrong. Cheaper to hear it from the database than from a dispute
+-- over which address a statutory notice went to.
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_address_has_provenance'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_address_has_provenance
+        CHECK ((recipient_address IS NULL) = (recipient_address_source IS NULL)) NOT VALID
+    $stmt$;
+END IF;
+
+-- This service cannot observe whether an email was opened. A read_at on an
+-- EMAIL row would assert something it has no way to know â€” the same
+-- overstatement as calling provider acceptance a delivery.
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_read_state_is_in_app'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_read_state_is_in_app
+        CHECK (read_at IS NULL OR channel = 'IN_APP') NOT VALID
+    $stmt$;
+END IF;
+
+IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                WHERE conname = 'notifications_read_after_created'
+                  AND conrelid = 'notification.notifications'::regclass) THEN
+    EXECUTE $stmt$
+    ALTER TABLE notification.notifications
+        ADD CONSTRAINT notifications_read_after_created
+        CHECK (read_at IS NULL OR read_at >= created_at) NOT VALID
+    $stmt$;
+END IF;
+
+-- â”€â”€ Index â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- The unread badge is polled by every signed-in session, making it the most
+-- frequent read this service serves. Partial: it answers one question, and the
+-- qualifying rows are a small and shrinking share of the register.
+EXECUTE $stmt$
+CREATE INDEX IF NOT EXISTS idx_notifications_unread
+    ON notification.notifications (tenant_id, recipient_principal_id)
+    WHERE read_at IS NULL AND channel = 'IN_APP'
+$stmt$;
+
+-- â”€â”€ Verification â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+--
+-- Asked as a query rather than trusted from "Success. No rows returned", which
+-- a guarded DO block returns whether it ran every statement or returned at the
+-- first IF.
+
+DECLARE missing text;
+BEGIN
+    SELECT string_agg(c.col, ', ')
+      INTO missing
+      FROM (VALUES ('recipient_address'), ('recipient_address_source'),
+                   ('provider_response'), ('read_at')) AS c(col)
+     WHERE NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'notification'
+           AND table_name   = 'notifications'
+           AND column_name  = c.col);
+
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION '0032 did not add: %', missing;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'notification' AND c.relname = 'idx_notifications_unread') THEN
+        RAISE EXCEPTION '0032 did not create idx_notifications_unread';
+    END IF;
+
+    -- The table was already ENABLE + FORCE before this migration; adding
+    -- columns does not change that, and checking costs nothing next to
+    -- discovering otherwise later.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'notification' AND c.relname = 'notifications'
+           AND c.relrowsecurity AND c.relforcerowsecurity) THEN
+        RAISE EXCEPTION 'notification.notifications does not have forced row security';
+    END IF;
+
+    RAISE NOTICE 'verified: 0032 applied â€” recipient address, provenance, provider evidence and read state present';
+END;
+
+END
+$guard$;

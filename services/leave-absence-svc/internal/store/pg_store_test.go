@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -37,18 +38,34 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS leave_requests, leave_balances, leave_types CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS leave_requests, leave_balances, leave_types, holidays CASCADE;`)
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_fix_race_and_idempotency.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", migration))
+	// EVERY *.up.sql, BY GLOB, NOT A HARDCODED LIST. This named 000001 and 000002
+	// and the service has three: 000003_leave_policy_and_holidays was never
+	// applied, so every test ran against a schema without carry_forward_allowed,
+	// min_notice_days or the holiday calendar - the whole of the policy
+	// enforcement these tests exist to cover.
+	//
+	// A suite that names migrations one at a time goes green while the boundary
+	// under test is simply absent, and it does so silently. Same failure mode
+	// found in notification-svc, evidence-manifest-svc, audit-event-store-svc and
+	// configuration-feature-flag-svc.
+	migrations, err := filepath.Glob(filepath.Join(base, "../../deployments/migrations", "*.up.sql"))
+	if err != nil {
+		t.Fatalf("globbing migrations: %v", err)
+	}
+	if len(migrations) == 0 {
+		t.Fatal("no *.up.sql found - these tests would run against an empty schema")
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", migration, err)
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(migration), err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", migration, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(migration), err)
 		}
 	}
 
@@ -76,7 +93,7 @@ func setupLeaveTypeAndBalance(t *testing.T, s *store.PgStore, ctx context.Contex
 // of creating a duplicate request and double-locking pending hours.
 func TestPgStore_SubmitLeaveRequest_RetriedCorrelationID_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -116,7 +133,7 @@ func TestPgStore_SubmitLeaveRequest_RetriedCorrelationID_IsIdempotent(t *testing
 // transition.
 func TestPgStore_ApproveLeaveRequest_ConcurrentApproveReject_NeverDoubleMutates(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -184,7 +201,7 @@ func TestPgStore_ApproveLeaveRequest_ConcurrentApproveReject_NeverDoubleMutates(
 
 func TestPgStore_ApproveLeaveRequest_DoubleApprove_SecondFails(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantID := uuid.New().String()
 	ctx := middleware.WithTenant(context.Background(), tenantID)
@@ -217,7 +234,7 @@ func TestPgStore_ApproveLeaveRequest_DoubleApprove_SecondFails(t *testing.T) {
 
 func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	pool := openTestPool(t)
-	s := store.New(pool)
+	s := store.New(pool, "")
 
 	tenantA := uuid.New().String()
 	tenantB := uuid.New().String()

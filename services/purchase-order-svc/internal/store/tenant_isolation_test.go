@@ -30,6 +30,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -98,18 +100,38 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
-	if err != nil {
-		fmt.Printf("failed to read migration: %v\n", err)
+	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
+	//
+	// This applied 000001 alone, so 000002_force_rls and
+	// 000003_policy_empty_tenant_is_null were never present -- a suite whose
+	// whole purpose is tenant isolation ran against a schema where the isolation
+	// had not been applied. A named file only stays correct while somebody
+	// remembers to edit it, and nobody did.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if err != nil || len(migrations) == 0 {
+		// Fatal, not a quiet skip: no migrations means no schema, and every
+		// assertion below would then fail for an unrelated reason.
+		fmt.Printf("no *.up.sql under deployments/migrations: %v\n", err)
 		testPool.Close()
 		_ = pg.Stop()
 		os.Exit(1)
 	}
-	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-		fmt.Printf("failed to apply migration: %v\n", err)
-		testPool.Close()
-		_ = pg.Stop()
-		os.Exit(1)
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, readErr := os.ReadFile(migration)
+		if readErr != nil {
+			fmt.Printf("failed to read migration %s: %v\n", filepath.Base(migration), readErr)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
 	}
 
 	testStore = store.New(testPool, zap.NewNop())

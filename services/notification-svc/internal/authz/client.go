@@ -21,9 +21,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	svcenvelope "zoiko.io/notification-svc/internal/envelope"
+	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 )
 
 // decisionCacheTTL bounds how long a GRANTED/DENIED decision from
@@ -102,7 +105,11 @@ type authorizeResponse struct {
 // Decisions are cached for decisionCacheTTL; see the constant for why, and for
 // why only real decisions are eligible.
 func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	// The tenant is part of the decision, so it is part of the key.
+	// authorization-svc refuses a claimed tenant that disagrees with the
+	// verified one; a key without it would let one tenant's cached decision
+	// answer another's request and hide that refusal.
+	key := svcmiddleware.TenantFromContext(ctx) + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -177,6 +184,59 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// authorization-svc validates the same canonical envelope contract this
+	// service does, and answers 400 envelope_incomplete without it. A non-200
+	// is treated as unavailable below, so an unforwarded envelope turned EVERY
+	// gated request into a 503 that reads like an outage rather than a missing
+	// header — measured on the local estate: no notification could be sent at
+	// all, and the register recorded nothing because the refusal happened
+	// before the record was written.
+	//
+	// The same defect was fixed in the four HR services on 31/08 (3c618c2);
+	// notification-svc was not in that change. This is that fix, applied here.
+	//
+	// The values are the CALLER's, taken from the envelope the middleware
+	// already parsed into this request's context. Minting fresh ones would
+	// satisfy the contract and lose the only thing it is for: a decision in
+	// access_decision_log traceable to the request that caused it.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	requestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when there is one.
+	sourceChannel := "system"
+
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			tenantID = env.TenantID
+		}
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", sourceChannel)
+
+	// One decision per (request, action). An inbound request may authorize
+	// several actions, and each is a separate decision to record — a key of the
+	// request alone would make the second look like a replay of the first.
+	req.Header.Set("Idempotency-Key", requestID+":"+actionType)
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		c.log.Error("failed to call authorization-svc", zap.Error(err))
@@ -185,6 +245,12 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
+		// The status is logged because the two causes are indistinguishable to
+		// the caller and need different fixes: a 400 is this service's own
+		// envelope being wrong, a 5xx is authorization-svc actually being down.
+		c.log.Error("authorization-svc refused the check",
+			zap.Int("status", resp.StatusCode),
+			zap.String("action_type", actionType))
 		return domain.ErrAuthzServiceUnavailable
 	}
 

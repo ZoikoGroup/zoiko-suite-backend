@@ -37,6 +37,29 @@ type Config struct {
 	// no configured exporter is normal, not an error), so its absence must
 	// never affect whether a request is let through.
 	SIEMServiceURL string
+
+	// TenantRegistryURL is tenant-entity-registry-svc — the tenant and legal
+	// entity master GOV-01 resolves context against. Empty disables resolution
+	// entirely: the gateway then verifies the token and forwards, exactly as it
+	// did before, rather than failing every request closed on a dependency the
+	// deployment has not configured yet.
+	//
+	// Once set, resolution is enforced: an unknown or suspended tenant is
+	// denied and an unreachable registry blocks material writes. That is the
+	// intended end state — see internal/tenantctx.
+	TenantRegistryURL string
+
+	// TenantContextTTL bounds how long a resolved context is reused before the
+	// registry is consulted again. Short enough that a suspension takes effect
+	// promptly, long enough that the registry is not in the hot path of every
+	// gated request.
+	TenantContextTTL time.Duration
+
+	// TenantContextStaleGrace bounds how far past TenantContextTTL an entry may
+	// still answer a NON-MATERIAL READ while the registry is unreachable
+	// (ZS-SVC-A-001 §4 GOV-01 degradation contract). Zero disables stale reads.
+	// It never applies to writes.
+	TenantContextStaleGrace time.Duration
 }
 
 func Load() (*Config, error) {
@@ -48,15 +71,26 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	ctxTTL, err := intEnv("TENANT_CONTEXT_TTL_SECONDS", 30)
+	if err != nil {
+		return nil, err
+	}
+	ctxGrace, err := intEnv("TENANT_CONTEXT_STALE_GRACE_SECONDS", 120)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Config{
-		Port:             port,
-		JWKSURL:          strEnv("IDENTITY_JWKS_URL", "http://identity-svc:8080/.well-known/jwks.json"),
-		JWKSCacheTTL:     time.Duration(ttlSeconds) * time.Second,
-		ExpectedIssuer:   strEnv("EXPECTED_ISSUER", "identity-context-svc"),
-		ExpectedAudience: strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
-		CartaServiceURL:  strEnv("CARTA_SERVICE_URL", ""),
-		SIEMServiceURL:   strEnv("SIEM_SERVICE_URL", ""),
+		Port:                    port,
+		JWKSURL:                 strEnv("IDENTITY_JWKS_URL", "http://identity-svc:8080/.well-known/jwks.json"),
+		JWKSCacheTTL:            time.Duration(ttlSeconds) * time.Second,
+		ExpectedIssuer:          strEnv("EXPECTED_ISSUER", "identity-context-svc"),
+		ExpectedAudience:        strEnv("EXPECTED_AUDIENCE", "zoiko-internal"),
+		CartaServiceURL:         strEnv("CARTA_SERVICE_URL", ""),
+		SIEMServiceURL:          strEnv("SIEM_SERVICE_URL", ""),
+		TenantRegistryURL:       strEnv("TENANT_REGISTRY_URL", ""),
+		TenantContextTTL:        time.Duration(ctxTTL) * time.Second,
+		TenantContextStaleGrace: time.Duration(ctxGrace) * time.Second,
 	}, nil
 }
 

@@ -1,4 +1,4 @@
-﻿-- Initial schema for Intercompany Accounting Service (intercompany-accounting-svc)
+-- Initial schema for Intercompany Accounting Service (intercompany-accounting-svc)
 
 CREATE TABLE IF NOT EXISTS intercompany_entries (
     intercompany_entry_id  UUID PRIMARY KEY,

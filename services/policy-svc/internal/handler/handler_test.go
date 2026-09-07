@@ -275,11 +275,12 @@ type stubAuthz struct {
 	principal  string
 	scope      string
 	actionType string
+	tenantID   string
 }
 
-func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType string) error {
+func (a *stubAuthz) CheckAllowed(_ context.Context, principalID, legalEntityID, actionType, tenantID string) error {
 	a.calls++
-	a.principal, a.scope, a.actionType = principalID, legalEntityID, actionType
+	a.principal, a.scope, a.actionType, a.tenantID = principalID, legalEntityID, actionType, tenantID
 	return a.err
 }
 
@@ -679,8 +680,9 @@ func TestMutatingRoutes_503_AuthzUnavailableFailsClosed(t *testing.T) {
 func TestActivateVersion_AuthorizedAgainstStoredScope(t *testing.T) {
 	entity := "legal-entity-77"
 	store := okStore()
+	// Version has a legal entity but no tenant_id (global scope), so it requires the global action.
 	store.findVersion = &domain.PolicyVersion{
-		PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT", LegalEntityID: &entity,
+		PolicyVersionID: "pv-1", PolicyID: "p-1", VersionStatus: "DRAFT", LegalEntityID: &entity, TenantID: nil,
 	}
 	az := &stubAuthz{}
 	r := newTestRouterWithAuthz(store, &stubPublisher{}, &stubDecisionLog{}, az)
@@ -695,8 +697,9 @@ func TestActivateVersion_AuthorizedAgainstStoredScope(t *testing.T) {
 	if az.scope != entity {
 		t.Errorf("authz scope = %q, want the version's legal entity %q", az.scope, entity)
 	}
-	if az.actionType != "POLICY_VERSION_ACTIVATE" {
-		t.Errorf("action_type = %q, want POLICY_VERSION_ACTIVATE", az.actionType)
+	// Version with no tenant_id requires the global action.
+	if az.actionType != "POLICY_VERSION_ACTIVATE_GLOBAL" {
+		t.Errorf("action_type = %q, want POLICY_VERSION_ACTIVATE_GLOBAL", az.actionType)
 	}
 }
 

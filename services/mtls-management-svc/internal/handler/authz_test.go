@@ -115,6 +115,7 @@ func TestAuthzDenied_RefusedOnEveryRoute(t *testing.T) {
 			}
 			req.Header.Set("X-Tenant-ID", "t1")
 			req.Header.Set("X-Principal-Id", "principal-denied")
+			req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -139,6 +140,7 @@ func TestRevokeDenied_CertificateStaysActive(t *testing.T) {
 	del := httptest.NewRequest(http.MethodDelete, "/v1/mtls/certificates/"+certID, nil)
 	del.Header.Set("X-Tenant-ID", "t1")
 	del.Header.Set("X-Principal-Id", "principal-denied")
+	del = withEnvelope(del) // rest of the canonical envelope; headers already set win
 	delW := httptest.NewRecorder()
 	r.ServeHTTP(delW, del)
 	if delW.Code != http.StatusForbidden {
@@ -152,6 +154,7 @@ func TestRevokeDenied_CertificateStaysActive(t *testing.T) {
 	get := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates/"+certID, nil)
 	get.Header.Set("X-Tenant-ID", "t1")
 	get.Header.Set("X-Principal-Id", "principal-test-01")
+	get = withEnvelope(get) // rest of the canonical envelope; headers already set win
 	getW := httptest.NewRecorder()
 	r.ServeHTTP(getW, get)
 	if getW.Code != http.StatusOK {
@@ -185,6 +188,7 @@ func TestAuthzUnavailable_FailsClosed(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -205,6 +209,7 @@ func TestListRequiresLegalEntity(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/mtls/certificates", nil)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

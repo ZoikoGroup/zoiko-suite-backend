@@ -1,10 +1,12 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/url"
 	"os"
+	"sort"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,7 +23,7 @@ import (
 )
 
 // openTestPool connects to a real Postgres and reapplies the migration from a
-// clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set — same
+// clean slate. Skips (not fails) if TEST_DATABASE_URL isn't set â€” same
 // convention as every other service in this platform.
 func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
@@ -43,19 +45,41 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS notifications CASCADE;`)
 
-	// Both migrations, in order: 000002 is what makes row-level security
-	// actually apply to this connection, so a suite that applied only 000001
-	// would be testing a schema no deployment runs.
-	for _, name := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_force_rls_and_constraints.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", name))
+	// Every migration, in order — discovered, not listed.
+	//
+	// This was a hardcoded list, with a comment warning that such a list is
+	// easy to leave behind and citing authorization-svc's equivalent being
+	// found short of 000005 on 31/08. It was then left behind in exactly the
+	// same way: 000004 landed and the list did not, so the whole suite ran
+	// against a schema with no delivery_attempts column and every test failed
+	// at once. A warning about a footgun is not a guard against it.
+	//
+	// Globbing removes the failure mode rather than documenting it. Filenames
+	// are zero-padded and fixed-width, so a lexical sort is the numeric order.
+	migrationDir := filepath.Join(base, "../../deployments/migrations")
+	names, err := filepath.Glob(filepath.Join(migrationDir, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to list migrations: %v", err)
+	}
+	if len(names) == 0 {
+		// An empty glob would otherwise leave every test failing against a
+		// table that was just dropped, which reads as a store bug.
+		t.Fatalf("no migrations found under %s", migrationDir)
+	}
+	sort.Strings(names)
+
+	for _, path := range names {
+		sql, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", name, err)
+			t.Fatalf("failed to read migration %s: %v", filepath.Base(path), err)
 		}
+		// A UTF-8 BOM survives ReadFile and is a syntax error to Postgres when
+		// the file is sent as a query string — psql -f strips it, so a
+		// migration can apply by hand and fail only here. 000003 shipped with
+		// one and took this whole suite down with "syntax error at or near".
+		sql = bytes.TrimPrefix(sql, []byte("\xef\xbb\xbf"))
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", name, err)
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(path), err)
 		}
 	}
 
@@ -101,7 +125,7 @@ func newNotification(tenantID, legalEntityID, recipient, correlationID string) *
 }
 
 // A retried send must resolve to the ORIGINAL notification, never a second
-// delivery — proved against the real unique index rather than a map stub.
+// delivery â€” proved against the real unique index rather than a map stub.
 func TestPgStore_CreateNotification_Retried_IsIdempotent(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool)
@@ -117,7 +141,7 @@ func TestPgStore_CreateNotification_Retried_IsIdempotent(t *testing.T) {
 	}
 
 	// The retry carries a fresh notification_id, exactly as the handler would
-	// generate on a second request — only the correlation id is the same.
+	// generate on a second request â€” only the correlation id is the same.
 	retry := newNotification("tenant-a", "le-us", "principal-2", "corr-retry")
 	retryGeneratedID := retry.NotificationID
 	created, err = s.CreateNotification(ctx, retry)
@@ -183,7 +207,7 @@ func TestPgStore_GetNotification_IsTenantScoped(t *testing.T) {
 }
 
 // notification_id is a uuid column, so a mistyped id dies inside the driver as
-// SQLSTATE 22P02. That used to surface as 503 store_unavailable — an outage
+// SQLSTATE 22P02. That used to surface as 503 store_unavailable â€” an outage
 // status for a typo in a URL.
 func TestPgStore_GetNotification_MalformedID_IsNotFoundNotAnOutage(t *testing.T) {
 	pool := openTestPool(t)
@@ -239,7 +263,7 @@ func TestPgStore_ListNotifications_IsTenantScopedAndPaged(t *testing.T) {
 	if len(rest) != 1 {
 		t.Fatalf("offset=2 returned %d rows, want the remaining 1", len(rest))
 	}
-	// The paging must partition the register, not repeat it — a tie on
+	// The paging must partition the register, not repeat it â€” a tie on
 	// created_at with no tiebreaker would let the same row appear twice.
 	for _, a := range page {
 		for _, b := range rest {
@@ -251,7 +275,7 @@ func TestPgStore_ListNotifications_IsTenantScopedAndPaged(t *testing.T) {
 }
 
 // The recipient filter is what an unscoped list falls back to, so it has to
-// actually filter — otherwise the handler's inbox scoping would be decorative.
+// actually filter â€” otherwise the handler's inbox scoping would be decorative.
 func TestPgStore_ListNotifications_FiltersByRecipient(t *testing.T) {
 	pool := openTestPool(t)
 	s := store.New(pool)
@@ -286,11 +310,11 @@ func TestPgStore_CompleteDelivery_IsTenantScoped(t *testing.T) {
 	}
 
 	sentAt := time.Now().UTC()
-	if err := s.CompleteDelivery(tenantCtx("tenant-b"), n.NotificationID, "SENT", "", &sentAt); !errors.Is(err, domain.ErrNotificationNotFound) {
+	if err := s.CompleteDelivery(tenantCtx("tenant-b"), n.NotificationID, "SENT", "", "stub receipt", &sentAt); !errors.Is(err, domain.ErrNotificationNotFound) {
 		t.Fatalf("cross-tenant complete returned %v, want ErrNotificationNotFound", err)
 	}
 
-	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", &sentAt); err != nil {
+	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "stub receipt", &sentAt); err != nil {
 		t.Fatalf("own-tenant complete: %v", err)
 	}
 	got, err := s.GetNotification(tenantCtx("tenant-a"), n.NotificationID)

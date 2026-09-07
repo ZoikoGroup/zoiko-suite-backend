@@ -24,6 +24,7 @@ type stubStore struct {
 	types    map[string]*domain.LeaveType
 	balances map[string]*domain.LeaveBalance
 	requests map[string]*domain.LeaveRequest
+	holidays map[string]*domain.Holiday
 }
 
 func newStubStore() *stubStore {
@@ -31,10 +32,17 @@ func newStubStore() *stubStore {
 		types:    make(map[string]*domain.LeaveType),
 		balances: make(map[string]*domain.LeaveBalance),
 		requests: make(map[string]*domain.LeaveRequest),
+		holidays: make(map[string]*domain.Holiday),
 	}
 }
 
 func (s *stubStore) CreateLeaveType(_ context.Context, lt *domain.LeaveType) error {
+	// Mirrors idx_leave_types_tenant_entity_code.
+	for _, existing := range s.types {
+		if existing.LegalEntityID == lt.LegalEntityID && existing.Code == lt.Code {
+			return domain.ErrLeaveTypeCodeExists
+		}
+	}
 	s.types[lt.LeaveTypeID] = lt
 	return nil
 }
@@ -357,6 +365,13 @@ func TestSubmitLeaveRequest_MissingCorrelationID_Rejected(t *testing.T) {
 func TestApproveLeaveRequest_EmployeeValidationServiceDown_FailsClosed(t *testing.T) {
 	s := newStubStore()
 
+	// leave_type_id is a foreign key in the real schema, and the submit path
+	// reads the leave type to apply its policy, so it has to exist.
+	s.types["lt-1"] = &domain.LeaveType{
+		LeaveTypeID: "lt-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Annual Vacation", Code: "VACATION", IsPaid: true,
+		Status: "ACTIVE", RequiresApproval: true,
+	}
 	s.balances["emp-501:lt-1"] = &domain.LeaveBalance{
 		BalanceID: "bal-1", TenantID: "tenant-abc", EmployeeID: "emp-501", LeaveTypeID: "lt-1", AllocatedHours: 80,
 	}
@@ -382,6 +397,13 @@ func TestSubmitLeaveRequest_RetriedCorrelationID_ReturnsOriginal(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newRouter(s, pub, &stubAuthZ{}, &stubEmployeeValidator{})
 
+	// leave_type_id is a foreign key in the real schema, and the submit path
+	// reads the leave type to apply its policy, so it has to exist.
+	s.types["lt-1"] = &domain.LeaveType{
+		LeaveTypeID: "lt-1", TenantID: "tenant-abc", LegalEntityID: "le-us",
+		Name: "Annual Vacation", Code: "VACATION", IsPaid: true,
+		Status: "ACTIVE", RequiresApproval: true,
+	}
 	s.balances["emp-501:lt-1"] = &domain.LeaveBalance{
 		BalanceID: "bal-1", TenantID: "tenant-abc", EmployeeID: "emp-501", LeaveTypeID: "lt-1", AllocatedHours: 80,
 	}

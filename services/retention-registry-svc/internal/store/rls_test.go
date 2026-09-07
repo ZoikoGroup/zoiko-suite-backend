@@ -296,7 +296,7 @@ func TestRLS_TenantCannotSeeAnotherTenantsHold(t *testing.T) {
 
 	holdA := addHold(t, s, tenantA, "FINANCIAL_LEDGER", strp(tenantA))
 
-	if got, err := s.FindLegalHoldByID(ctxFor(tenantB), holdA); err == nil {
+	if got, err := s.FindLegalHoldByID(ctxFor(tenantB), holdA, tenantB); err == nil {
 		t.Fatalf("ISOLATION FAILURE: tenant B read tenant A's legal hold: authority=%q scope=%q",
 			got.Authority, got.ScopeDescription)
 	}
@@ -311,7 +311,7 @@ func TestRLS_TenantCannotSeeAnotherTenantsHold(t *testing.T) {
 	}
 
 	// Sanity: tenant A still reads its own and is still blocked by it.
-	own, err := s.FindLegalHoldByID(ctxFor(tenantA), holdA)
+	own, err := s.FindLegalHoldByID(ctxFor(tenantA), holdA, tenantA)
 	if err != nil {
 		t.Fatalf("tenant A must still read its own hold: %v", err)
 	}
@@ -344,13 +344,13 @@ func TestRLS_ReleasingAnotherTenantsHold_Refused(t *testing.T) {
 
 	holdA := addHold(t, s, tenantA, "FINANCIAL_LEDGER", strp(tenantA))
 
-	if _, err := s.ReleaseLegalHold(ctxFor(tenantB), holdA, "principal-b", "approver-b"); err == nil {
+	if _, err := s.ReleaseLegalHold(ctxFor(tenantB), holdA, tenantB, "principal-b", "approver-b"); err == nil {
 		t.Fatal("tenant B must not be able to release tenant A's legal hold")
 	}
 
 	// And it must still be ACTIVE — the refusal has to mean "nothing
 	// happened", not just "the response said no".
-	still, err := s.FindLegalHoldByID(ctxFor(tenantA), holdA)
+	still, err := s.FindLegalHoldByID(ctxFor(tenantA), holdA, tenantA)
 	if err != nil {
 		t.Fatalf("read tenant A's hold: %v", err)
 	}

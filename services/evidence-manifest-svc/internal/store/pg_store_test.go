@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,28 +32,20 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	`)
 	require.NoError(t, err)
 
-	// Apply EVERY migration in filename order, never one hardcoded name.
-	// This previously read 000001 alone, which meant migration 000002's
-	// append-only trigger was never exercised and 000003's RLS policies
-	// would have been skipped silently — the tests would have gone green
-	// while the boundary under test was absent. Same failure mode found in
-	// audit-event-store-svc and configuration-feature-flag-svc during
-	// Priority 1.
-	entries, err := os.ReadDir("../../deployments/migrations")
-	require.NoError(t, err)
-	var migs []string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".up.sql") {
-			migs = append(migs, e.Name())
-		}
-	}
-	require.NotEmpty(t, migs, "no migrations found")
-	sort.Strings(migs)
-	for _, name := range migs {
-		sql, err := os.ReadFile(filepath.Join("../../deployments/migrations", name))
-		require.NoError(t, err, name)
+	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE. This applied 000001 alone and
+	// the service has two, so 000002_enforce_immutability was never present —
+	// the append-only triggers on an evidence manifest were absent from the
+	// schema these tests ran against, which is the one property a manifest has.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	require.NoError(t, err, "globbing migrations")
+	require.NotEmpty(t, migrations, "no *.up.sql found — these tests would run against an empty schema")
+	sort.Strings(migrations)
+
+	for _, path := range migrations {
+		sql, readErr := os.ReadFile(path)
+		require.NoError(t, readErr, "reading %s", filepath.Base(path))
 		_, err = pool.Exec(context.Background(), string(sql))
-		require.NoError(t, err, name)
+		require.NoError(t, err, "applying %s", filepath.Base(path))
 	}
 
 	return pool

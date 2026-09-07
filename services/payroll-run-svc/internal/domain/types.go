@@ -31,19 +31,54 @@ type PayrollRun struct {
 }
 
 type PaySlip struct {
-	SlipID             string    `json:"slip_id"`
-	TenantID           string    `json:"tenant_id"`
-	RunID              string    `json:"run_id"`
-	EmployeeID         string    `json:"employee_id"`
-	EmployeeNumber     string    `json:"employee_number"`
-	EmployeeName       string    `json:"employee_name"`
-	GrossPay           float64   `json:"gross_pay"`
-	TaxWithheld        float64   `json:"tax_withheld"`
-	BenefitsDeductions float64   `json:"benefits_deductions"`
-	NetPay             float64   `json:"net_pay"`
-	Currency           string    `json:"currency"`
-	EffectiveDate      string    `json:"effective_date"`
-	CreatedAt          time.Time `json:"created_at"`
+	SlipID             string  `json:"slip_id"`
+	TenantID           string  `json:"tenant_id"`
+	RunID              string  `json:"run_id"`
+	EmployeeID         string  `json:"employee_id"`
+	EmployeeNumber     string  `json:"employee_number"`
+	EmployeeName       string  `json:"employee_name"`
+	GrossPay           float64 `json:"gross_pay"`
+	TaxWithheld        float64 `json:"tax_withheld"`
+	BenefitsDeductions float64 `json:"benefits_deductions"`
+	NetPay             float64 `json:"net_pay"`
+	Currency           string  `json:"currency"`
+	EffectiveDate      string  `json:"effective_date"`
+
+	// TaxableAmount is the base tax was actually applied to. It is not gross:
+	// non-taxable earnings are excluded and taxable deductions come off it.
+	TaxableAmount float64 `json:"taxable_amount"`
+
+	// StructureID is the compensation structure this slip was computed from.
+	// nil means the employee is paid a flat base salary with no components —
+	// a valid state, not missing data.
+	StructureID *string `json:"structure_id,omitempty"`
+
+	// Items are the lines behind the totals, in payslip order.
+	Items []PaySlipItem `json:"items,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// PaySlipItem is one line of a payslip, copied from the compensation breakdown
+// that produced it.
+//
+// CalculationMethod and CalculationValue are stored rather than referenced: if
+// a structure changes 40% HRA to 35% next quarter, this payslip must still show
+// the 40% it was actually paid on.
+type PaySlipItem struct {
+	ItemID            string    `json:"item_id"`
+	TenantID          string    `json:"tenant_id"`
+	SlipID            string    `json:"slip_id"`
+	ComponentID       *string   `json:"component_id,omitempty"`
+	ComponentCode     string    `json:"component_code"`
+	ComponentName     string    `json:"component_name"`
+	ComponentType     string    `json:"component_type"` // EARNING, DEDUCTION
+	IsTaxable         bool      `json:"is_taxable"`
+	CalculationMethod string    `json:"calculation_method"`
+	CalculationValue  float64   `json:"calculation_value"`
+	Amount            float64   `json:"amount"`
+	Sequence          int       `json:"sequence"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 type ShadowComparison struct {
@@ -112,4 +147,11 @@ var (
 	// back to a fabricated baseline salary — computing real pay off a
 	// made-up number is worse than refusing to compute it at all.
 	ErrContractLookupFailed = errorString("failed to verify an active salary contract for one or more employees")
+
+	// ErrCompensationLookupFailed means compensation-svc could not be reached
+	// to resolve what an employee's pay is composed of. An employee with no
+	// structure configured is a normal state and does not raise this — it is
+	// reserved for the service being unable to answer at all, where guessing
+	// the composition would mean inventing deductions.
+	ErrCompensationLookupFailed = errorString("failed to resolve compensation breakdown: compensation-svc unavailable")
 )

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -102,18 +103,48 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	sql, err := os.ReadFile("../../deployments/migrations/000001_initial_schema.up.sql")
+	// EVERY *.up.sql, BY GLOB, NOT ONE NAMED FILE.
+	//
+	// This applied 000001 alone, so the force_rls and
+	// policy_empty_tenant_is_null migrations that came later were never present
+	// -- a suite whose whole purpose is tenant isolation ran against a schema
+	// where the isolation had not been applied, and would pass with the policies
+	// absent altogether. A named file only stays correct while somebody
+	// remembers to edit it, and nobody did.
+	//
+	// filepath.Glob returns lexically sorted names and the 000001_/000002_
+	// prefixes make lexical order the migration order.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
 	if err != nil {
-		fmt.Printf("failed to read migration: %v\n", err)
+		fmt.Printf("failed to glob migrations: %v\n", err)
 		testPool.Close()
 		_ = pg.Stop()
 		os.Exit(1)
 	}
-	if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-		fmt.Printf("failed to apply migration: %v\n", err)
+	if len(migrations) == 0 {
+		// Fatal, not a quiet skip: no migrations means no schema, and every
+		// assertion below would then fail for a reason unrelated to isolation.
+		fmt.Println("no *.up.sql found -- the suite would run against an empty schema")
 		testPool.Close()
 		_ = pg.Stop()
 		os.Exit(1)
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, readErr := os.ReadFile(migration)
+		if readErr != nil {
+			fmt.Printf("failed to read migration %s: %v\n", filepath.Base(migration), readErr)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
+		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
+			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
+			testPool.Close()
+			_ = pg.Stop()
+			os.Exit(1)
+		}
 	}
 
 	testStore = store.New(testPool)

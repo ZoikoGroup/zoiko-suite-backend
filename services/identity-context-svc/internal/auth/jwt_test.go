@@ -45,6 +45,9 @@ func mintToken(t *testing.T, claims idpClaims) string {
 	return signed
 }
 
+// validClaims carries aud and iss because VerifyBearer requires both. Tests
+// that assert some OTHER rejection must still supply them, or they pass for the
+// wrong reason — the token is refused before the claim under test is read.
 func validClaims(expOffset time.Duration) idpClaims {
 	now := time.Now()
 	return idpClaims{
@@ -52,10 +55,35 @@ func validClaims(expOffset time.Duration) idpClaims {
 		MFADone:  false,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   "auth0|user-123",
+			Issuer:    testCfg.JWTIssuer,
+			Audience:  jwt.ClaimStrings{auth.IdPTokenAudience},
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(expOffset)),
 		},
 	}
+}
+
+// A token that is otherwise perfect but names a different audience must be
+// refused: a signature proves the token was not forged, not that it was minted
+// for this endpoint.
+func TestVerifyBearer_WrongAudience_ReturnsError(t *testing.T) {
+	v := auth.NewJWTVerifier(testCfg)
+	claims := validClaims(5 * time.Minute)
+	claims.Audience = jwt.ClaimStrings{"zoiko-internal"}
+
+	_, err := v.VerifyBearer(context.Background(), mintToken(t, claims))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "aud")
+}
+
+func TestVerifyBearer_WrongIssuer_ReturnsError(t *testing.T) {
+	v := auth.NewJWTVerifier(testCfg)
+	claims := validClaims(5 * time.Minute)
+	claims.Issuer = "some-other-service"
+
+	_, err := v.VerifyBearer(context.Background(), mintToken(t, claims))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "iss")
 }
 
 // ── Happy path ───────────────────────────────────────────────────────────────
@@ -131,7 +159,10 @@ func TestVerifyBearer_MissingSubClaim_ReturnsError(t *testing.T) {
 	claims := idpClaims{
 		TenantID: "tenant-abc",
 		RegisteredClaims: jwt.RegisteredClaims{
-			// Subject intentionally absent
+			// Subject intentionally absent; aud and iss present so the token
+			// reaches the sub check rather than being refused before it.
+			Issuer:    testCfg.JWTIssuer,
+			Audience:  jwt.ClaimStrings{auth.IdPTokenAudience},
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
 		},
@@ -150,9 +181,12 @@ func TestVerifyBearer_MissingSubClaim_ReturnsError(t *testing.T) {
 func TestVerifyBearer_MissingTenantID_ReturnsError(t *testing.T) {
 	verifier := auth.NewJWTVerifier(testCfg)
 	claims := idpClaims{
-		// TenantID intentionally absent
+		// TenantID intentionally absent; aud and iss present so the token
+		// reaches the tenant_id check rather than being refused before it.
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   "auth0|user-123",
+			Issuer:    testCfg.JWTIssuer,
+			Audience:  jwt.ClaimStrings{auth.IdPTokenAudience},
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
 		},

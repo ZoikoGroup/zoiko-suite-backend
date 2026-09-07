@@ -37,6 +37,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -105,11 +107,26 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_idempotency_index.up.sql",
-	} {
-		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
+	//
+	// This named two migrations and the service has four. The omitted pair were
+	// 000003_force_rls and 000004_policy_empty_tenant_is_null -- so a suite whose
+	// whole purpose is tenant isolation ran against a schema where the isolation
+	// had not been applied. A named list only stays correct while somebody
+	// remembers to edit it, and nobody did.
+	migrations, globErr := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if globErr != nil || len(migrations) == 0 {
+		// Fatal, not a quiet skip: no migrations means no schema, and every
+		// assertion below would then fail for an unrelated reason.
+		fmt.Printf("no *.up.sql under deployments/migrations: %v\n", globErr)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
 			fmt.Printf("failed to read migration %s: %v\n", migration, err)
 			testPool.Close()

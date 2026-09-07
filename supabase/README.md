@@ -53,10 +53,10 @@ so attribution comes from the verified caller rather than the request body. It i
 fail-closed — with no principal on the connection the default is `NULL` and the
 `NOT NULL` rejects the write.
 
-## Progress — 20 of 20 complete
+## Progress — 25 services, plus 4 platform-wide corrections
 
-All applied and verified against a clean Postgres 16 container. **42 tables, 21
-schemas** (`app` plus one per service).
+All applied and verified against a clean Postgres 16 container by `./verify.sh`.
+**58 tables, 26 schemas** (`app` plus one per service).
 
 | # | service | schema | tables |
 |---|---|---|---|
@@ -80,6 +80,29 @@ schemas** (`app` plus one per service).
 | 18 | document-vault-svc | `document_vault` | 3 |
 | 19 | secret-vault-integration-svc | `secret_vault_integration` | 4 |
 | 20 | policy-svc | `policy` | 5 |
+| 21 | employee-master-svc | `employee_master` | 1 |
+| 22 | leave-absence-svc | `leave_absence` | 4 |
+| 23 | compensation-svc | `compensation` | 5 |
+| 24 | payroll-run-svc | `payroll_run` | 4 |
+| 25 | employment-contracts-svc | `employment_contracts` | 2 |
+
+Four files in the set create no tables. They correct defects found after the
+service migrations landed, and each says what it measured:
+
+| # | file | what it repairs |
+|---|------|-----------------|
+| 0026 | `policies_apply_to_connecting_role` | all 62 tenant policies named `zoiko_backend`, which is not the role any service connects as — under `FORCE` that is zero rows read and nothing written |
+| 0027 | `tenant_registry_fail_closed` | `tenant_entity_registry` policies had `USING` without `WITH CHECK` |
+| 0028 | `authorization_svc_row_security` | two tables with no row security at all, and two whose missing `WITH CHECK` let any tenant write a platform-wide row |
+| 0029 | `fix_payroll_immutability_trigger` | `RETURN NEW` in a `BEFORE DELETE` trigger silently cancelled every delete, duplicating payslips on recalculation |
+
+`0027` and `0028` operate on `authorization_svc` and `tenant_entity_registry`,
+which **no file in this directory creates** — they arrive via
+`deployments/supabase` applying the service compose migrations. Both are written
+to be a no-op when their schema is absent, so a fresh project can apply the
+whole set in one paste and re-run them afterwards. Do not rewrite either as bare
+DDL: the first `ALTER TABLE` then aborts the batch and everything numbered after
+it is silently skipped.
 
 ## Numbering
 
@@ -91,7 +114,7 @@ diff alike.
 `0001` must run first: every other file depends on the `app` schema, the
 `zoiko_backend` role and the identity helpers it creates.
 
-Add the next service as `0022_`. Never renumber a file that has been applied
+Add the next service as `0031_`. Never renumber a file that has been applied
 anywhere — the number is how you say which migrations a given database has
 already seen.
 

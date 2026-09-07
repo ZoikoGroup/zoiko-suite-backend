@@ -43,6 +43,7 @@ func seedKey(t *testing.T, r http.Handler, tenantID, alias string) string {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
 	req.Header.Set("X-Principal-Id", "principal-seed")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
@@ -124,6 +125,7 @@ func TestAuthzDenied_RefusedOnEveryRoute(t *testing.T) {
 			}
 			req.Header.Set("X-Tenant-ID", "t1")
 			req.Header.Set("X-Principal-Id", "principal-denied")
+			req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -152,6 +154,7 @@ func TestDisableDenied_KeyStaysEnabled(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/keys/"+keyID+"/disable", nil)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-denied")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
@@ -165,6 +168,7 @@ func TestDisableDenied_KeyStaysEnabled(t *testing.T) {
 	get := httptest.NewRequest(http.MethodGet, "/v1/keys/"+keyID, nil)
 	get.Header.Set("X-Tenant-ID", "t1")
 	get.Header.Set("X-Principal-Id", "principal-test-01")
+	get = withEnvelope(get) // rest of the canonical envelope; headers already set win
 	getW := httptest.NewRecorder()
 	r.ServeHTTP(getW, get)
 	if getW.Code != http.StatusOK {
@@ -193,6 +197,7 @@ func TestRotateDenied_VersionUnchanged(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/keys/"+keyID+"/rotate", nil)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-denied")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	if w.Code != http.StatusForbidden {
@@ -203,6 +208,7 @@ func TestRotateDenied_VersionUnchanged(t *testing.T) {
 	get := httptest.NewRequest(http.MethodGet, "/v1/keys/"+keyID, nil)
 	get.Header.Set("X-Tenant-ID", "t1")
 	get.Header.Set("X-Principal-Id", "principal-test-01")
+	get = withEnvelope(get) // rest of the canonical envelope; headers already set win
 	getW := httptest.NewRecorder()
 	r.ServeHTTP(getW, get)
 	var key struct {
@@ -232,6 +238,7 @@ func TestAuthzUnavailable_FailsClosed(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -250,6 +257,7 @@ func TestListRequiresLegalEntity(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/keys", nil)
 	req.Header.Set("X-Tenant-ID", "t1")
 	req.Header.Set("X-Principal-Id", "principal-test-01")
+	req = withEnvelope(req) // rest of the canonical envelope; headers already set win
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

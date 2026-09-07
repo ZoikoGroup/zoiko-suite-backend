@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zoiko.io/leave-absence-svc/internal/domain"
@@ -16,10 +17,31 @@ import (
 
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// schema is applied as a transaction-local search_path on every withRLS
+	// transaction. Empty means the server default, which is what a
+	// database-per-service deployment wants.
+	//
+	// It is set per transaction rather than once per connection because neither
+	// connection-level mechanism survives a transaction pooler:
+	//
+	//   - The DSN's " search_path=x" is a startup option, and Supavisor in
+	//     transaction mode drops startup options - a pooled server connection
+	//     is shared, so it cannot carry per-client session state.
+	//   - ALTER ROLE ... SET search_path is applied by Postgres at SESSION
+	//     start, and the pooler reuses server connections whose sessions began
+	//     before the change. Measured: of four roles altered at the same
+	//     moment, one picked it up and three were still on "$user", public
+	//     five minutes and many connections later, with no way to force a
+	//     recycle from the client.
+	//
+	// A transaction-local set_config is re-applied every transaction, so it
+	// holds whichever pooled connection serves it.
+	schema string
 }
 
-func New(pool *pgxpool.Pool) *PgStore {
-	return &PgStore{pool: pool}
+func New(pool *pgxpool.Pool, schema string) *PgStore {
+	return &PgStore{pool: pool, schema: schema}
 }
 
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.Tx) error) error {
@@ -30,6 +52,14 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 	defer func() {
 		_ = tx.Rollback(ctx)
 	}()
+
+	// Before anything reads a table: an unqualified name resolves against
+	// search_path, and the pooler cannot be relied on to have carried it.
+	if s.schema != "" {
+		if _, err := tx.Exec(ctx, "SELECT set_config('search_path', $1, true)", s.schema); err != nil {
+			return fmt.Errorf("set search_path: %w", err)
+		}
+	}
 
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		return fmt.Errorf("set tenant context: %w", err)
@@ -51,16 +81,28 @@ func (s *PgStore) CreateLeaveType(ctx context.Context, lt *domain.LeaveType) err
 		return domain.ErrIdentityMissing
 	}
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO leave_types (
 				leave_type_id, tenant_id, legal_entity_id, name, code,
-				is_paid, accrual_rate_per_year, max_balance, status, created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				is_paid, accrual_rate_per_year, max_balance, status,
+				carry_forward_allowed, carry_forward_max_hours, min_notice_days,
+				max_consecutive_days, requires_approval, color_hex, icon,
+				created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		`, lt.LeaveTypeID, tenantID, lt.LegalEntityID, lt.Name, lt.Code,
-			lt.IsPaid, lt.AccrualRatePerYear, lt.MaxBalance, lt.Status, lt.CreatedAt, lt.UpdatedAt)
+			lt.IsPaid, lt.AccrualRatePerYear, lt.MaxBalance, lt.Status,
+			lt.CarryForwardAllowed, lt.CarryForwardMaxHours, lt.MinNoticeDays,
+			lt.MaxConsecutiveDays, lt.RequiresApproval, lt.ColorHex, lt.Icon,
+			lt.CreatedAt, lt.UpdatedAt)
 		return err
 	})
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return domain.ErrLeaveTypeCodeExists
+	}
+	return err
 }
 
 func (s *PgStore) ListLeaveTypes(ctx context.Context, legalEntityID string) ([]domain.LeaveType, error) {
@@ -73,7 +115,10 @@ func (s *PgStore) ListLeaveTypes(ctx context.Context, legalEntityID string) ([]d
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := `
 			SELECT leave_type_id, tenant_id, legal_entity_id, name, code,
-			       is_paid, accrual_rate_per_year, max_balance, status, created_at, updated_at
+			       is_paid, accrual_rate_per_year, max_balance, status,
+			       carry_forward_allowed, carry_forward_max_hours, min_notice_days,
+			       max_consecutive_days, requires_approval, color_hex, icon,
+			       created_at, updated_at
 			FROM leave_types
 			WHERE tenant_id = $1
 		`
@@ -95,7 +140,10 @@ func (s *PgStore) ListLeaveTypes(ctx context.Context, legalEntityID string) ([]d
 			var lt domain.LeaveType
 			if err := rows.Scan(
 				&lt.LeaveTypeID, &lt.TenantID, &lt.LegalEntityID, &lt.Name, &lt.Code,
-				&lt.IsPaid, &lt.AccrualRatePerYear, &lt.MaxBalance, &lt.Status, &lt.CreatedAt, &lt.UpdatedAt,
+				&lt.IsPaid, &lt.AccrualRatePerYear, &lt.MaxBalance, &lt.Status,
+				&lt.CarryForwardAllowed, &lt.CarryForwardMaxHours, &lt.MinNoticeDays,
+				&lt.MaxConsecutiveDays, &lt.RequiresApproval, &lt.ColorHex, &lt.Icon,
+				&lt.CreatedAt, &lt.UpdatedAt,
 			); err != nil {
 				return err
 			}
@@ -119,12 +167,18 @@ func (s *PgStore) GetLeaveType(ctx context.Context, leaveTypeID string) (*domain
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
 			SELECT leave_type_id, tenant_id, legal_entity_id, name, code,
-			       is_paid, accrual_rate_per_year, max_balance, status, created_at, updated_at
+			       is_paid, accrual_rate_per_year, max_balance, status,
+			       carry_forward_allowed, carry_forward_max_hours, min_notice_days,
+			       max_consecutive_days, requires_approval, color_hex, icon,
+			       created_at, updated_at
 			FROM leave_types
 			WHERE tenant_id = $1 AND leave_type_id = $2
 		`, tenantID, leaveTypeID).Scan(
 			&lt.LeaveTypeID, &lt.TenantID, &lt.LegalEntityID, &lt.Name, &lt.Code,
-			&lt.IsPaid, &lt.AccrualRatePerYear, &lt.MaxBalance, &lt.Status, &lt.CreatedAt, &lt.UpdatedAt,
+			&lt.IsPaid, &lt.AccrualRatePerYear, &lt.MaxBalance, &lt.Status,
+			&lt.CarryForwardAllowed, &lt.CarryForwardMaxHours, &lt.MinNoticeDays,
+			&lt.MaxConsecutiveDays, &lt.RequiresApproval, &lt.ColorHex, &lt.Icon,
+			&lt.CreatedAt, &lt.UpdatedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {

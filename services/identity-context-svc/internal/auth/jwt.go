@@ -47,6 +47,12 @@ func (v *JWTVerifier) VerifyBearer(_ context.Context, token string) (*domain.Ver
 	},
 		jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(),
+		// Audience and issuer are both checked. Neither was before, so any
+		// token this secret could verify was accepted here — including one
+		// minted for a different purpose entirely. A signature says the token
+		// was not forged; it does not say the token was meant for this door.
+		jwt.WithAudience(IdPTokenAudience),
+		jwt.WithIssuer(v.cfg.JWTIssuer),
 	)
 	if err != nil {
 		return nil, err

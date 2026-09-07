@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	authzpkg "zoiko.io/key-management-svc/internal/authz"
 	"zoiko.io/key-management-svc/internal/domain"
+	svcenvelope "zoiko.io/key-management-svc/internal/envelope"
 	"zoiko.io/key-management-svc/internal/siem"
 	"zoiko.io/key-management-svc/internal/store"
 )
@@ -128,6 +129,13 @@ func New(s store.Store, siemClient *siem.Client, az AuthzChecker, l *zap.Logger)
 func NewRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID, chimw.RealIP, chimw.Logger, chimw.Recoverer)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer so a refusal is still traced, and ahead of every handler so no
+	// request reaches business logic without a resolved tenant, actor,
+	// correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "key-management-svc"})

@@ -34,6 +34,16 @@ var (
 	ErrUpstreamUnavailable = errors.New("upstream dependency unavailable")
 	// ErrNoToken is returned when neither bearer_token nor saml_assertion is provided.
 	ErrNoToken = errors.New("exactly one of bearer_token or saml_assertion must be provided")
+
+	// ErrSAMLUnsupported is returned for a saml_assertion, which this service
+	// does not process. No SAML identity provider is configured anywhere in the
+	// estate and no assertion can be validated against one that does not exist.
+	//
+	// Distinct from ErrTokenInvalid, and a 400 rather than a 401, because the
+	// caller's credential is not the problem: no assertion they could supply
+	// would work. Reporting it as "token invalid" invites a retry that cannot
+	// succeed, and buries an unimplemented feature as a routine auth failure.
+	ErrSAMLUnsupported = errors.New("saml_assertion is not supported: no SAML identity provider is configured")
 )
 
 // Resolver orchestrates the six-dimension identity context resolution.
@@ -93,16 +103,33 @@ func NewResolver(
 	}
 }
 
-// Drain blocks until all in-flight event publish goroutines have completed.
-// Call this after srv.Shutdown() returns during graceful shutdown to avoid
-// losing events mid-flight on SIGTERM.
+// Drain waits for in-flight event publish goroutines, bounded by ctx.
 //
-// NOTE: Drain is unbounded — it blocks indefinitely if a goroutine hangs.
-// A context-aware bounded drain with a configurable timeout is tracked as a
-// follow-up (see linked GitHub issue) so the process is not fully dependent
-// on the orchestrator's SIGKILL grace period in pathological cases.
-func (r *Resolver) Drain() {
-	r.wg.Wait()
+// Call it after srv.Shutdown() returns so events are not lost mid-flight on
+// SIGTERM. It returns ctx.Err() if the budget expires with goroutines still
+// running — the caller logs that and continues shutting down.
+//
+// The bound matters: this was previously an unconditional wg.Wait(), so one
+// goroutine blocked on an unreachable broker hung the process until the
+// orchestrator's SIGKILL. A stop that never completes is indistinguishable
+// from a crash in every dashboard that watches for clean termination.
+func (r *Resolver) Drain(ctx context.Context) error {
+	return waitCtx(ctx, &r.wg)
+}
+
+// waitCtx waits on wg until it completes or ctx is done.
+func waitCtx(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Resolve assembles and signs the IdentityContextEnvelope from all six dimensions.
@@ -120,10 +147,18 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 
 	// ── Dimension 1: Verify inbound token → authenticated principal ─────────
 	claims, err := r.verifyToken(ctx, req)
+	if errors.Is(err, ErrSAMLUnsupported) {
+		// Not wrapped in ErrTokenInvalid: the assertion was never assessed, so
+		// calling it invalid would state a verification result that never
+		// happened.
+		return "", err
+	}
 	if err != nil {
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
+			ctx, cancel := detach(ctx)
+			defer cancel()
 			if err := r.events.PublishResolutionFailed(ctx, "unknown", req.CorrelationID, "token_invalid"); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "identity.context.resolution_failed"),
@@ -140,6 +175,8 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
+			ctx, cancel := detach(ctx)
+			defer cancel()
 			if err := r.events.PublishResolutionFailed(ctx, claims.Subject, req.CorrelationID, "principal_inactive_or_not_found"); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "identity.context.resolution_failed"),
@@ -157,7 +194,8 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	}
 
 	// ── Dimension 3: Legal entity scope validation ──────────────────────────
-	if err := r.validateEntityScope(ctx, principal.PrincipalID, req.LegalEntityID, req.CorrelationID); err != nil {
+	entityScope, err := r.validateEntityScope(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, req.CorrelationID)
+	if err != nil {
 		return "", err
 	}
 
@@ -170,13 +208,16 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	for i, ra := range roleAssignments {
 		roleIDs[i] = ra.RoleID
 	}
-	permBundleIDs, err := r.upstream.ResolvePermissionBundles(ctx, roleIDs)
+	permBundleIDs, err := r.upstream.ResolvePermissionBundles(ctx, principal.TenantID, roleIDs)
 	if err != nil {
 		return "", fmt.Errorf("%w: permission bundles: %v", ErrUpstreamUnavailable, err)
 	}
 
 	// ── Dimension 5: Delegated authority ────────────────────────────────────
-	delegations, err := r.upstream.FetchActiveDelegations(ctx, principal.PrincipalID, req.LegalEntityID)
+	// Read from this service's own store, not an upstream. delegated_authorities
+	// is owned here, and asking a stubbed "upstream" for it meant every envelope
+	// carried an empty delegation list that looked authoritative.
+	delegations, err := r.principals.FindActiveDelegations(ctx, principal.PrincipalID, principal.TenantID)
 	if err != nil {
 		return "", fmt.Errorf("%w: delegated authority: %v", ErrUpstreamUnavailable, err)
 	}
@@ -191,6 +232,8 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
+			ctx, cancel := detach(ctx)
+			defer cancel()
 			if err := r.events.PublishResolutionFailed(ctx, principal.PrincipalID, req.CorrelationID, "trust_posture_blocked"); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "identity.context.resolution_failed"),
@@ -224,8 +267,16 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 		}
 	}
 
+	// FindActiveDelegations returns everything the principal holds across the
+	// tenant, so the session's own entity scope is applied here. A NULL
+	// legal_entity_id is tenant-wide and travels with every session; one naming
+	// a different entity must not, or an envelope issued for entity A would
+	// carry an authority that only exists on entity B.
 	activeDelegations := make([]domain.DelegatedAuthorityClaim, 0, len(delegations))
 	for _, d := range delegations {
+		if d.LegalEntityID != nil && *d.LegalEntityID != req.LegalEntityID {
+			continue
+		}
 		if d.RevocationStatus == domain.RevocationStatusActive {
 			activeDelegations = append(activeDelegations, domain.DelegatedAuthorityClaim{
 				DelegatedAuthorityID: d.DelegatedAuthorityID,
@@ -274,22 +325,27 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 
 	// ── Persist SessionContext (append-only evidence obligation) ─────────────
 	sc := domain.SessionContext{
-		SessionContextID:      sessionContextID,
-		PrincipalID:           principal.PrincipalID,
-		TenantID:              principal.TenantID,
-		LegalEntityID:         req.LegalEntityID,
-		CorrelationID:         req.CorrelationID,
-		TrustPosture:          posture,
-		MFAVerified:           claims.MFADone,
-		DeviceTrustScore:      0, // TODO: derive from device fingerprint claim in IdP token
-		AdaptiveRiskScore:     riskScore,
-		RiskSignalSource:      riskSource,
-		EnvelopeJWTJTI:        jti,
-		IssuedAt:              now,
-		ExpiresAt:             exp,
-		InvalidatedAt:         nil,
-		InvalidationReason:    nil,
-		DataResidencyPolicyID: "", // TODO: resolve from Tenant & Entity Registry
+		SessionContextID: sessionContextID,
+		PrincipalID:      principal.PrincipalID,
+		TenantID:         principal.TenantID,
+		LegalEntityID:    req.LegalEntityID,
+		CorrelationID:    req.CorrelationID,
+		TrustPosture:     posture,
+		MFAVerified:      claims.MFADone,
+		// nil, not 0. No device fingerprint reaches this service, and 0 is the
+		// worst score rather than the absence of one — see DeviceTrustScore.
+		DeviceTrustScore:   nil,
+		AdaptiveRiskScore:  riskScore,
+		RiskSignalSource:   riskSource,
+		EnvelopeJWTJTI:     jti,
+		IssuedAt:           now,
+		ExpiresAt:          exp,
+		InvalidatedAt:      nil,
+		InvalidationReason: nil,
+		// Resolved in Dimension 3 from the entity the session is scoped to. The
+		// registry treats it as mandatory on every LegalEntity, and this record
+		// is the evidence of which policy governed the session's PII.
+		DataResidencyPolicyID: entityScope.DataResidencyPolicyID,
 		SourceService:         "identity-context-svc",
 		SchemaVersion:         "1.0",
 	}
@@ -307,6 +363,8 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
+		ctx, cancel := detach(ctx)
+		defer cancel()
 		if err := r.events.PublishContextResolved(ctx, principal.PrincipalID, principal.TenantID, req.LegalEntityID, sessionContextID, req.CorrelationID); err != nil {
 			r.log.Error("event publish failed",
 				zap.String("event_type", "identity.context.resolved"),
@@ -327,16 +385,21 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (stri
 }
 
 // InvalidateSession appends invalidated_at to the SessionContext record and
-// evicts the JWT from Redis cache. Fully idempotent — re-invalidating an
+// evicts the JWT from cache. Fully idempotent — re-invalidating an
 // already-invalidated session is a no-op.
+//
+// tenantID is the caller's verified scope. A session belonging to another
+// tenant reads back as absent, so this is a no-op rather than a cross-tenant
+// revocation.
 func (r *Resolver) InvalidateSession(
 	ctx context.Context,
 	sessionContextID string,
+	tenantID string,
 	reason domain.InvalidationReason,
 	actorPrincipalID string,
 	correlationID string,
 ) error {
-	existing, err := r.sessions.GetSessionContext(ctx, sessionContextID)
+	existing, err := r.sessions.GetSessionContext(ctx, sessionContextID, tenantID)
 	if err != nil || existing == nil {
 		// Not found — idempotent no-op
 		return nil
@@ -350,7 +413,7 @@ func (r *Resolver) InvalidateSession(
 	}
 
 	now := time.Now().UTC()
-	if err := r.sessions.Invalidate(ctx, sessionContextID, reason, now); err != nil {
+	if err := r.sessions.Invalidate(ctx, sessionContextID, tenantID, reason, now); err != nil {
 		return fmt.Errorf("invalidate session context: %w", err)
 	}
 	if err := r.sessions.Evict(ctx, sessionContextID); err != nil {
@@ -360,6 +423,8 @@ func (r *Resolver) InvalidateSession(
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
+		ctx, cancel := detach(ctx)
+		defer cancel()
 		if err := r.events.PublishSessionInvalidated(ctx, sessionContextID, existing.PrincipalID, reason, correlationID); err != nil {
 			r.log.Error("event publish failed",
 				zap.String("event_type", "session.invalidated"),
@@ -383,8 +448,11 @@ func (r *Resolver) verifyToken(ctx context.Context, req domain.ResolveRequest) (
 	if req.BearerToken != "" {
 		return r.verifier.VerifyBearer(ctx, req.BearerToken)
 	}
-	// SAML: TODO implement xmlsec1-backed SAML 2.0 assertion validation
-	return nil, errors.New("SAML assertion processing not yet implemented")
+	// Refused at the edge rather than half-attempted. Implementing this needs a
+	// chosen IdP, its metadata and signing certificates, plus xmlsec1 or an
+	// equivalent — none of which exist here, so there is nothing to validate
+	// against and no way to test an implementation that claimed to.
+	return nil, ErrSAMLUnsupported
 }
 
 func (r *Resolver) validateTenant(ctx context.Context, tenantID, correlationID string) error {
@@ -403,8 +471,8 @@ func (r *Resolver) validateTenant(ctx context.Context, tenantID, correlationID s
 	return nil
 }
 
-func (r *Resolver) validateEntityScope(ctx context.Context, principalID, legalEntityID, correlationID string) error {
-	authorized, err := r.upstream.IsPrincipalAuthorizedForEntity(ctx, principalID, legalEntityID)
+func (r *Resolver) validateEntityScope(ctx context.Context, principalID, tenantID, legalEntityID, correlationID string) (*domain.EntityScope, error) {
+	scope, err := r.upstream.ResolveEntityScope(ctx, principalID, tenantID, legalEntityID)
 	if err != nil {
 		r.log.Error("entity registry unreachable — failing closed",
 			zap.String("principal_id", principalID),
@@ -412,12 +480,12 @@ func (r *Resolver) validateEntityScope(ctx context.Context, principalID, legalEn
 			zap.String("correlation_id", correlationID),
 			zap.Error(err),
 		)
-		return fmt.Errorf("%w: entity registry: %v", ErrUpstreamUnavailable, err)
+		return nil, fmt.Errorf("%w: entity registry: %v", ErrUpstreamUnavailable, err)
 	}
-	if !authorized {
-		return fmt.Errorf("%w: principal=%s entity=%s", ErrEntityUnauthorized, principalID, legalEntityID)
+	if scope == nil || !scope.Authorized {
+		return nil, fmt.Errorf("%w: principal=%s entity=%s", ErrEntityUnauthorized, principalID, legalEntityID)
 	}
-	return nil
+	return scope, nil
 }
 
 // resolveTrustPosture reads from the async risk-signal cache (Q3).
@@ -444,6 +512,8 @@ func (r *Resolver) resolveTrustPosture(
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
+			ctx, cancel := detach(ctx)
+			defer cancel()
 			if err := r.events.PublishRiskSignalUnavailable(ctx, principalID, correlationID); err != nil {
 				r.log.Error("event publish failed",
 					zap.String("event_type", "session.risk.changed"),
@@ -475,3 +545,26 @@ func (r *Resolver) resolveTrustPosture(
 
 	return posture, riskScore, riskSource, nil
 }
+
+// detach returns a context that keeps ctx's values — trace span, correlation —
+// but is immune to its cancellation.
+//
+// Every event publish below runs in a goroutine that outlives the HTTP handler
+// that started it. Handing those the REQUEST context meant the response
+// completing cancelled the publish mid-write: the observed failure was
+// "kafka write: context canceled" on identity.authentication.succeeded, and the
+// event simply never reached the topic.
+//
+// That is the evidence obligation failing silently. It is worse than a dropped
+// log line, because the service reports the login as succeeded and no record of
+// it exists anywhere downstream. A publish is given its own deadline instead, so
+// it is bounded by how long a publish may reasonably take rather than by how
+// quickly the client got its response.
+func detach(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), eventPublishTimeout)
+}
+
+// eventPublishTimeout bounds one fire-and-forget publish. Long enough for a
+// broker round trip including a metadata refresh, short enough that Drain's
+// budget is not consumed by one stuck write.
+const eventPublishTimeout = 5 * time.Second

@@ -1,0 +1,195 @@
+-- 0028_authorization_svc_row_security.sql
+-- authorization-svc → schema `authorization_svc`. Creates no tables.
+--
+-- Like tenant_entity_registry in 0027, this schema has no migration in this
+-- directory: it reached the project through deployments/supabase applying the
+-- service compose migrations. Found by surveying the live database.
+--
+-- This is the service every write on the platform is checked against, so each
+-- change below was measured on a faithful reproduction before being written —
+-- including the exact FindGrantedActions query, because a policy that filters
+-- that join makes the platform deny everything.
+--
+-- ── Defect 1: two tables have no row security at all ─────────────────────────
+--
+-- permission_bundles and principal_role_assignments carry no tenant_id, so the
+-- service own 000004_add_rls skipped them and said why. Measured: with a tenant
+-- installed, app_authorization saw BOTH tenants assignments and BOTH tenants
+-- permission bundles.
+--
+-- Neither needs a tenant column. Both carry role_id, and `roles` IS tenant
+-- scoped with RLS already enabled and forced. Scoping them through the parent
+-- role keeps ONE source of truth for which tenant owns a grant, and makes a
+-- bundle that disagrees with its role about the tenant unrepresentable — the
+-- same shape 0019 uses for document_versions and 0009 for replay_manifests.
+--
+-- It also preserves the platform-scope path, which matters more here than
+-- anywhere else. The roles policy honours app.platform_scope = 'true' as
+-- "visible regardless of tenant_id", and FindGrantedActions sets it. Because the
+-- EXISTS subquery reads `roles`, it inherits that behaviour exactly: scoped when
+-- a tenant is installed, unscoped under platform scope. Verified both ways.
+--
+-- ── Defect 2: any tenant could write a GLOBAL row ────────────────────────────
+--
+-- sod_rules and access_decision_log both read
+--
+--     tenant_id IS NULL OR tenant_id = <caller tenant>
+--
+-- with no WITH CHECK. A FOR ALL policy that omits WITH CHECK applies USING to
+-- the write check, and USING permits tenant_id IS NULL — so any tenant could
+-- INSERT a row with a NULL tenant and have it apply platform-wide. Measured: a
+-- connection scoped to one tenant planted a global SoD rule successfully.
+--
+-- On sod_rules that is a segregation-of-duties rule affecting every tenant on
+-- the platform, written by one of them.
+--
+-- The fix is the asymmetric shape 0010, 0020 and 0021 already use for nullable
+-- tenant columns:
+--
+--   USING      — global rows OR my own tenant rows
+--   WITH CHECK — my own tenant rows; a GLOBAL row only from a connection that
+--                has installed NO tenant at all
+--
+-- That grants strictly less than before: a tenant connection can never write a
+-- global, and a no-tenant connection can write ONLY globals, because its own
+-- tenant clause is NULL and NULL is not true. Platform-level rules therefore
+-- require an explicitly platform-level connection.
+--
+-- ── Left alone, deliberately ──────────────────────────────────────────────────
+--
+-- delegated_authorities still has no row security. It carries neither tenant_id
+-- nor role_id, so there is no path to a tenant to write a policy against, and
+-- giving it one means a column the service INSERT does not supply — a change to
+-- authorization-svc, not to its schema. It holds 0 rows today.
+--
+-- Also NOT addressed, because it is a code change and not a schema one:
+-- FindGrantedActions runs under withPlatformScope, so the role join during the
+-- decision that authorizes every platform write is unscoped by tenant. Its own
+-- doc comment says platform scope is "Used ONLY by FindRoleByID", so the comment
+-- and the code disagree. Whether that read should take the caller verified
+-- tenant instead belongs in its own review.
+
+-- ── Why every statement below is guarded ─────────────────────────────────────
+--
+-- `authorization_svc` is not created by anything in this directory. It reaches
+-- a database through deployments/supabase applying the service's own compose
+-- migrations, which happens AFTER the SQL editor has been given the migration
+-- set. So on a fresh project — and in supabase/verify.sh, which applies only
+-- this directory — the schema genuinely is not there yet.
+--
+-- Written as bare DDL, the first ALTER TABLE aborted the whole batch with
+--
+--     ERROR:  schema "authorization_svc" does not exist
+--
+-- which stopped 0029 and everything after it from being applied at all. The
+-- guard makes this file a no-op in that case and leaves the rest of the set to
+-- run; where the schema does exist the executed statements are unchanged, so
+-- the end state is identical. 0027 has the same dependency and survives it only
+-- because it happens to iterate a catalogue, which is empty rather than absent.
+--
+-- Re-run this file after deployments/supabase has created the schema.
+
+DO $guard$
+BEGIN
+
+IF NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'authorization_svc') THEN
+    RAISE NOTICE 'schema authorization_svc absent; skipping 0028 — re-run it after deployments/supabase has created the schema';
+    RETURN;
+END IF;
+
+-- ── permission_bundles and principal_role_assignments ────────────────────────
+
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.permission_bundles         FORCE  ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments ENABLE ROW LEVEL SECURITY$stmt$;
+EXECUTE $stmt$ALTER TABLE authorization_svc.principal_role_assignments FORCE  ROW LEVEL SECURITY$stmt$;
+
+-- The subquery reads `roles`, which is itself under RLS, so this policy is
+-- whatever the roles policy is: tenant-scoped normally, platform-wide under
+-- app.platform_scope. Do not inline the roles predicate here — duplicating it
+-- would let the two drift, and the platform-scope hatch would have to be
+-- repeated in three places instead of living in one.
+-- Dropped first so this file is re-runnable. The guard above tells you to run
+-- it again once deployments/supabase has created the schema, and on a project
+-- where it HAS already applied a bare CREATE POLICY would fail with "policy
+-- ... already exists" — turning the documented recovery step into an error.
+-- The two policies below are recreated identically, so a re-run is a no-op.
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.permission_bundles$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_via_role ON authorization_svc.permission_bundles
+    FOR ALL
+    USING (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = permission_bundles.role_id))
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = permission_bundles.role_id))
+$stmt$;
+
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_via_role ON authorization_svc.principal_role_assignments$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_via_role ON authorization_svc.principal_role_assignments
+    FOR ALL
+    USING (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = principal_role_assignments.role_id))
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM authorization_svc.roles r
+         WHERE r.role_id = principal_role_assignments.role_id))
+$stmt$;
+
+-- ── sod_rules and access_decision_log: globals become platform-only ──────────
+
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.sod_rules$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.sod_rules
+    FOR ALL
+    USING (
+        tenant_id IS NULL
+        OR tenant_id::text = app.current_tenant_id()
+    )
+    WITH CHECK (
+        (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
+        OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
+    )
+$stmt$;
+
+EXECUTE $stmt$DROP POLICY IF EXISTS tenant_isolation_policy ON authorization_svc.access_decision_log$stmt$;
+EXECUTE $stmt$
+CREATE POLICY tenant_isolation_policy ON authorization_svc.access_decision_log
+    FOR ALL
+    USING (
+        tenant_id IS NULL
+        OR tenant_id::text = app.current_tenant_id()
+    )
+    WITH CHECK (
+        (tenant_id IS NOT NULL AND tenant_id::text = app.current_tenant_id())
+        OR (tenant_id IS NULL AND app.current_tenant_id() IS NULL)
+    )
+$stmt$;
+
+-- ── Verification ─────────────────────────────────────────────────────────────
+
+DECLARE unprotected int; no_check int;
+BEGIN
+    SELECT count(*) INTO unprotected
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'authorization_svc' AND c.relkind = 'r'
+       AND c.relname IN ('permission_bundles','principal_role_assignments')
+       AND NOT (c.relrowsecurity AND c.relforcerowsecurity);
+    IF unprotected > 0 THEN
+        RAISE EXCEPTION '% authorization_svc tables still lack forced row security', unprotected;
+    END IF;
+
+    SELECT count(*) INTO no_check
+      FROM pg_policies
+     WHERE schemaname = 'authorization_svc'
+       AND tablename IN ('sod_rules','access_decision_log')
+       AND with_check IS NULL;
+    IF no_check > 0 THEN
+        RAISE EXCEPTION '% nullable-tenant policies still have no WITH CHECK', no_check;
+    END IF;
+END;
+
+END
+$guard$;

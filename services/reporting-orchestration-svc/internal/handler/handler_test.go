@@ -40,6 +40,7 @@ func newRouter(t *testing.T) http.Handler {
 func TestHealthCheck(t *testing.T) {
 	router := newRouter(t)
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(req)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -69,6 +70,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 	}
 	body, _ := json.Marshal(createReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/reports/definitions", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", "principal-01")
@@ -92,6 +94,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 
 	// 2. Get Definition by ID
 	getReq := httptest.NewRequest(http.MethodGet, "/v1/reports/definitions/"+def.ID, nil)
+	withEnvelope(getReq)
 	getReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	getRec := httptest.NewRecorder()
 	router.ServeHTTP(getRec, getReq)
@@ -101,6 +104,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 
 	// 3. List Definitions
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/reports/definitions?legal_entity_id=LE-4004", nil)
+	withEnvelope(listReq)
 	listReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	listRec := httptest.NewRecorder()
 	router.ServeHTTP(listRec, listReq)
@@ -120,6 +124,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 		PeriodEnd:   "2026-09-30",
 	})
 	runReq := httptest.NewRequest(http.MethodPost, "/v1/reports/definitions/"+def.ID+"/runs", bytes.NewBuffer(runBody))
+	withEnvelope(runReq)
 	runReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	runReq.Header.Set("Content-Type", "application/json")
 	runReq.Header.Set("X-Principal-Id", "principal-01")
@@ -153,6 +158,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 
 	// 5. Get Run by ID
 	getRunReq := httptest.NewRequest(http.MethodGet, "/v1/reports/runs/"+run.ID, nil)
+	withEnvelope(getRunReq)
 	getRunReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	getRunRec := httptest.NewRecorder()
 	router.ServeHTTP(getRunRec, getRunReq)
@@ -162,6 +168,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 
 	// 6. List Runs
 	listRunsReq := httptest.NewRequest(http.MethodGet, "/v1/reports/runs?definition_id="+def.ID, nil)
+	withEnvelope(listRunsReq)
 	listRunsReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	listRunsRec := httptest.NewRecorder()
 	router.ServeHTTP(listRunsRec, listRunsReq)
@@ -172,6 +179,7 @@ func TestCreateDefinitionAndTriggerRun(t *testing.T) {
 	// 7. Update Definition Status (pause)
 	patchBody, _ := json.Marshal(map[string]string{"status": "PAUSED"})
 	patchReq := httptest.NewRequest(http.MethodPatch, "/v1/reports/definitions/"+def.ID+"/status", bytes.NewBuffer(patchBody))
+	withEnvelope(patchReq)
 	patchReq.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	patchReq.Header.Set("Content-Type", "application/json")
 	patchReq.Header.Set("X-Principal-Id", "principal-01")
@@ -188,6 +196,7 @@ func TestValidationErrors(t *testing.T) {
 	// Missing legal_entity_id
 	body, _ := json.Marshal(domain.CreateDefinitionRequest{ReportName: "Test"})
 	req := httptest.NewRequest(http.MethodPost, "/v1/reports/definitions", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -202,6 +211,7 @@ func TestTriggerRunOnMissingDefinition(t *testing.T) {
 
 	runBody, _ := json.Marshal(domain.TriggerRunRequest{TriggeredBy: domain.TriggerManual})
 	req := httptest.NewRequest(http.MethodPost, "/v1/reports/definitions/non-existent-id/runs", bytes.NewBuffer(runBody))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-rpt-77")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -38,8 +39,9 @@ type AuthZClient interface {
 // AuthzAdmin provisions the role/bundle definition into authorization-svc's
 // real admin API — the step that makes a definition actually enforced.
 type AuthzAdmin interface {
-	CreateRole(ctx context.Context, roleID, tenantID, roleCode, roleName, roleScopeType, createdByPrincipalID string) error
-	CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string) error
+	CreateRole(ctx context.Context, roleID, tenantID, roleCode, roleName, roleScopeType, createdByPrincipalID, correlationID string) error
+	CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string, correlationID string) error
+	SetRoleActive(ctx context.Context, roleID string, active bool, correlationID string) error
 }
 
 const (
@@ -93,15 +95,17 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionRoleManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
-
-	tenantID := svcmiddleware.TenantFromContext(r.Context())
 	roleID := uuid.NewString()
 
-	if err := h.authzAdmin.CreateRole(r.Context(), roleID, tenantID, req.RoleCode, req.RoleName, req.RoleScopeType, principalID); err != nil {
+	if err := h.authzAdmin.CreateRole(r.Context(), roleID, tenantID, req.RoleCode, req.RoleName, req.RoleScopeType, principalID, req.CorrelationID); err != nil {
 		h.log.Error("failed to provision role in authorization-svc", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 		return
@@ -143,6 +147,10 @@ func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	list, err := h.store.ListRoles(r.Context(), status)
 	if err != nil {
@@ -162,6 +170,10 @@ func (h *Handler) GetRole(w http.ResponseWriter, r *http.Request) {
 	roleDefinitionID := chi.URLParam(r, "role_definition_id")
 
 	_, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -189,9 +201,59 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionRoleManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
+	}
+
+	// Reject an unknown status instead of storing it.
+	//
+	// This used to pass req.Status straight to the store, and the column is a
+	// bare VARCHAR(20) with the vocabulary only in a comment -- so
+	// {"status":"BANANA"} persisted, and ListRoles(?status=ACTIVE) then omitted
+	// a role that was neither active nor retired but simply unreadable. The
+	// CHECK constraint added in 000002 is the backstop; this is the error the
+	// caller can act on.
+	if req.Status != "" && req.Status != string(domain.RoleStatusActive) && req.Status != string(domain.RoleStatusRetired) {
+		writeError(w, http.StatusBadRequest, "invalid_status",
+			fmt.Sprintf("status must be %s or %s, got %q", domain.RoleStatusActive, domain.RoleStatusRetired, req.Status))
+		return
+	}
+
+	// PROPAGATE THE STATUS CHANGE BEFORE RECORDING IT, and fail closed.
+	//
+	// This is the same ordering CreateRole uses, for the same reason: the
+	// catalogue must never claim a state the platform is not actually
+	// enforcing. Retiring here without telling authorization-svc left the role
+	// fully live -- FindGrantedActions joins through roles.active_flag, so
+	// every principal holding it kept every action, while this service's
+	// register displayed RETIRED. A governance record that disagrees with the
+	// enforcement it describes is worse than no record.
+	//
+	// Only a real transition is propagated. An empty status means "rename
+	// only", and PATCHing the status it already has is a no-op here rather than
+	// a redundant call -- though the remote is idempotent either way.
+	if req.Status != "" {
+		current, err := h.store.GetRole(r.Context(), roleDefinitionID)
+		if err != nil {
+			h.writeStoreErr(w, err)
+			return
+		}
+		if req.Status != string(current.Status) {
+			active := req.Status == string(domain.RoleStatusActive)
+			if err := h.authzAdmin.SetRoleActive(r.Context(), roleDefinitionID, active, req.CorrelationID); err != nil {
+				h.log.Error("failed to propagate role status to authorization-svc",
+					zap.String("role_definition_id", roleDefinitionID),
+					zap.String("status", req.Status),
+					zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
+				return
+			}
+		}
 	}
 
 	updated, err := h.store.UpdateRole(r.Context(), roleDefinitionID, req.RoleName, req.Status)
@@ -228,6 +290,10 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionRoleManage); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -238,7 +304,7 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authzAdmin.CreatePermissionBundle(r.Context(), roleDefinitionID, req.BundleCode, req.PermittedActions); err != nil {
+	if err := h.authzAdmin.CreatePermissionBundle(r.Context(), roleDefinitionID, req.BundleCode, req.PermittedActions, req.CorrelationID); err != nil {
 		h.log.Error("failed to provision permission bundle in authorization-svc", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 		return
@@ -279,6 +345,10 @@ func (h *Handler) ListBundles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	list, err := h.store.ListBundles(r.Context(), roleDefinitionID)
 	if err != nil {
@@ -301,6 +371,15 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if tenantID == "" {
+		writeError(w, http.StatusUnauthorized, "tenant_missing", string(domain.ErrTenantMissing))
+		return "", false
+	}
+	return tenantID, true
 }
 
 func (h *Handler) writeAuthzErr(w http.ResponseWriter, err error) {

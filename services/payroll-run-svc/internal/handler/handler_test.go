@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/payroll-run-svc/internal/compensation"
 	"zoiko.io/payroll-run-svc/internal/contract"
 	"zoiko.io/payroll-run-svc/internal/domain"
 	"zoiko.io/payroll-run-svc/internal/employee"
@@ -177,6 +178,11 @@ func (c *stubContractClient) GetActiveContract(_ context.Context, _, _, employee
 // ── router factory ─────────────────────────────────────────────────────────────
 
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, empC *stubEmployeeClient, ctrC *stubContractClient) chi.Router {
+	// No structures configured: every employee resolves to a flat base salary.
+	return newRouterWithComp(s, pub, authz, empC, ctrC, &stubCompensationClient{})
+}
+
+func newRouterWithComp(s *stubStore, pub *stubPublisher, authz *stubAuthZ, empC *stubEmployeeClient, ctrC *stubContractClient, compC *stubCompensationClient) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -184,7 +190,7 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, empC *stubEmp
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, empC, ctrC, zap.NewNop())
+	h := handler.New(s, pub, authz, empC, ctrC, compC, testTaxRate, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -273,7 +279,28 @@ func TestCalculateRun_StandardAndShadowMode(t *testing.T) {
 		},
 	}
 
-	r := newRouter(s, pub, &stubAuthZ{}, empC, ctrC)
+	// The 500 of other deductions that makes Zoiko's net match the legacy net
+	// now comes from a configured compensation component. It used to be a
+	// hardcoded gross*0.05 inside the calculation.
+	compC := &stubCompensationClient{
+		breakdowns: map[string]*compensation.Breakdown{
+			"emp-1": {
+				StructureID: "str-us-1", StructureName: "US Standard", Currency: "USD",
+				BaseAmount: 10000.0,
+				Lines: []compensation.BreakdownLine{
+					{
+						ComponentID: "cmp-benefits", ComponentCode: "BENEFITS", ComponentName: "Benefits",
+						ComponentType: "DEDUCTION", IsTaxable: false,
+						CalculationMethod: "FIXED", CalculationValue: 500.0, Amount: 500.0, Sequence: 1,
+					},
+				},
+				TotalEarnings: 0, TotalDeductions: 500.0,
+				TaxableAmount: 10000.0, GrossEarnings: 10000.0, NetAmount: 9500.0,
+			},
+		},
+	}
+
+	r := newRouterWithComp(s, pub, &stubAuthZ{}, empC, ctrC, compC)
 
 	// 1. Initiate shadow run
 	rrInit := doReq(r, http.MethodPost, "/v1/payroll/runs", map[string]any{
@@ -294,7 +321,7 @@ func TestCalculateRun_StandardAndShadowMode(t *testing.T) {
 			{
 				"employee_id":         "emp-1",
 				"legacy_gross_pay":    10000.0,
-				"legacy_net_pay":      7500.0, // Zoiko net = 10000 - 2000 (tax) - 500 (benefits) = 7500.0 (equivalent!)
+				"legacy_net_pay":      7500.0, // Zoiko net = 10000 - 500 (BENEFITS component) - 2000 (tax) = 7500.0
 				"legacy_tax_withheld": 2000.0,
 			},
 		},

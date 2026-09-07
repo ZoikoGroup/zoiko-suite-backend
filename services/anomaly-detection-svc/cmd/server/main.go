@@ -16,6 +16,7 @@ import (
 
 	"zoiko.io/anomaly-detection-svc/internal/authz"
 	"zoiko.io/anomaly-detection-svc/internal/config"
+	svcenvelope "zoiko.io/anomaly-detection-svc/internal/envelope"
 	"zoiko.io/anomaly-detection-svc/internal/events"
 	"zoiko.io/anomaly-detection-svc/internal/handler"
 	"zoiko.io/anomaly-detection-svc/internal/health"
@@ -89,6 +90,13 @@ func main() {
 	r.Use(chimiddleware.Logger)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(middleware.TenantContext)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	r.Get("/healthz", health.Handler())
 	handler.RegisterRoutes(r, h)

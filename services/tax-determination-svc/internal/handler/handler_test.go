@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/tax-determination-svc/internal/domain"
 	"zoiko.io/tax-determination-svc/internal/events"
+	"zoiko.io/tax-determination-svc/internal/registry"
 	"zoiko.io/tax-determination-svc/internal/rules"
 )
 
@@ -88,10 +89,76 @@ func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 	return s.err
 }
 
+// stubJurisdiction stands in for jurisdiction-rules-svc. The zero value
+// recognises every jurisdiction, which is what the pre-existing tests assume;
+// the TAX-03 tests set err to exercise unknown and unreachable.
+type stubJurisdiction struct {
+	err  error
+	seen []string
+}
+
+func (s *stubJurisdiction) Validate(_ context.Context, _, jurisdictionID string) error {
+	if jurisdictionID != "" {
+		s.seen = append(s.seen, jurisdictionID)
+	}
+	return s.err
+}
+
+// stubRegistry stands in for tenant-entity-registry-svc's tax identity bundles.
+// The zero value answers "the seller holds no registration there", which is a
+// legitimate state rather than a failure — see registry.ResolveSellerRegistration.
+type stubRegistry struct {
+	reg *registry.Registration
+	err error
+}
+
+func (s *stubRegistry) ResolveSellerRegistration(_ context.Context, _, _, _, _ string) (*registry.Registration, error) {
+	return s.reg, s.err
+}
+
 func newTestHandler() *Handler {
+	return newTestHandlerWith(&stubJurisdiction{}, &stubRegistry{})
+}
+
+func newTestHandlerWith(jv JurisdictionValidator, rr RegistrationResolver) *Handler {
 	logger, _ := zap.NewDevelopment()
 	rulesClient := rules.NewClient("http://localhost:8125")
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, rulesClient, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, rulesClient, jv, rr, logger)
+}
+
+// withTAX03 fills the TAX-03 required business/source inputs on a request that
+// does not set them itself.
+//
+// The pre-existing tests were written before §9.J's inputs were required and are
+// about rule snapshots, authorization and overrides — not about the input
+// contract. Filling only what they left blank keeps them testing what they were
+// written for, while the TAX-03 tests set these fields explicitly.
+func withTAX03(req domain.DetermineTaxRequest) domain.DetermineTaxRequest {
+	if req.SellerPartyID == "" {
+		req.SellerPartyID = "party-seller-1"
+	}
+	if req.BuyerPartyID == "" {
+		req.BuyerPartyID = "party-buyer-1"
+	}
+	if req.SupplyJurisdictionID == "" {
+		req.SupplyJurisdictionID = req.JurisdictionID
+	}
+	if req.SupplyDate == "" {
+		req.SupplyDate = "2026-01-15"
+	}
+	if req.ProductClassification == "" {
+		req.ProductClassification = "SOFTWARE_LICENCE"
+	}
+	if req.SupplyKind == "" {
+		req.SupplyKind = domain.SupplyKindServices
+	}
+	if req.SupplyType == "" {
+		req.SupplyType = domain.SupplyTypeB2C
+	}
+	if req.Currency == "" {
+		req.Currency = "GBP"
+	}
+	return req
 }
 
 func buildRequest(method, path string, body interface{}) *http.Request {
@@ -121,7 +188,7 @@ func TestDetermineTax(t *testing.T) {
 		EvaluatedBy:    "billing-engine",
 	}
 	w := httptest.NewRecorder()
-	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", body))
+	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — %s", w.Code, w.Body.String())
 	}
@@ -149,7 +216,7 @@ func TestDetermineTax_FallbackRuleHasNoSnapshot(t *testing.T) {
 		Currency: "GBP", EffectiveFrom: "2026-01-01", EvaluatedBy: "billing-engine",
 	}
 	w := httptest.NewRecorder()
-	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", body))
+	h.DetermineTax(w, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d — %s", w.Code, w.Body.String())
 	}
@@ -202,7 +269,7 @@ func TestOverrideDetermination(t *testing.T) {
 		EvaluatedBy:    "po-engine",
 	}
 	wDet := httptest.NewRecorder()
-	r.ServeHTTP(wDet, buildRequest(http.MethodPost, "/v1/tax-determinations", body))
+	r.ServeHTTP(wDet, buildRequest(http.MethodPost, "/v1/tax-determinations", withTAX03(body)))
 	var created domain.TaxDetermination
 	_ = json.NewDecoder(wDet.Body).Decode(&created)
 

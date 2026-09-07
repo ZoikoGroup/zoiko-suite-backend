@@ -42,6 +42,7 @@ func TestHealthCheck(t *testing.T) {
 	router := setupTestRouter(t)
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	withEnvelope(req)
 	rec := httptest.NewRecorder()
 
 	router.ServeHTTP(rec, req)
@@ -82,6 +83,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 
 	body, _ := json.Marshal(analyzeReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Principal-Id", "principal-01")
@@ -108,6 +110,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 
 	// 2. Get Job by ID
 	getReq := httptest.NewRequest(http.MethodGet, "/v1/reconciliations/"+job.ID, nil)
+	withEnvelope(getReq)
 	getReq.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	getRec := httptest.NewRecorder()
 
@@ -125,6 +128,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 	})
 
 	applyReq := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/"+job.ID+"/resolutions/"+itemId+"/apply", bytes.NewBuffer(applyBody))
+	withEnvelope(applyReq)
 	applyReq.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	applyReq.Header.Set("Content-Type", "application/json")
 	applyReq.Header.Set("X-Principal-Id", "principal-01")
@@ -138,6 +142,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 
 	// 4. List Jobs
 	listReq := httptest.NewRequest(http.MethodGet, "/v1/reconciliations?legal_entity_id=LE-3003", nil)
+	withEnvelope(listReq)
 	listReq.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	listRec := httptest.NewRecorder()
 
@@ -149,6 +154,7 @@ func TestAnalyzeAndLifecycleReconciliation(t *testing.T) {
 
 	// 5. Archive Job
 	delReq := httptest.NewRequest(http.MethodDelete, "/v1/reconciliations/"+job.ID, nil)
+	withEnvelope(delReq)
 	delReq.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	delReq.Header.Set("X-Principal-Id", "principal-01")
 	delRec := httptest.NewRecorder()
@@ -169,6 +175,7 @@ func TestValidationErrors(t *testing.T) {
 
 	body, _ := json.Marshal(invalidReq)
 	req := httptest.NewRequest(http.MethodPost, "/v1/reconciliations/analyze", bytes.NewBuffer(body))
+	withEnvelope(req)
 	req.Header.Set("X-Tenant-ID", "tenant-rec-88")
 	rec := httptest.NewRecorder()
 

@@ -53,11 +53,17 @@ const journalHeaderColumns = `
 	reversal_of_journal_id, description, created_by_principal_id,
 	validated_by_principal_id, posted_by_principal_id, reversed_by_principal_id,
 	correlation_id, created_at, validated_at, posted_at, reversed_at,
-	source_event_id, governance_decision_id`
+	source_event_id, governance_decision_id,
+	journal_type, transaction_date, posting_date, currency_code,
+	book_id, reporting_basis, evidence_refs`
 
 // scanHeaderTargets returns scan destinations matching journalHeaderColumns,
 // column for column. status is scanned into a plain string and converted by
 // the caller — domain.JournalStatus has no sql.Scanner.
+//
+// journal_type does have one (domain.JournalType.Scan), so it scans directly
+// rather than adding a second out-parameter to a signature four read paths
+// already share.
 func scanHeaderTargets(h *domain.JournalHeader, status *string) []any {
 	return []any{
 		&h.JournalID, &h.TenantID, &h.LegalEntityID, &h.FiscalPeriod, status,
@@ -65,19 +71,21 @@ func scanHeaderTargets(h *domain.JournalHeader, status *string) []any {
 		&h.ValidatedByPrincipalID, &h.PostedByPrincipalID, &h.ReversedByPrincipalID,
 		&h.CorrelationID, &h.CreatedAt, &h.ValidatedAt, &h.PostedAt, &h.ReversedAt,
 		&h.SourceEventID, &h.GovernanceDecisionID,
+		&h.JournalType, &h.TransactionDate, &h.PostingDate, &h.CurrencyCode,
+		&h.BookID, &h.ReportingBasis, &h.EvidenceRefs,
 	}
 }
 
 const journalLineColumns = `
 	journal_line_id, journal_id, line_number, account_code,
 	debit_amount, credit_amount, COALESCE(description, ''),
-	tax_code, tax_logic_snapshot_id`
+	tax_code, tax_logic_snapshot_id, dimensions`
 
 func scanLineTargets(l *domain.JournalLine) []any {
 	return []any{
 		&l.JournalLineID, &l.JournalID, &l.LineNumber, &l.AccountCode,
 		&l.DebitAmount, &l.CreditAmount, &l.Description,
-		&l.TaxCode, &l.TaxLogicSnapshotID,
+		&l.TaxCode, &l.TaxLogicSnapshotID, &l.Dimensions,
 	}
 }
 
@@ -174,14 +182,19 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			reversal_of_journal_id, description, created_by_principal_id,
 			validated_by_principal_id, posted_by_principal_id, reversed_by_principal_id,
 			correlation_id, created_at, validated_at, posted_at, reversed_at,
-			source_event_id, governance_decision_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+			source_event_id, governance_decision_id,
+			journal_type, transaction_date, posting_date, currency_code,
+			book_id, reporting_basis, evidence_refs
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+		          $19, $20, $21, $22, $23, $24, $25)
 		ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id != '' DO NOTHING
 	`, h.JournalID, tenantID, h.LegalEntityID, h.FiscalPeriod, string(h.Status),
 		h.ReversalOfJournalID, h.Description, h.CreatedByPrincipalID,
 		h.ValidatedByPrincipalID, h.PostedByPrincipalID, h.ReversedByPrincipalID,
 		h.CorrelationID, h.CreatedAt, h.ValidatedAt, h.PostedAt, h.ReversedAt,
-		h.SourceEventID, h.GovernanceDecisionID)
+		h.SourceEventID, h.GovernanceDecisionID,
+		h.JournalType, h.TransactionDate, h.PostingDate, h.CurrencyCode,
+		h.BookID, h.ReportingBasis, h.EvidenceRefs)
 	if err != nil {
 		return nil, false, mapPgError(err)
 	}
@@ -216,11 +229,11 @@ func insertJournal(ctx context.Context, tx pgx.Tx, tenantID string, h *domain.Jo
 			INSERT INTO journal_lines (
 				journal_line_id, journal_id, tenant_id, line_number,
 				account_code, debit_amount, credit_amount, description,
-				tax_code, tax_logic_snapshot_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+				tax_code, tax_logic_snapshot_id, dimensions
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		`, lines[i].JournalLineID, h.JournalID, tenantID, lines[i].LineNumber,
 			lines[i].AccountCode, lines[i].DebitAmount, lines[i].CreditAmount, lines[i].Description,
-			lines[i].TaxCode, lines[i].TaxLogicSnapshotID); err != nil {
+			lines[i].TaxCode, lines[i].TaxLogicSnapshotID, lines[i].Dimensions); err != nil {
 			return nil, false, mapPgError(err)
 		}
 	}

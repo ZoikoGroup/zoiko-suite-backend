@@ -22,10 +22,12 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/payroll-run-svc/internal/compensation"
 	"zoiko.io/payroll-run-svc/internal/config"
 	"zoiko.io/payroll-run-svc/internal/contract"
 	"zoiko.io/payroll-run-svc/internal/domain"
 	"zoiko.io/payroll-run-svc/internal/employee"
+	svcenvelope "zoiko.io/payroll-run-svc/internal/envelope"
 	"zoiko.io/payroll-run-svc/internal/events"
 	"zoiko.io/payroll-run-svc/internal/handler"
 	"zoiko.io/payroll-run-svc/internal/health"
@@ -74,7 +76,11 @@ type httpAuthzClient struct {
 }
 
 func (a *httpAuthzClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	// The tenant is part of the decision, so it is part of the key.
+	// authorization-svc refuses a claimed tenant that disagrees with the
+	// verified one; a key without it would let one tenant's cached decision
+	// answer another's request and hide that refusal.
+	key := svcmiddleware.TenantFromContext(ctx) + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := a.lookupCache(key); hit {
 		return decision
@@ -143,6 +149,54 @@ func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, leg
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	// authorization-svc validates the same canonical envelope contract this
+	// service does, and answers 400 envelope_incomplete without it. A non-200 is
+	// treated as unavailable below, so an unforwarded envelope turned every
+	// gated request into a 503 that read like an outage rather than a missing
+	// header.
+	//
+	// The values are the CALLER's, taken from the envelope the middleware
+	// already parsed into this request's context. Minting fresh ones here would
+	// satisfy the contract and lose the only thing it is for: a decision in
+	// access_decision_log that can be traced back to the request that caused it.
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	requestID := middleware.GetReqID(ctx)
+	// Service-to-service. "system" is in the contract's accepted set; the
+	// caller's own channel replaces it when there is one.
+	sourceChannel := "system"
+
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		if env.TenantID != "" {
+			tenantID = env.TenantID
+		}
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.SourceChannel != "" {
+			sourceChannel = string(env.SourceChannel)
+		}
+		if env.CorrelationID != "" {
+			req.Header.Set("X-Correlation-ID", env.CorrelationID)
+		}
+		if env.CausationID != "" {
+			req.Header.Set("X-Causation-Id", env.CausationID)
+		}
+	}
+
+	if tenantID != "" {
+		req.Header.Set("X-Tenant-Id", tenantID)
+	}
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Source-Channel", sourceChannel)
+
+	// One decision per (request, action). An inbound request may authorize
+	// several actions, and each is a separate decision to record — a key of the
+	// request alone would make the second look like a replay of the first.
+	req.Header.Set("Idempotency-Key", requestID+":"+actionType)
+
 	resp, err := a.client.Do(req)
 	if err != nil {
 		a.log.Error("failed to call authorization-svc", zap.Error(err))
@@ -190,6 +244,7 @@ func main() {
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("employee_master_url", cfg.EmployeeMasterURL),
 		zap.String("employment_contracts_url", cfg.EmploymentContractsURL),
+		zap.String("compensation_url", cfg.CompensationURL),
 		zap.String("authz_url", cfg.AuthZServiceURL),
 	)
 
@@ -234,7 +289,7 @@ func main() {
 	log.Info("db pool connected")
 
 	// ── 4. Store, Kafka producer, clients ─────────────────────────────────────
-	pgStore := store.New(pool)
+	pgStore := store.New(pool, cfg.DB.Schema)
 
 	// AllowAutoTopicCreation is required even though the broker itself has
 	// auto.create.topics.enable=true: segmentio/kafka-go's Writer defaults
@@ -268,6 +323,7 @@ func main() {
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	empClient := employee.NewClient(cfg.EmployeeMasterURL, &http.Client{Timeout: 5 * time.Second})
 	ctrClient := contract.NewClient(cfg.EmploymentContractsURL, &http.Client{Timeout: 5 * time.Second})
+	compClient := compensation.NewClient(cfg.CompensationURL, &http.Client{Timeout: 5 * time.Second})
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -280,7 +336,14 @@ func main() {
 	r.Use(svcmiddleware.TenantContext())
 	r.Use(middleware.Logger)
 
-	h := handler.New(pgStore, publisher, authzClient, empClient, ctrClient, log)
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+
+	h := handler.New(pgStore, publisher, authzClient, empClient, ctrClient, compClient, cfg.DefaultTaxRate, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

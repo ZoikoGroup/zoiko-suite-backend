@@ -136,6 +136,48 @@ func (p *Publisher) PublishPrincipalStatusChanged(
 	})
 }
 
+// PublishAuthenticationSucceeded records that a human proved possession of a
+// principal's credential.
+//
+// Distinct from identity.context.resolved: that event says an envelope was
+// issued, this one says a password was verified. They are usually seconds
+// apart but they answer different questions, and collapsing them would make
+// "someone logged in but never obtained an envelope" — a resolution that
+// failed on tenant, entity or trust posture AFTER a correct password —
+// invisible in the event stream.
+func (p *Publisher) PublishAuthenticationSucceeded(
+	ctx context.Context,
+	principalID, tenantID, correlationID string,
+) error {
+	return p.emit(ctx, "identity.authentication.succeeded", tenantID, "", principalID, correlationID, principalID, map[string]any{
+		"principal_id":    principalID,
+		"tenant_id":       tenantID,
+		"credential_type": "PASSWORD",
+		"correlation_id":  correlationID,
+	})
+}
+
+// PublishAuthenticationFailed records a rejected attempt.
+//
+// subject is the email as supplied. It is emitted even when it matches no
+// principal, because a stream of failures against addresses that do not exist
+// is the signature of an enumeration sweep, and dropping those events would
+// hide exactly the attack the constant-time verification path is defending
+// against. principalID is empty in that case rather than fabricated.
+func (p *Publisher) PublishAuthenticationFailed(
+	ctx context.Context,
+	subject, principalID, tenantID, correlationID, reason string,
+) error {
+	return p.emit(ctx, "identity.authentication.failed", tenantID, "", principalID, correlationID, subject, map[string]any{
+		"subject":         subject,
+		"principal_id":    principalID,
+		"tenant_id":       tenantID,
+		"credential_type": "PASSWORD",
+		"failure_reason":  reason,
+		"correlation_id":  correlationID,
+	})
+}
+
 // emit serialises the payload and writes to the Kafka topic.
 // Returns an error so callers can detect failures (Gap 1 fix).
 func (p *Publisher) emit(ctx context.Context, eventType, tenantID, legalEntityID, actorID, correlationID, key string, payload map[string]any) error {

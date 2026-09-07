@@ -17,11 +17,14 @@ import (
 
 	"zoiko.io/tax-determination-svc/internal/authz"
 	"zoiko.io/tax-determination-svc/internal/config"
+	svcenvelope "zoiko.io/tax-determination-svc/internal/envelope"
 	"zoiko.io/tax-determination-svc/internal/events"
 	"zoiko.io/tax-determination-svc/internal/handler"
 	"zoiko.io/tax-determination-svc/internal/health"
+	"zoiko.io/tax-determination-svc/internal/jurisdiction"
 	"zoiko.io/tax-determination-svc/internal/middleware"
 	"zoiko.io/tax-determination-svc/internal/mtls"
+	"zoiko.io/tax-determination-svc/internal/registry"
 	"zoiko.io/tax-determination-svc/internal/rules"
 	"zoiko.io/tax-determination-svc/internal/store"
 	"zoiko.io/tax-determination-svc/internal/telemetry"
@@ -81,13 +84,27 @@ func main() {
 	}
 	rulesClient := rules.NewClient(cfg.TaxRulesServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, rulesClient, logger)
+	// TAX-03's two server-resolved inputs. JurisdictionRulesURL has been in the
+	// config since this service was built and nothing read it, so the
+	// jurisdictions a determination named were never checked against the service
+	// that owns them.
+	jurisdictionClient := jurisdiction.NewClient(cfg.JurisdictionRulesURL)
+	registryClient := registry.NewClient(cfg.TenantEntityRegistryURL)
+
+	h := handler.New(pgStore, publisher, authzClient, rulesClient, jurisdictionClient, registryClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(middleware.TenantContextMiddleware)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))

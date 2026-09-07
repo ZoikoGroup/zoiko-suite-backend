@@ -30,6 +30,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -98,12 +100,37 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	for _, migration := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_idempotency_index.up.sql",
-		"000003_add_gl_cash_account_code.up.sql",
-	} {
-		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
+	// EVERY *.up.sql, BY GLOB, NOT A NAMED LIST.
+	//
+	// This named three migrations and the service has five. The two it omitted
+	// were 000004_force_rls and 000005_policy_empty_tenant_is_null — so a suite
+	// whose entire purpose is proving tenant isolation was running against a
+	// schema where the isolation had not been applied, and would have passed with
+	// the policies absent altogether. A named list only stays correct while
+	// somebody remembers to edit it, and nobody did.
+	//
+	// LC_ALL-independent ordering is not needed here: filepath.Glob returns
+	// lexically sorted names, and the 000001_/000002_ prefixes make lexical order
+	// the migration order.
+	migrations, err := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if err != nil {
+		fmt.Printf("failed to glob migrations: %v\n", err)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+	if len(migrations) == 0 {
+		// Fatal rather than a quiet skip: no migrations means no schema, and
+		// every assertion below would fail for a reason unrelated to isolation.
+		fmt.Println("no *.up.sql found — the suite would run against an empty schema")
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
+	}
+	sort.Strings(migrations)
+
+	for _, migration := range migrations {
+		sql, err := os.ReadFile(migration)
 		if err != nil {
 			fmt.Printf("failed to read migration %s: %v\n", migration, err)
 			testPool.Close()
@@ -111,7 +138,7 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-			fmt.Printf("failed to apply migration %s: %v\n", migration, err)
+			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(migration), err)
 			testPool.Close()
 			_ = pg.Stop()
 			os.Exit(1)

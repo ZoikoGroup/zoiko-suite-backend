@@ -17,6 +17,7 @@ import (
 
 	"zoiko.io/source-authority-svc/internal/authz"
 	"zoiko.io/source-authority-svc/internal/config"
+	svcenvelope "zoiko.io/source-authority-svc/internal/envelope"
 	"zoiko.io/source-authority-svc/internal/events"
 	"zoiko.io/source-authority-svc/internal/handler"
 	"zoiko.io/source-authority-svc/internal/health"
@@ -85,6 +86,13 @@ func main() {
 	r.Use(chimiddleware.RealIP)
 	r.Use(chimiddleware.Recoverer)
 	r.Use(middleware.TenantContext())
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer and telemetry so a refusal is still traced, and ahead of every
+	// handler so no request reaches business logic without a resolved tenant,
+	// actor, correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	r.Get("/healthz", health.HealthzHandler)
 	r.Get("/readyz", health.ReadyzHandler(pool))

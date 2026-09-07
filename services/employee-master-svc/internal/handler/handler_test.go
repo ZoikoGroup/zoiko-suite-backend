@@ -31,11 +31,19 @@ func newStubStore() *stubStore {
 
 func (s *stubStore) CreateEmployee(_ context.Context, emp *domain.Employee) error {
 	for _, existing := range s.employees {
-		if existing.TenantID == emp.TenantID && existing.Email == emp.Email {
+		if existing.TenantID != emp.TenantID {
+			continue
+		}
+		if existing.Email == emp.Email {
 			return domain.ErrEmailAlreadyExists
 		}
-		if existing.TenantID == emp.TenantID && existing.EmployeeNumber == emp.EmployeeNumber {
+		if existing.EmployeeNumber == emp.EmployeeNumber {
 			return domain.ErrEmployeeNumberExists
+		}
+		// Mirrors idx_employees_tenant_work_email: unique per tenant, but only
+		// over the rows that actually carry a work email.
+		if emp.WorkEmail != nil && existing.WorkEmail != nil && *existing.WorkEmail == *emp.WorkEmail {
+			return domain.ErrWorkEmailAlreadyExists
 		}
 	}
 	s.employees[emp.EmployeeID] = emp
@@ -50,25 +58,46 @@ func (s *stubStore) GetEmployee(_ context.Context, id string) (*domain.Employee,
 	return emp, nil
 }
 
-func (s *stubStore) ListEmployees(_ context.Context, legalEntityID, status, workerType, departmentID, managerEmployeeID string) ([]domain.Employee, error) {
+func (s *stubStore) ListEmployees(_ context.Context, f domain.EmployeeFilter) ([]domain.Employee, error) {
+	matches := func(want string, got *string) bool {
+		return want == "" || (got != nil && *got == want)
+	}
+
 	var out []domain.Employee
 	for _, emp := range s.employees {
-		if legalEntityID != "" && emp.LegalEntityID != legalEntityID {
+		if f.LegalEntityID != "" && emp.LegalEntityID != f.LegalEntityID {
 			continue
 		}
-		if status != "" && emp.Status != status {
+		if f.Status != "" && emp.Status != f.Status {
 			continue
 		}
-		if workerType != "" && emp.WorkerType != workerType {
+		if f.WorkerType != "" && emp.WorkerType != f.WorkerType {
 			continue
 		}
-		if departmentID != "" && (emp.DepartmentID == nil || *emp.DepartmentID != departmentID) {
+		if !matches(f.DepartmentID, emp.DepartmentID) ||
+			!matches(f.ManagerEmployeeID, emp.ManagerEmployeeID) ||
+			!matches(f.BusinessUnit, emp.BusinessUnit) ||
+			!matches(f.Division, emp.Division) ||
+			!matches(f.DesignationID, emp.DesignationID) {
 			continue
 		}
-		if managerEmployeeID != "" && (emp.ManagerEmployeeID == nil || *emp.ManagerEmployeeID != managerEmployeeID) {
-			continue
-		}
-		out = append(out, *emp)
+
+		// The real store serves listings from listColumns, which omits personal
+		// data. Reproduce that here so a test cannot pass against the stub while
+		// the projection leaks in production.
+		projected := *emp
+		projected.DateOfBirth = nil
+		projected.Gender = nil
+		projected.ProfilePictureURL = nil
+		projected.PersonalEmail = nil
+		projected.CurrentAddress = nil
+		projected.PermanentAddress = nil
+		projected.City = nil
+		projected.State = nil
+		projected.Country = nil
+		projected.PostalCode = nil
+
+		out = append(out, projected)
 	}
 	return out, nil
 }

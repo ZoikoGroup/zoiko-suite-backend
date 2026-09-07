@@ -244,6 +244,41 @@ type UpdateEntityRequest struct {
 	ActorPrincipalID string `json:"-"`
 }
 
+// UpdateWorkspaceRequest patches the mutable facts of a workspace.
+//
+// Only the descriptive and commercial fields are patchable. tenant_id and
+// legal_entity_id are the workspace's position in the tenant hierarchy, and
+// moving a workspace between them is not an edit — it would silently
+// re-attribute everything already recorded against it.
+//
+// billing_classification is patchable precisely because it has to be
+// correctable. It decides whether the workspace may ever produce a live charge,
+// so a workspace created under the wrong class was previously wrong for the
+// rest of its life: the table carried updated_at and updated_by_principal_id
+// from the start, but no write path ever set them. Every change emits
+// workspace.updated so commercial-account-svc observes the reclassification
+// rather than inferring it.
+type UpdateWorkspaceRequest struct {
+	Name                  *string `json:"name,omitempty"`
+	BusinessUnit          *string `json:"business_unit,omitempty"`
+	BillingClassification *string `json:"billing_classification,omitempty"`
+	BillingSource         *string `json:"billing_source,omitempty"`
+	CommercialAccountID   *string `json:"commercial_account_id,omitempty"`
+	CorrelationID         string  `json:"correlation_id"`
+	// ActorPrincipalID is populated server-side from the verified request
+	// context before the store is called. Never accepted from the request body
+	// (json:"-") — see UpdateEntityRequest for why.
+	ActorPrincipalID string `json:"-"`
+}
+
+// TransitionWorkspaceStatusRequest archives or restores a workspace. Kept off
+// UpdateWorkspaceRequest so the transition can be applied as a single guarded
+// UPDATE against the allowed prior states, the same way entity status is.
+type TransitionWorkspaceStatusRequest struct {
+	NewStatus     WorkspaceStatus `json:"new_status"`
+	CorrelationID string          `json:"correlation_id"`
+}
+
 type TransitionEntityStatusRequest struct {
 	NewStatus     EntityStatus `json:"new_status"`
 	CorrelationID string       `json:"correlation_id"`

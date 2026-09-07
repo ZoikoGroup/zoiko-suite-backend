@@ -19,7 +19,7 @@ import (
 type Store interface {
 	CreateEmployee(ctx context.Context, emp *domain.Employee) error
 	GetEmployee(ctx context.Context, id string) (*domain.Employee, error)
-	ListEmployees(ctx context.Context, legalEntityID, status, workerType, departmentID, managerEmployeeID string) ([]domain.Employee, error)
+	ListEmployees(ctx context.Context, filter domain.EmployeeFilter) ([]domain.Employee, error)
 	UpdateEmployee(ctx context.Context, emp *domain.Employee) error
 	UpdateStatus(ctx context.Context, id, newStatus string, terminationDate *string) error
 }
@@ -88,6 +88,24 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !validGender(req.Gender) {
+		writeError(w, http.StatusBadRequest, "invalid_gender", genderMessage)
+		return
+	}
+
+	for _, d := range []struct {
+		field string
+		value *string
+	}{
+		{"date_of_birth", req.DateOfBirth},
+		{"confirmation_date", req.ConfirmationDate},
+	} {
+		if !validDate(d.value) {
+			writeError(w, http.StatusBadRequest, "invalid_date", d.field+" "+string(domain.ErrInvalidDate))
+			return
+		}
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -128,8 +146,29 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 		Status:            "ACTIVE",
 		HireDate:          req.HireDate,
 		EffectiveFrom:     now,
-		CreatedAt:         now,
-		UpdatedAt:         now,
+
+		DateOfBirth:       req.DateOfBirth,
+		Gender:            req.Gender,
+		ProfilePictureURL: req.ProfilePictureURL,
+		PersonalEmail:     req.PersonalEmail,
+		WorkEmail:         req.WorkEmail,
+
+		CurrentAddress:   req.CurrentAddress,
+		PermanentAddress: req.PermanentAddress,
+		City:             req.City,
+		State:            req.State,
+		Country:          req.Country,
+		PostalCode:       req.PostalCode,
+
+		Company:          req.Company,
+		BusinessUnit:     req.BusinessUnit,
+		Division:         req.Division,
+		Team:             req.Team,
+		DesignationID:    req.DesignationID,
+		ConfirmationDate: req.ConfirmationDate,
+
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 
 	if err := h.store.CreateEmployee(r.Context(), emp); errors.Is(err, domain.ErrEmailAlreadyExists) {
@@ -137,6 +176,9 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 		return
 	} else if errors.Is(err, domain.ErrEmployeeNumberExists) {
 		writeError(w, http.StatusConflict, "employee_number_exists", err.Error())
+		return
+	} else if errors.Is(err, domain.ErrWorkEmailAlreadyExists) {
+		writeError(w, http.StatusConflict, "work_email_exists", err.Error())
 		return
 	} else if err != nil {
 		h.log.Error("failed to create employee", zap.Error(err))
@@ -153,28 +195,36 @@ func (h *Handler) CreateEmployee(w http.ResponseWriter, r *http.Request) {
 // ── GET /v1/employees ─────────────────────────────────────────────────────────────
 
 func (h *Handler) ListEmployees(w http.ResponseWriter, r *http.Request) {
-	legalEntityID := r.URL.Query().Get("legal_entity_id")
-	status := r.URL.Query().Get("status")
-	workerType := r.URL.Query().Get("worker_type")
-	departmentID := r.URL.Query().Get("department_id")
-	managerEmployeeID := r.URL.Query().Get("manager_employee_id")
+	q := r.URL.Query()
+	filter := domain.EmployeeFilter{
+		LegalEntityID:     q.Get("legal_entity_id"),
+		Status:            q.Get("status"),
+		WorkerType:        q.Get("worker_type"),
+		DepartmentID:      q.Get("department_id"),
+		ManagerEmployeeID: q.Get("manager_employee_id"),
+		BusinessUnit:      q.Get("business_unit"),
+		Division:          q.Get("division"),
+		DesignationID:     q.Get("designation_id"),
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 
-	if legalEntityID == "" {
+	// legal_entity_id stays mandatory: it is what the authorization decision is
+	// scoped to, so without it there is nothing to authorize the listing against.
+	if filter.LegalEntityID == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
 		return
 	}
 
-	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionEmployeeView); err != nil {
+	if err := h.authz.CheckAllowed(r.Context(), principalID, filter.LegalEntityID, actionEmployeeView); err != nil {
 		h.writeAuthzErr(w, err)
 		return
 	}
 
-	list, err := h.store.ListEmployees(r.Context(), legalEntityID, status, workerType, departmentID, managerEmployeeID)
+	list, err := h.store.ListEmployees(r.Context(), filter)
 	if err != nil {
 		h.log.Error("failed to list employees", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -274,9 +324,76 @@ func (h *Handler) UpdateEmployee(w http.ResponseWriter, r *http.Request) {
 		emp.WorkerType = *req.WorkerType
 	}
 
+	if req.Gender != nil {
+		if !validGender(req.Gender) {
+			writeError(w, http.StatusBadRequest, "invalid_gender", genderMessage)
+			return
+		}
+		emp.Gender = req.Gender
+	}
+	if req.DateOfBirth != nil {
+		if !validDate(req.DateOfBirth) {
+			writeError(w, http.StatusBadRequest, "invalid_date", "date_of_birth "+string(domain.ErrInvalidDate))
+			return
+		}
+		emp.DateOfBirth = req.DateOfBirth
+	}
+	if req.ConfirmationDate != nil {
+		if !validDate(req.ConfirmationDate) {
+			writeError(w, http.StatusBadRequest, "invalid_date", "confirmation_date "+string(domain.ErrInvalidDate))
+			return
+		}
+		emp.ConfirmationDate = req.ConfirmationDate
+	}
+	if req.ProfilePictureURL != nil {
+		emp.ProfilePictureURL = req.ProfilePictureURL
+	}
+	if req.PersonalEmail != nil {
+		emp.PersonalEmail = req.PersonalEmail
+	}
+	if req.WorkEmail != nil {
+		emp.WorkEmail = req.WorkEmail
+	}
+	if req.CurrentAddress != nil {
+		emp.CurrentAddress = req.CurrentAddress
+	}
+	if req.PermanentAddress != nil {
+		emp.PermanentAddress = req.PermanentAddress
+	}
+	if req.City != nil {
+		emp.City = req.City
+	}
+	if req.State != nil {
+		emp.State = req.State
+	}
+	if req.Country != nil {
+		emp.Country = req.Country
+	}
+	if req.PostalCode != nil {
+		emp.PostalCode = req.PostalCode
+	}
+	if req.Company != nil {
+		emp.Company = req.Company
+	}
+	if req.BusinessUnit != nil {
+		emp.BusinessUnit = req.BusinessUnit
+	}
+	if req.Division != nil {
+		emp.Division = req.Division
+	}
+	if req.Team != nil {
+		emp.Team = req.Team
+	}
+	if req.DesignationID != nil {
+		emp.DesignationID = req.DesignationID
+	}
+
 	emp.UpdatedAt = time.Now().UTC()
 
-	if err := h.store.UpdateEmployee(r.Context(), emp); err != nil {
+	if err := h.store.UpdateEmployee(r.Context(), emp); errors.Is(err, domain.ErrWorkEmailAlreadyExists) {
+		writeError(w, http.StatusConflict, "work_email_exists", err.Error())
+		return
+	} else if err != nil {
 		h.log.Error("failed to update employee profile", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
@@ -356,6 +473,38 @@ func (h *Handler) UpdateStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
+
+// allowedGenders mirrors the employees_gender_check constraint in migration
+// 000002. Kept here as well so a bad value is a 400 naming the field rather than
+// a 503 from a constraint violation the caller cannot interpret.
+var allowedGenders = map[string]bool{
+	"MALE":        true,
+	"FEMALE":      true,
+	"NON_BINARY":  true,
+	"OTHER":       true,
+	"UNSPECIFIED": true,
+}
+
+const genderMessage = "gender must be MALE, FEMALE, NON_BINARY, OTHER, or UNSPECIFIED"
+
+// validGender accepts nil — the field is optional to disclose.
+func validGender(g *string) bool {
+	if g == nil {
+		return true
+	}
+	return allowedGenders[*g]
+}
+
+// validDate accepts nil, and otherwise requires a real calendar date in
+// YYYY-MM-DD. Postgres would reject a malformed one anyway, but as a 503 that
+// reads like the store is down rather than a 400 the caller can act on.
+func validDate(d *string) bool {
+	if d == nil {
+		return true
+	}
+	_, err := time.Parse("2006-01-02", *d)
+	return err == nil
+}
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
 	principalID := r.Header.Get("X-Principal-Id")

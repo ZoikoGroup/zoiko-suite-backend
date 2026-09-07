@@ -19,20 +19,28 @@ import (
 // AuthorizationStore is the narrow interface the handler depends on.
 type AuthorizationStore interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
+	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
 	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
-	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
-	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID string) (*domain.DelegatedAuthority, error)
+	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
+	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
-	FindGrantedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
-	FindDelegatedActions(ctx context.Context, principalID, legalEntityID string) ([]string, string, error)
+	FindGrantedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
+	FindDelegatedActions(ctx context.Context, principalID, legalEntityID, tenantID string) ([]string, string, error)
 	CheckSoDConflict(ctx context.Context, grantedActions []string, candidateAction, tenantID string) (string, bool, error)
+	// Satya's own-object Segregation-of-Duties check (ef4cc2c), kept as-is.
 	CheckOwnObjectSoD(ctx context.Context, actionType, tenantID string) (bool, error)
-	RecordAccessDecision(ctx context.Context, principalID, legalEntityID, actionType, outcome, basis, correlationID string) (*domain.AccessDecisionLog, error)
-	FindAccessDecisionByID(ctx context.Context, accessDecisionID string) (*domain.AccessDecisionLog, error)
+
+	// TENANT-SCOPED SIGNATURES, DELIBERATELY. main carried the pre-f931093
+	// shapes: RecordAccessDecision took positional args and FindAccessDecisionByID
+	// took no tenant at all. Taking main's side here compiles perfectly and
+	// silently reverts the cross-tenant fix — a tenant-wide assignment in tenant A
+	// was granting actions against a legal entity in tenant B.
+	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
+	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on.
@@ -48,16 +56,31 @@ type Handler struct {
 	jurisdictionValidator jurisdiction.Validator
 	siem                  *siem.Client
 	log                   *zap.Logger
+
+	// platformScopeEntityID is the synthetic legal entity a platform-wide act
+	// is authorized against — see requirePlatformAction. Empty refuses every
+	// platform-wide act, which is the correct default for a control that has
+	// not been provisioned yet.
+	platformScopeEntityID string
 }
 
-func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, siemClient *siem.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, jurisdictionValidator: jurisdictionValidator, siem: siemClient, log: log}
+func New(store AuthorizationStore, publisher EventPublisher, jurisdictionValidator jurisdiction.Validator, siemClient *siem.Client, platformScopeEntityID string, log *zap.Logger) *Handler {
+	return &Handler{
+		store:                 store,
+		publisher:             publisher,
+		jurisdictionValidator: jurisdictionValidator,
+		siem:                  siemClient,
+		platformScopeEntityID: platformScopeEntityID,
+		log:                   log,
+	}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Use(correlationIDMiddleware)
 
 	r.Post("/v1/admin/roles", h.CreateRole)
+	r.Post("/v1/admin/roles/{role_id}/retire", h.RetireRole)
+	r.Post("/v1/admin/roles/{role_id}/reactivate", h.ReactivateRole)
 	r.Post("/v1/admin/roles/{role_id}/permission-bundles", h.CreatePermissionBundle)
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
@@ -119,6 +142,85 @@ func (h *Handler) refuseForeignTenant(w http.ResponseWriter, claimed, verifiedTe
 		return true
 	}
 	return false
+}
+
+// requirePlatformAction confirms the caller holds actionType at platform
+// scope, and records the decision like any other.
+//
+// This service is the authorization engine, so it does not call itself over
+// HTTP — it asks its own store the same question /v1/authorize asks. What it
+// asks about is the synthetic platform-scope legal entity (config
+// AUTHZ_PLATFORM_SCOPE_ENTITY_ID, the same pattern policy-svc uses for a
+// policy with no owning entity), because a platform-wide act has no legal
+// entity of its own.
+//
+// Fails closed in both directions: an unset platform-scope entity id refuses
+// every platform-wide act rather than waving them through, and a store error
+// is a refusal, not an allow. A grant here is a distinct grant — it is
+// deliberately NOT satisfied by any tenant-level role.
+func (h *Handler) requirePlatformAction(w http.ResponseWriter, r *http.Request, principalID, actionType string) bool {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if h.platformScopeEntityID == "" {
+		h.log.Error("platform-scope action refused: AUTHZ_PLATFORM_SCOPE_ENTITY_ID is not configured",
+			zap.String("correlation_id", correlationID),
+			zap.String("action_type", actionType))
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "platform_scope_not_configured",
+			"message": "platform-wide actions require AUTHZ_PLATFORM_SCOPE_ENTITY_ID to be configured",
+		})
+		return false
+	}
+
+	// Empty tenant, deliberately: a platform-wide grant is held against the
+	// platform-scope entity and is NOT satisfied by any tenant-level role, so
+	// scoping this to the caller's tenant would refuse every platform act.
+	actions, basis, err := h.store.FindGrantedActions(r.Context(), principalID, h.platformScopeEntityID, "")
+	if err != nil {
+		h.log.Error("platform-scope action check failed — refusing",
+			zap.String("correlation_id", correlationID),
+			zap.String("action_type", actionType),
+			zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return false
+	}
+
+	outcome, decisionBasis := "DENIED", "no_grant"
+	if contains(actions, actionType) {
+		outcome, decisionBasis = "GRANTED", basis
+	}
+
+	// A platform-wide governance act is a material action, so it gets a
+	// decision artifact whichever way it goes — the same constraint
+	// /v1/authorize is held to. A failure to record is not a reason to
+	// proceed: it is logged and the act is refused below if denied, and
+	// allowed only when the decision was recorded.
+	if _, recErr := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
+		PrincipalID:   principalID,
+		LegalEntityID: h.platformScopeEntityID,
+		ActionType:    actionType,
+		Outcome:       outcome,
+		Basis:         decisionBasis,
+		CorrelationID: correlationID,
+	}); recErr != nil {
+		h.log.Error("platform-scope action: failed to record decision — refusing",
+			zap.String("correlation_id", correlationID),
+			zap.String("action_type", actionType),
+			zap.Error(recErr))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return false
+	}
+
+	if outcome != "GRANTED" {
+		h.siem.Stream(r.Context(), "", "authorization.denied", siem.SeverityHigh,
+			"Platform-scope action "+actionType+" denied for principal "+principalID)
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "authorization_denied",
+			"message": actionType + " is required to act at platform scope",
+		})
+		return false
+	}
+	return true
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {
@@ -204,6 +306,102 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, role)
+}
+
+// ── POST /v1/admin/roles/{role_id}/retire | /reactivate ──────────────────────
+
+// RetireRole handles POST /v1/admin/roles/{role_id}/retire.
+//
+// Sets active_flag false, which is what actually stops the role granting
+// anything: FindGrantedActions joins through `roles.active_flag`, so every
+// action this role conferred disappears from the next /v1/authorize decision
+// for every principal holding it. Assignments are left intact so the effect is
+// reversible — see SetRoleActive for why cascading revocation is a separate
+// decision.
+//
+// Idempotent: retiring an already-retired role is 200, not 409. The caller
+// asked for a state, and that state holds.
+//
+// Response: 200 retired / 401 missing principal or tenant scope /
+// 404 role not found or owned by another tenant / 503 unavailable.
+func (h *Handler) RetireRole(w http.ResponseWriter, r *http.Request) {
+	h.setRoleActive(w, r, false)
+}
+
+// ReactivateRole handles POST /v1/admin/roles/{role_id}/reactivate.
+//
+// Restores exactly the access the retirement suspended, because the
+// assignments were never removed. Response shape matches RetireRole.
+func (h *Handler) ReactivateRole(w http.ResponseWriter, r *http.Request) {
+	h.setRoleActive(w, r, true)
+}
+
+func (h *Handler) setRoleActive(w http.ResponseWriter, r *http.Request, active bool) {
+	roleID := chi.URLParam(r, "role_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	// This pair of routes checked NOTHING before: not the principal, not the
+	// tenant, not who owns the role. An unauthenticated POST could retire any
+	// tenant's role by id — stripping every principal holding it of every
+	// action it grants, since FindGrantedActions joins through
+	// roles.active_flag — or reactivate one that had been deliberately
+	// retired. Seven sibling admin routes already required both headers.
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	// Same doctrine as CreatePermissionBundle and CreateRoleAssignment: the
+	// role's OWN tenant decides scope, and it must be the caller's. 404 rather
+	// than 403 so a probe against another tenant's role_id cannot confirm it
+	// exists.
+	role, err := h.store.FindRoleByID(r.Context(), roleID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRoleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": roleID})
+			return
+		}
+		h.log.Error("setRoleActive: role lookup failed",
+			zap.String("correlation_id", correlationID),
+			zap.String("role_id", roleID),
+			zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if role.TenantID != tenantScope {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found", "role_id": roleID})
+		return
+	}
+
+	role, err = h.store.SetRoleActive(r.Context(), roleID, tenantScope, active)
+	if err != nil {
+		if errors.Is(err, domain.ErrRoleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "role_not_found"})
+			return
+		}
+		h.log.Error("setRoleActive: store unavailable",
+			zap.String("correlation_id", correlationID),
+			zap.String("role_id", roleID),
+			zap.Bool("active", active),
+			zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	// Logged at info because this is a change to what the platform will
+	// enforce, not a read. A retirement that nobody can account for later is
+	// the same problem as one that never happened.
+	h.log.Info("role active_flag changed",
+		zap.String("correlation_id", correlationID),
+		zap.String("role_id", role.RoleID),
+		zap.String("role_code", role.RoleCode),
+		zap.String("tenant_id", role.TenantID),
+		zap.Bool("active_flag", role.ActiveFlag))
+
+	writeJSON(w, http.StatusOK, role)
 }
 
 // ── POST /v1/admin/roles/{role_id}/permission-bundles ───────────────────────
@@ -446,6 +644,13 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	// This was the one /v1/admin/* route that never resolved a tenant, because
+	// the table had no tenant_id to put one in. 000006 gives it one, NOT NULL,
+	// so the scope is now required here as it already was everywhere else.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	var req createDelegationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -480,6 +685,7 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	}
 
 	d, err := h.store.CreateDelegatedAuthority(r.Context(), domain.CreateDelegatedAuthorityParams{
+		TenantID:             tenantScope,
 		DelegatedAuthorityID: req.DelegatedAuthorityID, DelegatorPrincipalID: req.DelegatorPrincipalID,
 		DelegatePrincipalID: req.DelegatePrincipalID, ScopeType: req.ScopeType, LegalEntityID: legalEntityID,
 		AuthorityLimitType: req.AuthorityLimitType, AuthorityLimitValue: req.AuthorityLimitValue,
@@ -495,10 +701,20 @@ func (h *Handler) CreateDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 
 // RevokeDelegatedAuthority handles POST /v1/admin/delegated-authorities/{delegation_id}/revoke.
 //
-// Response: 200 revoked / 404 not found / 409 already revoked / 503 unavailable.
+// Response: 200 revoked / 401 no scope / 404 not found / 409 already revoked /
+// 503 unavailable.
+//
+// The lookup below is tenant-scoped, so another tenant's delegation is a 404
+// before the delegator check is ever reached — "not yours" and "does not
+// exist" are deliberately indistinguishable to a prober.
 func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Request) {
 	delegationID := chi.URLParam(r, "delegation_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
+
+	revokeTenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -509,7 +725,7 @@ func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 	// secret-vault-integration-svc's RevokeLease: only the delegator may
 	// take back authority they gave away — this had no check of any kind
 	// before, so any caller could revoke any principal's delegation.
-	existing, err := h.store.FindDelegatedAuthorityByID(r.Context(), delegationID)
+	existing, err := h.store.FindDelegatedAuthorityByID(r.Context(), delegationID, revokeTenantScope)
 	if err != nil {
 		if errors.Is(err, domain.ErrDelegatedAuthorityNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "delegated_authority_not_found"})
@@ -527,7 +743,7 @@ func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	d, err := h.store.RevokeDelegatedAuthority(r.Context(), delegationID)
+	d, err := h.store.RevokeDelegatedAuthority(r.Context(), delegationID, revokeTenantScope)
 	if err != nil {
 		switch {
 		case errors.Is(err, domain.ErrDelegatedAuthorityNotFound):
@@ -544,6 +760,12 @@ func (h *Handler) RevokeDelegatedAuthority(w http.ResponseWriter, r *http.Reques
 }
 
 // ── POST /v1/admin/sod-rules ──────────────────────────────────────────────────
+
+// ActionSoDRuleManageGlobal is the action a principal must hold, against the
+// platform-scope legal entity, to author a segregation-of-duties rule that
+// applies to every tenant. Deliberately not the same grant that authors a
+// rule for one tenant: those are different blast radii.
+const ActionSoDRuleManageGlobal = "SOD_RULE_MANAGE_GLOBAL"
 
 type createSoDRuleRequest struct {
 	DomainCode     string  `json:"domain_code"`
@@ -575,11 +797,19 @@ func (req createSoDRuleRequest) missingField() string {
 // supplied it's validated synchronously against jurisdiction-rules-svc,
 // fail-closed.
 //
-// Response: 201 created / 400 missing field / 404 jurisdiction not found / 503 unavailable.
+// A rule with no tenant_id applies to EVERY tenant, and creating one
+// therefore requires the platform-scope grant named by
+// ActionSoDRuleManageGlobal — not the tenant scope that authorizes a rule for
+// the caller's own tenant.
+//
+// Response: 201 created / 400 missing field / 401 missing principal or tenant
+// scope / 403 not authorized for a platform-wide rule / 404 jurisdiction not
+// found / 503 unavailable.
 func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	if _, ok := h.requirePrincipal(w, r); !ok {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
 		return
 	}
 
@@ -592,16 +822,28 @@ func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": missing})
 		return
 	}
-	// TenantID is optional (nil = globally-applicable rule, same doctrine
-	// as JurisdictionID). When present, it must be the caller's own tenant
-	// — before this fix nothing checked this, so any caller could write a
-	// segregation-of-duties rule into any tenant.
+	// A tenant scope is required to reach this route AT ALL, whether or not
+	// the body names one. Requiring it only when tenant_id was present made
+	// the omission the cheap path: with no tenant_id, one request carrying
+	// nothing but a principal header stored a rule with tenant_id = NULL,
+	// which CheckSoDConflict matches for every tenant. That is a platform-wide
+	// denial of service delivered through the authorization engine — every
+	// principal anywhere holding both actions gets DENIED on their next
+	// /v1/authorize — and it crossed no tenant boundary because none was asked
+	// for.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
 	if req.TenantID != nil && *req.TenantID != "" {
-		tenantScope, ok := h.requireTenant(w, r)
-		if !ok {
+		if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
 			return
 		}
-		if h.refuseForeignTenant(w, *req.TenantID, tenantScope) {
+	} else {
+		// nil tenant_id still means "applies to every tenant" — that is a
+		// deliberate and useful thing to be able to say. It is now a distinct
+		// grant to say it, rather than a side effect of leaving a field out.
+		if !h.requirePlatformAction(w, r, principalID, ActionSoDRuleManageGlobal) {
 			return
 		}
 	}
@@ -638,9 +880,9 @@ type authorizeRequest struct {
 	PrincipalID   string `json:"principal_id"`
 	LegalEntityID string `json:"legal_entity_id"`
 	ActionType    string `json:"action_type"`
-	// TenantID is optional. Omitting it preserves today's behavior — only
-	// globally-applicable SoD rules are considered. Supplying it also
-	// brings that tenant's own SoD rules into the check.
+	// TenantID is the FALLBACK source of the tenant scope, kept only for
+	// callers that do not forward X-Tenant-Id yet. See resolveTenantScope:
+	// the header wins, and a body that disagrees with it is refused.
 	TenantID string `json:"tenant_id,omitempty"`
 	// ResourceOwnerPrincipalID is optional: the principal who prepared or
 	// created the specific object action_type is being performed against
@@ -687,9 +929,66 @@ type authorizeResponse struct {
 // not implemented in v1 — no other attribute-condition rules exist
 // anywhere in the architecture docs to encode; see progress.md.
 //
+// The tenant scope of the evaluation comes from the verified X-Tenant-Id
+// header when the caller sends one — see resolveTenantScope for why that
+// matters more than it looks.
+//
 // Response: 200 with decision_outcome GRANTED|DENIED (both are 200 — the
 // HTTP status reflects "the evaluation succeeded", not the outcome) /
-// 400 missing field / 503 store unavailable (fail-closed, no decision recorded).
+// 400 missing field / 403 body tenant_id disagrees with the verified header /
+// 503 store unavailable (fail-closed, no decision recorded).
+// resolveTenantScope decides which tenant's SoD rules apply to this
+// evaluation: the verified X-Tenant-Id header if the caller forwards one,
+// otherwise the body's tenant_id, otherwise none.
+//
+// WHY THIS EXISTS. CheckSoDConflict's predicate is
+// `tenant_id IS NULL OR tenant_id = <given>`, so an absent tenant narrows the
+// check to globally-applicable rules ONLY. The tenant was read exclusively
+// from the request body, and across this estate just three of roughly sixty
+// authz clients put it there — so a tenant admin could create a
+// segregation-of-duties rule, get a 201, see it in the register, and have it
+// silently never applied to a decision made through any of the other
+// fifty-odd services. SoD enforcement was opt-in per calling service, which
+// is the inverse of what a control is for.
+//
+// Reading the header first makes the tenant arrive with the same identity the
+// gateway already verified, so a caller that forwards the header cannot
+// under-scope the check by omitting a body field. The body remains a fallback
+// rather than an error because ~60 services call this endpoint and most send
+// no tenant at all yet: rejecting them would replace a weak check with an
+// outage. A body that CONTRADICTS the header is refused outright — that is
+// not an old caller, it is a caller trying to be evaluated in someone else's
+// scope.
+func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bodyTenantID string) (string, bool) {
+	headerTenantID := r.Header.Get("X-Tenant-Id")
+
+	if headerTenantID != "" {
+		if bodyTenantID != "" && bodyTenantID != headerTenantID {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error":   "tenant_scope_mismatch",
+				"message": "request tenant_id does not match the caller's verified tenant scope",
+			})
+			return "", false
+		}
+		return headerTenantID, true
+	}
+
+	if bodyTenantID != "" {
+		// Logged, not refused: this is the pre-header calling convention, and
+		// the log is what makes the remaining callers findable.
+		h.log.Debug("authorize: tenant scope taken from request body — caller does not forward X-Tenant-Id",
+			zap.String("correlation_id", r.Header.Get("X-Correlation-ID")))
+		return bodyTenantID, true
+	}
+
+	// No tenant anywhere: only globally-applicable SoD rules can be
+	// considered. Warned at every call so "this tenant's SoD rules never
+	// fired" is diagnosable from the logs rather than from an incident.
+	h.log.Warn("authorize: no tenant scope supplied — only global SoD rules will be evaluated",
+		zap.String("correlation_id", r.Header.Get("X-Correlation-ID")))
+	return "", true
+}
+
 func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	correlationID := r.Header.Get("X-Correlation-ID")
 
@@ -711,7 +1010,12 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rbacActions, rbacBasis, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, req.LegalEntityID)
+	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID)
+	if !ok {
+		return
+	}
+
+	rbacActions, rbacBasis, err := h.store.FindGrantedActions(r.Context(), req.PrincipalID, req.LegalEntityID, tenantScope)
 	if err != nil {
 		// Fail-closed: the store is unreachable, so no decision can be made
 		// or recorded. Returning 503 here (rather than a recorded DENIED)
@@ -728,7 +1032,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	allHeldActions := append([]string{}, rbacActions...)
 
 	if !granted {
-		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, req.LegalEntityID)
+		delegatedActions, delegatedBasis, err := h.store.FindDelegatedActions(r.Context(), req.PrincipalID, req.LegalEntityID, tenantScope)
 		if err != nil {
 			h.log.Error("Authorize: store unavailable (delegation lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -748,7 +1052,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		// SoD check: does holding req.ActionType alongside anything else
 		// this principal already holds violate a Separation-of-Duties rule?
 		others := removeAll(allHeldActions, req.ActionType)
-		conflicting, hasConflict, err := h.store.CheckSoDConflict(r.Context(), others, req.ActionType, req.TenantID)
+		conflicting, hasConflict, err := h.store.CheckSoDConflict(r.Context(), others, req.ActionType, tenantScope)
 		if err != nil {
 			h.log.Error("Authorize: store unavailable (sod check)", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -780,7 +1084,15 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	decision, err := h.store.RecordAccessDecision(r.Context(), req.PrincipalID, req.LegalEntityID, req.ActionType, outcome, basis, correlationID)
+	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
+		PrincipalID:   req.PrincipalID,
+		LegalEntityID: req.LegalEntityID,
+		ActionType:    req.ActionType,
+		Outcome:       outcome,
+		Basis:         basis,
+		CorrelationID: correlationID,
+		TenantID:      tenantScope,
+	})
 	if err != nil {
 		h.log.Error("Authorize: failed to record access decision", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -808,7 +1120,7 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		if isSoD {
 			severity = siem.SeverityHigh
 		}
-		h.siem.Stream(r.Context(), req.TenantID, "authorization.denied", severity,
+		h.siem.Stream(r.Context(), tenantScope, "authorization.denied", severity,
 			"Authorization denied for principal "+req.PrincipalID+", action "+req.ActionType+": "+basis)
 		if isSoD {
 			// conflict_with= names the other held action; an own-object
@@ -839,12 +1151,33 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 // GetAccessDecision handles GET /v1/access-decisions/{access_decision_id} —
 // the "retrieve authorization rationale" capability.
 //
-// Response: 200 the decision / 404 not found / 503 unavailable.
+// Authenticated and tenant-scoped. It was neither: the route checked no
+// principal and no tenant, and the query carried no tenant or entity
+// predicate, so anyone able to reach the port could walk decision ids and
+// read principal_id, legal_entity_id, action_type, decision_outcome and
+// decision_basis for every tenant — and decision_basis carries
+// `sod:conflict_with=<action>`, which names where the segregation-of-duties
+// tripwires are. A readable map of who may do what, and where the alarms are.
+//
+// A decision belonging to another tenant, and a decision recorded with no
+// tenant at all, both answer 404 rather than 403 — a probe must not be able
+// to confirm that an id exists.
+//
+// Response: 200 the decision / 401 missing principal or tenant scope /
+// 404 not found, not yours, or unattributed / 503 unavailable.
 func (h *Handler) GetAccessDecision(w http.ResponseWriter, r *http.Request) {
 	accessDecisionID := chi.URLParam(r, "access_decision_id")
 	correlationID := r.Header.Get("X-Correlation-ID")
 
-	d, err := h.store.FindAccessDecisionByID(r.Context(), accessDecisionID)
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	d, err := h.store.FindAccessDecisionByID(r.Context(), accessDecisionID, tenantScope)
 	if err != nil {
 		if errors.Is(err, domain.ErrAccessDecisionNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "access_decision_not_found"})

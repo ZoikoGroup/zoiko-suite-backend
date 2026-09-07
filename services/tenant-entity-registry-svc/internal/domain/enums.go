@@ -69,6 +69,19 @@ const (
 	WorkspaceStatusArchived WorkspaceStatus = "ARCHIVED"
 )
 
+// ValidWorkspaceStatusTransitions maps valid source states to allowed targets.
+// Any transition not in this map is rejected fail-closed — including
+// ACTIVE->ACTIVE, so a repeated archive request cannot silently re-stamp
+// updated_by_principal_id with a no-op.
+//
+// Archiving is reversible. It hides a workspace from operational use but
+// deletes nothing, so a workspace archived by mistake has to be recoverable;
+// making ARCHIVED terminal would mean an accidental archive is permanent.
+var ValidWorkspaceStatusTransitions = map[WorkspaceStatus][]WorkspaceStatus{
+	WorkspaceStatusActive:   {WorkspaceStatusArchived},
+	WorkspaceStatusArchived: {WorkspaceStatusActive},
+}
+
 // BillingClassification is mandatory on every workspace per doc7 §T — it
 // determines whether the workspace may ever generate a live Zoiko charge.
 // Non-commercial classes (INTERNAL, DEMO, SANDBOX, QA_AUTOMATION,
@@ -110,6 +123,15 @@ const (
 	BillingSourceDirect         BillingSource = "DIRECT"
 	BillingSourceZoikoOneBundle BillingSource = "ZOIKO_ONE_BUNDLE"
 )
+
+// ValidBillingSources gates billing_source the way ValidBillingClassifications
+// gates classification. The create path defaults an empty value to NONE but
+// never checked a non-empty one, so an unrecognised source reached the column.
+var ValidBillingSources = map[BillingSource]bool{
+	BillingSourceNone:           true,
+	BillingSourceDirect:         true,
+	BillingSourceZoikoOneBundle: true,
+}
 
 // HierarchyRelationshipType classifies the nature of a parent-child entity relationship.
 type HierarchyRelationshipType string

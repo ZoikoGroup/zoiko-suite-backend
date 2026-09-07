@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/payroll-run-svc/internal/compensation"
 	"zoiko.io/payroll-run-svc/internal/contract"
 	"zoiko.io/payroll-run-svc/internal/domain"
 	"zoiko.io/payroll-run-svc/internal/employee"
@@ -53,6 +54,13 @@ type ContractClient interface {
 	GetActiveContract(ctx context.Context, tenantID, principalID, employeeID string) (*contract.ActiveContract, error)
 }
 
+// CompensationClient resolves what an employee's pay is composed of.
+// GetBreakdown returns compensation.ErrNoStructure when the employee simply has
+// none configured, which is a normal state and not an error.
+type CompensationClient interface {
+	GetBreakdown(ctx context.Context, tenantID, principalID, employeeID string, baseAmount float64) (*compensation.Breakdown, error)
+}
+
 const (
 	actionRunCreate   = "PAYROLL_RUN_CREATE"
 	actionRunView     = "PAYROLL_RUN_VIEW"
@@ -61,22 +69,33 @@ const (
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	empClient EmployeeClient
-	ctrClient ContractClient
-	log       *zap.Logger
+	store      Store
+	publisher  Publisher
+	authz      AuthZClient
+	empClient  EmployeeClient
+	ctrClient  ContractClient
+	compClient CompensationClient
+	// defaultTaxRate is applied to the taxable amount when no jurisdiction
+	// rule is available.
+	//
+	// This is a placeholder, and the last fabricated number left in this
+	// calculation. payroll-tax-svc is the authoritative source and should
+	// replace it; until it is wired, the rate is at least named, configurable,
+	// and applied to the correct base rather than to gross.
+	defaultTaxRate float64
+	log            *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, empClient EmployeeClient, ctrClient ContractClient, log *zap.Logger) *Handler {
+func New(store Store, publisher Publisher, authz AuthZClient, empClient EmployeeClient, ctrClient ContractClient, compClient CompensationClient, defaultTaxRate float64, log *zap.Logger) *Handler {
 	return &Handler{
-		store:     store,
-		publisher: publisher,
-		authz:     authz,
-		empClient: empClient,
-		ctrClient: ctrClient,
-		log:       log,
+		store:          store,
+		publisher:      publisher,
+		authz:          authz,
+		empClient:      empClient,
+		ctrClient:      ctrClient,
+		compClient:     compClient,
+		defaultTaxRate: defaultTaxRate,
+		log:            log,
 	}
 }
 
@@ -262,17 +281,47 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Resolve each employee's compensation breakdown. The base salary still
+		// comes from the contract above — that is the authoritative figure.
+		// compensation-svc supplies only the composition layered on it.
+		//
+		// An employee with no structure configured is a normal state: they are
+		// paid a flat base salary. compensation-svc being unreachable is not,
+		// and blocks the run rather than inventing deductions.
+		breakdowns := make(map[string]*compensation.Breakdown, len(activeEmployees))
+		for _, emp := range activeEmployees {
+			if h.compClient == nil {
+				continue
+			}
+			bd, err := h.compClient.GetBreakdown(r.Context(), tenantID, principalID, emp.EmployeeID, contracts[emp.EmployeeID].BaseSalaryAmount)
+			if errors.Is(err, compensation.ErrNoStructure) {
+				continue
+			}
+			if err != nil {
+				h.log.Error("failed to resolve compensation breakdown",
+					zap.String("employee_id", emp.EmployeeID), zap.Error(err))
+				h.publisher.PublishRunBlocked(r.Context(), getCorrelationID(r), principalID, *run, domain.ErrCompensationLookupFailed.Error())
+				writeError(w, http.StatusServiceUnavailable, "compensation_lookup_failed", string(domain.ErrCompensationLookupFailed))
+				return
+			}
+			breakdowns[emp.EmployeeID] = bd
+		}
+
 		for _, emp := range activeEmployees {
 			ctr := contracts[emp.EmployeeID]
-			gross := ctr.BaseSalaryAmount
 			curr := "USD"
 			if ctr.Currency != "" {
 				curr = ctr.Currency
 			}
 
-			tax := gross * 0.20
-			benefits := gross * 0.05
-			net := gross - tax - benefits
+			slipCalc := h.calculateSlip(ctr.BaseSalaryAmount, breakdowns[emp.EmployeeID])
+			gross := slipCalc.gross
+			tax := slipCalc.tax
+			benefits := slipCalc.deductions
+			net := slipCalc.net
+			if slipCalc.currency != "" {
+				curr = slipCalc.currency
+			}
 
 			totalGross += gross
 			totalNet += net
@@ -280,8 +329,9 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 			totalDeductions += benefits
 
 			name := fmt.Sprintf("%s %s", emp.FirstName, emp.LastName)
+			slipID := uuid.NewString()
 			slip := domain.PaySlip{
-				SlipID:             uuid.NewString(),
+				SlipID:             slipID,
 				TenantID:           tenantID,
 				RunID:              run.RunID,
 				EmployeeID:         emp.EmployeeID,
@@ -293,6 +343,9 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 				NetPay:             net,
 				Currency:           curr,
 				EffectiveDate:      run.PayDate,
+				TaxableAmount:      slipCalc.taxable,
+				StructureID:        slipCalc.structureID,
+				Items:              buildSlipItems(tenantID, slipID, now, breakdowns[emp.EmployeeID]),
 				CreatedAt:          now,
 			}
 			slips = append(slips, slip)
@@ -337,8 +390,15 @@ func (h *Handler) CalculateRun(w http.ResponseWriter, r *http.Request) {
 		for _, item := range req.ShadowBaselineItems {
 			gross := item.LegacyGrossPay
 			tax := item.LegacyTaxWithheld
-			benefits := gross * 0.05
 			net := item.LegacyNetPay
+
+			// Other deductions are derived from the legacy figures rather than
+			// assumed: whatever is left after tax that did not reach net pay is,
+			// by definition, the legacy system's other deductions. This used to
+			// be a flat gross*0.05, which put a number on the slip that the
+			// legacy payroll never produced. Floored at zero because legacy
+			// inputs that do not reconcile must not create a negative deduction.
+			benefits := math.Max(round2(gross-tax-net), 0)
 
 			totalGross += gross
 			totalNet += net

@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	authzpkg "zoiko.io/siem-integration-svc/internal/authz"
 	"zoiko.io/siem-integration-svc/internal/domain"
+	svcenvelope "zoiko.io/siem-integration-svc/internal/envelope"
 	"zoiko.io/siem-integration-svc/internal/store"
 )
 
@@ -126,6 +127,22 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 func NewRouter(h *Handler) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.RequestID, chimw.RealIP, chimw.Logger, chimw.Recoverer)
+
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4). Runs after
+	// Recoverer so a refusal is still traced, and ahead of every handler so no
+	// request reaches business logic without a resolved tenant, actor,
+	// correlation and — on material writes — an idempotency key.
+	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
+	//
+	// POST /v1/siem/stream is exempt, and the exemption is the point of the
+	// route. gateway-auth-svc calls it to report an AUTHENTICATION FAILURE, so
+	// by definition there is no authenticated principal to put in an envelope.
+	// Requiring one would silently drop exactly the events the SIEM exists to
+	// receive. Same shape as carta-svc's /evaluate and identity-context-svc's
+	// /v1/context/resolve. TestServiceToServiceRoutesStillWork pins it.
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.ExemptPaths = []string{"/v1/siem/stream"}
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
 	r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "siem-integration-svc"})

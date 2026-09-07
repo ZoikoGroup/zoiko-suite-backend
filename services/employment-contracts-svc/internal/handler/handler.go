@@ -96,6 +96,28 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The vocabularies and the currency format are CHECK constraints on the
+	// table (supabase/migrations/0030). Refusing here keeps a mistyped
+	// contract_type a 400 naming the field, rather than a constraint violation
+	// surfacing as a 500 that names nothing the caller can act on.
+	if !domain.IsValidContractType(req.ContractType) {
+		writeError(w, http.StatusBadRequest, "unknown_contract_type", domain.ErrUnknownContractType.Error())
+		return
+	}
+	if !domain.IsValidPayFrequency(req.PayFrequency) {
+		writeError(w, http.StatusBadRequest, "unknown_pay_frequency", domain.ErrUnknownPayFrequency.Error())
+		return
+	}
+	if !domain.IsValidCurrency(req.Currency) {
+		writeError(w, http.StatusBadRequest, "invalid_currency", domain.ErrInvalidCurrency.Error())
+		return
+	}
+	if req.EffectiveTo != nil && *req.EffectiveTo != "" && *req.EffectiveTo < req.EffectiveFrom {
+		writeError(w, http.StatusBadRequest, "invalid_effective_range",
+			"effective_to precedes effective_from")
+		return
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
@@ -152,6 +174,14 @@ func (h *Handler) IssueContract(w http.ResponseWriter, r *http.Request) {
 	}
 
 	created, err := h.store.IssueContract(r.Context(), contract)
+	if errors.Is(err, domain.ErrContractNumberVersionExists) {
+		// A caller-supplied contract_number already in use. That is the
+		// caller's to resolve, and reporting it as store_unavailable would send
+		// them to look at the database instead.
+		writeError(w, http.StatusConflict, "contract_number_exists",
+			domain.ErrContractNumberVersionExists.Error())
+		return
+	}
 	if err != nil {
 		h.log.Error("failed to issue contract", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -303,23 +333,47 @@ func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AmendContract closes the prior version with effective_to = this date, so
+	// an amendment dated before the contract began would leave a row whose
+	// effective range runs backwards — refused by contracts_effective_range.
+	if req.EffectiveFrom < oldContract.EffectiveFrom {
+		writeError(w, http.StatusBadRequest, "amendment_predates_contract",
+			domain.ErrAmendmentPredatesContract.Error())
+		return
+	}
+
 	title := oldContract.Title
 	if req.Title != nil {
 		title = *req.Title
 	}
 
+	// The amend path takes each of these as an optional override and, unlike
+	// the issue path, never checked any of them. A negative salary or an
+	// unknown pay frequency could only ever arrive this way.
 	salary := oldContract.BaseSalaryAmount
 	if req.BaseSalaryAmount != nil {
+		if *req.BaseSalaryAmount <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_salary", domain.ErrInvalidSalary.Error())
+			return
+		}
 		salary = *req.BaseSalaryAmount
 	}
 
 	currency := oldContract.Currency
 	if req.Currency != nil {
+		if !domain.IsValidCurrency(*req.Currency) {
+			writeError(w, http.StatusBadRequest, "invalid_currency", domain.ErrInvalidCurrency.Error())
+			return
+		}
 		currency = *req.Currency
 	}
 
 	freq := oldContract.PayFrequency
 	if req.PayFrequency != nil {
+		if !domain.IsValidPayFrequency(*req.PayFrequency) {
+			writeError(w, http.StatusBadRequest, "unknown_pay_frequency", domain.ErrUnknownPayFrequency.Error())
+			return
+		}
 		freq = *req.PayFrequency
 	}
 
@@ -355,7 +409,22 @@ func (h *Handler) AmendContract(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:       now,
 	}
 
-	if err := h.store.AmendContract(r.Context(), id, newContract, amendment); err != nil {
+	// Both conflicts below are races: the status check above passed, and
+	// something else amended or terminated the same contract in between. They
+	// were reported as store_unavailable, which points the caller at the
+	// database rather than at the contract that moved under them.
+	err = h.store.AmendContract(r.Context(), id, newContract, amendment)
+	if errors.Is(err, domain.ErrContractAlreadyTerminated) {
+		writeError(w, http.StatusConflict, "contract_not_active",
+			domain.ErrContractAlreadyTerminated.Error())
+		return
+	}
+	if errors.Is(err, domain.ErrContractNumberVersionExists) {
+		writeError(w, http.StatusConflict, "contract_version_exists",
+			domain.ErrContractNumberVersionExists.Error())
+		return
+	}
+	if err != nil {
 		h.log.Error("failed to amend contract", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
