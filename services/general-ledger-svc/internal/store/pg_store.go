@@ -547,6 +547,16 @@ func (s *PgStore) TransitionJournal(ctx context.Context, tenantID, journalID str
 			return mapPgError(err)
 		}
 		affected = tag.RowsAffected()
+		if affected > 0 && toStatus == domain.JournalStatusFinalized {
+			// ACC-05: every journal that reaches FINALIZED appends its
+			// posted ledger entries in the SAME transaction as the status
+			// flip — never a second call a future call site could forget,
+			// the same bug class already hit twice this session with
+			// MarkJournalPosted. See migration 000011's doc comment.
+			if err := appendLedgerEntries(ctx, tx, tenantID, journalID); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if errors.Is(err, domain.ErrInvalidIdentifier) {
@@ -574,6 +584,234 @@ func transitionColumns(to domain.JournalStatus) (actorColumn, timeColumn string)
 	default:
 		return "posted_by_principal_id", "posted_at"
 	}
+}
+
+// appendLedgerEntries is ACC-05's AppendPostedJournal — "(internal only)"
+// per the spec's own wireframe, so it is never a Store interface method a
+// handler can call; it exists purely as TransitionJournal's own side
+// effect, run in the same transaction as the PENDING/VALIDATED ->
+// FINALIZED flip that calls it. ON CONFLICT DO NOTHING makes it safe to
+// call at most once per journal in practice while remaining idempotent in
+// principle (the spec's own negative path #2, "duplicate journal append").
+func appendLedgerEntries(ctx context.Context, tx pgx.Tx, tenantID, journalID string) error {
+	rows, err := tx.Query(ctx, `
+		SELECT jl.journal_line_id, jl.line_number, jl.account_code,
+		       jl.debit_amount, jl.credit_amount, jl.dimensions,
+		       jh.legal_entity_id, COALESCE(jh.book_id, ''), jh.fiscal_period,
+		       jh.currency_code, jh.transaction_date, jh.posting_date,
+		       jh.source_event_id, jh.correlation_id
+		FROM journal_lines jl
+		JOIN journal_headers jh ON jh.journal_id = jl.journal_id
+		WHERE jl.journal_id = $1 AND jh.tenant_id = $2
+	`, journalID, tenantID)
+	if err != nil {
+		return mapPgError(err)
+	}
+	type entryRow struct {
+		lineID, accountCode, legalEntityID, bookID, fiscalPeriod, currencyCode, correlationID string
+		lineNumber                                                                             int
+		debit, credit                                                                          float64
+		dimensions                                                                              domain.Dimensions
+		transactionDate, postingDate                                                            domain.Date
+		sourceEventID                                                                           *string
+	}
+	var entries []entryRow
+	for rows.Next() {
+		var e entryRow
+		if err := rows.Scan(&e.lineID, &e.lineNumber, &e.accountCode, &e.debit, &e.credit, &e.dimensions,
+			&e.legalEntityID, &e.bookID, &e.fiscalPeriod, &e.currencyCode, &e.transactionDate, &e.postingDate,
+			&e.sourceEventID, &e.correlationID); err != nil {
+			rows.Close()
+			return mapPgError(err)
+		}
+		entries = append(entries, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return mapPgError(err)
+	}
+
+	now := time.Now().UTC()
+	for _, e := range entries {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO ledger_entries (
+				ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
+				journal_id, journal_line_id, line_number, account_code,
+				debit_amount, credit_amount, currency_code, dimensions,
+				transaction_date, posting_date, source_event_id, correlation_id, created_at
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+			ON CONFLICT (tenant_id, journal_id, journal_line_id) DO NOTHING
+		`, uuid.NewString(), tenantID, e.legalEntityID, e.bookID, e.fiscalPeriod,
+			journalID, e.lineID, e.lineNumber, e.accountCode,
+			e.debit, e.credit, e.currencyCode, e.dimensions,
+			e.transactionDate, e.postingDate, e.sourceEventID, e.correlationID, now); err != nil {
+			return mapPgError(err)
+		}
+	}
+	return nil
+}
+
+// QueryLedger is ACC-05's own read authority over ledger_entries. Filter's
+// LegalEntityID must already be validated non-empty by the caller
+// (ErrLedgerScopeRequired) — the spec's own negative path #4, "cross-book
+// query leakage."
+func (s *PgStore) QueryLedger(ctx context.Context, tenantID string, filter domain.QueryLedgerFilter, limit int) ([]domain.LedgerEntry, error) {
+	if limit <= 0 || limit > MaxListLimit {
+		limit = DefaultListLimit
+	}
+	query := `
+		SELECT ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
+		       journal_id, journal_line_id, line_number, account_code,
+		       debit_amount, credit_amount, currency_code, dimensions,
+		       transaction_date, posting_date, source_event_id, correlation_id, entry_seq, created_at
+		FROM ledger_entries
+		WHERE tenant_id = $1 AND legal_entity_id = $2`
+	args := []any{tenantID, filter.LegalEntityID}
+	if filter.BookID != "" {
+		args = append(args, filter.BookID)
+		query += fmt.Sprintf(" AND book_id = $%d", len(args))
+	}
+	if filter.AccountCode != "" {
+		args = append(args, filter.AccountCode)
+		query += fmt.Sprintf(" AND account_code = $%d", len(args))
+	}
+	if filter.FiscalPeriod != "" {
+		args = append(args, filter.FiscalPeriod)
+		query += fmt.Sprintf(" AND fiscal_period = $%d", len(args))
+	}
+	if filter.JournalID != "" {
+		args = append(args, filter.JournalID)
+		query += fmt.Sprintf(" AND journal_id = $%d", len(args))
+	}
+	if filter.MaxEntrySeq != nil {
+		args = append(args, *filter.MaxEntrySeq)
+		query += fmt.Sprintf(" AND entry_seq <= $%d", len(args))
+	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY entry_seq ASC LIMIT $%d", len(args))
+
+	var entries []domain.LedgerEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e domain.LedgerEntry
+			if err := rows.Scan(&e.LedgerEntryID, &e.TenantID, &e.LegalEntityID, &e.BookID, &e.FiscalPeriod,
+				&e.JournalID, &e.JournalLineID, &e.LineNumber, &e.AccountCode,
+				&e.DebitAmount, &e.CreditAmount, &e.CurrencyCode, &e.Dimensions,
+				&e.TransactionDate, &e.PostingDate, &e.SourceEventID, &e.CorrelationID, &e.EntrySeq, &e.CreatedAt); err != nil {
+				return mapPgError(err)
+			}
+			entries = append(entries, e)
+		}
+		return mapPgError(rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// QuerySourceEntries returns every ledger entry traceable to the given
+// source_event_id — ACC-05's own lineage query, distinct from QueryLedger
+// in that it deliberately does NOT require legal_entity_id: tracing a
+// source fact to its consequences is a cross-entity question by nature
+// (e.g. an intercompany event posts to two entities), so it is scoped by
+// tenant + the source reference alone.
+func (s *PgStore) QuerySourceEntries(ctx context.Context, tenantID, sourceEventID string) ([]domain.LedgerEntry, error) {
+	var entries []domain.LedgerEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT ledger_entry_id, tenant_id, legal_entity_id, book_id, fiscal_period,
+			       journal_id, journal_line_id, line_number, account_code,
+			       debit_amount, credit_amount, currency_code, dimensions,
+			       transaction_date, posting_date, source_event_id, correlation_id, entry_seq, created_at
+			FROM ledger_entries
+			WHERE tenant_id = $1 AND source_event_id = $2
+			ORDER BY entry_seq ASC
+		`, tenantID, sourceEventID)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e domain.LedgerEntry
+			if err := rows.Scan(&e.LedgerEntryID, &e.TenantID, &e.LegalEntityID, &e.BookID, &e.FiscalPeriod,
+				&e.JournalID, &e.JournalLineID, &e.LineNumber, &e.AccountCode,
+				&e.DebitAmount, &e.CreditAmount, &e.CurrencyCode, &e.Dimensions,
+				&e.TransactionDate, &e.PostingDate, &e.SourceEventID, &e.CorrelationID, &e.EntrySeq, &e.CreatedAt); err != nil {
+				return mapPgError(err)
+			}
+			entries = append(entries, e)
+		}
+		return mapPgError(rows.Err())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+// QueryAccountBalance reads the ledger_balances projection — the fast
+// path, not a live recompute. Returns domain.ErrPostingExecutionNotFound's
+// sibling zero-value semantics: a scope with no projection row yet (never
+// posted to, or never rebuilt) is reported as a zero balance, not an
+// error — an account nobody has posted to genuinely has a zero balance.
+func (s *PgStore) QueryAccountBalance(ctx context.Context, tenantID string, req domain.QueryAccountBalanceRequest) (*domain.LedgerBalance, error) {
+	bal := &domain.LedgerBalance{
+		TenantID: tenantID, LegalEntityID: req.LegalEntityID, BookID: req.BookID,
+		AccountCode: req.AccountCode, FiscalPeriod: req.FiscalPeriod,
+	}
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(debit_total), 0), COALESCE(SUM(credit_total), 0),
+			       COALESCE(SUM(net_balance), 0), COALESCE(MAX(watermark_entry_seq), 0)
+			FROM ledger_balances
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND book_id = $3
+			  AND account_code = $4 AND fiscal_period = $5
+		`, tenantID, req.LegalEntityID, req.BookID, req.AccountCode, req.FiscalPeriod)
+		return mapPgError(row.Scan(&bal.DebitTotal, &bal.CreditTotal, &bal.NetBalance, &bal.WatermarkEntrySeq))
+	})
+	if err != nil {
+		return nil, err
+	}
+	return bal, nil
+}
+
+// RebuildDerivedBalanceProjection is ACC-05's own controlled command —
+// "balance projections versioned/rebuildable from entries." It recomputes
+// ledger_balances entirely from ledger_entries for the given scope and
+// never touches ledger_entries itself, satisfying the spec's own negative
+// path #3, "balance projection corrupt while entries intact": whatever
+// state ledger_balances was in, this replaces it with a value entries
+// alone can reproduce.
+func (s *PgStore) RebuildDerivedBalanceProjection(ctx context.Context, tenantID string, req domain.RebuildBalanceProjectionRequest) error {
+	now := time.Now().UTC()
+	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM ledger_balances
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND book_id = $3 AND fiscal_period = $4
+		`, tenantID, req.LegalEntityID, req.BookID, req.FiscalPeriod); err != nil {
+			return mapPgError(err)
+		}
+		_, err := tx.Exec(ctx, `
+			INSERT INTO ledger_balances (
+				tenant_id, legal_entity_id, book_id, account_code, fiscal_period, dimensions_key,
+				debit_total, credit_total, net_balance, watermark_entry_seq, rebuilt_at
+			)
+			SELECT tenant_id, legal_entity_id, book_id, account_code, fiscal_period,
+			       COALESCE(dimensions, '{}'::jsonb)::text,
+			       SUM(debit_amount), SUM(credit_amount), SUM(debit_amount - credit_amount),
+			       MAX(entry_seq), $5
+			FROM ledger_entries
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND book_id = $3 AND fiscal_period = $4
+			GROUP BY tenant_id, legal_entity_id, book_id, account_code, fiscal_period, COALESCE(dimensions, '{}'::jsonb)::text
+		`, tenantID, req.LegalEntityID, req.BookID, req.FiscalPeriod, now)
+		return mapPgError(err)
+	})
 }
 
 // SumLines returns the total debit and credit amounts for a journal's lines —

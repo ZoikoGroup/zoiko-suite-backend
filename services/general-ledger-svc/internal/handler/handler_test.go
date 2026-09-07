@@ -57,6 +57,11 @@ type stubStore struct {
 	currentMappings map[string]*domain.AccountMapping // by "tenant|mapping_key"
 	setMappingErr   error
 
+	ledgerEntries        []domain.LedgerEntry
+	ledgerBalance        *domain.LedgerBalance
+	rebuildCalled        bool
+	lastRebuildRequest   domain.RebuildBalanceProjectionRequest
+
 	postingExecutions map[string]*domain.PostingExecution // by execution_id
 	bySourceEvent     map[string]string                   // "tenant|source_event_id" -> execution_id
 	createExecErr     error
@@ -430,6 +435,43 @@ func (s *stubStore) AmendDraftJournal(_ context.Context, _, journalID string, up
 		lines[i].LineNumber = i + 1
 	}
 	s.lines[journalID] = lines
+	return nil
+}
+
+func (s *stubStore) QueryLedger(_ context.Context, _ string, filter domain.QueryLedgerFilter, _ int) ([]domain.LedgerEntry, error) {
+	var out []domain.LedgerEntry
+	for _, e := range s.ledgerEntries {
+		if e.LegalEntityID != filter.LegalEntityID {
+			continue
+		}
+		if filter.MaxEntrySeq != nil && e.EntrySeq > *filter.MaxEntrySeq {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func (s *stubStore) QuerySourceEntries(_ context.Context, _, sourceEventID string) ([]domain.LedgerEntry, error) {
+	var out []domain.LedgerEntry
+	for _, e := range s.ledgerEntries {
+		if e.SourceEventID != nil && *e.SourceEventID == sourceEventID {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) QueryAccountBalance(_ context.Context, _ string, _ domain.QueryAccountBalanceRequest) (*domain.LedgerBalance, error) {
+	if s.ledgerBalance != nil {
+		return s.ledgerBalance, nil
+	}
+	return &domain.LedgerBalance{}, nil
+}
+
+func (s *stubStore) RebuildDerivedBalanceProjection(_ context.Context, _ string, req domain.RebuildBalanceProjectionRequest) error {
+	s.rebuildCalled = true
+	s.lastRebuildRequest = req
 	return nil
 }
 

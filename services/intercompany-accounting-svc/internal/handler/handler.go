@@ -23,6 +23,11 @@ type Store interface {
 	GetEntry(ctx context.Context, id string) (*domain.IntercompanyEntry, error)
 	ListEntries(ctx context.Context, sourceEntityID, targetEntityID string) ([]domain.IntercompanyEntry, error)
 	UpdateMatch(ctx context.Context, id, targetJournalID, matchStatus string, mismatchReason *string) error
+
+	// ACC-11 lifecycle — see migration 000003's doc comment.
+	AcknowledgeCounterparty(ctx context.Context, id, principalID string) error
+	DisputeIntercompany(ctx context.Context, id, principalID, reason string) error
+	ResolveMismatch(ctx context.Context, id, principalID, resolutionNote string) error
 }
 
 type Publisher interface {
@@ -43,6 +48,15 @@ const (
 	actionCreateEntry = "INTERCOMPANY_ENTRY_CREATE"
 	actionViewEntry   = "INTERCOMPANY_ENTRY_VIEW"
 	actionMatchEntry  = "INTERCOMPANY_ENTRY_MATCH"
+
+	// ACC-11 lifecycle actions. actionResolveMismatch is deliberately
+	// distinct from actionDisputeIntercompany — the spec's own state model
+	// treats disputing and resolving a dispute as different acts, and
+	// collapsing them into one grantable action would let whoever raises a
+	// dispute also be the one who closes it out, with no independent check.
+	actionAcknowledgeCounterparty = "INTERCOMPANY_ENTRY_ACKNOWLEDGE"
+	actionDisputeIntercompany     = "INTERCOMPANY_ENTRY_DISPUTE"
+	actionResolveMismatch         = "INTERCOMPANY_ENTRY_RESOLVE"
 )
 
 type Handler struct {
@@ -69,6 +83,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListEntries)
 		r.Get("/{id}", h.GetEntry)
 		r.Post("/{id}/match", h.MatchEntry)
+		r.Post("/{id}/acknowledge", h.AcknowledgeCounterparty)
+		r.Post("/{id}/dispute", h.DisputeIntercompany)
+		r.Post("/{id}/resolve", h.ResolveMismatch)
 	})
 }
 
@@ -238,7 +255,15 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if entry.MatchStatus == "MATCHED" {
+	// MatchIntercompany is only meaningful from OPEN ("UNMATCHED") or
+	// AWAITING_COUNTERPARTY — a pair already MATCHED, under DISPUTE, or
+	// RESOLVED has left the part of the state model matching belongs to.
+	switch entry.MatchStatus {
+	case domain.MatchStatusUnmatched, domain.MatchStatusAwaitingCounterparty, domain.MatchStatusMismatch:
+		// MISMATCH is also re-matchable: a caller correcting a prior
+		// mismatch (e.g. supplying the right target_journal_id this time)
+		// re-runs MatchIntercompany rather than needing a separate command.
+	default:
 		writeError(w, http.StatusUnprocessableEntity, "entry_already_matched", string(domain.ErrEntryAlreadyMatched))
 		return
 	}
@@ -252,6 +277,25 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch target journal detail from general-ledger-svc
 	journal, err := h.ledger.GetJournal(r.Context(), tenantID, req.TargetJournalID)
+	if errors.Is(err, domain.ErrEntryNotFound) {
+		// ACC-11's own negative path, "One side missing": the named
+		// counterparty journal does not exist at all. A real accounting
+		// fact worth recording as MISMATCH, not a transient 503 — the
+		// caller almost certainly named the wrong journal_id, and retrying
+		// the identical request will fail identically.
+		reason := domain.ErrCounterpartyJournalMissing.Error()
+		_ = h.store.UpdateMatch(r.Context(), id, req.TargetJournalID, domain.MatchStatusMismatch, &reason)
+		entry.TargetJournalID = &req.TargetJournalID
+		entry.MatchStatus = domain.MatchStatusMismatch
+		entry.MismatchReason = &reason
+		h.publisher.PublishMismatchDetected(r.Context(), correlationID, principalID, *entry, reason)
+		writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
+			IntercompanyEntryID: id,
+			MatchStatus:         domain.MatchStatusMismatch,
+			MismatchReason:      &reason,
+		})
+		return
+	}
 	if err != nil {
 		h.log.Error("failed to query target journal from GL", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "gl_query_failed", err.Error())
@@ -332,6 +376,152 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 		IntercompanyEntryID: id,
 		MatchStatus:         "MATCHED",
 	})
+}
+
+// ── POST /v1/intercompany/entries/{id}/acknowledge ───────────────────────────────
+
+// AcknowledgeCounterparty is ACC-11's own AcknowledgeCounterparty command —
+// moves a pair to AWAITING_COUNTERPARTY, the spec's own named milestone
+// between a pair being opened and it being matched.
+func (h *Handler) AcknowledgeCounterparty(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	entry, err := h.store.GetEntry(r.Context(), id)
+	if errors.Is(err, domain.ErrEntryNotFound) {
+		writeError(w, http.StatusNotFound, "entry_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch intercompany entry", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entry.TargetLegalEntityID, actionAcknowledgeCounterparty); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if err := h.store.AcknowledgeCounterparty(r.Context(), id, principalID); err != nil {
+		if errors.Is(err, domain.ErrInvalidPairTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+			return
+		}
+		h.log.Error("failed to acknowledge counterparty", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusAwaitingCounterparty})
+}
+
+// ── POST /v1/intercompany/entries/{id}/dispute ────────────────────────────────────
+
+// DisputeIntercompany is ACC-11's own DisputeIntercompany command — flags a
+// MISMATCH pair for investigation, only reachable from MISMATCH.
+func (h *Handler) DisputeIntercompany(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var req domain.DisputeIntercompanyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrDisputeReasonRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	entry, err := h.store.GetEntry(r.Context(), id)
+	if errors.Is(err, domain.ErrEntryNotFound) {
+		writeError(w, http.StatusNotFound, "entry_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch intercompany entry", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entry.TargetLegalEntityID, actionDisputeIntercompany); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if err := h.store.DisputeIntercompany(r.Context(), id, principalID, req.Reason); err != nil {
+		if errors.Is(err, domain.ErrInvalidPairTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+			return
+		}
+		h.log.Error("failed to dispute intercompany pair", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusDisputed})
+}
+
+// ── POST /v1/intercompany/entries/{id}/resolve ────────────────────────────────────
+
+// ResolveMismatch is ACC-11's own ResolveMismatch command — records a
+// human resolution decision for a DISPUTED pair. Deliberately distinct
+// authorization action from DisputeIntercompany (see actionResolveMismatch's
+// own comment): whoever raises a dispute is not automatically who can close it.
+func (h *Handler) ResolveMismatch(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var req domain.ResolveMismatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if req.ResolutionNote == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrResolutionNoteRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+
+	entry, err := h.store.GetEntry(r.Context(), id)
+	if errors.Is(err, domain.ErrEntryNotFound) {
+		writeError(w, http.StatusNotFound, "entry_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch intercompany entry", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, entry.TargetLegalEntityID, actionResolveMismatch); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if err := h.store.ResolveMismatch(r.Context(), id, principalID, req.ResolutionNote); err != nil {
+		if errors.Is(err, domain.ErrInvalidPairTransition) {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_transition", err.Error())
+			return
+		}
+		h.log.Error("failed to resolve intercompany mismatch", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"match_status": domain.MatchStatusResolved})
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────

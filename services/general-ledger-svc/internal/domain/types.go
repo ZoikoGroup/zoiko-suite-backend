@@ -445,6 +445,85 @@ type CreateReversalPostingRequest struct {
 	Reason            string `json:"reason"`
 }
 
+// LedgerEntry is ACC-05's own authority: "LedgerEntry and authoritative
+// posted balance state; no draft/manual business lifecycle." One row per
+// journal line, written exactly once — when the journal that contains it
+// reaches FINALIZED — and never updated or deleted afterward (see
+// migration 000011's doc comment and its append-only trigger). Never
+// constructed directly by a handler; only PgStore.appendLedgerEntries,
+// called from inside TransitionJournal's own transaction, ever inserts one.
+type LedgerEntry struct {
+	LedgerEntryID   string     `json:"ledger_entry_id"`
+	TenantID        string     `json:"tenant_id"`
+	LegalEntityID   string     `json:"legal_entity_id"`
+	BookID          string     `json:"book_id,omitempty"`
+	FiscalPeriod    string     `json:"fiscal_period"`
+	JournalID       string     `json:"journal_id"`
+	JournalLineID   string     `json:"journal_line_id"`
+	LineNumber      int        `json:"line_number"`
+	AccountCode     string     `json:"account_code"`
+	DebitAmount     float64    `json:"debit_amount"`
+	CreditAmount    float64    `json:"credit_amount"`
+	CurrencyCode    string     `json:"currency_code"`
+	Dimensions      Dimensions `json:"dimensions,omitempty"`
+	TransactionDate Date       `json:"transaction_date"`
+	PostingDate     Date       `json:"posting_date"`
+	SourceEventID   *string    `json:"source_event_id,omitempty"`
+	CorrelationID   string     `json:"correlation_id"`
+	EntrySeq        int64      `json:"entry_seq"`
+	CreatedAt       time.Time  `json:"created_at"`
+}
+
+// LedgerBalance is ACC-05's "balance projections versioned/rebuildable
+// from entries" — a derived, replaceable aggregate over ledger_entries,
+// never itself a source of truth. Grouped by entity/book/account/period
+// and a canonicalized dimensions key, matching the spec's "by entity,
+// book, account, dimension and period."
+type LedgerBalance struct {
+	TenantID          string    `json:"tenant_id"`
+	LegalEntityID     string    `json:"legal_entity_id"`
+	BookID            string    `json:"book_id,omitempty"`
+	AccountCode       string    `json:"account_code"`
+	FiscalPeriod      string    `json:"fiscal_period"`
+	DimensionsKey     string    `json:"dimensions_key,omitempty"`
+	DebitTotal        float64   `json:"debit_total"`
+	CreditTotal       float64   `json:"credit_total"`
+	NetBalance        float64   `json:"net_balance"`
+	WatermarkEntrySeq int64     `json:"watermark_entry_seq"`
+	RebuiltAt         time.Time `json:"rebuilt_at"`
+}
+
+// QueryLedgerFilter is QueryLedger's own scope — every field but
+// LegalEntityID is optional narrowing. LegalEntityID is mandatory
+// (ErrLedgerScopeRequired) so a caller can never accidentally receive
+// every entity's entries at once.
+type QueryLedgerFilter struct {
+	LegalEntityID string
+	BookID        string
+	AccountCode   string
+	FiscalPeriod  string
+	JournalID     string
+	MaxEntrySeq   *int64 // set by QueryLedgerAsOf to reconstruct a point-in-time view
+}
+
+// QueryAccountBalanceRequest is QueryAccountBalance's input — reads the
+// ledger_balances projection, not ledger_entries directly.
+type QueryAccountBalanceRequest struct {
+	LegalEntityID string
+	BookID        string
+	AccountCode   string
+	FiscalPeriod  string
+}
+
+// RebuildBalanceProjectionRequest is RebuildDerivedBalanceProjection's
+// input — always scoped to one entity/period so a rebuild's blast radius
+// is explicit and bounded, never a whole-tenant rebuild by accident.
+type RebuildBalanceProjectionRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	BookID        string `json:"book_id,omitempty"`
+	FiscalPeriod  string `json:"fiscal_period"`
+}
+
 type CompileTrialBalanceRequest struct {
 	LegalEntityID string `json:"legal_entity_id"`
 	FiscalPeriod  string `json:"fiscal_period"`
@@ -706,6 +785,13 @@ var (
 	// there is a posted fact to correct; a draft or rejected journal has
 	// nothing yet to correct.
 	ErrCorrectionSourceNotPosted = errorString("only a POSTED journal may be corrected")
+
+	// ── ACC-05 General Ledger ────────────────────────────────────────────
+
+	// ErrLedgerScopeRequired is every ACC-05 query's own negative-path
+	// guard against "Cross-book query leakage": legal_entity_id must
+	// always be supplied and is never inferred or defaulted.
+	ErrLedgerScopeRequired = errorString("legal_entity_id is required to query the ledger")
 )
 
 // ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic

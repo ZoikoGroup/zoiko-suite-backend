@@ -74,6 +74,16 @@ type Store interface {
 	RequestJournalPosting(ctx context.Context, tenantID, journalID, principalID string) error
 	MarkJournalPosted(ctx context.Context, tenantID, journalID string) error
 	AmendDraftJournal(ctx context.Context, tenantID, journalID string, h *domain.JournalHeader, lines []domain.JournalLine) error
+
+	// ACC-05 General Ledger — see migration 000011's doc comment.
+	// AppendPostedJournal itself is "(internal only)" per the spec's own
+	// wireframe and is deliberately NOT a Store method here — it runs
+	// only as TransitionJournal's own side effect (see appendLedgerEntries
+	// in pg_store.go), never reachable from a handler.
+	QueryLedger(ctx context.Context, tenantID string, filter domain.QueryLedgerFilter, limit int) ([]domain.LedgerEntry, error)
+	QuerySourceEntries(ctx context.Context, tenantID, sourceEventID string) ([]domain.LedgerEntry, error)
+	QueryAccountBalance(ctx context.Context, tenantID string, req domain.QueryAccountBalanceRequest) (*domain.LedgerBalance, error)
+	RebuildDerivedBalanceProjection(ctx context.Context, tenantID string, req domain.RebuildBalanceProjectionRequest) error
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -151,6 +161,14 @@ const (
 	actionRequestPosting         = "GL_JOURNAL_POST_REQUEST"
 	actionAmendDraftJournal      = "GL_JOURNAL_AMEND"
 	actionRequestCorrection      = "GL_JOURNAL_CORRECT"
+
+	// ACC-05 General Ledger actions. actionLedgerRebuildBalances is
+	// deliberately separate from actionLedgerQuery — the spec's own
+	// "controlled" annotation on RebuildDerivedBalanceProjection marks it
+	// as a materially more sensitive act than an ordinary read, grantable
+	// to a narrower operational group.
+	actionLedgerQuery            = "GL_LEDGER_QUERY"
+	actionLedgerRebuildBalances  = "GL_LEDGER_REBUILD_BALANCES"
 )
 
 // coaPlatformScopeID is the legal_entity_id presented to authorization-svc
@@ -235,6 +253,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{execution_id}", h.GetPostingExecution)
 		r.Get("/{execution_id}/explain", h.ExplainPosting)
 		r.Post("/{execution_id}/reprocess", h.ReprocessFailedPosting)
+	})
+	r.Route("/v1/ledger", func(r chi.Router) {
+		r.Get("/entries", h.QueryLedger)
+		r.Get("/as-of", h.QueryLedgerAsOf)
+		r.Get("/source-entries", h.QuerySourceEntries)
+		r.Get("/balance", h.QueryAccountBalance)
+		r.Post("/rebuild-balances", h.RebuildDerivedBalanceProjection)
 	})
 }
 
@@ -2240,6 +2265,219 @@ func (h *Handler) writePostingExecutionErr(w http.ResponseWriter, err error) {
 	}
 	h.log.Error("posting execution store unavailable", zap.Error(err))
 	writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+}
+
+// ── GET /v1/ledger/entries ───────────────────────────────────────────────────
+//
+// ACC-05 General Ledger. See migration 000011's doc comment for why this
+// reads a physically separate, append-only table rather than
+// journal_headers/journal_lines directly.
+
+func (h *Handler) QueryLedger(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrLedgerScopeRequired.Error())
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionLedgerQuery); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	limit, ok := parseLimit(w, q.Get("limit"))
+	if !ok {
+		return
+	}
+	filter := domain.QueryLedgerFilter{
+		LegalEntityID: legalEntityID,
+		BookID:        q.Get("book_id"),
+		AccountCode:   q.Get("account_code"),
+		FiscalPeriod:  q.Get("fiscal_period"),
+		JournalID:     q.Get("journal_id"),
+	}
+	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
+	if err != nil {
+		h.log.Error("QueryLedger: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if entries == nil {
+		entries = []domain.LedgerEntry{}
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+// QueryLedgerAsOf is QueryLedger scoped to entries whose entry_seq does not
+// exceed the named watermark — a point-in-time reconstruction, since
+// ledger_entries is append-only and every entry's own entry_seq is a
+// stable, monotonic position that never changes retroactively.
+func (h *Handler) QueryLedgerAsOf(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrLedgerScopeRequired.Error())
+		return
+	}
+	watermarkRaw := q.Get("as_of_entry_seq")
+	if watermarkRaw == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "as_of_entry_seq")
+		return
+	}
+	watermark, err := strconv.ParseInt(watermarkRaw, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_field", "as_of_entry_seq must be an integer")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionLedgerQuery); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	limit, ok := parseLimit(w, q.Get("limit"))
+	if !ok {
+		return
+	}
+	filter := domain.QueryLedgerFilter{
+		LegalEntityID: legalEntityID,
+		BookID:        q.Get("book_id"),
+		AccountCode:   q.Get("account_code"),
+		FiscalPeriod:  q.Get("fiscal_period"),
+		MaxEntrySeq:   &watermark,
+	}
+	entries, err := h.store.QueryLedger(r.Context(), tenantID, filter, limit)
+	if err != nil {
+		h.log.Error("QueryLedgerAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	if entries == nil {
+		entries = []domain.LedgerEntry{}
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+// QuerySourceEntries has no legal_entity_id requirement — see the store
+// method's own comment on why lineage queries are cross-entity by nature.
+// Authorization is therefore checked per-entry, against whichever entities
+// the trace actually touches, rather than a single upfront scope check.
+func (h *Handler) QuerySourceEntries(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	sourceEventID := r.URL.Query().Get("source_event_id")
+	if sourceEventID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "source_event_id")
+		return
+	}
+	entries, err := h.store.QuerySourceEntries(r.Context(), tenantID, sourceEventID)
+	if err != nil {
+		h.log.Error("QuerySourceEntries: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	seenEntities := map[string]bool{}
+	for _, e := range entries {
+		if seenEntities[e.LegalEntityID] {
+			continue
+		}
+		if err := h.authz.CheckAllowed(r.Context(), principalID, e.LegalEntityID, actionLedgerQuery); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+		seenEntities[e.LegalEntityID] = true
+	}
+	if entries == nil {
+		entries = []domain.LedgerEntry{}
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+// QueryAccountBalance reads the ledger_balances projection.
+func (h *Handler) QueryAccountBalance(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	legalEntityID := q.Get("legal_entity_id")
+	accountCode := q.Get("account_code")
+	fiscalPeriod := q.Get("fiscal_period")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrLedgerScopeRequired.Error())
+		return
+	}
+	if accountCode == "" || fiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "account_code and fiscal_period are required")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionLedgerQuery); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	bal, err := h.store.QueryAccountBalance(r.Context(), tenantID, domain.QueryAccountBalanceRequest{
+		LegalEntityID: legalEntityID, BookID: q.Get("book_id"), AccountCode: accountCode, FiscalPeriod: fiscalPeriod,
+	})
+	if err != nil {
+		h.log.Error("QueryAccountBalance: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, bal)
+}
+
+// RebuildDerivedBalanceProjection is the spec's own "controlled" command —
+// see actionLedgerRebuildBalances' comment.
+func (h *Handler) RebuildDerivedBalanceProjection(w http.ResponseWriter, r *http.Request) {
+	var req domain.RebuildBalanceProjectionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.FiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "legal_entity_id and fiscal_period are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionLedgerRebuildBalances); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if err := h.store.RebuildDerivedBalanceProjection(r.Context(), tenantID, req); err != nil {
+		h.log.Error("RebuildDerivedBalanceProjection: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "rebuilt"})
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
