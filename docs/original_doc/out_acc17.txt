@@ -1,0 +1,43 @@
+P: 20. ACC-17 — Opening Balance & Migration
+TABLE 1 rows 1 cols
+Establish controlled opening accounting state from legacy systems without bypassing posting, control-account or reconciliation rules.
+P: 
+TABLE 16 rows 2 cols
+Contract field | Specification
+Service ID / owner | ACC-17 — Accounting & Record-to-Report; accountable engineering/product/control owner recorded in service registry.
+Purpose / bounded scope | Establish controlled opening accounting state from legacy systems without bypassing posting, control-account or reconciliation rules.
+Authoritative ownership | MigrationAccountingBatch, opening journal proposals, source crosswalk and reconciliation/certification refs.
+Required source inputs | source system; cutover date; opening TB; open AR/AP; bank/tax balances; source IDs; mappings; source control totals.
+Server-resolved / derived context | entity/book/account validation; migration mapping; period; approval; control-account strategy.
+Commands | CreateMigrationAccountingBatch; ValidateOpeningBalances; ApproveMigrationBatch; CommitOpeningPosting; CertifyMigrationAccounting
+Queries / read contracts | GetMigrationBatch; GetSourceTargetCrosswalk; GetMigrationExceptions; GetMigrationReconciliation
+State model | Planned → Loaded → Validated → Approved → Posted → Reconciled → Certified; failed/quarantined as needed.
+Authorization / permissions | migration.accounting.manage; migration.accounting.approve/certify.
+Segregation of duties | Migration preparer cannot certify own material cutover; production posting still routed through ACC-04.
+Events produced | MigrationAccountingBatchCreated; OpeningPostingCommitted; MigrationReconciliationFailed; MigrationAccountingCertified
+Dependencies | ZS-MIG; ACC-01/02/04/05/06; AR/AP/Bank/Tax source domains.
+Failure / degradation semantics | No production acceptance without source-to-target reconciliation; unexplained balancing plug prohibited.
+Evidence / lineage | Source extract hashes, crosswalk, mappings, exceptions, opening postings, reconciliations and certificate.
+NFR / recovery profile | C0 cutover-critical; repeatable dry-run and deterministic rerun before go-live.
+P: Engineering Interaction Wireframe
+TABLE 9 rows 4 cols
+Type | Operation | Illustrative contract surface | Mandatory controls
+QUERY | GetMigrationBatch | GET/POST /internal/v1/acc17/getMigrationBatch | Scoped read; correlation + auth context
+QUERY | GetSourceTargetCrosswalk | GET/POST /internal/v1/acc17/getSourceTargetCrosswalk | Scoped read; correlation + auth context
+QUERY | GetMigrationExceptions | GET/POST /internal/v1/acc17/getMigrationExceptions | Scoped read; correlation + auth context
+QUERY | GetMigrationReconciliation | GET/POST /internal/v1/acc17/getMigrationReconciliation | Scoped read; correlation + auth context
+COMMAND | CreateMigrationAccountingBatch | POST /internal/v1/acc17/commands/createMigrationAccountingBatch | Idempotency-Key; expected_version where stateful
+COMMAND | ValidateOpeningBalances | POST /internal/v1/acc17/commands/validateOpeningBalances | Idempotency-Key; expected_version where stateful
+COMMAND | ApproveMigrationBatch | POST /internal/v1/acc17/commands/approveMigrationBatch | Idempotency-Key; expected_version where stateful
+COMMAND | CommitOpeningPosting | POST /internal/v1/acc17/commands/commitOpeningPosting | Idempotency-Key; expected_version where stateful
+P: Minimum Negative-Path Acceptance
+TABLE 5 rows 3 cols
+# | Scenario | Required result
+1 | Opening TB forced with suspense plug | Block/deny/quarantine or preserve safe state; stable error/evidence; no unauthorized or duplicate accounting consequence.
+2 | Open AR included both in history and opening state | Block/deny/quarantine or preserve safe state; stable error/evidence; no unauthorized or duplicate accounting consequence.
+3 | Source-target row counts match but values differ | Block/deny/quarantine or preserve safe state; stable error/evidence; no unauthorized or duplicate accounting consequence.
+4 | Commit repeated after timeout | Block/deny/quarantine or preserve safe state; stable error/evidence; no unauthorized or duplicate accounting consequence.
+P: 
+P: Figure 11 — Opening balance and migration accounting cutover.
+P: 
+P: 21. ACC-18 — Source-to-Report Traceability
