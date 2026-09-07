@@ -1,0 +1,111 @@
+# docker-compose.yml — limited, self-contained local stack for general-ledger-svc
+#
+# Runs:
+#   postgres   — PostgreSQL 16. DB: general_ledger. Applies all six migrations
+#                (000001→000006) on first boot.
+#   fake       — tiny two-in-one shim: authorization-svc (POST /v1/authorize →
+#                GRANTED on :8089) and financial-close-svc (GET
+#                /v1/close/periods/status → OPEN on :8104). Required because
+#                every journal mutation fails closed without both.
+#   svc        — general-ledger-svc, resource-limited (mem_limit 256m,
+#                cpus 0.5). HTTP on :8098.
+#
+# The service is run without a real Kafka broker: it publishes journal events
+# to a kafka.Writer that connects lazily, so a missing broker is a logged,
+# non-blocking publish failure — the DB write and the API response complete.
+#
+# RLS note: journal_headers/journal_lines use FORCE ROW LEVEL SECURITY with an
+# app.tenant_id policy. Connecting as the postgres superuser bypasses RLS, so
+# tenant isolation on a local run comes from the store's explicit tenant_id
+# predicates (the header must be a valid UUID).
+#
+# Usage:
+#   docker compose up -d --build     # build & start in background
+#   docker compose logs -f svc       # tail service logs
+#   docker compose down -v           # stop and remove volumes
+#
+# Health probe: http://localhost:8098/healthz   (liveness)
+# Readiness:    http://localhost:8098/readyz    (requires a live DB pool)
+
+name: gl-stack
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: gl-postgres
+    ports:
+      - "5436:5432"
+    environment:
+      POSTGRES_DB: general_ledger
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./migrations/000002_add_idempotency_index.up.sql:/docker-entrypoint-initdb.d/002_idempotency.sql:ro
+      - ./migrations/000003_add_atomic_linking.up.sql:/docker-entrypoint-initdb.d/003_atomic_linking.sql:ro
+      - ./migrations/000004_force_rls.up.sql:/docker-entrypoint-initdb.d/004_force_rls.sql:ro
+      - ./migrations/000005_policy_empty_tenant_is_null.up.sql:/docker-entrypoint-initdb.d/005_policy_tenant.sql:ro
+      - ./migrations/000006_acc03_journal_inputs.up.sql:/docker-entrypoint-initdb.d/006_acc03.sql:ro
+      - gl_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d general_ledger"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Two-in-one fake: authorization (GRANTED) + financial-close (OPEN) ────────
+  fake:
+    build:
+      context: ./fake-svcs
+      dockerfile: Dockerfile
+    container_name: gl-fake-svcs
+    image: fake-svcs:local
+    expose:
+      - "8089"
+      - "8104"
+
+  # ── general-ledger-svc (resource-limited) ─────────────────────────────────────
+  svc:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: general-ledger-svc
+    image: general-ledger-svc:local
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8098:8098"
+    environment:
+      ENV: local
+      PORT: "8098"
+      # Postgres — superuser local run; RLS bypassed, tenant isolation from
+      # the store's explicit tenant_id predicates (header must be a UUID).
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: general_ledger
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      # Fail-closed dependencies answered by the local GRANTED/OPEN shim.
+      AUTHZ_SERVICE_URL: "http://fake:8089"
+      CLOSE_SERVICE_URL: "http://fake:8104"
+      # No real Kafka for the limited run; publishes are logged no-ops.
+      KAFKA_BROKERS: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      fake:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8098/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+volumes:
+  gl_pgdata:

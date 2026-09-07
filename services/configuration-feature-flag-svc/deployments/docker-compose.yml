@@ -1,0 +1,91 @@
+# docker-compose.yml — limited, self-contained local stack for configuration-feature-flag-svc
+#
+# Runs:
+#   postgres     — PostgreSQL 16. DB: configuration_feature_flag. Applies all
+#                  migrations (000001 initial schema, 000002 RLS) on first boot.
+#   svc          — configuration-feature-flag-svc, resource-limited
+#                  (mem_limit 256m, cpus 0.5). HTTP on :8086.
+#
+# The service is deliberately run without relying on Kafka, OTEL, or
+# authorization-svc: in ENV=local an absent event backbone is a logged no-op
+# and authorization falls back to the permit-all stub. Postgres is the only
+# hard dependency.
+#
+# RLS note: config_entries and feature_flags both ENABLE + FORCE row-level
+# security with an app.tenant_id GUC policy. Connecting as the postgres
+# superuser bypasses RLS (superusers ignore FORCE RLS), which is fine for a
+# local dev run; the middleware still sets app.tenant_id per request when an
+# X-Tenant-Id header is present.
+#
+# Usage:
+#   docker compose up -d --build     # build & start in background
+#   docker compose logs -f svc       # tail service logs
+#   docker compose down -v           # stop and remove volumes
+#
+# Health probe: http://localhost:8086/healthz   (liveness)
+# Readiness:    http://localhost:8086/readyz    (requires a live DB pool)
+
+name: cff-stack
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: cff-postgres
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: configuration_feature_flag
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./migrations/000002_add_rls.up.sql:/docker-entrypoint-initdb.d/002_rls.sql:ro
+      - cff_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d configuration_feature_flag"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── configuration-feature-flag-svc (resource-limited) ─────────────────────────
+  svc:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: configuration-feature-flag-svc
+    image: configuration-feature-flag-svc:local
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8086:8086"
+    environment:
+      ENV: local
+      PORT: "8086"
+      # Postgres — superuser for the single-service local run; RLS is
+      # bypassed because superusers ignore FORCE RLS, which is fine here.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: configuration_feature_flag
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      # No Kafka/OTEL/AuthZ for the limited run. Point these at their own
+      # containers if you want the event backbone / authorization gate.
+      KAFKA_BROKERS: ""
+      AUTHZ_SERVICE_URL: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8086/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+volumes:
+  cff_pgdata:
