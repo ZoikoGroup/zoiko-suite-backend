@@ -2292,6 +2292,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.intercompany.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2300,6 +2301,8 @@ services:
       authorization-svc:
         condition: service_healthy
       general-ledger-svc:
+        condition: service_healthy
+      tenant-entity-registry-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8105/healthz"]

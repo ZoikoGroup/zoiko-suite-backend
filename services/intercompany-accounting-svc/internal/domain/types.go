@@ -123,4 +123,14 @@ var (
 	// not a 503 — a missing counterparty journal is a real accounting
 	// fact worth recording, not a transient outage.
 	ErrCounterpartyJournalMissing = errorString("counterparty journal does not exist in general-ledger-svc")
+
+	// ErrEntityRegistryUnavailable is returned when tenant-entity-registry-svc
+	// cannot be reached to check group relationship state.
+	ErrEntityRegistryUnavailable = errorString("tenant-entity-registry-svc unavailable")
+
+	// ErrGroupRelationshipLost is the spec's own negative path, "Entity
+	// loses group relationship mid-period": the source and target legal
+	// entities no longer share an open group relationship as of the match
+	// attempt, per tenant-entity-registry-svc's own EntityHierarchy record.
+	ErrGroupRelationshipLost = errorString("source and target legal entities no longer share an open group relationship")
 )

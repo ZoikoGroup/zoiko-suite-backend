@@ -45,6 +45,9 @@ type stubStore struct {
 	recognitions         map[string][]domain.RecognitionInstance // scheduleID -> instances
 	createRecognitionErr error
 	listRecognitionsErr  error
+	reversals            map[string]*domain.RecognitionReversal // recognitionInstanceID -> reversal
+	createReversalErr    error
+	getReversalErr       error
 	activateErr          error
 	completeErr          error
 
@@ -62,6 +65,7 @@ type stubStore struct {
 	allocationRuns  map[string]*domain.AllocationRun  // keyed by run_id
 	createRuleErr   error
 	approveRuleErr  error
+	supersedeRuleErr error
 	createRunErr2   error
 	markCalcErr     error
 	markPostedErr   error
@@ -81,7 +85,9 @@ type stubStore struct {
 	createSnapshotErr     error
 	transitionSnapshotErr error
 
-	lineageEdges      []domain.LineageEdge
+	lineageEdges            []domain.LineageEdge
+	tracePathVerifications  []domain.TracePathVerification
+	quarantinedLineageGaps  []domain.QuarantinedLineageGap
 	recordEdgeErr     error
 	postedJournalRefs []domain.PostedJournalRef
 	postedRefsErr     error
@@ -349,6 +355,42 @@ func (s *stubStore) ListRecognitionInstances(_ context.Context, scheduleID strin
 	return s.recognitions[scheduleID], nil
 }
 
+func (s *stubStore) GetRecognitionInstanceByPeriod(_ context.Context, scheduleID, fiscalPeriod string) (*domain.RecognitionInstance, error) {
+	for _, inst := range s.recognitions[scheduleID] {
+		if inst.FiscalPeriod == fiscalPeriod {
+			cp := inst
+			return &cp, nil
+		}
+	}
+	return nil, domain.ErrRecognitionInstanceNotFound
+}
+
+func (s *stubStore) GetRecognitionReversalByInstance(_ context.Context, recognitionInstanceID string) (*domain.RecognitionReversal, error) {
+	if s.getReversalErr != nil {
+		return nil, s.getReversalErr
+	}
+	if s.reversals == nil {
+		return nil, nil
+	}
+	return s.reversals[recognitionInstanceID], nil
+}
+
+func (s *stubStore) CreateRecognitionReversal(_ context.Context, rev *domain.RecognitionReversal) (bool, error) {
+	if s.createReversalErr != nil {
+		return false, s.createReversalErr
+	}
+	if s.reversals == nil {
+		s.reversals = make(map[string]*domain.RecognitionReversal)
+	}
+	if existing, ok := s.reversals[rev.RecognitionInstanceID]; ok {
+		*rev = *existing
+		return false, nil
+	}
+	cp := *rev
+	s.reversals[rev.RecognitionInstanceID] = &cp
+	return true, nil
+}
+
 func (s *stubStore) CreatePrepaymentSchedule(_ context.Context, sch *domain.PrepaymentSchedule) error {
 	if s.createPrepaymentErr != nil {
 		return s.createPrepaymentErr
@@ -517,6 +559,23 @@ func (s *stubStore) ApproveAllocationRule(_ context.Context, ruleVersionID, prin
 		}
 	}
 	return domain.ErrAllocationRuleNotFound
+}
+
+func (s *stubStore) SupersedeAllocationRule(_ context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error {
+	if s.supersedeRuleErr != nil {
+		return s.supersedeRuleErr
+	}
+	current, ok := s.allocationRules[ruleID]
+	if !ok || (current.Status != domain.AllocationRuleStatusApproved && current.Status != domain.AllocationRuleStatusActive) {
+		return domain.ErrNoCurrentRuleToSupersede
+	}
+	newVersion.Version = current.Version + 1
+	newVersion.RuleID = ruleID
+	newVersion.TenantID = current.TenantID
+	newVersion.Status = domain.AllocationRuleStatusDraft
+	cp := *newVersion
+	s.allocationRules[ruleID] = &cp
+	return nil
 }
 
 func (s *stubStore) ActivateAllocationRule(_ context.Context, ruleVersionID string) error {
@@ -869,6 +928,41 @@ func (s *stubStore) ListLineageEdgesTo(_ context.Context, toType, toID string) (
 	return out, nil
 }
 
+func (s *stubStore) ListLineageEdgesToAsOf(_ context.Context, toType, toID string, asOf time.Time) ([]domain.LineageEdge, error) {
+	var out []domain.LineageEdge
+	for _, e := range s.lineageEdges {
+		if e.ToType == toType && e.ToID == toID && !e.RecordedAt.After(asOf) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) CreateTracePathVerification(_ context.Context, v *domain.TracePathVerification) error {
+	s.tracePathVerifications = append(s.tracePathVerifications, *v)
+	return nil
+}
+
+func (s *stubStore) CreateQuarantinedLineageGap(_ context.Context, g *domain.QuarantinedLineageGap) error {
+	for _, existing := range s.quarantinedLineageGaps {
+		if existing.FromType == g.FromType && existing.FromID == g.FromID && existing.ToType == g.ToType && existing.ToID == g.ToID {
+			return nil
+		}
+	}
+	s.quarantinedLineageGaps = append(s.quarantinedLineageGaps, *g)
+	return nil
+}
+
+func (s *stubStore) ListQuarantinedLineageGaps(_ context.Context, legalEntityID string) ([]domain.QuarantinedLineageGap, error) {
+	var out []domain.QuarantinedLineageGap
+	for _, g := range s.quarantinedLineageGaps {
+		if g.LegalEntityID == legalEntityID {
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
 func (s *stubStore) ListPostedJournalRefs(_ context.Context, legalEntityID string) ([]domain.PostedJournalRef, error) {
 	if s.postedRefsErr != nil {
 		return nil, s.postedRefsErr
@@ -939,6 +1033,11 @@ type stubClients struct {
 	apPeriodStart, apPeriodEnd time.Time
 	arPeriodStart, arPeriodEnd time.Time
 
+	checkARInvoiceErr  error
+	checkAPInvoiceErr  error
+	existingARInvoices map[string]bool // "customerID|invoiceNumber" -> exists
+	existingAPInvoices map[string]bool // "vendorID|invoiceNumber" -> exists
+
 	controlAccountCodes map[string]string // mapping key -> account code
 	mappingErr          error
 	apSubledgerTotal    float64
@@ -951,6 +1050,11 @@ type stubClients struct {
 	lastPostedAmount float64
 	lastPostedPeriod string
 	postJournalCalls int
+
+	reverseJournalErr        error
+	reversingJournalID       string
+	reverseJournalCalls      int
+	lastReverseCorrelationID string
 
 	accountStatuses      map[string]string // account_code -> status
 	accountStatusErr     error
@@ -991,6 +1095,20 @@ func (c *stubClients) GetUnsettledARInvoicesCount(_ context.Context, _, _ string
 	c.arPeriodStart, c.arPeriodEnd = periodStart, periodEnd
 	return c.unsettledAR, c.arErr
 }
+
+func (c *stubClients) CheckARInvoiceExists(_ context.Context, _, _, customerID, invoiceNumber string) (bool, error) {
+	if c.checkARInvoiceErr != nil {
+		return false, c.checkARInvoiceErr
+	}
+	return c.existingARInvoices[customerID+"|"+invoiceNumber], nil
+}
+
+func (c *stubClients) CheckAPInvoiceExists(_ context.Context, _, _, vendorID, invoiceNumber string) (bool, error) {
+	if c.checkAPInvoiceErr != nil {
+		return false, c.checkAPInvoiceErr
+	}
+	return c.existingAPInvoices[vendorID+"|"+invoiceNumber], nil
+}
 func (c *stubClients) UploadCloseEvidence(_ context.Context, _, _, _ string, _ map[string]float64, _ string) (string, error) {
 	if c.uploadErr != nil {
 		return "", c.uploadErr
@@ -1014,6 +1132,18 @@ func (c *stubClients) GetAPSubledgerTotal(_ context.Context, _, _ string) (float
 
 func (c *stubClients) GetARSubledgerTotal(_ context.Context, _, _ string) (float64, error) {
 	return c.arSubledgerTotal, c.arSubledgerErr
+}
+
+func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
+	c.reverseJournalCalls++
+	c.lastReverseCorrelationID = correlationID
+	if c.reverseJournalErr != nil {
+		return "", c.reverseJournalErr
+	}
+	if c.reversingJournalID != "" {
+		return c.reversingJournalID, nil
+	}
+	return "reversing-journal-generated", nil
 }
 
 func (c *stubClients) PostAccrualRecognitionJournal(_ context.Context, _, _, fiscalPeriod, _, _, _, _, _ string, amount float64) (string, error) {

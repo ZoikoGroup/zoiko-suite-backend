@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/intercompany-accounting-svc/internal/domain"
+	"zoiko.io/intercompany-accounting-svc/internal/entityregistry"
 	"zoiko.io/intercompany-accounting-svc/internal/ledger"
 	svcmiddleware "zoiko.io/intercompany-accounting-svc/internal/middleware"
 )
@@ -44,6 +45,12 @@ type LedgerClient interface {
 	GetJournal(ctx context.Context, tenantID, journalID string) (*ledger.JournalDetail, error)
 }
 
+// EntityRegistryClient is ACC-11's own closure of "Entity loses group
+// relationship mid-period" — see internal/entityregistry's doc comment.
+type EntityRegistryClient interface {
+	ListHierarchies(ctx context.Context, tenantID, legalEntityID string) ([]entityregistry.Hierarchy, error)
+}
+
 const (
 	actionCreateEntry = "INTERCOMPANY_ENTRY_CREATE"
 	actionViewEntry   = "INTERCOMPANY_ENTRY_VIEW"
@@ -60,11 +67,12 @@ const (
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	ledger    LedgerClient
-	log       *zap.Logger
+	store         Store
+	publisher     Publisher
+	authz         AuthZClient
+	ledger        LedgerClient
+	entityRegistry EntityRegistryClient
+	log           *zap.Logger
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, ledger LedgerClient, log *zap.Logger) *Handler {
@@ -75,6 +83,17 @@ func New(store Store, publisher Publisher, authz AuthZClient, ledger LedgerClien
 		ledger:    ledger,
 		log:       log,
 	}
+}
+
+// WithEntityRegistry sets the client MatchIntercompany uses to check ACC-11's
+// own "Entity loses group relationship mid-period" negative path. Left nil,
+// the check is skipped entirely (a deliberate, deployable-without-it
+// posture — see MatchEntry's own comment) rather than New's signature
+// growing a required parameter every existing caller and test would have
+// to update.
+func (h *Handler) WithEntityRegistry(c EntityRegistryClient) *Handler {
+	h.entityRegistry = c
+	return h
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -358,6 +377,36 @@ func (h *Handler) MatchEntry(w http.ResponseWriter, r *http.Request) {
 			MismatchReason:      &reason,
 		})
 		return
+	}
+
+	// Validation 4: source and target legal entities must still share an
+	// open group relationship — the spec's own negative path, "Entity
+	// loses group relationship mid-period." Skipped (not enforced) when no
+	// entity-registry client is configured — see WithEntityRegistry's own
+	// comment — rather than this handler failing closed against a
+	// dependency a deployment hasn't wired up.
+	if h.entityRegistry != nil {
+		sourceHierarchies, srcErr := h.entityRegistry.ListHierarchies(r.Context(), tenantID, entry.SourceLegalEntityID)
+		targetHierarchies, tgtErr := h.entityRegistry.ListHierarchies(r.Context(), tenantID, entry.TargetLegalEntityID)
+		if srcErr != nil || tgtErr != nil {
+			h.log.Error("failed to query tenant-entity-registry-svc for group relationship", zap.Error(srcErr), zap.Error(tgtErr))
+			writeError(w, http.StatusServiceUnavailable, "entity_registry_unavailable", domain.ErrEntityRegistryUnavailable.Error())
+			return
+		}
+		if !entityregistry.SharesOpenGroupRelationship(sourceHierarchies, targetHierarchies, entry.SourceLegalEntityID, entry.TargetLegalEntityID, time.Now().UTC()) {
+			reason := domain.ErrGroupRelationshipLost.Error()
+			_ = h.store.UpdateMatch(r.Context(), id, req.TargetJournalID, domain.MatchStatusMismatch, &reason)
+			entry.TargetJournalID = &req.TargetJournalID
+			entry.MatchStatus = domain.MatchStatusMismatch
+			entry.MismatchReason = &reason
+			h.publisher.PublishMismatchDetected(r.Context(), correlationID, principalID, *entry, reason)
+			writeJSON(w, http.StatusUnprocessableEntity, domain.MatchEntryResponse{
+				IntercompanyEntryID: id,
+				MatchStatus:         domain.MatchStatusMismatch,
+				MismatchReason:      &reason,
+			})
+			return
+		}
 	}
 
 	// Match Successful
