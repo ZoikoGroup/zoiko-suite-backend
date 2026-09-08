@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/authorization-svc/internal/domain"
+	"zoiko.io/authorization-svc/internal/retention"
 )
 
 // Store is the full read/write surface PgStore implements.
@@ -218,6 +220,64 @@ func (s *PgStore) FindRoleByID(ctx context.Context, roleID string) (*domain.Role
 	return r, nil
 }
 
+// ListRoles returns the tenant's role catalogue, retired roles last.
+//
+// WHY THIS EXISTS. This service could create a role, retire it, reactivate it
+// and attach permission bundles to it, and never once list what it held. Every
+// admin write returned the row it had just written, so the only way to learn a
+// role's id was to have been the caller that created it — and role_code, the
+// idempotent creation key, could not be checked for collision before writing.
+// A catalogue nobody can read is a catalogue nobody can audit: "which roles
+// exist in this tenant, and which of them still grant anything" had no answer
+// on this API at all.
+//
+// Retired roles are returned rather than filtered out by default, ordered
+// last. A retired role grants nothing, but it is the reason a principal who
+// used to hold access no longer does, and hiding it would make that
+// unexplainable from the console. `activeOnly` narrows it for callers that
+// genuinely only want what is in force.
+//
+// Tenant-scoped both ways — the explicit predicate and withRLS — for the
+// reason SetRoleActive's comment sets out at length: on a NOBYPASSRLS role a
+// missing app.tenant_id makes the FORCE policy predicate NULL and the
+// statement match nothing, and on an owner connection the same statement
+// reads every tenant's roles.
+func (s *PgStore) ListRoles(ctx context.Context, tenantID string, activeOnly bool) ([]domain.Role, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+
+	const query = `
+		SELECT ` + roleColumns + `
+		  FROM roles
+		 WHERE tenant_id = $1::uuid
+		   AND (NOT $2::boolean OR active_flag)
+		 ORDER BY active_flag DESC, role_code
+		 LIMIT 500;`
+
+	var out []domain.Role
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, tenantID, activeOnly)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, scanErr := scanRole(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			out = append(out, *r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListRoles failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
 // SetRoleActive flips a role's active_flag and returns the role as it now
 // stands. This is the ONLY way to stop a role being enforced.
 //
@@ -318,28 +378,63 @@ func (s *PgStore) CreateRole(ctx context.Context, params domain.CreateRoleParams
 
 // ── permission_bundles ───────────────────────────────────────────────────────
 
-func (s *PgStore) CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
+const bundleColumns = `permission_bundle_id, role_id, bundle_code, permitted_actions, active_flag, created_at`
+
+func scanBundle(row pgx.Row, extra ...any) (*domain.PermissionBundle, error) {
+	b := &domain.PermissionBundle{}
+	var rawActions []byte
+	dest := []any{&b.PermissionBundleID, &b.RoleID, &b.BundleCode, &rawActions, &b.ActiveFlag, &b.CreatedAt}
+	dest = append(dest, extra...)
+	if err := row.Scan(dest...); err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal(rawActions, &b.PermittedActions)
+	return b, nil
+}
+
+// CreatePermissionBundle writes a bundle of permitted actions onto a role, and
+// reports whether the row was CREATED or an existing bundle_code was REPLACED.
+//
+// WHY THE SECOND RETURN VALUE. The statement is an upsert on
+// (role_id, bundle_code) — reposting a code overwrites permitted_actions
+// wholesale. That is the right behaviour (a bundle is a declaration of what a
+// role grants, and re-declaring it should converge), but it is destructive and
+// it used to be invisible: the store returned the row with no indication of
+// which path produced it, so a caller that had just silently emptied a role's
+// grant set got the same 201 as one that created a bundle. Combined with there
+// having been no way to LIST bundles, an operator could not discover the code
+// was taken beforehand or that it had been replaced afterwards.
+//
+// `(xmax = 0)` is the standard discriminator: on the INSERT path xmax is zero,
+// on the DO UPDATE path it carries the locking transaction. Verified against
+// PostgreSQL 16 rather than assumed.
+//
+// Deliberately NOT changed to ON CONFLICT DO NOTHING or to a 409. Callers
+// re-provision bundles from a declarative catalogue (access-control-svc is the
+// governed authoring layer in front of this API), so refusing a repeat would
+// break replay; what was missing was the caller being told which happened.
+func (s *PgStore) CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error) {
 	// The role is fetched for existence, and its tenant is what scopes the
 	// INSERT below. permission_bundles carries no tenant_id of its own, so
 	// the owning tenant is only knowable through this FK — which is also
 	// exactly how 000007's policy reads it.
 	role, err := s.FindRoleByID(ctx, params.RoleID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if params.PermissionBundleID == "" {
 		params.PermissionBundleID = uuid.New().String()
 	}
 	actionsJSON, marshalErr := json.Marshal(params.PermittedActions)
 	if marshalErr != nil {
-		return nil, fmt.Errorf("marshal permitted_actions: %w", marshalErr)
+		return nil, false, fmt.Errorf("marshal permitted_actions: %w", marshalErr)
 	}
 
 	const query = `
 		INSERT INTO permission_bundles (permission_bundle_id, role_id, bundle_code, permitted_actions)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (role_id, bundle_code) DO UPDATE SET permitted_actions = EXCLUDED.permitted_actions
-		RETURNING permission_bundle_id, role_id, bundle_code, permitted_actions, active_flag, created_at;`
+		RETURNING ` + bundleColumns + `, (xmax = 0) AS inserted;`
 
 	// withRLS, not s.pool directly. This query went straight to the pool
 	// until 000007 gave permission_bundles a policy, at which point every
@@ -347,17 +442,144 @@ func (s *PgStore) CreatePermissionBundle(ctx context.Context, params domain.Crea
 	// set, so the policy's WITH CHECK could not match and refused the row.
 	// The same shape obligations-svc had (nine pool-direct queries) and the
 	// reason it only joined create-app-roles.sh after being fixed.
-	b := &domain.PermissionBundle{}
-	var rawActions []byte
+	var b *domain.PermissionBundle
+	var created bool
 	err = s.withRLS(ctx, role.TenantID, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, query, params.PermissionBundleID, params.RoleID, params.BundleCode, actionsJSON).
-			Scan(&b.PermissionBundleID, &b.RoleID, &b.BundleCode, &rawActions, &b.ActiveFlag, &b.CreatedAt)
+		row := tx.QueryRow(ctx, query, params.PermissionBundleID, params.RoleID, params.BundleCode, actionsJSON)
+		scanned, scanErr := scanBundle(row, &created)
+		if scanErr != nil {
+			return scanErr
+		}
+		b = scanned
+		return nil
 	})
 	if err != nil {
 		s.log.Error("pg CreatePermissionBundle failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return b, created, nil
+}
+
+// ListPermissionBundles reads the bundles attached to one role — which is to
+// say, what that role actually permits.
+//
+// WHY THIS EXISTS. permitted_actions was write-only. A role could be created,
+// given bundles, retired and reactivated, and nothing could read back what it
+// granted: ListRoles returns role_code / role_name / role_scope_type /
+// active_flag and no actions at all, and the only other reader of this table
+// is FindGrantedActions, which answers "what may THIS principal do" for one
+// principal and one legal entity. So the console listed role LABELS. A
+// role_code is a name an operator chose; the bundle is the control.
+//
+// It also made the upsert in CreatePermissionBundle unsafe to use: a
+// bundle_code could not be checked for collision before writing, and a
+// collision silently replaced the action set.
+//
+// TENANT SCOPE. Through the role FK in the predicate AND withRLS, matching
+// 000007's policy exactly — this table has no tenant_id to filter on directly.
+// The role's own tenant is checked here rather than trusted from the caller,
+// so naming another tenant's role_id returns empty rather than its bundles.
+//
+// Retired bundles are included and ordered last. A retired bundle is why
+// access someone used to have is gone; omitting it makes that unexplainable —
+// the same reason ListRoles keeps retired roles.
+func (s *PgStore) ListPermissionBundles(ctx context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+
+	const query = `
+		SELECT ` + bundleColumns + `
+		  FROM permission_bundles pb
+		 WHERE pb.role_id = $1::uuid
+		   AND EXISTS (
+		         SELECT 1 FROM roles r
+		          WHERE r.role_id = pb.role_id
+		            AND r.tenant_id = $2::uuid)
+		 ORDER BY pb.active_flag DESC, pb.bundle_code
+		 LIMIT 500;`
+
+	var out []domain.PermissionBundle
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, roleID, tenantID)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			b, scanErr := scanBundle(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			out = append(out, *b)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListPermissionBundles failed", zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
-	_ = json.Unmarshal(rawActions, &b.PermittedActions)
+	return out, nil
+}
+
+// SetPermissionBundleActive flips a bundle's active_flag — the only way to
+// withdraw one bundle's actions from a role without retiring the whole role.
+//
+// WHY THIS EXISTS. active_flag has been on permission_bundles since the
+// initial schema and BOTH evaluation reads join through it —
+// FindGrantedActions (`JOIN permission_bundles pb ON ... AND pb.active_flag`)
+// and FindDelegatedActions — so a false flag genuinely removes every action
+// the bundle granted, from the next decision. No route, store method or
+// console control could set it. This is the same defect SetSoDRuleActive was
+// added to fix, on the granting side rather than the denying side: an off
+// switch wired into the hot path with nothing able to reach it.
+//
+// What the workarounds cost, which is why the whole-role retire is not a
+// substitute: retiring the ROLE withdraws every bundle it holds at once and
+// suspends the role for every principal assigned it. Re-POSTing the bundle
+// with a shorter action list is the other option, and it destroys the record
+// of what was withdrawn. Neither can take back one bundle and leave the rest.
+//
+// Idempotent: retiring an already-retired bundle returns it unchanged with no
+// error, because the caller's intent (these actions must not be granted) is
+// already satisfied and a 409 would make a safe retry look like a failure.
+// A bundle outside the caller's tenant is ErrPermissionBundleNotFound — a
+// different fact, and 404-not-403 so a probe cannot confirm the id exists.
+//
+// No delete. The bundle stays readable because a grant recorded in the
+// decision log as `rbac:role=<code>` is only explainable while the actions
+// that role held can still be looked up.
+func (s *PgStore) SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool) (*domain.PermissionBundle, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+
+	const query = `
+		UPDATE permission_bundles pb
+		   SET active_flag = $3
+		 WHERE pb.permission_bundle_id = $1::uuid
+		   AND EXISTS (
+		         SELECT 1 FROM roles r
+		          WHERE r.role_id = pb.role_id
+		            AND r.tenant_id = $2::uuid)
+		RETURNING ` + bundleColumns + `;`
+
+	var b *domain.PermissionBundle
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		scanned, scanErr := scanBundle(tx.QueryRow(ctx, query, permissionBundleID, tenantID, active))
+		if scanErr != nil {
+			return scanErr
+		}
+		b = scanned
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrPermissionBundleNotFound
+		}
+		s.log.Error("pg SetPermissionBundleActive failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
 	return b, nil
 }
 
@@ -705,6 +927,70 @@ func (s *PgStore) FindDelegatedAuthorityByID(ctx context.Context, delegatedAutho
 	return d, nil
 }
 
+// ListDelegatedAuthorities returns the tenant's delegations, live ones first.
+//
+// The read half of a write-only surface, for the same reason ListRoles exists:
+// a delegation could be created and revoked by id, and never listed, so the
+// register of "who is currently acting on whose behalf" — the question a
+// delegation exists to answer — was unanswerable on this API.
+//
+// principalID, when given, matches a delegation where that principal is
+// EITHER side. "Show me this person's delegations" means both the authority
+// they have lent out and the authority they have been lent; splitting those
+// into two filters would make the common question take two calls and invite a
+// caller to ask only half of it.
+//
+// activeOnly applies the same three conditions the evaluation path applies —
+// ACTIVE, started, not expired — rather than revocation_status alone. A
+// delegation that has been superseded by its own effective_to grants nothing,
+// and reporting it as active here while /v1/authorize treats it as expired
+// would make the register disagree with the decisions.
+//
+// Projected rows (source_service set) are included. delegated-authority-svc
+// is the authoritative owner of the lifecycle and this table is the evaluation
+// read-model, so a projected delegation is exactly as load-bearing as a
+// locally-authored one — see the consumer's doc comment.
+func (s *PgStore) ListDelegatedAuthorities(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.DelegatedAuthority, error) {
+	if tenantID == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+
+	const query = `
+		SELECT ` + delegationColumns + `
+		  FROM delegated_authorities
+		 WHERE tenant_id = $1::uuid
+		   AND ($2 = '' OR delegator_principal_id::text = $2 OR delegate_principal_id::text = $2)
+		   AND (NOT $3::boolean OR (
+		         revocation_status = 'ACTIVE'
+		         AND effective_from <= now()
+		         AND (effective_to IS NULL OR effective_to > now())
+		       ))
+		 ORDER BY (revocation_status = 'ACTIVE') DESC, created_at DESC
+		 LIMIT 500;`
+
+	var out []domain.DelegatedAuthority
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query, tenantID, principalID, activeOnly)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			d, scanErr := scanDelegation(rows)
+			if scanErr != nil {
+				return scanErr
+			}
+			out = append(out, *d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListDelegatedAuthorities failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
 func (s *PgStore) RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error) {
 	if tenantID == "" {
 		return nil, domain.ErrTenantScopeRequired
@@ -809,6 +1095,60 @@ func (s *PgStore) ListSoDRules(ctx context.Context, tenantID string) ([]domain.S
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return out, nil
+}
+
+// SetSoDRuleActive retires or reactivates a conflict rule. This is the ONLY
+// way to stop an SoD rule denying.
+//
+// WHY THIS EXISTS. active_flag has been on sod_rules since the initial schema
+// and CheckSoDConflict has always filtered on it (`WHERE active_flag`), so a
+// false flag genuinely stops the rule denying. What was missing was any route
+// that could set it: this service could create a conflict rule and never
+// retire one. Every sibling object had a lifecycle — roles retire/reactivate,
+// assignments and delegations revoke, and abac_rules gained retire/reactivate
+// with 000010 — and this one, alone, could only be created.
+//
+// That asymmetry was the most consequential of the set. An SoD rule denies an
+// action to EVERY principal holding the pair, immediately and tenant-wide, and
+// a rule authored by mistake could not be undone through the API at all: the
+// only remedies were a manual UPDATE against the table or deleting a row from
+// an append-only control surface. This is the same defect SetRoleActive's
+// comment describes for roles, left unfixed on the one object where the blast
+// radius is widest.
+//
+// Idempotent, for SetRoleActive's reason: retiring an already-retired rule
+// returns it unchanged rather than 409, because the caller's intent — this
+// rule must not deny anything — is already satisfied, and a conflict would
+// make a safe retry look like a failure.
+//
+// tenant_id = $3 with NO IS NULL branch, deliberately, exactly as
+// SetABACRuleActive has it: retiring a PLATFORM-WIDE rule from one tenant's
+// scope would let any single tenant disable a control binding every other one.
+// Those are authored behind the platform-scope grant and must be retired the
+// same way, so from a tenant scope they read as absent.
+func (s *PgStore) SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error) {
+	const query = `
+		UPDATE sod_rules
+		   SET active_flag = $2
+		 WHERE sod_rule_id = $1 AND tenant_id = $3::uuid
+		RETURNING sod_rule_id, domain_code, action_a, action_b, conflict_type,
+		          jurisdiction_id, tenant_id, active_flag, created_at;`
+
+	var r *domain.SoDRule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		r = &domain.SoDRule{}
+		return tx.QueryRow(ctx, query, sodRuleID, active, tenantID).Scan(
+			&r.SoDRuleID, &r.DomainCode, &r.ActionA, &r.ActionB, &r.ConflictType,
+			&r.JurisdictionID, &r.TenantID, &r.ActiveFlag, &r.CreatedAt)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrSoDRuleNotFound
+		}
+		s.log.Error("pg SetSoDRuleActive failed", zap.Error(err), zap.String("sod_rule_id", sodRuleID), zap.Bool("active", active))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return r, nil
 }
 
 // ── abac_rules ───────────────────────────────────────────────────────────────
@@ -1053,6 +1393,17 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 
 	seen := map[string]bool{}
 	var actions []string
+	// seenRole dedups the BASIS, which names roles and not rows. The query
+	// returns one row per (assignment x bundle), so a role holding two bundles
+	// used to be appended twice and decision_basis read
+	// `rbac:role=FINANCE_APPROVER,FINANCE_APPROVER` — measured over HTTP, not
+	// hypothetical. That field is the audit record of WHY an action was
+	// allowed and the console renders it verbatim beside its paraphrase
+	// precisely so an auditor can cite what the service holds, so a role
+	// repeated once per bundle is noise in the one place that must be exact.
+	// It also leaked how many bundles matched, which is not what the field
+	// claims to report.
+	seenRole := map[string]bool{}
 	var roleCodes []string
 
 	evaluate := func(tx pgx.Tx) error {
@@ -1070,7 +1421,10 @@ func (s *PgStore) FindGrantedActions(ctx context.Context, principalID, legalEnti
 			}
 			var bundleActions []string
 			_ = json.Unmarshal(rawActions, &bundleActions)
-			roleCodes = append(roleCodes, roleCode)
+			if !seenRole[roleCode] {
+				seenRole[roleCode] = true
+				roleCodes = append(roleCodes, roleCode)
+			}
 			for _, a := range bundleActions {
 				if !seen[a] {
 					seen[a] = true
@@ -1348,6 +1702,117 @@ func (s *PgStore) CheckOwnObjectSoD(ctx context.Context, actionType, tenantID st
 		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return forbidden, nil
+}
+
+// ── access_decision_log retention ────────────────────────────────────────────
+//
+// These four call the maintenance helpers 000009 created and 000011 made
+// callable. They run on the BARE POOL, not through withRLS or
+// withPlatformScope, and that is deliberate: they are catalogue-level
+// maintenance on the parent table, not reads or writes of tenant rows. There
+// is no tenant to scope them to, and installing app.tenant_id would say there
+// was.
+//
+// Both helpers are SECURITY DEFINER as of 000011, so the DDL inside executes
+// as the table owner. Before that migration the create half answered
+// "permission denied for schema public" and the detach half "must be owner of
+// table access_decision_log" for every deployment whose DB_USER is not a
+// superuser — which is every deployment that has flipped DB_USER, i.e. the
+// intended configuration.
+
+// retentionLockKey is the advisory-lock key the sweep serialises on.
+//
+// An arbitrary constant, chosen once and never derived from anything: an
+// advisory lock is only a lock if every replica asks for the same number.
+const retentionLockKey int64 = 0x2617_A017_0900_0001
+
+// TryRetentionLock takes a SESSION-scoped advisory lock.
+//
+// Session-scoped rather than transaction-scoped because the sweep is several
+// statements and some of them are DDL that the helpers run in their own
+// contexts; a transaction-scoped lock would be released at the first commit
+// inside them. The caller must release it — Runner.Sweep does, in a defer.
+//
+// pg_try_advisory_lock, not pg_advisory_lock: a replica that cannot get the
+// lock should skip this sweep, not queue up behind another one. The work is
+// idempotent and time-based, so skipping costs nothing and blocking would
+// stack goroutines behind a stuck sweep.
+func (s *PgStore) TryRetentionLock(ctx context.Context) (bool, error) {
+	var locked bool
+	if err := s.pool.QueryRow(ctx, `SELECT pg_try_advisory_lock($1);`, retentionLockKey).Scan(&locked); err != nil {
+		return false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return locked, nil
+}
+
+// ReleaseRetentionLock releases the lock TryRetentionLock took.
+//
+// A false return from pg_advisory_unlock means this session did not hold it,
+// which is a bug in the caller rather than a database problem — logged by the
+// caller, not turned into an error here, because failing a sweep that already
+// did its work would be the wrong response.
+func (s *PgStore) ReleaseRetentionLock(ctx context.Context) error {
+	var released bool
+	if err := s.pool.QueryRow(ctx, `SELECT pg_advisory_unlock($1);`, retentionLockKey).Scan(&released); err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	if !released {
+		s.log.Warn("pg ReleaseRetentionLock: this session did not hold the lock")
+	}
+	return nil
+}
+
+// EnsureAccessDecisionPartition creates the monthly partition covering month.
+//
+// Idempotent by the function's own contract: a partition that exists is
+// returned unchanged rather than being an error, so this is safe to call on
+// every sweep for every month in the runway.
+func (s *PgStore) EnsureAccessDecisionPartition(ctx context.Context, month time.Time) (string, error) {
+	var name string
+	err := s.pool.QueryRow(ctx,
+		`SELECT create_access_decision_log_partition($1::date);`,
+		month.Format("2006-01-02"),
+	).Scan(&name)
+	if err != nil {
+		s.log.Error("pg EnsureAccessDecisionPartition failed",
+			zap.String("month", month.Format("2006-01")), zap.Error(err))
+		return "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return name, nil
+}
+
+// DetachAccessDecisionPartitionsBefore detaches every monthly partition whose
+// range ends on or before cutoff, returning what it detached.
+//
+// DETACH, never DELETE or DROP: the rows stay in an ordinary table so the log
+// remains append-only and an operator archives them deliberately. The default
+// partition is never detached — that is enforced in the function, not here,
+// because it is a property of the retention contract rather than of this
+// caller.
+func (s *PgStore) DetachAccessDecisionPartitionsBefore(ctx context.Context, cutoff time.Time) ([]retention.Detached, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT partition_name, row_count FROM detach_access_decision_log_partitions_before($1::date);`,
+		cutoff.Format("2006-01-02"),
+	)
+	if err != nil {
+		s.log.Error("pg DetachAccessDecisionPartitionsBefore failed",
+			zap.String("cutoff", cutoff.Format("2006-01-02")), zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	defer rows.Close()
+
+	var out []retention.Detached
+	for rows.Next() {
+		var d retention.Detached
+		if err := rows.Scan(&d.PartitionName, &d.RowCount); err != nil {
+			return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
 }
 
 // ── access_decision_log ──────────────────────────────────────────────────────

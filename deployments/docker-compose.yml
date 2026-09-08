@@ -1711,6 +1711,19 @@ services:
       NOTIFICATION_RETRY_MAX_DELAY: "${NOTIFICATION_RETRY_MAX_DELAY:-8m}"
       NOTIFICATION_RETRY_INTERVAL: "${NOTIFICATION_RETRY_INTERVAL:-10s}"
       NOTIFICATION_RETRY_BATCH_SIZE: "${NOTIFICATION_RETRY_BATCH_SIZE:-50}"
+      # How long a notification may sit in flight — PENDING with nothing
+      # scheduled — before the worker treats it as abandoned and puts it
+      # back on the schedule. Nothing else in the service ever moves such a
+      # row: the due poll requires a schedule to be set, so before this
+      # existed a send whose process died between accepting and concluding
+      # was never delivered, never failed and never retried. Five such rows
+      # were found on this stack on 2026-09-08, six days old.
+      #
+      # Must stay well above the longest possible attempt (SMTP timeout 10s,
+      # server WriteTimeout 15s) or the sweep could reschedule a send another
+      # replica is still working on and the recipient gets it twice. 0 is a
+      # true off switch, not "sweep everything now".
+      NOTIFICATION_STRANDED_AFTER: "${NOTIFICATION_STRANDED_AFTER:-15m}"
     depends_on:
       postgres:
         condition: service_healthy

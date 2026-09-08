@@ -433,9 +433,20 @@ var ErrAccessDecisionNotFound = errorString("access decision not found")
 // rather than written — see Store.ProjectDelegation.
 var ErrProjectionSourceRequired = errorString("projected delegation requires source_service and source_delegation_id")
 
+// ErrSoDRuleNotFound means no sod_rules row with that id exists in the
+// caller's tenant scope. A PLATFORM-WIDE rule (tenant_id NULL) reads as absent
+// from any one tenant's scope on purpose — see Store.SetSoDRuleActive.
+var ErrSoDRuleNotFound = errorString("sod rule not found")
+
 // ErrABACRuleNotFound means no abac_rules row with that id exists in the
 // caller's tenant scope.
 var ErrABACRuleNotFound = errorString("abac rule not found")
+
+// ErrPermissionBundleNotFound means no permission_bundles row with that id is
+// reachable from the caller's tenant scope. permission_bundles carries no
+// tenant_id of its own, so "reachable" means its role_id resolves to a role
+// in that tenant — the same route 000007's policy takes.
+var ErrPermissionBundleNotFound = errorString("permission bundle not found")
 
 // ErrUnsupportedABACOperator means the rule named an operator the evaluator
 // does not implement. Refused at creation (400) rather than discovered when a

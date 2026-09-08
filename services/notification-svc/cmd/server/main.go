@@ -164,10 +164,10 @@ func main() {
 			zap.String("set", "NOTIFICATION_EMAIL_PROVIDER=smtp with SMTP_HOST and NOTIFICATION_EMAIL_FROM"))
 	case "smtp":
 		p, err := deliver.NewSMTPProvider(deliver.SMTPConfig{
-			Host:     cfg.Email.Host,
-			Port:     cfg.Email.Port,
-			Username: cfg.Email.Username,
-			Password: cfg.Email.Password,
+			Host:           cfg.Email.Host,
+			Port:           cfg.Email.Port,
+			Username:       cfg.Email.Username,
+			Password:       cfg.Email.Password,
 			From:           cfg.Email.From,
 			TLSMode:        deliver.TLSMode(cfg.Email.TLSMode),
 			AllowCleartext: cfg.Email.AllowCleartext,
@@ -280,9 +280,10 @@ func main() {
 	retryWorker := retry.NewWorker(
 		pgStore, deliverer, publisher, identityClient, identity.IsSettled,
 		retry.Options{
-			Interval:  cfg.Retry.Interval,
-			BatchSize: cfg.Retry.BatchSize,
-			Policy:    retryPolicy,
+			Interval:      cfg.Retry.Interval,
+			BatchSize:     cfg.Retry.BatchSize,
+			Policy:        retryPolicy,
+			StrandedAfter: cfg.Retry.StrandedAfter,
 		}, log)
 	go retryWorker.Start(workerCtx)
 

@@ -23,15 +23,36 @@ type AuthorizationStore interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
 	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
-	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
+	// CreatePermissionBundle returns whether the row was CREATED or an
+	// existing bundle_code was REPLACED. The upsert overwrites
+	// permitted_actions wholesale, and a caller that had just emptied a
+	// role's grant set used to get the same answer as one that created a
+	// bundle — see PgStore.CreatePermissionBundle.
+	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error)
+	// The bundle read and the bundle off switch. permitted_actions is what a
+	// role actually permits and was write-only: ListRoles returns no actions,
+	// and pb.active_flag sits in FindGrantedActions' JOIN with nothing able to
+	// set it — the SetSoDRuleActive defect on the granting side.
+	ListPermissionBundles(ctx context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error)
+	SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 	ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error)
+	// The catalogue reads. Both admin surfaces were write-only until now: a
+	// role or a delegation could be created and revoked by id and never listed,
+	// so neither register could be audited from outside the caller that wrote it.
+	ListRoles(ctx context.Context, tenantID string, activeOnly bool) ([]domain.Role, error)
+	ListDelegatedAuthorities(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.DelegatedAuthority, error)
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
 	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 	ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error)
+	// The off switch. active_flag is in CheckSoDConflict's predicate and was
+	// reachable by no route at all — a conflict rule could be created and
+	// never retired, on the one object whose blast radius is every principal
+	// holding the pair.
+	SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error)
 
 	// ABAC — the attribute-condition layer. CreateABACRule/SetABACRuleActive/
 	// ListABACRules are the admin surface; FindABACRules is the evaluation
@@ -92,16 +113,23 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Use(correlationIDMiddleware)
 
 	r.Post("/v1/admin/roles", h.CreateRole)
+	r.Get("/v1/admin/roles", h.ListRoles)
 	r.Post("/v1/admin/roles/{role_id}/retire", h.RetireRole)
 	r.Post("/v1/admin/roles/{role_id}/reactivate", h.ReactivateRole)
 	r.Post("/v1/admin/roles/{role_id}/permission-bundles", h.CreatePermissionBundle)
+	r.Get("/v1/admin/roles/{role_id}/permission-bundles", h.ListPermissionBundles)
+	r.Post("/v1/admin/permission-bundles/{permission_bundle_id}/retire", h.RetirePermissionBundle)
+	r.Post("/v1/admin/permission-bundles/{permission_bundle_id}/reactivate", h.ReactivatePermissionBundle)
 	r.Post("/v1/admin/role-assignments", h.CreateRoleAssignment)
 	r.Get("/v1/admin/role-assignments", h.ListRoleAssignments)
 	r.Post("/v1/admin/role-assignments/{assignment_id}/revoke", h.RevokeRoleAssignment)
 	r.Post("/v1/admin/delegated-authorities", h.CreateDelegatedAuthority)
+	r.Get("/v1/admin/delegated-authorities", h.ListDelegatedAuthorities)
 	r.Post("/v1/admin/delegated-authorities/{delegation_id}/revoke", h.RevokeDelegatedAuthority)
 	r.Post("/v1/admin/sod-rules", h.CreateSoDRule)
 	r.Get("/v1/admin/sod-rules", h.ListSoDRules)
+	r.Post("/v1/admin/sod-rules/{sod_rule_id}/retire", h.RetireSoDRule)
+	r.Post("/v1/admin/sod-rules/{sod_rule_id}/reactivate", h.ReactivateSoDRule)
 	r.Post("/v1/admin/abac-rules", h.CreateABACRule)
 	r.Get("/v1/admin/abac-rules", h.ListABACRules)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/retire", h.RetireABACRule)
@@ -480,7 +508,7 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	bundle, err := h.store.CreatePermissionBundle(r.Context(), domain.CreatePermissionBundleParams{
+	bundle, created, err := h.store.CreatePermissionBundle(r.Context(), domain.CreatePermissionBundleParams{
 		RoleID: roleID, BundleCode: req.BundleCode, PermittedActions: req.PermittedActions,
 	})
 	if err != nil {
@@ -492,7 +520,161 @@ func (h *Handler) CreatePermissionBundle(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		return
 	}
+
+	// 201 for a new bundle, 200 for one whose action set was REPLACED — the
+	// distinction the response used to hide. The upsert overwrites
+	// permitted_actions wholesale, so a repost against an existing
+	// bundle_code can silently narrow or empty what a role grants; answering
+	// 201 to that says "created" about a destructive edit. Logged at Info on
+	// the replace path with the action count, because it is a change to what
+	// a role permits and the previous set is gone from the row.
+	//
+	// A 409 was considered and rejected: callers re-provision bundles from a
+	// declarative catalogue, so refusing a repeat would break replay. Same
+	// created/replayed shape CreateRole already answers with.
+	if !created {
+		h.log.Info("permission bundle replaced",
+			zap.String("permission_bundle_id", bundle.PermissionBundleID),
+			zap.String("role_id", bundle.RoleID),
+			zap.String("bundle_code", bundle.BundleCode),
+			zap.Int("permitted_action_count", len(bundle.PermittedActions)),
+			zap.String("correlation_id", correlationID),
+		)
+		writeJSON(w, http.StatusOK, bundle)
+		return
+	}
 	writeJSON(w, http.StatusCreated, bundle)
+}
+
+// ── GET /v1/admin/roles/{role_id}/permission-bundles ────────────────────────
+
+// ListPermissionBundles handles GET /v1/admin/roles/{role_id}/permission-bundles
+// — read what a role actually permits.
+//
+// The read that was missing from the object that IS the permission. A role
+// could be created, given bundles, retired and reactivated, and nothing could
+// list what it granted: ListRoles returns role_code, role_name,
+// role_scope_type and active_flag and no actions at all, and the table's only
+// other reader is FindGrantedActions, which answers the different question
+// "what may THIS principal do here". The console therefore listed role
+// LABELS — and a role_code is a name an operator chose, while the bundle is
+// the control.
+//
+// It also made POST to this same path unsafe: the upsert on
+// (role_id, bundle_code) replaces permitted_actions wholesale, and with no
+// read a code could not be checked for collision beforehand.
+//
+// Tenant-scoped from the VERIFIED header, and the role's ownership is checked
+// in the store rather than trusted: naming another tenant's role_id returns an
+// empty list, not its bundles. 200-with-[] rather than 404 for a role that
+// does not exist in this scope — the same posture the sibling catalogue reads
+// take, and it avoids turning this into an existence oracle for role ids.
+//
+// Retired bundles are included and ordered last, for the reason ListRoles
+// keeps retired roles: a retired bundle is why access someone used to have is
+// gone, and hiding it makes that unexplainable.
+//
+// Response: 200 the bundles (possibly empty) / 401 missing principal or tenant
+// scope / 503 unavailable.
+func (h *Handler) ListPermissionBundles(w http.ResponseWriter, r *http.Request) {
+	roleID := chi.URLParam(r, "role_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	bundles, err := h.store.ListPermissionBundles(r.Context(), roleID, tenantScope)
+	if err != nil {
+		h.log.Error("ListPermissionBundles: store unavailable",
+			zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if bundles == nil {
+		bundles = []domain.PermissionBundle{}
+	}
+	writeJSON(w, http.StatusOK, bundles)
+}
+
+// ── POST /v1/admin/permission-bundles/{permission_bundle_id}/retire|reactivate ──
+
+// RetirePermissionBundle handles
+// POST /v1/admin/permission-bundles/{permission_bundle_id}/retire — withdraw
+// one bundle's actions from its role.
+//
+// The off switch this object never had a route for. `pb.active_flag` is in the
+// JOIN of BOTH evaluation reads — FindGrantedActions and FindDelegatedActions
+// — so a false flag genuinely removes every action the bundle granted, from
+// the next decision, including through delegations of the role. Nothing in the
+// service could set it. That is the same defect SetSoDRuleActive was added to
+// fix, on the granting side rather than the denying side.
+//
+// Why retiring the ROLE is not a substitute: it withdraws every bundle the
+// role holds at once and suspends the role for every principal assigned it.
+// The other workaround — reposting the bundle with a shorter action list —
+// destroys the record of what was withdrawn, since the upsert overwrites
+// permitted_actions. Neither can take back one bundle and leave the rest.
+//
+// Deliberately does NOT delete, and does not touch assignments. The bundle
+// stays readable because a grant recorded as `rbac:role=<code>` is only
+// explainable while the actions that role held can still be read; and
+// reactivating restores exactly the access that was suspended.
+//
+// Response: 200 retired / 401 missing principal or tenant scope / 404 not
+// found in this tenant / 503 unavailable.
+func (h *Handler) RetirePermissionBundle(w http.ResponseWriter, r *http.Request) {
+	h.setPermissionBundleActive(w, r, false)
+}
+
+// ReactivatePermissionBundle handles
+// POST /v1/admin/permission-bundles/{permission_bundle_id}/reactivate.
+// Restores exactly the actions the retirement withdrew. Response shape matches
+// RetirePermissionBundle.
+func (h *Handler) ReactivatePermissionBundle(w http.ResponseWriter, r *http.Request) {
+	h.setPermissionBundleActive(w, r, true)
+}
+
+func (h *Handler) setPermissionBundleActive(w http.ResponseWriter, r *http.Request, active bool) {
+	bundleID := chi.URLParam(r, "permission_bundle_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	bundle, err := h.store.SetPermissionBundleActive(r.Context(), bundleID, tenantScope, active)
+	if err != nil {
+		if errors.Is(err, domain.ErrPermissionBundleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "permission_bundle_not_found"})
+			return
+		}
+		h.log.Error("setPermissionBundleActive: store unavailable",
+			zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	// Logged at Info with the action count, for the reason the SoD flip is:
+	// changing what a role grants is a governance event in its own right, and
+	// the count is what makes the entry mean anything when read back later.
+	h.log.Info("permission bundle active flag set",
+		zap.String("permission_bundle_id", bundle.PermissionBundleID),
+		zap.String("role_id", bundle.RoleID),
+		zap.String("bundle_code", bundle.BundleCode),
+		zap.Int("permitted_action_count", len(bundle.PermittedActions)),
+		zap.Bool("active", bundle.ActiveFlag),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, bundle)
 }
 
 // ── POST /v1/admin/role-assignments ──────────────────────────────────────────
@@ -923,6 +1105,75 @@ func (h *Handler) CreateSoDRule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, rule)
+}
+
+// ── POST /v1/admin/sod-rules/{sod_rule_id}/retire|reactivate ────────────────
+
+// RetireSoDRule handles POST /v1/admin/sod-rules/{sod_rule_id}/retire — stop a
+// conflict rule denying.
+//
+// The lifecycle this object never had. active_flag is in CheckSoDConflict's
+// predicate, so retiring genuinely stops the rule denying on the next
+// evaluation; until this route existed nothing could set it, and a conflict
+// rule authored by mistake denied its action to every principal holding the
+// pair with no way to undo it through the API.
+//
+// Deliberately does NOT delete. The rule has to stay resolvable for the
+// decisions it already caused — a denial recorded with
+// `sod:conflict_with=<action>` is only explainable while the rule that caused
+// it can still be read.
+//
+// A PLATFORM-WIDE rule answers 404 here rather than being retired from one
+// tenant's console, exactly as setABACRuleActive does: a rule binding every
+// tenant must not be disableable by any one of them.
+//
+// Response: 200 retired / 401 missing principal or tenant scope / 404 not
+// found or platform-wide / 503 unavailable.
+func (h *Handler) RetireSoDRule(w http.ResponseWriter, r *http.Request) {
+	h.setSoDRuleActive(w, r, false)
+}
+
+// ReactivateSoDRule handles POST /v1/admin/sod-rules/{sod_rule_id}/reactivate.
+// Restores exactly the denials the retirement suspended. Response shape matches
+// RetireSoDRule.
+func (h *Handler) ReactivateSoDRule(w http.ResponseWriter, r *http.Request) {
+	h.setSoDRuleActive(w, r, true)
+}
+
+func (h *Handler) setSoDRuleActive(w http.ResponseWriter, r *http.Request, active bool) {
+	sodRuleID := chi.URLParam(r, "sod_rule_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	rule, err := h.store.SetSoDRuleActive(r.Context(), sodRuleID, tenantScope, active)
+	if err != nil {
+		if errors.Is(err, domain.ErrSoDRuleNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "sod_rule_not_found"})
+			return
+		}
+		h.log.Error("setSoDRuleActive: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+
+	// Logged at Info with both actions named: turning an SoD control off is a
+	// governance event in its own right, and the pair is what makes the log
+	// entry mean anything later.
+	h.log.Info("sod rule active flag set",
+		zap.String("sod_rule_id", rule.SoDRuleID),
+		zap.String("action_a", rule.ActionA),
+		zap.String("action_b", rule.ActionB),
+		zap.Bool("active", rule.ActiveFlag),
+		zap.String("correlation_id", correlationID),
+	)
+	writeJSON(w, http.StatusOK, rule)
 }
 
 // ── /v1/admin/abac-rules ─────────────────────────────────────────────────────
@@ -1670,6 +1921,110 @@ func (h *Handler) ListSoDRules(w http.ResponseWriter, r *http.Request) {
 		rules = []domain.SoDRule{}
 	}
 	writeJSON(w, http.StatusOK, rules)
+}
+
+// ── GET /v1/admin/roles ─────────────────────────────────────────────────────
+
+// ListRoles handles GET /v1/admin/roles — read this tenant's role catalogue.
+//
+// The read that was missing from a write-only admin surface. Roles could be
+// created, retired, reactivated and given permission bundles; none of that
+// could be listed back, so the only way to know a role's id was to have
+// created it in the same breath, and role_code could not be checked for
+// collision before writing.
+//
+// Tenant-scoped from the VERIFIED header, never a query parameter: a
+// tenant_id a caller can choose is not a scope. Retired roles are included by
+// default and ordered last — a retired role is why access someone used to
+// have is gone, and omitting it makes that unexplainable. `?active_only=true`
+// narrows it.
+//
+// Authorization posture matches the sibling reads (ListRoleAssignments,
+// ListSoDRules): principal and tenant required, no per-action grant. Reading
+// your own tenant's role catalogue is not a privileged act, and gating it
+// behind a grant nobody has seeded would make the console unusable while
+// protecting a list the same caller can already infer from its assignments.
+//
+// Response: 200 the roles (possibly empty) / 401 missing principal or tenant
+// scope / 503 unavailable.
+func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	activeOnly := r.URL.Query().Get("active_only") == "true"
+
+	roles, err := h.store.ListRoles(r.Context(), tenantScope, activeOnly)
+	if err != nil {
+		h.log.Error("ListRoles: store unavailable",
+			zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if roles == nil {
+		roles = []domain.Role{}
+	}
+	writeJSON(w, http.StatusOK, roles)
+}
+
+// ── GET /v1/admin/delegated-authorities ─────────────────────────────────────
+
+// ListDelegatedAuthorities handles GET /v1/admin/delegated-authorities — read
+// who is currently acting on whose behalf in this tenant.
+//
+// The other half of a write-only surface. A delegation could be created and
+// revoked by id and never listed, so the register a delegation exists to
+// produce — who holds borrowed authority right now — could not be read from
+// the service that evaluates against it.
+//
+// `?principal_id=` matches a principal on EITHER side of the delegation,
+// because "this person's delegations" means both the authority they lent out
+// and the authority they were lent. `?active_only=true` applies the same three
+// conditions the evaluation path applies, so the register cannot report a
+// delegation as live that /v1/authorize treats as expired.
+//
+// Revoked and expired delegations are returned by default, ordered after the
+// live ones: a revoked delegation is the evidence that authority was
+// withdrawn, which is exactly what an auditor came for.
+//
+// Response: 200 the delegations (possibly empty) / 401 missing principal or
+// tenant scope / 503 unavailable.
+func (h *Handler) ListDelegatedAuthorities(w http.ResponseWriter, r *http.Request) {
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	principalFilter := strings.TrimSpace(r.URL.Query().Get("principal_id"))
+	activeOnly := r.URL.Query().Get("active_only") == "true"
+
+	// principal_id is compared as ::text, so a non-UUID is a comparison that
+	// matches nothing rather than a driver error — the same posture
+	// ListRoleAssignments takes with role_id, and the reason neither needs to
+	// reject a malformed filter with a 400 or surface one as a 503.
+
+	delegations, err := h.store.ListDelegatedAuthorities(r.Context(), tenantScope, principalFilter, activeOnly)
+	if err != nil {
+		h.log.Error("ListDelegatedAuthorities: store unavailable",
+			zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if delegations == nil {
+		delegations = []domain.DelegatedAuthority{}
+	}
+	writeJSON(w, http.StatusOK, delegations)
 }
 
 // ── GET /v1/access-decisions/{access_decision_id} ───────────────────────────

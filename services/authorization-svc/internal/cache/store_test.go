@@ -71,7 +71,13 @@ func (c *countingStore) SetRoleActive(_ context.Context, _, _ string, _ bool) (*
 func (c *countingStore) FindRoleByID(_ context.Context, _ string) (*domain.Role, error) {
 	return &domain.Role{}, nil
 }
-func (c *countingStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
+func (c *countingStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error) {
+	return &domain.PermissionBundle{}, true, nil
+}
+func (c *countingStore) ListPermissionBundles(_ context.Context, _, _ string) ([]domain.PermissionBundle, error) {
+	return nil, nil
+}
+func (c *countingStore) SetPermissionBundleActive(_ context.Context, _, _ string, _ bool) (*domain.PermissionBundle, error) {
 	return &domain.PermissionBundle{}, nil
 }
 func (c *countingStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
@@ -81,6 +87,12 @@ func (c *countingStore) RevokeRoleAssignment(_ context.Context, _, _ string) (*d
 	return &domain.PrincipalRoleAssignment{}, nil
 }
 func (c *countingStore) ListRoleAssignments(_ context.Context, _, _, _ string, _ bool) ([]domain.PrincipalRoleAssignment, error) {
+	return nil, nil
+}
+func (c *countingStore) ListRoles(_ context.Context, _ string, _ bool) ([]domain.Role, error) {
+	return nil, nil
+}
+func (c *countingStore) ListDelegatedAuthorities(_ context.Context, _, _ string, _ bool) ([]domain.DelegatedAuthority, error) {
 	return nil, nil
 }
 func (c *countingStore) CreateDelegatedAuthority(_ context.Context, _ domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error) {
@@ -103,6 +115,9 @@ func (c *countingStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleP
 }
 func (c *countingStore) ListSoDRules(_ context.Context, _ string) ([]domain.SoDRule, error) {
 	return nil, nil
+}
+func (c *countingStore) SetSoDRuleActive(_ context.Context, _, _ string, _ bool) (*domain.SoDRule, error) {
+	return &domain.SoDRule{}, nil
 }
 func (c *countingStore) CreateABACRule(_ context.Context, _ domain.CreateABACRuleParams) (*domain.ABACRule, error) {
 	return &domain.ABACRule{}, nil

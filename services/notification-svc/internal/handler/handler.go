@@ -15,8 +15,8 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/identity"
-	"zoiko.io/notification-svc/internal/retry"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/templates"
 )
 
@@ -51,7 +51,7 @@ const (
 )
 
 var supportedChannels = map[string]bool{
-	"EMAIL":   true,
+	"EMAIL": true,
 	// SMS is deliberately absent. The service used to accept it, resolve a
 	// recipient for it, and then fail every one — the only channel that
 	// advertised a capability the platform does not have. A caller now gets
@@ -324,13 +324,39 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 
 	attemptedAt := time.Now().UTC()
 
+	// The OUTCOME of an attempt already made is recorded on a context that
+	// outlives the request, not on r.Context().
+	//
+	// WHY. Once the provider has been called, what happened is a fact about
+	// the outside world, and the caller hanging up does not un-send an email.
+	// r.Context() is cancelled when the response is written — and sooner if
+	// the client disconnects or the server's 15s WriteTimeout fires — so the
+	// two statements below could fail for no reason but the request ending,
+	// leaving the notification PENDING with nothing scheduled: in flight
+	// forever, which is the stranded state internal/retry's sweep exists to
+	// repair. Five rows on the dev stack were in exactly that state for six
+	// days.
+	//
+	// The sweep is the backstop; this is the fix. It matters most in the worst
+	// case — a message that WAS delivered and whose success was never written
+	// — because there the sweep would reasonably re-send it and the recipient
+	// would get the notice twice. Keeping the write alive is what makes that
+	// rare rather than routine.
+	//
+	// The tenant is carried over explicitly: the store reads it from the
+	// context, and a bare context.Background() would have no tenant installed
+	// and be refused by row-level security.
+	outcomeCtx, cancelOutcome := context.WithTimeout(
+		svcmiddleware.WithTenant(context.WithoutCancel(r.Context()), tenantID), 10*time.Second)
+	defer cancelOutcome()
+
 	// A failure worth re-attempting does not conclude the notification. It
 	// stays PENDING with a schedule on it, and internal/retry's worker picks
 	// it up — which is the whole difference between classifying a failure and
 	// doing something about it.
 	if !outcome.Delivered && outcome.Retryable {
 		if next, ok := h.retryPolicy.NextAttempt(attemptedAt, 1); ok {
-			if err := h.store.ScheduleRetry(r.Context(), notification.NotificationID,
+			if err := h.store.ScheduleRetry(outcomeCtx, notification.NotificationID,
 				tenantID, outcome.Reason, attemptedAt, next); err != nil {
 				h.log.Error("failed to schedule delivery retry", zap.Error(err))
 				writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -363,7 +389,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		newStatus = "FAILED"
 	}
 
-	if err := h.store.CompleteDelivery(r.Context(), notification.NotificationID,
+	if err := h.store.CompleteDelivery(outcomeCtx, notification.NotificationID,
 		newStatus, outcome.Reason, outcome.ProviderResponse, &attemptedAt); err != nil {
 		h.log.Error("failed to record delivery outcome", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -377,9 +403,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	notification.LastAttemptAt = &attemptedAt
 
 	if outcome.Delivered {
-		h.publisher.PublishSent(r.Context(), correlationID, *notification)
+		h.publisher.PublishSent(outcomeCtx, correlationID, *notification)
 	} else {
-		h.publisher.PublishFailed(r.Context(), correlationID, *notification, outcome.Reason)
+		h.publisher.PublishFailed(outcomeCtx, correlationID, *notification, outcome.Reason)
 	}
 
 	writeJSON(w, http.StatusCreated, notification)

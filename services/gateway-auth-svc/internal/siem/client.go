@@ -7,10 +7,49 @@
 // an error — most tenants will not have set one up, and that must never be
 // treated as a failure by the service reporting the event.
 //
-// This is deliberately fire-and-forget: streaming is a monitoring
-// side-channel, never a gate. A slow or unreachable siem-integration-svc
-// must never delay or fail the request that triggered the security event —
-// it is logged locally either way.
+// This is fire-and-forget: streaming is a monitoring side-channel, never a
+// gate. A slow or unreachable siem-integration-svc must never delay or fail
+// the request that triggered the security event.
+//
+// ── THAT USED TO BE A CLAIM, NOT A FACT ─────────────────────────────────────
+//
+// Stream did the work inline: an exporter lookup and then one POST per
+// exporter, on the caller's goroutine, on the caller's request context. This
+// package's own Stream doc acknowledged it and pushed the burden onto callers
+// — "Call this from a goroutine if the caller is on a latency-sensitive path
+// ... it does not return until every exporter has been tried".
+//
+// Neither call site in this service did that. Both
+// internal/handler/handler.go:133 (session_risk.*) and :256
+// (tenant_context.denied) called Stream inline on r.Context(), so a
+// siem-integration-svc that was merely absent added its connect time to the
+// gateway's own auth verdict — measured at 850ms median on the service this
+// was ported from, against an upstream that was not running. And absent is the
+// compose DEFAULT: SIEM_SERVICE_URL points at siem-integration-svc, which
+// lives in docker-compose.phase6.yml.
+//
+// Advice in a doc comment is not a control. The blocking is gone from the
+// implementation instead, so the call sites are correct as they stand.
+//
+// ── WHAT IT DOES NOW ────────────────────────────────────────────────────────
+//
+// Stream hands the event to a bounded queue and returns. A small worker pool
+// does the HTTP on its own goroutines with its own background context —
+// deliberately NOT the request context, which is cancelled the moment the
+// response is written and would abort every delivery.
+//
+// The queue is BOUNDED and a full queue DROPS the event, loudly. That is the
+// right trade for this signal: the alternative is an unbounded queue that
+// turns a SIEM outage into this service's memory problem, and blocking is the
+// behaviour being removed. A drop is counted and logged so the gap is visible
+// rather than silent.
+//
+// Close drains the queue on shutdown so a SIGTERM does not discard events
+// already accepted.
+//
+// Ported from authorization-svc, where the defect was measured. The four
+// copies of this package were byte-identical below the doc comment, so the
+// defect was in the shared shape rather than in any one service's use of it.
 package siem
 
 import (
@@ -19,6 +58,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -32,6 +73,24 @@ const (
 	SeverityHigh     Severity = "HIGH"
 	SeverityCritical Severity = "CRITICAL"
 )
+
+// queueDepth and workerCount size the dispatcher.
+//
+// Small on purpose. This is a side-channel, so the queue exists to absorb a
+// burst, not to buffer an outage: at 4 workers and a 3-second per-event
+// budget, 256 slots is roughly three minutes of sustained denials before
+// dropping starts, and anything longer than that is an incident the drop
+// counter should be reporting rather than something to hold in memory.
+const (
+	queueDepth  = 256
+	workerCount = 4
+)
+
+// perEventTimeout bounds one event's delivery on the worker, replacing the
+// request context that used to bound it. It has to exist: without it a hung
+// siem-integration-svc would occupy a worker indefinitely and the queue would
+// fill behind it.
+const perEventTimeout = 3 * time.Second
 
 type exporter struct {
 	ID     string `json:"id"`
@@ -51,38 +110,111 @@ type streamRequest struct {
 	Payload    string   `json:"payload,omitempty"`
 }
 
+// event is one queued stream request.
+type event struct {
+	tenantID  string
+	eventType string
+	severity  Severity
+	message   string
+}
+
 // Client calls siem-integration-svc. A nil/zero-value Client (baseURL == "")
-// makes Stream a no-op — this mirrors carta.Client's posture: an optional
-// safety layer whose absence must not change primary request handling.
+// makes Stream a no-op and starts no goroutines.
 type Client struct {
 	baseURL   string
 	sourceSvc string
 	http      *http.Client
 	log       *zap.Logger
+
+	queue   chan event
+	workers sync.WaitGroup
+
+	// dropped counts events discarded because the queue was full. Exposed via
+	// Dropped() so the gap is measurable rather than only logged.
+	dropped atomic.Uint64
+
+	closeOnce sync.Once
 }
 
 func New(baseURL, sourceSvc string, log *zap.Logger) *Client {
-	return &Client{
+	c := &Client{
 		baseURL:   strings.TrimRight(baseURL, "/"),
 		sourceSvc: sourceSvc,
 		log:       log,
 		http:      &http.Client{Timeout: 2 * time.Second},
 	}
+	if c.baseURL == "" {
+		// Streaming disabled. No queue, no workers — Stream returns
+		// immediately on the baseURL check, exactly as before.
+		return c
+	}
+	c.queue = make(chan event, queueDepth)
+	c.workers.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go c.worker()
+	}
+	return c
 }
 
-// Stream looks up tenantID's active SIEM exporters and streams eventType to
-// each. Call this from a goroutine if the caller is on a latency-sensitive
-// path — it does its own bounded-timeout context internally either way, but
-// it does not return until every exporter has been tried.
-func (c *Client) Stream(ctx context.Context, tenantID, eventType string, severity Severity, message string) {
+// Stream enqueues eventType for tenantID's active exporters and returns
+// immediately.
+//
+// ctx is accepted for call-site symmetry and is deliberately NOT used for the
+// delivery: it is the request context, cancelled when the response is written,
+// so honouring it would cancel every event this function exists to send. The
+// only thing it could legitimately gate is whether to enqueue at all, and an
+// already-cancelled request is exactly when a security event is most worth
+// keeping.
+func (c *Client) Stream(_ context.Context, tenantID, eventType string, severity Severity, message string) {
 	if c == nil || c.baseURL == "" || tenantID == "" {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	select {
+	case c.queue <- event{tenantID: tenantID, eventType: eventType, severity: severity, message: message}:
+	default:
+		// Dropped rather than blocked. Blocking is the behaviour this design
+		// removes, and an unbounded queue would make a SIEM outage into this
+		// service's memory problem.
+		n := c.dropped.Add(1)
+		c.log.Warn("siem: queue full — security event dropped",
+			zap.String("event_type", eventType),
+			zap.Uint64("dropped_total", n))
+	}
+}
+
+// Dropped returns the number of events discarded because the queue was full.
+func (c *Client) Dropped() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.dropped.Load()
+}
+
+// Close stops accepting events and waits for the queued ones to drain, so a
+// graceful shutdown does not discard events already accepted. Safe to call
+// more than once, and on a Client with streaming disabled.
+func (c *Client) Close() {
+	if c == nil || c.queue == nil {
+		return
+	}
+	c.closeOnce.Do(func() { close(c.queue) })
+	c.workers.Wait()
+}
+
+func (c *Client) worker() {
+	defer c.workers.Done()
+	for e := range c.queue {
+		c.deliver(e)
+	}
+}
+
+// deliver does what Stream used to do inline.
+func (c *Client) deliver(e event) {
+	ctx, cancel := context.WithTimeout(context.Background(), perEventTimeout)
 	defer cancel()
 
-	exporters, err := c.activeExporters(ctx, tenantID)
+	exporters, err := c.activeExporters(ctx, e.tenantID)
 	if err != nil {
 		c.log.Debug("siem: could not list exporters — skipping (opt-in feature, not a failure)", zap.Error(err))
 		return
@@ -92,7 +224,7 @@ func (c *Client) Stream(ctx context.Context, tenantID, eventType string, severit
 	}
 
 	for _, exp := range exporters {
-		if err := c.streamTo(ctx, tenantID, exp.ID, eventType, severity, message); err != nil {
+		if err := c.streamTo(ctx, e.tenantID, exp.ID, e.eventType, e.severity, e.message); err != nil {
 			c.log.Warn("siem: stream failed for one exporter", zap.String("exporter_id", exp.ID), zap.Error(err))
 		}
 	}

@@ -83,6 +83,8 @@ type Config struct {
 	// the rest of the service's configuration rather than living only in
 	// whatever cron invokes the function.
 	AccessDecisionRetentionMonths int
+	RetentionSweepInterval        time.Duration
+	PartitionMonthsAhead          int
 }
 
 type DBConfig struct {
@@ -255,6 +257,18 @@ func Load() (*Config, error) {
 		// deletion: the function it configures detaches partitions, and an
 		// operator archives them. 0 disables detaching entirely.
 		AccessDecisionRetentionMonths: envInt("AUTHZ_ACCESS_DECISION_RETENTION_MONTHS", 24),
+
+		// How often the retention sweep runs. Daily is ample: both halves of the
+		// sweep are month-granular, so the only thing a shorter interval buys is
+		// a faster recovery after a failed sweep. 0 disables the sweeper entirely,
+		// which leaves the partition runway to be extended by hand — the
+		// behaviour before the sweeper existed.
+		RetentionSweepInterval: time.Duration(envInt("AUTHZ_RETENTION_SWEEP_INTERVAL_HOURS", 24)) * time.Hour,
+
+		// How many months of partitions to keep ahead of the current one. Three
+		// is a runway, not a guess: it means the sweep can fail silently for two
+		// consecutive months before any decision lands in the default partition.
+		PartitionMonthsAhead: envInt("AUTHZ_PARTITION_MONTHS_AHEAD", 3),
 	}, nil
 }
 

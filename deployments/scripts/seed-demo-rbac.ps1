@@ -350,6 +350,29 @@ $BUNDLES = @(
         Actions = @("DELEGATION_CREATE", "DELEGATION_VIEW", "DELEGATION_REVOKE")
     },
     @{
+        # SUPERSEDE is separate from CREATE on purpose, and the split is the
+        # whole point of the pair. Recording a new precedence rule adds a
+        # ranking; ending one CHANGES WHICH SOURCE THE PLATFORM BELIEVES for a
+        # field family, silently and everywhere, from the moment it takes
+        # effect. Someone who may propose a ranking should not automatically be
+        # able to switch the platform's system of record.
+        #
+        # VIEW is separate from both because the register is the platform's
+        # trust topology -- which connected systems are believed over which --
+        # and reading it is a disclosure even though the rows belong to no
+        # tenant. It ran no authorization at all until this pass.
+        #
+        # NORMALIZED_FACT_VIEW is separate again: unlike the rules, facts are
+        # tenant business data and the route returns raw fact values.
+        Code    = "SOURCE_AUTHORITY_FULL"
+        Service = "source-authority-svc"
+        Actions = @(
+            "SOURCE_AUTHORITY_MAP_CREATE", "SOURCE_AUTHORITY_MAP_VIEW",
+            "SOURCE_AUTHORITY_MAP_SUPERSEDE",
+            "NORMALIZED_FACT_RECORD", "NORMALIZED_FACT_VIEW"
+        )
+    },
+    @{
         Code    = "JURISDICTION_FULL"
         Service = "jurisdiction-rules-svc"
         Actions = @(

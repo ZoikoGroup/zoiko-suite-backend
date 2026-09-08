@@ -68,10 +68,14 @@ type Inner interface {
 	CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error)
 	SetRoleActive(ctx context.Context, roleID, tenantID string, active bool) (*domain.Role, error)
 	FindRoleByID(ctx context.Context, roleID string) (*domain.Role, error)
-	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error)
+	CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error)
+	ListPermissionBundles(ctx context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error)
+	SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool) (*domain.PermissionBundle, error)
 	CreateRoleAssignment(ctx context.Context, params domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error)
 	RevokeRoleAssignment(ctx context.Context, assignmentID, tenantID string) (*domain.PrincipalRoleAssignment, error)
 	ListRoleAssignments(ctx context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error)
+	ListRoles(ctx context.Context, tenantID string, activeOnly bool) ([]domain.Role, error)
+	ListDelegatedAuthorities(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.DelegatedAuthority, error)
 	CreateDelegatedAuthority(ctx context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error)
 	FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
 	RevokeDelegatedAuthority(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error)
@@ -79,6 +83,7 @@ type Inner interface {
 	RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error)
 	CreateSoDRule(ctx context.Context, params domain.CreateSoDRuleParams) (*domain.SoDRule, error)
 	ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error)
+	SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error)
 	CreateABACRule(ctx context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error)
 	SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error)
 	ListABACRules(ctx context.Context, tenantID, actionType string) ([]domain.ABACRule, error)
@@ -373,13 +378,33 @@ func (s *Store) SetRoleActive(ctx context.Context, roleID, tenantID string, acti
 	return role, err
 }
 
-func (s *Store) CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
-	bundle, err := s.inner.CreatePermissionBundle(ctx, params)
+func (s *Store) CreatePermissionBundle(ctx context.Context, params domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error) {
+	bundle, created, err := s.inner.CreatePermissionBundle(ctx, params)
 	if err == nil {
 		// The bundle knows its role, not its tenant. Rather than resolve the
 		// role's tenant with another query, invalidate across every tenant:
 		// bundles change rarely, and a bundle is the definition of what a role
 		// grants, so a stale one is the worst kind of stale entry to keep.
+		//
+		// Unconditional on err == nil, INCLUDING the replaced path: an upsert
+		// that overwrote permitted_actions changed what the role grants just
+		// as much as a fresh insert did.
+		s.invalidateGrantSources("")
+	}
+	return bundle, created, err
+}
+
+// SetPermissionBundleActive invalidates on the same terms, and the
+// invalidation is what makes the off switch mean anything within the TTL: a
+// cached grant set would keep granting actions the operator just withdrew,
+// for as long as the entry lived. Same reason SetSoDRuleActive invalidates
+// nsSoD — a cached conflict would keep denying an action just un-blocked.
+//
+// Across every tenant, for the reason above: the bundle names a role, not a
+// tenant, and this method deliberately does not spend a query resolving one.
+func (s *Store) SetPermissionBundleActive(ctx context.Context, permissionBundleID, tenantID string, active bool) (*domain.PermissionBundle, error) {
+	bundle, err := s.inner.SetPermissionBundleActive(ctx, permissionBundleID, tenantID, active)
+	if err == nil {
 		s.invalidateGrantSources("")
 	}
 	return bundle, err
@@ -453,6 +478,17 @@ func (s *Store) CreateABACRule(ctx context.Context, params domain.CreateABACRule
 	return rule, err
 }
 
+// Invalidates nsSoD for the same reason CreateSoDRule does: retiring a rule
+// changes what CheckSoDConflict answers, and a cached conflict would keep
+// denying an action the operator has just stopped enforcing.
+func (s *Store) SetSoDRuleActive(ctx context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error) {
+	rule, err := s.inner.SetSoDRuleActive(ctx, sodRuleID, tenantID, active)
+	if err == nil {
+		s.invalidate(nsSoD, tenantID)
+	}
+	return rule, err
+}
+
 func (s *Store) SetABACRuleActive(ctx context.Context, abacRuleID, tenantID string, active bool) (*domain.ABACRule, error) {
 	rule, err := s.inner.SetABACRuleActive(ctx, abacRuleID, tenantID, active)
 	if err == nil {
@@ -489,6 +525,27 @@ func (s *Store) ListRoleAssignments(ctx context.Context, tenantID, principalID, 
 
 func (s *Store) FindDelegatedAuthorityByID(ctx context.Context, delegatedAuthorityID, tenantID string) (*domain.DelegatedAuthority, error) {
 	return s.inner.FindDelegatedAuthorityByID(ctx, delegatedAuthorityID, tenantID)
+}
+
+// ListRoles and ListDelegatedAuthorities are admin catalogue reads, not
+// evaluation reads, so they pass straight through uncached — same as the other
+// List* methods here. Caching them would put staleness in the one place an
+// operator looks to confirm a write landed, and save nothing: no request path
+// calls them.
+func (s *Store) ListRoles(ctx context.Context, tenantID string, activeOnly bool) ([]domain.Role, error) {
+	return s.inner.ListRoles(ctx, tenantID, activeOnly)
+}
+
+func (s *Store) ListDelegatedAuthorities(ctx context.Context, tenantID, principalID string, activeOnly bool) ([]domain.DelegatedAuthority, error) {
+	return s.inner.ListDelegatedAuthorities(ctx, tenantID, principalID, activeOnly)
+}
+
+// ListPermissionBundles is uncached for the same reason, and one more specific
+// to it: it is the read an operator uses to confirm which actions a role now
+// grants, immediately after changing them. FindGrantedActions is the cached
+// path over this same table, so the speed is already where it is needed.
+func (s *Store) ListPermissionBundles(ctx context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error) {
+	return s.inner.ListPermissionBundles(ctx, roleID, tenantID)
 }
 
 func (s *Store) ListSoDRules(ctx context.Context, tenantID string) ([]domain.SoDRule, error) {

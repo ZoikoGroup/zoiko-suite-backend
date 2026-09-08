@@ -514,16 +514,111 @@ refused. Both outbound clients in this service now have tests that drive a real
 `httptest` server with the dependency's literal response shape — the gap that
 let financial-close-svc ship three of these at once.
 
-## Open: notification-svc holds rows from before the channel fix
-The delivery adapter used to report an unrecognised channel as a delivery
-failure, so a caller's typo produced a stored FAILED record and a
-`notification.failed` event — evidence of an attempt no provider ever saw. The
-dev database has one (`channel: 'PIGEON'`). Migration 000002 adds its CHECK
-constraints `NOT VALID` deliberately: new writes are constrained, existing rows
-are preserved. A register that quietly edits its own history is worth less than
-one with an embarrassing row in it. Run `ALTER TABLE ... VALIDATE CONSTRAINT`
-once the backlog has been dealt with by someone who can decide what to do
-with it.
+## Resolved: notification-svc accepted notices it then never sent, and nothing would ever have noticed
+PENDING with `next_attempt_at` NULL means "in flight right now" — the state
+`ClaimRetry` creates on purpose. Nothing in the service ever moved such a row
+again: `FindDueRetries` requires `next_attempt_at IS NOT NULL`, so a send whose
+attempt never reported an outcome sat there permanently. Never delivered, never
+failed, never re-attempted, and displayed as PENDING, which reads as progress
+rather than as a governed notice that silently did not go out.
+
+Four ways in, all real: the process dies between accepting the send and
+concluding it; `ScheduleRetry` fails and the handler answers 503; the same for
+`CompleteDelivery`; or the request context is cancelled mid-attempt, which it
+can be, because the delivery call AND the store write recording its outcome both
+ran on `r.Context()` against a 15s WriteTimeout.
+
+`internal/retry`'s own `RunOnce` said a claimed row left "PENDING with nothing
+scheduled ... is what the sweep below is for". There was no sweep. The failure
+mode was understood, written down, and the remedy never built — and
+`attempt`'s error path names it a third time in a log message about a row being
+"stalled PENDING with no schedule".
+
+Measured on the dev stack 2026-09-08: five notifications from 2026-09-02, six
+days old, `delivery_attempts = 0`, real subjects to a real address.
+
+`Worker.SweepStranded` + `FindStrandedDeliveries` / `ReviveStranded` close it.
+The sweep only ever SCHEDULES — delivery still goes through the ordinary due
+path, so one code path sends — and reclaimed rows keep their attempt count, so
+being stranded does not buy a fresh retry budget. `COALESCE(last_attempt_at,
+created_at)` is the in-flight clock, because a row stranded before its first
+attempt has no `last_attempt_at` at all, which was the whole of the real case.
+
+The threshold is the safety property and is why it is configurable
+(`NOTIFICATION_STRANDED_AFTER`, default 15m, `0` a true off switch and never
+"sweep everything now"): a row being attempted right now is indistinguishable
+from an abandoned one except by how long it has looked that way, so the window
+must exceed the longest possible attempt — SMTP timeout 10s, WriteTimeout 15s,
+so ~30s in practice. Reviving risks a duplicate notice; not reviving guarantees
+some notices never arrive, and for this service the first is the right way to be
+wrong. SENT rows are never touched.
+
+Also fixed, and it is what keeps that duplicate rare rather than routine: the
+outcome of an attempt already made is now written on a context that outlives the
+request. Once the provider has been called, what happened is a fact about the
+outside world and the caller hanging up does not un-send an email.
+
+Verified end to end: rebuilt, restarted, and the first tick reclaimed all five
+and delivered all five — six days late, but delivered, and confirmed in the
+mail catcher. Zero stranded rows remain.
+
+## Resolved: the pre-channel-fix backlog is clean, so the NOT VALID constraints can be validated
+Superseded measurement, recorded because the previous entry told the next
+person to go and check. Migration 000002 added its CHECK constraints `NOT VALID`
+because the delivery adapter used to record an unrecognised channel as a
+delivery FAILURE, leaving rows like `channel: 'PIGEON'` — evidence of an attempt
+no provider ever saw — and a migration must not quietly rewrite the record of
+what the service actually did.
+
+Counted on the dev database 2026-09-08: **zero** violations across all six
+checkable constraints (`channel_known`, `status_known`,
+`concluded_has_timestamp`, `failed_has_reason`, `attempts_non_negative`,
+`concluded_has_no_retry`). The PIGEON row is gone. The one SMS row that remains
+is legitimate history — SMS was genuinely accepted for a period before being
+withdrawn — and `channel_known` permits it.
+
+Deliberately NOT turned into a validating migration. `ALTER TABLE ... VALIDATE
+CONSTRAINT` scans the table and fails outright if any row violates, so a
+migration that validated would hard-fail on deploy against any environment whose
+backlog is *not* clean — taking the service down to gain nothing, since NOT VALID
+already enforces every new write. It stays an operator step, per environment,
+after checking that environment's own counts.
+
+## Open: nothing on the estate sends a notification
+The largest gap in notification-svc, and none of it is in notification-svc.
+
+The service is complete and works: six routes, all wired to the console,
+templates, retry with backoff, the stranded sweep above, RLS forced, and the two
+events §9.7 requires. What it does not have is a single caller. There is no
+notification client in any of the other 103 services, and no
+`NOTIFICATION_SERVICE_URL` — or any equivalent — in any compose file. Checked by
+sweeping every Go file and every deployment manifest for any env var matching
+`NOTIF`: the only hits are notification-svc's own config, its DB role, and the
+two authz action codes it checks.
+
+Doc 03 §9.7 gives it "workflows, deadlines, escalations, approvals, and status
+changes". None of those produce a notification today, so every notice the
+platform has ever sent was sent by hand.
+
+Deliberately not fixed here: which service notifies whom, on what event, from
+which template is a product decision per workflow, and picking one to wire would
+be inventing that decision rather than encoding it. The path is proven end to
+end (a seeded `NOTIFICATION_SEND` grant, a real send, a real replay), so
+adoption is wiring, not discovery.
+
+## Open: the notifications register grows without bound
+One row per notification, forever, carrying the subject and body of every notice
+the platform has sent, plus the recipient address it went to. There is no
+retention, no partitioning and no archival anywhere in the service — grepped.
+
+Not urgent and recorded rather than fixed: the volume is small (35 rows on the
+dev stack) and the rows are the evidence of what was sent to whom, which is the
+one thing this register is for, so a purge is a governance decision and not a
+cleanup. It is the same shape as authorization-svc's `access_decision_log`
+before migration 000009, and the same answer will probably apply — monthly
+partitions with DETACH rather than DELETE — when volume justifies it. The
+data-minimisation question (how long a governed notice's BODY should be retained)
+needs a human before the mechanism does.
 
 ## Resolved: schema-registry-svc worked only on one developer's machine
 Two independent instances of the same shape, both invisible locally and both
@@ -1428,3 +1523,226 @@ internal/siem client — gateway-auth-svc, identity-context-svc,
 key-management-svc, mtls-management-svc (the five listed in the item-84d
 writeup). The inline shape is presumably identical in each. Only
 authorization-svc's copy was changed.
+
+## Resolved: source-authority-svc's normalized facts had no tenant at all
+Found 8 Sep 2026 while wiring the console. The service's two tables were given
+the same answer to the tenancy question and only one of them deserved it.
+
+source_authority_maps IS platform-wide reference data. "ADP outranks the HR
+spreadsheet for PAYROLL_GROSS_PAY" is a statement about which connected SYSTEM
+is trusted, and every tenant is legitimately ranked by the same topology.
+
+normalized_facts is not reference data and never was. A row there is one
+business fact about one business entity -- an employee's gross pay, a
+counterparty's billing contact -- in a JSONB fact_value keyed by a free-text
+entity_ref that no registry constrains. It had no tenant column, so one
+undivided pool held every tenant's values.
+
+Three things compounded into a read with no control on it whatsoever:
+
+  1. no tenant column, so no query could scope by tenant even in principle;
+  2. GET /v1/source-authority/resolve is deliberately ungated on authorization
+     -- the cheap hot read every service needs, same posture as
+     kill-switch-registry-svc's resolve -- which is defensible for a boolean
+     kill switch and not for a route returning raw fact values;
+  3. the envelope middleware defaults to write-strict, which ADMITS READS with
+     no envelope, so nothing upstream supplied a tenant or a principal either.
+
+Together: a guessed entity_ref was the entire access control, from anything that
+could reach the port. internal/events/publisher.go's own comment recorded the
+wrong half of the distinction as settled doctrine -- "neither
+domain.SourceAuthorityMap nor domain.NormalizedFact has a tenant_id field at
+all, same pattern as capability-registry-svc and metric-registry-svc" -- which
+is true of the maps and wrong about the facts, and is the reason nobody looked.
+The same lesson as the item-84d writeup above: the comment was the thing that
+stopped anyone checking.
+
+Closed by migration 000002 (tenant_id, FORCE row-level security with an
+explicit WITH CHECK, tenant-leading indexes) plus an explicit tenant_id
+predicate on every fact statement -- both, not either, for the reason
+delegated-authority-svc's 000002 gives. requireTenant now answers 401 on the
+read path specifically, because write-strict means nothing else will.
+
+Pre-existing rows keep tenant_id = '' and are visible to no tenant. That is
+deliberate: nothing in a fact row records which tenant reported it and
+entity_ref is free text, so there is nothing to infer from, and guessing would
+hand one tenant another's fact under the appearance of a fix.
+
+## Resolved: source-authority-svc could never actually change a precedence
+Same pass. effective_to existed from the first migration and
+ResolveAuthoritativeFact always honoured it -- and nothing in the service could
+ever set it. There was no supersede route, no UPDATE, nothing.
+
+So the documented way to change a ranking, "a changed precedence is a new row,
+never an UPDATE", left BOTH rows currently effective. The resolver's join
+matched both, the same source_system appeared twice at two different ranks, and
+the code takes the lowest rank number -- so demoting a source from rank 1 to
+rank 3 had no effect and reported none. An operator would read the register,
+see their new rank-3 row present and correct, and be wrong about what the
+platform believed.
+
+Closed by POST /v1/source-authority-maps/{id}/supersede, which end-dates the
+rule and records who ended it and when. The rule's own terms are never
+rewritten, so a resolution made while it applied is still explained by the row
+that made it. Back-dating is refused: it would rewrite which rule was in force
+when an earlier resolution was made. The resolver additionally now picks ONE
+rule per (field_family, source_system) -- the most recently effective -- so
+overlapping rows cannot double-rank a source even if some other writer creates
+them.
+
+## Resolved: source-authority-svc dropped unranked sources from resolution
+Same pass. ResolveAuthoritativeFact INNER JOINed facts to source_authority_maps,
+so a source system that HAD reported a fact and had no precedence rule in force
+did not lose the ranking -- it vanished from it. "Nobody has ranked this source
+yet" and "this source lost" were indistinguishable, and the unranked source's
+disagreement with the winner never surfaced anywhere.
+
+On a register whose entire purpose is to surface disagreement between sources,
+that is the one confusion it cannot afford. Closed with a LEFT JOIN and a new
+unmapped_sources field on the resolution, reported alongside the answer rather
+than as an error -- the resolution over the ranked sources is still correct, it
+is just not the whole picture.
+
+## Resolved: source-authority-svc ignored the correlation_id in its own contract
+Same pass. CorrelationID was a field on both CreateSourceAuthorityMapRequest and
+RecordFactRequest from the beginning, and the handler read neither. Neither
+table had a column for it.
+
+The two consequences are mirror images. On normalized_facts -- append-only, and
+the exact account of what each source said -- a retry appended a SECOND
+observation that no source ever made, and two rows from the same source at the
+same effective_at then raced in the resolver's DISTINCT ON. On
+source_authority_maps the unique index on (field_family, source_system,
+effective_from) turned a retry into a 409, so an operator who never saw the
+first response was told their rule conflicted with the one they had just
+successfully created.
+
+Both are now idempotent -- facts on (tenant_id, correlation_id), rules on
+correlation_id -- answering 200 on a replay and 201 on a real write, with the
+idempotency check ordered ahead of the uniqueness constraint so a replay is
+never reported as a conflict with itself.
+
+## Resolved: source-authority-svc's precedence register was readable by anyone
+Same pass. GET /v1/source-authority-maps ran no authorization of any kind. The
+rows are not tenant data, but they are the platform's trust topology -- which
+connected systems are believed over which, for which field families -- and that
+is a disclosure whether or not the rows belong to anyone.
+
+Five actions gate the service now, and the splits are deliberate:
+SOURCE_AUTHORITY_MAP_VIEW (reading the topology),
+SOURCE_AUTHORITY_MAP_CREATE (proposing a ranking),
+SOURCE_AUTHORITY_MAP_SUPERSEDE (changing which source the platform believes,
+everywhere, silently -- not the same power as proposing one),
+NORMALIZED_FACT_RECORD, and NORMALIZED_FACT_VIEW (raw fact values, tenant data,
+so separate from the map actions).
+
+Nothing had ever granted a SOURCE_AUTHORITY_* action, so as with
+delegated-authority-svc and jurisdiction-rules-svc before it the newly gated
+routes would have 403'd every principal. SOURCE_AUTHORITY_FULL added to
+seed-demo-rbac.ps1 in the same pass.
+
+Also closed alongside: authority_class was documented as a closed set
+(AUTHORITATIVE | DERIVED | CACHED) and enforced neither in Go nor in the schema,
+so a misspelling stored a fact in a class no consumer knows how to weigh -- and
+because the column carries a DEFAULT, a misspelled JSON KEY stored it silently
+under the default instead. Unknown JSON fields are now refused, bodies are
+capped, both list routes are paged, and field_family stopped being a required
+query parameter so the register can actually be browsed.
+
+## Open: DELEGATION_ADMINISTER is enforced but never granted
+Noticed 8 Sep 2026 while adding SOURCE_AUTHORITY_FULL to seed-demo-rbac.ps1.
+Not introduced by that pass and not closed by it.
+
+delegated-authority-svc's 18 Aug pass added DELEGATION_ADMINISTER as the grant a
+caller needs to create a delegation on someone else's behalf, and the seed
+script's DELEGATION_FULL bundle still lists only DELEGATION_CREATE,
+DELEGATION_VIEW and DELEGATION_REVOKE. So the administer path is unreachable for
+every seeded principal: an administrator setting up a delegation between two
+other people gets delegator_mismatch.
+
+This fails CLOSED, which is why it is recorded rather than urgent -- the refusal
+is the safe direction, and delegating your own authority (the common path) needs
+no administer grant. But it means the "an administrator may arrange delegations
+between other people" behaviour that pass deliberately preserved has never been
+exercisable in a seeded environment, and the console's explainDelegationError
+tells the reader to "ask a delegation administrator" when no such principal can
+exist.
+
+## Resolved: authorization-svc could not say what a role permitted, and could not take part of it back
+Found 2026-09-08 by asking what the last un-reviewed admin object could do.
+`permission_bundles` holds `permitted_actions` -- the actual list of things a
+role allows -- and three properties of it composed badly.
+
+**It was write-only.** `GET /v1/admin/roles` returns role_code, role_name,
+role_scope_type and active_flag, and no actions. The table's only other reader
+is FindGrantedActions, which answers the different question "what may THIS
+principal do in THIS entity". So nothing in the service or the console could
+list what a role granted: an operator saw that a role existed and was being
+enforced, and could not learn whether it permitted one action or forty, or
+which. The who-can-do-what map was unreadable from the one page built to show
+it. It also meant a bundle_code could not be checked for collision before
+writing, which matters because of the next paragraph.
+
+**Its off switch had no writer.** active_flag has been on the table since
+000001 and BOTH evaluation reads join through it -- FindGrantedActions and
+FindDelegatedActions -- so a false flag genuinely withdraws the set's actions
+from direct holders and from anyone who borrowed the role through a delegation.
+No route, store method or console control could set it. Third appearance of
+this exact shape in this service: roles (fixed in Priority 1 row 5), sod_rules
+(fixed 2026-09-08 earlier the same day), and now the granting side. The
+workarounds were both wrong: retiring the ROLE withdraws every set at once and
+suspends it for everybody assigned it, and reposting the set with a shorter
+list destroys the record of what was withdrawn.
+
+**Its write replaced silently and reported a creation.** The upsert on
+(role_id, bundle_code) overwrites permitted_actions wholesale, and the handler
+answered 201 whichever path ran. A repost that narrowed or emptied what a role
+grants -- taking those actions off every principal holding it from the next
+decision -- looked exactly like having created something, and with no LIST it
+was undiscoverable before or after.
+
+All three closed: GET /v1/admin/roles/{role_id}/permission-bundles,
+POST /v1/admin/permission-bundles/{id}/retire|reactivate, and 201-created /
+200-replaced discriminated on `(xmax = 0)`. The upsert is deliberately kept --
+access-control-svc re-provisions bundles from a declarative catalogue, so DO
+NOTHING or a 409 would break replay; what was missing was the caller being
+told. Checked before changing the status code: access-control-svc's
+AuthzAdminClient.post tests `resp.StatusCode >= 300`, so 200 passes as 201 did,
+and no other service calls the route.
+
+Proven at the evaluation layer rather than at the route, because the flag was
+always in the query and what was missing was any way to set it: two sets on one
+role, retire one, and ACTION_DROP answers DENIED `no_grant` while ACTION_KEEP
+stays GRANTED -- the second half being what proves it withdraws ONE set.
+
+**Also found by driving it, and only findable that way:** `decision_basis`
+named a role once per bundle, so a role with two bundles produced
+`rbac:role=X,X`. No test had a role with more than one bundle. That field is
+the audit record of why an action was allowed and the console renders it
+verbatim beside its paraphrase so an auditor cites the service rather than the
+console -- so the duplicate was noise in the one field that has to be exact,
+and it leaked how many bundles matched, which is not what the field reports.
+
+## Recorded: this service's store tests skip silently, and destroy any database they are pointed at
+Two halves, both found 2026-09-08, neither a code defect.
+
+`TEST_DATABASE_URL` unset makes every store integration test `t.Skip` while
+`go test ./...` still prints `ok`. Several passes' worth of "full go test green"
+therefore did not establish that the store suite ran at all. It does pass
+against real PostgreSQL 16 -- but the claim and the evidence had drifted apart,
+which is the same class of thing as a suite that only uses the migration
+connection proving nothing about row security.
+
+And `setupTestDB` DROPs every table this service owns before re-running the
+migrations, so pointing that variable at the compose `authorization_svc`
+database erases that stack's roles, bundles, assignments, delegations, SoD
+rules, attribute conditions and access_decision_log history. Done accidentally
+on 2026-09-08. The SCHEMA survives -- migrations re-apply, all seven tables
+return to relforcerowsecurity=t, internal/retention re-creates the partition
+runway on boot -- so the service keeps answering; the fixtures do not.
+
+The doc comment now states it. Deliberately no heuristic guard on the DSN:
+refusing a database named authorization_svc, requiring a name suffix, or
+checking the host each either blocks the legitimate throwaway case or gives
+false confidence against a URL shaped slightly differently. A stated contract
+is more honest than a check that can be satisfied by accident.

@@ -41,6 +41,10 @@ func main() {
 	cartaClient := carta.New(cfg.CartaServiceURL, log)
 	siemClient := siem.New(cfg.SIEMServiceURL, "gateway-auth-svc", log)
 
+	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
+	// so without this a SIGTERM would discard security events already accepted.
+	defer siemClient.Close()
+
 	// GOV-01 tenant context resolution against tenant-entity-registry-svc.
 	// nil when TENANT_REGISTRY_URL is unset, which leaves the gateway behaving
 	// exactly as before rather than failing closed on an unconfigured dependency.

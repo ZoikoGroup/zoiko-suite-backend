@@ -32,8 +32,20 @@ type stubStore struct {
 	setActiveCalls  int
 	setActiveWanted []bool
 
-	bundle    *domain.PermissionBundle
-	bundleErr error
+	bundle        *domain.PermissionBundle
+	bundleCreated bool
+	bundleErr     error
+
+	bundles            []domain.PermissionBundle
+	bundlesErr         error
+	bundlesRoleID      string
+	bundlesTenantID    string
+	bundleActive       *domain.PermissionBundle
+	bundleActiveErr    error
+	bundleActiveCalls  int
+	bundleActiveWant   []bool
+	bundleActiveID     string
+	bundleActiveTenant string
 
 	assignment      *domain.PrincipalRoleAssignment
 	assignmentErr   error
@@ -67,6 +79,25 @@ type stubStore struct {
 	listSoDRules    []domain.SoDRule
 	listSoDRulesErr error
 	gotSoDTenant    string
+
+	setSoDActiveErr    error
+	gotSoDActiveID     string
+	gotSoDActiveTenant string
+	gotSoDActiveValue  bool
+
+	// The two catalogue reads. Args are captured so a test can assert the
+	// handler passed the VERIFIED tenant scope rather than anything from the
+	// query string — the property that matters on a tenant-scoped read.
+	roles              []domain.Role
+	listRolesErr       error
+	gotRolesTenant     string
+	gotRolesActiveOnly bool
+
+	delegations        []domain.DelegatedAuthority
+	listDelegationsErr error
+	gotDelegTenant     string
+	gotDelegPrincipal  string
+	gotDelegActiveOnly bool
 
 	rbacActions []string
 	rbacBasis   string
@@ -134,8 +165,18 @@ func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool) (
 	s.setActiveWanted = append(s.setActiveWanted, active)
 	return s.setActiveRole, s.setActiveErr
 }
-func (s *stubStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
-	return s.bundle, s.bundleErr
+func (s *stubStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error) {
+	return s.bundle, s.bundleCreated, s.bundleErr
+}
+func (s *stubStore) ListPermissionBundles(_ context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error) {
+	s.bundlesRoleID, s.bundlesTenantID = roleID, tenantID
+	return s.bundles, s.bundlesErr
+}
+func (s *stubStore) SetPermissionBundleActive(_ context.Context, bundleID, tenantID string, active bool) (*domain.PermissionBundle, error) {
+	s.bundleActiveCalls++
+	s.bundleActiveWant = append(s.bundleActiveWant, active)
+	s.bundleActiveID, s.bundleActiveTenant = bundleID, tenantID
+	return s.bundleActive, s.bundleActiveErr
 }
 func (s *stubStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
 	return s.assignment, s.assignmentErr
@@ -162,6 +203,35 @@ func (s *stubStore) ListRoleAssignments(_ context.Context, tenantID, principalID
 		return nil, s.listAssignmentsErr
 	}
 	return s.listAssignments, nil
+}
+
+func (s *stubStore) SetSoDRuleActive(_ context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error) {
+	s.gotSoDActiveID = sodRuleID
+	s.gotSoDActiveTenant = tenantID
+	s.gotSoDActiveValue = active
+	if s.setSoDActiveErr != nil {
+		return nil, s.setSoDActiveErr
+	}
+	return &domain.SoDRule{SoDRuleID: sodRuleID, ActionA: "PAYMENT_APPROVE", ActionB: "PAYMENT_INITIATE", ActiveFlag: active}, nil
+}
+
+func (s *stubStore) ListRoles(_ context.Context, tenantID string, activeOnly bool) ([]domain.Role, error) {
+	s.gotRolesTenant = tenantID
+	s.gotRolesActiveOnly = activeOnly
+	if s.listRolesErr != nil {
+		return nil, s.listRolesErr
+	}
+	return s.roles, nil
+}
+
+func (s *stubStore) ListDelegatedAuthorities(_ context.Context, tenantID, principalID string, activeOnly bool) ([]domain.DelegatedAuthority, error) {
+	s.gotDelegTenant = tenantID
+	s.gotDelegPrincipal = principalID
+	s.gotDelegActiveOnly = activeOnly
+	if s.listDelegationsErr != nil {
+		return nil, s.listDelegationsErr
+	}
+	return s.delegations, nil
 }
 
 func (s *stubStore) ListSoDRules(_ context.Context, tenantID string) ([]domain.SoDRule, error) {
@@ -479,8 +549,9 @@ func TestCreateRole_ForeignTenantBody_Refused(t *testing.T) {
 
 func TestCreatePermissionBundle_Created(t *testing.T) {
 	store := &stubStore{
-		role:   &domain.Role{RoleID: "r-1", TenantID: "t-1"},
-		bundle: &domain.PermissionBundle{PermissionBundleID: "b-1", RoleID: "r-1"},
+		role:          &domain.Role{RoleID: "r-1", TenantID: "t-1"},
+		bundle:        &domain.PermissionBundle{PermissionBundleID: "b-1", RoleID: "r-1"},
+		bundleCreated: true,
 	}
 	r := newTestRouter(store)
 

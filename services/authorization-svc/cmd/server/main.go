@@ -37,6 +37,7 @@ import (
 	"zoiko.io/authorization-svc/internal/health"
 	"zoiko.io/authorization-svc/internal/jurisdiction"
 	"zoiko.io/authorization-svc/internal/mtls"
+	"zoiko.io/authorization-svc/internal/retention"
 	"zoiko.io/authorization-svc/internal/siem"
 	"zoiko.io/authorization-svc/internal/store"
 	"zoiko.io/authorization-svc/internal/telemetry"
@@ -260,6 +261,28 @@ func main() {
 		// granting for up to a TTL after it was applied.
 		consumer := events.NewConsumer(log, authzStore)
 		go consumer.Run(consumerCtx, reader)
+	}
+
+	// ── access_decision_log retention ──────────────────────────────────────
+	//
+	// One row per evaluation on a table that is correctly append-only, which
+	// together describe unbounded growth. 000009 partitioned it by month and
+	// wrote both maintenance helpers; nothing called either until this
+	// sweeper existed, so the runway was whatever the migration created and
+	// the retention window was configuration with no effect.
+	//
+	// pgStore, NOT authzStore: these are catalogue-level maintenance calls on
+	// the parent table, and routing them through the evaluation cache would
+	// invalidate every namespace on a sweep for no reason — nothing the sweep
+	// touches is a cached read.
+	if cfg.RetentionSweepInterval <= 0 {
+		log.Warn("retention sweeper disabled (AUTHZ_RETENTION_SWEEP_INTERVAL_HOURS=0) — the access_decision_log partition runway will not be extended, and rows will land in the default partition once the pre-created months elapse")
+	} else {
+		retentionCtx, stopRetention := context.WithCancel(context.Background())
+		defer stopRetention()
+		sweeper := retention.New(pgStore, log, cfg.RetentionSweepInterval,
+			cfg.PartitionMonthsAhead, cfg.AccessDecisionRetentionMonths)
+		go sweeper.Run(retentionCtx)
 	}
 
 	quit := make(chan os.Signal, 1)
