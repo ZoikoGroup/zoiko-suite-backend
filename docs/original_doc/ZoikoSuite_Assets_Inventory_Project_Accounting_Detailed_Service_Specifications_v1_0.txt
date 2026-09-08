@@ -1,0 +1,669 @@
+ZOIKOSUITE
+[Title] Assets, Inventory & Project AccountingDetailed Service Specifications
+[Subtitle] AST-01–AST-03 • INV-01–INV-05 • PRJ-01–PRJ-04  •  Build-Ready Subledger Baseline
+[TABLE START]
+Field | Value
+Document ID | ZS-SVC-G-001
+Version | 1.0 — Assets, Inventory & Project Accounting Engineering Baseline
+Date | 24 August 2026
+Status | Build-ready domain specification. Entity-specific capitalization thresholds, depreciation conventions, valuation methods, inventory policies, project recognition policies, physical-control procedures and accounting-framework interpretations remain controlled through approved Accounting/Jurisdiction policy and launch configuration.
+Owner | ZoikoSuite Product Architecture / Asset, Inventory & Project Accounting Engineering
+Applies to | Engineering, Product, Finance, Accounting, AR/AP, Banking, Payroll, Tax, Operations, Supply Chain, Project Finance, Security, QA, Audit and Integration teams
+Language | American English
+[TABLE END]
+[TABLE START]
+Executive doctrine: ZoikoSuite Assets, Inventory & Project Accounting is a controlled subledger layer. Physical assets, stock quantities, valuation, project costs and project revenue/WIP remain separate authoritative facts. On-hand quantities and carrying values are derived from immutable events and approved policy. No service in this domain writes the General Ledger directly, invents accounting policy, treats billing as revenue, or alters certified historic state in place.
+[TABLE END]
+[Heading1] 1. Architecture Decisions That Must Not Be Diluted
+[TABLE START]
+Decision | Engineering consequence
+Physical identity and book value are different | AST-01 keeps stable asset/component identity; book-specific carrying state comes from AST-03 events + AST-02 depreciation and can differ by accounting book.
+Asset economics are event-driven | Capitalization, improvement, impairment/revaluation, component replacement and disposal are append-only governed events; carrying values are never free-form editable balances.
+Inventory quantity and inventory value are separate | INV-03 owns quantity movement truth; INV-04 owns monetary valuation. Neither can silently rewrite the other.
+On-hand is a projection | Inventory quantity is reconstructed from immutable movements plus controlled count adjustments, not maintained as an independently editable balance field.
+Commercial product is not inventory item authority | INV-01 owns stockkeeping/accounting attributes; BIZ-07 may own commercial catalog/offer data but cannot change valuation policy.
+Valuation method is accounting-policy controlled | Cost formula/method is effective-dated by book/framework. IFRS restrictions or other-GAAP permissions are enforced by policy, not hardcoded globally.
+Count variance is not a direct balance edit | INV-05 approves variance; INV-03 creates the adjustment movement; INV-04 values it; ACC-04 posts any accounting consequence.
+Project cost capture does not double-post source costs | PRJ-02 attributes authoritative AP/payroll/inventory/asset costs to projects. Only incremental reclassification/capitalization effects produce new accounting events.
+Project billing is not project revenue | AR owns issued invoices; PRJ-03 determines recognition/WIP/contract balance under approved policy; cash settlement remains Banking.
+Project profitability is a read model | PRJ-04 cannot recognize revenue, post costs, edit WIP or change project lifecycle.
+All accounting consequences route through ACC-04 | Subledger services emit governed accounting events; direct GL writes are prohibited.
+Historic state must be reproducible | Every schedule, movement, valuation, count, project cost and recognition run preserves source identity, policy version, effective dates and correction chain.
+[TABLE END]
+Figure 1 — Assets, Inventory & Project Accounting authoritative control chain.
+[Heading1] 2. Domain Constitution & Non-Negotiable Invariants
+[TABLE START]
+# | Invariant
+1 | Every authoritative record is tenant- and legal-entity-scoped before data access; cross-entity ownership is never inferred from physical location or project grouping.
+2 | Asset physical identity is separate from book-specific accounting state; one asset may have multiple approved book profiles without one book overwriting another.
+3 | Asset carrying values are derived from capitalization/subsequent events and depreciation schedules; direct value-field edits are prohibited.
+4 | Asset components with materially different useful lives or policy treatment can be represented and depreciated separately.
+5 | Applied asset events are immutable; corrections use reversal/supersession and preserve original evidence.
+6 | A transfer of asset ownership between legal entities is not a metadata transfer; it follows approved intercompany/disposal-acquisition accounting.
+7 | Depreciation is deterministic by asset/component/book/period and exact policy version; reruns are idempotent and population-frozen.
+8 | Inventory item accounting attributes are separate from commercial catalog pricing/offers.
+9 | Inventory on-hand quantity is derived from committed movements; direct quantity overwrites are prohibited.
+10 | Every material movement preserves source identity, item, UOM, location, lot/serial where applicable, business/effective dates and idempotency identity.
+11 | Negative inventory behavior is explicit policy; the system never silently allows negative stock because a projection is stale.
+12 | Physical location/custody and legal ownership are separate facts.
+13 | Inventory valuation uses effective-dated accounting policy and preserves method/cost-layer trace; late costs trigger controlled revaluation, not silent historical mutation.
+14 | Accounting-framework constraints are policy-driven: for example an IFRS book cannot use a valuation method prohibited by the active IFRS policy profile.
+15 | Inventory write-downs/reversals require approved evidence and remain distinct from physical quantity movement.
+16 | Count populations and system quantities are frozen at a defined cutoff; in-flight movements are reconciled explicitly.
+17 | Blind-count controls prevent unauthorized exposure of expected quantities where configured; material variance approvals are independent.
+18 | Approved stock-count variances produce inventory movements; count services never edit on-hand balances directly.
+19 | Financial projects/jobs are legal-entity scoped. Group programs reference separate entity projects rather than one cross-entity accounting aggregate.
+20 | Project cost entries preserve authoritative source-domain identity and do not create duplicate source accounting.
+21 | Project revenue recognition remains separate from customer billing, cash settlement and tax determination.
+22 | WIP, unbilled revenue, contract asset/liability and deferred balances are policy-specific states; the platform does not treat them as interchangeable labels.
+23 | Project estimates, progress measures and recognition methods are versioned; protected changes invalidate approval/certification.
+24 | Closed-period corrections follow governed reopen or forward-correction rules and reperform affected depreciation/valuation/recognition controls.
+25 | All subledger-to-GL controls and source-to-report lineage must remain reconstructable from evidence; AI cannot autonomously change carrying value, valuation method, count variance or revenue recognition.
+[TABLE END]
+Figure 2 — Period cutoff, retroactivity and forward-correction doctrine.
+[Heading1] 3. Cross-Service Authority Matrix
+[TABLE START]
+Service | Authoritative ownership | Must never own / bypass
+AST-01 | FixedAsset | Posted GL balances, depreciation calculations or free-form carrying-value edits
+AST-02 | DepreciationSchedule | Asset physical identity, impairment/disposal decisions or direct GL posting
+AST-03 | AssetEvent | General Ledger or unsupported valuation/legal conclusions
+INV-01 | InventoryItem | Commercial offer/pricing authority or historic movement reinterpretation
+INV-02 | InventoryLocation | Legal ownership changes or inventory quantity/value
+INV-03 | InventoryMovement | Monetary valuation policy or direct GL writes
+INV-04 | InventoryCostLayer/Pool | Physical quantity truth or commercial pricing
+INV-05 | StockCountSession | Direct on-hand edits or valuation/accounting policy
+PRJ-01 | FinancialProject | General task/project-management execution or cross-entity accounting aggregate
+PRJ-02 | ProjectCostEntry | Source AP/payroll/inventory facts or duplicate source GL posting
+PRJ-03 | ProjectRecognitionRun | Invoice issuance, cash settlement or direct GL posting
+PRJ-04 | ProjectProfitabilitySnapshot/read model | Revenue recognition, cost mutation, WIP decisions or accounting authority
+[TABLE END]
+[Heading1] 4. Shared Command, Error & Context Contract
+[TABLE START]
+Area | Required behavior
+Context | Every protected command resolves tenant, legal entity, accounting book/basis, accounting period, jurisdiction/policy, currency, actor/workload, region/residency, correlation/causation and idempotency server-side.
+Physical vs financial | Asset/item/location/project physical/operational facts are not allowed to imply book value, ownership transfer, revenue recognition or accounting posting without the corresponding governed service/command.
+Dates | Business/effective, posting, in-service, count cutoff, movement, recognition and source-document dates remain distinct where needed. Backdating cannot bypass closed-period controls.
+Concurrency | Mutable masters use expected-version semantics. Approval/certification binds a protected-field fingerprint and frozen population for depreciation, valuation, stock count and recognition runs.
+Errors | Stable types include ASSET_BOOK_POLICY_MISSING, ASSET_EVENT_STATE_INVALID, DEPRECIATION_POPULATION_CHANGED, INVENTORY_NEGATIVE_NOT_ALLOWED, SERIAL_DUPLICATE, UOM_MAPPING_AMBIGUOUS, VALUATION_METHOD_NOT_PERMITTED, STOCK_COUNT_POPULATION_CHANGED, PROJECT_SOURCE_DUPLICATE, PROJECT_POLICY_MISSING, RECOGNITION_EVIDENCE_INCOMPLETE and CLOSED_PERIOD_CORRECTION_REQUIRED.
+Evidence | Every material result preserves source identities, policy/method versions, exact calculation trace, approvals, accounting-event IDs and reconciliation/certification evidence.
+[TABLE END]
+[Heading1] 5. Canonical Domain Data Model
+[TABLE START]
+Entity | Primary authority / purpose
+FixedAsset | AST-01 — stable physical/business asset identity
+AssetComponent | AST-01 — componentization and identity
+AssetBookProfile | AST-01 — book-specific policy/basis binding
+DepreciationSchedule | AST-02 — deterministic component/book schedule
+DepreciationRun | AST-02 — frozen period run and exceptions
+AssetEvent | AST-03 — append-only economic lifecycle event
+InventoryItem | INV-01 — stockkeeping identity/accounting profile
+InventoryLocation | INV-02 — physical/custody location hierarchy
+InventoryMovement | INV-03 — immutable quantity event
+InventoryCostLayer | INV-04 — source-linked cost layer/pool
+InventoryValuationEntry | INV-04 — valuation/write-down/reversal fact
+StockCountSession | INV-05 — count scope/snapshot/control state
+StockCountLine | INV-05 — observation/recount/variance
+FinancialProject | PRJ-01 — entity-scoped project/job financial identity
+ProjectWorkPackage | PRJ-01 — WBS/work package financial structure
+ProjectCostEntry | PRJ-02 — source-linked cost attribution
+ProjectRecognitionRun | PRJ-03 — frozen revenue/WIP calculation
+ProjectContractBalance | PRJ-03 — policy-specific WIP/contract balance
+ProjectProfitabilitySnapshot | PRJ-04 — reconciled read model
+[TABLE END]
+[Heading1] 6. Canonical Domain Events
+[TABLE START]
+Event | Minimum contract
+AssetRegistered | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+AssetBookAssigned | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+AssetCapitalized | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+DepreciationRunApproved | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+DepreciationAccountingEventEmitted | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+AssetImpaired | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+AssetRevalued | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+AssetDisposed | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+AssetEventReversed | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+InventoryItemActivated | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+InventoryLocationChanged | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+InventoryMovementCommitted | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+InventoryMovementReversed | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+InventoryValued | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+InventoryWriteDownRecorded | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+StockCountPopulationFrozen | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+StockCountVarianceApproved | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+StockCountCertified | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+ProjectActivated | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+ProjectCostCaptured | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+ProjectCostReversed | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+ProjectRecognitionCalculated | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+ProjectRevenueApproved | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+ProjectRecognitionAccountingEventEmitted | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+ProjectProfitabilitySnapshotCertified | event_id; tenant/entity; aggregate_id/version; book/period where material; item/asset/project and source references; occurred_at; business/effective date; correlation/causation; producer; policy/method version; residency context; evidence reference; no secret/credential material.
+[TABLE END]
+[Heading1] 7. Detailed Service Specifications — AST-01 through PRJ-04
+The following profiles are build contracts. Physical deployment may be consolidated, but each logical service retains separate authoritative facts, commands, states, evidence and certification requirements.
+[Heading1] AST-01 — Fixed Asset Register
+[TABLE START]
+Maintain authoritative physical/business asset identity, components and book assignments while keeping book values derived from governed asset events and depreciation.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | FixedAsset; AssetComponent; asset category/class; tag/serial; ownership entity; custodian/location references; acquisition/source references; in-service metadata; AssetBookProfile linkage; lifecycle projection. It does not own posted GL balances.
+Required business/source inputs | approved acquisition/capital project/source document; legal entity; asset category; item/serial/tag; location/custodian; acquisition/in-service dates; component structure; cost source; useful-life/residual-value proposals; evidence.
+Server-resolved/derived context | accounting book; capitalization policy/threshold; asset class policy; account mapping; depreciation convention; permitted cost model; impairment/revaluation policy; currency/FX; period state; permissions/SoD.
+Explicit commands | CreateAssetCandidate; ApproveAssetRegistration; AddComponent; AmendNonFinancialMetadata; AssignAssetBookProfile; RequestCapitalization; TransferCustody; TransferLocation; SuspendAsset; MergeAssetControlled; SplitAssetControlled
+Queries/retrieval | GetAsset; GetAssetAsOf; GetAssetComponents; GetAssetBookProfiles; GetAssetSourceLineage; ListAssets; GetAvailableActions
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Candidate→Reviewed→Registered→Capitalized/Active; Suspended/Disposed/HeldForSale are lifecycle dimensions driven by accepted events; book states tracked separately.
+Permissions | asset.read; asset.create; asset.approve; asset.component.manage; asset.book.assign; asset.metadata.manage.
+Segregation of duties | Creator cannot approve capitalization where maker-checker is required; custodian/location metadata change cannot alter accounting basis; merge/split requires independent approval and lineage preservation.
+Events produced | AssetRegistered; AssetComponentAdded; AssetBookAssigned; AssetCapitalizationRequested; AssetMetadataChanged; AssetSuspended
+Dependencies | ORG; REF accounting book/period/dimensions; AP/PRJ sources; GOV policy/workflow; AST-02/03; ACC; TAX; Evidence.
+Failure/degradation semantics | Missing ownership entity, source cost, in-service evidence, book policy or account mapping blocks capitalization. Physical record remains accessible even when one book is suspended.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Acquisition/source IDs, asset/component identity, policy versions, book assignments, approvals, source hashes and all lifecycle-event links.
+NFR / resilience profile | C1; strong historical reconstruction; high durability; search projection rebuildable; no mutable net-book-value source field.
+Minimum negative-path certification | Asset capitalized without source evidence; Physical asset merged across legal entities; Retroactive book profile change rewrites prior depreciation; User edits carrying value directly
+[TABLE END]
+Figure 3 — Asset identity and lifecycle boundary.
+[Heading1] AST-02 — Depreciation
+[TABLE START]
+Calculate and certify book-specific, component-level depreciation schedules and period runs from approved asset-book facts without writing the General Ledger directly.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | DepreciationSchedule; DepreciationRun; DepreciationLine; accumulated-depreciation subledger facts by asset/component/book; run eligibility/exceptions; schedule version.
+Required business/source inputs | capitalized AssetBookProfile; component cost basis; residual value; useful life; method; in-service/retirement dates; prior depreciation; approved subsequent asset events; accounting period.
+Server-resolved/derived context | book accounting policy; depreciation convention; calendar; rounding; impairment/revaluation adjustments; period state; account mapping; FX where relevant.
+Explicit commands | BuildDepreciationSchedule; RecalculateSchedule; CreateDepreciationRun; FreezeDepreciationPopulation; ValidateDepreciationRun; ApproveDepreciationRun; EmitDepreciationAccountingEvent; SupersedeDepreciationRun
+Queries/retrieval | GetDepreciationSchedule; GetDepreciationRun; GetAccumulatedDepreciation; GetDepreciationAsOf; ListRunExceptions
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Schedule Draft→Validated→Active→Superseded; Run Draft→PopulationFrozen→Calculated→Validated→Approved→AccountingEventEmitted→Reconciled/Certified.
+Permissions | asset.depreciation.read; asset.depreciation.run; asset.depreciation.approve; asset.depreciation.supersede.
+Segregation of duties | Run preparer cannot self-approve material exceptions; policy/life/residual changes after approval invalidate the run; period-close authority remains ACC.
+Events produced | DepreciationScheduleBuilt; DepreciationRunCalculated; DepreciationRunApproved; DepreciationAccountingEventEmitted; DepreciationRunSuperseded
+Dependencies | AST-01/03; REF; ACC-04/06; TAX policy where relevant; DATA-07; Evidence.
+Failure/degradation semantics | Incomplete asset population, overlapping schedule versions, closed period or inconsistent component basis blocks certification. Failed accounting event remains retriable/idempotent without duplicate depreciation.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Frozen population manifest, schedule formulas, policy/version, component basis, exact calculations, approvals, accounting-event IDs and reconciliation result.
+NFR / resilience profile | C1 period-end; deterministic; scalable batch; exact decimals; rerunnable from frozen population; RPO/RTO aligned to close.
+Minimum negative-path certification | Same asset depreciated twice in period; Disposed component remains in eligible population; Useful life changed after approval without invalidation; Rerun emits duplicate accounting event
+[TABLE END]
+Figure 4 — Book-specific depreciation control.
+[Heading1] AST-03 — Asset Event
+[TABLE START]
+Record governed economic lifecycle events that change asset book state, including capitalization, additions, component replacement, transfer, impairment/revaluation and disposal, while preserving immutable history.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | AssetEvent; event type; affected asset/component/book; source basis; value/effective date; approval fingerprint; resulting book-state delta; correction/supersession links.
+Required business/source inputs | asset/component; event type; source document/valuation/approval; amount/currency; effective date; proceeds where applicable; destination/custodian/location; impairment/revaluation evidence; disposal evidence.
+Server-resolved/derived context | asset/book state; accounting policy; impairment/revaluation model; legal entity; period state; FX; account mapping; tax treatment; SoD and delegated authority.
+Explicit commands | CreateAssetEvent; ValidateAssetEvent; ApproveAssetEvent; ApplyAssetEvent; ReverseAssetEvent; SupersedeAssetEvent; RecordDisposal; RecordImpairment; RecordRevaluation; RecordComponentReplacement
+Queries/retrieval | GetAssetEvent; GetAssetEventChain; GetAssetBookStateAsOf; ListAssetEvents; ExplainAssetState
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Draft→Validated→Approved→Applied→AccountingEventEmitted→Reconciled; Rejected/Cancelled before apply; applied events corrected only by reverse/supersede.
+Permissions | asset.event.read; asset.event.create; asset.event.approve; asset.event.apply; asset.event.correct.
+Segregation of duties | Event initiator cannot approve material impairment/revaluation/disposal where maker-checker applies; valuation evidence preparer and approver separated where configured.
+Events produced | AssetEventCreated; AssetEventApproved; AssetEventApplied; AssetImpaired; AssetRevalued; AssetDisposed; AssetEventReversed
+Dependencies | AST-01/02; ACC; TAX; BNK/AR for disposal proceeds; PRJ/AP source facts; GOV; Evidence.
+Failure/degradation semantics | Direct cross-legal-entity “transfer” is blocked: ownership change requires intercompany/disposal-acquisition treatment. Closed-period corrections follow ACC reopen/forward-correction rules.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Source event/evidence hash, valuation inputs, approval, original/correction link, resulting asset-book state, accounting-event and reconciliation references.
+NFR / resilience profile | C1; event immutability; low-volume/high-integrity; exact value changes; legal-hold capable.
+Minimum negative-path certification | Impairment amount entered without evidence/approval; Disposed asset event edited in place; Cross-entity asset transfer bypasses intercompany accounting; Hard-closed-period event silently backdated
+[TABLE END]
+Figure 5 — Subsequent asset event, impairment and correction chain.
+[Heading1] INV-01 — Item / Product Master
+[TABLE START]
+Maintain canonical stockkeeping and inventory-accounting attributes for physical/stock items while remaining distinct from the commercial Product & Service Catalog.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | InventoryItem; item/SKU identity; stocking/base UOM; item type; lot/serial/expiry policy; inventory classification; entity inventory profile; valuation-policy reference; lifecycle.
+Required business/source inputs | item identity; description; base/alternate UOM; physical characteristics; lot/serial/expiry requirements; entity applicability; stock/non-stock classification; source/catalog references.
+Server-resolved/derived context | REF UOM; entity; inventory accounting policy; valuation-method profile; tax-category reference; account mapping; negative-stock policy; effective dates; permissions.
+Explicit commands | CreateInventoryItem; ActivateInventoryItem; AmendInventoryProfile; SetTrackingPolicy; SetValuationPolicyFutureEffective; RetireInventoryItem; LinkCommercialCatalogItem
+Queries/retrieval | GetInventoryItem; GetInventoryProfileAsOf; ListItems; GetTrackingPolicy; GetValuationPolicy; GetAvailableActions
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Draft→Active→Suspended→Retired; valuation/tracking policy versions are effective-dated and do not rewrite historic movements.
+Permissions | inventory.item.read; inventory.item.manage; inventory.policy.assign.
+Segregation of duties | Retroactive valuation-policy change requires controlled migration/revaluation approval; commercial pricing/catalog editors cannot alter inventory accounting policy.
+Events produced | InventoryItemCreated; InventoryItemActivated; InventoryPolicyChanged; InventoryItemRetired
+Dependencies | BIZ-07; REF UOM; ORG; TAX; ACC mappings; GOV; INV-03/04.
+Failure/degradation semantics | Missing base UOM, valuation policy or entity profile blocks stock movement/valuation. Historical item versions remain available after retirement.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Item/profile version, UOM mappings, policy IDs, approvals, commercial-catalog link and source evidence.
+NFR / resilience profile | C1 master data; high read volume; versioned cache; strong referential integrity.
+Minimum negative-path certification | Commercial catalog changes inventory valuation method; Historic movement reinterpreted using new UOM mapping; Lot-tracked item moved without lot identity; Retired item accepts new receipt without override
+[TABLE END]
+Figure 6 — Item master, commercial catalog and location authority boundary.
+[Heading1] INV-02 — Inventory Location
+[TABLE START]
+Maintain authoritative physical/custody inventory-location hierarchy and operational eligibility without inferring legal ownership from physical location.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | InventoryLocation; warehouse/site/bin/quarantine/transit location; parent hierarchy; custody entity; operational state; location type; counting/negative-stock attributes.
+Required business/source inputs | legal entity/custodian; physical site; warehouse/bin identifiers; location type; parent; storage/custody rules; effective dates; controlled external-warehouse reference.
+Server-resolved/derived context | entity ownership rules; inventory policy; timezone; count-control profile; cross-border/residency metadata where relevant; permissions.
+Explicit commands | CreateInventoryLocation; ActivateLocation; SuspendLocation; AmendLocationMetadata; ReparentLocationControlled; SetQuarantineState; RetireLocation
+Queries/retrieval | GetLocation; GetLocationHierarchy; GetLocationAsOf; ListEligibleLocations; GetLocationInventorySummary
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Draft→Active→Suspended/Quarantine→Retired; hierarchy changes versioned; physical state separate from item quantity.
+Permissions | inventory.location.read; inventory.location.manage; inventory.location.quarantine.
+Segregation of duties | Location administrator cannot use reparenting to move ownership between legal entities; quarantine release can require independent approval.
+Events produced | InventoryLocationCreated; InventoryLocationActivated; InventoryLocationQuarantined; InventoryLocationChanged; InventoryLocationRetired
+Dependencies | ORG; REF; INV-01/03/05; GOV; Security.
+Failure/degradation semantics | Cross-entity reparenting, circular hierarchy, movement into retired location or unauthorized quarantine release is blocked.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Location hierarchy versions, custody/ownership context, approvals, external warehouse evidence and change history.
+NFR / resilience profile | C1; highly available master; hierarchy caching with version identity; historical as-of queries.
+Minimum negative-path certification | Physical location change silently changes legal owner; Circular warehouse/bin hierarchy created; Movement enters retired location; Quarantine released without authority
+[TABLE END]
+[Heading1] INV-03 — Inventory Movement
+[TABLE START]
+Record immutable quantity movements across external boundaries and locations so on-hand quantity is derived from events rather than editable balance fields.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | InventoryMovement; movement line; source/destination; quantity/UOM; item/lot/serial; business/effective/posting dates; source reference; movement type; reversal/supersession link.
+Required business/source inputs | source event (receipt/shipment/return/project issue/count adjustment/transfer); item; quantity/UOM; source/destination; lot/serial; legal entity; business/effective date; source identity/idempotency key.
+Server-resolved/derived context | UOM conversion version; item/location eligibility; ownership/custody; negative-stock policy; period state; source transaction state; valuation context; permissions.
+Explicit commands | CreateInventoryMovement; ValidateMovement; CommitMovement; ReverseMovement; SupersedeMovement; TransferInventory; ReceiveInventory; IssueInventory; AdjustInventoryFromApprovedCount
+Queries/retrieval | GetMovement; GetMovementChain; GetOnHand; GetOnHandAsOf; ListMovements; GetMovementLineage
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Draft→Validated→Committed→Valued→Reconciled; committed movement immutable; reversed/superseded separately.
+Permissions | inventory.movement.read; inventory.movement.create; inventory.movement.adjust; inventory.movement.reverse.
+Segregation of duties | Manual adjustment/reversal above threshold requires independent approval; source domain cannot create arbitrary inventory adjustment disguised as receipt/issue.
+Events produced | InventoryMovementCommitted; InventoryMovementReversed; InventoryTransferred; InventoryReceived; InventoryIssued; InventoryMovementExceptionRaised
+Dependencies | INV-01/02/04/05; AP receipts; AR fulfillment; PRJ-02; ACC; TAX; GOV; Evidence.
+Failure/degradation semantics | Duplicate idempotency key returns original result; insufficient/negative stock follows explicit policy; serial duplication or UOM ambiguity blocks commit. Hard-closed-period correction follows governed forward/reopen path.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Source identity, before/after derived quantity proof, UOM conversion, lot/serial, locations, approval, movement hash and downstream valuation/accounting references.
+NFR / resilience profile | C0/C1 high-volume path; exact quantities; ordered per item/location partition where necessary; replay-safe; no silent loss.
+Minimum negative-path certification | Duplicate receipt creates duplicate quantity; Serial-numbered unit appears in two locations; Negative stock allowed despite policy prohibition; Hard-closed movement backdated without correction path
+[TABLE END]
+Figure 7 — Immutable inventory movement and derived on-hand.
+[Heading1] INV-04 — Inventory Valuation
+[TABLE START]
+Assign deterministic monetary cost to inventory movements and on-hand stock using effective-dated accounting-policy methods and source-linked cost evidence.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | InventoryCostLayer/Pool; ValuationEntry; unit cost; inventory value; consumed cost; landed/conversion cost allocation; write-down/reversal; valuation run/version.
+Required business/source inputs | committed movements; purchase/production/conversion/landed costs; item/location/entity/book; opening layers; currency/FX; approved NRV/valuation evidence.
+Server-resolved/derived context | accounting framework/book; permitted valuation method; cost inclusion rules; allocation policy; rounding; FX; period state; NRV/write-down policy; account mappings.
+Explicit commands | ValueMovement; CreateValuationRun; RecalculateValuation; AllocateLandedCost; RecordInventoryWriteDown; ReverseWriteDown; RebuildCostLayersControlled; EmitInventoryAccountingEvent
+Queries/retrieval | GetInventoryValue; GetCostLayers; GetCOGSAssignment; GetValuationRun; GetInventoryValueAsOf; GetValuationEvidence
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Movement valuation Draft→Calculated→Validated→Final; run PopulationFrozen→Calculated→Approved→AccountingEventEmitted→Reconciled; adjustments supersede prior state.
+Permissions | inventory.valuation.read; inventory.valuation.run; inventory.valuation.adjust; inventory.valuation.approve.
+Segregation of duties | Operator cannot switch cost formula retroactively without approved accounting-policy migration; write-down/reversal requires evidence and approval where material.
+Events produced | InventoryValued; CostLayerCreated; InventoryWriteDownRecorded; InventoryWriteDownReversed; InventoryAccountingEventEmitted
+Dependencies | INV-01/03; AP cost sources; REF FX/UOM; ACC; TAX; DATA-07; Evidence.
+Failure/degradation semantics | Method not permitted by active accounting policy blocks valuation. Late costs/corrections trigger controlled revaluation rather than silent historical layer mutation.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Movement/cost-source IDs, method/policy version, cost-layer trace, FX/rounding, valuation evidence, approvals, accounting-event and reconciliation IDs.
+NFR / resilience profile | C0/C1; deterministic; scalable by item/location/book; exact decimals; full historical rebuild from movements and cost sources.
+Minimum negative-path certification | IFRS book uses prohibited LIFO profile; Late landed cost silently rewrites closed-period COGS; NRV write-down lacks evidence; Same movement consumes two cost layers twice
+[TABLE END]
+Figure 8 — Inventory valuation and cost-layer architecture.
+[Heading1] INV-05 — Stock Count
+[TABLE START]
+Govern physical/cycle count populations, observations, recounts and variance approvals while requiring all accepted quantity corrections to flow through INV-03 movements.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | StockCountSession; count population/snapshot; CountLine; observed quantity; recount; variance; reason; approval; adjustment proposal; completion certificate.
+Required business/source inputs | count scope; item/location population; count date/cutoff; system quantity snapshot; counter assignments; observations; lot/serial evidence; in-flight movement list.
+Server-resolved/derived context | count-control policy; blind-count rules; tolerance/materiality; independence/recount requirements; location/item state; period state; permissions.
+Explicit commands | CreateStockCount; FreezeCountPopulation; AssignCounters; RecordBlindCount; RequestRecount; ApproveCountVariance; GenerateAdjustmentMovements; CertifyStockCount; CancelStockCount
+Queries/retrieval | GetStockCount; GetCountLines; GetVarianceReport; GetCountSnapshot; GetAdjustmentStatus; GetCountEvidence
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Planned→PopulationFrozen→Counting→VarianceReview→Recount/Approved→AdjustmentsGenerated→Reconciled→Certified; Cancelled before certification.
+Permissions | inventory.count.read; inventory.count.plan; inventory.count.record; inventory.count.approve; inventory.count.certify.
+Segregation of duties | Counter cannot approve own material variance; system quantity hidden during blind count; adjustment generator cannot bypass INV-03 approval policy.
+Events produced | StockCountStarted; StockCountPopulationFrozen; StockCountVarianceDetected; StockCountVarianceApproved; StockCountAdjustmentRequested; StockCountCertified
+Dependencies | INV-01/02/03/04; GOV; DATA-07; ACC control; Evidence.
+Failure/degradation semantics | Population mutation after freeze invalidates certification; in-flight movements are explicitly reconciled to cutoff. Direct balance edits are prohibited.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Frozen population/watermark, counter identity, observations, recounts, variance policy, approvals, generated movement IDs and reconciliation certificate.
+NFR / resilience profile | C1 periodic/cycle workload; offline-safe capture where designed; deterministic cutoff; audit-grade evidence.
+Minimum negative-path certification | Counter sees system quantity in blind count; Population changes after freeze without invalidation; Variance approved by same counter; Count directly overwrites on-hand quantity
+[TABLE END]
+Figure 9 — Stock count, recount and adjustment flow.
+[Heading1] PRJ-01 — Project / Job Master
+[TABLE START]
+Maintain the financial project/job identity, WBS/work-package structure and accounting-policy bindings required for project costing and revenue/WIP without becoming a general project-management task system.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | FinancialProject; ProjectWorkPackage/WBS; legal entity; customer/contract references; project type; manager/cost center; accounting/billing policy refs; dimensions; lifecycle.
+Required business/source inputs | legal entity; project/job identifier; customer/contract; start/end; WBS; project type; responsible org; billing/costing attributes; currency; budget/commitment references.
+Server-resolved/derived context | accounting book; financial dimensions; project accounting policy; tax profile; recognition method eligibility; capitalization/WIP policy; permissions; period state.
+Explicit commands | CreateProject; ApproveProject; ActivateProject; AddWorkPackage; AmendFinancialProfile; SuspendProject; CloseProject; ReopenProjectControlled; LinkContract
+Queries/retrieval | GetProject; GetProjectAsOf; GetWBS; GetFinancialProfile; ListProjects; GetAvailableActions
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Draft→Approved→Active→Suspended→Closing→Closed; Reopened controlled. WBS versions effective-dated.
+Permissions | project.read; project.create; project.approve; project.financial.manage; project.close/reopen.
+Segregation of duties | Project creator cannot self-approve high-value/regulated project profile; closed project reopen requires independent approval; project manager cannot alter recognition policy after approved revenue runs without invalidation.
+Events produced | ProjectCreated; ProjectApproved; ProjectActivated; ProjectFinancialProfileChanged; ProjectClosed; ProjectReopened
+Dependencies | ORG; BIZ contract/task refs; REF; TAX; ACC; PRJ-02/03/04; GOV.
+Failure/degradation semantics | Project cannot span multiple legal entities as one accounting aggregate; group programs use separate entity projects with group reference. Missing policy/currency/book blocks activation.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Project/WBS versions, contract/customer refs, accounting/tax policy IDs, approvals and lifecycle evidence.
+NFR / resilience profile | C1 master; historical as-of; scalable hierarchy; no hidden cross-entity aggregation.
+Minimum negative-path certification | Single project posts costs across two legal entities; Recognition policy changed after run without invalidation; Closed project accepts new cost without controlled reopen; WBS deletion orphans historical cost
+[TABLE END]
+Figure 10 — Financial project master and source-linked cost capture.
+[Heading1] PRJ-02 — Project Cost Capture
+[TABLE START]
+Capture source-linked project/job cost attribution from AP, expenses, payroll, inventory, assets and allocations without double-posting costs already recognized by source domains.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | ProjectCostEntry; source identity; project/WBS; cost type; quantity/amount/currency; billable/capitalizable/WIP eligibility; source accounting reference; correction chain.
+Required business/source inputs | source-domain posted/accepted line; project/WBS; amount/quantity/currency; cost category; employee/vendor/item/asset refs; transaction/effective date; allocation basis.
+Server-resolved/derived context | project financial profile; source state; account/dimension mapping; capitalization/WIP eligibility; tax treatment; FX; period; duplicate-source detection; permissions.
+Explicit commands | CaptureProjectCost; ValidateProjectCost; ReclassifyProjectCost; ReverseProjectCost; AllocateSharedCostToProject; MarkBillableEligibility; CertifyCostPopulation
+Queries/retrieval | GetProjectCosts; GetCostByWBS; GetCostSourceLineage; GetUnallocatedCostExceptions; GetProjectCostAsOf
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Captured→Validated→Accepted→Reconciled; Reclassified/Reversed via linked entries; source accounting state remains separate.
+Permissions | project.cost.read; project.cost.capture; project.cost.reclassify; project.cost.adjust; project.cost.certify.
+Segregation of duties | Manual project-cost adjustment above threshold requires independent approval; project cost user cannot modify source AP/payroll/inventory facts.
+Events produced | ProjectCostCaptured; ProjectCostReclassified; ProjectCostReversed; ProjectCostPopulationCertified
+Dependencies | PRJ-01; AP; WFP/Payroll; INV-03/04; AST-02/03; ACC; TAX; DATA-07.
+Failure/degradation semantics | Duplicate source line is idempotently rejected/returned; source reversal propagates correction requirement. Capturing a cost does not automatically create a second GL posting.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Source-domain object/line/posting IDs, project mapping, allocation basis, FX, eligibility policy, corrections and reconciliation result.
+NFR / resilience profile | C1 high-volume; idempotent by source identity + attribution purpose; batch and event ingestion; historical rebuildable.
+Minimum negative-path certification | Same AP line captured twice to project; Source payroll reversal not reflected; Project cost capture creates duplicate GL expense; Manual cost amount differs from authoritative source without approved adjustment
+[TABLE END]
+Figure 11 — Project cost attribution without duplicate source posting.
+[Heading1] PRJ-03 — Project Revenue & WIP
+[TABLE START]
+Calculate project/job revenue recognition, WIP and contract-balance facts under approved accounting-framework policy while keeping billing, cash and accounting posting authorities separate.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | ProjectRecognitionRun; performance obligation/milestone mapping; measure of progress; recognized revenue/cost/margin; WIP/unbilled/contract asset/liability/deferred balance; estimate version; adjustment chain.
+Required business/source inputs | project/contract; performance obligations/milestones; transaction price/billing facts; project costs; progress evidence; estimates to complete; change orders/claims where approved; prior recognition; invoice facts.
+Server-resolved/derived context | accounting framework/book; recognition policy; point-in-time/over-time eligibility; progress method; variable-consideration constraints; FX; period state; tax treatment; approval/SoD.
+Explicit commands | CreateRecognitionRun; FreezeRecognitionPopulation; SetApprovedEstimate; CalculateProjectRevenue; CalculateProjectWIP; ValidateRecognitionRun; ApproveRecognitionRun; EmitRecognitionAccountingEvent; SupersedeRecognitionRun
+Queries/retrieval | GetRecognitionRun; GetRevenueSchedule; GetWIPOrContractBalance; GetProgressEvidence; GetRecognitionAsOf; ExplainRecognition
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Draft→PopulationFrozen→Calculated→Reviewed→Approved→AccountingEventEmitted→Reconciled/Certified; estimate/revision supersedes, never overwrites certified run.
+Permissions | project.revenue.read; project.revenue.run; project.estimate.manage; project.revenue.approve; project.revenue.supersede.
+Segregation of duties | Estimator/preparer cannot self-approve material estimate or recognition override; billing user cannot force revenue recognition; policy/method change invalidates approval.
+Events produced | ProjectRecognitionCalculated; ProjectRevenueApproved; ProjectWIPCalculated; ProjectRecognitionAccountingEventEmitted; ProjectRecognitionSuperseded
+Dependencies | PRJ-01/02; AR contract/invoice; ACC; TAX; REF FX; GOV; DATA-07; Evidence.
+Failure/degradation semantics | Missing progress evidence, inconsistent contract facts, closed period or unsupported recognition policy blocks certification. Billing/cash receipt never equals revenue by default.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Frozen source population, contract/performance-obligation refs, progress/estimate evidence, policy version, calculations, approvals, accounting-event and reconciliation IDs.
+NFR / resilience profile | C0/C1 period-end; exact decimals; deterministic from frozen inputs except approved estimates; historical reconstruction and close deadlines.
+Minimum negative-path certification | Invoice amount treated automatically as revenue; Progress estimate changed after approval without invalidation; Contract asset silently classified as inventory WIP; Recognition rerun duplicates GL posting
+[TABLE END]
+Figure 12 — Project revenue recognition, WIP and contract-balance boundary.
+[Heading1] PRJ-04 — Project Profitability
+[TABLE START]
+Provide reconciled, freshness-labeled project profitability and performance analytics from authoritative project cost/revenue/WIP and accounting facts without becoming a posting or recognition authority.
+[TABLE END]
+[TABLE START]
+Contract field | Build requirement
+Authoritative ownership | ProjectProfitabilitySnapshot/read model; revenue/cost/margin; billed/unbilled/WIP; commitments; forecast/ETC/EAC where configured; source watermark; reconciliation/freshness state.
+Required business/source inputs | certified PRJ-02 costs; PRJ-03 revenue/WIP; AR billing; AP commitments; ACC ledger/snapshot; budget/forecast where available; project hierarchy.
+Server-resolved/derived context | currency/presentation basis; management-accounting allocations; metric definitions; source watermarks; reconciliation state; freshness threshold; permissions.
+Explicit commands | BuildProfitabilitySnapshot; RefreshProfitabilityProjection; CertifyProfitabilitySnapshot; RebuildProjection
+Queries/retrieval | GetProjectProfitability; GetMarginBridge; GetCostRevenueDrilldown; GetProfitabilityAsOf; GetFreshness
+[TABLE END]
+[TABLE START]
+Control field | Build requirement
+State model | Projection Current/Stale/Rebuilding; Snapshot Draft→Reconciled→Certified; no business lifecycle authority.
+Permissions | project.profitability.read; project.profitability.certify.
+Segregation of duties | Analytics user cannot alter revenue/cost source facts; certification requires reconciliation owner separate from metric-model author where configured.
+Events produced | ProjectProfitabilityRefreshed; ProjectProfitabilitySnapshotCertified; ProjectProfitabilityBecameStale
+Dependencies | PRJ-01/02/03; AR/AP; ACC; FIN planning; DATA platform; Evidence.
+Failure/degradation semantics | Stale/unreconciled data is labeled and cannot be presented as certified. Missing source watermarks block certification.
+[TABLE END]
+[TABLE START]
+Evidence / NFR | Build requirement
+Evidence & lineage | Metric version, source IDs/watermarks, reconciliation result, FX/presentation basis and certification evidence.
+NFR / resilience profile | C2 read-heavy; projection rebuildable; freshness SLI; drilldown to authoritative sources; no autonomous writes.
+Minimum negative-path certification | Stale project margin shown as certified; Manual edit changes margin without source fact; Profitability snapshot omits source watermark; Analytics write changes recognition state
+[TABLE END]
+Figure 13 — Reconciled profitability read model.
+[Heading1] 8. Accounting-Impact & Source-Authority Matrix
+[TABLE START]
+Business fact | Source authority | Accounting consequence
+Asset acquisition/capitalization | AP/PRJ/other source + AST-03 approved event | AST emits accounting event → ACC-04; asset subledger reconciles to fixed-asset/control accounts.
+Depreciation | AST-02 approved run | Depreciation accounting event → ACC-04; accumulated depreciation reconciled by asset/book/period.
+Asset impairment/revaluation/disposal | AST-03 approved event using applicable accounting policy/evidence | Accounting event → ACC-04; proceeds may come from AR/Banking; original asset event remains immutable.
+Inventory receipt/issue/transfer | INV-03 movement | INV-04 determines monetary effect; accounting event → ACC-04 only where policy/source requires.
+Inventory valuation / write-down | INV-04 | Approved valuation event → ACC-04; quantity remains INV-03 authority.
+Stock-count variance | INV-05 approves; INV-03 creates adjustment | INV-04 values adjustment → ACC-04; no direct count-to-GL or count-to-balance mutation.
+Project source cost | AP/Payroll/INV/AST/ACC source | PRJ-02 attributes source cost; no duplicate GL posting unless controlled reclassification/capitalization requires it.
+Project revenue/WIP | PRJ-03 approved recognition run | Recognition/reclassification accounting event → ACC-04; AR invoice state is separate.
+Project profitability | PRJ-04 read model | No accounting consequence; must drill to authoritative source/subledger/GL facts.
+[TABLE END]
+Figure 14 — Subledger accounting-control and source-to-report lineage.
+[Heading1] 9. Subledger Reconciliation & Control Framework
+[TABLE START]
+Control | Mandatory assertion | Blocking behavior
+Assets → GL | Asset book gross cost, accumulated depreciation, impairment/revaluation and disposal balances reconcile to mapped GL control accounts by entity/book/period. | Material unexplained difference blocks close/certification.
+Depreciation completeness | All eligible active components are included once in the frozen run; no disposed/suspended/ineligible item included. | Missing/duplicate eligible population is P0/P1 depending materiality and blocks certification.
+Inventory quantity | Opening + committed movements + approved adjustments = derived on-hand by item/location/lot/serial. | Unexplained negative/duplicate serial/quantity break raises exception.
+Inventory value → GL | Valuation subledger equals GL inventory/COGS/write-down consequences by entity/book/period. | Unexplained difference blocks close.
+Stock count | Frozen system quantity + cutoff movements reconcile to physical observations and approved adjustment movements. | Unapproved variance cannot be hidden or directly cleared.
+Project cost completeness | Project cost population reconciles to source AP/payroll/inventory/asset/allocations using source IDs and purpose. | Missing/duplicate source capture blocks project certification.
+Project revenue/WIP → GL | Certified recognition/WIP run reconciles to posted revenue/contract balance/WIP accounts and AR billing separately. | Revenue/billing mismatch is explained, not forced to zero.
+Source-to-report | Every signed/reporting amount drills through GL/subledger to source event/document and policy version. | Missing lineage is a control exception, not a reporting-only warning.
+[TABLE END]
+[Heading1] 10. Inventory Valuation Method Governance
+[TABLE START]
+Policy area | Engineering rule
+Method registry | Specific identification, FIFO, weighted average and other framework-permitted profiles are versioned methods. The engine does not globally assume one GAAP.
+Accounting-framework constraints | Jurisdiction/accounting policy determines permitted methods. An IFRS profile rejects LIFO; another approved framework may permit methods not available under IFRS.
+Method changes | Changes are future-effective or processed through a controlled conversion/revaluation/migration plan. Historic cost layers retain their original method identity.
+Cost composition | Purchase, conversion, landed and other eligible costs are source-linked and policy-classified. Ineligible costs cannot be capitalized merely because they are available.
+NRV / impairment-like inventory adjustment | Write-down/reversal uses approved evidence and policy. It does not change physical quantity.
+Late-arriving cost | Late freight/landed cost or invoice correction creates controlled revaluation/reallocation and accounting correction according period state; closed-period history is not silently rewritten.
+[TABLE END]
+[Heading1] 11. Project Revenue / WIP Policy Boundary
+[TABLE START]
+Area | Build rule
+Contract/billing | AR owns invoices/credits and billing state. PRJ-03 consumes those facts but does not issue customer documents.
+Recognition | PRJ-03 applies the active accounting-framework/project-recognition policy to certified contract and progress evidence.
+Over-time vs point-in-time | The method is explicit and policy-validated. For over-time recognition, approved progress evidence and measure-of-progress version are mandatory.
+WIP vs contract balance | Inventory WIP, project WIP, unbilled revenue, contract asset and contract liability are separate policy-specific concepts; field names and reporting mappings preserve the distinction.
+Estimate changes | Estimate-to-complete, progress measure and variable consideration changes create new versioned inputs and may require reapproval/reperformance; prior certified run remains reconstructable.
+Borrowing costs / qualifying assets | Where applicable, IAS 23 or other framework policy may allow/require capitalization of qualifying borrowing costs; project services consume approved financing/capitalization inputs but do not invent eligible borrowing cost.
+Impairment / recoverability | Impairment decisions use approved applicable policy/evidence and create governed asset/project events; AI cannot autonomously set impairment amounts.
+[TABLE END]
+[Heading1] 12. Negative-Path Domain Certification
+[TABLE START]
+# | Scenario | Certification requirement
+1 | Asset capitalized without source acquisition or approval evidence | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+2 | Same physical asset assigned to two legal owners for same effective period | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+3 | Asset book value edited directly | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+4 | Component with distinct useful life omitted despite configured componentization | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+5 | Depreciation run includes disposed component | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+6 | Depreciation run misses eligible active component | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+7 | Depreciation rerun posts twice | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+8 | Useful-life/residual-value change after approval does not invalidate run | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+9 | Impairment event lacks approved evidence | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+10 | Revaluation event bypasses accounting policy | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+11 | Cross-entity asset transfer treated as metadata-only change | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+12 | Disposed asset event overwritten instead of corrected | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+13 | Commercial product catalog changes inventory valuation method | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+14 | Historic item movement reinterpreted using new UOM mapping | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+15 | Movement received into retired/quarantined location without authority | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+16 | Duplicate receipt idempotency key creates duplicate stock | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+17 | Serial-numbered item exists in two locations simultaneously | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+18 | Movement silently creates prohibited negative stock | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+19 | UOM conversion ambiguity guessed | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+20 | Inventory movement committed with no source identity | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+21 | Valuation method not permitted by active accounting-framework policy | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+22 | Late cost silently rewrites closed-period cost layer | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+23 | Same issue consumes cost layer twice | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+24 | Inventory write-down lacks approved NRV/policy evidence | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+25 | Inventory write-down changes physical quantity | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+26 | Stock count population changes after freeze without invalidation | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+27 | Blind counter receives expected system quantity | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+28 | Counter self-approves material variance | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+29 | Stock count directly edits on-hand balance | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+30 | In-flight movements omitted from count cutoff reconciliation | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+31 | Project spans multiple legal entities as one accounting aggregate | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+32 | WBS deletion orphans historic project cost | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+33 | Same AP/payroll source line captured twice to project | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+34 | Project cost capture creates duplicate GL expense | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+35 | Source reversal fails to correct project cost | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+36 | Invoice amount automatically treated as project revenue | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+37 | Project progress estimate changed after approval without invalidation | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+38 | Contract asset mislabeled as inventory WIP | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+39 | Recognition run rerun duplicates accounting posting | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+40 | Closed project accepts new cost without controlled reopen | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+41 | Project profitability displayed as certified while source stale/unreconciled | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+42 | Analytics user edits project margin manually | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+43 | Hard-closed-period inventory/asset/project event silently backdated | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+44 | AI-generated valuation/impairment/revenue amount enters authoritative state without deterministic policy/human approval | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+45 | Source-to-report trace missing for asset/inventory/project balance | Automated/controlled test proves fail-safe blocking or governed correction, preserves source/policy evidence, prevents duplicate quantity/value/revenue/accounting effect, and leaves the affected subledger↔GL/source population fully reconciliable.
+[TABLE END]
+[Heading1] 13. Definition of Ready — Individual Service
+[TABLE START]
+# | Ready gate
+1 | Authoritative/prohibited ownership approved
+2 | Physical vs financial/book authority explicitly separated
+3 | Entity/book/period/effective-date semantics defined
+4 | Commands/queries/states/errors instantiated
+5 | Policy/method/UOM/FX/rounding semantics defined
+6 | Permissions/SoD and protected approval fields defined
+7 | Idempotency/concurrency and correction behavior specified
+8 | Accounting event and reconciliation impacts mapped
+9 | Source identity/evidence/retention/legal-hold requirements mapped
+10 | NFR/RPO/RTO/capacity and batch/close dependencies defined
+11 | Migration/opening-state behavior defined where applicable
+12 | Golden/property/boundary/historical/negative tests approved
+[TABLE END]
+[Heading1] 14. Definition of Done — Individual Service
+[TABLE START]
+# | Done gate
+1 | Machine-readable contracts published and compatibility certified
+2 | No direct balance/value/GL bypass remains
+3 | Idempotency and duplicate-effect tests pass
+4 | State/concurrency/approval invalidation tests pass
+5 | Multi-book/framework policy tests pass where applicable
+6 | Asset/inventory/project subledger reconciliation controls pass
+7 | Closed-period correction/reopen tests pass
+8 | Migration/opening-state and historical replay tests pass
+9 | Security/residency/privacy/legal-hold tests pass
+10 | Performance/batch/close/runbook tests pass
+11 | Source-to-report evidence verifies source and policy hashes
+12 | Release certificate has no unresolved mandatory control
+[TABLE END]
+[Heading1] 15. Recommended Engineering Sequence
+[TABLE START]
+Wave | Services | Reason
+1 | INV-01 + INV-02 + AST-01 + PRJ-01 | Establish stable master identities, entity scope, policy bindings and hierarchies.
+2 | INV-03 | Build immutable quantity movement source before valuation/count adjustment.
+3 | INV-04 | Build deterministic valuation/cost layers and inventory accounting events.
+4 | INV-05 | Add controlled physical/cycle count and adjustment generation.
+5 | AST-03 + AST-02 | Build asset economic events, then deterministic depreciation and reconciliation.
+6 | PRJ-02 | Capture and reconcile source-linked project costs without duplicate accounting.
+7 | PRJ-03 | Add revenue recognition/WIP/contract balance with policy and close controls.
+8 | PRJ-04 + full domain certification | Add reconciled analytics and complete end-to-end source-to-report certification.
+[TABLE END]
+[Heading1] 16. Controlled Pre-Production Decisions
+[TABLE START]
+Decision | Required owner / evidence
+Asset classes, capitalization thresholds and componentization policy | Controller/Accounting + local jurisdiction validation; versioned by entity/book.
+Depreciation methods, useful-life defaults, residual-value review and conventions | Controller/Accounting; framework/jurisdiction policy and test fixtures.
+Impairment/revaluation/held-for-sale treatment | Accounting/Finance/Legal where relevant; applicable framework profile and approval evidence.
+Inventory item types, UOM conversions, lot/serial controls and negative-stock policy | Operations/Supply Chain + Accounting + QA.
+Inventory valuation method by entity/book/item class | Controller/Accounting; accounting-framework constraints and migration plan for changes.
+Cost inclusion/landed-cost allocation and NRV policy | Accounting/Tax/Operations; deterministic allocation rules and source evidence.
+Stock-count cadence, blind/recount rules, tolerances and materiality | Operations/Controller/Audit; physical-control procedure and SoD matrix.
+Project types, WBS conventions and cost eligibility | Project Finance/Accounting/Product.
+Project recognition/WIP/contract-balance policy | Controller/Revenue Accounting/Legal/Tax; IFRS 15 or applicable-GAAP profile and evidence.
+Borrowing-cost capitalization/qualifying asset policy | Treasury/Accounting/Tax; IAS 23 or applicable-GAAP configuration.
+Numeric SLOs/RPO/RTO/retention | SRE/Finance/Operations/Compliance after representative load, close and legal analysis.
+[TABLE END]
+[Heading1] 17. Prohibited Domain Anti-Patterns
+[TABLE START]
+Anti-pattern | Why prohibited
+Store asset net book value as an editable master field | Creates a second source of truth separate from asset events/depreciation.
+One global depreciation schedule for all books | Different accounting/tax/management books may require different bases and policies.
+Edit posted asset event | Destroys historical evidence and correction lineage.
+Physical asset transfer changes legal owner automatically | Custody/location is not legal ownership; cross-entity transfers need governed accounting/legal treatment.
+Maintain inventory on-hand as independently editable balance | Quantity must be derived from immutable movements and approved adjustments.
+Let product catalog control inventory valuation | Commercial pricing/offer data is not inventory-accounting policy.
+Hardcode FIFO globally | Platform must support framework-specific policy; methods are governed and effective-dated.
+Use stock count to overwrite quantity | Count variance must create an auditable adjustment movement.
+Project cost subledger reposts every source cost to GL | Creates duplicated expenses/assets and breaks source authority.
+Treat invoice or cash receipt as revenue by default | Billing, cash and revenue recognition are separate facts.
+Use “WIP” for every unbilled/contract balance | Inventory WIP, contract asset/liability and project WIP have different accounting meaning.
+Allow analytics to alter project profitability inputs | PRJ-04 is a read model only.
+Backdate into hard-closed period to “fix” subledger | Requires governed reopen or forward correction and re-reconciliation.
+Let AI set impairment, valuation or recognition amount authoritatively | Material accounting outcomes require deterministic policy/evidence and accountable approval.
+[TABLE END]
+[Heading1] 18. Current Accounting-Framework Architecture Notes
+[TABLE START]
+IAS 16 Property, Plant and Equipment establishes principles for recognizing property, plant and equipment, measuring carrying amounts, and depreciation/impairment. ZoikoSuite therefore separates stable asset identity from book-specific cost, depreciation and subsequent-event history, and supports component-level schedules under approved policy.
+[TABLE END]
+[TABLE START]
+IAS 2 Inventories requires inventories to be measured at the lower of cost and net realizable value and describes specific identification, FIFO and weighted-average cost formulas. The platform therefore treats cost formula as an effective-dated accounting-policy profile and must reject a method not permitted by the active framework; it does not hardcode one global method.
+[TABLE END]
+[TABLE START]
+IFRS 15 Revenue from Contracts with Customers recognizes revenue based on transfer of promised goods/services and distinguishes performance satisfied over time from point-in-time recognition. PRJ-03 therefore separates contract/billing facts from recognition, requires versioned progress evidence for over-time methods, and keeps contract assets/liabilities distinct from inventory WIP.
+[TABLE END]
+[TABLE START]
+IAS 23 requires borrowing costs directly attributable to a qualifying asset to form part of that asset cost under its criteria; other borrowing costs are expensed. ZoikoSuite therefore models borrowing-cost capitalization as a controlled accounting-policy input rather than a free-form project-cost choice. IAS 36 separately governs impairment of many non-financial assets; impairment events require approved recoverability evidence and never arise from an AI guess.
+[TABLE END]
+Architecture references: IFRS Foundation — IAS 16 Property, Plant and Equipment; IAS 2 Inventories; IFRS 15 Revenue from Contracts with Customers; IAS 23 Borrowing Costs; IAS 36 Impairment of Assets. ZoikoSuite remains accounting-framework neutral: jurisdiction/accounting-policy packs determine the applicable GAAP treatment. This engineering standard is not accounting, tax or legal advice and is not itself a compliance certification.
+[Heading1] 19. Final Architecture Decision
+[TABLE START]
+APPROVED BASELINE: ZoikoSuite Assets, Inventory & Project Accounting is implemented as an event-driven, multi-book and evidence-first subledger domain. Asset identity/book values, inventory quantity/value, and project cost/revenue/WIP remain separate governed facts. All material calculations are deterministic under versioned policy, all corrections preserve history, all accounting effects flow through ACC-04, and each subledger must reconcile to source populations and the GL before certification. The domain is build-ready only when duplicate movement/posting, closed-period correction, count independence, framework-specific valuation, revenue-recognition evidence and source-to-report negative paths are enforced in code and certified end-to-end.
+[TABLE END]

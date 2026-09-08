@@ -1,0 +1,4 @@
+DROP TRIGGER IF EXISTS trg_reject_recognition_reversal_delete ON accrual_recognition_reversals;
+DROP TRIGGER IF EXISTS trg_reject_recognition_reversal_update ON accrual_recognition_reversals;
+DROP FUNCTION IF EXISTS reject_recognition_reversal_mutation();
+DROP TABLE IF EXISTS accrual_recognition_reversals;

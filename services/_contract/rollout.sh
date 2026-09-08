@@ -25,7 +25,7 @@ SERVICES_DIR="$PWD/.."
 # already carry legal_entity_id in internal/domain — this reflects the platform as
 # built, not an aspiration.
 ENTITY_SCOPED="access-control-svc accounts-payable-svc accounts-receivable-svc \
-anomaly-detection-svc authorization-svc bank-reconciliation-svc banking-connector-svc \
+anomaly-detection-svc asset-management-svc authorization-svc bank-reconciliation-svc banking-connector-svc \
 benefits-svc board-resolutions-svc carta-svc clause-template-svc commercial-account-svc \
 compensation-svc compliance-risk-scoring-svc compliance-status-svc \
 connectivity-api-bridge-svc consolidation-svc contract-lifecycle-svc \
@@ -82,7 +82,7 @@ audit-event-store-svc hris-connector-svc"
 # carries book_id today so callers can begin sending it; flipping these to
 # Required is a one-line change per service once REF-06 ships.
 ACCOUNTING="general-ledger-svc accounts-payable-svc accounts-receivable-svc \
-consolidation-svc intercompany-accounting-svc financial-close-svc migration-integrity-svc \
+asset-management-svc consolidation-svc intercompany-accounting-svc financial-close-svc migration-integrity-svc \
 reporting-orchestration-svc metric-registry-svc corporate-tax-svc vat-gst-svc \
 withholding-tax-svc tax-determination-svc payroll-tax-svc treasury-svc \
 bank-reconciliation-svc reconciliation-intelligence-svc"

@@ -1,0 +1,87 @@
+================================================================================
+TABLE 0 rows= 1 cols= 1
+0 ['ZOIKOSUITE | Master Wireframe & | Engineering Standards Register | Canonical Documents #1–44 | Architecture • Engineering • Control • Shared Services']
+================================================================================
+TABLE 1 rows= 4 cols= 2
+0 ['Document Status', 'Canonical master register']
+1 ['Date', '24 August 2026']
+2 ['Coverage', 'Foundational standards • Core service architecture • Shared horizontal control planes']
+3 ['Total Documents', '44']
+================================================================================
+TABLE 2 rows= 1 cols= 3
+0 ['15 | FOUNDATIONAL | Architecture, engineering and control standards', '16 | CORE SERVICES | Domain and service architecture wireframes', '13 | SHARED CONTROLS | Horizontal control-plane wireframes']
+================================================================================
+TABLE 3 rows= 1 cols= 1
+0 ['44 controlled documents • one continuous engineering register • no duplicate numbering']
+================================================================================
+TABLE 4 rows= 1 cols= 1
+0 ['PART I — FOUNDATIONAL ARCHITECTURE & ENGINEERING STANDARDS']
+================================================================================
+TABLE 5 rows= 16 cols= 3
+0 ['#', 'Document ID', 'Wireframe / Engineering Standard']
+1 ['1', 'ZS-DATA-001', 'ZoikoSuite Global Canonical Data Model, Data Dictionary & ERD']
+2 ['2', 'ZS-ACC-KERNEL-001', 'ZoikoSuite Global Accounting Kernel — Detailed Engineering Wireframe & Posting Rules Standard']
+3 ['3', 'ZS-STATE-001', 'ZoikoSuite Business Object State Machine, Workflow & Approval Catalogue']
+4 ['4', 'ZS-API-001', 'ZoikoSuite Global API, Command & Integration Contract Standard']
+5 ['5', 'ZS-EVENT-001', 'ZoikoSuite Enterprise Domain Event Catalogue & Event Contract Standard']
+6 ['6', 'ZS-IAM-001', 'ZoikoSuite Global Authorization, RBAC/ABAC & Segregation-of-Duties Standard']
+7 ['7', 'ZS-JUR-001', 'ZoikoSuite Global Jurisdiction Pack & Regulatory Rule Architecture Standard']
+8 ['8', 'ZS-CONTROL-001', 'ZoikoSuite Global Financial Reconciliation & Control Framework']
+9 ['9', 'ZS-SEC-001', 'ZoikoSuite Global Security Architecture & Secure Engineering Standard']
+10 ['10', 'ZS-QA-001', 'ZoikoSuite Engineering Verification, Certification & Acceptance Standard']
+11 ['11', 'ZS-MIG-001', 'ZoikoSuite Global Migration, Opening Balance & Cutover Standard']
+12 ['12', 'ZS-NFR-001', 'ZoikoSuite Global Non-Functional Requirements, SLO & Resilience Standard']
+13 ['13', 'ZS-OPS-001', 'ZoikoSuite Global Operational Runbook & Production Control Standard']
+14 ['14', 'ZS-DATA-GOV-001', 'ZoikoSuite Global Data Governance, Evidence, Lineage, Retention & Legal Hold Standard']
+15 ['15', 'ZS-SVC-SPEC-001', 'ZoikoSuite Detailed Service Requirements Specification & Engineering Contract Standard']
+================================================================================
+TABLE 6 rows= 1 cols= 1
+0 ['PART II — CORE DOMAIN & SERVICE ARCHITECTURE']
+================================================================================
+TABLE 7 rows= 17 cols= 3
+0 ['#', 'Document ID', 'Wireframe / Engineering Standard']
+1 ['16', 'ZS-SVC-A-001', 'Governance & Control Plane']
+2 ['17', 'ZS-SVC-B-001', 'Accounting & Record-to-Report']
+3 ['18', 'ZS-SVC-C-001', 'Revenue, Billing & Accounts Receivable']
+4 ['19', 'ZS-SVC-D-001', 'Procurement, Expenses & Accounts Payable']
+5 ['20', 'ZS-SVC-E-001', 'Banking, Cash & Treasury']
+6 ['21', 'ZS-SVC-F-001', 'Tax, E-Invoicing & Regulatory Compliance']
+7 ['22', 'ZS-SVC-G-001', 'Assets, Inventory & Project Accounting']
+8 ['23', 'ZS-SVC-H-001', 'Financial, Statutory & Regulatory Reporting']
+9 ['24', 'ZS-SVC-I-001', 'Organization, Legal Entity & Global Reference Data']
+10 ['25', 'ZS-SVC-J-001', 'Planning, Forecasting & Performance']
+11 ['26', 'ZS-SVC-K-001', 'Audit & Assurance']
+12 ['27', 'ZS-SVC-L-001', 'Workforce & Payroll']
+13 ['28', 'ZS-SVC-M-001', 'Integration & Interoperability']
+14 ['29', 'ZS-SVC-N-001', 'Data, Search, Analytics & AI']
+15 ['30', 'ZS-SVC-O-001', 'Legal, Corporate Governance & Contract Lifecycle']
+16 ['31', 'ZS-SVC-P-001', 'Business Operations & Content Services']
+================================================================================
+TABLE 8 rows= 1 cols= 1
+0 ['PART III — SHARED HORIZONTAL CONTROL PLANES']
+================================================================================
+TABLE 9 rows= 14 cols= 3
+0 ['#', 'Document ID', 'Wireframe / Engineering Standard']
+1 ['32', 'ZS-SVC-Q-001', 'Commercial Platform Billing, Subscription & Entitlement']
+2 ['33', 'ZS-SVC-R-001', 'Workflow, Approval, Case & Obligation Control']
+3 ['34', 'ZS-SVC-S-001', 'Document, Record, Retention & Legal-Hold Control']
+4 ['35', 'ZS-SVC-T-001', 'External Integration, Connector & Data Exchange Control']
+5 ['36', 'ZS-SVC-U-001', 'Enterprise Master Data, Legal Entity, Party & Reference Data Control']
+6 ['37', 'ZS-SVC-V-001', 'Policy, Rules, Decision & Jurisdictional Applicability Control']
+7 ['38', 'ZS-SVC-W-001', 'Privacy, Consent, Purpose & Data Rights Control']
+8 ['39', 'ZS-SVC-X-001', 'AI Governance, Model, Prompt & Human-Oversight Control']
+9 ['40', 'ZS-SVC-Y-001', 'Notification, Communication & Delivery Control']
+10 ['41', 'ZS-SVC-Z-001', 'Data Quality, Reconciliation, Lineage & Control Totals Control']
+11 ['42', 'ZS-SVC-AA-001', 'Platform Configuration, Feature Flag, Environment & Change Control']
+12 ['43', 'ZS-SVC-AB-001', 'Enterprise Search, Indexing, Query & Secure Retrieval Control']
+13 ['44', 'ZS-SVC-AC-001', 'Governed Reporting, Analytics, Semantic Metrics & Export Control']
+================================================================================
+TABLE 10 rows= 1 cols= 1
+0 ['Documents #1–44 constitute the complete current ZoikoSuite engineering master register.']
+================================================================================
+TABLE 11 rows= 5 cols= 3
+0 ['Register Segment', 'Range', 'Count']
+1 ['Foundational standards', '#1–15', '15']
+2 ['Core domain/service architecture', '#16–31', '16']
+3 ['Shared horizontal control planes', '#32–44', '13']
+4 ['TOTAL CONTROLLED DOCUMENTS', '44']

@@ -121,6 +121,7 @@ financial_close:financial-close
 bank_reconciliation:bank-reconciliation
 intercompany_accounting:intercompany-accounting
 consolidation_svc:consolidation
+asset_management:asset-management
 invoice_approval:invoice-approval
 employee_master:employee-master
 employment_contracts:employment-contracts
@@ -224,7 +225,7 @@ echo "Granting least-privilege runtime access to zoiko_app (databases with no pe
 zoiko_app_granted=0
 zoiko_app_skipped=0
 for db in \
-    access_control accounts_payable accounts_receivable ai_governance audit_event_store \
+    access_control accounts_payable accounts_receivable ai_governance asset_management audit_event_store \
     authorization_svc bank_reconciliation benefits board_resolutions capability_registry \
     clause_template commercial_account compensation configuration_feature_flag consolidation_svc \
     contract_lifecycle corporate_actions corporate_tax counterparty_management decision_support \
