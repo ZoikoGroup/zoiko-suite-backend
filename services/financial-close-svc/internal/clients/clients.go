@@ -494,6 +494,52 @@ func (c *Clients) PostAccrualRecognitionJournal(ctx context.Context, tenantID, l
 	return journal.JournalID, nil
 }
 
+// glReverseJournalResponse mirrors general-ledger-svc's own
+// domain.JournalWithLines — only the field this client needs.
+type glReverseJournalResponse struct {
+	JournalID string `json:"journal_id"`
+}
+
+// ReverseGLJournal is ACC-07's own closure of "Auto-reversal duplicates" —
+// it calls general-ledger-svc's real ReverseJournal (the same primitive
+// ACC-04/ACC-05/ACC-12 all use), which is itself idempotent on
+// correlation_id: a retried reversal for the same journal returns the
+// SAME reversing journal rather than a second one. correlationID here is
+// the caller's own idempotency anchor, distinct from the recognition's
+// own correlation_id (schedule_id+fiscal_period) — reversing a posting is
+// a different idempotent operation from creating it.
+func (c *Clients) ReverseGLJournal(ctx context.Context, tenantID, principalID, journalID, reason, correlationID string) (reversingJournalID string, err error) {
+	payload, err := json.Marshal(map[string]string{"reason": reason, "correlation_id": correlationID})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/journals/"+journalID+"/reverse", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", domain.ErrJournalPostingFailed
+	}
+	var out glReverseJournalResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.JournalID == "" {
+		return "", domain.ErrGLServiceUnavailable
+	}
+	return out.JournalID, nil
+}
+
 func (c *Clients) createGLJournal(ctx context.Context, tenantID, principalID string, body glCreateJournalRequest) (*glJournalCreateResponse, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -783,8 +829,51 @@ type apInvoice struct {
 	Status    string `json:"status"`
 	// DueDate is the only business date accounts-payable-svc carries — there is
 	// no invoice_date column — so it is what places an invoice in a period.
-	DueDate time.Time `json:"due_date"`
-	Amount  float64   `json:"amount"`
+	DueDate       time.Time `json:"due_date"`
+	Amount        float64   `json:"amount"`
+	InvoiceNumber string    `json:"invoice_number"`
+	VendorID      string    `json:"vendor_id"`
+}
+
+// CheckAPInvoiceExists is CheckARInvoiceExists' own mirror for accounts-
+// payable-svc — ACC-17's "Open AR included both in history and opening
+// state" negative path applies identically to AP per the spec's own
+// Dependencies field ("AR/AP/Bank/Tax source domains").
+func (c *Clients) CheckAPInvoiceExists(ctx context.Context, tenantID, legalEntityID, vendorID, invoiceNumber string) (bool, error) {
+	u, err := url.Parse(c.apURL + "/v1/invoices")
+	if err != nil {
+		return false, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("vendor_id", vendorID)
+	q.Set("limit", strconv.Itoa(subledgerPageLimit))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, domain.ErrAPServiceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, domain.ErrAPServiceUnavailable
+	}
+	var list []apInvoice
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return false, err
+	}
+	for _, inv := range list {
+		if inv.InvoiceNumber == invoiceNumber {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // subledgerPageLimit is the largest page AP/AR will serve one request
@@ -940,10 +1029,54 @@ func day(t time.Time) time.Time {
 // ---------------------------------------------------------------------------
 
 type arInvoice struct {
-	InvoiceID string    `json:"invoice_id"`
-	Status    string    `json:"status"`
-	DueDate   time.Time `json:"due_date"`
-	Amount    float64   `json:"amount"`
+	InvoiceID     string    `json:"invoice_id"`
+	Status        string    `json:"status"`
+	DueDate       time.Time `json:"due_date"`
+	Amount        float64   `json:"amount"`
+	InvoiceNumber string    `json:"invoice_number"`
+	CustomerID    string    `json:"customer_id"`
+}
+
+// CheckARInvoiceExists is ACC-17's own closure of "Open AR included both
+// in history and opening state" — it asks accounts-receivable-svc's real
+// register whether this customer already has a real, live invoice under
+// this invoice_number, rather than trusting the migration operator's own
+// crosswalk to be free of items that already exist elsewhere.
+func (c *Clients) CheckARInvoiceExists(ctx context.Context, tenantID, legalEntityID, customerID, invoiceNumber string) (bool, error) {
+	u, err := url.Parse(c.arURL + "/v1/invoices")
+	if err != nil {
+		return false, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("customer_id", customerID)
+	q.Set("limit", strconv.Itoa(subledgerPageLimit))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, domain.ErrARServiceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, domain.ErrARServiceUnavailable
+	}
+	var list []arInvoice
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return false, err
+	}
+	for _, inv := range list {
+		if inv.InvoiceNumber == invoiceNumber {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // GetARSubledgerTotal sums the OUTSTANDING (not yet PAID) balance of every

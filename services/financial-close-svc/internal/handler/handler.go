@@ -55,6 +55,9 @@ type Store interface {
 	AmendAccrualSchedule(ctx context.Context, scheduleID string, totalAmount float64, periodCount int) error
 	CreateRecognitionInstance(ctx context.Context, inst *domain.RecognitionInstance) (created bool, err error)
 	ListRecognitionInstances(ctx context.Context, scheduleID string) ([]domain.RecognitionInstance, error)
+	GetRecognitionInstanceByPeriod(ctx context.Context, scheduleID, fiscalPeriod string) (*domain.RecognitionInstance, error)
+	GetRecognitionReversalByInstance(ctx context.Context, recognitionInstanceID string) (*domain.RecognitionReversal, error)
+	CreateRecognitionReversal(ctx context.Context, rev *domain.RecognitionReversal) (created bool, err error)
 
 	// ACC-08 (Prepayments & Deferrals) — economically the mirror of ACC-07,
 	// see domain.PrepaymentSchedule's doc comment.
@@ -76,6 +79,9 @@ type Store interface {
 	GetAllocationRuleVersion(ctx context.Context, ruleVersionID string) (*domain.AllocationRule, error)
 	ListAllocationRules(ctx context.Context, legalEntityID string) ([]domain.AllocationRule, error)
 	ApproveAllocationRule(ctx context.Context, ruleVersionID, principalID string, at time.Time) error
+	// SupersedeAllocationRule is ACC-09's own SupersedeAllocationRule
+	// command — see its own doc comment in internal/store.
+	SupersedeAllocationRule(ctx context.Context, ruleID string, newVersion *domain.AllocationRule, supersededAt time.Time) error
 	ActivateAllocationRule(ctx context.Context, ruleVersionID string) error
 	CreateAllocationRun(ctx context.Context, run *domain.AllocationRun) error
 	GetAllocationRunByRuleAndPeriod(ctx context.Context, ruleID, fiscalPeriod string) (*domain.AllocationRun, error)
@@ -120,6 +126,14 @@ type Store interface {
 	// doc comment for the authority boundary these implement.
 	RecordLineageEdge(ctx context.Context, edge *domain.LineageEdge) error
 	ListLineageEdgesTo(ctx context.Context, toType, toID string) ([]domain.LineageEdge, error)
+	// ListLineageEdgesToAsOf/CreateTracePathVerification/
+	// CreateQuarantinedLineageGap/ListQuarantinedLineageGaps back
+	// GetLineageAsOf/VerifyTracePath/QuarantineBrokenLineage — see their
+	// own doc comments in internal/store.
+	ListLineageEdgesToAsOf(ctx context.Context, toType, toID string, asOf time.Time) ([]domain.LineageEdge, error)
+	CreateTracePathVerification(ctx context.Context, v *domain.TracePathVerification) error
+	CreateQuarantinedLineageGap(ctx context.Context, g *domain.QuarantinedLineageGap) error
+	ListQuarantinedLineageGaps(ctx context.Context, legalEntityID string) ([]domain.QuarantinedLineageGap, error)
 	ListPostedJournalRefs(ctx context.Context, legalEntityID string) ([]domain.PostedJournalRef, error)
 	GetLineageProjectionStatus(ctx context.Context, legalEntityID string) (*domain.LineageProjectionStatus, error)
 	UpsertLineageProjectionStatus(ctx context.Context, legalEntityID, status string, degradedReason *string, at *time.Time) error
@@ -145,6 +159,11 @@ type Clients interface {
 	// anywhere blocked every period forever.
 	GetUnsettledAPInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error)
 	GetUnsettledARInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error)
+	// CheckARInvoiceExists/CheckAPInvoiceExists back ACC-17's own closure
+	// of "Open AR included both in history and opening state" — see their
+	// doc comments in internal/clients.
+	CheckARInvoiceExists(ctx context.Context, tenantID, legalEntityID, customerID, invoiceNumber string) (bool, error)
+	CheckAPInvoiceExists(ctx context.Context, tenantID, legalEntityID, vendorID, invoiceNumber string) (bool, error)
 	UploadCloseEvidence(ctx context.Context, tenantID, legalEntityID, periodName string, trialBalance map[string]float64, principalID string) (string, error)
 	// GetControlAccountCode resolves an ACC-06 caller-declared mapping key to
 	// the real chart-registered account code it currently names, via GL's
@@ -155,6 +174,9 @@ type Clients interface {
 	// PostAccrualRecognitionJournal is ACC-07's only path to the ledger —
 	// see its doc comment in internal/clients for why.
 	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error)
+	// ReverseGLJournal is ACC-07's own closure of "Auto-reversal
+	// duplicates" — see its doc comment in internal/clients.
+	ReverseGLJournal(ctx context.Context, tenantID, principalID, journalID, reason, correlationID string) (reversingJournalID string, err error)
 	// GetAccountStatus/PostAllocationJournal back ACC-09 — see their doc
 	// comments in internal/clients.
 	GetAccountStatus(ctx context.Context, tenantID, principalID, accountCode string) (status string, err error)
@@ -198,6 +220,13 @@ const (
 	actionAccrualAmend     = "ACCRUAL_AMEND"
 	actionAccrualCancel    = "ACCRUAL_CANCEL"
 	actionAccrualView      = "ACCRUAL_VIEW"
+	// actionAccrualReverse is deliberately its own action, not reused from
+	// actionAccrualRecognize — reversing a posted recognition is a
+	// materially more sensitive act than posting one in the first place
+	// (it un-does an already-evidenced accounting fact), the same
+	// reasoning actionPeriodReopen already applies to reopening a locked
+	// period versus closing one.
+	actionAccrualReverse = "ACCRUAL_RECOGNITION_REVERSE"
 
 	// ACC-08 (Prepayments & Deferrals) actions — same segregation-of-duties
 	// posture as ACC-07's: approve is its own action, separate from create.
@@ -212,10 +241,11 @@ const (
 	// posture: approving a rule is its own action, separate from creating
 	// one, and executing/reprocessing (both post real ledger entries) are
 	// separate again from viewing.
-	actionAllocationRuleCreate  = "ALLOCATION_RULE_CREATE"
-	actionAllocationRuleApprove = "ALLOCATION_RULE_APPROVE"
-	actionAllocationExecute     = "ALLOCATION_EXECUTE"
-	actionAllocationView        = "ALLOCATION_VIEW"
+	actionAllocationRuleCreate    = "ALLOCATION_RULE_CREATE"
+	actionAllocationRuleApprove   = "ALLOCATION_RULE_APPROVE"
+	actionAllocationRuleSupersede = "ALLOCATION_RULE_SUPERSEDE"
+	actionAllocationExecute       = "ALLOCATION_EXECUTE"
+	actionAllocationView          = "ALLOCATION_VIEW"
 
 	// ACC-10 (FX Revaluation) actions — same segregation-of-duties posture:
 	// approve and post are each their own action, and both are more
@@ -250,8 +280,15 @@ const (
 	// ACC-18 (Source-to-Report Traceability) actions. Rebuilding the
 	// projection is a heavier operation than reading it, so it gets its
 	// own action rather than reusing the view grant.
-	actionLineageView    = "LINEAGE_VIEW"
-	actionLineageRebuild = "LINEAGE_REBUILD"
+	actionLineageView       = "LINEAGE_VIEW"
+	actionLineageRebuild    = "LINEAGE_REBUILD"
+	actionLineageVerifyPath = "LINEAGE_VERIFY_PATH"
+	// actionLineageQuarantine is deliberately its own action, distinct
+	// from actionLineageRebuild — accepting a gap as permanently known
+	// (rather than fixing it) is a materially more sensitive decision
+	// than an ordinary rebuild, and it changes what
+	// VerifyLineageCompleteness reports from that point on.
+	actionLineageQuarantine = "LINEAGE_QUARANTINE"
 )
 
 type Handler struct {
@@ -298,6 +335,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/cancel", h.CancelFutureAccrual)
 		r.Post("/{id}/recognize", h.RunAccrualRecognition)
 		r.Get("/{id}/recognitions", h.ListRecognitions)
+		r.Post("/{id}/recognitions/{fiscal_period}/reverse", h.ReverseAccrualRecognition)
 	})
 	r.Route("/v1/prepayments", func(r chi.Router) {
 		r.Post("/", h.CreatePrepayment)
@@ -315,6 +353,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListAllocationRules)
 		r.Get("/{id}", h.GetAllocationRule)
 		r.Post("/{id}/approve", h.ApproveAllocationRule)
+		r.Post("/{id}/supersede", h.SupersedeAllocationRule)
 	})
 	r.Route("/v1/allocation-runs", func(r chi.Router) {
 		r.Post("/", h.ExecuteAllocation)
@@ -349,9 +388,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 	r.Route("/v1/lineage", func(r chi.Router) {
 		r.Get("/journals/{id}/source", h.TraceJournalToSource)
+		r.Get("/journals/{id}/source/as-of", h.GetLineageAsOf)
 		r.Get("/verify", h.VerifyLineageCompleteness)
 		r.Get("/status", h.GetLineageProjectionStatusHandler)
 		r.Post("/rebuild", h.RebuildLineageProjection)
+		r.Post("/verify-path", h.VerifyTracePath)
+		r.Post("/quarantine", h.QuarantineBrokenLineage)
 	})
 }
 
@@ -1376,6 +1418,111 @@ func (h *Handler) ListRecognitions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, list)
 }
 
+// ReverseAccrualRecognition closes the spec's own "Auto-reversal
+// duplicates" negative path: reverses one already-recognized period's
+// journal via general-ledger-svc's real ReverseJournal, and is idempotent
+// — a retried or replayed reverse call for the same recognition instance
+// returns the SAME reversal, never a second reversing journal.
+//
+// Checked in this order deliberately: the existing-reversal lookup runs
+// BEFORE calling general-ledger-svc, so a replay never even issues a
+// second GL call; CreateRecognitionReversal's own UNIQUE constraint (see
+// migration 000012) is the second, database-enforced line of defense
+// against a race between two concurrent reverse requests for the same
+// instance.
+func (h *Handler) ReverseAccrualRecognition(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	fiscalPeriod := chi.URLParam(r, "fiscal_period")
+
+	var req domain.ReverseAccrualRecognitionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrReversalReasonRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	sch, err := h.store.GetAccrualSchedule(r.Context(), id)
+	if err != nil {
+		h.writeAccrualStoreErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sch.LegalEntityID, actionAccrualReverse); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	inst, err := h.store.GetRecognitionInstanceByPeriod(r.Context(), id, fiscalPeriod)
+	if errors.Is(err, domain.ErrRecognitionInstanceNotFound) {
+		writeError(w, http.StatusNotFound, "recognition_instance_not_found", err.Error())
+		return
+	}
+	if err != nil {
+		h.log.Error("ReverseAccrualRecognition: failed to fetch recognition instance", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// Idempotency: return the existing reversal rather than calling
+	// general-ledger-svc a second time.
+	if existing, err := h.store.GetRecognitionReversalByInstance(r.Context(), inst.RecognitionInstanceID); err != nil {
+		h.log.Error("ReverseAccrualRecognition: failed to check for an existing reversal", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	} else if existing != nil {
+		writeJSON(w, http.StatusOK, existing)
+		return
+	}
+
+	// Distinct from the recognition's own correlation_id (schedule_id +
+	// fiscal_period) — reversing is a different idempotent operation from
+	// recognizing, and general-ledger-svc's ReverseJournal keys its own
+	// replay detection on whatever correlation_id this call sends.
+	reverseCorrelationID := "reverse:" + inst.RecognitionInstanceID
+	reversingJournalID, err := h.clients.ReverseGLJournal(r.Context(), tenantID, principalID, inst.JournalID, req.Reason, reverseCorrelationID)
+	if err != nil {
+		h.log.Error("ReverseAccrualRecognition: journal reversal failed", zap.String("schedule_id", id), zap.String("journal_id", inst.JournalID), zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "journal_reversal_failed", err.Error())
+		return
+	}
+
+	rev := &domain.RecognitionReversal{
+		RecognitionReversalID: uuid.NewString(),
+		ScheduleID:            id,
+		RecognitionInstanceID: inst.RecognitionInstanceID,
+		ReversingJournalID:    reversingJournalID,
+		Reason:                req.Reason,
+		ReversedAt:            time.Now().UTC(),
+		ReversedByPrincipalID: principalID,
+	}
+	created, err := h.store.CreateRecognitionReversal(r.Context(), rev)
+	if err != nil {
+		h.log.Error("accrual recognition reversed on the ledger but the evidence row could not be recorded",
+			zap.String("schedule_id", id), zap.String("reversing_journal_id", reversingJournalID), zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "reversal_not_recorded",
+			"the reversing journal IS posted to general-ledger-svc ("+reversingJournalID+"), but its evidence row was not persisted.")
+		return
+	}
+
+	h.recordLineageEdge(r.Context(), sch.LegalEntityID, "accrual_recognition_reversal", rev.RecognitionReversalID, "journal", reversingJournalID)
+
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, rev)
+}
+
 // writeAccrualStoreErr maps an accrual store failure to the status it
 // actually means — not-found is 404, an invalid lifecycle transition is
 // 422 (the caller's request is wrong for the schedule's current state, not
@@ -2079,6 +2226,70 @@ func (h *Handler) ApproveAllocationRule(w http.ResponseWriter, r *http.Request) 
 	rule.Status = domain.AllocationRuleStatusApproved
 	rule.ApprovedAt, rule.ApprovedByPrincipalID = &now, &principalID
 	writeJSON(w, http.StatusOK, rule)
+}
+
+// SupersedeAllocationRule is ACC-09's own SupersedeAllocationRule command
+// — closes the gap left by CreateAllocationRule always minting a brand
+// new, unrelated rule_id: without this, nothing stopped two concurrently
+// ACTIVE rules from existing for the same source_account_code, each
+// eligible to post its own allocation run against the same source balance.
+func (h *Handler) SupersedeAllocationRule(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var req domain.SupersedeAllocationRuleRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Name == "" || req.SourceAccountCode == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "name and source_account_code are required")
+		return
+	}
+	if len(req.Drivers) == 0 {
+		writeError(w, http.StatusBadRequest, "no_drivers", string(domain.ErrNoDriversDefined))
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	current, err := h.store.GetCurrentAllocationRule(r.Context(), id)
+	if err != nil {
+		h.writeAllocationErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, current.LegalEntityID, actionAllocationRuleSupersede); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	now := time.Now().UTC()
+	newVersion := &domain.AllocationRule{
+		RuleVersionID:        uuid.NewString(),
+		LegalEntityID:        current.LegalEntityID,
+		Name:                 req.Name,
+		SourceAccountCode:    req.SourceAccountCode,
+		Drivers:              req.Drivers,
+		CreatedAt:            now,
+		CreatedByPrincipalID: principalID,
+	}
+	if err := h.store.SupersedeAllocationRule(r.Context(), id, newVersion, now); err != nil {
+		if errors.Is(err, domain.ErrNoCurrentRuleToSupersede) {
+			writeError(w, http.StatusUnprocessableEntity, "no_current_rule_to_supersede", err.Error())
+			return
+		}
+		h.log.Error("failed to supersede allocation rule", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	newVersion.RuleID = id
+	newVersion.TenantID = current.TenantID
+	newVersion.Status = domain.AllocationRuleStatusDraft
+	writeJSON(w, http.StatusCreated, newVersion)
 }
 
 // allocationAmountsFor computes each driver's share of sourceAmount,
@@ -2827,12 +3038,14 @@ func (h *Handler) CreateMigrationAccountingBatch(w http.ResponseWriter, r *http.
 	entries := make([]domain.MigrationCrosswalkEntry, len(req.Entries))
 	for i, e := range req.Entries {
 		entries[i] = domain.MigrationCrosswalkEntry{
-			EntryID:           uuid.NewString(),
-			SourceReferenceID: e.SourceReferenceID,
-			SourceAccountCode: e.SourceAccountCode,
-			TargetAccountCode: e.TargetAccountCode,
-			DebitAmount:       e.DebitAmount,
-			CreditAmount:      e.CreditAmount,
+			EntryID:             uuid.NewString(),
+			SourceReferenceID:   e.SourceReferenceID,
+			SourceAccountCode:   e.SourceAccountCode,
+			TargetAccountCode:   e.TargetAccountCode,
+			DebitAmount:         e.DebitAmount,
+			CreditAmount:        e.CreditAmount,
+			SourceReferenceType: e.SourceReferenceType,
+			PartyID:             e.PartyID,
 		}
 	}
 	batch := &domain.MigrationBatch{
@@ -2920,6 +3133,36 @@ func (h *Handler) ValidateOpeningBalances(w http.ResponseWriter, r *http.Request
 			h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode+" is not ACTIVE")
 			writeError(w, http.StatusUnprocessableEntity, "target_account_invalid", string(domain.ErrMigrationTargetAccountInvalid)+": "+e.TargetAccountCode+" is not ACTIVE")
 			return
+		}
+
+		// The spec's own negative path, "Open AR included both in history
+		// and opening state" — only checked for entries the caller flagged
+		// as a real open AR/AP item; an ordinary GL balance line has no
+		// subledger history to double-book against.
+		if e.SourceReferenceType != nil {
+			if e.PartyID == nil || *e.PartyID == "" {
+				h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrPartyIDRequiredForOpenItem)+": "+e.SourceReferenceID)
+				writeError(w, http.StatusUnprocessableEntity, "party_id_required", string(domain.ErrPartyIDRequiredForOpenItem)+": "+e.SourceReferenceID)
+				return
+			}
+			var exists bool
+			var checkErr error
+			switch *e.SourceReferenceType {
+			case domain.MigrationCrosswalkTypeAROpenItem:
+				exists, checkErr = h.clients.CheckARInvoiceExists(r.Context(), tenantID, batch.LegalEntityID, *e.PartyID, e.SourceReferenceID)
+			case domain.MigrationCrosswalkTypeAPOpenItem:
+				exists, checkErr = h.clients.CheckAPInvoiceExists(r.Context(), tenantID, batch.LegalEntityID, *e.PartyID, e.SourceReferenceID)
+			}
+			if checkErr != nil {
+				h.log.Error("ValidateOpeningBalances: failed to check open item against subledger history", zap.Error(checkErr))
+				writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", checkErr.Error())
+				return
+			}
+			if exists {
+				h.quarantineMigrationBatch(r.Context(), id, string(domain.ErrOpenItemAlreadyExistsInHistory)+": "+e.SourceReferenceID)
+				writeError(w, http.StatusUnprocessableEntity, "open_item_already_exists_in_history", string(domain.ErrOpenItemAlreadyExistsInHistory)+": "+e.SourceReferenceID)
+				return
+			}
 		}
 	}
 
@@ -3534,6 +3777,15 @@ func (h *Handler) buildCompletenessReport(ctx context.Context, legalEntityID str
 	if err != nil {
 		return nil, err
 	}
+	quarantined, err := h.store.ListQuarantinedLineageGaps(ctx, legalEntityID)
+	if err != nil {
+		return nil, err
+	}
+	isQuarantined := make(map[string]bool, len(quarantined))
+	for _, q := range quarantined {
+		isQuarantined[q.FromType+"|"+q.FromID+"|"+q.ToType+"|"+q.ToID] = true
+	}
+
 	report := &domain.LineageCompletenessReport{LegalEntityID: legalEntityID, CheckedCount: len(refs), Gaps: []domain.PostedJournalRef{}}
 	for _, ref := range refs {
 		edges, err := h.store.ListLineageEdgesTo(ctx, "journal", ref.JournalID)
@@ -3547,12 +3799,159 @@ func (h *Handler) buildCompletenessReport(ctx context.Context, legalEntityID str
 				break
 			}
 		}
-		if !found {
-			report.Gaps = append(report.Gaps, ref)
+		if found {
+			continue
 		}
+		// A quarantined gap was deliberately accepted as known — it stays
+		// out of Gaps but is still counted, never silently vanished.
+		if isQuarantined[ref.FromType+"|"+ref.FromID+"|journal|"+ref.JournalID] {
+			report.QuarantinedCount++
+			continue
+		}
+		report.Gaps = append(report.Gaps, ref)
 	}
 	report.Complete = len(report.Gaps) == 0
 	return report, nil
+}
+
+// GetLineageAsOf answers ACC-18's own GetLineageAsOf query — a
+// point-in-time reconstruction of TraceJournalToSource, since
+// lineage_edges is append-only and every edge's own recorded_at is a
+// stable position that never changes retroactively.
+func (h *Handler) GetLineageAsOf(w http.ResponseWriter, r *http.Request) {
+	journalID := chi.URLParam(r, "id")
+	asOfRaw := r.URL.Query().Get("as_of")
+	if asOfRaw == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrLineageAsOfRequired.Error())
+		return
+	}
+	asOf, err := time.Parse(time.RFC3339, asOfRaw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_field", domain.ErrLineageAsOfRequired.Error())
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	edges, err := h.store.ListLineageEdgesToAsOf(r.Context(), "journal", journalID, asOf)
+	if err != nil {
+		h.log.Error("GetLineageAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if len(edges) == 0 {
+		writeJSON(w, http.StatusOK, []domain.LineageEdge{})
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, edges[0].LegalEntityID, actionLineageView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, edges)
+}
+
+// VerifyTracePath answers ACC-18's own VerifyTracePath command — checks
+// whether ONE specific edge is recorded, and permanently records the
+// verification result (the spec's own "verification results" ownership).
+// Unlike VerifyLineageCompleteness (which scans every posted journal for
+// a legal entity), this verifies a single, caller-named path — the
+// narrower, targeted check the wireframe names as its own command.
+func (h *Handler) VerifyTracePath(w http.ResponseWriter, r *http.Request) {
+	var req domain.VerifyTracePathRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.FromType == "" || req.FromID == "" || req.ToID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, from_type, from_id and to_id are required")
+		return
+	}
+	toType := req.ToType
+	if toType == "" {
+		toType = "journal"
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionLineageVerifyPath); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	edges, err := h.store.ListLineageEdgesTo(r.Context(), toType, req.ToID)
+	if err != nil {
+		h.log.Error("VerifyTracePath: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	verified := false
+	for _, e := range edges {
+		if e.FromType == req.FromType && e.FromID == req.FromID {
+			verified = true
+			break
+		}
+	}
+
+	result := &domain.TracePathVerification{
+		VerificationID: uuid.NewString(), LegalEntityID: req.LegalEntityID,
+		FromType: req.FromType, FromID: req.FromID, ToType: toType, ToID: req.ToID,
+		Verified: verified, VerifiedAt: time.Now().UTC(), VerifiedByPrincipalID: principalID,
+	}
+	if err := h.store.CreateTracePathVerification(r.Context(), result); err != nil {
+		h.log.Error("VerifyTracePath: failed to record verification result", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// QuarantineBrokenLineage answers ACC-18's own QuarantineBrokenLineage
+// command — the ONLY way a gap stops appearing in
+// VerifyLineageCompleteness's own Gaps list, so it always requires a
+// reason: a deliberate, evidenced decision, never a silent exclusion.
+func (h *Handler) QuarantineBrokenLineage(w http.ResponseWriter, r *http.Request) {
+	var req domain.QuarantineBrokenLineageRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.FromType == "" || req.FromID == "" || req.ToID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, from_type, from_id and to_id are required")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", domain.ErrLineageQuarantineReasonRequired.Error())
+		return
+	}
+	toType := req.ToType
+	if toType == "" {
+		toType = "journal"
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionLineageQuarantine); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	gap := &domain.QuarantinedLineageGap{
+		QuarantineID: uuid.NewString(), LegalEntityID: req.LegalEntityID,
+		FromType: req.FromType, FromID: req.FromID, ToType: toType, ToID: req.ToID,
+		Reason: req.Reason, QuarantinedAt: time.Now().UTC(), QuarantinedByPrincipalID: principalID,
+	}
+	if err := h.store.CreateQuarantinedLineageGap(r.Context(), gap); err != nil {
+		h.log.Error("QuarantineBrokenLineage: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, gap)
 }
 
 // RebuildLineageProjection re-derives every missing edge from the

@@ -43,13 +43,13 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
 		close_evidences, fiscal_periods, period_reopen_events,
 		subledger_control_runs,
-		accrual_recognition_instances, accrual_schedules,
+		accrual_recognition_reversals, accrual_recognition_instances, accrual_schedules,
 		prepayment_recognition_instances, prepayment_schedules,
 		allocation_run_result_lines, allocation_runs, allocation_rule_drivers, allocation_rules,
 		fx_revaluation_items, fx_revaluation_runs,
 		migration_crosswalk_entries, migration_batches,
 		financial_snapshots,
-		lineage_edges, lineage_projection_status
+		lineage_edges, lineage_projection_status, lineage_trace_verifications, lineage_quarantined_gaps
 		CASCADE;`)
 
 	// The DROP list above must be kept in sync with every CREATE TABLE the

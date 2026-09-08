@@ -28,6 +28,7 @@ import (
 	"zoiko.io/intercompany-accounting-svc/internal/events"
 	"zoiko.io/intercompany-accounting-svc/internal/handler"
 	"zoiko.io/intercompany-accounting-svc/internal/health"
+	"zoiko.io/intercompany-accounting-svc/internal/entityregistry"
 	"zoiko.io/intercompany-accounting-svc/internal/ledger"
 	svcmiddleware "zoiko.io/intercompany-accounting-svc/internal/middleware"
 	"zoiko.io/intercompany-accounting-svc/internal/mtls"
@@ -264,6 +265,7 @@ func main() {
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
 	ledgerClient := ledger.NewClient(cfg.LedgerServiceURL, log)
+	entityRegistryClient := entityregistry.NewClient(cfg.TenantRegistryURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -283,7 +285,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, ledgerClient, log)
+	h := handler.New(pgStore, publisher, authzClient, ledgerClient, log).WithEntityRegistry(entityRegistryClient)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
