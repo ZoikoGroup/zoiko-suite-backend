@@ -94,6 +94,9 @@ type Inner interface {
 	CheckOwnObjectSoD(ctx context.Context, actionType, tenantID string) (bool, error)
 	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
 	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
+	ListAccessDecisions(ctx context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error)
+	ProjectPrincipalStatus(ctx context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error)
+	FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error)
 }
 
 // The cache namespaces. A write invalidates whole namespaces for a tenant
@@ -106,6 +109,14 @@ const (
 	nsDelegation = "delegation"
 	nsSoD        = "sod"
 	nsABAC       = "abac"
+
+	// nsPrincipal caches the layer-0 principal-status read. Its own namespace
+	// rather than nsGrants: a status change invalidates one principal's
+	// standing and nothing about what any role grants, and folding it into
+	// nsGrants would make every suspension throw away the whole tenant's
+	// cached grant sets — on the platform's hottest path, for a change that
+	// affects one principal.
+	nsPrincipal = "principal"
 )
 
 // DefaultTTL is the staleness bound when none is configured. Small on
@@ -360,6 +371,30 @@ func (s *Store) FindABACRules(ctx context.Context, actionType, tenantID string) 
 	return rules, nil
 }
 
+// FindPrincipalStatus caches per (tenant, principal) — layer 0 of every
+// evaluation, so it is read on literally every /v1/authorize call and is worth
+// caching for the same reason FindABACRules is: the answer is almost always
+// "ACTIVE, no row", and that is a database round-trip to learn nothing changed.
+//
+// The TTL bound matters more here than on the other cached reads and is worth
+// stating plainly: it is how long a principal SUSPENDED through another replica
+// can still be authorized. That is the same window a revoked grant already has
+// (see the package comment), it is five seconds by default, and
+// AUTHZ_CACHE_TTL_SECONDS=0 removes it. A suspension applied by THIS process's
+// consumer invalidates immediately and exactly.
+func (s *Store) FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error) {
+	k := s.key(nsPrincipal, tenantID, principalID)
+	if v, ok := s.load(k); ok {
+		return v.(string), nil
+	}
+	status, err := s.inner.FindPrincipalStatus(ctx, principalID, tenantID)
+	if err != nil {
+		return "", err
+	}
+	s.save(k, status)
+	return status, nil
+}
+
 // ── writes: pass through, then invalidate ────────────────────────────────────
 
 func (s *Store) CreateRole(ctx context.Context, params domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -450,6 +485,25 @@ func (s *Store) ProjectDelegation(ctx context.Context, params domain.ProjectDele
 	return d, err
 }
 
+// ProjectPrincipalStatus invalidates the principal namespace for the tenant.
+//
+// BOTH scopes, deliberately: the tenant's, and — via the empty-tenant call —
+// the global counter that every key carries. FindPrincipalStatus is keyed on
+// the tenant it was ASKED with, and a tenantless caller's entry is keyed under
+// "" rather than under the tenant this event names. Invalidating only the
+// named tenant would leave the 86 callers who send no tenant reading a stale
+// ACTIVE for a principal that was just suspended — which is the majority of
+// this endpoint's traffic and precisely the caller 000013's platform_scope
+// hatch exists to gate.
+func (s *Store) ProjectPrincipalStatus(ctx context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error) {
+	p, err := s.inner.ProjectPrincipalStatus(ctx, params)
+	if err == nil {
+		s.invalidate(nsPrincipal, params.TenantID)
+		s.invalidate(nsPrincipal, "")
+	}
+	return p, err
+}
+
 func (s *Store) RevokeProjectedDelegation(ctx context.Context, sourceService, sourceDelegationID, tenantID string) (*domain.DelegatedAuthority, error) {
 	d, err := s.inner.RevokeProjectedDelegation(ctx, sourceService, sourceDelegationID, tenantID)
 	if err == nil {
@@ -495,6 +549,35 @@ func (s *Store) SetABACRuleActive(ctx context.Context, abacRuleID, tenantID stri
 		s.invalidate(nsABAC, tenantID)
 	}
 	return rule, err
+}
+
+// InvalidateGrantSourcesForTenant drops the cached grant and delegation
+// namespaces for one tenant, or for every tenant when tenantID is empty.
+//
+// ── WHY THIS IS EXPORTED, WHICH NOTHING ELSE HERE IS ────────────────────────
+//
+// Every other invalidation in this file is a side effect of a write that
+// passed through this process. That is exactly the limitation the package
+// comment states plainly: "A write through THIS process invalidates
+// immediately and exactly; a write through ANOTHER replica, or directly
+// against the database, is not seen until the entry expires. That makes the
+// TTL the real bound on how long a revoked grant can still authorize."
+//
+// This is how that bound stops being the only mechanism. internal/events'
+// lifecycle consumer calls it when an authoritative service announces a change
+// to the grant graph — access-control-svc republishing a role or a permission
+// bundle, tenant-entity-registry-svc changing an entity's standing or
+// hierarchy. Those writes reach authorization-svc through ONE replica's admin
+// API and are announced to all of them, so consuming the announcement is what
+// converts a five-second staleness window on every other replica into broker
+// latency.
+//
+// It is a cache concern rather than a store concern, which is why it lives
+// here and why PgStore has no counterpart: there is nothing to invalidate
+// without a cache. A deployment with AUTHZ_CACHE_TTL_SECONDS=0 has this called
+// harmlessly and reads the database every time regardless.
+func (s *Store) InvalidateGrantSourcesForTenant(tenantID string) {
+	s.invalidateGrantSources(tenantID)
 }
 
 // invalidateGrantSources drops BOTH the grants and the delegation namespaces.
@@ -562,6 +645,19 @@ func (s *Store) RecordAccessDecision(ctx context.Context, params domain.RecordAc
 
 func (s *Store) FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error) {
 	return s.inner.FindAccessDecisionByID(ctx, accessDecisionID, tenantID)
+}
+
+// ListAccessDecisions is deliberately UNCACHED, and it is the one place in
+// this file where that is a correctness requirement rather than a judgement
+// about hit rates.
+//
+// This is the audit read. Its purpose is to state what the log contains right
+// now, and a cached page would answer with what it contained up to a TTL ago —
+// so a decision recorded seconds before an auditor looked could be absent from
+// the answer they were given. It is also append-only and paged newest-first,
+// so page one changes on essentially every request and would never hit anyway.
+func (s *Store) ListAccessDecisions(ctx context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error) {
+	return s.inner.ListAccessDecisions(ctx, tenantID, params)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

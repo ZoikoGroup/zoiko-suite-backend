@@ -152,6 +152,24 @@ type stubStore struct {
 	// is the evidence, so what it records is worth asserting rather than
 	// assuming.
 	recordedParams domain.RecordAccessDecisionParams
+
+	// The decision-log audit read. listDecisions is the page returned;
+	// gotListDecisionsTenant / gotListDecisionsParams record what it was
+	// asked for, because the property that matters on this read is that the
+	// tenant came from the VERIFIED header and not from a query parameter.
+	listDecisions          *domain.AccessDecisionPage
+	listDecisionsErr       error
+	gotListDecisionsTenant string
+	gotListDecisionsParams domain.ListAccessDecisionsParams
+
+	// Layer 0. principalStatus is what FindPrincipalStatus returns; the zero
+	// value "" is deliberately NOT treated as ACTIVE by the handler, so every
+	// existing test would start failing with a denial if this stub returned
+	// the zero value — see the method below.
+	principalStatus          string
+	principalStatusErr       error
+	gotPrincipalStatusArgs   []string
+	principalStatusCallCount int
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -295,6 +313,33 @@ func (s *stubStore) RecordAccessDecision(_ context.Context, params domain.Record
 }
 func (s *stubStore) FindAccessDecisionByID(_ context.Context, _, _ string) (*domain.AccessDecisionLog, error) {
 	return s.findDecision, s.findDecisionErr
+}
+
+func (s *stubStore) ListAccessDecisions(_ context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error) {
+	s.gotListDecisionsTenant = tenantID
+	s.gotListDecisionsParams = params
+	return s.listDecisions, s.listDecisionsErr
+}
+
+// FindPrincipalStatus defaults to ACTIVE when the test set no status.
+//
+// The default matters more than it looks. Layer 0 denies anything that is not
+// exactly domain.PrincipalStatusActive, so a stub returning the zero value ""
+// would deny every request in every test in this package — and the failures
+// would read as regressions in the RBAC, delegation, SoD and ABAC layers rather
+// than as an unset stub field. Defaulting here keeps every test that does not
+// care about layer 0 testing what it says it tests, and a test that does care
+// sets principalStatus explicitly.
+func (s *stubStore) FindPrincipalStatus(_ context.Context, principalID, tenantID string) (string, error) {
+	s.principalStatusCallCount++
+	s.gotPrincipalStatusArgs = []string{principalID, tenantID}
+	if s.principalStatusErr != nil {
+		return "", s.principalStatusErr
+	}
+	if s.principalStatus == "" {
+		return domain.PrincipalStatusActive, nil
+	}
+	return s.principalStatus, nil
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────

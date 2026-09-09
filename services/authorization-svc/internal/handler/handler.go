@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/authorization-svc/internal/abac"
@@ -75,6 +76,24 @@ type AuthorizationStore interface {
 	// was granting actions against a legal entity in tenant B.
 	RecordAccessDecision(ctx context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error)
 	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
+
+	// The audit read. §8.3 requires denials to be "evidentially retrievable",
+	// and by-id retrieval is retrieval only for somebody who already holds the
+	// id — which, for a denial, exists only in the response given to the
+	// service that was refused.
+	ListAccessDecisions(ctx context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error)
+
+	// FindPrincipalStatus is layer 0 of the evaluation: a principal
+	// identity-context-svc has SUSPENDED or DISABLED may execute nothing.
+	// Returns domain.PrincipalStatusActive when no status has been projected,
+	// so the layer is inert on a deployment that has seen no status event.
+	//
+	// ProjectPrincipalStatus is deliberately NOT here. The handler must never
+	// write this table — identity-context-svc is authoritative for principal
+	// standing, and an admin route that could override it would let this
+	// service and that one disagree about who is suspended. Only
+	// internal/events.LifecycleConsumer holds the writing interface.
+	FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on.
@@ -135,8 +154,21 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/retire", h.RetireABACRule)
 	r.Post("/v1/admin/abac-rules/{abac_rule_id}/reactivate", h.ReactivateABACRule)
 
-	r.Post("/v1/authorize", h.Authorize)
-	r.Get("/v1/access-decisions/{access_decision_id}", h.GetAccessDecision)
+	r.Post(AuthorizePath, h.Authorize)
+
+	// The other three inbound APIs Doc 03 §8.3 names. Folded into
+	// /v1/authorize as internal layers until now, which left three questions
+	// unanswerable — see internal/handler/validation.go's header for what each
+	// one is and why it is not a material write.
+	r.Post(EntityScopeValidatePath, h.ValidateEntityScope)
+	r.Post(SoDValidatePath, h.ValidateSoDConflicts)
+	r.Post(DelegatedAccessEvaluatePath, h.EvaluateDelegatedAccess)
+
+	// "Retrieve authorization rationale" — both halves. The collection read is
+	// what makes §8.3's "denials must be evidentially retrievable" true;
+	// by-id alone is retrieval only for a caller that already holds the id.
+	r.Get(AccessDecisionsPath, h.ListAccessDecisions)
+	r.Get(AccessDecisionsPath+"/{access_decision_id}", h.GetAccessDecision)
 }
 
 // requirePrincipal reads the caller's verified principal from the
@@ -1502,6 +1534,22 @@ type authorizeRequest struct {
 // fail-closed direction requirePlatformAction takes.
 const PlatformScopeSentinel = "PLATFORM"
 
+// principalStatusBasisPrefix is the decision_basis a layer-0 denial carries:
+// "principal_status:SUSPENDED", "principal_status:DISABLED".
+//
+// The STATUS is in the basis, not just the fact of denial, because the two
+// mean different things to whoever reads the log — suspended is reversible and
+// usually deliberate, disabled is usually terminal — and a bare
+// "principal_not_active" would make an operator go and ask
+// identity-context-svc which it was.
+//
+// Prefixed rather than bare so the basis vocabulary stays parseable in the
+// same way "rbac:", "sod:" and "abac:" already are. NOT prefixed "sod:", which
+// would have been convenient for the severity branch and wrong: the sod:
+// prefix is what makes recordAndAnswer publish sod.violation.detected, and a
+// suspended principal is not a duty conflict.
+const principalStatusBasisPrefix = "principal_status:"
+
 type authorizeResponse struct {
 	DecisionOutcome  string `json:"decision_outcome"`
 	DecisionBasis    string `json:"decision_basis"`
@@ -1511,6 +1559,15 @@ type authorizeResponse struct {
 // Authorize handles POST /v1/authorize — the core evaluation endpoint.
 //
 // Layers, in order:
+//  0. Principal status — has identity-context-svc suspended or disabled this
+//     principal? A principal that is not ACTIVE is denied every action,
+//     before any grant is looked up. Deny-only, and ABSENT MEANS ACTIVE, so
+//     the layer is inert until a principal.status.changed event has been
+//     projected — see domain.PrincipalStatusProjection and migration 000013.
+//     This closes a hole session eviction does not: identity-context-svc
+//     evicts SESSIONS on suspension, but this endpoint is called
+//     service-to-service on envelopes resolved before the suspension and on
+//     queued work that carries a principal and no session at all.
 //  1. RBAC — does the principal directly hold a role granting action_type
 //     in legal_entity_id?
 //  2. Delegated access — if not, does the principal have an active
@@ -1532,8 +1589,8 @@ type authorizeResponse struct {
 //     domain.ABACRule for the semantics. abac_rules ships EMPTY, so this
 //     layer changes no outcome until somebody declares a rule.
 //
-// Layers 1 and 2 are cached (internal/cache); 3, 4 and 5 are cached too.
-// The DECISION is not, and neither is the artifact — see below.
+// Layers 0 through 5 are all cached reads (internal/cache). The DECISION is
+// not, and neither is the artifact — see below.
 //
 // Every evaluation — grant or deny — is written to access_decision_log
 // before the response is returned (critical constraint: no material action
@@ -1632,23 +1689,39 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 	// platform-wide act is evaluated against the same id everywhere instead of
 	// against whichever synthetic uuid each calling service invented. Fails
 	// closed on an unconfigured deployment: a 400 naming the missing config,
-	// not a guess.
-	evaluationEntityID := req.LegalEntityID
-	if evaluationEntityID == PlatformScopeSentinel {
-		if h.platformScopeEntityID == "" {
-			h.log.Error("Authorize: platform scope requested but AUTHZ_PLATFORM_SCOPE_ENTITY_ID is unset",
-				zap.String("correlation_id", correlationID))
-			writeJSON(w, http.StatusBadRequest, map[string]string{
-				"error":   "platform_scope_not_configured",
-				"message": "legal_entity_id=PLATFORM requires AUTHZ_PLATFORM_SCOPE_ENTITY_ID to be configured on authorization-svc",
-			})
-			return
-		}
-		evaluationEntityID = h.platformScopeEntityID
+	// not a guess. Shared with the three §8.3 validation routes, which accept
+	// the sentinel on identical terms — see resolvePlatformScope.
+	evaluationEntityID, ok := h.resolvePlatformScope(w, req.LegalEntityID, correlationID)
+	if !ok {
+		return
 	}
 
 	tenantScope, ok := h.resolveTenantScope(w, r, req.TenantID)
 	if !ok {
+		return
+	}
+
+	// ── layer 0: is this still an active principal? ─────────────────────────
+	//
+	// Before RBAC, because no grant can be exercised by a principal
+	// identity-context-svc has suspended, and running the grant lookup first
+	// would only mean computing a basis nobody is entitled to. The denial IS
+	// recorded — a suspended principal being refused is exactly the evidence
+	// §8.3 requires — so this returns through the same record-and-publish path
+	// as every other outcome rather than short-circuiting the artifact.
+	//
+	// No projected row means ACTIVE, so on a deployment that has seen no
+	// status event this layer changes nothing. See
+	// domain.PrincipalStatusProjection.
+	principalStatus, err := h.store.FindPrincipalStatus(r.Context(), req.PrincipalID, tenantScope)
+	if err != nil {
+		h.log.Error("Authorize: store unavailable (principal status lookup)", zap.String("correlation_id", correlationID), zap.Error(err))
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		return
+	}
+	if principalStatus != domain.PrincipalStatusActive {
+		h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID,
+			"DENIED", principalStatusBasisPrefix+principalStatus)
 		return
 	}
 
@@ -1766,6 +1839,26 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	h.recordAndAnswer(w, r, req, evaluationEntityID, tenantScope, correlationID, outcome, basis)
+}
+
+// recordAndAnswer writes the decision artifact, publishes, streams to SIEM and
+// answers the caller. Every outcome leaves Authorize through here.
+//
+// Extracted when layer 0 (the principal-status gate) was added, because that
+// layer produces a denial before any of the grant lookups have run. Inlining a
+// second copy of this tail is how one of the two paths eventually stops
+// publishing authorization.denied, or stops recording the artifact at all —
+// which is the critical constraint ("no material action executes without an
+// authorization decision artifact") being broken by a refactor rather than by a
+// decision.
+func (h *Handler) recordAndAnswer(
+	w http.ResponseWriter,
+	r *http.Request,
+	req authorizeRequest,
+	evaluationEntityID, tenantScope, correlationID string,
+	outcome, basis string,
+) {
 	decision, err := h.store.RecordAccessDecision(r.Context(), domain.RecordAccessDecisionParams{
 		PrincipalID: req.PrincipalID,
 		// The RESOLVED entity, not the sentinel the caller may have sent.
@@ -1805,6 +1898,15 @@ func (h *Handler) Authorize(w http.ResponseWriter, r *http.Request) {
 		// convention so they get the same elevated severity and event.
 		isSoD := strings.HasPrefix(basis, "sod:")
 		if isSoD {
+			severity = siem.SeverityHigh
+		}
+		// A suspended or disabled principal whose credentials are still being
+		// used to attempt material actions is a stronger signal than an
+		// ordinary "no grant" — the account has been stood down and something
+		// is still acting as it. Same elevation as an SoD violation, and
+		// deliberately not folded into the sod: prefix, because it publishes
+		// no sod.violation.detected: nothing here is a duty conflict.
+		if strings.HasPrefix(basis, principalStatusBasisPrefix) {
 			severity = siem.SeverityHigh
 		}
 		h.siem.Stream(r.Context(), tenantScope, "authorization.denied", severity,
@@ -2072,6 +2174,27 @@ func (h *Handler) GetAccessDecision(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+// validScope reports whether v is a well-formed UUID, for a value that will be
+// compared against a uuid COLUMN.
+//
+// WHY THIS EXISTS. known-gaps.md records the shape as a platform-wide habit:
+// "a malformed authorization scope read as an outage". legal_entity_id is a
+// uuid column, and passing a non-UUID to a uuid comparison is a driver error,
+// which this service's store layer wraps as ErrStoreUnavailable and every
+// handler answers 503 for. From a calling service that 503 is
+// indistinguishable from this service genuinely being down, so somebody who
+// mistyped an entity id was told the authorization plane had failed.
+//
+// Only for values compared against a uuid column. A malformed value compared
+// as ::text — role_id in ListRoleAssignments, principal_id anywhere — is a
+// valid comparison that matches nothing, and rejecting those would refuse
+// legitimate non-UUID principal ids: this service has never required a
+// principal id to be a UUID, and service-account ids are not.
+func validScope(v string) bool {
+	_, err := uuid.Parse(v)
+	return err == nil
+}
 
 func contains(list []string, target string) bool {
 	for _, v := range list {

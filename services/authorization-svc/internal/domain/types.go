@@ -7,7 +7,11 @@
 // real (tiny) state machine: ACTIVE -> REVOKED, one-way, enforced in code.
 package domain
 
-import "time"
+import (
+	"encoding/base64"
+	"strings"
+	"time"
+)
 
 // Role is a tenant-scoped grantable role. No hard-delete: a role is
 // deactivated via ActiveFlag, never removed — role assignments referencing
@@ -290,6 +294,60 @@ type AccessDecisionLog struct {
 	DecidedAt     time.Time `json:"decided_at"`
 }
 
+// ── principal status ─────────────────────────────────────────────────────────
+
+// PrincipalStatusProjection is the read-model of identity-context-svc's
+// principal status, evaluated as LAYER 0 of /v1/authorize — before RBAC, and
+// therefore before anything else can grant.
+//
+// DENY-ONLY, and ABSENT MEANS ACTIVE. A principal with no projected row
+// evaluates exactly as it did before this layer existed, which is what lets
+// the table ship empty (same shape as ABACRule). The layer can only ever
+// remove access from a principal identity-context-svc has explicitly said is
+// not active; it never confers anything.
+//
+// The status is per tenant because that is how identity-context-svc publishes
+// it. See Store.FindPrincipalStatus for what a tenantless caller resolves,
+// which is the case that matters most: most of this endpoint's callers send no
+// tenant, and a gate they could escape by omitting a header would not be one.
+type PrincipalStatusProjection struct {
+	PrincipalID string `json:"principal_id"`
+	TenantID    string `json:"tenant_id"`
+
+	// Status is identity-context-svc's PrincipalStatus verbatim. Data only —
+	// anything other than PrincipalStatusActive denies, INCLUDING a value this
+	// build has never seen, which is the fail-closed direction for a status
+	// nobody here can interpret.
+	Status string `json:"status"`
+
+	SourceService string `json:"source_service"`
+
+	// StatusChangedAt is when upstream says the change happened, nil when the
+	// payload did not carry it.
+	StatusChangedAt *time.Time `json:"status_changed_at,omitempty"`
+	ProjectedAt     time.Time  `json:"projected_at"`
+}
+
+// PrincipalStatusActive is the ONE status that permits evaluation to continue.
+// Spelled as the allow-list rather than as a deny-list of SUSPENDED/DISABLED:
+// identity-context-svc may add a fourth status, and a deny-list would silently
+// admit it.
+const PrincipalStatusActive = "ACTIVE"
+
+// ProjectPrincipalStatusParams is the write shape used by the principal
+// lifecycle consumer. An UPSERT on (tenant_id, principal_id) — the broker
+// redelivers, and a status is a current value rather than an append-only
+// history, so the latest event wins.
+type ProjectPrincipalStatusParams struct {
+	PrincipalID string
+	// TenantID is required: the consumer refuses to project without one
+	// rather than write a row no policy can match.
+	TenantID        string
+	Status          string
+	SourceService   string
+	StatusChangedAt *time.Time
+}
+
 // ── params ───────────────────────────────────────────────────────────────────
 
 type CreateRoleParams struct {
@@ -412,6 +470,165 @@ type RecordAccessDecisionParams struct {
 	// through GET /v1/access-decisions/{id}, which is tenant-scoped.
 	TenantID string
 }
+
+// ListAccessDecisionsParams filters the decision log for
+// GET /v1/access-decisions.
+//
+// WHY THIS EXISTS. Doc 03 §8.3 sets two evidence obligations on this service:
+// "every decision logged with actor, action, basis, and outcome", and "denials
+// must be evidentially retrievable". The first held from 000001. The second did
+// not, because the only read was FindAccessDecisionByID — retrieval by primary
+// key, which is retrieval only for somebody who already holds the key. A
+// denial's id exists in one place: the response handed to the service that was
+// refused. Auditing a denial therefore meant reading the CALLING service's logs
+// to find a UUID to give back to this one, which is not what "evidentially
+// retrievable" describes.
+//
+// Every field is optional; each one narrows. TenantID is NOT here — it comes
+// from the caller's verified scope, never from a filter, so a filter can never
+// widen the read past the tenant. See Store.ListAccessDecisions.
+type ListAccessDecisionsParams struct {
+	// PrincipalID narrows to one actor: "what has this principal been
+	// refused". Served by 000009's (principal_id, decided_at DESC) index.
+	PrincipalID string
+
+	// Outcome narrows to GRANTED or DENIED. The reason 000012 exists: DENIED
+	// is a small minority of a very large table, and it is the half the
+	// evidence obligation names.
+	Outcome string
+
+	// ActionType and LegalEntityID narrow further. Neither is a leading
+	// predicate — both are applied after tenant and date have already reduced
+	// the scan — which is why 000012 deliberately indexes neither.
+	ActionType    string
+	LegalEntityID string
+
+	// DecidedFrom / DecidedTo bound the window, inclusive-exclusive. Nil means
+	// unbounded on that side. access_decision_log is partitioned by
+	// decided_at, so a bounded window is also partition pruning.
+	DecidedFrom *time.Time
+	DecidedTo   *time.Time
+
+	// Limit is capped by the store — see MaxAccessDecisionPageSize.
+	Limit int
+
+	// Cursor continues a previous page. Empty starts at the newest decision.
+	Cursor AccessDecisionCursor
+}
+
+// AccessDecisionCursor is a keyset position in the decision log, ordered
+// newest-first by (decided_at, access_decision_id).
+//
+// KEYSET, NOT OFFSET, and on this table that is not a preference. OFFSET makes
+// the database walk and discard every skipped row, so page 200 of an audit
+// costs 200 pages of work — on the largest table on the platform, across every
+// monthly partition. Worse, the log is append-only and constantly appended to,
+// so a row inserted during paging shifts every subsequent offset and an
+// auditor silently never sees one decision while seeing another twice.
+//
+// A keyset position is stable against concurrent inserts: new rows are newer
+// than the cursor and sort ahead of it, so they appear on a re-read of page one
+// and never displace what a later page returns.
+//
+// access_decision_id is the tie-breaker because decided_at is not unique —
+// /v1/authorize is called concurrently by 111 services and two decisions can
+// share a timestamp. Ordering on the timestamp alone would let a page boundary
+// fall between two rows with equal timestamps and drop or repeat one.
+type AccessDecisionCursor struct {
+	DecidedAt        time.Time
+	AccessDecisionID string
+}
+
+// IsZero reports whether this cursor names no position, i.e. start from the
+// newest decision.
+func (c AccessDecisionCursor) IsZero() bool {
+	return c.AccessDecisionID == "" || c.DecidedAt.IsZero()
+}
+
+// Encode renders the cursor as one opaque token for the wire.
+//
+// Opaque on purpose: it is a position, not an offset an API consumer should be
+// composing by hand. The encoding is base64 of "RFC3339Nano|uuid", which is
+// legible in a log when somebody has to debug a page boundary, without being a
+// shape callers will start constructing.
+func (c AccessDecisionCursor) Encode() string {
+	if c.IsZero() {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString(
+		[]byte(c.DecidedAt.UTC().Format(time.RFC3339Nano) + "|" + c.AccessDecisionID))
+}
+
+// DecodeAccessDecisionCursor parses a token produced by
+// AccessDecisionCursor.Encode.
+//
+// A malformed token is an error rather than a silent reset to page one:
+// starting over when the caller asked to continue would hand an auditor the
+// newest page while they believed they were reading the oldest, which is the
+// kind of wrong that is not visible in the output.
+func DecodeAccessDecisionCursor(token string) (AccessDecisionCursor, error) {
+	if token == "" {
+		return AccessDecisionCursor{}, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return AccessDecisionCursor{}, ErrInvalidCursor
+	}
+	at, id, found := strings.Cut(string(raw), "|")
+	if !found || at == "" || id == "" {
+		return AccessDecisionCursor{}, ErrInvalidCursor
+	}
+	decidedAt, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return AccessDecisionCursor{}, ErrInvalidCursor
+	}
+	return AccessDecisionCursor{DecidedAt: decidedAt, AccessDecisionID: id}, nil
+}
+
+// AccessDecisionPage is one page of the decision log plus where to continue.
+type AccessDecisionPage struct {
+	Decisions []AccessDecisionLog `json:"decisions"`
+
+	// NextCursor is empty when this is the last page. Its presence is the
+	// only correct test for "there is more" — a full page is not proof, and a
+	// short page is not proof of the end either once a filter is applied.
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+// The page-size bounds for ListAccessDecisions.
+//
+// MaxAccessDecisionPageSize is a CAP, not a suggestion: this is an
+// unauthenticated-by-action read of the platform's audit trail, and an
+// unbounded limit is how one console request scans a month of every service's
+// decisions. A caller wanting more pages, not a bigger page, is the intended
+// shape.
+const (
+	DefaultAccessDecisionPageSize = 50
+	MaxAccessDecisionPageSize     = 200
+)
+
+// ErrInvalidCursor means the continuation token was not one this service
+// issued. Refused rather than ignored — see DecodeAccessDecisionCursor.
+var ErrInvalidCursor = errorString("invalid pagination cursor")
+
+// ErrInvalidDecisionOutcomeFilter means the outcome filter named neither
+// GRANTED nor DENIED. Refused rather than matching nothing, because a listing
+// that is empty because of a typo looks exactly like a tenant with no
+// decisions — and on an audit read those two must not be confusable.
+var ErrInvalidDecisionOutcomeFilter = errorString("decision_outcome filter must be GRANTED or DENIED")
+
+// ErrPrincipalStatusIncomplete means a status projection arrived without the
+// principal or the status it is about. Refused rather than written: a row with
+// an empty status would be read as not-ACTIVE by the gate and would deny that
+// principal everything, from a malformed event.
+var ErrPrincipalStatusIncomplete = errorString("principal status projection requires principal_id and status")
+
+// ErrPrincipalStatusStale means a newer status for that principal is already
+// stored, so the event was not applied. NOT an error condition for the
+// consumer — see Store.ProjectPrincipalStatus. It exists so "did not apply
+// because it was old" is distinguishable from "did not apply because the write
+// failed", which are the same return value otherwise.
+var ErrPrincipalStatusStale = errorString("a newer principal status is already projected")
 
 var ErrRoleNotFound = errorString("role not found")
 var ErrRoleAssignmentNotFound = errorString("role assignment not found")

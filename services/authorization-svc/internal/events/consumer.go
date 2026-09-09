@@ -52,9 +52,24 @@ const upstreamService = "delegated-authority-svc"
 // names it as a separate service, which is tracker item 81's whole complaint —
 // has been announcing every grant and revocation it makes, to nobody.
 //
-// role.assigned, employment.changed and entity.scope.updated still have no
-// producer anywhere on the estate. A consumer for them would still be dead
-// infrastructure, and they are still deliberately not consumed.
+// role.assigned, employment.changed and entity.scope.updated were recorded
+// here as having "no producer anywhere on the estate", so that a consumer for
+// them "would still be dead infrastructure".
+//
+// **That was wrong, and corrected 2026-09-09.** All three are published, under
+// concrete names this comment never searched for: role.created /
+// role.updated / permission.bundle.updated by access-control-svc,
+// principal.status.changed by identity-context-svc, and entity.status.changed /
+// entity.hierarchy.changed / entity.jurisdiction.changed by
+// tenant-entity-registry-svc. They are consumed by LifecycleConsumer, in
+// lifecycle_consumer.go, whose header carries the full mapping and the one
+// candidate that genuinely is not consumable (employee.terminated, whose
+// payload names an employee_id that nothing on this estate maps to a
+// principal).
+//
+// The error is left visible rather than edited away because the shape of it
+// recurs: the conclusion came from grepping the SPEC's event names instead of
+// reading what the producers publish.
 //
 // ── WHAT THIS DOES TO TRACKER ITEM 81 ───────────────────────────────────────
 //

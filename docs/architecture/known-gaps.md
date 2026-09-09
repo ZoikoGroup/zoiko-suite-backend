@@ -1415,9 +1415,10 @@ purpose-created ordinary role and asserts its own non-superuser status before
 asserting anything else, so a misconfigured instance fails loudly rather than
 passing for the wrong reason.
 
-## Open: /v1/authorize refuses most of its callers on the canonical input contract
+## Resolved (2026-09-09): /v1/authorize refuses most of its callers on the canonical input contract
 Found while verifying the delegation fix end-to-end, and pre-existing rather
-than caused by it.
+than caused by it. Fixed 2026-09-09 — see the resolution at the end of this
+entry, which also corrects the reasoning that had ruled the cheap fix out.
 
 authorization-svc mounts the canonical input-contract middleware ahead of every
 route. ZS_ENVELOPE_ENFORCEMENT defaults to write-strict and nothing in
@@ -1480,6 +1481,87 @@ tenant. While this middleware is at write-strict, no such caller reaches the
 handler over HTTP. Those paths are not dead — observe mode reaches them, and
 the store documents the contract — but they are not the live path, and the
 comments that said otherwise have been corrected.
+
+### Resolved — and the argument above contains a mistake
+
+Fixed by the first of the two candidates, a MaterialWrite override, which the
+2026-09-08 pass had recorded as measured not to work. That conclusion was an
+inference from the violation list — four of the six missing fields are the
+unconditional set, so relaxing the two conditional ones "still leaves a 401" —
+and it is wrong, because MaterialWrite does not only select which conditional
+fields Validate demands. Middleware gates refusal on it too:
+
+    if err := policy.Validate(e, r); err != nil {
+        if enforced(mode, policy.materialWrite(r)) { writeViolation(w, err); return }
+        ...
+    }
+    func enforced(mode Mode, isWrite bool) bool {
+        switch mode {
+        case ModeStrict:      return true
+        case ModeWriteStrict: return isWrite     // non-writes are not enforced
+        default:              return false
+        }
+    }
+
+Under write-strict a request classified as a non-write is admitted whatever
+Validate found, so the override never had to satisfy the unconditional five.
+
+POST /v1/authorize is the right thing to classify that way. It appends to
+access_decision_log, which is what the "it does write the decision artifact"
+objection above was about — but that row is the audit record OF the question,
+not business state, and replay protection is backwards for it: two identical
+questions must produce two rows. Policy.MaterialWrite's own doc comment names
+the case ("a search or evaluate endpoint").
+
+Implemented as handler.EnvelopePolicy / handler.MaterialWrite in
+services/authorization-svc/internal/handler/envelope_policy.go, wired in that
+service's main.go. Deliberately not in internal/envelope/contract.go, which
+_contract/rollout.sh regenerates, and not in main.go, so the tests exercise the
+policy rather than a copy of it.
+
+The relaxation reaches one route, measured rather than asserted:
+
+  POST /v1/authorize, obligations-svc's exact headers   401 -> 200 GRANTED
+  POST /v1/authorize, no headers at all                 401 -> 200 GRANTED
+  POST /v1/authorize, full envelope                     200 -> 200, unflagged
+  POST /v1/authorize, action not held                   DENIED no_grant
+  all 12 /v1/admin/* writes, no envelope                401 -> 401
+  GET /v1/admin/roles, tenant + principal               200 -> 200
+
+An admitted violation is not silent: the response carries
+X-Envelope-Contract: violated and the reporter logs WARN with the missing
+fields, so the remaining migration is a generated list rather than a sweep.
+
+It is also not a permanent exemption, which is why ExemptPaths was not used —
+that field is for endpoints that PRODUCE the mandatory fields (gateway-auth-svc's
+/verify), and a blanket bypass would have dropped request_id and correlation_id
+from the one path where losing the trace costs most. Under ModeStrict the
+endpoint is refused again with no code change, confirmed on a second container
+from the same image with ZS_ENVELOPE_ENFORCEMENT=strict:
+
+  POST /v1/authorize, no envelope                       401
+  POST /v1/authorize, the five unconditional fields     200 GRANTED
+  POST /v1/admin/roles, the same five fields            401, missing exactly
+                                                        idempotency_key,
+                                                        legal_entity_id
+
+That last line is the point of the classification: under strict, an evaluation
+requires the five unconditional fields and is no longer asked for an
+idempotency key or an entity header it has no use for, while an admin write on
+the same service in the same request shape still is.
+
+Consequence for the "related" paragraph above: resolveTenantScope's tenantless
+branch, the store's `$3 = ''` fallbacks and migration 000008's platform-scope
+hatch are now the live path for the 86 callers that send no tenant, not just
+reachable in observe mode. Verified — body-tenant calls wrote decision-log rows
+carrying the correct tenant_id and principal_id.
+
+What remains is the migration, now a cleanup rather than an outage: 86 clients
+still send no envelope, so their decisions are logged without caller
+attribution, and ZS_ENVELOPE_ENFORCEMENT cannot go to strict until they are
+moved. services/policy-svc/internal/authz/client.go is the reference — it lifts
+the inbound envelope off the request context with svcenvelope.FromContext(ctx)
+and forwards it, so no client signature changes.
 
 ## Resolved: /v1/authorize paid 850ms per denial for a SIEM service that was absent
 Found while trying to reproduce a 1.07s authorize call that had been attributed

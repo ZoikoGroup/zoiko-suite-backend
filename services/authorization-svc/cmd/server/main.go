@@ -13,10 +13,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -48,6 +50,16 @@ import (
 // to any one tenant's data, same convention as AUTHZ_PLATFORM_SCOPE_ID
 // elsewhere in this codebase.
 const platformScopeID = "00000000-0000-0000-0000-00000000f001"
+
+// partitionWatchInterval is how often each consumer group re-reads partition
+// metadata and rejoins if it changed.
+//
+// 30s rather than kafka-go's 5s default. The condition it recovers from — a
+// join assigned no partitions — is rare and not time-critical to within
+// seconds, and this poll is a metadata round-trip per interval per reader
+// against a Tier-0 broker. 30s bounds a silent stall at half a minute while
+// costing two requests a minute.
+const partitionWatchInterval = 30 * time.Second
 
 func main() {
 	cfg, err := config.Load()
@@ -154,7 +166,11 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	//
+	// handler.EnvelopePolicy, not svcenvelope.ServicePolicy: the generated
+	// policy classifies POST /v1/authorize as a material write, which refused
+	// almost every caller of the evaluation endpoint. See handler.MaterialWrite.
+	r.Use(svcenvelope.Middleware(handler.EnvelopePolicy(), svcenvelope.DefaultReporter()))
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "authorization-svc", log)
 	// Drains the SIEM queue on shutdown. Streaming is fire-and-forget, so
@@ -255,12 +271,100 @@ func main() {
 			MinBytes: 1,
 			MaxBytes: 10e6,
 			MaxWait:  500 * time.Millisecond,
+			// See kafkaErrorLogger: without this, a consumer group that joins
+			// and is assigned nothing does so in complete silence.
+			ErrorLogger: kafkaErrorLogger(log, cfg.Kafka.DelegationTopic),
+			// See the comment on the lifecycle reader below. Same hazard,
+			// same recovery: a first join that is assigned no partitions
+			// otherwise stays that way for the life of the process.
+			WatchPartitionChanges:  true,
+			PartitionWatchInterval: partitionWatchInterval,
 		})
 		// authzStore, not pgStore: a projected delegation must invalidate the
 		// cached delegation lookups, or an upstream revocation would keep
 		// granting for up to a TTL after it was applied.
 		consumer := events.NewConsumer(log, authzStore)
 		go consumer.Run(consumerCtx, reader)
+	}
+
+	// ── lifecycle consumer ──────────────────────────────────────────────────
+	//
+	// The other three consumed events Doc 03 §8.3 names, which four passes
+	// recorded as having no producer. They do — under concrete names, on three
+	// topics; see internal/events.LifecycleConsumer for the mapping and for
+	// the one candidate that genuinely is not consumable.
+	//
+	// Two distinct jobs, one subscription:
+	//
+	//   principal.status.changed  is PROJECTED into
+	//                             principal_status_projection and read as
+	//                             layer 0 of /v1/authorize — a principal
+	//                             identity-context-svc has suspended is denied
+	//                             every action. Session eviction does not
+	//                             cover this: 111 services call this endpoint
+	//                             east-west on envelopes resolved before the
+	//                             suspension.
+	//   the rest                  INVALIDATE this replica's cached grant
+	//                             reads. Admin writes reach ONE replica and
+	//                             are announced to all of them, so consuming
+	//                             the announcement is what stops the cache TTL
+	//                             being the only bound on cross-replica
+	//                             staleness.
+	//
+	// authzStore, not pgStore, and for both jobs: the projection has to
+	// invalidate the cached layer-0 read or a suspension would take up to a
+	// TTL to bite, and the invalidation hook only exists on the cache.
+	//
+	// Same posture as the delegation consumer on failure: never fatal, retried
+	// forever, and a broker that is down means these two mechanisms degrade to
+	// where they were before this consumer existed rather than stopping the
+	// service.
+	if len(cfg.Kafka.LifecycleTopics) == 0 {
+		log.Info("lifecycle consumer disabled (KAFKA_LIFECYCLE_TOPICS empty) — principal suspensions will not be projected (layer 0 stays inert) and cross-replica cache invalidation falls back to the TTL")
+	} else {
+		lifecycleReader := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: cfg.Kafka.Brokers,
+			GroupID: cfg.Kafka.LifecycleGroupID,
+			// GroupTopics, not Topic: one logical subscription over three
+			// topics, one offset stream per topic managed by the group. Topic
+			// and GroupTopics are mutually exclusive in kafka-go.
+			GroupTopics: cfg.Kafka.LifecycleTopics,
+			MinBytes:    1,
+			MaxBytes:    10e6,
+			MaxWait:     500 * time.Millisecond,
+			ErrorLogger: kafkaErrorLogger(log, strings.Join(cfg.Kafka.LifecycleTopics, ",")),
+
+			// ── recovery from a bad first join ──────────────────────────────
+			//
+			// MEASURED, not precautionary. On the first run of this consumer
+			// the group joined, reported Stable with one member and **zero
+			// partitions assigned**, and consumed nothing — while the service
+			// log said only "lifecycle consumer started". A second run under a
+			// different group id was assigned all three partitions
+			// immediately, from the same image against the same broker, which
+			// is what identifies this as a join-time race rather than a
+			// configuration error.
+			//
+			// kafka-go defaults WatchPartitionChanges to FALSE, so a member
+			// that is assigned nothing never re-checks: it heartbeats happily,
+			// the group stays Stable, ReadMessage blocks forever, and the
+			// broker reports a healthy group with a member holding no
+			// partitions. Nothing in the Run loop can detect it — that loop
+			// only sees errors RETURNED from ReadMessage, and this failure
+			// returns nothing at all.
+			//
+			// On this service that failure mode means principal suspensions
+			// silently never take effect, which is the one thing layer 0
+			// exists to prevent. With the watch on, the reader re-reads
+			// partition metadata every interval and rejoins when it differs,
+			// so the bad assignment is corrected within one interval instead
+			// of persisting until somebody restarts the pod.
+			WatchPartitionChanges:  true,
+			PartitionWatchInterval: partitionWatchInterval,
+		})
+		lifecycleConsumer := events.NewLifecycleConsumer(log, authzStore)
+		go lifecycleConsumer.Run(consumerCtx, lifecycleReader)
+		log.Info("lifecycle consumer wired", zap.Strings("topics", cfg.Kafka.LifecycleTopics))
 	}
 
 	// ── access_decision_log retention ──────────────────────────────────────
@@ -309,6 +413,37 @@ func main() {
 		}
 	}
 	log.Info("server stopped")
+}
+
+// kafkaErrorLogger adapts zap to kafka-go's LoggerFunc for a reader's
+// ErrorLogger.
+//
+// ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+//
+// kafka-go reports consumer-group problems — a failed JoinGroup, a metadata
+// fetch that returned no partitions, a coordinator that moved — only through
+// Logger and ErrorLogger. Both default to nil, which DISCARDS them.
+//
+// That was measured, not assumed: the lifecycle consumer joined its group,
+// reported Stable with one member and ZERO partitions assigned, and consumed
+// nothing, while the service log showed only "lifecycle consumer started".
+// internal/events' Run loop cannot help — it logs errors returned from
+// ReadMessage, and this failure never surfaces there: ReadMessage simply blocks
+// forever on a member with no assignment.
+//
+// So a consumer that is doing nothing at all looks exactly like a consumer with
+// nothing to do. On this service that means a suspension silently never taking
+// effect. ErrorLogger is now wired on every reader.
+//
+// Only ErrorLogger, not Logger: kafka-go's Logger is per-fetch debug chatter
+// on a hot loop, and turning it on would bury the errors this is here to
+// surface.
+func kafkaErrorLogger(log *zap.Logger, topics string) kafka.LoggerFunc {
+	return func(msg string, args ...any) {
+		log.Error("kafka consumer error",
+			zap.String("topics", topics),
+			zap.String("detail", fmt.Sprintf(msg, args...)))
+	}
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {

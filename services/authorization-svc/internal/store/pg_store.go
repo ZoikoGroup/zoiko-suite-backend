@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -119,6 +120,31 @@ type Store interface {
 	// tenantID scope. A decision recorded without a tenant is not readable
 	// here at all - see RecordAccessDecisionParams.TenantID.
 	FindAccessDecisionByID(ctx context.Context, accessDecisionID, tenantID string) (*domain.AccessDecisionLog, error)
+
+	// ListAccessDecisions returns a keyset-paginated page of the decision log
+	// in tenantID scope, newest first. This is what makes §8.3's "denials must
+	// be evidentially retrievable" true — FindAccessDecisionByID alone is
+	// retrieval only for a caller who already holds the id.
+	//
+	// tenantID is a separate argument from the filters on purpose, and a
+	// tenantless call is REFUSED rather than served unscoped: unlike an
+	// evaluation, nobody has to be able to read the whole platform's audit
+	// trail.
+	ListAccessDecisions(ctx context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error)
+
+	// ProjectPrincipalStatus upserts identity-context-svc's principal status.
+	// Only internal/events.LifecycleConsumer calls it; there is deliberately
+	// no admin route that writes this table — identity-context-svc is
+	// authoritative for principal standing, and a console override would make
+	// two services disagree about who is suspended.
+	ProjectPrincipalStatus(ctx context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error)
+
+	// FindPrincipalStatus answers layer 0 of /v1/authorize. A principal with
+	// no projected row is ACTIVE, so this returns
+	// domain.PrincipalStatusActive rather than an error for the absent case —
+	// the projection ships empty and the layer must be inert until a status
+	// event arrives.
+	FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -1889,4 +1915,280 @@ func (s *PgStore) FindAccessDecisionByID(ctx context.Context, accessDecisionID, 
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return d, nil
+}
+
+// ListAccessDecisions reads a page of the decision log, newest first, scoped
+// to tenantID.
+//
+// This is the read that makes "denials must be evidentially retrievable" (Doc
+// 03 §8.3) true. See domain.ListAccessDecisionsParams for why retrieval by
+// primary key was not enough.
+//
+// ── TENANT SCOPE ────────────────────────────────────────────────────────────
+//
+// tenantID is a separate argument and NOT a member of params, deliberately: it
+// comes from the caller's verified X-Tenant-Id and every other value in params
+// comes from the query string. Putting them in one struct is how a filter field
+// eventually gets populated from user input and widens the scope. The explicit
+// `tenant_id = $1::uuid` predicate is the control, exactly as in
+// FindAccessDecisionByID — the RLS policy admits NULL-tenant rows because
+// RecordAccessDecision has to be able to write one, so the predicate is what
+// excludes them.
+//
+// A tenantless read is therefore refused rather than served unscoped. That is a
+// deliberate difference from FindGrantedActions, which does have a tenantless
+// fallback: an evaluation must answer for a caller that sends no tenant, but
+// nobody has to be able to READ the whole platform's audit trail, and the
+// console — the only caller of this method — always has a verified tenant.
+//
+// ── KEYSET PAGINATION ───────────────────────────────────────────────────────
+//
+// ORDER BY (decided_at, access_decision_id) DESC with a strict row-value
+// comparison against the cursor. The row-value form `(a, b) < ($x, $y)` is one
+// index-friendly predicate rather than the three-way OR expansion, and it gets
+// the tie-breaking right on a table where two decisions genuinely can share a
+// timestamp. See domain.AccessDecisionCursor for why OFFSET is wrong here.
+//
+// One extra row is fetched beyond the limit to decide whether a next cursor
+// exists, and dropped before returning. The alternative — a COUNT(*) over the
+// filtered set — is a second full scan of the largest table on the platform to
+// answer a question the page boundary already contains.
+func (s *PgStore) ListAccessDecisions(ctx context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error) {
+	if strings.TrimSpace(tenantID) == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+
+	limit := params.Limit
+	if limit <= 0 {
+		limit = domain.DefaultAccessDecisionPageSize
+	}
+	if limit > domain.MaxAccessDecisionPageSize {
+		limit = domain.MaxAccessDecisionPageSize
+	}
+
+	// The '' / NULL sentinels keep this one prepared statement rather than
+	// sixty-four assembled ones, and every value below is a real bound
+	// parameter — nothing here is concatenated from input.
+	//
+	// $7/$8 are the cursor. $9 is the "no cursor" flag rather than a NULL
+	// comparison, because a row-value comparison against NULL yields NULL
+	// (not TRUE), which would return an empty first page for every caller who
+	// did not pass a cursor.
+	const query = `
+		SELECT ` + accessDecisionColumns + `
+		  FROM access_decision_log
+		 WHERE tenant_id = $1::uuid
+		   AND ($2 = '' OR principal_id = $2)
+		   AND ($3 = '' OR decision_outcome = $3)
+		   AND ($4 = '' OR action_type = $4)
+		   AND ($5 = '' OR legal_entity_id = NULLIF($5, '')::uuid)
+		   AND ($6::timestamptz IS NULL OR decided_at >= $6)
+		   AND ($7::timestamptz IS NULL OR decided_at <  $7)
+		   AND ($10 OR (decided_at, access_decision_id) < ($8::timestamptz, $9::uuid))
+		 ORDER BY decided_at DESC, access_decision_id DESC
+		 LIMIT $11;`
+
+	var cursorAt any
+	var cursorID any
+	noCursor := params.Cursor.IsZero()
+	if !noCursor {
+		cursorAt = params.Cursor.DecidedAt
+		cursorID = params.Cursor.AccessDecisionID
+	}
+
+	out := make([]domain.AccessDecisionLog, 0, limit)
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, qErr := tx.Query(ctx, query,
+			tenantID,
+			params.PrincipalID,
+			params.Outcome,
+			params.ActionType,
+			params.LegalEntityID,
+			params.DecidedFrom,
+			params.DecidedTo,
+			cursorAt,
+			cursorID,
+			noCursor,
+			// One more than asked for: the extra row is the existence proof
+			// for a next page and is discarded below.
+			limit+1,
+		)
+		if qErr != nil {
+			return qErr
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d domain.AccessDecisionLog
+			if scanErr := rows.Scan(&d.AccessDecisionID, &d.PrincipalID, &d.LegalEntityID,
+				&d.ActionType, &d.DecisionOutcome, &d.DecisionBasis, &d.TenantID,
+				&d.CorrelationID, &d.DecidedAt); scanErr != nil {
+				return scanErr
+			}
+			out = append(out, d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		s.log.Error("pg ListAccessDecisions failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+
+	page := &domain.AccessDecisionPage{}
+	if len(out) > limit {
+		last := out[limit-1]
+		page.NextCursor = domain.AccessDecisionCursor{
+			DecidedAt:        last.DecidedAt,
+			AccessDecisionID: last.AccessDecisionID,
+		}.Encode()
+		out = out[:limit]
+	}
+	page.Decisions = out
+	return page, nil
+}
+
+// ── principal_status_projection ──────────────────────────────────────────────
+
+// ProjectPrincipalStatus upserts one principal's status from
+// identity-context-svc's principal.status.changed event.
+//
+// An UPSERT on (tenant_id, principal_id) rather than an append: a status is a
+// current value, not a history, and the broker redelivers. An INSERT per
+// delivery would either violate the primary key or — with a surrogate key —
+// leave the gate reading whichever duplicate the planner returned first.
+//
+// The row is only advanced when the incoming event is not OLDER than what is
+// already stored, which matters because Kafka guarantees order within a
+// partition and this consumer reads a topic partitioned by principal at best.
+// A replay of an old SUSPENDED after a newer ACTIVE would otherwise re-suspend
+// a reinstated principal, silently, and the only symptom would be a person
+// unable to work. status_changed_at is the comparison when upstream supplied
+// one; when it did not, the write proceeds, because refusing on a missing field
+// would make an event with no timestamp permanently unappliable.
+func (s *PgStore) ProjectPrincipalStatus(ctx context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error) {
+	if strings.TrimSpace(params.TenantID) == "" {
+		return nil, domain.ErrTenantScopeRequired
+	}
+	if strings.TrimSpace(params.PrincipalID) == "" || strings.TrimSpace(params.Status) == "" {
+		return nil, domain.ErrPrincipalStatusIncomplete
+	}
+
+	const query = `
+		INSERT INTO principal_status_projection
+		    (principal_id, tenant_id, status, source_service, status_changed_at)
+		VALUES ($1, $2::uuid, $3, $4, $5)
+		ON CONFLICT (tenant_id, principal_id) DO UPDATE
+		   SET status            = EXCLUDED.status,
+		       source_service    = EXCLUDED.source_service,
+		       status_changed_at = EXCLUDED.status_changed_at,
+		       projected_at      = NOW()
+		 WHERE principal_status_projection.status_changed_at IS NULL
+		    OR EXCLUDED.status_changed_at IS NULL
+		    OR EXCLUDED.status_changed_at >= principal_status_projection.status_changed_at
+		RETURNING principal_id, tenant_id, status, source_service, status_changed_at, projected_at;`
+
+	var p *domain.PrincipalStatusProjection
+	err := s.withRLS(ctx, params.TenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, query, params.PrincipalID, params.TenantID,
+			params.Status, params.SourceService, params.StatusChangedAt)
+		var got domain.PrincipalStatusProjection
+		if scanErr := row.Scan(&got.PrincipalID, &got.TenantID, &got.Status,
+			&got.SourceService, &got.StatusChangedAt, &got.ProjectedAt); scanErr != nil {
+			return scanErr
+		}
+		p = &got
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The DO UPDATE ... WHERE was not satisfied: a newer status is
+			// already stored, so this event is stale. Not an error — the
+			// outcome the stream is converging on already holds.
+			return nil, domain.ErrPrincipalStatusStale
+		}
+		s.log.Error("pg ProjectPrincipalStatus failed", zap.Error(err))
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return p, nil
+}
+
+// FindPrincipalStatus answers layer 0 of /v1/authorize: is this principal
+// still an active principal?
+//
+// ── ABSENCE IS NOT AN ERROR ─────────────────────────────────────────────────
+//
+// No row returns (PrincipalStatusActive, nil). The projection ships empty, so
+// on any deployment that has not yet seen a status event this method answers
+// ACTIVE for everybody and the gate changes no outcome — see
+// domain.PrincipalStatusProjection for why fail-open is right for this one
+// layer and nowhere else in this service.
+//
+// ── THE TENANTLESS CALLER ───────────────────────────────────────────────────
+//
+// 86 of this endpoint's 111 callers send no X-Tenant-Id. A gate that only
+// applied to the other 25 would be escapable by omitting a header, so a
+// tenantless call reads by principal alone, under app.platform_scope (the hatch
+// 000013's policy carries for exactly this read), and takes the MOST
+// RESTRICTIVE row: `ORDER BY (status <> 'ACTIVE') DESC` puts any non-active row
+// first. A principal suspended in one tenant is therefore suspended for a
+// caller that names none, which is the fail-closed direction and the only
+// defensible one — the alternative is a bypass.
+//
+// A tenant-scoped call reads that tenant's row only. A suspension in tenant A
+// does not deny in tenant B, because identity-context-svc publishes standing
+// per tenant and cross-tenant denial would be this service inventing a policy
+// the authoritative service did not state.
+func (s *PgStore) FindPrincipalStatus(ctx context.Context, principalID, tenantID string) (string, error) {
+	if strings.TrimSpace(principalID) == "" {
+		return domain.PrincipalStatusActive, nil
+	}
+
+	const scoped = `
+		SELECT status
+		  FROM principal_status_projection
+		 WHERE tenant_id = $2::uuid AND principal_id = $1;`
+
+	// Most-restrictive-first, so a principal with standing in several tenants
+	// is gated by any tenant that has suspended them.
+	const unscoped = `
+		SELECT status
+		  FROM principal_status_projection
+		 WHERE principal_id = $1
+		 ORDER BY (status <> '` + domain.PrincipalStatusActive + `') DESC
+		 LIMIT 1;`
+
+	var status string
+	var err error
+	if strings.TrimSpace(tenantID) == "" {
+		err = s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, unscoped, principalID).Scan(&status)
+		})
+	} else {
+		err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, scoped, principalID, tenantID).Scan(&status)
+		})
+	}
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.PrincipalStatusActive, nil
+		}
+		// A MISSING TABLE also answers ACTIVE rather than failing the
+		// evaluation. That is what makes 000013 revertible on a live service:
+		// without it, dropping the table would 503 every authorization call on
+		// the platform instead of returning the layer to being a no-op.
+		if isUndefinedTable(err) {
+			s.log.Warn("principal_status_projection is absent — layer 0 is inert; apply migration 000013",
+				zap.String("principal_id", principalID))
+			return domain.PrincipalStatusActive, nil
+		}
+		s.log.Error("pg FindPrincipalStatus failed", zap.Error(err))
+		return "", fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return status, nil
+}
+
+// isUndefinedTable reports whether err is Postgres 42P01 (undefined_table).
+// Matched on the SQLSTATE rather than on the message, which is localised.
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42P01"
 }

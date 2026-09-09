@@ -23,6 +23,13 @@ type countingStore struct {
 	abacCalls      int
 	recordCalls    int
 
+	// listDecisionCalls counts the audit read, which must NOT be cached: a
+	// cached page would answer an auditor with what the log held up to a TTL
+	// ago. principalStatusCalls counts layer 0, which must be.
+	listDecisionCalls    int
+	principalStatusCalls int
+	principalStatus      string
+
 	actions []string
 	basis   string
 
@@ -130,6 +137,24 @@ func (c *countingStore) ListABACRules(_ context.Context, _, _ string) ([]domain.
 }
 func (c *countingStore) FindAccessDecisionByID(_ context.Context, _, _ string) (*domain.AccessDecisionLog, error) {
 	return &domain.AccessDecisionLog{}, nil
+}
+func (c *countingStore) ListAccessDecisions(_ context.Context, _ string, _ domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error) {
+	c.listDecisionCalls++
+	return &domain.AccessDecisionPage{}, nil
+}
+func (c *countingStore) ProjectPrincipalStatus(_ context.Context, params domain.ProjectPrincipalStatusParams) (*domain.PrincipalStatusProjection, error) {
+	return &domain.PrincipalStatusProjection{
+		PrincipalID: params.PrincipalID,
+		TenantID:    params.TenantID,
+		Status:      params.Status,
+	}, nil
+}
+func (c *countingStore) FindPrincipalStatus(_ context.Context, _, _ string) (string, error) {
+	c.principalStatusCalls++
+	if c.principalStatus == "" {
+		return domain.PrincipalStatusActive, nil
+	}
+	return c.principalStatus, nil
 }
 
 const (
@@ -441,5 +466,196 @@ func TestCache_DoesNotCacheErrors(t *testing.T) {
 	}
 	if inner.grantCalls != 2 {
 		t.Fatalf("inner called %d times, want 2 — a failed read must not populate the cache", inner.grantCalls)
+	}
+}
+
+// ── layer 0: the principal-status read ──────────────────────────────────────
+
+// Read on literally every /v1/authorize call, and the answer is almost always
+// "ACTIVE, no row" — the same reason FindABACRules is cached: a database
+// round-trip to learn nothing changed.
+func TestCache_PrincipalStatusIsCached(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{}
+	c := newCache(inner, time.Minute)
+
+	for i := 0; i < 5; i++ {
+		status, err := c.FindPrincipalStatus(ctx, "p-1", tenantA)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if status != domain.PrincipalStatusActive {
+			t.Fatalf("call %d returned %q", i, status)
+		}
+	}
+	if inner.principalStatusCalls != 1 {
+		t.Fatalf("inner store called %d times for 5 identical status reads, want 1", inner.principalStatusCalls)
+	}
+}
+
+// Its own namespace, so a suspension does not throw away the tenant's whole
+// cached grant map on the hot path.
+func TestCache_PrincipalStatusIsKeyedPerPrincipal(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{}
+	c := newCache(inner, time.Minute)
+
+	_, _ = c.FindPrincipalStatus(ctx, "p-1", tenantA)
+	_, _ = c.FindPrincipalStatus(ctx, "p-2", tenantA)
+	_, _ = c.FindPrincipalStatus(ctx, "p-1", tenantB)
+
+	if inner.principalStatusCalls != 3 {
+		t.Fatalf("inner called %d times for three distinct (principal, tenant) pairs, want 3",
+			inner.principalStatusCalls)
+	}
+}
+
+// The property a suspension depends on. A projection must invalidate BOTH the
+// named tenant's entry AND the tenantless one — FindPrincipalStatus is keyed on
+// the tenant it was ASKED with, and 86 of this endpoint's callers ask with none.
+// Invalidating only the named tenant would leave the majority of the platform's
+// traffic reading a stale ACTIVE for a principal that was just suspended.
+func TestCache_ProjectingAStatusInvalidatesBothScopedAndTenantlessReads(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{}
+	c := newCache(inner, time.Minute)
+
+	// Warm both keys: one tenant-scoped, one tenantless.
+	if _, err := c.FindPrincipalStatus(ctx, "p-1", tenantA); err != nil {
+		t.Fatalf("warm scoped: %v", err)
+	}
+	if _, err := c.FindPrincipalStatus(ctx, "p-1", ""); err != nil {
+		t.Fatalf("warm tenantless: %v", err)
+	}
+	if inner.principalStatusCalls != 2 {
+		t.Fatalf("warm-up made %d inner calls, want 2", inner.principalStatusCalls)
+	}
+
+	inner.principalStatus = "SUSPENDED"
+	if _, err := c.ProjectPrincipalStatus(ctx, domain.ProjectPrincipalStatusParams{
+		PrincipalID: "p-1", TenantID: tenantA, Status: "SUSPENDED",
+	}); err != nil {
+		t.Fatalf("project: %v", err)
+	}
+
+	scoped, err := c.FindPrincipalStatus(ctx, "p-1", tenantA)
+	if err != nil {
+		t.Fatalf("scoped read: %v", err)
+	}
+	if scoped != "SUSPENDED" {
+		t.Errorf("tenant-scoped read = %q after projection, want SUSPENDED", scoped)
+	}
+
+	tenantless, err := c.FindPrincipalStatus(ctx, "p-1", "")
+	if err != nil {
+		t.Fatalf("tenantless read: %v", err)
+	}
+	if tenantless != "SUSPENDED" {
+		t.Errorf("tenantless read = %q after projection, want SUSPENDED — this is the caller shape 86 of 111 services use, and it must not keep a stale ACTIVE",
+			tenantless)
+	}
+}
+
+// ── the audit read must NOT be cached ───────────────────────────────────────
+
+// The one place in the cache where "uncached" is a correctness requirement
+// rather than a judgement about hit rates: a cached page would answer an
+// auditor with what the log held up to a TTL ago, so a decision recorded
+// seconds before they looked could be absent from the answer they were given.
+func TestCache_AccessDecisionListingIsNeverCached(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{}
+	c := newCache(inner, time.Minute)
+
+	for i := 0; i < 4; i++ {
+		if _, err := c.ListAccessDecisions(ctx, tenantA, domain.ListAccessDecisionsParams{}); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if inner.listDecisionCalls != 4 {
+		t.Fatalf("the audit read reached the store %d times for 4 identical listings, want 4 — "+
+			"a cached page would hand an auditor a log that is up to a TTL out of date",
+			inner.listDecisionCalls)
+	}
+}
+
+// ── cross-replica invalidation ──────────────────────────────────────────────
+
+// The hook the lifecycle consumer calls when an authoritative service announces
+// a change this replica did not make. Before it existed, the TTL was the only
+// bound on how long another replica's admin write took to be seen.
+func TestCache_InvalidateGrantSourcesForTenantDropsGrantsAndDelegations(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{actions: []string{"PAYMENT_APPROVE"}, basis: "rbac:role=X"}
+	c := newCache(inner, time.Minute)
+
+	_, _, _ = c.FindGrantedActions(ctx, "p-1", "e-1", tenantA)
+	_, _, _ = c.FindDelegatedActions(ctx, "p-1", "e-1", tenantA)
+	if inner.grantCalls != 1 || inner.delegateCalls != 1 {
+		t.Fatalf("warm-up: grants=%d delegations=%d, want 1 each", inner.grantCalls, inner.delegateCalls)
+	}
+
+	c.InvalidateGrantSourcesForTenant(tenantA)
+
+	_, _, _ = c.FindGrantedActions(ctx, "p-1", "e-1", tenantA)
+	_, _, _ = c.FindDelegatedActions(ctx, "p-1", "e-1", tenantA)
+
+	// Delegations too, always: FindDelegatedActions resolves the delegator's
+	// own role assignments, so a change to any role or bundle changes what
+	// every delegation from that principal confers. Dropping only the grants
+	// namespace would leave a revoked role still reachable through a
+	// delegation of it.
+	if inner.grantCalls != 2 {
+		t.Errorf("grants re-read %d times, want 2", inner.grantCalls)
+	}
+	if inner.delegateCalls != 2 {
+		t.Errorf("delegations re-read %d times, want 2 — a role change alters what every delegation from that principal confers",
+			inner.delegateCalls)
+	}
+}
+
+// An empty tenant means every tenant, which is what a tenantless grant-graph
+// event gets. Over-invalidating costs one read; under-invalidating leaves a
+// replica authorizing from a grant set that has already changed.
+func TestCache_InvalidateWithNoTenantDropsEveryTenant(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{actions: []string{"PAYMENT_APPROVE"}, basis: "rbac:role=X"}
+	c := newCache(inner, time.Minute)
+
+	_, _, _ = c.FindGrantedActions(ctx, "p-1", "e-1", tenantA)
+	_, _, _ = c.FindGrantedActions(ctx, "p-1", "e-1", tenantB)
+	if inner.grantCalls != 2 {
+		t.Fatalf("warm-up made %d calls, want 2", inner.grantCalls)
+	}
+
+	c.InvalidateGrantSourcesForTenant("")
+
+	_, _, _ = c.FindGrantedActions(ctx, "p-1", "e-1", tenantA)
+	_, _, _ = c.FindGrantedActions(ctx, "p-1", "e-1", tenantB)
+
+	if inner.grantCalls != 4 {
+		t.Fatalf("grants re-read %d times after a tenantless invalidation, want 4 (both tenants)", inner.grantCalls)
+	}
+}
+
+// With the cache off, every read goes through and the invalidation hooks are
+// harmless no-ops rather than panics — AUTHZ_CACHE_TTL_SECONDS=0 is a real off
+// switch, and the lifecycle consumer calls into it unconditionally.
+func TestCache_DisabledCacheStillAcceptsInvalidation(t *testing.T) {
+	ctx := context.Background()
+	inner := &countingStore{}
+	c := newCache(inner, 0)
+
+	if c.Enabled() {
+		t.Fatal("cache reports enabled with a zero TTL")
+	}
+
+	_, _ = c.FindPrincipalStatus(ctx, "p-1", tenantA)
+	c.InvalidateGrantSourcesForTenant(tenantA)
+	c.InvalidateGrantSourcesForTenant("")
+	_, _ = c.FindPrincipalStatus(ctx, "p-1", tenantA)
+
+	if inner.principalStatusCalls != 2 {
+		t.Fatalf("status read %d times with caching disabled, want 2", inner.principalStatusCalls)
 	}
 }

@@ -1202,3 +1202,314 @@ Unchanged, and all of it either a cross-service decision or producerless:
   JS browser — no browser automation available here. Every wire contract
   underneath them was verified directly against the live service, this pass's
   three routes included.
+
+---
+
+# Sixth pass — 2026-09-09
+
+One thing, the one that was blocking everything else: **`POST /v1/authorize`
+now answers its callers instead of refusing them.** Tracker 82i, open across
+three passes as "needs a decision", is closed — and it turned out not to need
+the decision it was recorded as needing, because the reasoning that ruled out
+the cheap fix was wrong.
+
+## The cheap fix was rejected on an inference, and the inference was wrong
+
+The third pass measured the refusal from the wire and then reasoned about the
+remedy:
+
+> Which settles the `MaterialWrite`-override question empirically: four of the
+> six violations — `actor_subject_id`, `request_id`, `source_channel`,
+> `tenant_id` — are the unconditional set, so an override that drops
+> `idempotency_key` and `legal_entity_id` still leaves a 401. **The cheap fix
+> does not work.**
+
+The measurement was right; the inference from it was not. It assumed
+`MaterialWrite` only selects which *conditional* fields `Validate` demands. It
+also decides whether a violation is **refused at all**:
+
+```go
+if err := policy.Validate(e, r); err != nil {
+    if enforced(mode, policy.materialWrite(r)) {   // <-- here
+        writeViolation(w, err)
+        return
+    }
+    ...
+}
+
+func enforced(mode Mode, isWrite bool) bool {
+    switch mode {
+    case ModeStrict:      return true
+    case ModeWriteStrict: return isWrite     // <-- non-writes are not enforced
+    default:              return false
+    }
+}
+```
+
+Under `write-strict`, a request classified as a non-write is admitted whatever
+`Validate` found. So the override does not have to satisfy the unconditional
+five — it takes `/v1/authorize` out of enforcement entirely, in that mode, and
+only in that mode. A day was nearly spent on the 86-service migration on the
+strength of a conclusion that could have been checked by reading fifteen lines
+of the middleware it was about.
+
+Recorded rather than quietly corrected, because the shape is worth keeping: the
+pass measured the symptom on real infrastructure and then reasoned about the
+cure on paper. This pass measured the cure too — see Verified below.
+
+## The fix
+
+`internal/handler/envelope_policy.go` — new, 70 lines, mostly the argument:
+
+```go
+func EnvelopePolicy() svcenvelope.Policy {
+	p := svcenvelope.ServicePolicy()
+	p.MaterialWrite = MaterialWrite
+	return p
+}
+
+func MaterialWrite(r *http.Request) bool {
+	if r.Method == http.MethodPost && r.URL.Path == AuthorizePath {
+		return false
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
+}
+```
+
+and `cmd/server/main.go` passes `handler.EnvelopePolicy()` where it passed
+`svcenvelope.ServicePolicy()`.
+
+Three things about where it lives. It is **not** in `internal/envelope/
+contract.go`: `services/_contract/rollout.sh` regenerates that file (`cp` of
+five named sources plus a generated `contract.go`), so an override there
+survives until the next rollout and then silently does not. It is **not** in
+`main.go` either, though that is where the wiring goes, because then the tests
+would exercise a copy of the policy rather than the policy. It is in the
+handler package, next to `RegisterRoutes`, because what it encodes — which of
+this service's routes change state — is a property of the route table. Adding a
+route puts the question in front of whoever adds it.
+
+## Why this is the right answer and not merely the cheap one
+
+Both prior write-ups recorded a real objection to the override: it "weakens a
+control on the platform's authorization path", and "the endpoint DOES write the
+decision artifact, so *it changes nothing* is not quite true of it either."
+Taking those in turn.
+
+**On the decision artifact.** `/v1/authorize` appends to
+`access_decision_log`. That row is the audit record *of the question*, not
+business state. Replay protection is not merely unnecessary for it, it is
+backwards: two identical questions must produce two log rows, because the log
+is how "who asked what, when" is answered. An `Idempotency-Key` on an
+evaluation would suppress exactly the second entry the audit trail needs. So
+the endpoint writes, but not material state — which is the distinction
+`RequiredOnWrite` exists to draw, and `Policy.MaterialWrite`'s own doc comment
+names the case: "Override where a service exposes a POST that changes nothing —
+a search or evaluate endpoint."
+
+**On weakening the control.** Measured, not asserted: the relaxation reaches
+one route.
+
+- Every `/v1/admin/*` write is still refused without a full envelope — all
+  twelve of them, checked individually.
+- Under `ModeStrict` the endpoint is refused again. `enforced` ignores the
+  classification in that mode, so this is not a hole strict mode has to undo:
+  flipping `ZS_ENVELOPE_ENFORCEMENT=strict` re-closes it with no code change.
+- What the override *does* change about the strict end state is correct on its
+  own terms: `/v1/authorize` under strict requires the five unconditional §4
+  fields and no longer demands `Idempotency-Key` or `X-Legal-Entity-Id` —
+  neither of which an evaluation has anything to do with, and the entity is in
+  the body where the handler already validates it.
+- It is not silent. A violating call is admitted with
+  `X-Envelope-Contract: violated` on the response and a `WARN` from the
+  reporter naming the missing fields. The log is the migration list.
+
+So this is a migration state with a defined end, not a permanent exemption —
+which is what `ExemptPaths` would have been, and why it was not used. That
+field is for endpoints that *produce* the mandatory fields (gateway-auth-svc's
+`/verify` derives tenant and principal from a signed token); `/v1/authorize`
+consumes a tenant scope, so a blanket bypass would also have dropped
+`request_id` and `correlation_id` from the one path where losing the trace
+costs most.
+
+## What this unblocks, and the part that is now live for the first time
+
+86 of 111 callers were failing closed on a 401 they reported as an
+authorization failure. They now get real decisions. That includes
+accounts-payable, general-ledger, workflow-svc, every `payment-*` and
+`privacy-*` service, tenant-entity-registry-svc and identity-context-svc.
+
+It also makes live a set of paths that three passes have described as correct
+but not reached: `resolveTenantScope`'s body-then-nothing fallback, the store's
+`$3 = ''` tenantless fallbacks, and migration `000008`'s platform-scope hatch on
+`delegated_authorities`. Those were built for exactly this caller — one that
+arrives with no `X-Tenant-Id` — and the middleware was refusing it one layer
+up, which is why 82a's fix (2) was previously reachable only in observe mode.
+The body-tenant path is exercised below and resolves the correct tenant.
+
+Note the consequence for the fallback item that has been carried as open since
+the second pass: it was kept so a caller with no `X-Tenant-Id` would not be
+refused, then recorded as protecting nobody because the middleware refused that
+caller anyway. It now protects the callers it was written for. It stays, and the
+reason is no longer moot.
+
+## Verified
+
+`go build`, `go vet`, `gofmt` clean on both changed files; full `go test ./...`
+green.
+
+Nine new tests in `internal/handler/envelope_policy_test.go`, which mount the
+real middleware with `handler.EnvelopePolicy()` — the other handler tests
+deliberately omit the middleware and send no headers, so none of them could
+have caught this. They cover: the no-envelope call admitted and flagged; the
+obligations-svc header shape admitted; a conformant caller admitted and *not*
+flagged; all twelve admin writes still refused with `envelope_incomplete`;
+strict mode still refusing; strict mode not demanding an idempotency key;
+strict mode still demanding tenant; and the classifier itself, including
+`POST /v1/authorize/something` which is not the evaluation endpoint.
+
+**On the wire**, against the real service on :8089 — postgres 16 and Kafka up,
+`DB_USER=app_authorization`, deliberately only those three containers:
+
+| call | before | now |
+|---|---|---|
+| `POST /v1/authorize`, obligations-svc's exact headers | 401 | **200** `GRANTED` `rbac:role=TEST_ROLE`, flagged `violated` |
+| `POST /v1/authorize`, no headers at all | 401 | **200** `GRANTED`, flagged `violated` |
+| `POST /v1/authorize`, full envelope (policy-svc's shape) | 200 | **200**, and *not* flagged |
+| `POST /v1/authorize`, action the principal does not hold | — | **DENIED** `no_grant` — fail-closed intact |
+| `POST /v1/admin/roles` and the other 11 admin writes, no envelope | 401 | **401** `envelope_incomplete` |
+| `GET /v1/admin/roles`, tenant + principal | 200 | **200** |
+
+Tenant resolution on the newly-live path: the body-tenant calls wrote
+`access_decision_log` rows carrying the correct
+`tenant_id=11111111-…-111111111111` and `principal_id`, so the fallback
+resolves rather than merely admitting.
+
+And the strict end state, measured on a second container run from the same
+image with `ZS_ENVELOPE_ENFORCEMENT=strict` (stopped afterwards):
+
+| call under strict | result |
+|---|---|
+| `POST /v1/authorize`, no envelope | **401** — re-closes, as claimed |
+| `POST /v1/authorize`, the five unconditional fields only | **200** `GRANTED` |
+| `POST /v1/admin/roles`, the same five fields | **401**, missing exactly `idempotency_key, legal_entity_id` |
+
+That last row is the write/non-write distinction doing its job on two routes of
+the same service in the same request shape.
+
+## Still open after this pass
+
+82i is closed as a refusal. What remains of it is the migration it was
+blocking, and it is now a cleanup rather than an outage:
+
+- **86 callers still send no envelope.** They work, and every call is logged
+  `WARN canonical input contract violated` with the missing fields, so the list
+  is generated rather than swept for. The doctrinal end state is still to
+  migrate them and set `ZS_ENVELOPE_ENFORCEMENT=strict`; until then the
+  decision log records those calls without caller attribution.
+  `services/policy-svc/internal/authz/client.go` is the reference
+  implementation — it lifts the inbound envelope off the request context with
+  `svcenvelope.FromContext(ctx)` and forwards it, so no client signature has to
+  change. This is 86 services of small, identical edits, and out of scope here
+  by instruction.
+- **Tracker 81 (two delegation stores)**, **tracker 79 (role assignment
+  duplicated with identity-context-svc)** — unchanged, cross-service decisions.
+- **Three unconsumed events** — `role.assigned`, `employment.changed`,
+  `entity.scope.updated` — still have no producer.
+- **The Server Actions behind the console forms** are still not exercised by a
+  JS browser; no browser automation here. Every wire contract underneath them
+  has been verified directly.
+- **The store integration suite did not run in this pass.** `TEST_DATABASE_URL`
+  was left unset deliberately, because `setupTestDB` DROPs every table the
+  service owns and the only database to hand was the compose stack's
+  `authorization_svc` with the fixtures these wire tests depend on. `go test
+  ./...` prints `ok` for `internal/store` regardless, which is why this is
+  written down: that `ok` means "skipped", not "passed". Use a throwaway
+  database.
+
+
+# Seventh pass — 2026-09-09
+
+## The blocker the sixth pass applied, and the caller it left in the cold
+
+The sixth pass made every `/v1/admin/*` write require the §4 envelope. It did
+not break the console — `lib/api/envelope.ts`/`client.ts` in the frontend and
+`access-control-svc/internal/clients/authzadmin.go` already send the canonical
+headers. It broke the one remaining caller that did not: the demo RBAC seeding
+script.
+
+`seed-demo-rbac.ps1` predates the enforcement, sends no envelope, and every one
+of its writes (role create, 26 bundle creates, 4 role-assignments) was answered
+`401 envelope_incomplete`. The script kept running, kept failing into its
+catch blocks, and reported the result honestly at the end:
+
+    Seeding demo RBAC via http://localhost:8089 — 102 of 82 actions missing: ...
+
+So a fresh stack — this one included — had a console wired correctly and a
+service answering its reads, with *nothing seeded behind it*: every gated
+service write refused `DENIED / no_grant`, the exact "console can read and
+write nothing" state the script's own header describes. This is why the
+enforcement and the seeding could not coexist: each half was done, and the
+join was missing.
+
+## The fix
+
+`deployments/scripts/seed-demo-rbac.ps1` now builds the §4 envelope in
+`New-AuthzEnvelope` and `Invoke-Authz` attaches it with `-Headers`. The shape
+mirrors what the console and access-control-svc send:
+
+- every request: `X-Tenant-Id`, `X-Principal-Id`, `X-Legal-Entity-Id`,
+  `X-Correlation-ID`, `X-Request-Id`, `X-Source-System=console-seed`,
+  `X-Source-Channel=api`;
+- material writes add `Idempotency-Key` (fresh GUID per call — the seeding
+  stays idempotent at the domain level, on primary keys, exactly as before),
+  `X-Occurred-At`, `X-Operation=admin_seed`;
+- the `/v1/authorize` probes are classified as non-writes and omit
+  `Idempotency-Key`, matching the sixth pass's classification of that route.
+
+The probes now also send `X-Tenant-Id`, so `resolveTenantScope` evaluates
+against the demo tenant instead of the global-only fallback — closer to what a
+real caller sends. The decision *scope* is unaffected: `Authorize` reads
+`legal_entity_id` from the body, not the header (verified in `handleAuthorize`),
+so the platform-scope probes still evaluate on the platform identity.
+
+## Verified — the run it has been failing since enforcement shipped
+
+First run, against the live `authz-e2e` container on :8089 (postgres 16 +
+Kafka up, no gateway): role `CONSOLE_DEMO_OPERATOR` created, all 26 bundles
+`201`, all 4 assignments `201` (legal entity, tenant, platform scope, plus the
+SoD approver), and the full verification loop green on all three scopes.
+
+Second run, same volume: fast-path — "Already granted — holds all 82 actions on
+… and the platform scope", with the whole verification suite re-run green:
+
+    Done. The console can write to all 25 wired services.
+
+That final line is the state every downstream service now actually sees via
+`POST /v1/authorize`: `GRANTED (rbac:role=CONSOLE_DEMO_OPERATOR)` everywhere it
+was previously `DENIED / no_grant`.
+
+## Still open after this pass
+
+The seed-path blocker is closed. Everything else is the same cross-service
+list, unchanged:
+
+- **86 callers still send no envelope** — the migration out of scope here.
+- **Tracker 81 (two delegation stores)**, **tracker 79 (role assignment
+  duplicated with identity-context-svc)** — unchanged, cross-service decisions.
+- **Three unconsumed events** — `role.assigned`, `employment.changed`,
+  `entity.scope.updated` — still have no producer.
+- **`DELEGATION_ADMINISTER`** is enforced but deliberately not seeded: the
+  script's header keeps it out of the demo bundle ("handing it to the demo
+  principal would restore exactly the escalation this pass closed") and the
+  console's `explainDelegationError` relies on a delegation administrator that
+  a stock demo stack therefore cannot name. A deliberate gap, recorded — close
+  it by seeding a separate delegation-admin bundle to a second principal when
+  that principal exists to be realistic.
+- **The store integration suite still does not run** — the same
+  `TEST_DATABASE_URL` caveat as pass six, unchanged.

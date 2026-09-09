@@ -195,6 +195,40 @@ type KafkaConfig struct {
 	// between a producer and a consumer reads as a single logical
 	// subscription and makes offsets impossible to reason about.
 	DelegationGroupID string
+
+	// LifecycleTopics are the topics carrying the other three consumed-event
+	// concepts Doc 03 §8.3 names — see internal/events.LifecycleConsumer for
+	// the mapping from spec name to real event, which is not one-to-one:
+	//
+	//	zoiko.identity.events        principal.status.changed
+	//	                             (§8.3's employment.changed) — PROJECTED
+	//	                             into principal_status_projection and read
+	//	                             as layer 0 of /v1/authorize.
+	//	zoiko.access-control.events  role.created / role.updated /
+	//	                             permission.bundle.updated
+	//	                             (§8.3's role.assigned)
+	//	zoiko.entity.events          entity.status.changed /
+	//	                             entity.hierarchy.changed /
+	//	                             entity.jurisdiction.changed
+	//	                             (§8.3's entity.scope.updated)
+	//
+	// ONE reader over three topics, via kafka.ReaderConfig.GroupTopics,
+	// rather than three readers: they share a dispatch table, a dedupe set
+	// and a consumer group, and three readers would mean three offset streams
+	// to reason about for one logical subscription.
+	//
+	// Comma-separated, and EMPTY DISABLES the consumer entirely — the off
+	// switch for a deployment where these services are not running, which
+	// would otherwise leave a reader retrying topics that never appear. With
+	// it off, layer 0 stays inert (no row means ACTIVE) and the cache TTL is
+	// once again the only bound on cross-replica staleness, which is where
+	// this service was before the consumer existed.
+	LifecycleTopics []string
+
+	// LifecycleGroupID is the consumer group for the above. Distinct from
+	// both GroupID and DelegationGroupID for the same reason those are
+	// distinct from each other.
+	LifecycleGroupID string
 }
 
 // Load reads configuration from environment variables.
@@ -238,6 +272,16 @@ func Load() (*Config, error) {
 			// "off" at all.
 			DelegationTopic:   envAllowEmpty("KAFKA_DELEGATION_TOPIC", "zoiko.delegated-authority.events"),
 			DelegationGroupID: env("KAFKA_DELEGATION_GROUP_ID", "authorization-svc-delegation-projector"),
+
+			// Defaulted to the three producers' own compose defaults, on the
+			// same reasoning as DelegationTopic: a stack running those
+			// services is consumed from with no extra configuration.
+			// envAllowEmpty so KAFKA_LIFECYCLE_TOPICS="" is a real off switch
+			// — env() would fold the empty value back into this default and
+			// there would be no way to express "off".
+			LifecycleTopics: splitTopics(envAllowEmpty("KAFKA_LIFECYCLE_TOPICS",
+				"zoiko.identity.events,zoiko.access-control.events,zoiko.entity.events")),
+			LifecycleGroupID: env("KAFKA_LIFECYCLE_GROUP_ID", "authorization-svc-lifecycle"),
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
@@ -290,6 +334,28 @@ func envAllowEmpty(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitTopics parses a comma-separated topic list, dropping empties.
+//
+// Returns nil for an empty or all-whitespace value rather than a one-element
+// slice containing "", which is what strings.Split does and which would have
+// the consumer subscribe to a topic named empty string — a subscription that
+// never delivers and never errors, i.e. the off switch appearing to work while
+// leaving a reader spinning. Whitespace around each name is trimmed because
+// "a, b" in an env var or a compose file is what a person writes.
+func splitTopics(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func envInt(key string, def int) int {
