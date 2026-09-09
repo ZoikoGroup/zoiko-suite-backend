@@ -41,7 +41,7 @@ const (
 )
 
 type AuthzChecker interface {
-	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
+	CheckAllowed(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error
 }
 
 type Handler struct {
@@ -463,7 +463,12 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 }
 
 func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, actionType string) bool {
-	if err := h.authz.CheckAllowed(r.Context(), principalID, platformScopeID, actionType); err != nil {
+	// Read straight from context rather than taking a parameter: every caller
+	// has already passed requireTenant, so the value is present, and threading
+	// it through five call sites would only give each one a chance to pass the
+	// wrong thing.
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	if err := h.authz.CheckAllowed(r.Context(), tenantID, principalID, platformScopeID, actionType); err != nil {
 		if errors.Is(err, authzpkg.ErrAuthorizationDenied) {
 			writeError(w, http.StatusForbidden, "not authorized to perform this action")
 		} else {

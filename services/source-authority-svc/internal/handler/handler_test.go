@@ -265,7 +265,7 @@ var _ events.Publisher = (*stubPublisher)(nil)
 
 type stubAuthz struct{ err error }
 
-func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _, _ string) error { return a.err }
 
 var _ AuthzChecker = (*stubAuthz)(nil)
 
