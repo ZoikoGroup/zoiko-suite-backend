@@ -79,6 +79,7 @@ services:
       - ../services/consolidation-svc/deployments/migrations:/migrations/consolidation:ro
       - ../services/asset-management-svc/deployments/migrations:/migrations/asset-management:ro
       - ../services/inventory-management-svc/deployments/migrations:/migrations/inventory-management:ro
+      - ../services/project-accounting-svc/deployments/migrations:/migrations/project-accounting:ro
       - ../services/invoice-approval-svc/deployments/migrations:/migrations/invoice-approval:ro
       - ../services/employee-master-svc/deployments/migrations:/migrations/employee-master:ro
       - ../services/employment-contracts-svc/deployments/migrations:/migrations/employment-contracts:ro
@@ -2431,6 +2432,41 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8168/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  project-accounting-svc:
+    build:
+      context: ../services/project-accounting-svc
+      dockerfile: Dockerfile
+    container_name: project-accounting-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8169:8169"
+    environment:
+      PORT: "8169"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: project_accounting
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.project.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8169/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
