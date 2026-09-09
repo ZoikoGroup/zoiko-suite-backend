@@ -2416,12 +2416,15 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.inventory.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      CLOSE_SERVICE_URL: "http://financial-close-svc:8104"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      financial-close-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8168/healthz"]

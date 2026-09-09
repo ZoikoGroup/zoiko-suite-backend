@@ -310,3 +310,146 @@ var (
 
 	ErrLocationNotQuarantined = errorString("location is not currently quarantined")
 )
+
+// ── INV-03 Inventory Movement ────────────────────────────────────────────────
+//
+// See migration 000003's doc comment for the full state-model/command
+// mapping and all four negative-path enforcement mechanisms — including
+// the two negative paths INV-01/INV-02 each deferred to this capability.
+
+const (
+	MovementTypeReceipt      = "RECEIPT"
+	MovementTypeIssue        = "ISSUE"
+	MovementTypeTransfer     = "TRANSFER"
+	MovementTypeAdjustment   = "ADJUSTMENT"
+	MovementTypeReversal     = "REVERSAL"
+	MovementTypeSupersession = "SUPERSESSION"
+
+	MovementStatusDraft     = "DRAFT"
+	MovementStatusValidated = "VALIDATED"
+	MovementStatusCommitted = "COMMITTED"
+)
+
+// InventoryMovement is INV-03's own authority — "InventoryMovement;
+// movement line; source/destination; quantity/UOM; item/lot/serial;
+// business/effective/posting dates; source reference; movement type;
+// reversal/supersession link." Quantity is always a positive magnitude;
+// direction is implied by movement_type and which of
+// Source/DestinationLocationID is set — see migration 000003's doc
+// comment for the full mapping.
+type InventoryMovement struct {
+	MovementID    string `json:"movement_id"`
+	TenantID      string `json:"tenant_id"`
+	LegalEntityID string `json:"legal_entity_id"`
+	MovementType  string `json:"movement_type"`
+	Status        string `json:"status"`
+
+	ItemID                string    `json:"item_id"`
+	SourceLocationID      *string   `json:"source_location_id,omitempty"`
+	DestinationLocationID *string   `json:"destination_location_id,omitempty"`
+	Quantity              float64   `json:"quantity"`
+	UOM                   string    `json:"uom"`
+	LotNumber             *string   `json:"lot_number,omitempty"`
+	SerialNumber          *string   `json:"serial_number,omitempty"`
+	SourceReference       string    `json:"source_reference"`
+	SourceIdempotencyKey  string    `json:"source_idempotency_key"`
+	BusinessDate          time.Time `json:"business_date"`
+	FiscalPeriod          string    `json:"fiscal_period"`
+	ReversesMovementID    *string   `json:"reverses_movement_id,omitempty"`
+	SupersedesMovementID  *string   `json:"supersedes_movement_id,omitempty"`
+	Reason                *string   `json:"reason,omitempty"`
+
+	CreatedAt              time.Time  `json:"created_at"`
+	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
+	ValidatedAt            *time.Time `json:"validated_at,omitempty"`
+	CommittedAt            *time.Time `json:"committed_at,omitempty"`
+	CommittedByPrincipalID *string    `json:"committed_by_principal_id,omitempty"`
+}
+
+// ── Request types ────────────────────────────────────────────────────────
+
+// CreateInventoryMovementRequest is the one real create path every named
+// command (CreateInventoryMovement and the four type-specific wrappers)
+// funnels through — see migration 000003's doc comment.
+type CreateInventoryMovementRequest struct {
+	MovementType          string     `json:"movement_type,omitempty"` // required for CreateInventoryMovement; pre-filled by the type-specific wrappers
+	ItemID                string     `json:"item_id"`
+	SourceLocationID      string     `json:"source_location_id,omitempty"`
+	DestinationLocationID string     `json:"destination_location_id,omitempty"`
+	Quantity              float64    `json:"quantity"`
+	UOM                   string     `json:"uom"`
+	LotNumber             string     `json:"lot_number,omitempty"`
+	SerialNumber          string     `json:"serial_number,omitempty"`
+	SourceReference       string     `json:"source_reference"`
+	SourceIdempotencyKey  string     `json:"source_idempotency_key"`
+	BusinessDate          *time.Time `json:"business_date,omitempty"`
+	FiscalPeriod          string     `json:"fiscal_period"`
+	Reason                string     `json:"reason,omitempty"`
+}
+
+type ReverseMovementRequest struct {
+	Reason string `json:"reason"`
+}
+
+type SupersedeMovementRequest struct {
+	Reason string `json:"reason"`
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
+
+var (
+	ErrMovementNotFound = errorString("inventory movement not found")
+
+	ErrInvalidMovementTransition = errorString("inventory movement is not in a status that allows this action")
+
+	ErrMovementTypeRequired = errorString("movement_type is required")
+
+	// ErrDuplicateIdempotencyKey signals the store already has a movement
+	// under this key — the caller-facing handler resolves this to the
+	// EXISTING movement rather than an error, per the spec's own failure
+	// semantics: "Duplicate idempotency key returns original result."
+	ErrDuplicateIdempotencyKey = errorString("a movement already exists for this source_idempotency_key")
+
+	ErrReceiptRequiresDestinationOnly = errorString("a RECEIPT movement requires destination_location_id and must not set source_location_id")
+	ErrIssueRequiresSourceOnly        = errorString("an ISSUE movement requires source_location_id and must not set destination_location_id")
+	ErrTransferRequiresBothLocations  = errorString("a TRANSFER movement requires both source_location_id and destination_location_id")
+	ErrAdjustmentRequiresOneLocation  = errorString("an ADJUSTMENT movement requires exactly one of source_location_id (decrease) or destination_location_id (increase)")
+
+	// ErrLotIdentityRequired is INV-01's own deferred negative path,
+	// "Lot-tracked item moved without lot identity" — enforced here, at
+	// the one place stock actually moves.
+	ErrLotIdentityRequired = errorString("this item's tracking policy requires a lot_number for every movement")
+
+	// ErrSerialIdentityRequired is the serial-tracking half of the same
+	// deferred negative path.
+	ErrSerialIdentityRequired = errorString("this item's tracking policy requires a serial_number for every movement")
+
+	// ErrLocationNotEligible is INV-02's own deferred negative path,
+	// "Movement enters retired location" (generalized to any non-ACTIVE
+	// location) — enforced here, at the one place stock actually moves.
+	ErrLocationNotEligible = errorString("source and destination locations must both be ACTIVE")
+
+	// ErrItemNotEligibleForMovement covers a movement against an item
+	// that is not currently ACTIVE.
+	ErrItemNotEligibleForMovement = errorString("item must be ACTIVE to be moved")
+
+	// ErrUOMMismatch is the spec's own negative path, "UOM ambiguity
+	// blocks commit" — this v1's real, simple enforcement: a movement's
+	// own uom must exactly match the item's base_uom (no REF UOM
+	// conversion service exists yet to reconcile a mismatch safely).
+	ErrUOMMismatch = errorString("movement uom does not match the item's own base_uom")
+
+	// ErrSerialAlreadyResident and ErrSerialNotAtSourceLocation are the
+	// spec's own negative path, "Serial-numbered unit appears in two
+	// locations."
+	ErrSerialAlreadyResident     = errorString("this serial number already has a residency record — it cannot be received again without first leaving the tracked estate")
+	ErrSerialNotAtSourceLocation = errorString("this serial number does not currently reside at the claimed source location")
+
+	// ErrNegativeStockNotAllowed is the spec's own negative path,
+	// "Negative stock allowed despite policy prohibition" — no
+	// per-item/location override exists in this v1, refused universally.
+	ErrNegativeStockNotAllowed = errorString("this movement would take on-hand quantity below zero")
+
+	ErrPeriodCheckUnavailable = errorString("financial-close-svc unavailable")
+	ErrPeriodLocked           = errorString("cannot commit a movement into a LOCKED fiscal period")
+)

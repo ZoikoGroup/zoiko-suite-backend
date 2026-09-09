@@ -113,6 +113,42 @@ func (p *Publisher) PublishInventoryLocationRetired(ctx context.Context, correla
 	})
 }
 
+// INV-03's own named events (a subset — "InventoryMovementExceptionRaised"
+// is not wired in, since this v1 has no exception-detection logic yet;
+// stated honestly in the findings doc): "InventoryMovementCommitted;
+// InventoryMovementReversed; InventoryTransferred; InventoryReceived;
+// InventoryIssued."
+
+func (p *Publisher) PublishInventoryMovementCommitted(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement) {
+	p.emit(ctx, "inventory.movement.committed", correlationID, m.TenantID, m.LegalEntityID, actorID, m.MovementID, map[string]any{
+		"movement_id": m.MovementID, "item_id": m.ItemID, "movement_type": m.MovementType, "quantity": m.Quantity,
+	})
+}
+
+func (p *Publisher) PublishInventoryMovementReversed(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement) {
+	p.emit(ctx, "inventory.movement.reversed", correlationID, m.TenantID, m.LegalEntityID, actorID, m.MovementID, map[string]any{
+		"movement_id": m.MovementID, "reverses_movement_id": m.ReversesMovementID, "supersedes_movement_id": m.SupersedesMovementID,
+	})
+}
+
+func (p *Publisher) PublishInventoryTransferred(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement) {
+	p.emit(ctx, "inventory.transferred", correlationID, m.TenantID, m.LegalEntityID, actorID, m.MovementID, map[string]any{
+		"movement_id": m.MovementID, "item_id": m.ItemID, "quantity": m.Quantity,
+	})
+}
+
+func (p *Publisher) PublishInventoryReceived(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement) {
+	p.emit(ctx, "inventory.received", correlationID, m.TenantID, m.LegalEntityID, actorID, m.MovementID, map[string]any{
+		"movement_id": m.MovementID, "item_id": m.ItemID, "quantity": m.Quantity,
+	})
+}
+
+func (p *Publisher) PublishInventoryIssued(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement) {
+	p.emit(ctx, "inventory.issued", correlationID, m.TenantID, m.LegalEntityID, actorID, m.MovementID, map[string]any{
+		"movement_id": m.MovementID, "item_id": m.ItemID, "quantity": m.Quantity,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

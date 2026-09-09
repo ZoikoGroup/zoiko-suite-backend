@@ -15,6 +15,10 @@ type Config struct {
 	Kafka KafkaConfig
 
 	AuthZServiceURL string
+	// CloseServiceURL is financial-close-svc's own base URL — INV-03
+	// depends on its period-status check per the spec's own negative
+	// path, "Hard-closed movement backdated without correction path."
+	CloseServiceURL string
 
 	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
 	// OFF by default — when false, nothing about the existing authz call
@@ -75,6 +79,7 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.inventory.events"),
 		},
 		AuthZServiceURL: env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		CloseServiceURL: env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

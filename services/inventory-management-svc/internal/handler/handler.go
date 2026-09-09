@@ -46,6 +46,23 @@ type Store interface {
 	GetAncestorChain(ctx context.Context, locationID string) ([]string, error)
 	ReparentLocation(ctx context.Context, locationID, newParentLocationID, principalID string, at time.Time) error
 	GetParentAsOf(ctx context.Context, locationID string, at time.Time) (*string, error)
+
+	// INV-03 (Inventory Movement) — see internal/store/movement_store.go's
+	// own doc comments for the authority boundary these implement.
+	CreateMovement(ctx context.Context, m *domain.InventoryMovement) error
+	GetMovement(ctx context.Context, movementID string) (*domain.InventoryMovement, error)
+	ListMovements(ctx context.Context, itemID string) ([]domain.InventoryMovement, error)
+	ValidateMovement(ctx context.Context, movementID string, at time.Time) error
+	CommitMovement(ctx context.Context, movementID, principalID string, at time.Time) error
+	GetOnHand(ctx context.Context, itemID, locationID string) (float64, error)
+	GetOnHandAsOf(ctx context.Context, itemID, locationID string, at time.Time) (float64, error)
+	CreateCorrectionMovement(ctx context.Context, originalMovementID, principalID, reason string, isSupersede bool, newMovementID string, at time.Time) (*domain.InventoryMovement, error)
+}
+
+// PeriodChecker is INV-03's own real "hard-closed-period" dependency on
+// financial-close-svc — see internal/clients/close.go's own doc comment.
+type PeriodChecker interface {
+	CheckPeriodOpen(ctx context.Context, tenantID, legalEntityID, periodName string) error
 }
 
 // Publisher is the event-publishing contract the handler depends on —
@@ -66,6 +83,16 @@ type Publisher interface {
 	PublishInventoryLocationQuarantined(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation)
 	PublishInventoryLocationChanged(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, locationID, changeType string)
 	PublishInventoryLocationRetired(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation)
+
+	// INV-03 (Inventory Movement) — the spec's own named Events:
+	// "InventoryMovementCommitted; InventoryMovementReversed;
+	// InventoryTransferred; InventoryReceived; InventoryIssued;
+	// InventoryMovementExceptionRaised."
+	PublishInventoryMovementCommitted(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
+	PublishInventoryMovementReversed(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
+	PublishInventoryTransferred(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
+	PublishInventoryReceived(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
+	PublishInventoryIssued(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -91,17 +118,40 @@ const (
 	actionInventoryLocationRead       = "INVENTORY_LOCATION_READ"
 	actionInventoryLocationManage     = "INVENTORY_LOCATION_MANAGE"
 	actionInventoryLocationQuarantine = "INVENTORY_LOCATION_QUARANTINE"
+
+	// INV-03 (Inventory Movement) actions — the spec's own Permissions
+	// field: "inventory.movement.read; inventory.movement.create;
+	// inventory.movement.adjust; inventory.movement.reverse."
+	// actionInventoryMovementAdjust is deliberately distinct from
+	// actionInventoryMovementCreate — the spec's own SoD: "source domain
+	// cannot create arbitrary inventory adjustment disguised as
+	// receipt/issue."
+	actionInventoryMovementRead    = "INVENTORY_MOVEMENT_READ"
+	actionInventoryMovementCreate  = "INVENTORY_MOVEMENT_CREATE"
+	actionInventoryMovementAdjust  = "INVENTORY_MOVEMENT_ADJUST"
+	actionInventoryMovementReverse = "INVENTORY_MOVEMENT_REVERSE"
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	log       *zap.Logger
+	store         Store
+	publisher     Publisher
+	authz         AuthZClient
+	periodChecker PeriodChecker
+	log           *zap.Logger
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
 	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+}
+
+// WithPeriodChecker sets INV-03's own real dependency on
+// financial-close-svc. Left unconfigured, CommitMovement and the two
+// correction commands refuse with a clear error rather than a nil
+// dereference — the same posture asset-management-svc's own
+// WithLedgerClient takes for a never-optional dependency.
+func (h *Handler) WithPeriodChecker(c PeriodChecker) *Handler {
+	h.periodChecker = c
+	return h
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -133,6 +183,20 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}/hierarchy", h.GetLocationHierarchy)
 		r.Get("/{id}/as-of", h.GetLocationAsOf)
 	})
+	r.Route("/v1/movements", func(r chi.Router) {
+		r.Post("/", h.CreateInventoryMovement)
+		r.Post("/receive", h.ReceiveInventory)
+		r.Post("/issue", h.IssueInventory)
+		r.Post("/transfer", h.TransferInventory)
+		r.Post("/adjust", h.AdjustInventoryFromApprovedCount)
+		r.Get("/", h.ListMovements)
+		r.Get("/{id}", h.GetMovement)
+		r.Post("/{id}/validate", h.ValidateMovement)
+		r.Post("/{id}/commit", h.CommitMovement)
+		r.Post("/{id}/reverse", h.ReverseMovement)
+		r.Post("/{id}/supersede", h.SupersedeMovement)
+	})
+	r.Get("/v1/on-hand", h.GetOnHand)
 }
 
 // ── POST /v1/items ────────────────────────────────────────────────────────

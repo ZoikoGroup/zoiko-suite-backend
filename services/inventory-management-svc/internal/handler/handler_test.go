@@ -29,6 +29,10 @@ type stubStore struct {
 
 	locations map[string]*domain.InventoryLocation
 	parents   map[string]*string // location_id -> current parent_location_id
+
+	movements       map[string]*domain.InventoryMovement
+	movementsByKey  map[string]string // source_idempotency_key -> movement_id
+	serialResidency map[string]string // "item_id|serial_number" -> location_id
 }
 
 func newStubStore() *stubStore {
@@ -38,6 +42,9 @@ func newStubStore() *stubStore {
 		valuationPolicies: make(map[string]*domain.ValuationPolicy),
 		locations:         make(map[string]*domain.InventoryLocation),
 		parents:           make(map[string]*string),
+		movements:         make(map[string]*domain.InventoryMovement),
+		movementsByKey:    make(map[string]string),
+		serialResidency:   make(map[string]string),
 	}
 }
 
@@ -306,6 +313,204 @@ func (s *stubStore) GetProfileAsOf(_ context.Context, itemID string, _ time.Time
 	return s.trackingPolicies[itemID], s.valuationPolicies[itemID], nil
 }
 
+// ── INV-03 (Inventory Movement) ──────────────────────────────────────────────
+
+func (s *stubStore) CreateMovement(_ context.Context, m *domain.InventoryMovement) error {
+	if existingID, ok := s.movementsByKey[m.SourceIdempotencyKey]; ok {
+		*m = *s.movements[existingID]
+		return nil
+	}
+	cp := *m
+	s.movements[m.MovementID] = &cp
+	s.movementsByKey[m.SourceIdempotencyKey] = m.MovementID
+	return nil
+}
+
+func (s *stubStore) GetMovement(_ context.Context, movementID string) (*domain.InventoryMovement, error) {
+	m, ok := s.movements[movementID]
+	if !ok {
+		return nil, domain.ErrMovementNotFound
+	}
+	cp := *m
+	return &cp, nil
+}
+
+func (s *stubStore) ListMovements(_ context.Context, itemID string) ([]domain.InventoryMovement, error) {
+	var out []domain.InventoryMovement
+	for _, m := range s.movements {
+		if m.ItemID == itemID {
+			out = append(out, *m)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) ValidateMovement(_ context.Context, movementID string, at time.Time) error {
+	m, ok := s.movements[movementID]
+	if !ok || m.Status != domain.MovementStatusDraft {
+		return domain.ErrInvalidMovementTransition
+	}
+	item, ok := s.items[m.ItemID]
+	if !ok {
+		return domain.ErrItemNotFound
+	}
+	if item.Status != domain.ItemStatusActive {
+		return domain.ErrItemNotEligibleForMovement
+	}
+	for _, locID := range []*string{m.SourceLocationID, m.DestinationLocationID} {
+		if locID == nil {
+			continue
+		}
+		loc, ok := s.locations[*locID]
+		if !ok {
+			return domain.ErrLocationNotFound
+		}
+		if loc.Status != domain.LocationStatusActive {
+			return domain.ErrLocationNotEligible
+		}
+	}
+	if tp, ok := s.trackingPolicies[m.ItemID]; ok {
+		if tp.RequiresLotTracking && (m.LotNumber == nil || *m.LotNumber == "") {
+			return domain.ErrLotIdentityRequired
+		}
+		if tp.RequiresSerialTracking && (m.SerialNumber == nil || *m.SerialNumber == "") {
+			return domain.ErrSerialIdentityRequired
+		}
+	}
+	m.Status, m.ValidatedAt = domain.MovementStatusValidated, &at
+	return nil
+}
+
+func serialKey(itemID string, serial *string) string {
+	if serial == nil {
+		return ""
+	}
+	return itemID + "|" + *serial
+}
+
+func (s *stubStore) checkNegativeStock(m *domain.InventoryMovement) error {
+	if m.SourceLocationID == nil {
+		return nil
+	}
+	var onHand float64
+	for _, other := range s.movements {
+		if other.Status != domain.MovementStatusCommitted || other.ItemID != m.ItemID {
+			continue
+		}
+		if other.DestinationLocationID != nil && *other.DestinationLocationID == *m.SourceLocationID {
+			onHand += other.Quantity
+		}
+		if other.SourceLocationID != nil && *other.SourceLocationID == *m.SourceLocationID {
+			onHand -= other.Quantity
+		}
+	}
+	if onHand-m.Quantity < 0 {
+		return domain.ErrNegativeStockNotAllowed
+	}
+	return nil
+}
+
+func (s *stubStore) applySerialResidency(m *domain.InventoryMovement) error {
+	if m.SerialNumber == nil || *m.SerialNumber == "" {
+		return nil
+	}
+	key := serialKey(m.ItemID, m.SerialNumber)
+	switch {
+	case m.SourceLocationID == nil && m.DestinationLocationID != nil:
+		if _, exists := s.serialResidency[key]; exists {
+			return domain.ErrSerialAlreadyResident
+		}
+		s.serialResidency[key] = *m.DestinationLocationID
+	case m.SourceLocationID != nil && m.DestinationLocationID == nil:
+		if s.serialResidency[key] != *m.SourceLocationID {
+			return domain.ErrSerialNotAtSourceLocation
+		}
+		delete(s.serialResidency, key)
+	case m.SourceLocationID != nil && m.DestinationLocationID != nil:
+		if s.serialResidency[key] != *m.SourceLocationID {
+			return domain.ErrSerialNotAtSourceLocation
+		}
+		s.serialResidency[key] = *m.DestinationLocationID
+	}
+	return nil
+}
+
+func (s *stubStore) CommitMovement(_ context.Context, movementID, principalID string, at time.Time) error {
+	m, ok := s.movements[movementID]
+	if !ok || m.Status != domain.MovementStatusValidated {
+		return domain.ErrInvalidMovementTransition
+	}
+	item := s.items[m.ItemID]
+	if item != nil && m.UOM != item.BaseUOM {
+		return domain.ErrUOMMismatch
+	}
+	if err := s.checkNegativeStock(m); err != nil {
+		return err
+	}
+	if err := s.applySerialResidency(m); err != nil {
+		return err
+	}
+	m.Status, m.CommittedAt, m.CommittedByPrincipalID = domain.MovementStatusCommitted, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) GetOnHand(_ context.Context, itemID, locationID string) (float64, error) {
+	var onHand float64
+	for _, m := range s.movements {
+		if m.Status != domain.MovementStatusCommitted || m.ItemID != itemID {
+			continue
+		}
+		if m.DestinationLocationID != nil && *m.DestinationLocationID == locationID {
+			onHand += m.Quantity
+		}
+		if m.SourceLocationID != nil && *m.SourceLocationID == locationID {
+			onHand -= m.Quantity
+		}
+	}
+	return onHand, nil
+}
+
+func (s *stubStore) GetOnHandAsOf(ctx context.Context, itemID, locationID string, _ time.Time) (float64, error) {
+	return s.GetOnHand(ctx, itemID, locationID)
+}
+
+func (s *stubStore) CreateCorrectionMovement(_ context.Context, originalMovementID, principalID, reason string, isSupersede bool, newMovementID string, at time.Time) (*domain.InventoryMovement, error) {
+	original, ok := s.movements[originalMovementID]
+	if !ok {
+		return nil, domain.ErrMovementNotFound
+	}
+	if original.Status != domain.MovementStatusCommitted {
+		return nil, domain.ErrInvalidMovementTransition
+	}
+	movementType := domain.MovementTypeReversal
+	if isSupersede {
+		movementType = domain.MovementTypeSupersession
+	}
+	correction := &domain.InventoryMovement{
+		MovementID: newMovementID, TenantID: original.TenantID, LegalEntityID: original.LegalEntityID, MovementType: movementType, Status: domain.MovementStatusValidated,
+		ItemID: original.ItemID, SourceLocationID: original.DestinationLocationID, DestinationLocationID: original.SourceLocationID,
+		Quantity: original.Quantity, UOM: original.UOM, LotNumber: original.LotNumber, SerialNumber: original.SerialNumber,
+		SourceReference: original.SourceReference, SourceIdempotencyKey: newMovementID, BusinessDate: at, FiscalPeriod: original.FiscalPeriod,
+		Reason: &reason, CreatedAt: at, CreatedByPrincipalID: principalID, ValidatedAt: &at,
+	}
+	if isSupersede {
+		correction.SupersedesMovementID = &originalMovementID
+	} else {
+		correction.ReversesMovementID = &originalMovementID
+	}
+	if err := s.checkNegativeStock(correction); err != nil {
+		return nil, err
+	}
+	if err := s.applySerialResidency(correction); err != nil {
+		return nil, err
+	}
+	correction.Status, correction.CommittedAt, correction.CommittedByPrincipalID = domain.MovementStatusCommitted, &at, &principalID
+	cp := *correction
+	s.movements[correction.MovementID] = &cp
+	s.movementsByKey[correction.SourceIdempotencyKey] = correction.MovementID
+	return correction, nil
+}
+
 var _ handler.Store = (*stubStore)(nil)
 
 type stubPublisher struct{ calls int }
@@ -337,6 +542,21 @@ func (p *stubPublisher) PublishInventoryLocationChanged(_ context.Context, _, _,
 func (p *stubPublisher) PublishInventoryLocationRetired(_ context.Context, _, _ string, _ domain.InventoryLocation) {
 	p.calls++
 }
+func (p *stubPublisher) PublishInventoryMovementCommitted(_ context.Context, _, _ string, _ domain.InventoryMovement) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryMovementReversed(_ context.Context, _, _ string, _ domain.InventoryMovement) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryTransferred(_ context.Context, _, _ string, _ domain.InventoryMovement) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryReceived(_ context.Context, _, _ string, _ domain.InventoryMovement) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryIssued(_ context.Context, _, _ string, _ domain.InventoryMovement) {
+	p.calls++
+}
 
 var _ handler.Publisher = (*stubPublisher)(nil)
 
@@ -344,7 +564,17 @@ type stubAuthZ struct{ err error }
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+type stubPeriodChecker struct{ err error }
+
+func (c *stubPeriodChecker) CheckPeriodOpen(_ context.Context, _, _, _ string) error { return c.err }
+
+var _ handler.PeriodChecker = (*stubPeriodChecker)(nil)
+
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
+	return newRouterWithPeriodChecker(s, pub, authz, &stubPeriodChecker{})
+}
+
+func newRouterWithPeriodChecker(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubPeriodChecker) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -352,7 +582,7 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop())
+	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc)
 	handler.RegisterRoutes(r, h)
 	return r
 }
