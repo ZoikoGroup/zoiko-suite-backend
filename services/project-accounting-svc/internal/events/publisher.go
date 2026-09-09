@@ -95,6 +95,33 @@ func (p *Publisher) PublishProjectReopened(ctx context.Context, correlationID, a
 	})
 }
 
+// PRJ-02's own named events: "ProjectCostCaptured; ProjectCostReclassified;
+// ProjectCostReversed; ProjectCostPopulationCertified."
+
+func (p *Publisher) PublishProjectCostCaptured(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry) {
+	p.emit(ctx, "project.cost.captured", correlationID, tenantID, e.LegalEntityID, actorID, e.EntryID, map[string]any{
+		"entry_id": e.EntryID, "project_id": e.ProjectID, "source_type": e.SourceType, "amount": e.Amount,
+	})
+}
+
+func (p *Publisher) PublishProjectCostReclassified(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry) {
+	p.emit(ctx, "project.cost.reclassified", correlationID, tenantID, e.LegalEntityID, actorID, e.EntryID, map[string]any{
+		"entry_id": e.EntryID, "reclassifies_entry_id": e.ReclassifiesEntryID,
+	})
+}
+
+func (p *Publisher) PublishProjectCostReversed(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry) {
+	p.emit(ctx, "project.cost.reversed", correlationID, tenantID, e.LegalEntityID, actorID, e.EntryID, map[string]any{
+		"entry_id": e.EntryID, "reverses_entry_id": e.ReversesEntryID,
+	})
+}
+
+func (p *Publisher) PublishProjectCostPopulationCertified(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, cert domain.CostCertification) {
+	p.emit(ctx, "project.cost.population_certified", correlationID, tenantID, legalEntityID, actorID, cert.CertificationID, map[string]any{
+		"certification_id": cert.CertificationID, "project_id": cert.ProjectID, "entry_count": cert.EntryCount, "total_amount": cert.TotalAmount,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

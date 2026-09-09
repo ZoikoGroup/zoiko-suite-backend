@@ -33,6 +33,16 @@ type Store interface {
 	AmendFinancialProfile(ctx context.Context, projectID string, newVersion *domain.FinancialProfile) error
 	GetCurrentFinancialProfile(ctx context.Context, projectID string) (*domain.FinancialProfile, error)
 	GetFinancialProfileAsOf(ctx context.Context, projectID string, at time.Time) (*domain.FinancialProfile, error)
+
+	// PRJ-02 (Project Cost Capture) — see internal/store/cost_entry_store.go's
+	// own doc comments for the authority boundary these implement.
+	CaptureProjectCost(ctx context.Context, e *domain.CostEntry) error
+	GetCostEntry(ctx context.Context, entryID string) (*domain.CostEntry, error)
+	ListCostEntries(ctx context.Context, projectID, wbsID string) ([]domain.CostEntry, error)
+	ValidateProjectCost(ctx context.Context, entryID string, at time.Time) error
+	MarkBillableEligibility(ctx context.Context, entryID string, billable, capitalizable bool) error
+	CreateLinkedCostEntry(ctx context.Context, originalEntryID, principalID, reason string, isReversal bool, newEntryID string, amountOverride *float64, costCategory *string, billable, capitalizable *bool, at time.Time) (*domain.CostEntry, error)
+	CertifyCostPopulation(ctx context.Context, projectID, principalID string, at time.Time) (*domain.CostCertification, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on —
@@ -46,6 +56,14 @@ type Publisher interface {
 	PublishProjectFinancialProfileChanged(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, projectID string)
 	PublishProjectClosed(ctx context.Context, correlationID, actorID string, pr domain.Project)
 	PublishProjectReopened(ctx context.Context, correlationID, actorID string, pr domain.Project)
+
+	// PRJ-02 (Project Cost Capture) — the spec's own named Events:
+	// "ProjectCostCaptured; ProjectCostReclassified; ProjectCostReversed;
+	// ProjectCostPopulationCertified."
+	PublishProjectCostCaptured(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry)
+	PublishProjectCostReclassified(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry)
+	PublishProjectCostReversed(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry)
+	PublishProjectCostPopulationCertified(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, cert domain.CostCertification)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -66,6 +84,19 @@ const (
 	actionProjectApprove         = "PROJECT_APPROVE"
 	actionProjectFinancialManage = "PROJECT_FINANCIAL_MANAGE"
 	actionProjectCloseReopen     = "PROJECT_CLOSE_REOPEN"
+
+	// PRJ-02 (Project Cost Capture) actions — the spec's own Permissions
+	// field: "project.cost.read; project.cost.capture;
+	// project.cost.reclassify; project.cost.adjust; project.cost.certify."
+	// actionProjectCostAdjust is deliberately distinct from
+	// actionProjectCostCapture — the spec's own SoD: "project cost user
+	// cannot modify source AP/payroll/inventory facts," and manual
+	// adjustments require independent approval.
+	actionProjectCostRead       = "PROJECT_COST_READ"
+	actionProjectCostCapture    = "PROJECT_COST_CAPTURE"
+	actionProjectCostReclassify = "PROJECT_COST_RECLASSIFY"
+	actionProjectCostAdjust     = "PROJECT_COST_ADJUST"
+	actionProjectCostCertify    = "PROJECT_COST_CERTIFY"
 )
 
 type Handler struct {
@@ -96,6 +127,17 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/financial-profile", h.AmendFinancialProfile)
 		r.Get("/{id}/financial-profile", h.GetFinancialProfile)
 		r.Get("/{id}/available-actions", h.GetAvailableActions)
+		r.Post("/{id}/certify-costs", h.CertifyCostPopulation)
+	})
+	r.Route("/v1/cost-entries", func(r chi.Router) {
+		r.Post("/", h.CaptureProjectCost)
+		r.Post("/allocate", h.AllocateSharedCostToProject)
+		r.Get("/", h.ListCostEntries)
+		r.Get("/{id}", h.GetCostEntry)
+		r.Post("/{id}/validate", h.ValidateProjectCost)
+		r.Post("/{id}/mark-billable", h.MarkBillableEligibility)
+		r.Post("/{id}/reclassify", h.ReclassifyProjectCost)
+		r.Post("/{id}/reverse", h.ReverseProjectCost)
 	})
 }
 

@@ -194,3 +194,115 @@ var (
 
 	ErrDuplicateWBSCode = errorString("a work package with this wbs_code already exists for this project")
 )
+
+// ── PRJ-02 Project Cost Capture ─────────────────────────────────────────────
+//
+// See migration 000002's doc comment for the full state-model/command
+// mapping and all four negative-path enforcement mechanisms.
+
+const (
+	CostSourceTypeAP         = "AP"
+	CostSourceTypePayroll    = "PAYROLL"
+	CostSourceTypeInventory  = "INVENTORY"
+	CostSourceTypeAsset      = "ASSET"
+	CostSourceTypeAllocation = "ALLOCATION"
+	CostSourceTypeManual     = "MANUAL"
+
+	CostEntryStatusCaptured = "CAPTURED"
+	CostEntryStatusAccepted = "ACCEPTED"
+	CostEntryStatusReversed = "REVERSED"
+)
+
+// CostEntry is PRJ-02's own "ProjectCostEntry" — append-only; its own
+// economic fields never change once written. See migration 000002's doc
+// comment on negative paths #1 and #4.
+type CostEntry struct {
+	EntryID               string     `json:"entry_id"`
+	LegalEntityID         string     `json:"legal_entity_id"`
+	ProjectID             string     `json:"project_id"`
+	WBSID                 *string    `json:"wbs_id,omitempty"`
+	SourceType            string     `json:"source_type"`
+	SourceReference       string     `json:"source_reference"`
+	CostCategory          string     `json:"cost_category,omitempty"`
+	Quantity              *float64   `json:"quantity,omitempty"`
+	Amount                float64    `json:"amount"`
+	Currency              string     `json:"currency"`
+	TransactionDate       time.Time  `json:"transaction_date"`
+	Billable              bool       `json:"billable"`
+	Capitalizable         bool       `json:"capitalizable"`
+	Status                string     `json:"status"`
+	ReclassifiesEntryID   *string    `json:"reclassifies_entry_id,omitempty"`
+	ReversesEntryID       *string    `json:"reverses_entry_id,omitempty"`
+	Reason                *string    `json:"reason,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
+	ValidatedAt           *time.Time `json:"validated_at,omitempty"`
+	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
+}
+
+// CostCertification is CertifyCostPopulation's own named evidence — a
+// point-in-time attestation over a project's own cost population.
+type CostCertification struct {
+	CertificationID        string    `json:"certification_id"`
+	ProjectID              string    `json:"project_id"`
+	EntryCount             int       `json:"entry_count"`
+	TotalAmount            float64   `json:"total_amount"`
+	CertifiedAt            time.Time `json:"certified_at"`
+	CertifiedByPrincipalID string    `json:"certified_by_principal_id"`
+}
+
+// ── Request types ────────────────────────────────────────────────────────
+
+// CaptureProjectCostRequest is the one real create path both
+// CaptureProjectCost and AllocateSharedCostToProject funnel through — the
+// latter pre-sets SourceType to ALLOCATION.
+type CaptureProjectCostRequest struct {
+	ProjectID       string     `json:"project_id"`
+	WBSID           string     `json:"wbs_id,omitempty"`
+	SourceType      string     `json:"source_type,omitempty"` // required for CaptureProjectCost; pre-filled by AllocateSharedCostToProject
+	SourceReference string     `json:"source_reference"`
+	CostCategory    string     `json:"cost_category,omitempty"`
+	Quantity        *float64   `json:"quantity,omitempty"`
+	Amount          float64    `json:"amount"`
+	Currency        string     `json:"currency"`
+	TransactionDate *time.Time `json:"transaction_date,omitempty"`
+}
+
+type ReclassifyProjectCostRequest struct {
+	CostCategory  string   `json:"cost_category,omitempty"`
+	Billable      *bool    `json:"billable,omitempty"`
+	Capitalizable *bool    `json:"capitalizable,omitempty"`
+	Amount        *float64 `json:"amount,omitempty"`
+	Reason        string   `json:"reason"`
+}
+
+type ReverseProjectCostRequest struct {
+	Reason string `json:"reason"`
+}
+
+type MarkBillableEligibilityRequest struct {
+	Billable      bool `json:"billable"`
+	Capitalizable bool `json:"capitalizable"`
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
+
+var (
+	ErrCostEntryNotFound = errorString("project cost entry not found")
+
+	ErrInvalidCostEntryTransition = errorString("cost entry is not in a status that allows this action")
+
+	ErrSourceTypeRequired = errorString("source_type is required")
+
+	// ErrSelfApprovalNotPermittedReclassify is the spec's own SoD, "Manual
+	// project-cost adjustment above threshold requires independent
+	// approval" — no materiality tiering exists in this platform, so
+	// refused universally, the same bootstrap-gap posture used throughout
+	// this session.
+	ErrSelfApprovalNotPermittedReclassify = errorString("the principal who captured this cost entry may not also approve a reclassification of it")
+
+	ErrSelfApprovalNotPermittedReversal = errorString("the principal who captured this cost entry may not also approve its reversal")
+
+	ErrCostEntryAlreadyReversed = errorString("this cost entry has already been reversed")
+)

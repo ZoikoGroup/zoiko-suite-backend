@@ -25,6 +25,9 @@ type stubStore struct {
 	workPackages map[string][]domain.WorkPackage // project_id -> work packages
 
 	financialProfiles map[string]*domain.FinancialProfile // project_id -> current version
+
+	costEntries     map[string]*domain.CostEntry
+	entriesBySource map[string]string // "source_type|source_reference" -> entry_id
 }
 
 func newStubStore() *stubStore {
@@ -32,7 +35,127 @@ func newStubStore() *stubStore {
 		projects:          make(map[string]*domain.Project),
 		workPackages:      make(map[string][]domain.WorkPackage),
 		financialProfiles: make(map[string]*domain.FinancialProfile),
+		costEntries:       make(map[string]*domain.CostEntry),
+		entriesBySource:   make(map[string]string),
 	}
+}
+
+// ── PRJ-02 (Project Cost Capture) ────────────────────────────────────────────
+
+func (s *stubStore) CaptureProjectCost(_ context.Context, e *domain.CostEntry) error {
+	key := e.SourceType + "|" + e.SourceReference
+	if existingID, ok := s.entriesBySource[key]; ok {
+		*e = *s.costEntries[existingID]
+		return nil
+	}
+	cp := *e
+	s.costEntries[e.EntryID] = &cp
+	s.entriesBySource[key] = e.EntryID
+	return nil
+}
+
+func (s *stubStore) GetCostEntry(_ context.Context, entryID string) (*domain.CostEntry, error) {
+	e, ok := s.costEntries[entryID]
+	if !ok {
+		return nil, domain.ErrCostEntryNotFound
+	}
+	cp := *e
+	return &cp, nil
+}
+
+func (s *stubStore) ListCostEntries(_ context.Context, projectID, wbsID string) ([]domain.CostEntry, error) {
+	var out []domain.CostEntry
+	for _, e := range s.costEntries {
+		if e.ProjectID != projectID {
+			continue
+		}
+		if wbsID != "" && (e.WBSID == nil || *e.WBSID != wbsID) {
+			continue
+		}
+		out = append(out, *e)
+	}
+	return out, nil
+}
+
+func (s *stubStore) ValidateProjectCost(_ context.Context, entryID string, at time.Time) error {
+	e, ok := s.costEntries[entryID]
+	if !ok || e.Status != domain.CostEntryStatusCaptured {
+		return domain.ErrInvalidCostEntryTransition
+	}
+	e.Status, e.ValidatedAt = domain.CostEntryStatusAccepted, &at
+	return nil
+}
+
+func (s *stubStore) MarkBillableEligibility(_ context.Context, entryID string, billable, capitalizable bool) error {
+	e, ok := s.costEntries[entryID]
+	if !ok {
+		return domain.ErrCostEntryNotFound
+	}
+	e.Billable, e.Capitalizable = billable, capitalizable
+	return nil
+}
+
+func (s *stubStore) CreateLinkedCostEntry(_ context.Context, originalEntryID, principalID, reason string, isReversal bool, newEntryID string, amountOverride *float64, costCategory *string, billable, capitalizable *bool, at time.Time) (*domain.CostEntry, error) {
+	original, ok := s.costEntries[originalEntryID]
+	if !ok {
+		return nil, domain.ErrCostEntryNotFound
+	}
+	if original.CreatedByPrincipalID == principalID {
+		if isReversal {
+			return nil, domain.ErrSelfApprovalNotPermittedReversal
+		}
+		return nil, domain.ErrSelfApprovalNotPermittedReclassify
+	}
+	if isReversal && original.Status == domain.CostEntryStatusReversed {
+		return nil, domain.ErrCostEntryAlreadyReversed
+	}
+
+	linked := &domain.CostEntry{
+		EntryID: newEntryID, LegalEntityID: original.LegalEntityID, ProjectID: original.ProjectID, WBSID: original.WBSID,
+		SourceType: original.SourceType, SourceReference: newEntryID, CostCategory: original.CostCategory,
+		Quantity: original.Quantity, Currency: original.Currency, TransactionDate: at,
+		Billable: original.Billable, Capitalizable: original.Capitalizable,
+		Status: domain.CostEntryStatusAccepted, Reason: &reason,
+		CreatedAt: at, CreatedByPrincipalID: principalID, ApprovedAt: &at, ApprovedByPrincipalID: &principalID,
+	}
+	if isReversal {
+		linked.Amount = -original.Amount
+		linked.ReversesEntryID = &originalEntryID
+		original.Status = domain.CostEntryStatusReversed
+	} else {
+		linked.Amount = original.Amount
+		if amountOverride != nil {
+			linked.Amount = *amountOverride
+		}
+		if costCategory != nil {
+			linked.CostCategory = *costCategory
+		}
+		if billable != nil {
+			linked.Billable = *billable
+		}
+		if capitalizable != nil {
+			linked.Capitalizable = *capitalizable
+		}
+		linked.ReclassifiesEntryID = &originalEntryID
+	}
+	s.costEntries[linked.EntryID] = linked
+	cp := *linked
+	return &cp, nil
+}
+
+func (s *stubStore) CertifyCostPopulation(_ context.Context, projectID, principalID string, at time.Time) (*domain.CostCertification, error) {
+	var count int
+	var total float64
+	for _, e := range s.costEntries {
+		if e.ProjectID == projectID && e.Status != domain.CostEntryStatusReversed {
+			count++
+			total += e.Amount
+		}
+	}
+	return &domain.CostCertification{
+		CertificationID: "cert-" + projectID, ProjectID: projectID, EntryCount: count, TotalAmount: total,
+		CertifiedAt: at, CertifiedByPrincipalID: principalID,
+	}, nil
 }
 
 func (s *stubStore) CreateProject(_ context.Context, p *domain.Project) error {
@@ -183,6 +306,18 @@ func (p *stubPublisher) PublishProjectClosed(_ context.Context, _, _ string, _ d
 	p.calls++
 }
 func (p *stubPublisher) PublishProjectReopened(_ context.Context, _, _ string, _ domain.Project) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectCostCaptured(_ context.Context, _, _, _ string, _ domain.CostEntry) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectCostReclassified(_ context.Context, _, _, _ string, _ domain.CostEntry) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectCostReversed(_ context.Context, _, _, _ string, _ domain.CostEntry) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectCostPopulationCertified(_ context.Context, _, _, _, _ string, _ domain.CostCertification) {
 	p.calls++
 }
 
