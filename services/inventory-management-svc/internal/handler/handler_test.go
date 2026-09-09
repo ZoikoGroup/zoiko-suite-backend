@@ -40,22 +40,29 @@ type stubStore struct {
 	entriesByMovement map[string]string                 // movement_id -> entry_id
 	valuationRuns     map[string]*domain.ValuationRun
 	writeDowns        map[string]*domain.WriteDown
+
+	stockCounts         map[string]*domain.StockCount
+	stockCountLocations map[string][]string // count_id -> location_ids
+	countLines          map[string]*domain.StockCountLine
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		items:             make(map[string]*domain.InventoryItem),
-		trackingPolicies:  make(map[string]*domain.TrackingPolicy),
-		valuationPolicies: make(map[string]*domain.ValuationPolicy),
-		locations:         make(map[string]*domain.InventoryLocation),
-		parents:           make(map[string]*string),
-		movements:         make(map[string]*domain.InventoryMovement),
-		movementsByKey:    make(map[string]string),
-		serialResidency:   make(map[string]string),
-		valuationEntries:  make(map[string]*domain.ValuationEntry),
-		entriesByMovement: make(map[string]string),
-		valuationRuns:     make(map[string]*domain.ValuationRun),
-		writeDowns:        make(map[string]*domain.WriteDown),
+		items:               make(map[string]*domain.InventoryItem),
+		trackingPolicies:    make(map[string]*domain.TrackingPolicy),
+		valuationPolicies:   make(map[string]*domain.ValuationPolicy),
+		locations:           make(map[string]*domain.InventoryLocation),
+		parents:             make(map[string]*string),
+		movements:           make(map[string]*domain.InventoryMovement),
+		stockCounts:         make(map[string]*domain.StockCount),
+		stockCountLocations: make(map[string][]string),
+		countLines:          make(map[string]*domain.StockCountLine),
+		movementsByKey:      make(map[string]string),
+		serialResidency:     make(map[string]string),
+		valuationEntries:    make(map[string]*domain.ValuationEntry),
+		entriesByMovement:   make(map[string]string),
+		valuationRuns:       make(map[string]*domain.ValuationRun),
+		writeDowns:          make(map[string]*domain.WriteDown),
 	}
 }
 
@@ -239,6 +246,173 @@ func (s *stubStore) ReverseWriteDown(_ context.Context, writeDownID, principalID
 		return domain.ErrWriteDownAlreadyReversed
 	}
 	w.Status, w.ReversedAt, w.ReversedByPrincipalID, w.ReversalReason = domain.WriteDownStatusReversed, &at, &principalID, &reason
+	return nil
+}
+
+// ── INV-05 (Stock Count) ──────────────────────────────────────────────────────
+
+func (s *stubStore) CreateStockCount(_ context.Context, sc *domain.StockCount, locationIDs []string) error {
+	cp := *sc
+	s.stockCounts[sc.CountID] = &cp
+	s.stockCountLocations[sc.CountID] = locationIDs
+	return nil
+}
+
+func (s *stubStore) GetStockCount(_ context.Context, countID string) (*domain.StockCount, error) {
+	sc, ok := s.stockCounts[countID]
+	if !ok {
+		return nil, domain.ErrStockCountNotFound
+	}
+	cp := *sc
+	cp.LocationIDs = s.stockCountLocations[countID]
+	for _, l := range s.countLines {
+		if l.CountID == countID {
+			cp.Lines = append(cp.Lines, *l)
+		}
+	}
+	return &cp, nil
+}
+
+func (s *stubStore) FreezeCountPopulation(_ context.Context, countID string, at time.Time) (int, error) {
+	sc, ok := s.stockCounts[countID]
+	if !ok || sc.Status != domain.StockCountStatusPlanned {
+		return 0, domain.ErrInvalidCountTransition
+	}
+	sc.Status, sc.FrozenAt, sc.CutoffAt = domain.StockCountStatusPopulationFrozen, &at, &at
+
+	type pair struct{ itemID, locationID string }
+	seen := map[pair]bool{}
+	frozen := 0
+	for _, locID := range s.stockCountLocations[countID] {
+		for _, m := range s.movements {
+			if m.Status != domain.MovementStatusCommitted {
+				continue
+			}
+			var itemID string
+			if m.SourceLocationID != nil && *m.SourceLocationID == locID {
+				itemID = m.ItemID
+			} else if m.DestinationLocationID != nil && *m.DestinationLocationID == locID {
+				itemID = m.ItemID
+			} else {
+				continue
+			}
+			p := pair{itemID, locID}
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+
+			var onHand float64
+			for _, other := range s.movements {
+				if other.Status != domain.MovementStatusCommitted || other.ItemID != itemID {
+					continue
+				}
+				if other.DestinationLocationID != nil && *other.DestinationLocationID == locID {
+					onHand += other.Quantity
+				}
+				if other.SourceLocationID != nil && *other.SourceLocationID == locID {
+					onHand -= other.Quantity
+				}
+			}
+
+			lineID := "line-" + countID + "-" + itemID + "-" + locID
+			s.countLines[lineID] = &domain.StockCountLine{
+				LineID: lineID, CountID: countID, ItemID: itemID, LocationID: locID,
+				SystemQuantity: onHand, Status: domain.CountLineStatusPending, CreatedAt: at,
+			}
+			frozen++
+		}
+	}
+	return frozen, nil
+}
+
+func (s *stubStore) AssignCounter(_ context.Context, lineID, counterPrincipalID string) error {
+	l, ok := s.countLines[lineID]
+	if !ok {
+		return domain.ErrCountLineNotFound
+	}
+	l.AssignedCounterPrincipalID = &counterPrincipalID
+	return nil
+}
+
+func (s *stubStore) RecordBlindCount(_ context.Context, lineID, principalID string, observedQuantity float64, at time.Time) (*domain.StockCountLine, error) {
+	l, ok := s.countLines[lineID]
+	if !ok || (l.Status != domain.CountLineStatusPending && l.Status != domain.CountLineStatusNeedsRecount) {
+		return nil, domain.ErrInvalidCountLineTransition
+	}
+	l.ObservedQuantity, l.ObservedAt, l.ObservedByPrincipalID, l.Status = &observedQuantity, &at, &principalID, domain.CountLineStatusCounted
+	cp := *l
+	return &cp, nil
+}
+
+func (s *stubStore) RequestRecount(_ context.Context, lineID string) error {
+	l, ok := s.countLines[lineID]
+	if !ok || l.Status != domain.CountLineStatusCounted {
+		return domain.ErrInvalidCountLineTransition
+	}
+	l.Status = domain.CountLineStatusNeedsRecount
+	return nil
+}
+
+func (s *stubStore) ApproveCountVariance(_ context.Context, lineID, principalID string, at time.Time) error {
+	l, ok := s.countLines[lineID]
+	if !ok || l.Status != domain.CountLineStatusCounted {
+		return domain.ErrInvalidCountLineTransition
+	}
+	if l.ObservedByPrincipalID != nil && *l.ObservedByPrincipalID == principalID {
+		return domain.ErrSelfVarianceApprovalNotPermitted
+	}
+	l.Status, l.VarianceApprovedAt, l.VarianceApprovedByPrincipalID = domain.CountLineStatusVarianceApproved, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) GetCountLine(_ context.Context, lineID string) (*domain.StockCountLine, error) {
+	l, ok := s.countLines[lineID]
+	if !ok {
+		return nil, domain.ErrCountLineNotFound
+	}
+	cp := *l
+	return &cp, nil
+}
+
+func (s *stubStore) LinkCountLineAdjustment(_ context.Context, lineID, movementID string) error {
+	l, ok := s.countLines[lineID]
+	if !ok || l.Status != domain.CountLineStatusVarianceApproved {
+		return domain.ErrInvalidCountLineTransition
+	}
+	l.Status, l.AdjustmentMovementID = domain.CountLineStatusAdjustmentGenerated, &movementID
+	return nil
+}
+
+func (s *stubStore) MarkCountAdjustmentsGenerated(_ context.Context, countID string) error {
+	sc, ok := s.stockCounts[countID]
+	if !ok {
+		return domain.ErrInvalidCountTransition
+	}
+	switch sc.Status {
+	case domain.StockCountStatusPopulationFrozen, domain.StockCountStatusAdjustmentsGenerated:
+	default:
+		return domain.ErrInvalidCountTransition
+	}
+	sc.Status = domain.StockCountStatusAdjustmentsGenerated
+	return nil
+}
+
+func (s *stubStore) CertifyStockCount(_ context.Context, countID, principalID string, at time.Time) error {
+	sc, ok := s.stockCounts[countID]
+	if !ok || sc.Status != domain.StockCountStatusAdjustmentsGenerated {
+		return domain.ErrInvalidCountTransition
+	}
+	sc.Status, sc.CertifiedAt, sc.CertifiedByPrincipalID = domain.StockCountStatusCertified, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) CancelStockCount(_ context.Context, countID, principalID, reason string, at time.Time) error {
+	sc, ok := s.stockCounts[countID]
+	if !ok || sc.Status == domain.StockCountStatusCertified || sc.Status == domain.StockCountStatusCancelled {
+		return domain.ErrInvalidCountTransition
+	}
+	sc.Status, sc.CancelledAt, sc.CancelledByPrincipalID, sc.CancelReason = domain.StockCountStatusCancelled, &at, &principalID, &reason
 	return nil
 }
 
@@ -761,6 +935,21 @@ func (p *stubPublisher) PublishInventoryWriteDownReversed(_ context.Context, _, 
 	p.calls++
 }
 func (p *stubPublisher) PublishInventoryAccountingEventEmitted(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishStockCountStarted(_ context.Context, _, _, _ string, _ domain.StockCount) {
+	p.calls++
+}
+func (p *stubPublisher) PublishStockCountPopulationFrozen(_ context.Context, _, _, _, _ string, _ int) {
+	p.calls++
+}
+func (p *stubPublisher) PublishStockCountVarianceApproved(_ context.Context, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishStockCountAdjustmentRequested(_ context.Context, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishStockCountCertified(_ context.Context, _, _, _ string, _ domain.StockCount) {
 	p.calls++
 }
 

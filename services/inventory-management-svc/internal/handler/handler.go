@@ -71,6 +71,21 @@ type Store interface {
 	CreateWriteDown(ctx context.Context, w *domain.WriteDown, journalID string) error
 	GetWriteDown(ctx context.Context, writeDownID string) (*domain.WriteDown, error)
 	ReverseWriteDown(ctx context.Context, writeDownID, principalID, reason string, at time.Time) error
+
+	// INV-05 (Stock Count) — see internal/store/stock_count_store.go's own
+	// doc comments for the authority boundary these implement.
+	CreateStockCount(ctx context.Context, sc *domain.StockCount, locationIDs []string) error
+	GetStockCount(ctx context.Context, countID string) (*domain.StockCount, error)
+	FreezeCountPopulation(ctx context.Context, countID string, at time.Time) (frozenCount int, err error)
+	AssignCounter(ctx context.Context, lineID, counterPrincipalID string) error
+	RecordBlindCount(ctx context.Context, lineID, principalID string, observedQuantity float64, at time.Time) (*domain.StockCountLine, error)
+	RequestRecount(ctx context.Context, lineID string) error
+	ApproveCountVariance(ctx context.Context, lineID, principalID string, at time.Time) error
+	GetCountLine(ctx context.Context, lineID string) (*domain.StockCountLine, error)
+	LinkCountLineAdjustment(ctx context.Context, lineID, movementID string) error
+	MarkCountAdjustmentsGenerated(ctx context.Context, countID string) error
+	CertifyStockCount(ctx context.Context, countID, principalID string, at time.Time) error
+	CancelStockCount(ctx context.Context, countID, principalID, reason string, at time.Time) error
 }
 
 // InventoryLedgerClient is INV-04's own real "ACC-04" dependency — see
@@ -123,6 +138,17 @@ type Publisher interface {
 	PublishInventoryWriteDownRecorded(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown)
 	PublishInventoryWriteDownReversed(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown)
 	PublishInventoryAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string)
+
+	// INV-05 (Stock Count) — the spec's own named Events (a subset —
+	// "StockCountVarianceDetected" is not wired in; stated honestly in
+	// the findings doc): "StockCountStarted; StockCountPopulationFrozen;
+	// StockCountVarianceApproved; StockCountAdjustmentRequested;
+	// StockCountCertified."
+	PublishStockCountStarted(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount)
+	PublishStockCountPopulationFrozen(ctx context.Context, correlationID, actorID, tenantID, countID string, frozenCount int)
+	PublishStockCountVarianceApproved(ctx context.Context, correlationID, actorID, tenantID, lineID string)
+	PublishStockCountAdjustmentRequested(ctx context.Context, correlationID, actorID, tenantID, lineID, movementID string)
+	PublishStockCountCertified(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -168,6 +194,17 @@ const (
 	actionInventoryValuationRun     = "INVENTORY_VALUATION_RUN"
 	actionInventoryValuationAdjust  = "INVENTORY_VALUATION_ADJUST"
 	actionInventoryValuationApprove = "INVENTORY_VALUATION_APPROVE"
+
+	// INV-05 (Stock Count) actions — the spec's own Permissions field:
+	// "inventory.count.read; inventory.count.plan; inventory.count.record;
+	// inventory.count.approve; inventory.count.certify." actionInventoryCountApprove
+	// is deliberately distinct from actionInventoryCountRecord — the
+	// spec's own SoD: "Counter cannot approve own material variance."
+	actionInventoryCountRead    = "INVENTORY_COUNT_READ"
+	actionInventoryCountPlan    = "INVENTORY_COUNT_PLAN"
+	actionInventoryCountRecord  = "INVENTORY_COUNT_RECORD"
+	actionInventoryCountApprove = "INVENTORY_COUNT_APPROVE"
+	actionInventoryCountCertify = "INVENTORY_COUNT_CERTIFY"
 )
 
 type Handler struct {
@@ -260,6 +297,21 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 			r.Post("/", h.RecordInventoryWriteDown)
 			r.Get("/{id}", h.GetWriteDown)
 			r.Post("/{id}/reverse", h.ReverseWriteDown)
+		})
+	})
+	r.Route("/v1/stock-counts", func(r chi.Router) {
+		r.Post("/", h.CreateStockCount)
+		r.Get("/{id}", h.GetStockCount)
+		r.Post("/{id}/freeze", h.FreezeCountPopulation)
+		r.Post("/{id}/certify", h.CertifyStockCount)
+		r.Post("/{id}/cancel", h.CancelStockCount)
+		r.Post("/{id}/generate-adjustments", h.GenerateAdjustmentMovements)
+		r.Route("/lines/{lineID}", func(r chi.Router) {
+			r.Get("/", h.GetCountLine)
+			r.Post("/assign-counter", h.AssignCounter)
+			r.Post("/record-count", h.RecordBlindCount)
+			r.Post("/request-recount", h.RequestRecount)
+			r.Post("/approve-variance", h.ApproveCountVariance)
 		})
 	})
 }

@@ -635,3 +635,121 @@ var (
 
 	ErrWriteDownAlreadyReversed = errorString("write-down has already been reversed")
 )
+
+// ── INV-05 Stock Count ────────────────────────────────────────────────────────
+//
+// See migration 000005's doc comment for the full state-model/command
+// mapping and all four negative-path enforcement mechanisms.
+
+const (
+	StockCountStatusPlanned              = "PLANNED"
+	StockCountStatusPopulationFrozen     = "POPULATION_FROZEN"
+	StockCountStatusCounting             = "COUNTING"
+	StockCountStatusVarianceReview       = "VARIANCE_REVIEW"
+	StockCountStatusAdjustmentsGenerated = "ADJUSTMENTS_GENERATED"
+	StockCountStatusCertified            = "CERTIFIED"
+	StockCountStatusCancelled            = "CANCELLED"
+
+	CountLineStatusPending             = "PENDING"
+	CountLineStatusCounted             = "COUNTED"
+	CountLineStatusNeedsRecount        = "NEEDS_RECOUNT"
+	CountLineStatusVarianceApproved    = "VARIANCE_APPROVED"
+	CountLineStatusAdjustmentGenerated = "ADJUSTMENT_GENERATED"
+)
+
+// StockCount is INV-05's own authority — "StockCountSession; count
+// population/snapshot; CountLine; observed quantity; recount; variance;
+// reason; approval; adjustment proposal; completion certificate."
+type StockCount struct {
+	CountID                string     `json:"count_id"`
+	LegalEntityID          string     `json:"legal_entity_id"`
+	FiscalPeriod           string     `json:"fiscal_period"`
+	Status                 string     `json:"status"`
+	CutoffAt               *time.Time `json:"cutoff_at,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
+	FrozenAt               *time.Time `json:"frozen_at,omitempty"`
+	CertifiedAt            *time.Time `json:"certified_at,omitempty"`
+	CertifiedByPrincipalID *string    `json:"certified_by_principal_id,omitempty"`
+	CancelledAt            *time.Time `json:"cancelled_at,omitempty"`
+	CancelledByPrincipalID *string    `json:"cancelled_by_principal_id,omitempty"`
+	CancelReason           *string    `json:"cancel_reason,omitempty"`
+
+	LocationIDs []string         `json:"location_ids,omitempty"`
+	Lines       []StockCountLine `json:"lines,omitempty"`
+}
+
+// StockCountLine is INV-05's own "CountLine" — one row per (item,
+// location) in the frozen population. SystemQuantity is set exactly
+// once, at freeze time, and never mutated again — see migration
+// 000005's doc comment on negative path #2.
+type StockCountLine struct {
+	LineID                        string     `json:"line_id"`
+	CountID                       string     `json:"count_id"`
+	ItemID                        string     `json:"item_id"`
+	LocationID                    string     `json:"location_id"`
+	SystemQuantity                float64    `json:"system_quantity"`
+	AssignedCounterPrincipalID    *string    `json:"assigned_counter_principal_id,omitempty"`
+	ObservedQuantity              *float64   `json:"observed_quantity,omitempty"`
+	ObservedAt                    *time.Time `json:"observed_at,omitempty"`
+	ObservedByPrincipalID         *string    `json:"observed_by_principal_id,omitempty"`
+	Status                        string     `json:"status"`
+	VarianceApprovedAt            *time.Time `json:"variance_approved_at,omitempty"`
+	VarianceApprovedByPrincipalID *string    `json:"variance_approved_by_principal_id,omitempty"`
+	AdjustmentMovementID          *string    `json:"adjustment_movement_id,omitempty"`
+	CreatedAt                     time.Time  `json:"created_at"`
+}
+
+// ── Request types ────────────────────────────────────────────────────────
+
+type CreateStockCountRequest struct {
+	LegalEntityID string   `json:"legal_entity_id"`
+	FiscalPeriod  string   `json:"fiscal_period"`
+	LocationIDs   []string `json:"location_ids"`
+}
+
+// RecordedBlindCount is RecordBlindCount's own response shape — it
+// deliberately has NO field for system_quantity at all, the real
+// enforcement of negative path #1, "Counter sees system quantity in
+// blind count." Not a runtime redaction of StockCountLine; a distinct
+// type that structurally cannot carry it.
+type RecordedBlindCount struct {
+	LineID           string    `json:"line_id"`
+	ItemID           string    `json:"item_id"`
+	LocationID       string    `json:"location_id"`
+	ObservedQuantity float64   `json:"observed_quantity"`
+	ObservedAt       time.Time `json:"observed_at"`
+}
+
+type RecordBlindCountRequest struct {
+	ObservedQuantity float64 `json:"observed_quantity"`
+}
+
+type AssignCounterRequest struct {
+	CounterPrincipalID string `json:"counter_principal_id"`
+}
+
+type CancelStockCountRequest struct {
+	Reason string `json:"reason"`
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
+
+var (
+	ErrStockCountNotFound         = errorString("stock count not found")
+	ErrCountLineNotFound          = errorString("stock count line not found")
+	ErrInvalidCountTransition     = errorString("stock count is not in a status that allows this action")
+	ErrInvalidCountLineTransition = errorString("stock count line is not in a status that allows this action")
+
+	ErrEmptyCountPopulation = errorString("no eligible item/location combinations were found to freeze into this count")
+
+	// ErrSelfVarianceApprovalNotPermitted is the spec's own SoD,
+	// "Counter cannot approve own material variance" — enforced at the
+	// LINE level: the approving principal must differ from that specific
+	// line's own observed_by_principal_id.
+	ErrSelfVarianceApprovalNotPermitted = errorString("the principal who recorded this line's count may not also approve its variance")
+
+	ErrLineNotYetCounted = errorString("this line has not been counted yet")
+
+	ErrNoVarianceApprovedLines = errorString("no variance-approved lines were found to generate adjustments for")
+)

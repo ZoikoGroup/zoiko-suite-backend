@@ -178,6 +178,41 @@ func (p *Publisher) PublishInventoryAccountingEventEmitted(ctx context.Context, 
 	})
 }
 
+// INV-05's own named events (a subset — "StockCountVarianceDetected" is
+// not wired in; stated honestly in the findings doc): "StockCountStarted;
+// StockCountPopulationFrozen; StockCountVarianceApproved;
+// StockCountAdjustmentRequested; StockCountCertified."
+
+func (p *Publisher) PublishStockCountStarted(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount) {
+	p.emit(ctx, "inventory.stock_count.started", correlationID, tenantID, sc.LegalEntityID, actorID, sc.CountID, map[string]any{
+		"count_id": sc.CountID, "legal_entity_id": sc.LegalEntityID, "status": sc.Status,
+	})
+}
+
+func (p *Publisher) PublishStockCountPopulationFrozen(ctx context.Context, correlationID, actorID, tenantID, countID string, frozenCount int) {
+	p.emit(ctx, "inventory.stock_count.population_frozen", correlationID, tenantID, "", actorID, countID, map[string]any{
+		"count_id": countID, "frozen_count": frozenCount,
+	})
+}
+
+func (p *Publisher) PublishStockCountVarianceApproved(ctx context.Context, correlationID, actorID, tenantID, lineID string) {
+	p.emit(ctx, "inventory.stock_count.variance_approved", correlationID, tenantID, "", actorID, lineID, map[string]any{
+		"line_id": lineID,
+	})
+}
+
+func (p *Publisher) PublishStockCountAdjustmentRequested(ctx context.Context, correlationID, actorID, tenantID, lineID, movementID string) {
+	p.emit(ctx, "inventory.stock_count.adjustment_requested", correlationID, tenantID, "", actorID, lineID, map[string]any{
+		"line_id": lineID, "movement_id": movementID,
+	})
+}
+
+func (p *Publisher) PublishStockCountCertified(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount) {
+	p.emit(ctx, "inventory.stock_count.certified", correlationID, tenantID, sc.LegalEntityID, actorID, sc.CountID, map[string]any{
+		"count_id": sc.CountID, "certified_at": sc.CertifiedAt,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
