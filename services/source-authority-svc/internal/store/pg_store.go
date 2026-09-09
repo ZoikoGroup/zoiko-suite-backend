@@ -276,6 +276,20 @@ const factColumns = `
 	source_version, fact_value, observed_at, effective_at, transformation_version,
 	authority_class, created_at, created_by_principal_id, correlation_id`
 
+// lpsFactColumns is factColumns qualified to the latest_per_source CTE.
+//
+// The resolver is the one query that reads facts through a JOIN, and the rule
+// side (current_rule) also exposes field_family and source_system — so the bare
+// list above makes both names ambiguous and Postgres rejects the whole query
+// with SQLSTATE 42702. Every other caller of factColumns selects from a single
+// table, where qualification would be noise, so this stays a separate constant
+// rather than a change to that one. Column order must match factColumns: both
+// feed the same scan order.
+const lpsFactColumns = `
+	lps.normalized_fact_id, lps.tenant_id, lps.field_family, lps.entity_ref, lps.source_system, lps.source_record,
+	lps.source_version, lps.fact_value, lps.observed_at, lps.effective_at, lps.transformation_version,
+	lps.authority_class, lps.created_at, lps.created_by_principal_id, lps.correlation_id`
+
 func scanFact(row pgx.Row, f *domain.NormalizedFact) error {
 	return row.Scan(
 		&f.NormalizedFactID, &f.TenantID, &f.FieldFamily, &f.EntityRef, &f.SourceSystem, &f.SourceRecord,
@@ -414,7 +428,7 @@ func (s *PgStore) ResolveAuthoritativeFact(ctx context.Context, tenantID, fieldF
 				  AND (effective_to IS NULL OR effective_to > NOW())
 				ORDER BY field_family, source_system, effective_from DESC, source_authority_map_id DESC
 			)
-			SELECT ` + factColumns + `, cr.precedence_rank, cr.conflict_route
+			SELECT ` + lpsFactColumns + `, cr.precedence_rank, cr.conflict_route
 			FROM latest_per_source lps
 			LEFT JOIN current_rule cr
 			  ON cr.field_family = lps.field_family AND cr.source_system = lps.source_system
