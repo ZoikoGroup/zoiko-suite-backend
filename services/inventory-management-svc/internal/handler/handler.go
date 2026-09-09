@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/inventory-management-svc/internal/clients"
 	"zoiko.io/inventory-management-svc/internal/domain"
 	svcmiddleware "zoiko.io/inventory-management-svc/internal/middleware"
 )
@@ -57,6 +58,26 @@ type Store interface {
 	GetOnHand(ctx context.Context, itemID, locationID string) (float64, error)
 	GetOnHandAsOf(ctx context.Context, itemID, locationID string, at time.Time) (float64, error)
 	CreateCorrectionMovement(ctx context.Context, originalMovementID, principalID, reason string, isSupersede bool, newMovementID string, at time.Time) (*domain.InventoryMovement, error)
+
+	// INV-04 (Inventory Valuation) — see internal/store/valuation_store.go's
+	// own doc comments for the authority boundary these implement.
+	ValueMovement(ctx context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, error)
+	GetValuationEntry(ctx context.Context, entryID string) (*domain.ValuationEntry, error)
+	GetInventoryValue(ctx context.Context, itemID, locationID string) (float64, error)
+	GetCostLayers(ctx context.Context, itemID, locationID string) ([]domain.CostLayer, error)
+	CreateValuationRun(ctx context.Context, r *domain.ValuationRun) (frozenCount int, err error)
+	GetValuationRun(ctx context.Context, runID string) (*domain.ValuationRun, error)
+	MarkValuationRunEmitted(ctx context.Context, runID, principalID, journalID string, at time.Time) error
+	CreateWriteDown(ctx context.Context, w *domain.WriteDown, journalID string) error
+	GetWriteDown(ctx context.Context, writeDownID string) (*domain.WriteDown, error)
+	ReverseWriteDown(ctx context.Context, writeDownID, principalID, reason string, at time.Time) error
+}
+
+// InventoryLedgerClient is INV-04's own real "ACC-04" dependency — see
+// internal/clients/ledger.go's own doc comment.
+type InventoryLedgerClient interface {
+	PostInventoryAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []clients.LedgerLine) (journalID string, err error)
+	ReverseInventoryJournal(ctx context.Context, tenantID, principalID, journalID, reason string) error
 }
 
 // PeriodChecker is INV-03's own real "hard-closed-period" dependency on
@@ -93,6 +114,15 @@ type Publisher interface {
 	PublishInventoryTransferred(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
 	PublishInventoryReceived(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
 	PublishInventoryIssued(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement)
+
+	// INV-04 (Inventory Valuation) — the spec's own named Events (a
+	// subset — "CostLayerCreated" is not wired in; stated honestly in the
+	// findings doc): "InventoryValued; InventoryWriteDownRecorded;
+	// InventoryWriteDownReversed; InventoryAccountingEventEmitted."
+	PublishInventoryValued(ctx context.Context, correlationID, actorID, tenantID string, e domain.ValuationEntry)
+	PublishInventoryWriteDownRecorded(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown)
+	PublishInventoryWriteDownReversed(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown)
+	PublishInventoryAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -130,6 +160,14 @@ const (
 	actionInventoryMovementCreate  = "INVENTORY_MOVEMENT_CREATE"
 	actionInventoryMovementAdjust  = "INVENTORY_MOVEMENT_ADJUST"
 	actionInventoryMovementReverse = "INVENTORY_MOVEMENT_REVERSE"
+
+	// INV-04 (Inventory Valuation) actions — the spec's own Permissions
+	// field: "inventory.valuation.read; inventory.valuation.run;
+	// inventory.valuation.adjust; inventory.valuation.approve."
+	actionInventoryValuationRead    = "INVENTORY_VALUATION_READ"
+	actionInventoryValuationRun     = "INVENTORY_VALUATION_RUN"
+	actionInventoryValuationAdjust  = "INVENTORY_VALUATION_ADJUST"
+	actionInventoryValuationApprove = "INVENTORY_VALUATION_APPROVE"
 )
 
 type Handler struct {
@@ -137,11 +175,22 @@ type Handler struct {
 	publisher     Publisher
 	authz         AuthZClient
 	periodChecker PeriodChecker
+	ledger        InventoryLedgerClient
 	log           *zap.Logger
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
 	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+}
+
+// WithLedgerClient sets INV-04's own real dependency on general-ledger-svc.
+// Left unconfigured, EmitInventoryAccountingEvent, RecordInventoryWriteDown
+// and ReverseWriteDown refuse with a clear error rather than a nil
+// dereference — the same posture asset-management-svc's own
+// WithLedgerClient takes for a never-optional dependency.
+func (h *Handler) WithLedgerClient(c InventoryLedgerClient) *Handler {
+	h.ledger = c
+	return h
 }
 
 // WithPeriodChecker sets INV-03's own real dependency on
@@ -197,6 +246,22 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/supersede", h.SupersedeMovement)
 	})
 	r.Get("/v1/on-hand", h.GetOnHand)
+	r.Route("/v1/valuation", func(r chi.Router) {
+		r.Post("/movements/{movementID}/value", h.ValueMovement)
+		r.Get("/entries/{id}", h.GetValuationEntry)
+		r.Get("/inventory-value", h.GetInventoryValue)
+		r.Get("/cost-layers", h.GetCostLayers)
+		r.Route("/runs", func(r chi.Router) {
+			r.Post("/", h.CreateValuationRun)
+			r.Get("/{id}", h.GetValuationRun)
+			r.Post("/{id}/emit", h.EmitInventoryAccountingEvent)
+		})
+		r.Route("/write-downs", func(r chi.Router) {
+			r.Post("/", h.RecordInventoryWriteDown)
+			r.Get("/{id}", h.GetWriteDown)
+			r.Post("/{id}/reverse", h.ReverseWriteDown)
+		})
+	})
 }
 
 // ── POST /v1/items ────────────────────────────────────────────────────────

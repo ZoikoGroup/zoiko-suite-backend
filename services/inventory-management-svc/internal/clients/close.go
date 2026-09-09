@@ -15,13 +15,14 @@ import (
 )
 
 type Clients struct {
-	closeURL string
-	http     *http.Client
-	log      *zap.Logger
+	closeURL  string
+	ledgerURL string
+	http      *http.Client
+	log       *zap.Logger
 }
 
-func New(closeURL string, log *zap.Logger) *Clients {
-	return &Clients{closeURL: closeURL, http: &http.Client{Timeout: 5 * time.Second}, log: log}
+func New(closeURL, ledgerURL string, log *zap.Logger) *Clients {
+	return &Clients{closeURL: closeURL, ledgerURL: ledgerURL, http: &http.Client{Timeout: 5 * time.Second}, log: log}
 }
 
 type periodStatusResp struct {

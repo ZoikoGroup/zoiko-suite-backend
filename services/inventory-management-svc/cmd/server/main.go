@@ -232,7 +232,7 @@ func main() {
 		authzBaseURL = cfg.AuthzMTLSURL
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
-	periodChecker := clients.New(cfg.CloseServiceURL, log)
+	platformClients := clients.New(cfg.CloseServiceURL, cfg.LedgerServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -248,7 +248,7 @@ func main() {
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log).WithPeriodChecker(periodChecker)
+	h := handler.New(pgStore, publisher, authzClient, log).WithPeriodChecker(platformClients).WithLedgerClient(platformClients)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

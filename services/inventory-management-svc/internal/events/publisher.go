@@ -149,6 +149,35 @@ func (p *Publisher) PublishInventoryIssued(ctx context.Context, correlationID, a
 	})
 }
 
+// INV-04's own named events (a subset — "CostLayerCreated" is not wired
+// in; stated honestly in the findings doc): "InventoryValued;
+// InventoryWriteDownRecorded; InventoryWriteDownReversed;
+// InventoryAccountingEventEmitted."
+
+func (p *Publisher) PublishInventoryValued(ctx context.Context, correlationID, actorID, tenantID string, e domain.ValuationEntry) {
+	p.emit(ctx, "inventory.valued", correlationID, tenantID, e.LegalEntityID, actorID, e.EntryID, map[string]any{
+		"entry_id": e.EntryID, "movement_id": e.MovementID, "entry_type": e.EntryType, "value": e.Value,
+	})
+}
+
+func (p *Publisher) PublishInventoryWriteDownRecorded(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown) {
+	p.emit(ctx, "inventory.write_down.recorded", correlationID, tenantID, w.LegalEntityID, actorID, w.WriteDownID, map[string]any{
+		"write_down_id": w.WriteDownID, "item_id": w.ItemID, "amount": w.Amount,
+	})
+}
+
+func (p *Publisher) PublishInventoryWriteDownReversed(ctx context.Context, correlationID, actorID, tenantID string, w domain.WriteDown) {
+	p.emit(ctx, "inventory.write_down.reversed", correlationID, tenantID, w.LegalEntityID, actorID, w.WriteDownID, map[string]any{
+		"write_down_id": w.WriteDownID, "reversal_reason": w.ReversalReason,
+	})
+}
+
+func (p *Publisher) PublishInventoryAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string) {
+	p.emit(ctx, "inventory.accounting_event.emitted", correlationID, tenantID, legalEntityID, actorID, runID, map[string]any{
+		"run_id": runID, "journal_id": journalID,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

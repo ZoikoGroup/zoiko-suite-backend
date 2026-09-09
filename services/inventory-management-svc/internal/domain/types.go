@@ -453,3 +453,185 @@ var (
 	ErrPeriodCheckUnavailable = errorString("financial-close-svc unavailable")
 	ErrPeriodLocked           = errorString("cannot commit a movement into a LOCKED fiscal period")
 )
+
+// ── INV-04 Inventory Valuation ───────────────────────────────────────────────
+//
+// See migration 000004's doc comment for the full state-model/command
+// mapping, the scope-narrowing decision, and all four negative-path
+// enforcement mechanisms.
+
+const (
+	ValuationEntryTypeInbound  = "INBOUND"
+	ValuationEntryTypeOutbound = "OUTBOUND"
+
+	ValuationRunStatusDraft                  = "DRAFT"
+	ValuationRunStatusPopulationFrozen       = "POPULATION_FROZEN"
+	ValuationRunStatusApproved               = "APPROVED"
+	ValuationRunStatusAccountingEventEmitted = "ACCOUNTING_EVENT_EMITTED"
+
+	WriteDownStatusAccountingEventEmitted = "ACCOUNTING_EVENT_EMITTED"
+	WriteDownStatusReversed               = "REVERSED"
+)
+
+// CostLayer is INV-04's own "InventoryCostLayer/Pool" — one row per
+// INBOUND movement, created exactly once (UNIQUE(tenant_id,
+// source_movement_id)).
+type CostLayer struct {
+	LayerID           string    `json:"layer_id"`
+	ItemID            string    `json:"item_id"`
+	LocationID        string    `json:"location_id"`
+	SourceMovementID  string    `json:"source_movement_id"`
+	OriginalQuantity  float64   `json:"original_quantity"`
+	RemainingQuantity float64   `json:"remaining_quantity"`
+	UnitCost          float64   `json:"unit_cost"`
+	CreatedAt         time.Time `json:"created_at"`
+}
+
+// ValuationEntry is INV-04's own "ValuationEntry" — exactly one row per
+// movement, ever (UNIQUE(tenant_id, movement_id)).
+type ValuationEntry struct {
+	EntryID              string    `json:"entry_id"`
+	LegalEntityID        string    `json:"legal_entity_id"`
+	ItemID               string    `json:"item_id"`
+	LocationID           string    `json:"location_id"`
+	MovementID           string    `json:"movement_id"`
+	EntryType            string    `json:"entry_type"`
+	Quantity             float64   `json:"quantity"`
+	Value                float64   `json:"value"`
+	ValuationMethod      string    `json:"valuation_method"`
+	FiscalPeriod         string    `json:"fiscal_period"`
+	RunID                *string   `json:"run_id,omitempty"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// LayerConsumption is the spec's own named "cost-layer trace" evidence —
+// which layers, and how much of each, an OUTBOUND entry drew from.
+type LayerConsumption struct {
+	ConsumptionID         string    `json:"consumption_id"`
+	ValuationEntryID      string    `json:"valuation_entry_id"`
+	LayerID               string    `json:"layer_id"`
+	QuantityConsumed      float64   `json:"quantity_consumed"`
+	UnitCostAtConsumption float64   `json:"unit_cost_at_consumption"`
+	CreatedAt             time.Time `json:"created_at"`
+}
+
+// ValuationRun mirrors AST-02's own DepreciationRun — one batch GL
+// posting per (legal_entity, fiscal_period).
+type ValuationRun struct {
+	RunID                 string     `json:"run_id"`
+	LegalEntityID         string     `json:"legal_entity_id"`
+	FiscalPeriod          string     `json:"fiscal_period"`
+	InventoryAccountCode  string     `json:"inventory_account_code"`
+	COGSAccountCode       string     `json:"cogs_account_code"`
+	Status                string     `json:"status"`
+	JournalID             *string    `json:"journal_id,omitempty"`
+	CreatedAt             time.Time  `json:"created_at"`
+	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
+	ApprovedAt            *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID *string    `json:"approved_by_principal_id,omitempty"`
+	EmittedAt             *time.Time `json:"emitted_at,omitempty"`
+
+	Entries []ValuationEntry `json:"entries,omitempty"`
+}
+
+// WriteDown is RecordInventoryWriteDown/ReverseWriteDown's own authority.
+// ValuationEvidenceRef is required — negative path #3, "NRV write-down
+// lacks evidence."
+type WriteDown struct {
+	WriteDownID           string     `json:"write_down_id"`
+	LegalEntityID         string     `json:"legal_entity_id"`
+	ItemID                string     `json:"item_id"`
+	LocationID            string     `json:"location_id"`
+	Amount                float64    `json:"amount"`
+	ValuationEvidenceRef  string     `json:"valuation_evidence_ref"`
+	ExpenseAccountCode    string     `json:"expense_account_code"`
+	InventoryAccountCode  string     `json:"inventory_account_code"`
+	JournalID             *string    `json:"journal_id,omitempty"`
+	Status                string     `json:"status"`
+	CreatedAt             time.Time  `json:"created_at"`
+	CreatedByPrincipalID  string     `json:"created_by_principal_id"`
+	ReversedAt            *time.Time `json:"reversed_at,omitempty"`
+	ReversedByPrincipalID *string    `json:"reversed_by_principal_id,omitempty"`
+	ReversalReason        *string    `json:"reversal_reason,omitempty"`
+}
+
+// ── Request types ────────────────────────────────────────────────────────
+
+// ValueMovementRequest supplies caller-declared cost inputs — no AP cost
+// source or REF FX service exists yet, the same bootstrap-gap posture
+// used throughout this session. UnitCost is required for an INBOUND
+// movement (the layer's own cost) and for a STANDARD_COST-method
+// OUTBOUND movement (no standard-cost master exists yet); it is ignored
+// for FIFO/WEIGHTED_AVERAGE OUTBOUND movements, whose cost is always
+// derived from existing layers.
+type ValueMovementRequest struct {
+	UnitCost *float64 `json:"unit_cost,omitempty"`
+}
+
+type CreateValuationRunRequest struct {
+	LegalEntityID        string `json:"legal_entity_id"`
+	FiscalPeriod         string `json:"fiscal_period"`
+	InventoryAccountCode string `json:"inventory_account_code"`
+	COGSAccountCode      string `json:"cogs_account_code"`
+}
+
+type RecordWriteDownRequest struct {
+	ItemID               string  `json:"item_id"`
+	LocationID           string  `json:"location_id"`
+	Amount               float64 `json:"amount"`
+	ValuationEvidenceRef string  `json:"valuation_evidence_ref"`
+	ExpenseAccountCode   string  `json:"expense_account_code"`
+	InventoryAccountCode string  `json:"inventory_account_code"`
+	FiscalPeriod         string  `json:"fiscal_period"`
+}
+
+type ReverseWriteDownRequest struct {
+	Reason string `json:"reason"`
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
+
+var (
+	ErrValuationEntryNotFound = errorString("valuation entry not found")
+	ErrValuationRunNotFound   = errorString("valuation run not found")
+	ErrWriteDownNotFound      = errorString("write-down not found")
+
+	// ErrMovementAlreadyValued is the spec's own negative path, "Same
+	// movement consumes two cost layers twice" — enforced structurally by
+	// UNIQUE(tenant_id, movement_id) on inventory_valuation_entries; a
+	// second ValueMovement call against the same movement is refused, not
+	// silently repeated.
+	ErrMovementAlreadyValued = errorString("this movement has already been valued")
+
+	ErrMovementNotCommitted = errorString("only a COMMITTED movement can be valued")
+
+	// ErrUnitCostRequired covers both an INBOUND movement missing its own
+	// unit_cost and a STANDARD_COST-method OUTBOUND movement missing its
+	// own caller-declared standard cost.
+	ErrUnitCostRequired = errorString("unit_cost is required for this movement")
+
+	// ErrInsufficientCostLayers is a real integrity guard distinct from
+	// INV-03's own negative-stock check: INV-03 blocks a movement that
+	// would take PHYSICAL on-hand negative; this blocks valuing an
+	// OUTBOUND movement whose item/location has no valued cost layers
+	// covering it — a legitimate gap when, e.g., opening balances were
+	// never valued.
+	ErrInsufficientCostLayers = errorString("insufficient valued cost layers to cover this movement's quantity")
+
+	ErrInvalidRunTransition = errorString("valuation run is not in a status that allows this action")
+
+	ErrValuationRunAlreadyExistsForPeriod = errorString("a live valuation run already exists for this legal entity and fiscal period")
+
+	ErrEmptyValuationPopulation = errorString("no unclaimed FINAL valuation entries were found to freeze into this run")
+
+	ErrSelfApprovalNotPermittedRun = errorString("the principal who created this valuation run may not also approve it")
+
+	// ErrValuationEvidenceRequired is the spec's own negative path, "NRV
+	// write-down lacks evidence."
+	ErrValuationEvidenceRequired = errorString("a write-down requires a recorded valuation_evidence_ref")
+
+	ErrSelfWriteDownReversalNotPermitted = errorString("the principal who recorded this write-down may not also reverse it")
+
+	ErrWriteDownAlreadyReversed = errorString("write-down has already been reversed")
+)

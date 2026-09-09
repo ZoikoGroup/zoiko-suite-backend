@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/inventory-management-svc/internal/clients"
 	"zoiko.io/inventory-management-svc/internal/domain"
 	"zoiko.io/inventory-management-svc/internal/handler"
 	"zoiko.io/inventory-management-svc/internal/middleware"
@@ -33,6 +34,12 @@ type stubStore struct {
 	movements       map[string]*domain.InventoryMovement
 	movementsByKey  map[string]string // source_idempotency_key -> movement_id
 	serialResidency map[string]string // "item_id|serial_number" -> location_id
+
+	costLayers        []*domain.CostLayer
+	valuationEntries  map[string]*domain.ValuationEntry // entry_id -> entry
+	entriesByMovement map[string]string                 // movement_id -> entry_id
+	valuationRuns     map[string]*domain.ValuationRun
+	writeDowns        map[string]*domain.WriteDown
 }
 
 func newStubStore() *stubStore {
@@ -45,7 +52,194 @@ func newStubStore() *stubStore {
 		movements:         make(map[string]*domain.InventoryMovement),
 		movementsByKey:    make(map[string]string),
 		serialResidency:   make(map[string]string),
+		valuationEntries:  make(map[string]*domain.ValuationEntry),
+		entriesByMovement: make(map[string]string),
+		valuationRuns:     make(map[string]*domain.ValuationRun),
+		writeDowns:        make(map[string]*domain.WriteDown),
 	}
+}
+
+// ── INV-04 (Inventory Valuation) ─────────────────────────────────────────────
+
+func (s *stubStore) ValueMovement(_ context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, error) {
+	if _, exists := s.entriesByMovement[movementID]; exists {
+		return nil, domain.ErrMovementAlreadyValued
+	}
+	m, ok := s.movements[movementID]
+	if !ok {
+		return nil, domain.ErrMovementNotFound
+	}
+	if m.Status != domain.MovementStatusCommitted {
+		return nil, domain.ErrMovementNotCommitted
+	}
+	vp, ok := s.valuationPolicies[m.ItemID]
+	if !ok {
+		return nil, domain.ErrValuationPolicyRequiredForActivation
+	}
+
+	entryID := "entry-" + movementID
+	entry := &domain.ValuationEntry{
+		EntryID: entryID, LegalEntityID: m.LegalEntityID, ItemID: m.ItemID, MovementID: movementID,
+		ValuationMethod: vp.ValuationMethod, FiscalPeriod: m.FiscalPeriod, Quantity: m.Quantity,
+		CreatedAt: at, CreatedByPrincipalID: principalID,
+	}
+
+	if m.DestinationLocationID != nil {
+		if unitCost == nil {
+			return nil, domain.ErrUnitCostRequired
+		}
+		entry.LocationID = *m.DestinationLocationID
+		entry.EntryType = domain.ValuationEntryTypeInbound
+		entry.Value = m.Quantity * *unitCost
+		s.costLayers = append(s.costLayers, &domain.CostLayer{
+			LayerID: "layer-" + movementID, ItemID: m.ItemID, LocationID: *m.DestinationLocationID, SourceMovementID: movementID,
+			OriginalQuantity: m.Quantity, RemainingQuantity: m.Quantity, UnitCost: *unitCost, CreatedAt: at,
+		})
+	} else if m.SourceLocationID != nil {
+		entry.LocationID = *m.SourceLocationID
+		entry.EntryType = domain.ValuationEntryTypeOutbound
+		if vp.ValuationMethod == domain.ValuationMethodStandardCost {
+			if unitCost == nil {
+				return nil, domain.ErrUnitCostRequired
+			}
+			entry.Value = m.Quantity * *unitCost
+		} else {
+			var totalRemaining, totalValue float64
+			for _, l := range s.costLayers {
+				if l.ItemID == m.ItemID && l.LocationID == *m.SourceLocationID {
+					totalRemaining += l.RemainingQuantity
+					totalValue += l.RemainingQuantity * l.UnitCost
+				}
+			}
+			if totalRemaining < m.Quantity {
+				return nil, domain.ErrInsufficientCostLayers
+			}
+			averageRate := totalValue / totalRemaining
+			remaining := m.Quantity
+			var consumedValue float64
+			for _, l := range s.costLayers {
+				if remaining <= 0 {
+					break
+				}
+				if l.ItemID != m.ItemID || l.LocationID != *m.SourceLocationID || l.RemainingQuantity <= 0 {
+					continue
+				}
+				take := l.RemainingQuantity
+				if take > remaining {
+					take = remaining
+				}
+				rate := l.UnitCost
+				if vp.ValuationMethod == domain.ValuationMethodWeightedAverage {
+					rate = averageRate
+				}
+				consumedValue += take * rate
+				l.RemainingQuantity -= take
+				remaining -= take
+			}
+			entry.Value = consumedValue
+		}
+	} else {
+		return nil, domain.ErrMovementNotFound
+	}
+
+	s.valuationEntries[entryID] = entry
+	s.entriesByMovement[movementID] = entryID
+	cp := *entry
+	return &cp, nil
+}
+
+func (s *stubStore) GetValuationEntry(_ context.Context, entryID string) (*domain.ValuationEntry, error) {
+	e, ok := s.valuationEntries[entryID]
+	if !ok {
+		return nil, domain.ErrValuationEntryNotFound
+	}
+	cp := *e
+	return &cp, nil
+}
+
+func (s *stubStore) GetInventoryValue(_ context.Context, itemID, locationID string) (float64, error) {
+	var value float64
+	for _, l := range s.costLayers {
+		if l.ItemID == itemID && l.LocationID == locationID {
+			value += l.RemainingQuantity * l.UnitCost
+		}
+	}
+	return value, nil
+}
+
+func (s *stubStore) GetCostLayers(_ context.Context, itemID, locationID string) ([]domain.CostLayer, error) {
+	var out []domain.CostLayer
+	for _, l := range s.costLayers {
+		if l.ItemID == itemID && l.LocationID == locationID {
+			out = append(out, *l)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) CreateValuationRun(_ context.Context, r *domain.ValuationRun) (int, error) {
+	for _, existing := range s.valuationRuns {
+		if existing.LegalEntityID == r.LegalEntityID && existing.FiscalPeriod == r.FiscalPeriod && existing.Status != domain.ValuationRunStatusAccountingEventEmitted {
+			return 0, domain.ErrValuationRunAlreadyExistsForPeriod
+		}
+	}
+	frozen := 0
+	cp := *r
+	cp.Status = domain.ValuationRunStatusPopulationFrozen
+	for _, e := range s.valuationEntries {
+		if e.LegalEntityID == r.LegalEntityID && e.FiscalPeriod == r.FiscalPeriod && e.RunID == nil {
+			runID := r.RunID
+			e.RunID = &runID
+			cp.Entries = append(cp.Entries, *e)
+			frozen++
+		}
+	}
+	s.valuationRuns[r.RunID] = &cp
+	return frozen, nil
+}
+
+func (s *stubStore) GetValuationRun(_ context.Context, runID string) (*domain.ValuationRun, error) {
+	r, ok := s.valuationRuns[runID]
+	if !ok {
+		return nil, domain.ErrValuationRunNotFound
+	}
+	cp := *r
+	return &cp, nil
+}
+
+func (s *stubStore) MarkValuationRunEmitted(_ context.Context, runID, principalID, journalID string, at time.Time) error {
+	r, ok := s.valuationRuns[runID]
+	if !ok || r.Status != domain.ValuationRunStatusPopulationFrozen {
+		return domain.ErrInvalidRunTransition
+	}
+	r.Status, r.EmittedAt, r.ApprovedAt, r.ApprovedByPrincipalID, r.JournalID = domain.ValuationRunStatusAccountingEventEmitted, &at, &at, &principalID, &journalID
+	return nil
+}
+
+func (s *stubStore) CreateWriteDown(_ context.Context, w *domain.WriteDown, journalID string) error {
+	cp := *w
+	cp.JournalID = &journalID
+	cp.Status = domain.WriteDownStatusAccountingEventEmitted
+	s.writeDowns[w.WriteDownID] = &cp
+	return nil
+}
+
+func (s *stubStore) GetWriteDown(_ context.Context, writeDownID string) (*domain.WriteDown, error) {
+	w, ok := s.writeDowns[writeDownID]
+	if !ok {
+		return nil, domain.ErrWriteDownNotFound
+	}
+	cp := *w
+	return &cp, nil
+}
+
+func (s *stubStore) ReverseWriteDown(_ context.Context, writeDownID, principalID, reason string, at time.Time) error {
+	w, ok := s.writeDowns[writeDownID]
+	if !ok || w.Status != domain.WriteDownStatusAccountingEventEmitted {
+		return domain.ErrWriteDownAlreadyReversed
+	}
+	w.Status, w.ReversedAt, w.ReversedByPrincipalID, w.ReversalReason = domain.WriteDownStatusReversed, &at, &principalID, &reason
+	return nil
 }
 
 // ── INV-02 (Inventory Location) ──────────────────────────────────────────────
@@ -557,6 +751,18 @@ func (p *stubPublisher) PublishInventoryReceived(_ context.Context, _, _ string,
 func (p *stubPublisher) PublishInventoryIssued(_ context.Context, _, _ string, _ domain.InventoryMovement) {
 	p.calls++
 }
+func (p *stubPublisher) PublishInventoryValued(_ context.Context, _, _, _ string, _ domain.ValuationEntry) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryWriteDownRecorded(_ context.Context, _, _, _ string, _ domain.WriteDown) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryWriteDownReversed(_ context.Context, _, _, _ string, _ domain.WriteDown) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryAccountingEventEmitted(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
 
 var _ handler.Publisher = (*stubPublisher)(nil)
 
@@ -570,11 +776,45 @@ func (c *stubPeriodChecker) CheckPeriodOpen(_ context.Context, _, _, _ string) e
 
 var _ handler.PeriodChecker = (*stubPeriodChecker)(nil)
 
+type stubLedger struct {
+	postJournalID string
+	postErr       error
+	postCalls     int
+	reverseErr    error
+	reverseCalls  int
+}
+
+func (l *stubLedger) PostInventoryAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _ string, _ []clients.LedgerLine) (string, error) {
+	l.postCalls++
+	if l.postErr != nil {
+		return "", l.postErr
+	}
+	if l.postJournalID != "" {
+		return l.postJournalID, nil
+	}
+	return "journal-" + sourceEventID, nil
+}
+
+func (l *stubLedger) ReverseInventoryJournal(_ context.Context, _, _, _, _ string) error {
+	l.reverseCalls++
+	return l.reverseErr
+}
+
+var _ handler.InventoryLedgerClient = (*stubLedger)(nil)
+
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
 	return newRouterWithPeriodChecker(s, pub, authz, &stubPeriodChecker{})
 }
 
 func newRouterWithPeriodChecker(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubPeriodChecker) chi.Router {
+	return newRouterFull(s, pub, authz, pc, &stubLedger{})
+}
+
+func newRouterWithLedger(s *stubStore, pub *stubPublisher, authz *stubAuthZ, ledger *stubLedger) chi.Router {
+	return newRouterFull(s, pub, authz, &stubPeriodChecker{}, ledger)
+}
+
+func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubPeriodChecker, ledger *stubLedger) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -582,7 +822,7 @@ func newRouterWithPeriodChecker(s *stubStore, pub *stubPublisher, authz *stubAut
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc)
+	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc).WithLedgerClient(ledger)
 	handler.RegisterRoutes(r, h)
 	return r
 }

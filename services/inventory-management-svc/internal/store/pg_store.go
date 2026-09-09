@@ -35,6 +35,14 @@ func uuidNewString() string {
 	return uuid.NewString()
 }
 
+// roundCents rounds v to the nearest cent — money is NUMERIC(18,2), and a
+// calculation that doesn't land on a whole cent is wrong, not merely
+// imprecise. Same helper this platform already uses in
+// financial-close-svc/asset-management-svc.
+func roundCents(v float64) float64 {
+	return float64(int64(v*100+0.5)) / 100
+}
+
 type PgStore struct {
 	pool *pgxpool.Pool
 }

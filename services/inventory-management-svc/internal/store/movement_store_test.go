@@ -45,8 +45,12 @@ func newActiveTestLocation(t *testing.T, s *store.PgStore, ctx context.Context, 
 }
 
 func newDraftReceipt(itemID, destLocationID, idemKey string, quantity float64, serial string) *domain.InventoryMovement {
+	return newDraftReceiptForEntity("", itemID, destLocationID, idemKey, quantity, serial)
+}
+
+func newDraftReceiptForEntity(legalEntityID, itemID, destLocationID, idemKey string, quantity float64, serial string) *domain.InventoryMovement {
 	m := &domain.InventoryMovement{
-		MovementID: uuid.New().String(), MovementType: domain.MovementTypeReceipt, Status: domain.MovementStatusDraft,
+		MovementID: uuid.New().String(), LegalEntityID: legalEntityID, MovementType: domain.MovementTypeReceipt, Status: domain.MovementStatusDraft,
 		ItemID: itemID, DestinationLocationID: &destLocationID, Quantity: quantity, UOM: "EACH",
 		SourceReference: "PO-1", SourceIdempotencyKey: idemKey, BusinessDate: time.Now().UTC(), FiscalPeriod: "2026-09",
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
