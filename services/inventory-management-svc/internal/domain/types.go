@@ -176,3 +176,137 @@ var (
 
 	ErrReasonRequired = errorString("reason is required")
 )
+
+// ── INV-02 Inventory Location ────────────────────────────────────────────────
+//
+// See migration 000002's doc comment for the full state-model/command
+// mapping and all four negative-path enforcement mechanisms.
+
+const (
+	LocationTypeWarehouse      = "WAREHOUSE"
+	LocationTypeSite           = "SITE"
+	LocationTypeBin            = "BIN"
+	LocationTypeQuarantineArea = "QUARANTINE_AREA"
+	LocationTypeTransit        = "TRANSIT"
+
+	LocationStatusDraft      = "DRAFT"
+	LocationStatusActive     = "ACTIVE"
+	LocationStatusSuspended  = "SUSPENDED"
+	LocationStatusQuarantine = "QUARANTINE"
+	LocationStatusRetired    = "RETIRED"
+)
+
+// InventoryLocation is INV-02's own authority — "InventoryLocation;
+// warehouse/site/bin/quarantine/transit location; parent hierarchy;
+// custody entity; operational state; location type; counting/
+// negative-stock attributes." LegalEntityID is set once at creation and
+// never exposed as an editable field of any later command — see
+// migration 000002's doc comment on negative path #1.
+type InventoryLocation struct {
+	LocationID      string `json:"location_id"`
+	TenantID        string `json:"tenant_id"`
+	LegalEntityID   string `json:"legal_entity_id"`
+	LocationCode    string `json:"location_code"`
+	LocationType    string `json:"location_type"`
+	Description     string `json:"description,omitempty"`
+	CustodianEntity string `json:"custodian_entity,omitempty"`
+
+	Status string `json:"status"`
+
+	CreatedAt                time.Time  `json:"created_at"`
+	CreatedByPrincipalID     string     `json:"created_by_principal_id"`
+	ActivatedAt              *time.Time `json:"activated_at,omitempty"`
+	ActivatedByPrincipalID   *string    `json:"activated_by_principal_id,omitempty"`
+	SuspendedAt              *time.Time `json:"suspended_at,omitempty"`
+	SuspendedByPrincipalID   *string    `json:"suspended_by_principal_id,omitempty"`
+	SuspensionReason         *string    `json:"suspension_reason,omitempty"`
+	QuarantinedAt            *time.Time `json:"quarantined_at,omitempty"`
+	QuarantinedByPrincipalID *string    `json:"quarantined_by_principal_id,omitempty"`
+	QuarantineReason         *string    `json:"quarantine_reason,omitempty"`
+	ReleasedAt               *time.Time `json:"released_at,omitempty"`
+	ReleasedByPrincipalID    *string    `json:"released_by_principal_id,omitempty"`
+	RetiredAt                *time.Time `json:"retired_at,omitempty"`
+	RetiredByPrincipalID     *string    `json:"retired_by_principal_id,omitempty"`
+	RetirementReason         *string    `json:"retirement_reason,omitempty"`
+}
+
+// LocationHierarchyVersion is INV-02's own "parent hierarchy" — versioned,
+// effective-dated, never mutated in place. See migration 000002's doc
+// comment: this is the real structural answer to "hierarchy changes
+// versioned."
+type LocationHierarchyVersion struct {
+	HierarchyVersionID string  `json:"hierarchy_version_id"`
+	Version            int     `json:"version"`
+	LocationID         string  `json:"location_id"`
+	ParentLocationID   *string `json:"parent_location_id,omitempty"`
+
+	EffectiveFrom time.Time  `json:"effective_from"`
+	EffectiveTo   *time.Time `json:"effective_to,omitempty"`
+
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// ── Request types ────────────────────────────────────────────────────────
+
+type CreateInventoryLocationRequest struct {
+	LegalEntityID    string `json:"legal_entity_id"`
+	LocationCode     string `json:"location_code"`
+	LocationType     string `json:"location_type"`
+	Description      string `json:"description,omitempty"`
+	CustodianEntity  string `json:"custodian_entity,omitempty"`
+	ParentLocationID string `json:"parent_location_id,omitempty"`
+}
+
+// AmendLocationMetadataRequest deliberately excludes LegalEntityID and
+// LocationType — neither is ever editable after creation. See migration
+// 000002's doc comment on negative path #1.
+type AmendLocationMetadataRequest struct {
+	Description     *string `json:"description,omitempty"`
+	CustodianEntity *string `json:"custodian_entity,omitempty"`
+}
+
+type SuspendLocationRequest struct {
+	Reason string `json:"reason"`
+}
+
+type ReparentLocationRequest struct {
+	NewParentLocationID string `json:"new_parent_location_id"`
+}
+
+type SetQuarantineStateRequest struct {
+	Quarantine bool   `json:"quarantine"`
+	Reason     string `json:"reason"`
+}
+
+type RetireLocationRequest struct {
+	Reason string `json:"reason"`
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
+
+var (
+	ErrLocationNotFound = errorString("inventory location not found")
+
+	ErrInvalidLocationTransition = errorString("inventory location is not in a status that allows this action")
+
+	ErrDuplicateLocationCode = errorString("a location with this location_code already exists for this legal entity")
+
+	// ErrReparentAcrossLegalEntities is the spec's own negative path,
+	// "Physical location change silently changes legal owner" — the
+	// enforcement half that lives at reparent time (the other half is
+	// LegalEntityID's own structural immutability).
+	ErrReparentAcrossLegalEntities = errorString("cannot reparent a location under a parent belonging to a different legal entity")
+
+	// ErrCircularLocationHierarchy is the spec's own negative path,
+	// "Circular warehouse/bin hierarchy created."
+	ErrCircularLocationHierarchy = errorString("this reparent would create a circular location hierarchy")
+
+	// ErrSelfQuarantineReleaseNotPermitted is the spec's own SoD,
+	// "quarantine release can require independent approval" — the
+	// principal releasing a quarantine must differ from the principal who
+	// set it.
+	ErrSelfQuarantineReleaseNotPermitted = errorString("the principal who quarantined this location may not also release it")
+
+	ErrLocationNotQuarantined = errorString("location is not currently quarantined")
+)

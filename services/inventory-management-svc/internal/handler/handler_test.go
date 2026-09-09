@@ -26,6 +26,9 @@ type stubStore struct {
 	valuationPolicies map[string]*domain.ValuationPolicy
 
 	createErr error
+
+	locations map[string]*domain.InventoryLocation
+	parents   map[string]*string // location_id -> current parent_location_id
 }
 
 func newStubStore() *stubStore {
@@ -33,7 +36,163 @@ func newStubStore() *stubStore {
 		items:             make(map[string]*domain.InventoryItem),
 		trackingPolicies:  make(map[string]*domain.TrackingPolicy),
 		valuationPolicies: make(map[string]*domain.ValuationPolicy),
+		locations:         make(map[string]*domain.InventoryLocation),
+		parents:           make(map[string]*string),
 	}
+}
+
+// ── INV-02 (Inventory Location) ──────────────────────────────────────────────
+
+func (s *stubStore) CreateLocation(_ context.Context, l *domain.InventoryLocation, parentLocationID *string) error {
+	for _, existing := range s.locations {
+		if existing.LegalEntityID == l.LegalEntityID && existing.LocationCode == l.LocationCode {
+			return domain.ErrDuplicateLocationCode
+		}
+	}
+	cp := *l
+	s.locations[l.LocationID] = &cp
+	s.parents[l.LocationID] = parentLocationID
+	return nil
+}
+
+func (s *stubStore) GetLocation(_ context.Context, locationID string) (*domain.InventoryLocation, error) {
+	l, ok := s.locations[locationID]
+	if !ok {
+		return nil, domain.ErrLocationNotFound
+	}
+	cp := *l
+	return &cp, nil
+}
+
+func (s *stubStore) ListLocations(_ context.Context, legalEntityID string, eligibleOnly bool) ([]domain.InventoryLocation, error) {
+	var out []domain.InventoryLocation
+	for _, l := range s.locations {
+		if l.LegalEntityID != legalEntityID {
+			continue
+		}
+		if eligibleOnly && l.Status != domain.LocationStatusActive {
+			continue
+		}
+		out = append(out, *l)
+	}
+	return out, nil
+}
+
+func (s *stubStore) ActivateLocation(_ context.Context, locationID, principalID string, at time.Time) error {
+	l, ok := s.locations[locationID]
+	if !ok || l.Status != domain.LocationStatusDraft {
+		return domain.ErrInvalidLocationTransition
+	}
+	l.Status, l.ActivatedAt, l.ActivatedByPrincipalID = domain.LocationStatusActive, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) SuspendLocation(_ context.Context, locationID, principalID, reason string, at time.Time) error {
+	l, ok := s.locations[locationID]
+	if !ok || l.Status != domain.LocationStatusActive {
+		return domain.ErrInvalidLocationTransition
+	}
+	l.Status, l.SuspendedAt, l.SuspendedByPrincipalID, l.SuspensionReason = domain.LocationStatusSuspended, &at, &principalID, &reason
+	return nil
+}
+
+func (s *stubStore) SetQuarantine(_ context.Context, locationID, principalID, reason string, quarantine bool, at time.Time) error {
+	l, ok := s.locations[locationID]
+	if !ok {
+		return domain.ErrLocationNotFound
+	}
+	if quarantine {
+		if l.Status != domain.LocationStatusActive {
+			return domain.ErrInvalidLocationTransition
+		}
+		l.Status, l.QuarantinedAt, l.QuarantinedByPrincipalID, l.QuarantineReason = domain.LocationStatusQuarantine, &at, &principalID, &reason
+		return nil
+	}
+	if l.Status != domain.LocationStatusQuarantine {
+		return domain.ErrLocationNotQuarantined
+	}
+	if l.QuarantinedByPrincipalID != nil && *l.QuarantinedByPrincipalID == principalID {
+		return domain.ErrSelfQuarantineReleaseNotPermitted
+	}
+	l.Status, l.ReleasedAt, l.ReleasedByPrincipalID = domain.LocationStatusActive, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) RetireLocation(_ context.Context, locationID, principalID, reason string, at time.Time) error {
+	l, ok := s.locations[locationID]
+	if !ok {
+		return domain.ErrLocationNotFound
+	}
+	switch l.Status {
+	case domain.LocationStatusActive, domain.LocationStatusSuspended, domain.LocationStatusQuarantine:
+	default:
+		return domain.ErrInvalidLocationTransition
+	}
+	l.Status, l.RetiredAt, l.RetiredByPrincipalID, l.RetirementReason = domain.LocationStatusRetired, &at, &principalID, &reason
+	return nil
+}
+
+func (s *stubStore) AmendLocationMetadata(_ context.Context, locationID string, description, custodianEntity *string) error {
+	l, ok := s.locations[locationID]
+	if !ok {
+		return domain.ErrLocationNotFound
+	}
+	if description != nil {
+		l.Description = *description
+	}
+	if custodianEntity != nil {
+		l.CustodianEntity = *custodianEntity
+	}
+	return nil
+}
+
+func (s *stubStore) GetCurrentParent(_ context.Context, locationID string) (*string, error) {
+	return s.parents[locationID], nil
+}
+
+func (s *stubStore) GetAncestorChain(_ context.Context, locationID string) ([]string, error) {
+	var chain []string
+	current := locationID
+	for i := 0; i < 1000; i++ {
+		parent := s.parents[current]
+		if parent == nil {
+			return chain, nil
+		}
+		chain = append(chain, *parent)
+		current = *parent
+	}
+	return chain, nil
+}
+
+func (s *stubStore) ReparentLocation(_ context.Context, locationID, newParentLocationID, principalID string, at time.Time) error {
+	child, ok := s.locations[locationID]
+	if !ok {
+		return domain.ErrLocationNotFound
+	}
+	newParent, ok := s.locations[newParentLocationID]
+	if !ok {
+		return domain.ErrLocationNotFound
+	}
+	if child.LegalEntityID != newParent.LegalEntityID {
+		return domain.ErrReparentAcrossLegalEntities
+	}
+	current := newParentLocationID
+	for i := 0; i < 1000; i++ {
+		if current == locationID {
+			return domain.ErrCircularLocationHierarchy
+		}
+		parent := s.parents[current]
+		if parent == nil {
+			break
+		}
+		current = *parent
+	}
+	s.parents[locationID] = &newParentLocationID
+	return nil
+}
+
+func (s *stubStore) GetParentAsOf(_ context.Context, locationID string, _ time.Time) (*string, error) {
+	return s.parents[locationID], nil
 }
 
 func (s *stubStore) CreateItem(_ context.Context, it *domain.InventoryItem) error {
@@ -161,6 +320,21 @@ func (p *stubPublisher) PublishInventoryPolicyChanged(_ context.Context, _, _, _
 	p.calls++
 }
 func (p *stubPublisher) PublishInventoryItemRetired(_ context.Context, _, _ string, _ domain.InventoryItem) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryLocationCreated(_ context.Context, _, _ string, _ domain.InventoryLocation) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryLocationActivated(_ context.Context, _, _ string, _ domain.InventoryLocation) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryLocationQuarantined(_ context.Context, _, _ string, _ domain.InventoryLocation) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryLocationChanged(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryLocationRetired(_ context.Context, _, _ string, _ domain.InventoryLocation) {
 	p.calls++
 }
 

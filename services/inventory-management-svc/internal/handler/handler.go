@@ -31,6 +31,21 @@ type Store interface {
 	SetValuationPolicy(ctx context.Context, p *domain.ValuationPolicy) error
 	GetCurrentValuationPolicy(ctx context.Context, itemID string) (*domain.ValuationPolicy, error)
 	GetProfileAsOf(ctx context.Context, itemID string, at time.Time) (*domain.TrackingPolicy, *domain.ValuationPolicy, error)
+
+	// INV-02 (Inventory Location) — see internal/store/location_store.go's
+	// own doc comments for the authority boundary these implement.
+	CreateLocation(ctx context.Context, l *domain.InventoryLocation, parentLocationID *string) error
+	GetLocation(ctx context.Context, locationID string) (*domain.InventoryLocation, error)
+	ListLocations(ctx context.Context, legalEntityID string, eligibleOnly bool) ([]domain.InventoryLocation, error)
+	ActivateLocation(ctx context.Context, locationID, principalID string, at time.Time) error
+	SuspendLocation(ctx context.Context, locationID, principalID, reason string, at time.Time) error
+	SetQuarantine(ctx context.Context, locationID, principalID, reason string, quarantine bool, at time.Time) error
+	RetireLocation(ctx context.Context, locationID, principalID, reason string, at time.Time) error
+	AmendLocationMetadata(ctx context.Context, locationID string, description, custodianEntity *string) error
+	GetCurrentParent(ctx context.Context, locationID string) (*string, error)
+	GetAncestorChain(ctx context.Context, locationID string) ([]string, error)
+	ReparentLocation(ctx context.Context, locationID, newParentLocationID, principalID string, at time.Time) error
+	GetParentAsOf(ctx context.Context, locationID string, at time.Time) (*string, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on —
@@ -41,6 +56,16 @@ type Publisher interface {
 	PublishInventoryItemActivated(ctx context.Context, correlationID, actorID string, it domain.InventoryItem)
 	PublishInventoryPolicyChanged(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, itemID, policyType string)
 	PublishInventoryItemRetired(ctx context.Context, correlationID, actorID string, it domain.InventoryItem)
+
+	// INV-02 (Inventory Location) — the spec's own named Events:
+	// "InventoryLocationCreated; InventoryLocationActivated;
+	// InventoryLocationQuarantined; InventoryLocationChanged;
+	// InventoryLocationRetired."
+	PublishInventoryLocationCreated(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation)
+	PublishInventoryLocationActivated(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation)
+	PublishInventoryLocationQuarantined(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation)
+	PublishInventoryLocationChanged(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, locationID, changeType string)
+	PublishInventoryLocationRetired(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -59,6 +84,13 @@ const (
 	actionInventoryItemRead     = "INVENTORY_ITEM_READ"
 	actionInventoryItemManage   = "INVENTORY_ITEM_MANAGE"
 	actionInventoryPolicyAssign = "INVENTORY_POLICY_ASSIGN"
+
+	// INV-02 (Inventory Location) actions — the spec's own Permissions
+	// field: "inventory.location.read; inventory.location.manage;
+	// inventory.location.quarantine."
+	actionInventoryLocationRead       = "INVENTORY_LOCATION_READ"
+	actionInventoryLocationManage     = "INVENTORY_LOCATION_MANAGE"
+	actionInventoryLocationQuarantine = "INVENTORY_LOCATION_QUARANTINE"
 )
 
 type Handler struct {
@@ -87,6 +119,19 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{id}/valuation-policy", h.GetValuationPolicy)
 		r.Get("/{id}/profile-as-of", h.GetInventoryProfileAsOf)
 		r.Get("/{id}/available-actions", h.GetAvailableActions)
+	})
+	r.Route("/v1/locations", func(r chi.Router) {
+		r.Post("/", h.CreateInventoryLocation)
+		r.Get("/", h.ListEligibleLocations)
+		r.Get("/{id}", h.GetLocation)
+		r.Post("/{id}/activate", h.ActivateLocation)
+		r.Post("/{id}/suspend", h.SuspendLocation)
+		r.Post("/{id}/amend", h.AmendLocationMetadata)
+		r.Post("/{id}/reparent", h.ReparentLocationControlled)
+		r.Post("/{id}/quarantine", h.SetQuarantineState)
+		r.Post("/{id}/retire", h.RetireLocation)
+		r.Get("/{id}/hierarchy", h.GetLocationHierarchy)
+		r.Get("/{id}/as-of", h.GetLocationAsOf)
 	})
 }
 

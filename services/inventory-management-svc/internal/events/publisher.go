@@ -79,6 +79,40 @@ func (p *Publisher) PublishInventoryItemRetired(ctx context.Context, correlation
 	})
 }
 
+// INV-02's own named events: "InventoryLocationCreated;
+// InventoryLocationActivated; InventoryLocationQuarantined;
+// InventoryLocationChanged; InventoryLocationRetired."
+
+func (p *Publisher) PublishInventoryLocationCreated(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation) {
+	p.emit(ctx, "inventory.location.created", correlationID, l.TenantID, l.LegalEntityID, actorID, l.LocationID, map[string]any{
+		"location_id": l.LocationID, "legal_entity_id": l.LegalEntityID, "location_code": l.LocationCode, "status": l.Status,
+	})
+}
+
+func (p *Publisher) PublishInventoryLocationActivated(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation) {
+	p.emit(ctx, "inventory.location.activated", correlationID, l.TenantID, l.LegalEntityID, actorID, l.LocationID, map[string]any{
+		"location_id": l.LocationID, "activated_at": l.ActivatedAt,
+	})
+}
+
+func (p *Publisher) PublishInventoryLocationQuarantined(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation) {
+	p.emit(ctx, "inventory.location.quarantined", correlationID, l.TenantID, l.LegalEntityID, actorID, l.LocationID, map[string]any{
+		"location_id": l.LocationID, "quarantine_reason": l.QuarantineReason, "quarantined_at": l.QuarantinedAt,
+	})
+}
+
+func (p *Publisher) PublishInventoryLocationChanged(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, locationID, changeType string) {
+	p.emit(ctx, "inventory.location.changed", correlationID, tenantID, legalEntityID, actorID, locationID, map[string]any{
+		"location_id": locationID, "change_type": changeType,
+	})
+}
+
+func (p *Publisher) PublishInventoryLocationRetired(ctx context.Context, correlationID, actorID string, l domain.InventoryLocation) {
+	p.emit(ctx, "inventory.location.retired", correlationID, l.TenantID, l.LegalEntityID, actorID, l.LocationID, map[string]any{
+		"location_id": l.LocationID, "retirement_reason": l.RetirementReason, "retired_at": l.RetiredAt,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
