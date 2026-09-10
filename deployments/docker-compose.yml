@@ -2196,6 +2196,26 @@ services:
       # upload with "failed to record close evidence in vault", which reads as
       # the vault being broken rather than as never having been contacted.
       VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # ACC-06's third subledger source (ASSETS), added to satisfy the
+      # AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
+      # assertion — no new reconciliation engine, just a new caller onto
+      # the existing subledger-control-run mechanism above.
+      ASSET_SERVICE_URL: "http://asset-management-svc:8167"
+      # ACC-06's INVENTORY_QUANTITY source — same §9 posture, satisfies
+      # the "Inventory quantity" assertion.
+      INVENTORY_SERVICE_URL: "http://inventory-management-svc:8168"
+      # ACC-06's PROJECT_REVENUE source — same §9 posture, satisfies the
+      # "Project revenue/WIP → GL" assertion.
+      PROJECT_SERVICE_URL: "http://project-accounting-svc:8169"
+      # The three topics this service's own ACC-18 lineage Kafka consumer
+      # subscribes to (asset-management-svc's, inventory-management-svc's
+      # and project-accounting-svc's own events topics) — satisfies the
+      # AST/INV/PRJ domain spec's own §9 "source-to-report" assertion.
+      # Deliberately distinct from this service's own KAFKA_EVENTS_TOPIC
+      # above (zoiko.close.events, which it only ever PUBLISHES to).
+      ASSET_EVENTS_TOPIC: "zoiko.asset.events"
+      INVENTORY_EVENTS_TOPIC: "zoiko.inventory.events"
+      PROJECT_EVENTS_TOPIC: "zoiko.project.events"
       # HMAC secret for the close evidence signature. The service refuses to
       # start without one, deliberately: the signature was previously keyed with
       # the tenant id — a public value — so anything it "guaranteed" was
@@ -2217,6 +2237,12 @@ services:
       accounts-receivable-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      asset-management-svc:
+        condition: service_healthy
+      inventory-management-svc:
+        condition: service_healthy
+      project-accounting-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
@@ -2458,12 +2484,18 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.project.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      CLOSE_SERVICE_URL: "http://financial-close-svc:8104"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
       authorization-svc:
+        condition: service_healthy
+      financial-close-svc:
+        condition: service_healthy
+      general-ledger-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8169/healthz"]

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/project-accounting-svc/internal/clients"
 	"zoiko.io/project-accounting-svc/internal/domain"
 	"zoiko.io/project-accounting-svc/internal/handler"
 	"zoiko.io/project-accounting-svc/internal/middleware"
@@ -28,6 +30,12 @@ type stubStore struct {
 
 	costEntries     map[string]*domain.CostEntry
 	entriesBySource map[string]string // "source_type|source_reference" -> entry_id
+
+	estimates map[string]*domain.RecognitionEstimate // project_id -> current version
+	runs      map[string]*domain.RecognitionRun
+
+	projections map[string]*domain.ProfitabilityProjection // project_id -> live projection
+	snapshots   map[string]*domain.ProfitabilitySnapshot
 }
 
 func newStubStore() *stubStore {
@@ -37,7 +45,234 @@ func newStubStore() *stubStore {
 		financialProfiles: make(map[string]*domain.FinancialProfile),
 		costEntries:       make(map[string]*domain.CostEntry),
 		entriesBySource:   make(map[string]string),
+		estimates:         make(map[string]*domain.RecognitionEstimate),
+		runs:              make(map[string]*domain.RecognitionRun),
+		projections:       make(map[string]*domain.ProfitabilityProjection),
+		snapshots:         make(map[string]*domain.ProfitabilitySnapshot),
 	}
+}
+
+// ── PRJ-04 (Project Profitability) ───────────────────────────────────────────
+
+func (s *stubStore) RefreshProfitabilityProjection(_ context.Context, projectID, principalID string, at time.Time) (*domain.ProfitabilityProjection, error) {
+	var revenue, cost float64
+	var runID *string
+	var revenueWatermark *time.Time
+	for _, r := range s.runs {
+		if r.ProjectID != projectID || r.Status == domain.RecognitionRunStatusDraft || r.Status == domain.RecognitionRunStatusPopulationFrozen || r.Status == domain.RecognitionRunStatusSuperseded {
+			continue
+		}
+		if r.CalculatedAt != nil && (revenueWatermark == nil || r.CalculatedAt.After(*revenueWatermark)) {
+			revenueWatermark = r.CalculatedAt
+			id := r.RunID
+			runID = &id
+			if r.CumulativeRecognizedRevenue != nil {
+				revenue = *r.CumulativeRecognizedRevenue
+			}
+		}
+	}
+	costWatermark := at
+	for _, e := range s.costEntries {
+		if e.ProjectID == projectID && e.Status != domain.CostEntryStatusReversed {
+			cost += e.Amount
+		}
+	}
+	p := &domain.ProfitabilityProjection{
+		ProjectionID: "projection-" + projectID, ProjectID: projectID, Status: domain.ProfitabilityProjectionStatusCurrent,
+		Revenue: revenue, Cost: cost, Margin: revenue - cost, CostWatermarkAt: costWatermark, RevenueRunID: runID, RevenueWatermarkAt: revenueWatermark,
+		RefreshedAt: at, RefreshedByPrincipalID: principalID, CreatedAt: at,
+	}
+	if pr, ok := s.projects[projectID]; ok {
+		p.LegalEntityID = pr.LegalEntityID
+	}
+	s.projections[projectID] = p
+	cp := *p
+	return &cp, nil
+}
+
+func (s *stubStore) GetProjectProfitability(_ context.Context, projectID string) (*domain.ProfitabilityProjection, error) {
+	p, ok := s.projections[projectID]
+	if !ok {
+		return nil, domain.ErrProjectionNotBuilt
+	}
+	cp := *p
+	return &cp, nil
+}
+
+func (s *stubStore) BuildProfitabilitySnapshot(_ context.Context, projectID, principalID string, at time.Time) (*domain.ProfitabilitySnapshot, error) {
+	p, ok := s.projections[projectID]
+	if !ok {
+		return nil, domain.ErrProjectionNotBuilt
+	}
+	if p.Status != domain.ProfitabilityProjectionStatusCurrent {
+		return nil, domain.ErrProjectionStale
+	}
+	snapshotSeq++
+	snap := &domain.ProfitabilitySnapshot{
+		SnapshotID: fmt.Sprintf("snapshot-%d", snapshotSeq), LegalEntityID: p.LegalEntityID, ProjectID: projectID, Status: domain.ProfitabilitySnapshotStatusReconciled,
+		Revenue: p.Revenue, Cost: p.Cost, Margin: p.Margin, BilledAmount: p.BilledAmount, UnbilledAmount: p.UnbilledAmount,
+		CostWatermarkAt: p.CostWatermarkAt, RevenueRunID: p.RevenueRunID, RevenueWatermarkAt: p.RevenueWatermarkAt,
+		BuiltAt: at, BuiltByPrincipalID: principalID,
+	}
+	s.snapshots[snap.SnapshotID] = snap
+	cp := *snap
+	return &cp, nil
+}
+
+func (s *stubStore) GetProfitabilitySnapshot(_ context.Context, snapshotID string) (*domain.ProfitabilitySnapshot, error) {
+	snap, ok := s.snapshots[snapshotID]
+	if !ok {
+		return nil, domain.ErrSnapshotNotFound
+	}
+	cp := *snap
+	return &cp, nil
+}
+
+func (s *stubStore) CertifyProfitabilitySnapshot(_ context.Context, snapshotID, principalID string, at time.Time) (*domain.ProfitabilitySnapshot, error) {
+	snap, ok := s.snapshots[snapshotID]
+	if !ok {
+		return nil, domain.ErrSnapshotNotFound
+	}
+	if snap.Status != domain.ProfitabilitySnapshotStatusReconciled {
+		return nil, domain.ErrInvalidSnapshotTransition
+	}
+	snap.Status, snap.CertifiedAt, snap.CertifiedByPrincipalID = domain.ProfitabilitySnapshotStatusCertified, &at, &principalID
+	cp := *snap
+	return &cp, nil
+}
+
+var snapshotSeq int
+
+// ── PRJ-03 (Project Revenue & WIP) ───────────────────────────────────────────
+
+func (s *stubStore) SetApprovedEstimate(_ context.Context, newVersion *domain.RecognitionEstimate) error {
+	if current, ok := s.estimates[newVersion.ProjectID]; ok {
+		et := newVersion.EffectiveFrom
+		current.EffectiveTo = &et
+	}
+	cp := *newVersion
+	s.estimates[newVersion.ProjectID] = &cp
+	return nil
+}
+
+func (s *stubStore) GetCurrentEstimate(_ context.Context, projectID string) (*domain.RecognitionEstimate, error) {
+	e, ok := s.estimates[projectID]
+	if !ok {
+		return nil, nil
+	}
+	cp := *e
+	return &cp, nil
+}
+
+func (s *stubStore) CreateRecognitionRun(_ context.Context, r *domain.RecognitionRun) error {
+	for _, existing := range s.runs {
+		if existing.ProjectID == r.ProjectID && existing.FiscalPeriod == r.FiscalPeriod && existing.Status != domain.RecognitionRunStatusSuperseded {
+			return domain.ErrRecognitionRunAlreadyExistsForPeriod
+		}
+	}
+	cp := *r
+	s.runs[r.RunID] = &cp
+	return nil
+}
+
+func (s *stubStore) GetRecognitionRun(_ context.Context, runID string) (*domain.RecognitionRun, error) {
+	r, ok := s.runs[runID]
+	if !ok {
+		return nil, domain.ErrRecognitionRunNotFound
+	}
+	cp := *r
+	return &cp, nil
+}
+
+func (s *stubStore) FreezeAndCalculate(_ context.Context, runID string, at time.Time) error {
+	r, ok := s.runs[runID]
+	if !ok {
+		return domain.ErrRecognitionRunNotFound
+	}
+	if r.Status != domain.RecognitionRunStatusDraft {
+		return domain.ErrInvalidRecognitionRunTransition
+	}
+	est, ok := s.estimates[r.ProjectID]
+	if !ok {
+		return domain.ErrApprovedEstimateRequired
+	}
+	contractValue := 0.0
+	if r.ContractValue != nil {
+		contractValue = *r.ContractValue
+	}
+	billedToDate := 0.0
+	if r.BilledToDate != nil {
+		billedToDate = *r.BilledToDate
+	}
+	itd := 0.0
+	percentComplete := 0.0
+	if itd+est.EstimateToComplete > 0 {
+		percentComplete = itd / (itd + est.EstimateToComplete)
+	}
+	cumulative := percentComplete * contractValue
+	period := cumulative
+	margin := cumulative - itd
+	balance := cumulative - billedToDate
+	balanceType := domain.BalanceTypeNone
+	if balance > 0 {
+		balanceType = domain.BalanceTypeContractAsset
+	} else if balance < 0 {
+		balanceType = domain.BalanceTypeContractLiability
+	}
+	r.Status, r.FrozenAt, r.CalculatedAt = domain.RecognitionRunStatusCalculated, &at, &at
+	r.EstimateToComplete, r.ITDCostIncurred, r.PercentComplete = &est.EstimateToComplete, &itd, &percentComplete
+	r.CumulativeRecognizedRevenue, r.PeriodRecognizedRevenue, r.RecognizedCost = &cumulative, &period, &itd
+	r.Margin, r.BalanceAmount, r.BalanceType = &margin, &balance, &balanceType
+	return nil
+}
+
+func (s *stubStore) ValidateRecognitionRun(_ context.Context, runID string, at time.Time) error {
+	r, ok := s.runs[runID]
+	if !ok || r.Status != domain.RecognitionRunStatusCalculated {
+		return domain.ErrInvalidRecognitionRunTransition
+	}
+	r.Status, r.ValidatedAt = domain.RecognitionRunStatusReviewed, &at
+	return nil
+}
+
+func (s *stubStore) ApproveRecognitionRun(_ context.Context, runID, principalID string, at time.Time) error {
+	r, ok := s.runs[runID]
+	if !ok || r.Status != domain.RecognitionRunStatusReviewed {
+		return domain.ErrInvalidRecognitionRunTransition
+	}
+	r.Status, r.ApprovedAt, r.ApprovedByPrincipalID = domain.RecognitionRunStatusApproved, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) MarkRecognitionRunEmitted(_ context.Context, runID, journalID string, at time.Time) error {
+	r, ok := s.runs[runID]
+	if !ok || r.Status != domain.RecognitionRunStatusApproved {
+		return domain.ErrInvalidRecognitionRunTransition
+	}
+	r.Status, r.EmittedAt, r.JournalID = domain.RecognitionRunStatusAccountingEventEmitted, &at, &journalID
+	return nil
+}
+
+func (s *stubStore) SupersedeRecognitionRun(_ context.Context, runID, principalID string, at time.Time) error {
+	r, ok := s.runs[runID]
+	if !ok {
+		return domain.ErrRecognitionRunNotFound
+	}
+	r.Status, r.SupersededAt, r.SupersededByPrincipalID = domain.RecognitionRunStatusSuperseded, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) GetPostedRevenueTotal(_ context.Context, legalEntityID, fiscalPeriod string) (float64, error) {
+	var total float64
+	for _, r := range s.runs {
+		if r.LegalEntityID != legalEntityID || r.FiscalPeriod != fiscalPeriod || r.Status != domain.RecognitionRunStatusAccountingEventEmitted {
+			continue
+		}
+		if r.PeriodRecognizedRevenue != nil {
+			total += *r.PeriodRecognizedRevenue
+		}
+	}
+	return total, nil
 }
 
 // ── PRJ-02 (Project Cost Capture) ────────────────────────────────────────────
@@ -320,6 +555,24 @@ func (p *stubPublisher) PublishProjectCostReversed(_ context.Context, _, _, _ st
 func (p *stubPublisher) PublishProjectCostPopulationCertified(_ context.Context, _, _, _, _ string, _ domain.CostCertification) {
 	p.calls++
 }
+func (p *stubPublisher) PublishProjectRecognitionCalculated(_ context.Context, _, _, _ string, _ domain.RecognitionRun) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectRevenueApproved(_ context.Context, _, _, _ string, _ domain.RecognitionRun) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectRecognitionAccountingEventEmitted(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectRecognitionSuperseded(_ context.Context, _, _, _ string, _ domain.RecognitionRun) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectProfitabilityRefreshed(_ context.Context, _, _, _ string, _ domain.ProfitabilityProjection) {
+	p.calls++
+}
+func (p *stubPublisher) PublishProjectProfitabilitySnapshotCertified(_ context.Context, _, _, _ string, _ domain.ProfitabilitySnapshot) {
+	p.calls++
+}
 
 var _ handler.Publisher = (*stubPublisher)(nil)
 
@@ -327,7 +580,51 @@ type stubAuthZ struct{ err error }
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+type stubPeriodChecker struct{ err error }
+
+func (c *stubPeriodChecker) CheckPeriodOpen(_ context.Context, _, _, _ string) error { return c.err }
+
+var _ handler.PeriodChecker = (*stubPeriodChecker)(nil)
+
+type stubLedger struct {
+	postJournalID string
+	postErr       error
+	postCalls     int
+	reverseErr    error
+	reverseCalls  int
+}
+
+func (l *stubLedger) PostRecognitionAccountingEvent(_ context.Context, _, _, _, _, _, sourceEventID, _ string, _ []clients.LedgerLine) (string, error) {
+	l.postCalls++
+	if l.postErr != nil {
+		return "", l.postErr
+	}
+	if l.postJournalID != "" {
+		return l.postJournalID, nil
+	}
+	return "journal-" + sourceEventID, nil
+}
+
+func (l *stubLedger) ReverseRecognitionJournal(_ context.Context, _, _, _, _ string) error {
+	l.reverseCalls++
+	return l.reverseErr
+}
+
+var _ handler.RecognitionLedgerClient = (*stubLedger)(nil)
+
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
+	return newRouterWithPeriodChecker(s, pub, authz, &stubPeriodChecker{})
+}
+
+func newRouterWithPeriodChecker(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubPeriodChecker) chi.Router {
+	return newRouterFull(s, pub, authz, pc, &stubLedger{})
+}
+
+func newRouterWithLedger(s *stubStore, pub *stubPublisher, authz *stubAuthZ, ledger *stubLedger) chi.Router {
+	return newRouterFull(s, pub, authz, &stubPeriodChecker{}, ledger)
+}
+
+func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, pc *stubPeriodChecker, ledger *stubLedger) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -335,7 +632,7 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, zap.NewNop())
+	h := handler.New(s, pub, authz, zap.NewNop()).WithPeriodChecker(pc).WithLedgerClient(ledger)
 	handler.RegisterRoutes(r, h)
 	return r
 }

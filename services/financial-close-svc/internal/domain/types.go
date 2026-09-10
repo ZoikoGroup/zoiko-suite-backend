@@ -54,8 +54,11 @@ type SubledgerControlRun struct {
 type RunSubledgerControlRequest struct {
 	LegalEntityID            string `json:"legal_entity_id"`
 	FiscalPeriod             string `json:"fiscal_period"`
-	Subledger                string `json:"subledger"` // AP | AR
+	Subledger                string `json:"subledger"` // AP | AR | ASSETS
 	ControlAccountMappingKey string `json:"control_account_mapping_key"`
+	// BookID is required only when Subledger is ASSETS — see
+	// ErrBookIDRequiredForAssets.
+	BookID string `json:"book_id,omitempty"`
 }
 
 // Accrual schedule lifecycle states (ACC-07's state model, verbatim from
@@ -771,17 +774,20 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrFiscalPeriodNotFound    = errorString("fiscal period not found")
-	ErrPeriodAlreadyLocked     = errorString("fiscal period is already locked")
-	ErrStoreUnavailable        = errorString("financial close store unavailable")
-	ErrAuthorizationDenied     = errorString("authorization denied for financial close action")
-	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
-	ErrIdentityMissing         = errorString("caller identity missing")
-	ErrReadinessChecksFailed   = errorString("period close blocked: unresolved balance sheet or ledger discrepancies")
-	ErrGLServiceUnavailable    = errorString("general-ledger-svc unavailable")
-	ErrAPServiceUnavailable    = errorString("accounts-payable-svc unavailable")
-	ErrARServiceUnavailable    = errorString("accounts-receivable-svc unavailable")
-	ErrVaultServiceUnavailable = errorString("document-vault-svc unavailable")
+	ErrFiscalPeriodNotFound        = errorString("fiscal period not found")
+	ErrPeriodAlreadyLocked         = errorString("fiscal period is already locked")
+	ErrStoreUnavailable            = errorString("financial close store unavailable")
+	ErrAuthorizationDenied         = errorString("authorization denied for financial close action")
+	ErrAuthzServiceUnavailable     = errorString("authorization-svc unavailable")
+	ErrIdentityMissing             = errorString("caller identity missing")
+	ErrReadinessChecksFailed       = errorString("period close blocked: unresolved balance sheet or ledger discrepancies")
+	ErrGLServiceUnavailable        = errorString("general-ledger-svc unavailable")
+	ErrAPServiceUnavailable        = errorString("accounts-payable-svc unavailable")
+	ErrARServiceUnavailable        = errorString("accounts-receivable-svc unavailable")
+	ErrVaultServiceUnavailable     = errorString("document-vault-svc unavailable")
+	ErrAssetServiceUnavailable     = errorString("asset-management-svc unavailable")
+	ErrInventoryServiceUnavailable = errorString("inventory-management-svc unavailable")
+	ErrProjectServiceUnavailable   = errorString("project-accounting-svc unavailable")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance
@@ -816,7 +822,26 @@ var (
 	// than logged and swallowed, same posture as ErrEvidenceNotRecorded.
 	ErrReopenEventNotRecorded = errorString("period reopened but the reopen event could not be recorded")
 
-	ErrInvalidSubledger = errorString("subledger must be AP or AR")
+	// ErrInvalidSubledger — extended beyond AP/AR to ASSETS,
+	// DEPRECIATION_COMPLETENESS, INVENTORY_QUANTITY, INVENTORY_VALUE,
+	// PROJECT_REVENUE and STOCK_COUNT, satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Subledger Reconciliation & Control Framework,"
+	// which names this same run/exception mechanism as the vehicle for
+	// its "Assets → GL," "Depreciation completeness," "Inventory
+	// quantity," "Inventory value → GL," "Project revenue/WIP → GL" and
+	// "Stock count" assertions. No new reconciliation engine was built
+	// for that spec — this existing ACC-06 run gained new sources.
+	ErrInvalidSubledger = errorString("subledger must be AP, AR, ASSETS, DEPRECIATION_COMPLETENESS, INVENTORY_QUANTITY, INVENTORY_VALUE, PROJECT_REVENUE or STOCK_COUNT")
+
+	// ErrBookIDRequiredForAssets is ASSETS-subledger's own extra required
+	// field — a fixed asset can carry more than one depreciation book
+	// (e.g. tax vs GAAP), and net book value is only meaningful against
+	// one caller-declared book at a time. No "primary GL book" concept
+	// exists anywhere in asset-management-svc's own schema, the same
+	// "deliberate bootstrap gap, safety-favoring direction" posture used
+	// throughout the AST/INV/PRJ build — the caller must say which book.
+	ErrBookIDRequiredForAssets = errorString("book_id is required when subledger is ASSETS")
+
 	// ErrControlAccountMappingNotFound is returned when
 	// control_account_mapping_key names no current mapping — ACC-06 must
 	// never guess which GL account a subledger reconciles against.

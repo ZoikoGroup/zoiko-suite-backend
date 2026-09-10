@@ -239,3 +239,137 @@ func TestPgStore_DepreciationLines_RejectsUpdateAndDelete_RealDB(t *testing.T) {
 		t.Fatal("expected UPDATE on depreciation_lines to be rejected by the append-only trigger")
 	}
 }
+
+// TestPgStore_GetNetBookValueTotal_UndepreciatedSchedule_CountsFullCostBasis
+// proves a schedule with no depreciation lines yet (never run) counts at
+// its full cost_basis — the real proof that "undepreciated" is a valid
+// NBV, not a missing/zero one.
+func TestPgStore_GetNetBookValueTotal_UndepreciatedSchedule_CountsFullCostBasis(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	a := activeAssetInStore(t, ctx, s, tenantID, "le-1")
+	sch := newTestSchedule(tenantID, a)
+	if err := s.CreateDepreciationSchedule(ctx, sch); err != nil {
+		t.Fatalf("CreateDepreciationSchedule: %v", err)
+	}
+
+	total, err := s.GetNetBookValueTotal(ctx, "le-1", "book-1")
+	if err != nil {
+		t.Fatalf("GetNetBookValueTotal: %v", err)
+	}
+	if total != 12000 {
+		t.Fatalf("expected 12000 (full cost_basis, never depreciated), got %v", total)
+	}
+}
+
+// TestPgStore_GetNetBookValueTotal_AfterDepreciationRun_SubtractsAccumulated
+// proves the real, live calculation against actual depreciation_lines —
+// this is the exact source financial-close-svc's ACC-06 reconciles
+// against for the AST/INV/PRJ domain spec's own §9 "Assets → GL"
+// assertion.
+func TestPgStore_GetNetBookValueTotal_AfterDepreciationRun_SubtractsAccumulated(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	a := activeAssetInStore(t, ctx, s, tenantID, "le-1")
+	sch := newTestSchedule(tenantID, a) // cost_basis=12000, useful_life=12 -> 1000/month straight-line
+	if err := s.CreateDepreciationSchedule(ctx, sch); err != nil {
+		t.Fatalf("CreateDepreciationSchedule: %v", err)
+	}
+
+	run := &domain.DepreciationRun{
+		RunID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
+		Status: domain.DepreciationRunStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateDepreciationRun(ctx, run); err != nil {
+		t.Fatalf("CreateDepreciationRun: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.FreezeDepreciationPopulation(ctx, run.RunID, "le-1", now); err != nil {
+		t.Fatalf("FreezeDepreciationPopulation: %v", err)
+	}
+	if _, err := s.ValidateDepreciationRun(ctx, run.RunID, now); err != nil {
+		t.Fatalf("ValidateDepreciationRun: %v", err)
+	}
+
+	total, err := s.GetNetBookValueTotal(ctx, "le-1", "book-1")
+	if err != nil {
+		t.Fatalf("GetNetBookValueTotal: %v", err)
+	}
+	if total != 11000 {
+		t.Fatalf("expected 11000 (12000 cost_basis - 1000 accumulated after one month), got %v", total)
+	}
+
+	// A schedule for a DIFFERENT book must never contribute.
+	otherBookTotal, err := s.GetNetBookValueTotal(ctx, "le-1", "book-tax")
+	if err != nil {
+		t.Fatalf("GetNetBookValueTotal (other book): %v", err)
+	}
+	if otherBookTotal != 0 {
+		t.Fatalf("expected 0 for an unrelated book_id, got %v", otherBookTotal)
+	}
+}
+
+// TestPgStore_GetDepreciationCompleteness_RealDB proves the real
+// eligible-vs-covered query against real Postgres, including the case a
+// schedule exists but the period was never run at all (covered=0,
+// eligible=1 — a real gap, not an error).
+func TestPgStore_GetDepreciationCompleteness_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	a := activeAssetInStore(t, ctx, s, tenantID, "le-1")
+	sch := newTestSchedule(tenantID, a)
+	if err := s.CreateDepreciationSchedule(ctx, sch); err != nil {
+		t.Fatalf("CreateDepreciationSchedule: %v", err)
+	}
+
+	covered, eligible, err := s.GetDepreciationCompleteness(ctx, "le-1", "2026-01")
+	if err != nil {
+		t.Fatalf("GetDepreciationCompleteness (never run): %v", err)
+	}
+	if eligible != 1 || covered != 0 {
+		t.Fatalf("expected eligible=1 covered=0 before any run, got eligible=%d covered=%d", eligible, covered)
+	}
+
+	run := &domain.DepreciationRun{
+		RunID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
+		Status: domain.DepreciationRunStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateDepreciationRun(ctx, run); err != nil {
+		t.Fatalf("CreateDepreciationRun: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.FreezeDepreciationPopulation(ctx, run.RunID, "le-1", now); err != nil {
+		t.Fatalf("FreezeDepreciationPopulation: %v", err)
+	}
+	if _, err := s.ValidateDepreciationRun(ctx, run.RunID, now); err != nil {
+		t.Fatalf("ValidateDepreciationRun: %v", err)
+	}
+
+	covered, eligible, err = s.GetDepreciationCompleteness(ctx, "le-1", "2026-01")
+	if err != nil {
+		t.Fatalf("GetDepreciationCompleteness (after run): %v", err)
+	}
+	if eligible != 1 || covered != 1 {
+		t.Fatalf("expected eligible=1 covered=1 after validation, got eligible=%d covered=%d", eligible, covered)
+	}
+
+	// A DIFFERENT fiscal period must never count as covered.
+	coveredOtherPeriod, eligibleOtherPeriod, err := s.GetDepreciationCompleteness(ctx, "le-1", "2026-02")
+	if err != nil {
+		t.Fatalf("GetDepreciationCompleteness (other period): %v", err)
+	}
+	if eligibleOtherPeriod != 1 || coveredOtherPeriod != 0 {
+		t.Fatalf("expected eligible=1 covered=0 for an unrun period, got eligible=%d covered=%d", eligibleOtherPeriod, coveredOtherPeriod)
+	}
+}

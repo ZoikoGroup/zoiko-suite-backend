@@ -390,3 +390,82 @@ func (s *PgStore) SupersedeDepreciationRun(ctx context.Context, runID, principal
 func newUUID() string {
 	return uuidNewString()
 }
+
+// GetNetBookValueTotal is the real, live source ACC-06 (financial-
+// close-svc) reconciles against for the AST/INV/PRJ domain spec's own §9
+// "Assets → GL" assertion: SUM(cost_basis - latest accumulated
+// depreciation) over every ACTIVE schedule, for one ACTIVE asset, in one
+// caller-declared book. bookID is required — there is no "primary GL
+// book" concept anywhere in this schema (an asset may carry more than
+// one book, e.g. tax vs GAAP), the same "deliberate bootstrap gap,
+// safety-favoring direction" posture used throughout this domain's own
+// build. A schedule with no depreciation lines yet (never run) counts at
+// its full cost_basis — undepreciated is a real, valid NBV, not zero.
+func (s *PgStore) GetNetBookValueTotal(ctx context.Context, legalEntityID, bookID string) (float64, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var total float64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(ds.cost_basis - COALESCE(latest.accumulated_depreciation_after, 0)), 0)
+			FROM depreciation_schedules ds
+			JOIN fixed_assets fa ON fa.asset_id = ds.asset_id
+			LEFT JOIN LATERAL (
+				SELECT dl.accumulated_depreciation_after
+				FROM depreciation_lines dl
+				WHERE dl.schedule_version_id = ds.schedule_version_id
+				ORDER BY dl.created_at DESC
+				LIMIT 1
+			) latest ON true
+			WHERE ds.tenant_id = $1 AND ds.legal_entity_id = $2 AND ds.book_id = $3
+			  AND ds.status = $4 AND ds.effective_to IS NULL AND fa.status = $5
+		`, tenantID, legalEntityID, bookID, domain.DepreciationScheduleStatusActive, domain.AssetStatusActive).Scan(&total)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+// GetDepreciationCompleteness is the AST/INV/PRJ domain spec's own §9
+// "Depreciation completeness" assertion — a coverage check, not a
+// balance comparison: how many of the schedules eligible for
+// depreciation in this legal entity actually got a line in the named
+// fiscal period's own live (non-SUPERSEDED) run, versus how many were
+// eligible. eligibleCount reuses the exact population query
+// FreezeDepreciationPopulation's own INSERT...SELECT already uses — the
+// same "ACTIVE schedule, ACTIVE asset" eligibility rule, queried fresh
+// rather than duplicated as a second, driftable copy. coveredCount
+// counts DISTINCT schedule_version_id among that period's own posted
+// lines, so a schedule appearing in more than one run for the same
+// period (should never happen given the partial UNIQUE index on live
+// runs) is never double-counted.
+func (s *PgStore) GetDepreciationCompleteness(ctx context.Context, legalEntityID, fiscalPeriod string) (coveredCount, eligibleCount int, err error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, 0, domain.ErrIdentityMissing
+	}
+	err = s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM depreciation_schedules ds
+			JOIN fixed_assets fa ON fa.asset_id = ds.asset_id
+			WHERE ds.tenant_id = $1 AND ds.legal_entity_id = $2
+			  AND ds.status = $3 AND ds.effective_to IS NULL AND fa.status = $4
+		`, tenantID, legalEntityID, domain.DepreciationScheduleStatusActive, domain.AssetStatusActive).Scan(&eligibleCount); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(DISTINCT dl.schedule_version_id)
+			FROM depreciation_lines dl
+			JOIN depreciation_runs dr ON dr.run_id = dl.run_id
+			WHERE dr.tenant_id = $1 AND dr.legal_entity_id = $2 AND dr.fiscal_period = $3
+			  AND dr.status != $4
+		`, tenantID, legalEntityID, fiscalPeriod, domain.DepreciationRunStatusSuperseded).Scan(&coveredCount)
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return coveredCount, eligibleCount, nil
+}

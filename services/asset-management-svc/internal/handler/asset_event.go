@@ -387,6 +387,7 @@ func (h *Handler) ApplyAssetEvent(w http.ResponseWriter, r *http.Request) {
 	status := domain.AssetEventStatusApplied
 	if journalID != nil {
 		status = domain.AssetEventStatusAccountingEventEmitted
+		h.publisher.PublishAssetEventAccountingEventEmitted(r.Context(), getCorrelationID(r), principalID, tenantID, e.LegalEntityID, id, *journalID)
 	}
 	resp := map[string]any{"event_id": id, "status": status}
 	if journalID != nil {
