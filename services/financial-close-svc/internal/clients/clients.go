@@ -1,19 +1,19 @@
 package clients
 
 import (
-	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
 
 	"go.uber.org/zap"
 	"zoiko.io/financial-close-svc/internal/domain"
@@ -44,13 +44,16 @@ type cachedDecision struct {
 }
 
 type Clients struct {
-	authzURL  string
-	ledgerURL string
-	apURL     string
-	arURL     string
-	vaultURL  string
-	http      *http.Client
-	log       *zap.Logger
+	authzURL     string
+	ledgerURL    string
+	apURL        string
+	arURL        string
+	vaultURL     string
+	assetURL     string
+	inventoryURL string
+	projectURL   string
+	http         *http.Client
+	log          *zap.Logger
 
 	// authzHTTP, when set, is used instead of http for calls to
 	// authorization-svc only — the mTLS pilot's Transport carries this
@@ -64,34 +67,40 @@ type Clients struct {
 	cacheWrites int
 }
 
-func New(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger) *Clients {
+func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL, projectURL string, log *zap.Logger) *Clients {
 	return &Clients{
-		authzURL:  authzURL,
-		ledgerURL: ledgerURL,
-		apURL:     apURL,
-		arURL:     arURL,
-		vaultURL:  vaultURL,
-		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
-		log:       log,
-		cache:     make(map[string]cachedDecision),
+		authzURL:     authzURL,
+		ledgerURL:    ledgerURL,
+		apURL:        apURL,
+		arURL:        arURL,
+		vaultURL:     vaultURL,
+		assetURL:     assetURL,
+		inventoryURL: inventoryURL,
+		projectURL:   projectURL,
+		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		log:          log,
+		cache:        make(map[string]cachedDecision),
 	}
 }
 
 // NewWithAuthzHTTPClient is New but with a caller-supplied *http.Client used
 // solely for calls to authorization-svc — used for the mTLS pilot. Every
-// other outbound client (GL/AP/AR/vault) built here is unaffected and keeps
-// using the plain, non-mTLS http.Client.
-func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
+// other outbound client (GL/AP/AR/vault/asset/inventory/project) built here
+// is unaffected and keeps using the plain, non-mTLS http.Client.
+func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL, projectURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
 	return &Clients{
-		authzURL:  authzURL,
-		ledgerURL: ledgerURL,
-		apURL:     apURL,
-		arURL:     arURL,
-		vaultURL:  vaultURL,
-		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
-		authzHTTP: authzHTTPClient,
-		log:       log,
-		cache:     make(map[string]cachedDecision),
+		authzURL:     authzURL,
+		ledgerURL:    ledgerURL,
+		apURL:        apURL,
+		arURL:        arURL,
+		vaultURL:     vaultURL,
+		assetURL:     assetURL,
+		inventoryURL: inventoryURL,
+		projectURL:   projectURL,
+		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		authzHTTP:    authzHTTPClient,
+		log:          log,
+		cache:        make(map[string]cachedDecision),
 	}
 }
 
@@ -1128,6 +1137,277 @@ func (c *Clients) GetARSubledgerTotal(ctx context.Context, tenantID, legalEntity
 		}
 	}
 	return total, nil
+}
+
+// assetNetBookValueResponse mirrors asset-management-svc's own
+// GET /v1/assets/net-book-value wire shape — only the field this client
+// needs.
+type assetNetBookValueResponse struct {
+	NetBookValueTotal float64 `json:"net_book_value_total"`
+}
+
+// GetAssetNetBookValueTotal asks asset-management-svc for the real, live
+// sum of cost_basis minus latest accumulated depreciation across every
+// ACTIVE depreciation schedule for one legal entity and one caller-
+// declared book — the ASSETS half of ACC-06, extended to satisfy the
+// AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
+// assertion. Not period-bounded, same posture as GetAPSubledgerTotal/
+// GetARSubledgerTotal: a control account balance is a point-in-time
+// total, not scoped to a fiscal period's own transactions.
+func (c *Clients) GetAssetNetBookValueTotal(ctx context.Context, tenantID, legalEntityID, bookID string) (float64, error) {
+	u, err := url.Parse(c.assetURL + "/v1/assets/net-book-value")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("book_id", bookID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch net book value from asset-management-svc", zap.Error(err))
+		return 0, domain.ErrAssetServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrAssetServiceUnavailable
+	}
+
+	var out assetNetBookValueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.NetBookValueTotal, nil
+}
+
+// assetDepreciationCompletenessResponse mirrors asset-management-svc's
+// own GET /v1/depreciation-schedules/completeness wire shape.
+type assetDepreciationCompletenessResponse struct {
+	CoveredCount  int `json:"covered_count"`
+	EligibleCount int `json:"eligible_count"`
+}
+
+// GetAssetDepreciationCompleteness is ACC-06's DEPRECIATION_COMPLETENESS
+// source — a coverage check, not a balance, satisfying the AST/INV/PRJ
+// domain spec's own §9 "Depreciation completeness" assertion.
+func (c *Clients) GetAssetDepreciationCompleteness(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (covered, eligible int, err error) {
+	u, err := url.Parse(c.assetURL + "/v1/depreciation-schedules/completeness")
+	if err != nil {
+		return 0, 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch depreciation completeness from asset-management-svc", zap.Error(err))
+		return 0, 0, domain.ErrAssetServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, domain.ErrAssetServiceUnavailable
+	}
+
+	var out assetDepreciationCompletenessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, 0, err
+	}
+	return out.CoveredCount, out.EligibleCount, nil
+}
+
+// inventoryNegativeOnHandResponse mirrors inventory-management-svc's own
+// GET /v1/on-hand/negative-count wire shape.
+type inventoryNegativeOnHandResponse struct {
+	NegativeOnHandCount int `json:"negative_on_hand_count"`
+}
+
+// GetInventoryNegativeOnHandCount is ACC-06's INVENTORY_QUANTITY
+// source — satisfies the AST/INV/PRJ domain spec's own §9 "Inventory
+// quantity" assertion. Like DEPRECIATION_COMPLETENESS, this is an
+// integrity check with no GL side, not a balance comparison.
+func (c *Clients) GetInventoryNegativeOnHandCount(ctx context.Context, tenantID, legalEntityID string) (int, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/on-hand/negative-count")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch negative on-hand count from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryNegativeOnHandResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.NegativeOnHandCount, nil
+}
+
+// inventoryUnapprovedVarianceResponse mirrors inventory-management-svc's
+// own GET /v1/stock-counts/unapproved-variance-count wire shape.
+type inventoryUnapprovedVarianceResponse struct {
+	UnapprovedVarianceCount int `json:"unapproved_variance_count"`
+}
+
+// GetInventoryUnapprovedVarianceCount is ACC-06's STOCK_COUNT source —
+// an integrity check with no GL side, satisfying the AST/INV/PRJ domain
+// spec's own §9 "Stock count" assertion the same way
+// GetInventoryNegativeOnHandCount satisfies "Inventory quantity."
+func (c *Clients) GetInventoryUnapprovedVarianceCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/stock-counts/unapproved-variance-count")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch unapproved variance count from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryUnapprovedVarianceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.UnapprovedVarianceCount, nil
+}
+
+// inventoryValueTotalResponse mirrors inventory-management-svc's own
+// GET /v1/valuation/inventory-value-total wire shape.
+type inventoryValueTotalResponse struct {
+	InventoryValueTotal float64 `json:"inventory_value_total"`
+}
+
+// GetInventoryValueTotal is ACC-06's INVENTORY_VALUE source — a REAL GL
+// balance comparison (unlike INVENTORY_QUANTITY/DEPRECIATION_COMPLETENESS),
+// satisfying the AST/INV/PRJ domain spec's own §9 "Inventory value → GL"
+// assertion the same way GetAssetNetBookValueTotal satisfies "Assets →
+// GL": a live sum of open cost-layer value, reconciled against a
+// caller-resolved GL control account.
+func (c *Clients) GetInventoryValueTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/valuation/inventory-value-total")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch inventory value total from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryValueTotalResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.InventoryValueTotal, nil
+}
+
+// projectPostedRevenueResponse mirrors project-accounting-svc's own
+// GET /v1/recognition/posted-revenue wire shape.
+type projectPostedRevenueResponse struct {
+	PostedRevenueTotal float64 `json:"posted_revenue_total"`
+}
+
+// GetProjectPostedRevenueTotal is ACC-06's PROJECT_REVENUE source — a
+// REAL GL balance comparison, satisfying the AST/INV/PRJ domain spec's
+// own §9 "Project revenue/WIP → GL" assertion the same way
+// GetAssetNetBookValueTotal/GetInventoryValueTotal satisfy their own
+// GL-comparison assertions: a live sum of only-actually-posted revenue,
+// reconciled against a caller-resolved GL revenue control account.
+func (c *Clients) GetProjectPostedRevenueTotal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (float64, error) {
+	u, err := url.Parse(c.projectURL + "/v1/recognition/posted-revenue")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch posted revenue total from project-accounting-svc", zap.Error(err))
+		return 0, domain.ErrProjectServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrProjectServiceUnavailable
+	}
+
+	var out projectPostedRevenueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.PostedRevenueTotal, nil
 }
 
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that

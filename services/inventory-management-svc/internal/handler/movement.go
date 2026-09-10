@@ -359,6 +359,39 @@ func (h *Handler) correctMovement(w http.ResponseWriter, r *http.Request, isSupe
 	writeJSON(w, http.StatusCreated, correction)
 }
 
+// ── GET /v1/on-hand/negative-count ────────────────────────────────────────────
+
+// GetNegativeOnHandCount is a read-only integrity check — never a
+// caller-declared figure. financial-close-svc's ACC-06 calls this
+// directly for the AST/INV/PRJ domain spec's own §9 "Inventory
+// quantity" assertion; see internal/store's own doc comment for the
+// exact calculation and its stated scope limits.
+func (h *Handler) GetNegativeOnHandCount(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionInventoryMovementRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	count, err := h.store.GetNegativeOnHandCount(r.Context(), legalEntityID)
+	if err != nil {
+		h.log.Error("GetNegativeOnHandCount: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"negative_on_hand_count": count})
+}
+
 // ── GET /v1/on-hand ───────────────────────────────────────────────────────────
 
 // GetOnHand/GetOnHandAsOf are always computed live from committed

@@ -413,3 +413,46 @@ func (s *PgStore) CancelStockCount(ctx context.Context, countID, principalID, re
 		return nil
 	})
 }
+
+// GetUnapprovedVarianceCount is the AST/INV/PRJ domain spec's own §9
+// "Stock count" assertion (verbatim): "Frozen system quantity + cutoff
+// movements reconcile to physical observations and approved adjustment
+// movements. Unapproved variance cannot be hidden or directly cleared."
+//
+// This surfaces a REAL gap, not a hypothetical one:
+// GenerateAdjustmentMovements (internal/handler/stock_count.go) only
+// ever processes lines already in VARIANCE_APPROVED — a counted line
+// with a genuine variance that nobody approved is silently skipped, and
+// nothing in CertifyStockCount checks for it either; the count can still
+// reach CERTIFIED with that line quietly left behind. This assertion
+// does not change either of those commands (out of scope for this
+// reconciliation-framework pass) — it gives ACC-06 a real, live count of
+// exactly this condition, the same "blocks close/certification via the
+// reconciliation control, not by rewriting the source command" posture
+// every other §9 assertion in this build already takes.
+//
+// Counts lines with a real, observed variance (observed_quantity IS NOT
+// NULL and differs from the frozen system_quantity) whose status is
+// neither VARIANCE_APPROVED nor ADJUSTMENT_GENERATED, across every
+// stock count for one legal entity and fiscal period.
+func (s *PgStore) GetUnapprovedVarianceCount(ctx context.Context, legalEntityID, fiscalPeriod string) (int, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var count int
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM inventory_stock_count_lines scl
+			JOIN inventory_stock_counts sc ON sc.count_id = scl.count_id
+			WHERE sc.tenant_id = $1 AND sc.legal_entity_id = $2 AND sc.fiscal_period = $3
+			  AND scl.observed_quantity IS NOT NULL AND scl.observed_quantity != scl.system_quantity
+			  AND scl.status NOT IN ($4, $5)
+		`, tenantID, legalEntityID, fiscalPeriod,
+			domain.CountLineStatusVarianceApproved, domain.CountLineStatusAdjustmentGenerated).Scan(&count)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}

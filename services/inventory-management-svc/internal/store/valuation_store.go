@@ -297,6 +297,31 @@ func (s *PgStore) GetInventoryValue(ctx context.Context, itemID, locationID stri
 	return value, err
 }
 
+// GetInventoryValueTotal is the AST/INV/PRJ domain spec's own §9
+// "Inventory value → GL" assertion (verbatim): "Valuation subledger
+// equals GL inventory/COGS/write-down consequences by entity/book/
+// period. Unexplained difference blocks close." Unlike "Inventory
+// quantity," this IS a real GL balance comparison — the same
+// SUM(remaining_quantity * unit_cost) formula GetInventoryValue already
+// uses per (item, location), widened to every open cost layer across
+// the whole legal entity, the real live current inventory value
+// financial-close-svc's ACC-06 reconciles against a GL inventory
+// control account.
+func (s *PgStore) GetInventoryValueTotal(ctx context.Context, legalEntityID string) (float64, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var value float64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(remaining_quantity * unit_cost), 0) FROM inventory_cost_layers
+			WHERE tenant_id = $1 AND legal_entity_id = $2
+		`, tenantID, legalEntityID).Scan(&value)
+	})
+	return value, err
+}
+
 func (s *PgStore) GetCostLayers(ctx context.Context, itemID, locationID string) ([]domain.CostLayer, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {

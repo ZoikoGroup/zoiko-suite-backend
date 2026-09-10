@@ -261,3 +261,47 @@ func TestPgStore_WriteDown_CreateAndReverse(t *testing.T) {
 		t.Fatalf("expected ErrWriteDownAlreadyReversed, got %v", err)
 	}
 }
+
+// TestPgStore_GetInventoryValueTotal_RealDB proves the real aggregation
+// query — the source financial-close-svc's ACC-06 reconciles against for
+// the AST/INV/PRJ domain spec's own §9 "Inventory value → GL" assertion.
+func TestPgStore_GetInventoryValueTotal_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-VAL-TOTAL-1")
+
+	itemA := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-VAL-TOTAL-A", domain.ValuationMethodFIFO)
+	receiptA := createCommittedReceipt(t, s, ctx, legalEntityID, itemA, locID, "idem-store-val-total-1", 10)
+	unitCostA := 5.0
+	if _, err := s.ValueMovement(ctx, receiptA.MovementID, "preparer-1", &unitCostA, time.Now().UTC()); err != nil {
+		t.Fatalf("ValueMovement (item A) failed: %v", err)
+	}
+
+	itemB := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-VAL-TOTAL-B", domain.ValuationMethodFIFO)
+	receiptB := createCommittedReceipt(t, s, ctx, legalEntityID, itemB, locID, "idem-store-val-total-2", 4)
+	unitCostB := 25.0
+	if _, err := s.ValueMovement(ctx, receiptB.MovementID, "preparer-1", &unitCostB, time.Now().UTC()); err != nil {
+		t.Fatalf("ValueMovement (item B) failed: %v", err)
+	}
+
+	total, err := s.GetInventoryValueTotal(ctx, legalEntityID)
+	if err != nil {
+		t.Fatalf("GetInventoryValueTotal failed: %v", err)
+	}
+	if total != 150 {
+		t.Fatalf("expected 150 (10*5 + 4*25 across two items), got %v", total)
+	}
+
+	// A DIFFERENT legal entity must never contribute.
+	otherEntityTotal, err := s.GetInventoryValueTotal(ctx, uuid.New().String())
+	if err != nil {
+		t.Fatalf("GetInventoryValueTotal (other entity) failed: %v", err)
+	}
+	if otherEntityTotal != 0 {
+		t.Fatalf("expected 0 for an unrelated legal_entity_id, got %v", otherEntityTotal)
+	}
+}

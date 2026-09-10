@@ -206,3 +206,71 @@ func TestPgStore_GenerateAdjustment_CreatesRealMovement(t *testing.T) {
 		t.Fatalf("expected CERTIFIED, got %q", final.Status)
 	}
 }
+
+// TestPgStore_GetUnapprovedVarianceCount_RealDB proves the real
+// aggregation query — the source financial-close-svc's ACC-06
+// reconciles against for the AST/INV/PRJ domain spec's own §9 "Stock
+// count" assertion. Also the real proof of the gap its own doc comment
+// names: RecordBlindCount alone (no ApproveCountVariance) leaves a real
+// variance sitting unapproved, and nothing in this service's own
+// commands blocks that today.
+func TestPgStore_GetUnapprovedVarianceCount_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-COUNT-VAR-1")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-COUNT-VAR-1")
+	createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-count-var-1", 20)
+
+	sc := &domain.StockCount{
+		CountID: uuid.New().String(), LegalEntityID: legalEntityID, FiscalPeriod: "2026-09",
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "planner-1",
+	}
+	if err := s.CreateStockCount(ctx, sc, []string{locID}); err != nil {
+		t.Fatalf("CreateStockCount failed: %v", err)
+	}
+	if _, err := s.FreezeCountPopulation(ctx, sc.CountID, time.Now().UTC()); err != nil {
+		t.Fatalf("FreezeCountPopulation failed: %v", err)
+	}
+
+	preCount, err := s.GetUnapprovedVarianceCount(ctx, legalEntityID, "2026-09")
+	if err != nil {
+		t.Fatalf("GetUnapprovedVarianceCount (before any observation) failed: %v", err)
+	}
+	if preCount != 0 {
+		t.Fatalf("expected 0 before any observation, got %d", preCount)
+	}
+
+	got, err := s.GetStockCount(ctx, sc.CountID)
+	if err != nil {
+		t.Fatalf("GetStockCount failed: %v", err)
+	}
+	lineID := got.Lines[0].LineID
+
+	if _, err := s.RecordBlindCount(ctx, lineID, "counter-1", 18, time.Now().UTC()); err != nil {
+		t.Fatalf("RecordBlindCount failed: %v", err)
+	}
+
+	postObservation, err := s.GetUnapprovedVarianceCount(ctx, legalEntityID, "2026-09")
+	if err != nil {
+		t.Fatalf("GetUnapprovedVarianceCount (after observation, before approval) failed: %v", err)
+	}
+	if postObservation != 1 {
+		t.Fatalf("expected 1 unapproved variance (observed 18 vs system 20, never approved), got %d", postObservation)
+	}
+
+	if err := s.ApproveCountVariance(ctx, lineID, "reviewer-2", time.Now().UTC()); err != nil {
+		t.Fatalf("ApproveCountVariance failed: %v", err)
+	}
+
+	postApproval, err := s.GetUnapprovedVarianceCount(ctx, legalEntityID, "2026-09")
+	if err != nil {
+		t.Fatalf("GetUnapprovedVarianceCount (after approval) failed: %v", err)
+	}
+	if postApproval != 0 {
+		t.Fatalf("expected 0 once the variance is approved, got %d", postApproval)
+	}
+}

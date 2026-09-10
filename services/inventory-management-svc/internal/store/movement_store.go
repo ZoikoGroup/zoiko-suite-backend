@@ -475,3 +475,62 @@ func (s *PgStore) CreateCorrectionMovement(ctx context.Context, originalMovement
 	}
 	return result, nil
 }
+
+// GetNegativeOnHandCount is the AST/INV/PRJ domain spec's own §9
+// "Inventory quantity" assertion (verbatim): "Opening + committed
+// movements + approved adjustments = derived on-hand by item/location/
+// lot/serial. Unexplained negative/duplicate serial/quantity break
+// raises exception." This is a movement-ledger internal-consistency
+// check, NOT a physical-count comparison — that is the separate "Stock
+// count" assertion (INV-05). There is no separate "opening balance"
+// concept in this schema (migration 000003's own doc comment: on-hand
+// is always derived from events, never a balance field), so "Opening"
+// is already folded into whichever movement is first for each (item,
+// location) pair.
+//
+// Both of the assertion's own named failure modes are ALREADY refused
+// structurally at CommitMovement time, confirmed by this service's own
+// existing tests: negative on-hand (ErrNegativeStockNotAllowed,
+// TestPgStore_CommitMovement_NegativeStockRefused) and duplicate serial
+// residency (ErrSerialAlreadyResident,
+// TestPgStore_SerialResidency_DuplicateReceiptRefused) both refuse the
+// COMMIT itself, before a violating row can ever exist. This read is
+// therefore defense-in-depth permanent evidence for ACC-06's own control
+// run — proof the guard held, recorded and auditable — not a gap-closer:
+// there is no live code path through this service's own HTTP surface
+// that could ever produce a negative count. It would only ever report
+// non-zero from data that bypassed the application layer entirely (a
+// direct migration/backfill, or a future regression in the guard
+// itself), which is exactly the scenario a permanent reconciliation
+// record exists to catch.
+func (s *PgStore) GetNegativeOnHandCount(ctx context.Context, legalEntityID string) (int, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var count int
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			WITH ins AS (
+				SELECT destination_location_id AS location_id, item_id, SUM(quantity) AS qty
+				FROM inventory_movements
+				WHERE tenant_id = $1 AND legal_entity_id = $2 AND status = $3 AND destination_location_id IS NOT NULL
+				GROUP BY destination_location_id, item_id
+			), outs AS (
+				SELECT source_location_id AS location_id, item_id, SUM(quantity) AS qty
+				FROM inventory_movements
+				WHERE tenant_id = $1 AND legal_entity_id = $2 AND status = $3 AND source_location_id IS NOT NULL
+				GROUP BY source_location_id, item_id
+			)
+			SELECT COUNT(*) FROM (
+				SELECT COALESCE(ins.qty, 0) - COALESCE(outs.qty, 0) AS on_hand
+				FROM ins FULL OUTER JOIN outs ON ins.location_id = outs.location_id AND ins.item_id = outs.item_id
+			) combined
+			WHERE on_hand < 0
+		`, tenantID, legalEntityID, domain.MovementStatusCommitted).Scan(&count)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
+}

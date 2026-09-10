@@ -29,6 +29,28 @@ type Config struct {
 	APServiceURL             string
 	ARServiceURL             string
 	VaultServiceURL          string
+	// AssetServiceURL is asset-management-svc — ACC-06's own third
+	// subledger source (ASSETS), satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Assets → GL" reconciliation assertion.
+	AssetServiceURL string
+	// InventoryServiceURL is inventory-management-svc — ACC-06's own
+	// INVENTORY_QUANTITY source, satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Inventory quantity" assertion.
+	InventoryServiceURL string
+	// ProjectServiceURL is project-accounting-svc — ACC-06's own
+	// PROJECT_REVENUE source, satisfying the AST/INV/PRJ domain spec's
+	// own §9 "Project revenue/WIP → GL" assertion.
+	ProjectServiceURL string
+
+	// AssetEventsTopic/InventoryEventsTopic/ProjectEventsTopic are the
+	// three Kafka topics this service's own ACC-18 lineage consumer
+	// subscribes to — asset-management-svc's, inventory-management-svc's
+	// and project-accounting-svc's own events topics, NOT this service's
+	// own (Kafka.Topic, zoiko.close.events). Satisfies the AST/INV/PRJ
+	// domain spec's own §9 "source-to-report" assertion.
+	AssetEventsTopic     string
+	InventoryEventsTopic string
+	ProjectEventsTopic   string
 
 	// CloseSigningKey is the HMAC secret the close evidence signature is
 	// computed with. There is deliberately NO default: the signature used to be
@@ -114,6 +136,12 @@ func Load() (*Config, error) {
 		// 8094 is the port document-vault-svc listens on. This defaulted to
 		// 8092, which nothing in this platform serves.
 		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		AssetServiceURL:      env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
+		InventoryServiceURL:  env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
+		ProjectServiceURL:    env("PROJECT_SERVICE_URL", "http://project-accounting-svc:8169"),
+		AssetEventsTopic:     env("ASSET_EVENTS_TOPIC", "zoiko.asset.events"),
+		InventoryEventsTopic: env("INVENTORY_EVENTS_TOPIC", "zoiko.inventory.events"),
+		ProjectEventsTopic:   env("PROJECT_EVENTS_TOPIC", "zoiko.project.events"),
 		CloseSigningKey:      signingKey,
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
