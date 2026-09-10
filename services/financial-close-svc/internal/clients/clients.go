@@ -1272,6 +1272,51 @@ func (c *Clients) GetInventoryNegativeOnHandCount(ctx context.Context, tenantID,
 	return out.NegativeOnHandCount, nil
 }
 
+// inventoryValueTotalResponse mirrors inventory-management-svc's own
+// GET /v1/valuation/inventory-value-total wire shape.
+type inventoryValueTotalResponse struct {
+	InventoryValueTotal float64 `json:"inventory_value_total"`
+}
+
+// GetInventoryValueTotal is ACC-06's INVENTORY_VALUE source — a REAL GL
+// balance comparison (unlike INVENTORY_QUANTITY/DEPRECIATION_COMPLETENESS),
+// satisfying the AST/INV/PRJ domain spec's own §9 "Inventory value → GL"
+// assertion the same way GetAssetNetBookValueTotal satisfies "Assets →
+// GL": a live sum of open cost-layer value, reconciled against a
+// caller-resolved GL control account.
+func (c *Clients) GetInventoryValueTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/valuation/inventory-value-total")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch inventory value total from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryValueTotalResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.InventoryValueTotal, nil
+}
+
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that
 // are not PAID. Period-bounded for the same reason as the payables count above.
 func (c *Clients) GetUnsettledARInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error) {

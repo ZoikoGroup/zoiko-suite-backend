@@ -105,6 +105,35 @@ func (h *Handler) GetInventoryValue(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"item_id": itemID, "location_id": locationID, "inventory_value": value})
 }
 
+// GetInventoryValueTotal is a read-only aggregate over real, live cost
+// layers — never a caller-declared figure. financial-close-svc's ACC-06
+// calls this directly for the AST/INV/PRJ domain spec's own §9
+// "Inventory value → GL" assertion.
+func (h *Handler) GetInventoryValueTotal(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionInventoryValuationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	value, err := h.store.GetInventoryValueTotal(r.Context(), legalEntityID)
+	if err != nil {
+		h.writeValuationErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]float64{"inventory_value_total": value})
+}
+
 func (h *Handler) GetCostLayers(w http.ResponseWriter, r *http.Request) {
 	itemID := r.URL.Query().Get("item_id")
 	locationID := r.URL.Query().Get("location_id")

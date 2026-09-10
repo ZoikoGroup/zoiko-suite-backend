@@ -1051,6 +1051,8 @@ type stubClients struct {
 	depCompletenessErr  error
 	invNegativeCount    int
 	invNegativeErr      error
+	invValueTotal       float64
+	invValueErr         error
 
 	postJournalErr   error
 	postedJournalID  string
@@ -1151,6 +1153,10 @@ func (c *stubClients) GetAssetDepreciationCompleteness(_ context.Context, _, _, 
 
 func (c *stubClients) GetInventoryNegativeOnHandCount(_ context.Context, _, _ string) (int, error) {
 	return c.invNegativeCount, c.invNegativeErr
+}
+
+func (c *stubClients) GetInventoryValueTotal(_ context.Context, _, _ string) (float64, error) {
+	return c.invValueTotal, c.invValueErr
 }
 
 func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
@@ -1972,6 +1978,81 @@ func TestRunSubledgerControl_InventoryQuantity_NoMappingKeyRequired(t *testing.T
 	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 (no mapping key needed), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRunSubledgerControl_InventoryValueMatched_RecordsRun proves
+// ACC-06's own run mechanism now also serves the AST/INV/PRJ domain
+// spec's own §9 "Inventory value → GL" assertion — a REAL GL balance
+// comparison, unlike DEPRECIATION_COMPLETENESS/INVENTORY_QUANTITY, so it
+// follows the exact same control-account/trial-balance path as
+// Assets → GL.
+func TestRunSubledgerControl_InventoryValueMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"INVENTORY_CONTROL": "1300-INV"},
+		invValueTotal:       150.00,
+		trialBalances:       map[string]float64{"1300-INV": 150.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_VALUE",
+		ControlAccountMappingKey: "INVENTORY_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+}
+
+func TestRunSubledgerControl_InventoryValueMismatch_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"INVENTORY_CONTROL": "1300-INV"},
+		invValueTotal:       150.00,
+		trialBalances:       map[string]float64{"1300-INV": 100.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_VALUE",
+		ControlAccountMappingKey: "INVENTORY_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION, got %q", run.Status)
+	}
+	if run.DifferenceAmount != 50.00 {
+		t.Errorf("expected difference 50.00, got %v", run.DifferenceAmount)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+func TestRunSubledgerControl_InventoryValueMissingMappingKey_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_VALUE"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (INVENTORY_VALUE is a real GL comparison, mapping key required), got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

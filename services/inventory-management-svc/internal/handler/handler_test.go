@@ -174,6 +174,18 @@ func (s *stubStore) GetInventoryValue(_ context.Context, itemID, locationID stri
 	return value, nil
 }
 
+func (s *stubStore) GetInventoryValueTotal(_ context.Context, legalEntityID string) (float64, error) {
+	var value float64
+	for _, l := range s.costLayers {
+		it, ok := s.items[l.ItemID]
+		if !ok || it.LegalEntityID != legalEntityID {
+			continue
+		}
+		value += l.RemainingQuantity * l.UnitCost
+	}
+	return value, nil
+}
+
 func (s *stubStore) GetCostLayers(_ context.Context, itemID, locationID string) ([]domain.CostLayer, error) {
 	var out []domain.CostLayer
 	for _, l := range s.costLayers {

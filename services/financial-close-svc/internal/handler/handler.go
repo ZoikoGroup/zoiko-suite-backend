@@ -180,6 +180,9 @@ type Clients interface {
 	// GetInventoryNegativeOnHandCount is ACC-06's INVENTORY_QUANTITY
 	// source — see its doc comment in internal/clients.
 	GetInventoryNegativeOnHandCount(ctx context.Context, tenantID, legalEntityID string) (int, error)
+	// GetInventoryValueTotal is ACC-06's INVENTORY_VALUE source — see its
+	// doc comment in internal/clients.
+	GetInventoryValueTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
 	// PostAccrualRecognitionJournal is ACC-07's only path to the ledger —
 	// see its doc comment in internal/clients for why.
 	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error)
@@ -846,7 +849,7 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
 		return
 	}
-	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" && req.Subledger != "DEPRECIATION_COMPLETENESS" && req.Subledger != "INVENTORY_QUANTITY" {
+	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" && req.Subledger != "DEPRECIATION_COMPLETENESS" && req.Subledger != "INVENTORY_QUANTITY" && req.Subledger != "INVENTORY_VALUE" {
 		writeError(w, http.StatusBadRequest, "invalid_subledger", string(domain.ErrInvalidSubledger))
 		return
 	}
@@ -944,6 +947,12 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		subledgerTotal, err = h.clients.GetAssetNetBookValueTotal(r.Context(), tenantID, req.LegalEntityID, req.BookID)
 		if err != nil {
 			h.writeSubledgerControlErr(w, err, "asset-management-svc")
+			return
+		}
+	case "INVENTORY_VALUE":
+		subledgerTotal, err = h.clients.GetInventoryValueTotal(r.Context(), tenantID, req.LegalEntityID)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "inventory-management-svc")
 			return
 		}
 	}

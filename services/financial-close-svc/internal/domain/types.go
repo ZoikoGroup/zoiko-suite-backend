@@ -822,14 +822,14 @@ var (
 	ErrReopenEventNotRecorded = errorString("period reopened but the reopen event could not be recorded")
 
 	// ErrInvalidSubledger — extended beyond AP/AR to ASSETS,
-	// DEPRECIATION_COMPLETENESS and INVENTORY_QUANTITY, satisfying the
-	// AST/INV/PRJ domain spec's own §9 "Subledger Reconciliation &
-	// Control Framework," which names this same run/exception mechanism
-	// as the vehicle for its "Assets → GL," "Depreciation completeness"
-	// and "Inventory quantity" assertions. No new reconciliation engine
-	// was built for that spec — this existing ACC-06 run gained new
-	// sources.
-	ErrInvalidSubledger = errorString("subledger must be AP, AR, ASSETS, DEPRECIATION_COMPLETENESS or INVENTORY_QUANTITY")
+	// DEPRECIATION_COMPLETENESS, INVENTORY_QUANTITY and INVENTORY_VALUE,
+	// satisfying the AST/INV/PRJ domain spec's own §9 "Subledger
+	// Reconciliation & Control Framework," which names this same
+	// run/exception mechanism as the vehicle for its "Assets → GL,"
+	// "Depreciation completeness," "Inventory quantity" and "Inventory
+	// value → GL" assertions. No new reconciliation engine was built for
+	// that spec — this existing ACC-06 run gained new sources.
+	ErrInvalidSubledger = errorString("subledger must be AP, AR, ASSETS, DEPRECIATION_COMPLETENESS, INVENTORY_QUANTITY or INVENTORY_VALUE")
 
 	// ErrBookIDRequiredForAssets is ASSETS-subledger's own extra required
 	// field — a fixed asset can carry more than one depreciation book

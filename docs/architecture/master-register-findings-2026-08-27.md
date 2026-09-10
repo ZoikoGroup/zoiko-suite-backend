@@ -1180,6 +1180,20 @@ Continuing §3.53–§3.54 into the third of the AST/INV/PRJ domain spec's own 8
 
 ---
 
+### 3.56 ACC-06 gained a sixth subledger source, INVENTORY_VALUE — back to a real GL comparison, same shape as Assets → GL (2026-09-10)
+
+Continuing §3.53–§3.55 into the fourth of the AST/INV/PRJ domain spec's own 8 §9 assertions. Verbatim: "Valuation subledger equals GL inventory/COGS/write-down consequences by entity/book/period. Unexplained difference blocks close." Unlike the two most recent sources (§3.54's completeness check, §3.55's integrity check), this one IS a genuine GL balance comparison — `RunSubledgerControl`'s `INVENTORY_VALUE` case slots into the exact same `GetControlAccountCode`/`CompileTrialBalance` path AP/AR/ASSETS already use, not the completeness-type early-exit branch.
+
+**The new source, on `inventory-management-svc`:** `GET /v1/valuation/inventory-value-total?legal_entity_id=` widens the service's own existing `GetInventoryValue(item, location)` (already used by INV-04's per-item read) to every open cost layer across the whole legal entity — the identical `SUM(remaining_quantity * unit_cost)` formula, not a second, divergent calculation. This is the real, live current inventory value the spec's own "Valuation subledger" language refers to.
+
+**No new configuration needed:** `financial-close-svc` already gained `INVENTORY_SERVICE_URL`/`inventoryURL` in §3.55 for `INVENTORY_QUANTITY` — `GetInventoryValueTotal` reuses the same client field and the same `depends_on: inventory-management-svc` wiring in `docker-compose.yml`, so this section touches no config, no `main.go`, no compose file at all.
+
+10 new tests: 3 handler tests in `financial-close-svc` (matched records a run, a mismatch records EXCEPTION with the exact difference amount asserted and publishes exactly once, and — same negative check §3.55 added for AP — `INVENTORY_VALUE` with no mapping key correctly refused with 400, proving this source really does require one unlike its two completeness-type siblings) and 7 in `inventory-management-svc` (3 handler — missing `legal_entity_id` 400, a sum across two different items at the same location, a different `legal_entity_id` correctly excluded; 1 real-Postgres proving the same two-item sum plus entity exclusion against real cost layers). Verified against a real throwaway Postgres container (19 store tests, including the new one). Negative-controlled: temporarily dropped `* unit_cost` from the aggregation SQL (summing bare `remaining_quantity` instead), confirmed the real-Postgres test failed exactly as expected (14 instead of 150), restored, confirmed green again.
+
+**Deliberately out of scope, stated honestly — this closes 4 of the spec's 8 named assertions.** The remaining 4 (stock count, project cost completeness, project revenue/WIP→GL, source-to-report) are unbuilt as of this section. Stock count remains expected to need a still-different shape from any of the four built so far — a variance-approval check against INV-05's own count-line evidence, not a live aggregate at all.
+
+---
+
 ## 4. Confirmations (no action needed, listed so they aren't re-litigated)
 
 - `tenant-entity-registry-svc`'s schema matches `ZS-SVC-I-001`'s canonical Tenant→LegalEntity→OrgUnit model almost field-for-field; its RLS posture (explicit WHERE-clause enforcement, RLS as defense-in-depth only, because the runtime connects as Postgres superuser) exceeds the doc's minimum.

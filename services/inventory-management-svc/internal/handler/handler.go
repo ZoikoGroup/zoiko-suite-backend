@@ -68,6 +68,11 @@ type Store interface {
 	ValueMovement(ctx context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, error)
 	GetValuationEntry(ctx context.Context, entryID string) (*domain.ValuationEntry, error)
 	GetInventoryValue(ctx context.Context, itemID, locationID string) (float64, error)
+	// GetInventoryValueTotal backs GET /v1/valuation/inventory-value-total
+	// — see internal/store/valuation_store.go's own doc comment. Serves
+	// the AST/INV/PRJ domain spec's own §9 "Inventory value → GL"
+	// assertion.
+	GetInventoryValueTotal(ctx context.Context, legalEntityID string) (float64, error)
 	GetCostLayers(ctx context.Context, itemID, locationID string) ([]domain.CostLayer, error)
 	CreateValuationRun(ctx context.Context, r *domain.ValuationRun) (frozenCount int, err error)
 	GetValuationRun(ctx context.Context, runID string) (*domain.ValuationRun, error)
@@ -292,6 +297,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/movements/{movementID}/value", h.ValueMovement)
 		r.Get("/entries/{id}", h.GetValuationEntry)
 		r.Get("/inventory-value", h.GetInventoryValue)
+		r.Get("/inventory-value-total", h.GetInventoryValueTotal)
 		r.Get("/cost-layers", h.GetCostLayers)
 		r.Route("/runs", func(r chi.Router) {
 			r.Post("/", h.CreateValuationRun)
