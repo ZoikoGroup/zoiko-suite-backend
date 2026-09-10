@@ -94,6 +94,11 @@ type Store interface {
 	LinkCountLineAdjustment(ctx context.Context, lineID, movementID string) error
 	MarkCountAdjustmentsGenerated(ctx context.Context, countID string) error
 	CertifyStockCount(ctx context.Context, countID, principalID string, at time.Time) error
+	// GetUnapprovedVarianceCount backs GET
+	// /v1/stock-counts/unapproved-variance-count — see
+	// internal/store/stock_count_store.go's own doc comment. Serves the
+	// AST/INV/PRJ domain spec's own §9 "Stock count" assertion.
+	GetUnapprovedVarianceCount(ctx context.Context, legalEntityID, fiscalPeriod string) (int, error)
 	CancelStockCount(ctx context.Context, countID, principalID, reason string, at time.Time) error
 }
 
@@ -312,6 +317,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 	r.Route("/v1/stock-counts", func(r chi.Router) {
 		r.Post("/", h.CreateStockCount)
+		r.Get("/unapproved-variance-count", h.GetUnapprovedVarianceCount)
 		r.Get("/{id}", h.GetStockCount)
 		r.Post("/{id}/freeze", h.FreezeCountPopulation)
 		r.Post("/{id}/certify", h.CertifyStockCount)

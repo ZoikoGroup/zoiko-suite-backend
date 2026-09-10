@@ -1275,6 +1275,50 @@ func (c *Clients) GetInventoryNegativeOnHandCount(ctx context.Context, tenantID,
 	return out.NegativeOnHandCount, nil
 }
 
+// inventoryUnapprovedVarianceResponse mirrors inventory-management-svc's
+// own GET /v1/stock-counts/unapproved-variance-count wire shape.
+type inventoryUnapprovedVarianceResponse struct {
+	UnapprovedVarianceCount int `json:"unapproved_variance_count"`
+}
+
+// GetInventoryUnapprovedVarianceCount is ACC-06's STOCK_COUNT source —
+// an integrity check with no GL side, satisfying the AST/INV/PRJ domain
+// spec's own §9 "Stock count" assertion the same way
+// GetInventoryNegativeOnHandCount satisfies "Inventory quantity."
+func (c *Clients) GetInventoryUnapprovedVarianceCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/stock-counts/unapproved-variance-count")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch unapproved variance count from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryUnapprovedVarianceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.UnapprovedVarianceCount, nil
+}
+
 // inventoryValueTotalResponse mirrors inventory-management-svc's own
 // GET /v1/valuation/inventory-value-total wire shape.
 type inventoryValueTotalResponse struct {

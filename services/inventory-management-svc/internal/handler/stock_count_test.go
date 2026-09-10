@@ -237,3 +237,78 @@ func TestCancelStockCount_BeforeCertification_Succeeds(t *testing.T) {
 		t.Fatalf("expected CANCELLED, got %q", s.stockCounts[countID].Status)
 	}
 }
+
+// ── GetUnapprovedVarianceCount (§9 "Stock count") ────────────────────────────
+
+func TestGetUnapprovedVarianceCount_MissingParams_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/unapproved-variance-count?legal_entity_id=le-1", nil, "reader-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 missing fiscal_period, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetUnapprovedVarianceCount_VarianceRecordedButNeverApproved_CountsOne(t *testing.T) {
+	// Proves the real gap this assertion surfaces: RecordBlindCount alone
+	// (no ApproveCountVariance) leaves a real variance sitting unapproved
+	// — nothing in this service's own commands blocks that today.
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 18}, "counter-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/unapproved-variance-count?legal_entity_id=le-1&fiscal_period=2026-09", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]int
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["unapproved_variance_count"] != 1 {
+		t.Fatalf("expected 1 (observed 18 vs system 20, never approved), got %+v", out)
+	}
+}
+
+func TestGetUnapprovedVarianceCount_ApprovedVariance_ExcludedFromCount(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 18}, "counter-1")
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/approve-variance", nil, "reviewer-2")
+
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/unapproved-variance-count?legal_entity_id=le-1&fiscal_period=2026-09", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]int
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["unapproved_variance_count"] != 0 {
+		t.Fatalf("expected 0 once the variance is approved, got %+v", out)
+	}
+}
+
+func TestGetUnapprovedVarianceCount_NoVariance_CountsZero(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+
+	// Observed exactly matches system quantity (20) — no real variance.
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 20}, "counter-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/unapproved-variance-count?legal_entity_id=le-1&fiscal_period=2026-09", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]int
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["unapproved_variance_count"] != 0 {
+		t.Fatalf("expected 0 (observed equals system, no variance), got %+v", out)
+	}
+}

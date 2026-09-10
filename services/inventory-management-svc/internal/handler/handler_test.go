@@ -410,6 +410,24 @@ func (s *stubStore) MarkCountAdjustmentsGenerated(_ context.Context, countID str
 	return nil
 }
 
+func (s *stubStore) GetUnapprovedVarianceCount(_ context.Context, legalEntityID, fiscalPeriod string) (int, error) {
+	count := 0
+	for _, line := range s.countLines {
+		sc, ok := s.stockCounts[line.CountID]
+		if !ok || sc.LegalEntityID != legalEntityID || sc.FiscalPeriod != fiscalPeriod {
+			continue
+		}
+		if line.ObservedQuantity == nil || *line.ObservedQuantity == line.SystemQuantity {
+			continue
+		}
+		if line.Status == domain.CountLineStatusVarianceApproved || line.Status == domain.CountLineStatusAdjustmentGenerated {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
 func (s *stubStore) CertifyStockCount(_ context.Context, countID, principalID string, at time.Time) error {
 	sc, ok := s.stockCounts[countID]
 	if !ok || sc.Status != domain.StockCountStatusAdjustmentsGenerated {

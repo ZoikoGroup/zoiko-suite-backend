@@ -186,6 +186,9 @@ type Clients interface {
 	// GetProjectPostedRevenueTotal is ACC-06's PROJECT_REVENUE source —
 	// see its doc comment in internal/clients.
 	GetProjectPostedRevenueTotal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (float64, error)
+	// GetInventoryUnapprovedVarianceCount is ACC-06's STOCK_COUNT source
+	// — see its doc comment in internal/clients.
+	GetInventoryUnapprovedVarianceCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error)
 	// PostAccrualRecognitionJournal is ACC-07's only path to the ledger —
 	// see its doc comment in internal/clients for why.
 	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error)
@@ -852,7 +855,7 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
 		return
 	}
-	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" && req.Subledger != "DEPRECIATION_COMPLETENESS" && req.Subledger != "INVENTORY_QUANTITY" && req.Subledger != "INVENTORY_VALUE" && req.Subledger != "PROJECT_REVENUE" {
+	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" && req.Subledger != "DEPRECIATION_COMPLETENESS" && req.Subledger != "INVENTORY_QUANTITY" && req.Subledger != "INVENTORY_VALUE" && req.Subledger != "PROJECT_REVENUE" && req.Subledger != "STOCK_COUNT" {
 		writeError(w, http.StatusBadRequest, "invalid_subledger", string(domain.ErrInvalidSubledger))
 		return
 	}
@@ -864,7 +867,7 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 	// checks, not GL balance comparisons (see writeup below) — neither
 	// ever resolves a control account or compiles a trial balance, so no
 	// mapping key applies to either.
-	isCompletenessType := req.Subledger == "DEPRECIATION_COMPLETENESS" || req.Subledger == "INVENTORY_QUANTITY"
+	isCompletenessType := req.Subledger == "DEPRECIATION_COMPLETENESS" || req.Subledger == "INVENTORY_QUANTITY" || req.Subledger == "STOCK_COUNT"
 	if !isCompletenessType && req.ControlAccountMappingKey == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields", "control_account_mapping_key is required")
 		return
@@ -923,6 +926,20 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.recordAndRespondControlRun(w, r, correlationID, principalID, tenantID, req, "N/A (integrity check — no GL account)", float64(negativeCount), 0)
+		return
+	}
+
+	// STOCK_COUNT is the AST/INV/PRJ domain spec's own §9 "Stock count"
+	// assertion — an integrity check (does any counted line carry a
+	// real, observed variance that was never approved?), same non-GL
+	// shape as INVENTORY_QUANTITY/DEPRECIATION_COMPLETENESS.
+	if req.Subledger == "STOCK_COUNT" {
+		unapprovedCount, err := h.clients.GetInventoryUnapprovedVarianceCount(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "inventory-management-svc")
+			return
+		}
+		h.recordAndRespondControlRun(w, r, correlationID, principalID, tenantID, req, "N/A (integrity check — no GL account)", float64(unapprovedCount), 0)
 		return
 	}
 
