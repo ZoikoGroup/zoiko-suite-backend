@@ -57,7 +57,7 @@ func TestAuthorize_OwnObjectSoD_UsesTheResolvedTenantScope(t *testing.T) {
 	// Header only — no tenant_id in the body, which is the convention.
 	code, _ := authorize(t,
 		r,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-1"}`,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"AP_INVOICE_APPROVE","resource_owner_principal_id":"p-1"}`,
 		map[string]string{"X-Tenant-Id": testTenant},
 	)
 	if code != http.StatusOK {
@@ -169,7 +169,7 @@ func TestAuthorize_ABACWithNoRulesChangesNothing(t *testing.T) {
 	r := newTestRouter(store)
 
 	code, got := authorize(t, r,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE","attributes":{"amount":"999999"}}`,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","attributes":{"amount":"999999"}}`,
 		map[string]string{"X-Tenant-Id": testTenant})
 
 	if code != http.StatusOK || got["decision_outcome"] != "GRANTED" {
@@ -190,13 +190,13 @@ func TestAuthorize_ABACDenies(t *testing.T) {
 		{
 			name:      "FORBID matched",
 			rules:     []domain.ABACRule{abacRule("NO_LARGE_SELF_SERVICE", domain.EffectForbid, "channel", "eq", "SELF_SERVICE")},
-			body:      `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE","attributes":{"channel":"SELF_SERVICE"}}`,
+			body:      `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","attributes":{"channel":"SELF_SERVICE"}}`,
 			wantBasis: "abac:forbidden=NO_LARGE_SELF_SERVICE",
 		},
 		{
 			name:      "REQUIRE unsatisfied",
 			rules:     []domain.ABACRule{abacRule("DUAL_APPROVAL", domain.EffectRequire, "dual_approved", "eq", "true")},
-			body:      `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE","attributes":{"dual_approved":"false"}}`,
+			body:      `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","attributes":{"dual_approved":"false"}}`,
 			wantBasis: "abac:require_failed=DUAL_APPROVAL",
 		},
 		{
@@ -204,7 +204,7 @@ func TestAuthorize_ABACDenies(t *testing.T) {
 			// simply omitting the attribute it requires.
 			name:      "REQUIRE with no attributes sent at all",
 			rules:     []domain.ABACRule{abacRule("DUAL_APPROVAL", domain.EffectRequire, "dual_approved", "eq", "true")},
-			body:      `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`,
+			body:      `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`,
 			wantBasis: "abac:require_failed=DUAL_APPROVAL",
 		},
 	}
@@ -249,7 +249,7 @@ func TestAuthorize_ABACIsDenyOnly(t *testing.T) {
 	r := newTestRouter(store)
 
 	code, got := authorize(t, r,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE","attributes":{"channel":"BRANCH"}}`,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","attributes":{"channel":"BRANCH"}}`,
 		map[string]string{"X-Tenant-Id": testTenant})
 
 	if code != http.StatusOK || got["decision_outcome"] != "DENIED" {
@@ -274,7 +274,7 @@ func TestAuthorize_ABACLookupIsTenantScoped(t *testing.T) {
 	r := newTestRouter(store)
 
 	_, _ = authorize(t, r,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`,
 		map[string]string{"X-Tenant-Id": testTenant})
 
 	if store.abacTenantArg != testTenant {
@@ -296,7 +296,7 @@ func TestAuthorize_ABACStoreOutageFailsClosed(t *testing.T) {
 	r := newTestRouter(store)
 
 	code, got := authorize(t, r,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`,
 		map[string]string{"X-Tenant-Id": testTenant})
 
 	if code != http.StatusServiceUnavailable {
@@ -320,7 +320,7 @@ func TestAuthorize_ABACUnevaluableRuleDenies(t *testing.T) {
 	r := newTestRouter(store)
 
 	code, got := authorize(t, r,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE","attributes":{"amount":"10000"}}`,
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","attributes":{"amount":"10000"}}`,
 		map[string]string{"X-Tenant-Id": testTenant})
 
 	if code != http.StatusOK || got["decision_outcome"] != "DENIED" {
@@ -547,7 +547,7 @@ func TestCreateDelegatedAuthority_ForwardsTheActionSubset(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"delegator_principal_id":"boss-1","delegate_principal_id":"assistant-1",` +
-		`"scope_type":"ACTION_SUBSET","legal_entity_id":"le-1",` +
+		`"scope_type":"ACTION_SUBSET","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1",` +
 		`"delegated_actions":["PAYMENT_APPROVE"],"effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "boss-1")
@@ -574,7 +574,7 @@ func TestCreateDelegatedAuthority_ActionSubsetWithoutASubsetIsRefused(t *testing
 	r := newTestRouter(store)
 
 	body := `{"delegator_principal_id":"boss-1","delegate_principal_id":"assistant-1",` +
-		`"scope_type":"ACTION_SUBSET","legal_entity_id":"le-1","effective_from":"2026-01-01T00:00:00Z"}`
+		`"scope_type":"ACTION_SUBSET","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "boss-1")
 	req.Header.Set("X-Tenant-Id", testTenant)
@@ -602,7 +602,7 @@ func TestCreateDelegatedAuthority_FullScopeNeedsNoSubset(t *testing.T) {
 	r := newTestRouter(store)
 
 	body := `{"delegator_principal_id":"boss-1","delegate_principal_id":"assistant-1",` +
-		`"scope_type":"FULL","legal_entity_id":"le-1","effective_from":"2026-01-01T00:00:00Z"}`
+		`"scope_type":"FULL","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "boss-1")
 	req.Header.Set("X-Tenant-Id", testTenant)

@@ -386,6 +386,34 @@ caller who mistyped a legal_entity_id filter was told the authorization plane
 had failed. Callers must therefore validate the scope themselves before
 asking: handler.validScope answers 400 `invalid_scope`.
 
+**Corrected 2026-09-10 — the remedy above was in the wrong place, and the
+service half was never done.** "Callers must validate the scope themselves"
+means the workaround is written 111 times, each copy has to know which of
+authorization-svc's columns are uuid, and any caller that forgets reports an
+outage instead of a typo. authorization-svc now refuses a malformed scope
+itself, with `400 invalid_scope` naming the field, in the three places that
+between them cover every route taking one: `resolvePlatformScope` (the four
+evaluate/validate routes), `resolveTenantScope` (the /v1/authorize header and
+body-fallback paths) and `requireTenant` (every admin read).
+
+The TENANT half was missed entirely by the note above and is the worse of the
+two. `withRLS` installs the raw value into `app.tenant_id` and the POLICY does
+the `::uuid` cast, so a malformed tenant does not fail in a query the service
+wrote — it fails inside row security, on a plain SELECT, on every table.
+Reproduced as the service's own role (`rolsuper=f rolbypassrls=f`):
+
+    SELECT set_config('app.tenant_id','acme',false);
+    SELECT count(*) FROM roles;
+      ERROR: invalid input syntax for type uuid: "acme"
+
+`principal_id` is deliberately NOT validated: it is TEXT in every table and
+compared as text, so a malformed one is a valid comparison that matches
+nothing, and refusing it would break every service account — those ids are not
+UUIDs. A MISSING tenant is still 401, not 400: "you did not identify your
+organisation" and "the organisation you named is not a reference" are different
+facts. Callers that already validate the scope themselves are unaffected and
+need no change.
+
 Worth noting for other services: it is specifically the value used as the
 AUTHORIZATION SCOPE that must be a UUID, not necessarily the column. In this
 service legal_entity_id and counterparty_id are VARCHAR(255) (only check_id
@@ -1828,3 +1856,35 @@ refusing a database named authorization_svc, requiring a name suffix, or
 checking the host each either blocks the legitimate throwaway case or gives
 false confidence against a URL shaped slightly differently. A stated contract
 is more honest than a check that can be satisfied by accident.
+
+## Open: employee.terminated cannot be consumed — no employee-to-principal map
+authorization-svc's spec (Doc 03 §8.3) names `employment.changed` as a consumed
+event, and five passes of its progress notes recorded that event and two others
+as having "no producer anywhere on the estate". **That was wrong, and corrected
+2026-09-10:** the conclusion came from grepping the SPEC's event names. The
+platform publishes all three concepts under concrete names —
+`principal.status.changed` (identity-context-svc, zoiko.identity.events),
+`role.created`/`role.updated`/`permission.bundle.updated` (access-control-svc),
+and `entity.status.changed`/`entity.hierarchy.changed`/
+`entity.jurisdiction.changed` (tenant-entity-registry-svc). All are now consumed
+by `internal/events.LifecycleConsumer`.
+
+One candidate genuinely is not consumable, and this is the gap.
+`employee.terminated` is published by BOTH employee-master-svc and
+offboarding-severance-svc, and its payload names an `employee_id`. There is no
+employee-to-principal mapping anywhere on this estate: employee-master-svc's
+schema carries no `principal_id` or `user_id` column at all. So the event says
+somebody left and authorization-svc cannot tell whose authority that is about.
+
+Consuming it on a guessed join would end the wrong principal's grants, silently,
+on the platform's authorization plane — strictly worse than not consuming it. So
+this is an IDENTITY-MAPPING gap, not a missing consumer, and it is recorded here
+as the former so the next person looks in the right place.
+
+What partially covers it today: identity-context-svc's
+`principal.status.changed` IS consumed and gates every action for a principal it
+reports as SUSPENDED or DISABLED (layer 0 of `/v1/authorize`). So an offboarding
+that suspends the PRINCIPAL is enforced; one that only terminates the EMPLOYEE
+record is not. Closing this needs either a `principal_id` on the employee master
+record, or offboarding-severance-svc to drive identity-context-svc's status
+change as part of its own flow — a cross-service decision, not a change here.

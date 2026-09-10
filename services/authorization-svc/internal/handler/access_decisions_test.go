@@ -38,7 +38,7 @@ func getDecisions(t *testing.T, r chi.Router, query string, headers map[string]s
 }
 
 func auditHeaders() map[string]string {
-	return map[string]string{"X-Principal-Id": "p-auditor", "X-Tenant-Id": "t-1"}
+	return map[string]string{"X-Principal-Id": "p-auditor", "X-Tenant-Id": "11111111-1111-4111-8111-111111111111"}
 }
 
 func emptyPageStore() *stubStore {
@@ -47,7 +47,7 @@ func emptyPageStore() *stubStore {
 
 func TestListAccessDecisions_RequiresPrincipal(t *testing.T) {
 	r := newTestRouter(emptyPageStore())
-	w := getDecisions(t, r, "", map[string]string{"X-Tenant-Id": "t-1"})
+	w := getDecisions(t, r, "", map[string]string{"X-Tenant-Id": "11111111-1111-4111-8111-111111111111"})
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("no principal: expected 401, got %d: %s", w.Code, w.Body.String())
 	}
@@ -72,9 +72,9 @@ func TestListAccessDecisions_TenantComesFromHeaderNotQuery(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if store.gotListDecisionsTenant != "t-1" {
+	if store.gotListDecisionsTenant != "11111111-1111-4111-8111-111111111111" {
 		t.Fatalf("store was scoped to %q, want the verified header tenant %q — a query parameter widened the audit read",
-			store.gotListDecisionsTenant, "t-1")
+			store.gotListDecisionsTenant, "11111111-1111-4111-8111-111111111111")
 	}
 }
 
@@ -317,7 +317,7 @@ func TestGetAccessDecision_StillRoutesUnderTheCollectionPrefix(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, handler.AccessDecisionsPath+"/dec-7", nil)
 	req.Header.Set("X-Principal-Id", "p-auditor")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

@@ -631,19 +631,49 @@ func (h *Handler) EvaluateDelegatedAccess(w http.ResponseWriter, r *http.Request
 // evaluating the literal string "PLATFORM" against a uuid column — which is a
 // 503 that reads as an outage, not a 400 that names the missing configuration.
 func (h *Handler) resolvePlatformScope(w http.ResponseWriter, legalEntityID, correlationID string) (string, bool) {
-	if legalEntityID != PlatformScopeSentinel {
-		return legalEntityID, true
+	if legalEntityID == PlatformScopeSentinel {
+		if h.platformScopeEntityID == "" {
+			h.log.Error("platform scope requested but AUTHZ_PLATFORM_SCOPE_ENTITY_ID is unset",
+				zap.String("correlation_id", correlationID))
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "platform_scope_not_configured",
+				"message": "legal_entity_id=PLATFORM requires AUTHZ_PLATFORM_SCOPE_ENTITY_ID to be configured on authorization-svc",
+			})
+			return "", false
+		}
+		return h.platformScopeEntityID, true
 	}
-	if h.platformScopeEntityID == "" {
-		h.log.Error("platform scope requested but AUTHZ_PLATFORM_SCOPE_ENTITY_ID is unset",
-			zap.String("correlation_id", correlationID))
+
+	// ── a mistyped entity is a 400, not an outage ───────────────────────────
+	//
+	// legal_entity_id is UUID NOT NULL in every table this value is compared
+	// against, and passing a non-UUID to a uuid comparison is a DRIVER error,
+	// which the store wraps as ErrStoreUnavailable and every handler answers
+	// 503 for. From a calling service that 503 is indistinguishable from this
+	// service being down — so a caller that mistyped an entity id was told the
+	// platform's authorization plane had failed.
+	//
+	// known-gaps.md recorded this and put the remedy on the CALLERS: "callers
+	// must therefore validate the scope themselves before asking". That is the
+	// wrong place. The workaround has to be written 111 times, each one has to
+	// know which of this service's columns are uuid, and any caller that
+	// forgets reports an outage instead of a typo. One check here replaces all
+	// of them.
+	//
+	// Deliberately NOT applied to principal_id, which is TEXT in every table
+	// and compared as text: a malformed principal is a valid comparison that
+	// matches nothing, and rejecting one would refuse the service-account ids
+	// this service has never required to be UUIDs.
+	if !validScope(legalEntityID) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
-			"error":   "platform_scope_not_configured",
-			"message": "legal_entity_id=PLATFORM requires AUTHZ_PLATFORM_SCOPE_ENTITY_ID to be configured on authorization-svc",
+			"error": "invalid_scope",
+			"field": "legal_entity_id",
+			"message": "legal_entity_id must be a UUID, or the literal " + PlatformScopeSentinel +
+				" for an act that belongs to no single legal entity",
 		})
 		return "", false
 	}
-	return h.platformScopeEntityID, true
+	return legalEntityID, true
 }
 
 // dedupeSorted returns the distinct values of in, sorted.

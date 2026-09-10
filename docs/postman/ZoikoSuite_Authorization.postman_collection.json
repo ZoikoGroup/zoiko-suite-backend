@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "ZoikoSuite - Authorization Service (8089)",
-    "description": "Every endpoint on authorization-svc (:8089), ordered as a runnable flow.\n\nRun the folders top to bottom with the Collection Runner. Ids are captured by\ntest scripts, so nothing needs pasting by hand.\n\nKEY FACTS\n- /v1/authorize returns HTTP 200 for BOTH grant and deny. The verdict is in\n  decision_outcome, not the status code. 200 means the evaluation succeeded.\n- Evaluation order: RBAC, then delegated authority, then SoD as a veto.\n- Every evaluation is written to access_decision_log before responding.\n- legal_entity_id, tenant_id and every *_id path param MUST be a UUID.\n  principal_id is free text. A non-UUID legal_entity_id returns 503\n  store_unavailable, not 400 - that is a service defect, not your mistake.\n- Purchase actions consumed by purchase-order-svc: PO_ISSUE, PO_AMEND, PO_CLOSE.",
+    "description": "Every endpoint on authorization-svc (:8089), ordered as a runnable flow.\n\nRun the folders top to bottom with the Collection Runner. Ids are captured by\ntest scripts, so nothing needs pasting by hand.\n\nTHE ENVELOPE IS SET FOR YOU\nA collection-level pre-request script adds the canonical input contract\n(ZS-ARCH-SVC-001 section 4) to every request: X-Tenant-Id, X-Principal-Id,\nX-Legal-Entity-Id, X-Request-Id, X-Correlation-ID, X-Source-Channel and, on\nmaterial writes only, Idempotency-Key. Without it every /v1/admin/* write here\nanswers 401 envelope_incomplete, because the service enforces write-strict by\ndefault. Open the collection's Pre-request Script tab to see it.\n\nKEY FACTS\n- /v1/authorize returns HTTP 200 for BOTH grant and deny. The verdict is in\n  decision_outcome, not the status code. 200 means the evaluation succeeded.\n- Evaluation order: principal status (layer 0), RBAC, delegated authority,\n  static SoD, own-object SoD, then attribute conditions. Every layer after the\n  first can only ever REMOVE access the earlier ones conferred.\n- Every evaluation is written to access_decision_log before responding. The\n  three pre-flight routes in folder 10 write nothing at all, which is what\n  makes them safe to call while somebody is still deciding.\n- legal_entity_id and tenant_id MUST be UUIDs — they are uuid columns. A\n  malformed one now answers 400 invalid_scope naming the field. It used to\n  answer 503 store_unavailable, which read to a caller as this service being\n  down; that is fixed, and this collection no longer documents it as a defect\n  you have to live with.\n- principal_id is free text and deliberately NOT validated: it is TEXT in every\n  table, and service-account ids are not UUIDs.\n- legal_entity_id accepts the literal PLATFORM for an act that belongs to no\n  single legal entity. It resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID.\n- Purchase actions consumed by purchase-order-svc: PO_ISSUE, PO_AMEND, PO_CLOSE.\n\nNOT REACHABLE FROM HERE, BY DESIGN\nLayer 0 (principal status) has no HTTP route. identity-context-svc is\nauthoritative for whether an account is active, and this service consumes\nprincipal.status.changed from zoiko.identity.events into a read-model. An admin\nroute that could override it would let two services disagree about who is\nsuspended. Folder 11 explains how to exercise it.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -47,6 +47,30 @@
     },
     {
       "key": "decisionId",
+      "value": ""
+    },
+    {
+      "key": "adminPrincipal",
+      "value": "pm-admin"
+    },
+    {
+      "key": "abacRoleId",
+      "value": ""
+    },
+    {
+      "key": "abacRuleId",
+      "value": ""
+    },
+    {
+      "key": "bundleId",
+      "value": ""
+    },
+    {
+      "key": "sodRuleId",
+      "value": ""
+    },
+    {
+      "key": "decisionCursor",
       "value": ""
     }
   ],
@@ -245,7 +269,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "// permitted_actions is the list authorize() checks against. Re-posting the same bundle_code updates it in place, still 201.",
-                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"bundleId\", pm.response.json().permission_bundle_id);"
                 ]
               }
             }
@@ -467,7 +492,8 @@
                 "type": "text/javascript",
                 "exec": [
                   "// jurisdiction_id is optional; if supplied it must exist in jurisdiction-rules-svc or you get 404 jurisdiction_not_found.",
-                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));"
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"sodRuleId\", pm.response.json().sod_rule_id);"
                 ]
               }
             }
@@ -1092,7 +1118,8 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.collectionVariables.set(\"bundleId\", pm.response.json().permission_bundle_id);"
                 ]
               }
             }
@@ -1220,6 +1247,2008 @@
           ]
         }
       ]
+    },
+    {
+      "name": "06 - Attribute conditions (ABAC, layer 5)",
+      "description": "The deny-only attribute layer. abac_rules SHIPS EMPTY, so this layer changes no outcome until somebody declares a rule — which is why creating one here immediately starts refusing an action that was allowed a moment ago.\n\nREQUIRE means the condition must hold or the action is denied, and an attribute the rule names that the caller did NOT send counts as not held. That is deliberate: otherwise any caller could evade a required condition by omitting a JSON field.",
+      "item": [
+        {
+          "name": "Grant DOC_PUBLISH via a role (setup)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles"
+              ]
+            },
+            "description": "A role to hang the condition off. Idempotent on role_code within a tenant.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"role_code\": \"DOC_PUBLISHER\",\n  \"role_name\": \"Document Publisher\",\n  \"role_scope_type\": \"LEGAL_ENTITY\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201 or 200\", () => pm.expect([200,201]).to.include(pm.response.code));",
+                  "pm.collectionVariables.set(\"abacRoleId\", pm.response.json().role_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attach DOC_PUBLISH to it",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles/{{abacRoleId}}/permission-bundles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles",
+                "{{abacRoleId}}",
+                "permission-bundles"
+              ]
+            },
+            "description": "A role with no bundle grants nothing.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"bundle_code\": \"DOC_ALL\",\n  \"permitted_actions\": [\"DOC_PUBLISH\"]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201 or 200\", () => pm.expect([200,201]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Assign it to publisher-dana",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/role-assignments",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "role-assignments"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"publisher-dana\",\n  \"role_id\": \"{{abacRoleId}}\",\n  \"legal_entity_id\": \"{{entityId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201 or 200\", () => pm.expect([200,201]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "DOC_PUBLISH -> GRANTED (no conditions yet)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "The baseline. abac_rules is empty, so layer 5 is a no-op.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"publisher-dana\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"DOC_PUBLISH\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"GRANTED\", () => pm.expect(pm.response.json().decision_outcome).to.eql(\"GRANTED\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Declare: DOC_PUBLISH is FORBIDden when channel = fax",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/abac-rules",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "abac-rules"
+              ]
+            },
+            "description": "rule_code is what decision_basis names on a denial, so the rule behind a refusal is findable from the log.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"rule_code\": \"NO_FAX_PUBLISH\",\n  \"action_type\": \"DOC_PUBLISH\",\n  \"effect\": \"FORBID\",\n  \"attribute_key\": \"channel\",\n  \"operator\": \"eq\",\n  \"attribute_value\": \"fax\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201 or 200\", () => pm.expect([200,201]).to.include(pm.response.code));",
+                  "pm.collectionVariables.set(\"abacRuleId\", pm.response.json().abac_rule_id);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Same request, channel=fax -> DENIED abac:forbidden",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "The same grant, refused for THIS request only. Nothing about the role changed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"publisher-dana\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"DOC_PUBLISH\",\n  \"tenant_id\": \"{{tenantId}}\",\n  \"attributes\": { \"channel\": \"fax\" }\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"DENIED\", () => pm.expect(b.decision_outcome).to.eql(\"DENIED\"));",
+                  "pm.test(\"basis names the rule\", () => pm.expect(b.decision_basis).to.include(\"NO_FAX_PUBLISH\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Same request, channel=portal -> GRANTED again",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "A FORBID condition that is not met permits. Only the request changed.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"publisher-dana\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"DOC_PUBLISH\",\n  \"tenant_id\": \"{{tenantId}}\",\n  \"attributes\": { \"channel\": \"portal\" }\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"GRANTED\", () => pm.expect(pm.response.json().decision_outcome).to.eql(\"GRANTED\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List the conditions in force",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/abac-rules",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "abac-rules"
+              ]
+            },
+            "description": "Includes platform-wide rules (tenant_id null) alongside the tenant's own — both deny identically, and hiding the ones a tenant operator cannot edit would make a denial unexplainable."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Retire the condition",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/abac-rules/{{abacRuleId}}/retire",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "abac-rules",
+                "{{abacRuleId}}",
+                "retire"
+              ]
+            },
+            "description": "The off switch. active_flag is in the evaluation predicate, and until this route existed nothing could reach it."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "channel=fax -> GRANTED once more",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "Proves the retirement is a control and not a label. May take up to AUTHZ_CACHE_TTL_SECONDS if another replica served the retire.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"publisher-dana\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"DOC_PUBLISH\",\n  \"tenant_id\": \"{{tenantId}}\",\n  \"attributes\": { \"channel\": \"fax\" }\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"GRANTED\", () => pm.expect(pm.response.json().decision_outcome).to.eql(\"GRANTED\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reactivate it",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/abac-rules/{{abacRuleId}}/reactivate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "abac-rules",
+                "{{abacRuleId}}",
+                "reactivate"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Unsupported operator -> 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/abac-rules",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "abac-rules"
+              ]
+            },
+            "description": "An operator the evaluator cannot execute is refused at CREATION rather than discovered when a request is denied by a rule nobody can evaluate.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"rule_code\": \"BAD_OPERATOR\",\n  \"action_type\": \"DOC_PUBLISH\",\n  \"effect\": \"FORBID\",\n  \"attribute_key\": \"channel\",\n  \"operator\": \"regex_match\",\n  \"attribute_value\": \"^fax$\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "07 - The registers (every admin read)",
+      "description": "All five admin reads. Each is authenticated and tenant-scoped: an assignment names a principal and the role they hold, and a SoD rule names where the segregation tripwires are.\n\nThe tenant comes from the VERIFIED X-Tenant-Id header, never from a query parameter — so no filter here can widen the scope.",
+      "item": [
+        {
+          "name": "Roles in this tenant",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles"
+              ]
+            },
+            "description": "Includes retired roles by default: a retired role is the reason access somebody used to hold is gone. Add ?active_only=true to narrow."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "What one role permits",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles/{{roleId}}/permission-bundles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles",
+                "{{roleId}}",
+                "permission-bundles"
+              ]
+            },
+            "description": "permitted_actions was write-only until this route existed — a role could be created and there was no way to read what it granted."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Live grants",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/role-assignments",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "role-assignments"
+              ]
+            },
+            "description": "Active only by default, which is what a revoke decision needs. ?include_expired=true adds the history."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "The delegation register",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/delegated-authorities",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "delegated-authorities"
+              ]
+            },
+            "description": "Locally-authored rows and rows PROJECTED from delegated-authority-svc's authority.* events. source_service tells them apart."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Conflict rules that will deny here",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/sod-rules",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "sod-rules"
+              ]
+            },
+            "description": "The tenant's own rules AND the globally-applicable ones (tenant_id null). Both deny identically; listing only the tenant's own would show a shorter rule set than the one actually refusing requests."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No tenant header -> 401",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminPrincipal}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": ""
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles?active_only=true",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles"
+              ],
+              "query": [
+                {
+                  "key": "active_only",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Sent with the tenant header deliberately removed. 'You did not identify your organisation' is an authentication problem, distinct from the 400 below."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Malformed tenant header -> 400 invalid_scope, not 503",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminPrincipal}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": "acme-corp"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles"
+              ]
+            },
+            "description": "tenant_id is a uuid column and withRLS installs the raw value into app.tenant_id, where the POLICY casts it — so a malformed tenant used to fail inside row security and surface as 503 store_unavailable, which reads to a caller as this service being down. Now a 400 naming the header."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"names the header\", () => pm.expect(pm.response.json().field).to.eql(\"X-Tenant-Id\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "08 - Off switches (retire / reactivate)",
+      "description": "Three objects carry an active_flag that sits in an evaluation predicate, and for a long time no route could reach any of them: a role, a permission bundle, or a conflict rule could be created and never withdrawn.\n\nThe blast radii differ and the routes are separate because of it. Retiring a ROLE suspends every action it grants for everybody holding it; withdrawing one BUNDLE removes only that bundle's actions and leaves the role's others in force.",
+      "item": [
+        {
+          "name": "Retire the buyer role",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles/{{roleId}}/retire",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles",
+                "{{roleId}}",
+                "retire"
+              ]
+            },
+            "description": "Suspends the role for every holder. Not a delete — assignments referencing it must stay resolvable for audit history."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PO_ISSUE -> DENIED no_grant",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "The retirement is a control, not a label.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const b = pm.response.json();",
+                  "pm.test(\"DENIED\", () => pm.expect(b.decision_outcome).to.eql(\"DENIED\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reactivate it",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/roles/{{roleId}}/reactivate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "roles",
+                "{{roleId}}",
+                "reactivate"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PO_ISSUE -> GRANTED again",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"GRANTED\", () => pm.expect(pm.response.json().decision_outcome).to.eql(\"GRANTED\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Withdraw one permission bundle",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/permission-bundles/{{bundleId}}/retire",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "permission-bundles",
+                "{{bundleId}}",
+                "retire"
+              ]
+            },
+            "description": "Narrower than retiring the role. Needs bundleId — folder 07's bundle read captures it."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200 or 404\", () => pm.expect([200,404]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Restore it",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/permission-bundles/{{bundleId}}/reactivate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "permission-bundles",
+                "{{bundleId}}",
+                "reactivate"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200 or 404\", () => pm.expect([200,404]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Retire the SoD rule",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/sod-rules/{{sodRuleId}}/retire",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "sod-rules",
+                "{{sodRuleId}}",
+                "retire"
+              ]
+            },
+            "description": "Stops the conflict being enforced. Withdrawing a segregation-of-duties control should be a decision somebody has taken, not a way to unblock a grant."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200 or 404\", () => pm.expect([200,404]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reactivate the SoD rule",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/admin/sod-rules/{{sodRuleId}}/reactivate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "admin",
+                "sod-rules",
+                "{{sodRuleId}}",
+                "reactivate"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200 or 404\", () => pm.expect([200,404]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "09 - The decision history (searchable)",
+      "description": "Doc 03 section 8.3 sets two evidence obligations: every decision logged with actor, action, basis and outcome, and separately, denials must be EVIDENTIALLY RETRIEVABLE.\n\nThe first held from the first migration. The second did not, because GET /v1/access-decisions/{id} was the only read — and retrieval by primary key only serves somebody who already holds the key. A denial's key exists in exactly one place: the response handed to the service that was refused. So auditing a denial began by reading the CALLING service's logs.\n\nNewest first, keyset-paginated. OFFSET would be wrong here: the log takes a row for every permission check on the platform, so a row inserted while somebody is paging would shift every later page and silently drop one decision while repeating another.",
+      "item": [
+        {
+          "name": "Every recorded check, newest first",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?limit=25",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "25"
+                }
+              ]
+            },
+            "description": "Decisions recorded with NO tenant are invisible here — the callers that do not yet forward an envelope. They cannot be attributed to an organisation, so serving them to one would be a guess."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"has decisions array\", () => pm.expect(b.decisions).to.be.an(\"array\"));",
+                  "if (b.next_cursor) { pm.collectionVariables.set(\"decisionCursor\", b.next_cursor); }"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Refusals only",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?decision_outcome=DENIED&limit=10",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "decision_outcome",
+                  "value": "DENIED"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "The query the evidence obligation actually names, and what migration 000012's index exists for: DENIED is a small minority of a very large table."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const ds = pm.response.json().decisions || [];",
+                  "pm.test(\"all denied\", () => ds.forEach(d => pm.expect(d.decision_outcome).to.eql(\"DENIED\")));",
+                  "pm.test(\"each names a reason\", () => ds.forEach(d => pm.expect(d.decision_basis).to.not.be.empty));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "One principal's history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?principal_id={{buyerPrincipal}}&limit=10",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "principal_id",
+                  "value": "{{buyerPrincipal}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "10"
+                }
+              ]
+            },
+            "description": "Served by migration 000009's (principal_id, decided_at DESC) index."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Continue from the cursor",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?limit=25&cursor={{decisionCursor}}",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "25"
+                },
+                {
+                  "key": "cursor",
+                  "value": "{{decisionCursor}}"
+                }
+              ]
+            },
+            "description": "The cursor is opaque and forward-only. Run the first request in this folder before this one, or decisionCursor is unset and this reads page one."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Mistyped outcome -> 400, not an empty page",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?decision_outcome=DENY",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "decision_outcome",
+                  "value": "DENY"
+                }
+              ]
+            },
+            "description": "Refused rather than matched against nothing. On an AUDIT read, 'this organisation refused nobody' and 'your filter was a typo' must not be the same answer — somebody could close an investigation on the difference."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"names the field\", () => pm.expect(pm.response.json().field).to.eql(\"decision_outcome\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Forged cursor -> 400",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?cursor=bm90LWEtY3Vyc29y",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "cursor",
+                  "value": "bm90LWEtY3Vyc29y"
+                }
+              ]
+            },
+            "description": "A token this service did not issue is refused, not silently reset to page one — that would hand an auditor the newest page while they believed they were continuing through the oldest."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Malformed company filter -> 400 invalid_filter",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?legal_entity_id=not-a-uuid",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "legal_entity_id",
+                  "value": "not-a-uuid"
+                }
+              ]
+            },
+            "description": "legal_entity_id is compared as a uuid, so this used to be a driver error reported as 503."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Inverted date window -> 400",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?decided_from=2026-09-30T00:00:00Z&decided_to=2026-09-01T00:00:00Z",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "decided_from",
+                  "value": "2026-09-30T00:00:00Z"
+                },
+                {
+                  "key": "decided_to",
+                  "value": "2026-09-01T00:00:00Z"
+                }
+              ]
+            },
+            "description": "Returns nothing, and nothing is a legitimate answer to a well-formed question — so it is refused instead."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "No tenant header -> 401",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "X-Principal-Id",
+                "value": "{{adminPrincipal}}"
+              },
+              {
+                "key": "X-Tenant-Id",
+                "value": ""
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ]
+            },
+            "description": "This is the who-tried-to-do-what map for a whole organisation. A denial's basis names the SoD rule that fired, so an unscoped listing would hand a reader the location of every tripwire on the platform."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 401\", () => pm.response.to.have.status(401));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "10 - Pre-flight checks (the other three section 8.3 APIs)",
+      "description": "Doc 03 section 8.3 lists five inbound APIs. Three of them — validate entity scope, validate SoD conflicts, evaluate delegated access — were folded into /v1/authorize as internal layers and had no HTTP surface, which left three questions unanswerable.\n\nNONE OF THESE RECORDS A DECISION ARTIFACT. The decision log means 'one row per authorization of a material act', and these answer questions ABOUT the grant graph rather than authorizing anything — rows from them would make that meaning false, and that meaning is what an auditor reads it for. So they are safe to call repeatedly while somebody is still deciding, unlike /v1/authorize.\n\nAll three are POSTs because each takes a body, and all three are classified as NON-WRITES, so no Idempotency-Key is sent or required.",
+      "item": [
+        {
+          "name": "Which companies may this person act in?",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/entity-scope/validate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "entity-scope",
+                "validate"
+              ]
+            },
+            "description": "One call for a whole list. The same question through /v1/authorize is one call per company AND one decision-log row per company — twelve audit records written to grey out four buttons.\n\nOmitting action_type asks the broad question and returns everything they hold in each company. Delegated authority counts as in scope.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_ids\": [\n    \"{{entityId}}\",\n    \"33330000-0000-4000-8000-000000000009\",\n    \"PLATFORM\"\n  ]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const rs = pm.response.json().results;",
+                  "pm.test(\"one result per company asked about\", () => pm.expect(rs).to.have.lengthOf(3));",
+                  "pm.test(\"order matches the request\", () => pm.expect(rs[2].legal_entity_id).to.eql(\"PLATFORM\"));",
+                  "pm.test(\"each carries a reason\", () => rs.forEach(r => pm.expect(r.basis).to.not.be.empty));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Narrowed to one action",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/entity-scope/validate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "entity-scope",
+                "validate"
+              ]
+            },
+            "description": "permitted_actions is suppressed on the narrow question: a caller asking about one action has not asked for the person's whole permission map.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_ids\": [\"{{entityId}}\"],\n  \"action_type\": \"PO_ISSUE\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"no full action list\", () => pm.expect(pm.response.json().results[0].permitted_actions).to.be.undefined);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Would this bundle breach separation of duties?",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/sod/validate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "sod",
+                "validate"
+              ]
+            },
+            "description": "The question /v1/authorize structurally cannot answer. A breach is a COMBINATION, so it only becomes visible once the combination exists — which meant the only way to discover a role must not be granted was to grant it and watch every use of it be refused.\n\nNo principal named, so this asks whether the SET conflicts with ITSELF. Folder 03 created the PO_ISSUE/PO_APPROVE rule, so expect a conflict with source 'candidate' — the bundle has to be split.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"candidate_actions\": [\"PO_ISSUE\", \"PO_APPROVE\"]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"conflict found\", () => pm.expect(b.conflict_free).to.eql(false));",
+                  "pm.test(\"source says which remedy applies\", () => pm.expect(b.conflicts[0].source).to.be.oneOf([\"candidate\",\"held\"]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Would this person be allowed to hold it?",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/sod/validate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "sod",
+                "validate"
+              ]
+            },
+            "description": "With a principal AND a company, the candidates are checked against what they already hold — including anything lent by a delegation, which conflicts just as hard. Excluding delegations here would clear a grant the evaluation engine then refuses.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"candidate_actions\": [\"PO_APPROVE\"]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"answers conflict_free\", () => pm.expect(pm.response.json()).to.have.property(\"conflict_free\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "A person with no company -> 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/sod/validate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "sod",
+                "validate"
+              ]
+            },
+            "description": "Refused rather than downgraded to the bundle-only question. Grants are entity-scoped, so answering the narrower question instead would return conflict_free:true for somebody who DOES conflict — a false all-clear on a control.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"candidate_actions\": [\"PO_APPROVE\"]\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"names the missing field\", () => pm.expect(pm.response.json().field).to.eql(\"legal_entity_id\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Own authority or borrowed?",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/delegated-access/evaluate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "delegated-access",
+                "evaluate"
+              ]
+            },
+            "description": "held_directly is the field that makes this route worth having. /v1/authorize returns one GRANTED for both paths and names RBAC as the basis when both apply — so somebody holding an action directly AND by delegation reads as ordinary role-based access. For a four-eyes step that has to know whether the delegate or the delegator satisfied it, that is the whole question.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{delegatePrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_APPROVE\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"answers has_delegated_access\", () => pm.expect(b).to.have.property(\"has_delegated_access\"));",
+                  "pm.test(\"carries a basis\", () => pm.expect(b.basis).to.not.be.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Everything lent in this company",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/delegated-access/evaluate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "delegated-access",
+                "evaluate"
+              ]
+            },
+            "description": "delegated_actions is already intersected with the lenders' LIVE grants by the service, so it can never list an action a lender no longer holds.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{delegatePrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Malformed company -> 400 invalid_scope",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/delegated-access/evaluate",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "delegated-access",
+                "evaluate"
+              ]
+            },
+            "description": "Every route taking a scope validates it. A 503 here would read to a caller as the authorization plane being down.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{delegatePrincipal}}\",\n  \"legal_entity_id\": \"not-a-uuid\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"invalid_scope\", () => pm.expect(pm.response.json().error).to.eql(\"invalid_scope\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "11 - Layer 0: principal status (event-driven, no HTTP route)",
+      "description": "A principal that identity-context-svc has SUSPENDED or DISABLED may execute NOTHING — refused before any grant is even looked up, with decision_basis principal_status:SUSPENDED.\n\nThis closes a hole session eviction does not. identity-context-svc evicts SESSIONS on principal.status.changed, so a suspended human cannot log in — but /v1/authorize is called east-west by 111 services on envelopes resolved BEFORE the suspension, and by scheduled and queued work that carries a principal and no session at all.\n\nTHERE IS DELIBERATELY NO ROUTE TO SET IT. identity-context-svc is authoritative for whether an account is active; an admin route here would let two services disagree about who is suspended. This service consumes principal.status.changed from zoiko.identity.events into a read-model.\n\nTO EXERCISE IT BY HAND, publish to the topic:\n\n  docker exec -i zoiko-kafka /opt/kafka/bin/kafka-console-producer.sh \\\n    --bootstrap-server localhost:9094 --topic zoiko.identity.events\n\nthen paste one line:\n\n  {\"event_id\":\"m-1\",\"event_type\":\"principal.status.changed\",\n   \"tenant_id\":\"<tenantId>\",\"payload\":{\"principal_id\":\"buyer-alice\",\n   \"tenant_id\":\"<tenantId>\",\"new_status\":\"SUSPENDED\"}}\n\nSend new_status ACTIVE to reinstate. The role assignments are never touched — that is why this is a projection and not a revocation: SUSPENDED is reversible and effective_to is not.\n\nNO ROW MEANS ACTIVE, so on a stack that has seen no status event this layer changes no outcome at all.",
+      "item": [
+        {
+          "name": "Check the gate (run after publishing SUSPENDED)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "Expect DENIED with decision_basis principal_status:SUSPENDED. Before any status event has been published this answers exactly as folder 02 did, which is the point of the empty-projection default.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "if (b.decision_basis && b.decision_basis.indexOf(\"principal_status:\") === 0) {",
+                  "  pm.test(\"denied by layer 0\", () => pm.expect(b.decision_outcome).to.eql(\"DENIED\"));",
+                  "} else {",
+                  "  console.log(\"No status projected for this principal — layer 0 is inert, which is the default. Basis: \" + b.decision_basis);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "The refusal is findable in the history",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{authzUrl}}/v1/access-decisions?decision_outcome=DENIED&principal_id={{buyerPrincipal}}&limit=5",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "access-decisions"
+              ],
+              "query": [
+                {
+                  "key": "decision_outcome",
+                  "value": "DENIED"
+                },
+                {
+                  "key": "principal_id",
+                  "value": "{{buyerPrincipal}}"
+                },
+                {
+                  "key": "limit",
+                  "value": "5"
+                }
+              ]
+            },
+            "description": "A suspended principal being refused is exactly the evidence section 8.3 requires, so the layer-0 denial goes through the same record-and-publish path as every other outcome rather than short-circuiting the artifact."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "12 - Scope validation (a typo is a 400, not an outage)",
+      "description": "legal_entity_id and tenant_id are UUID in every table this service compares them against, and passing a non-UUID to a uuid comparison is a DRIVER error — which the store wraps as ErrStoreUnavailable and every handler answers 503 for.\n\nFrom a calling service that 503 is indistinguishable from authorization-svc being down, so a caller that mistyped an entity id was told the platform's authorization plane had failed. known-gaps.md recorded it and put the remedy on the CALLERS — 'callers must validate the scope themselves before asking' — which is the wrong place: the workaround has to be written 111 times and any caller that forgets reports an outage instead of a typo.\n\nprincipal_id is deliberately NOT validated. It is TEXT in every table and compared as text, so a malformed one is a valid comparison that matches nothing — and refusing it would break every service account, whose ids are not UUIDs.",
+      "item": [
+        {
+          "name": "Malformed legal_entity_id -> 400 invalid_scope",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"not-a-uuid\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "const b = pm.response.json();",
+                  "pm.test(\"invalid_scope\", () => pm.expect(b.error).to.eql(\"invalid_scope\"));",
+                  "pm.test(\"names legal_entity_id\", () => pm.expect(b.field).to.eql(\"legal_entity_id\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Malformed body tenant_id -> 400 naming tenant_id",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "The body fallback is the pre-header calling convention ~86 callers still use. The message names the BODY field, because a caller told a header is wrong would look for one it never set.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"acme\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"names tenant_id\", () => pm.expect(pm.response.json().field).to.eql(\"tenant_id\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "A non-UUID principal is ACCEPTED",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "The other half, and the one it would be wrong to get wrong. Expect 200 with DENIED no_grant — evaluated properly, just holding nothing.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"svc-accounts-payable\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"evaluated, not refused\", () => pm.expect(pm.response.json()).to.have.property(\"decision_outcome\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PLATFORM is not refused as malformed",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "The sentinel is not a UUID and must not be rejected as one — a platform-wide act needs somewhere to put itself. Resolves to AUTHZ_PLATFORM_SCOPE_ENTITY_ID; a deployment without it answers 400 platform_scope_not_configured rather than inventing an id.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"PLATFORM\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"{{tenantId}}\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 or 400 platform_scope_not_configured\", () => {",
+                  "  if (pm.response.code === 400) {",
+                  "    pm.expect(pm.response.json().error).to.eql(\"platform_scope_not_configured\");",
+                  "  } else {",
+                  "    pm.expect(pm.response.code).to.eql(200);",
+                  "  }",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Body tenant disagreeing with the header -> 403",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{authzUrl}}/v1/authorize",
+              "host": [
+                "{{authzUrl}}"
+              ],
+              "path": [
+                "v1",
+                "authorize"
+              ]
+            },
+            "description": "Checked BEFORE the malformed-value check, deliberately: telling a caller its value is malformed when the real problem is that it is trying to be evaluated in somebody else's scope would hide the more serious of the two.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"principal_id\": \"{{buyerPrincipal}}\",\n  \"legal_entity_id\": \"{{entityId}}\",\n  \"action_type\": \"PO_ISSUE\",\n  \"tenant_id\": \"99990000-0000-4000-8000-000000000009\"\n}"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 403\", () => pm.response.to.have.status(403));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 section 4).",
+          "//",
+          "// authorization-svc mounts the envelope middleware ahead of EVERY route and",
+          "// ZS_ENVELOPE_ENFORCEMENT defaults to write-strict, so every /v1/admin/* write",
+          "// needs the full envelope or it answers 401 envelope_incomplete. Before this",
+          "// script existed every request here sent only Content-Type and",
+          "// X-Correlation-ID, which meant all fourteen writes in this collection were",
+          "// refused and the 'runnable flow' in the description was not runnable.",
+          "//",
+          "// Set here rather than on each of ~50 items: one definition, and a request",
+          "// added later inherits it. Nothing is overwritten — an item that sets its own",
+          "// X-Correlation-ID keeps it, which is how the per-step pm-N values survive.",
+          "const need = (k, v) => {",
+          "  if (v && !pm.request.headers.has(k)) {",
+          "    pm.request.headers.add({ key: k, value: v });",
+          "  }",
+          "};",
+          "",
+          "const slug = String(pm.info.requestName || 'req').replace(/[^A-Za-z0-9]+/g, '-').slice(0, 48);",
+          "",
+          "// The five unconditionally mandatory fields, plus the entity.",
+          "need('X-Tenant-Id', pm.collectionVariables.get('tenantId'));",
+          "need('X-Principal-Id', pm.collectionVariables.get('adminPrincipal'));",
+          "need('X-Legal-Entity-Id', pm.collectionVariables.get('entityId'));",
+          "need('X-Source-Channel', 'system');",
+          "need('X-Request-Id', 'pm-' + slug);",
+          "need('X-Correlation-ID', 'pm-' + slug);",
+          "",
+          "// Idempotency-Key is required on MATERIAL WRITES only. The four POSTs below",
+          "// are classified as non-writes by handler.MaterialWrite (see",
+          "// internal/handler/envelope_policy.go) because they change no business",
+          "// state: /v1/authorize writes only the audit record OF the question, and the",
+          "// three pre-flight routes write nothing at all. Sending a key there would",
+          "// imply replay protection on a question, which is backwards — two identical",
+          "// questions must produce two log rows.",
+          "const NON_WRITES = /\\/v1\\/(authorize|entity-scope\\/validate|sod\\/validate|delegated-access\\/evaluate)$/;",
+          "const path = '/' + pm.request.url.getPath().replace(/^\\/+/, '');",
+          "if (pm.request.method === 'POST' && !NON_WRITES.test(path)) {",
+          "  need('Idempotency-Key', 'pm-' + slug + '-1');",
+          "}"
+        ]
+      }
     }
   ]
 }

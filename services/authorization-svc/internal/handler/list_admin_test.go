@@ -27,7 +27,7 @@ func TestListRoleAssignments_RequiresPrincipal(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/role-assignments", nil)
-	req.Header.Set("X-Tenant-Id", "tenant-1") // tenant present, principal absent
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111") // tenant present, principal absent
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -65,14 +65,14 @@ func TestListRoleAssignments_TenantComesFromHeaderNotQuery(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/role-assignments?tenant_id=someone-elses-tenant", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if store.gotAssignTenant != "tenant-1" {
+	if store.gotAssignTenant != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("store scoped to %q; a query param overrode the verified header", store.gotAssignTenant)
 	}
 }
@@ -84,7 +84,7 @@ func TestListRoleAssignments_ForwardsFilters(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet,
 		"/v1/admin/role-assignments?principal_id=p-9&role_id=r-7", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -108,7 +108,7 @@ func TestListRoleAssignments_ActiveOnlyByDefault(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/role-assignments", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	r.ServeHTTP(httptest.NewRecorder(), req)
 
 	if !store.gotAssignActiveOnly {
@@ -119,7 +119,7 @@ func TestListRoleAssignments_ActiveOnlyByDefault(t *testing.T) {
 	r2 := newTestRouter(store2)
 	req2 := httptest.NewRequest(http.MethodGet, "/v1/admin/role-assignments?include_expired=true", nil)
 	req2.Header.Set("X-Principal-Id", "admin-1")
-	req2.Header.Set("X-Tenant-Id", "tenant-1")
+	req2.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	r2.ServeHTTP(httptest.NewRecorder(), req2)
 
 	if store2.gotAssignActiveOnly {
@@ -135,7 +135,7 @@ func TestListRoleAssignments_EmptyIsArrayNotNull(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/role-assignments", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -157,7 +157,7 @@ func TestListRoleAssignments_ReturnsRows(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/role-assignments", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -181,7 +181,7 @@ func TestListRoleAssignments_StoreUnavailableIs503(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/role-assignments", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -197,7 +197,7 @@ func TestListSoDRules_RequiresPrincipalAndTenant(t *testing.T) {
 		name    string
 		headers map[string]string
 	}{
-		{"no principal", map[string]string{"X-Tenant-Id": "tenant-1"}},
+		{"no principal", map[string]string{"X-Tenant-Id": "11111111-1111-4111-8111-111111111111"}},
 		{"no tenant", map[string]string{"X-Principal-Id": "admin-1"}},
 		{"neither", map[string]string{}},
 	} {
@@ -230,14 +230,14 @@ func TestListSoDRules_ScopedToVerifiedTenant(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/sod-rules", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if store.gotSoDTenant != "tenant-1" {
+	if store.gotSoDTenant != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("store scoped to %q, want tenant-1", store.gotSoDTenant)
 	}
 	var decoded []domain.SoDRule
@@ -255,7 +255,7 @@ func TestListSoDRules_EmptyIsArrayNotNull(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/sod-rules", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -270,7 +270,7 @@ func TestListSoDRules_StoreUnavailableIs503(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/sod-rules", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

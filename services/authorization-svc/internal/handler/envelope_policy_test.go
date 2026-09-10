@@ -37,7 +37,7 @@ func grantingStore() *stubStore {
 	}
 }
 
-const authorizeBody = `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+const authorizeBody = `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 
 func postAuthorize(t *testing.T, r chi.Router, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -55,12 +55,12 @@ func postAuthorize(t *testing.T, r chi.Router, headers map[string]string) *httpt
 func fullEnvelope() map[string]string {
 	return map[string]string{
 		"Content-Type":                   "application/json",
-		svcenvelope.HeaderTenantID:       "t-1",
+		svcenvelope.HeaderTenantID:       "11111111-1111-4111-8111-111111111111",
 		svcenvelope.HeaderActorSubjectID: "p-caller",
 		svcenvelope.HeaderRequestID:      "req-1",
 		svcenvelope.HeaderCorrelationID:  "corr-1",
 		svcenvelope.HeaderSourceChannel:  string(svcenvelope.ChannelSystem),
-		svcenvelope.HeaderLegalEntityID:  "le-1",
+		svcenvelope.HeaderLegalEntityID:  "11111111-1111-4111-8111-aaaaaaaaaaa1",
 		svcenvelope.HeaderIdempotencyKey: "req-1:PAYMENT_APPROVE",
 	}
 }
@@ -194,7 +194,7 @@ func TestEnvelope_Authorize_StrictMode_NoIdempotencyKeyDemanded(t *testing.T) {
 
 	w := postAuthorize(t, r, map[string]string{
 		"Content-Type":                   "application/json",
-		svcenvelope.HeaderTenantID:       "t-1",
+		svcenvelope.HeaderTenantID:       "11111111-1111-4111-8111-111111111111",
 		svcenvelope.HeaderActorSubjectID: "p-caller",
 		svcenvelope.HeaderRequestID:      "req-1",
 		svcenvelope.HeaderCorrelationID:  "corr-1",
@@ -281,9 +281,9 @@ func TestMaterialWrite_Classification(t *testing.T) {
 // non-migrated caller has.
 func TestEnvelope_ValidationRoutes_NoEnvelope_AdmittedUnderWriteStrict(t *testing.T) {
 	cases := []struct{ path, body string }{
-		{handler.EntityScopeValidatePath, `{"principal_id":"p-1","legal_entity_ids":["le-1"]}`},
+		{handler.EntityScopeValidatePath, `{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"]}`},
 		{handler.SoDValidatePath, `{"candidate_actions":["PAYMENT_APPROVE"]}`},
-		{handler.DelegatedAccessEvaluatePath, `{"principal_id":"p-1","legal_entity_id":"le-1"}`},
+		{handler.DelegatedAccessEvaluatePath, `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1"}`},
 	}
 
 	for _, c := range cases {
@@ -293,7 +293,7 @@ func TestEnvelope_ValidationRoutes_NoEnvelope_AdmittedUnderWriteStrict(t *testin
 			req := httptest.NewRequest(http.MethodPost, c.path, bytes.NewBufferString(c.body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("X-Principal-Id", "p-caller")
-			req.Header.Set("X-Tenant-Id", "t-1")
+			req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -347,7 +347,7 @@ func TestEnvelope_ValidationRoutes_StrictMode_StillRefused(t *testing.T) {
 
 			req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(`{}`))
 			req.Header.Set(svcenvelope.HeaderActorSubjectID, "p-caller")
-			req.Header.Set(svcenvelope.HeaderTenantID, "t-1")
+			req.Header.Set(svcenvelope.HeaderTenantID, "11111111-1111-4111-8111-111111111111")
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 
@@ -377,7 +377,7 @@ func TestEnvelope_ListAccessDecisions_NoEnvelope_Admitted(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, handler.AccessDecisionsPath, nil)
 	req.Header.Set("X-Principal-Id", "p-auditor")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

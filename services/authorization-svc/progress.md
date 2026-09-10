@@ -1513,3 +1513,553 @@ list, unchanged:
   that principal exists to be realistic.
 - **The store integration suite still does not run** — the same
   `TEST_DATABASE_URL` caveat as pass six, unchanged.
+---
+
+# Eighth pass — 2026-09-10
+
+The pass that was asked to close the service end to end, so this one is
+structured as an audit against Doc 03 §8.3 rather than around a single defect.
+Five things were found. Two of them were errors in this file.
+
+## The two things this file got wrong
+
+**1. Three "unconsumed events with no producer" have producers.** Carried since
+the first pass and repeated in every "Still open" list since, including the
+seventh: `role.assigned`, `employment.changed` and `entity.scope.updated` "have
+no producer anywhere on the estate", so consuming them "would still be dead
+infrastructure".
+
+That conclusion came from grepping the **spec's** event names. The platform
+publishes all three concepts under concrete names, and a grep for those finds
+them immediately:
+
+| §8.3 name | what is actually published | topic |
+|---|---|---|
+| `role.assigned` | `role.created`, `role.updated`, `permission.bundle.updated` — access-control-svc | `zoiko.access-control.events` |
+| `employment.changed` | `principal.status.changed` — identity-context-svc | `zoiko.identity.events` |
+| `entity.scope.updated` | `entity.status.changed`, `entity.hierarchy.changed`, `entity.jurisdiction.changed` — tenant-entity-registry-svc | `zoiko.entity.events` |
+
+This is the same shape as the sixth pass's `MaterialWrite` error, and worth
+naming as such: a measurement was taken correctly and then the *inference* from
+it was made on paper. There, a violation list was read as ruling out an override
+without reading the fifteen lines of middleware that decide refusal. Here, a
+spec's vocabulary was searched for instead of the producers' code being read.
+Both times the answer was one grep away from the thing already being looked at.
+
+The error is left in `internal/events/consumer.go`'s comment with the correction
+underneath it rather than edited out, because the shape recurs.
+
+**2. `employee.terminated` is the one candidate that genuinely cannot be
+consumed, and the reason is worth recording** rather than leaving as a silent
+omission. Both employee-master-svc and offboarding-severance-svc publish it, and
+its payload names an `employee_id`. There is **no employee-to-principal mapping
+anywhere on this estate** — employee-master-svc's schema carries no
+`principal_id` or `user_id` column at all. So the event says somebody left and
+this service cannot tell whose authority that is about. Consuming it on a guessed
+join would end the wrong principal's grants, silently, on the platform's
+authorization plane. That is an identity-mapping gap, not a missing consumer, and
+it is now recorded in `known-gaps.md` as the former.
+
+## Layer 0 — a suspended principal could do everything they held
+
+§8.3's first sentence is "determines whether a principal may execute a specific
+action". A principal identity-context-svc has SUSPENDED or DISABLED may execute
+nothing, and this service had no way to know that: their grants resolved exactly
+as before.
+
+The obvious objection is that identity-context-svc already evicts SESSIONS on
+`principal.status.changed`, so a suspended human cannot log in. True, and not the
+same control. This endpoint is called east-west, service to service, 111 callers
+deep, on requests whose identity envelope was resolved *before* the suspension,
+and by scheduled and queued work that carries a principal and no session at all.
+Session eviction closes the front door; nothing closed this one.
+
+`principal_status_projection` (migration `000013`) is the read-model, and
+`/v1/authorize` consults it as **layer 0**, before RBAC. Four decisions in it are
+load-bearing:
+
+- **A projection, not a revocation.** The tempting implementation is to end the
+  principal's role assignments on suspension. SUSPENDED is reversible and
+  `effective_to` is not — ending them would mean an unsuspension restored
+  nothing and somebody would have to reconstruct by hand what the principal used
+  to hold. Verified on the wire: after suspend → reinstate, the principal's five
+  assignments were untouched and every grant resolved again.
+- **Absence means ACTIVE.** The table ships empty and changes no outcome until a
+  status event arrives — the same shape `abac_rules` ships in. This is the one
+  fail-OPEN default in a service that fails closed everywhere else, and it is
+  correct here: the alternative denies every principal on the platform until a
+  status event happens to arrive for them, which is a total outage of the
+  authorization plane on first deploy. The gate can only ever take access away
+  from a principal an authoritative service has explicitly said is not active.
+- **A missing table also answers ACTIVE.** `FindPrincipalStatus` matches
+  SQLSTATE 42P01 and returns ACTIVE with a WARN. Without it, reverting `000013`
+  on a live service would 503 every authorization call on the platform — a
+  rollback that takes the authorization plane down is not a rollback. There is a
+  test that drops the table and asserts both code paths stay inert.
+- **The tenantless caller is gated too.** 86 of 111 callers send no
+  `X-Tenant-Id`. A gate that only applied to the other 25 would be escapable by
+  omitting a header, so a tenantless read runs under `app.platform_scope` and
+  takes the **most restrictive** row — `ORDER BY (status <> 'ACTIVE') DESC`.
+  Verified: with the principal suspended, both the tenant-scoped and the
+  tenantless call answered `DENIED principal_status:SUSPENDED`.
+
+The denial is **recorded and published** like every other outcome, through a
+`recordAndAnswer` extracted for the purpose — a suspended principal being
+refused is exactly the evidence §8.3 asks for. It is deliberately not prefixed
+`sod:`, because that prefix is what makes the handler publish
+`sod.violation.detected`, and a suspended principal is not a duty conflict.
+
+## "Denials must be evidentially retrievable" was not true
+
+§8.3 sets two evidence obligations. "Every decision logged with actor, action,
+basis, and outcome" has held since `000001`. "Denials must be evidentially
+retrievable" had not, and the gap was not in the schema — it was that
+`FindAccessDecisionByID` was the only read.
+
+Retrieval by primary key is retrieval only for somebody who already holds the
+key, and a denial's key exists in exactly one place: the response handed to the
+service that was refused. So auditing a denial began by reading the **calling**
+service's logs to find a UUID to bring back to this one. The console's own
+lookup box said so in its hint text: "take it from the answer a check gave you,
+or from the service that was refused — the reference is in its logs."
+
+`GET /v1/access-decisions` closes it — filterable by principal, outcome, action,
+entity and date window, keyset-paginated newest-first.
+
+**Keyset, not offset, and that is not a preference here.** This table takes one
+row per authorization evaluation platform-wide. OFFSET makes the database walk
+and discard every skipped row, and — worse — the log is append-only and
+constantly appended to, so a row inserted during paging shifts every subsequent
+offset and an auditor silently never sees one decision while seeing another
+twice. There is an integration test that inserts a decision between page one and
+page two and asserts page two is unmoved.
+
+`access_decision_id` is the tie-breaker because `decided_at` is not unique: 111
+services call this concurrently and two decisions can share a timestamp.
+
+**Migration `000012` is an index SWAP, not an addition.** `000009`'s
+`(tenant_id, decided_at DESC)` is a strict prefix of
+`(tenant_id, decision_outcome, decided_at DESC)`, so the old one is dropped.
+Index count matters more on this table than anywhere else on the platform —
+every index is maintained on the hottest write in the estate — so adding a fifth
+to buy an audit query would have charged every service's write latency for a
+read that runs when an auditor asks. Replacing a prefix is count-neutral.
+
+## The other three §8.3 inbound APIs had no surface
+
+§8.3 lists five inbound APIs. Three were folded into `/v1/authorize` as internal
+layers and recorded as a deliberate simplification on the grounds that "the
+capabilities exist, just not as separate HTTP surface".
+
+The capabilities do exist. What folding them cost is three questions that
+`/v1/authorize` **structurally cannot answer**, each one asked *before* a
+material action rather than about one:
+
+- **`POST /v1/entity-scope/validate`** — "which of these companies may this
+  principal act in?" Through `/v1/authorize` that is one call per (entity,
+  action) pair *and*, because every evaluation records its artifact, N rows in
+  `access_decision_log` for a question nobody acted on. A console listing twelve
+  entities would write twelve decision artifacts to grey out four buttons.
+- **`POST /v1/sod/validate`** — "would granting this role to this person breach
+  separation of duties?" A breach is a **combination**, so `/v1/authorize` can
+  only see one after it already exists. The only way to discover that a role
+  must not go to somebody was to grant it and then watch every use of it be
+  refused: the control working and the workflow failing, leaving a live
+  assignment that confers nothing and no explanation until somebody read a
+  decision log. It also checks the candidates against **each other**, because a
+  bundle carrying both halves of a pair grants both to everyone who holds the
+  role and then refuses them both.
+- **`POST /v1/delegated-access/evaluate`** — "is this principal acting on their
+  own authority or somebody else's?" `/v1/authorize` collapses both into one
+  GRANTED and names RBAC as the basis when both apply, so a principal who holds
+  an action *both* directly and by delegation reads as pure RBAC. For a
+  four-eyes step that has to know whether the delegate or the delegator
+  satisfied it, that is the whole question — `held_directly` is the field that
+  answers it.
+
+**None of the three records a decision artifact**, and that is the point rather
+than an omission. `access_decision_log` means "one row per authorization of a
+material act", and that meaning is what an auditor reads it for. All three
+therefore require a verified principal and tenant, on the same footing as the
+admin reads, and all three log what was asked — authenticated and logged rather
+than unauthenticated and recorded as evidence of something that did not happen.
+
+All three are also registered in `handler.evaluatePaths` so `MaterialWrite`
+classifies them as non-writes. A question-answering POST missing from that map is
+classified as a material write and its callers are refused 401 for want of an
+`Idempotency-Key` on a question — which is precisely tracker 82i, undiagnosed for
+three passes. The map exists so adding a route puts the question in front of
+whoever adds it.
+
+## A mistyped scope reported the authorization plane as down
+
+Found while auditing the Postman collection, which documented it as something to
+live with: *"A non-UUID legal_entity_id returns 503 store_unavailable, not 400 —
+that is a service defect, not your mistake."*
+
+`known-gaps.md` had it too, under **Resolved**, with the remedy assigned to the
+callers: *"callers must therefore validate the scope themselves before asking"*.
+That is the wrong place. The workaround has to be written 111 times, each copy
+has to know which of this service's columns are `uuid`, and any caller that
+forgets reports an outage instead of a typo.
+
+Reproduced as the service's own role (`rolsuper=f rolbypassrls=f`), both halves:
+
+```
+SELECT count(*) FROM principal_role_assignments WHERE legal_entity_id = 'oops'::uuid;
+  ERROR: invalid input syntax for type uuid: "oops"
+
+SELECT set_config('app.tenant_id','acme',false);
+SELECT count(*) FROM roles;
+  ERROR: invalid input syntax for type uuid: "acme"
+```
+
+The second is the one that was easy to miss and is the worse of the two:
+`withRLS` installs the raw value into `app.tenant_id` and the **policy** does the
+`::uuid` cast, so a malformed tenant does not fail in a query this service wrote
+— it fails inside row security, on a plain `SELECT`, on every table. The store
+wraps it as `ErrStoreUnavailable` and the handler answers 503.
+
+Now refused with `400 invalid_scope` naming the field, in three places that
+between them cover every route taking a scope: `resolvePlatformScope` (the four
+evaluate/validate routes), `resolveTenantScope` (the `/v1/authorize` header and
+body-fallback paths, each naming the field the caller actually set), and
+`requireTenant` (every admin read).
+
+**`principal_id` is deliberately not validated**, and that is the half it would
+be wrong to get wrong. It is `TEXT` in every table and compared as text, so a
+malformed one is a valid comparison that matches nothing — validating it would
+refuse the service-account ids this service has never required to be UUIDs.
+There is a test asserting a non-UUID principal is still evaluated.
+
+**A missing tenant is still 401, not 400.** "You did not identify your
+organisation" and "the organisation you named is not a reference" are different
+facts.
+
+### What this exposed about the test suite
+
+The change broke 69 assertions across ten handler test files, all of which sent
+tenants like `"tenant-1"` and entities like `"le-1"`. Those tests only ever
+passed because they use stub stores that never touch Postgres: **every one of
+them was asserting behaviour against a value the real service answers 503 to.**
+That is the same class of thing this file has recorded twice already — a suite
+that only uses the migration connection proving nothing about row security, and
+an `ok` that meant "skipped". Swept to real UUIDs, so the suite now exercises
+inputs the service can actually accept.
+
+## The Postman collection did not work at all
+
+`docs/postman/ZoikoSuite_Authorization.postman_collection.json` describes itself
+as "every endpoint on authorization-svc, ordered as a runnable flow". Neither
+half was true.
+
+**It was broken.** Every request sent only `Content-Type` and
+`X-Correlation-ID`. The sixth pass made the envelope middleware enforce on every
+`/v1/admin/*` write, so **all fourteen writes in the collection answered 401
+`envelope_incomplete`**, and both decision reads omitted the `X-Principal-Id` /
+`X-Tenant-Id` the handler requires and answered 401 as well. The seventh pass
+found and fixed exactly this shape in `seed-demo-rbac.ps1`; the collection is
+the same caller class and was missed.
+
+**It was incomplete.** 9 of 31 routes. Missing: the entire ABAC surface, every
+admin read, every retire/reactivate, and everything added this pass.
+
+Fixed with a collection-level pre-request script — one definition that every
+request inherits, rather than seven headers pasted onto each of 78 items — which
+also encodes the write/non-write distinction: `Idempotency-Key` is attached to
+material writes and withheld from the four evaluate/validate POSTs, because
+replay protection on a question is backwards. Now 13 folders, 78 requests, and a
+programmatic diff against `RegisterRoutes` confirms **31 routes in the service,
+31 in the collection, none missing, none spurious**.
+
+## Two silent-failure modes in the Kafka wiring
+
+Found by driving the new consumer rather than by reading it.
+
+**A consumer group joined, was assigned nothing, and said nothing.** On the
+first run the lifecycle group reported `Stable`, one member, **zero partitions**,
+and consumed nothing — while the service log said only "lifecycle consumer
+started". A second run under a different group id was assigned all three
+partitions immediately, from the same image against the same broker, which is
+what identifies it as a join-time race rather than a misconfiguration.
+
+Two independent causes, both fixed:
+
+- kafka-go reports consumer-group problems **only** through `Logger` and
+  `ErrorLogger`, both of which default to nil and **discard** them. The `Run`
+  loop cannot help: it logs errors returned from `ReadMessage`, and this failure
+  returns nothing at all — `ReadMessage` simply blocks forever on a member with
+  no assignment. So a consumer doing nothing looked exactly like a consumer with
+  nothing to do. `ErrorLogger` is now wired on both readers.
+- `WatchPartitionChanges` defaults to **false**, so a member assigned nothing
+  never re-checks: it heartbeats happily and the broker reports a healthy group
+  forever. Now `true` with a 30s interval on both readers, which bounds a silent
+  stall at half a minute instead of until somebody restarts the pod. Verified by
+  re-running under the **same group id that had been stuck**: 3 partitions
+  assigned.
+
+On this service that failure mode means principal suspensions silently never
+take effect — the one thing layer 0 exists to prevent.
+
+## The console
+
+`/admin/access-control` gains two panels, and `explainDecisionBasis` gains the
+branch it needed: without it every layer-0 denial rendered as "Reason not
+recognised", which is the least useful possible answer to "why was this person
+refused" when the answer is "their account has been stood down". A basis form the
+service emits and that function does not match falls through to a safe but
+useless fallback, so the two have to move together.
+
+- **The decision history** — filterable, paged, one row per check with the
+  plain-English reason and a "Why?" disclosure that renders the full rationale
+  through the same `AccessDecisionSummary` the by-reference lookup uses, so one
+  decision cannot be explained two different ways depending on how it was found.
+  The empty state says at length that an empty result is **not** "nothing
+  happened": checks from services that do not yet identify their organisation
+  are recorded without one and are deliberately unreadable from inside one, and
+  somebody could otherwise close an investigation on that difference.
+- **The pre-flight conflict check** — reports the two conflict shapes separately
+  because the remedies differ (withdraw something the person holds, versus split
+  the bundle), and states that it records nothing, in contrast to the evaluate
+  form directly above it which records every question it asks.
+
+The read/advisory actions live in a new `audit-actions.ts` rather than the
+1243-line `actions.ts`: everything in that module authors something, and its
+states and error handling are shaped by "did the write land".
+
+## Verified
+
+`go build`, `go vet`, `gofmt` clean. Full `go test ./...` green.
+
+**The store integration suite ran for real** — 62 tests, **0 skipped**, against
+PostgreSQL 16 in a throwaway database created for the purpose and dropped after.
+This is the item pass five recorded as "that `ok` means skipped, not passed" and
+pass six and seven carried forward unchanged. The compose stack's
+`authorization_svc` was checked before and after and its fixtures are intact (5
+roles, 1 SoD rule, 548 decisions) — `setupTestDB` DROPs every table it owns, and
+pointing it at the compose database is what erased that stack's fixtures on
+2026-09-08.
+
+Migrations `000012`/`000013` applied to the live database, then `down`, then
+re-applied; the `down` pair verified to leave the projection dropped, `000009`'s
+index restored and the new one gone.
+
+**Supabase mirror `0036` applied for real**, not read: against a purpose-built
+fixture standing in for `0001`–`0035`, then applied a **second** time to prove
+idempotence. End state asserted — new index present, old one dropped, index
+propagated to the partition, forced row security on the projection, the partial
+index carrying its `WHERE status <> 'ACTIVE'`, one policy, and
+`PRIMARY KEY (tenant_id, principal_id)`. The schema-absent guard was tested on an
+empty database and answers a NOTICE, not an error.
+
+On the wire, against the live service (postgres + kafka + authorization-svc
+only):
+
+| call | result |
+|---|---|
+| `POST /v1/authorize`, no envelope | **200** GRANTED |
+| `POST /v1/authorize`, malformed `legal_entity_id` | **400** `invalid_scope` (was 503) |
+| `POST /v1/authorize`, malformed tenant | **400** `invalid_scope` (was 503) |
+| `POST /v1/authorize`, non-UUID principal | **200** — evaluated, not refused |
+| `POST /v1/authorize`, `legal_entity_id=PLATFORM` | **200** |
+| `GET /v1/access-decisions` | **200** |
+| `GET /v1/access-decisions?decision_outcome=DENIED` | **200** |
+| `GET /v1/access-decisions`, malformed tenant | **400** |
+| `GET /v1/access-decisions`, no tenant | **401** |
+| `POST /v1/entity-scope/validate` (batch incl. PLATFORM) | **200** |
+| `POST /v1/sod/validate` | **200**, conflict on both halves of a real rule |
+| `POST /v1/delegated-access/evaluate` | **200**, `held_directly` correct |
+| `POST /v1/sod/validate`, malformed entity | **400** |
+| all 12 `/v1/admin/*` writes, no envelope | **401** `envelope_incomplete` |
+
+Layer 0 driven by a **real Kafka event** on `zoiko.identity.events`:
+
+| | |
+|---|---|
+| before | `GRANTED rbac:role=TEST_ROLE,CONSOLE_DEMO_OPERATOR` |
+| after SUSPENDED, with tenant | `DENIED principal_status:SUSPENDED` |
+| after SUSPENDED, **no** tenant (the 86-caller shape) | `DENIED principal_status:SUSPENDED` |
+| after ACTIVE | `GRANTED` — same basis as before |
+| assignments touched | **none** (5, unchanged) |
+
+The grant-graph half, also on real events: `permission.bundle.updated` and
+`entity.status.changed` each invalidated their tenant's cached grants;
+`role.updated` with no tenant invalidated across every tenant at WARN;
+`employee.terminated` was correctly ignored.
+
+**The console driven in a real browser** — Chromium via Playwright, signed in as
+the admin account. This closes the item five passes have carried as "the Server
+Actions behind the console forms are still not exercised by a JS browser":
+Turbopack does not put action ids in the server-rendered HTML, so the forms
+cannot be submitted by curl and the segment between a button and `lib/api` had
+never run. Sixteen checks, all passing — route renders (156KB, no error
+boundary); the search action returns "25 checks, 25 refused. There are older
+ones." with real rows, plain-English reasons and a "Why?" disclosure that adds
+1368 characters of rationale; the inverted-window error path renders a readable
+refusal; the pre-flight check reports the conflict, names both halves and states
+the remedy; the person-without-company guard is handled; the evaluate form
+returns a decision; zero page or console errors.
+
+Worth recording about that script: its first version reported two failures
+against features that work. Both assertions read `document.body.innerText` on a
+route that is 150KB of prose about "permission checks", so the wait matched
+static copy before the action had resolved. Scoped to the panel, both pass. A
+test that fails for its own reasons is worse than no test, because the next
+person spends their time on the wrong half.
+
+## Still open after this pass
+
+Nothing left inside this service. What remains is cross-service, and each item
+is now blocked on something nameable rather than merely unfinished:
+
+- **86 callers still send no envelope.** They work, every call is logged with the
+  missing fields, and the doctrinal end state is to migrate them and set
+  `ZS_ENVELOPE_ENFORCEMENT=strict`. Until then those decisions are recorded
+  without caller attribution — and, note, are therefore invisible in the new
+  audit read, which is tenant-scoped. `services/policy-svc/internal/authz/client.go`
+  is the reference implementation. 86 services of small identical edits.
+- **`employee.terminated` cannot be consumed** until something on the estate maps
+  an `employee_id` to a `principal_id`. Not a missing consumer — a missing
+  mapping. Recorded in `known-gaps.md`.
+- **Tracker 81 (two delegation stores)** and **tracker 79 (role assignment
+  duplicated with identity-context-svc)** — unchanged cross-service ownership
+  decisions.
+- **`DELEGATION_ADMINISTER` is enforced but deliberately not seeded** — as the
+  seventh pass recorded. Close it by seeding a delegation-admin bundle to a
+  second principal when one exists to be realistic.
+
+---
+
+# Ninth pass — 2026-09-10
+
+Triggered by being asked what percentage of the service is implemented. Trying
+to answer that with a number rather than a claim required a measurement, and
+the measurement found two things the eighth pass had reported as done.
+
+## What the measurement is
+
+`FE client` and `Console reaches` are different questions, and conflating them
+is how a percentage stops meaning anything. A route can have a typed client
+function and no button. So: parse `RegisterRoutes` for the real route table,
+parse `lib/api/authorization.ts` for which routes have a client, then grep the
+console for whether anything actually CALLS that client.
+
+Result, after the fixes below:
+
+| | |
+|---|---|
+| Doc 03 §8.3 checklist | **25/25** |
+| Backend route table | 28 routes |
+| FE client covers | **28/28** |
+| Console reaches | **27/28** |
+
+The one route with no direct console UI is `POST /v1/admin/roles`, and that is
+correct: access-control-svc owns role DEFINITIONS and forwards each write here,
+so the console defines roles through `createRoleDefinition` and this route is
+exercised on every one of those, one hop along. Calling it directly would
+create a role in the evaluation plane with no definition behind it — enforced,
+assignable, and absent from the register an auditor reads. `createRole` is
+therefore the one deliberately-uncalled export in that module, and its doc
+comment now says so, because an unused export where everything else is wired
+reads as something somebody forgot.
+
+## Two of the §8.3 routes had a client, a describer, and no UI
+
+The eighth pass built `validateEntityScope` and `evaluateDelegatedAccess`, wrote
+`describeEntityScope` and `describeDelegatedAccess` to render their answers, and
+then built console panels for only two of the three pre-flight routes. Nothing
+called either function. The pass reported the §8.3 surface as complete, and on
+the service side it was — but two of the three questions it had just made
+answerable could not be asked from the console.
+
+`components/admin/access-control/ReachChecks.tsx` closes it, as one card with
+two forms — they are the same question from two directions ("where can this
+person reach, and on whose authority") and an operator looking into somebody's
+access asks them together.
+
+The entity-scope form answers a batch and renders one row per company **in the
+order asked**, so a caller can line the answers against its own list. It refuses
+a malformed entry itself rather than forwarding it, so the message can name
+WHICH line was wrong — the service refuses the whole batch on the first bad one
+and cannot say which of five it was.
+
+The delegated-access form calls out the both-paths case explicitly rather than
+leaving it in a paragraph: somebody holding an action in their own right AND by
+delegation is exactly what a check on the outcome alone cannot see, and it is
+the answer a four-eyes step needs.
+
+## A real bug in the panels the eighth pass shipped
+
+Found by driving the new forms, and it is the more interesting half of this
+pass.
+
+**React discards an uncontrolled input's value when the panel's shape changes
+between statuses.** Measured, not inferred:
+
+```
+textarea BEFORE submit 1: "22222222-…-222222222222\nPLATFORM"
+textarea AFTER  submit 1: "22222222-…-222222222222"          <-- second line gone
+```
+
+The consequence is worse than losing typed text. The next submit sends the
+RESET value while showing the operator what they typed — so "tweak it and run it
+again" silently re-ran the ORIGINAL question and presented the answer as if it
+were the new one. The malformed-entry refusal never fired on a second submit for
+exactly that reason: the bad line had been discarded before the form was
+submitted.
+
+Fixed by echoing the submission back as `defaultValue` on every field, on every
+non-idle status — which is the fix `DecisionSearchState.filters` already carried
+in `DecisionLogPanel` for its own filters. That precedent existed and was not
+followed in the new panels, which is why this is recorded as a defect rather
+than a refinement.
+
+The form is read BEFORE the session check now, so a return on an expired session
+also echoes what was typed: somebody signing back in should not lose their input
+as well.
+
+After the fix, the same sequence:
+
+```
+textarea AFTER  submit 1: "22222222-…-222222222222\nPLATFORM"   <-- retained
+submit 2, malformed      : refusal banner present, results table gone
+```
+
+## The browser scripts were wrong twice more, in the same way
+
+Three of the reach-panel assertions failed against features that work:
+
+- an order check compared a result against the panel's own hint text, which says
+  "Use PLATFORM for something that belongs to no single company" and appears
+  before any result;
+- a verdict check matched the hint "Borrowed authority is recorded per company",
+  so the wait fired on static copy before the action had resolved;
+- a table-header check was case-sensitive against headers the stylesheet
+  uppercases.
+
+Same root cause as the eighth pass's two: **asserting against page text that
+contains prose about the thing being asserted.** The fix each time is to scope
+to the element that actually changes — the table, the panel, the specific
+headline — and to poll rather than match once. Recorded because it has now
+happened five times in two passes, and a test that fails for its own reasons
+costs more than no test: the next person spends their time on the wrong half.
+
+## Verified
+
+`go build`, `go vet` clean; full `go test ./...` green with the store suite
+running against real PostgreSQL (62 tests, 0 skipped). Frontend `tsc --noEmit`
+and `eslint` clean.
+
+Both browser suites green: 16 checks on the decision-history and SoD panels, 11
+on the two new reach panels, zero page or console errors in either.
+
+The compose-managed service (not an ad-hoc container) verified to wire the
+lifecycle consumer from `docker-compose.yml`'s own environment, with all three
+partitions assigned.
+
+## Still open after this pass
+
+Unchanged from the eighth pass. Nothing inside the service; the remainder is
+cross-service and each item is blocked on something nameable — the 86-caller
+envelope migration, the employee-to-principal mapping that
+`employee.terminated` needs, and tracker rows 79 and 81.

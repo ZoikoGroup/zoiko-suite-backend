@@ -27,7 +27,7 @@ func TestRetireSoDRule_RequiresPrincipal(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules/rule-1/retire", nil)
-	req.Header.Set("X-Tenant-Id", "tenant-1") // tenant present, principal absent
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111") // tenant present, principal absent
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -66,14 +66,14 @@ func TestRetireSoDRule_TenantComesFromHeaderNotQuery(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost,
 		"/v1/admin/sod-rules/rule-1/retire?tenant_id=someone-elses-tenant", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if store.gotSoDActiveTenant != "tenant-1" {
+	if store.gotSoDActiveTenant != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("store scoped to %q; a query param overrode the verified header", store.gotSoDActiveTenant)
 	}
 }
@@ -84,7 +84,7 @@ func TestRetireSoDRule_PassesFalse(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules/rule-9/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -105,7 +105,7 @@ func TestReactivateSoDRule_PassesTrue(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules/rule-9/reactivate", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -127,7 +127,7 @@ func TestSetSoDRuleActive_NotFoundIs404(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules/platform-wide/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -142,7 +142,7 @@ func TestSetSoDRuleActive_StoreFailureIs503(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules/rule-1/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 

@@ -204,7 +204,39 @@ func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string,
 		})
 		return "", false
 	}
+	if !validTenantScope(w, tenantID, "X-Tenant-Id") {
+		return "", false
+	}
 	return tenantID, true
+}
+
+// validTenantScope refuses a tenant scope that is not a UUID, writing a 400.
+//
+// Same defect as a malformed legal_entity_id and one layer deeper, which is
+// why it is easy to miss: tenant_id is UUID in every table that carries it,
+// and withRLS installs the raw value into app.tenant_id — where the POLICY
+// itself does `NULLIF(current_setting('app.tenant_id', true), '')::uuid`. So a
+// malformed tenant does not fail in a query this service wrote; it fails
+// inside row security, on every table, as a driver error the store reports as
+// ErrStoreUnavailable and the handler answers 503 for.
+//
+// The result is the worst possible diagnosis: a caller sending a mistyped
+// X-Tenant-Id is told the platform's authorization plane is down. Refused here
+// instead, naming the header or field that was wrong.
+//
+// `field` names where the value came from — the header on most routes, the
+// request body on the /v1/authorize fallback path — because "tenant_id is not a
+// UUID" is unhelpful to a caller that never set a field called tenant_id.
+func validTenantScope(w http.ResponseWriter, tenantID, field string) bool {
+	if validScope(tenantID) {
+		return true
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]string{
+		"error":   "invalid_scope",
+		"field":   field,
+		"message": field + " must be a UUID",
+	})
+	return false
 }
 
 // refuseForeignTenant reports whether claimed names a tenant other than
@@ -1645,10 +1677,16 @@ func (h *Handler) resolveTenantScope(w http.ResponseWriter, r *http.Request, bod
 			})
 			return "", false
 		}
+		if !validTenantScope(w, headerTenantID, "X-Tenant-Id") {
+			return "", false
+		}
 		return headerTenantID, true
 	}
 
 	if bodyTenantID != "" {
+		if !validTenantScope(w, bodyTenantID, "tenant_id") {
+			return "", false
+		}
 		// Logged, not refused: this is the pre-header calling convention, and
 		// the log is what makes the remaining callers findable.
 		h.log.Debug("authorize: tenant scope taken from request body — caller does not forward X-Tenant-Id",

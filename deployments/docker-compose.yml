@@ -1036,6 +1036,42 @@ services:
       # internal/events/consumer.go. Set to "" to disable.
       KAFKA_DELEGATION_TOPIC: "zoiko.delegated-authority.events"
       KAFKA_DELEGATION_GROUP_ID: "authorization-svc-delegation-projector"
+      # CONSUMED. The other three events Doc 03 §8.3 names — role.assigned,
+      # employment.changed, entity.scope.updated — which four passes of this
+      # service's notes recorded as having "no producer anywhere on the
+      # estate". They do. That conclusion came from grepping the SPEC's event
+      # names; the platform publishes the concepts under concrete ones:
+      #
+      #   zoiko.identity.events        principal.status.changed
+      #                                (identity-svc, line 485). PROJECTED into
+      #                                principal_status_projection and read as
+      #                                LAYER 0 of /v1/authorize — a principal
+      #                                identity has SUSPENDED or DISABLED is
+      #                                denied every action. Session eviction
+      #                                does not cover this: 111 services call
+      #                                the endpoint east-west on envelopes
+      #                                resolved before the suspension.
+      #   zoiko.access-control.events  role.created / role.updated /
+      #                                permission.bundle.updated (line 1914)
+      #   zoiko.entity.events          entity.status.changed /
+      #                                entity.hierarchy.changed /
+      #                                entity.jurisdiction.changed (line 613)
+      #
+      # The last two INVALIDATE this replica's cached grant reads rather than
+      # projecting anything. Those writes reach authorization-svc through ONE
+      # replica's admin API and are announced to all of them, so consuming the
+      # announcement is what stops AUTHZ_CACHE_TTL_SECONDS being the only bound
+      # on cross-replica staleness.
+      #
+      # employee.terminated is deliberately NOT consumed: its payload names an
+      # employee_id and nothing on this estate maps one to a principal, so the
+      # event says somebody left and this service cannot tell whose authority
+      # that is about. See internal/events/lifecycle_consumer.go.
+      #
+      # Set to "" to disable: layer 0 goes inert (no row means ACTIVE) and the
+      # cache TTL becomes the only staleness bound again.
+      KAFKA_LIFECYCLE_TOPICS: "zoiko.identity.events,zoiko.access-control.events,zoiko.entity.events"
+      KAFKA_LIFECYCLE_GROUP_ID: "authorization-svc-lifecycle"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
       # The one platform-scope legal entity, matching the AUTHZ_PLATFORM_SCOPE_ID
       # every CALLING service already carries. Without it this service refuses

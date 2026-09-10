@@ -33,7 +33,7 @@ import (
 func authorizeAs(t *testing.T, store *stubStore, pub *stubPublisher) *httptest.ResponseRecorder {
 	t.Helper()
 	r := newTestRouterFull(store, pub, &stubValidator{})
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE","tenant_id":"t-1"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE","tenant_id":"11111111-1111-4111-8111-111111111111"}`
 	req := httptest.NewRequest(http.MethodPost, handler.AuthorizePath, bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -144,7 +144,7 @@ func TestAuthorize_LayerZeroDenialIsRecordedAndPublished(t *testing.T) {
 	if store.recordedParams.PrincipalID != "p-1" {
 		t.Errorf("recorded principal = %q", store.recordedParams.PrincipalID)
 	}
-	if store.recordedParams.TenantID != "t-1" {
+	if store.recordedParams.TenantID != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("recorded tenant = %q — the resolved scope, not empty", store.recordedParams.TenantID)
 	}
 	if pub.deniedCalls != 1 {
@@ -190,9 +190,9 @@ func TestAuthorize_LayerZeroUsesTheResolvedTenantScope(t *testing.T) {
 
 	// Header only, no tenant_id in the body — the convention
 	// resolveTenantScope exists to encourage.
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, handler.AuthorizePath, bytes.NewBufferString(body))
-	req.Header.Set("X-Tenant-Id", "t-header")
+	req.Header.Set("X-Tenant-Id", "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -202,7 +202,7 @@ func TestAuthorize_LayerZeroUsesTheResolvedTenantScope(t *testing.T) {
 	if len(store.gotPrincipalStatusArgs) != 2 {
 		t.Fatal("FindPrincipalStatus was not called")
 	}
-	if got := store.gotPrincipalStatusArgs[1]; got != "t-header" {
+	if got := store.gotPrincipalStatusArgs[1]; got != "cccccccc-cccc-4ccc-8ccc-cccccccccccc" {
 		t.Fatalf("FindPrincipalStatus tenant = %q, want t-header — the resolved scope, not the body's (empty) one", got)
 	}
 	if got := store.gotPrincipalStatusArgs[0]; got != "p-1" {
@@ -251,9 +251,9 @@ func TestAuthorize_ActiveStatusGrantsNormally(t *testing.T) {
 // exactly the wrong thing to show somebody deciding what to revoke.
 func TestValidationRoutesDoNotConsultPrincipalStatus(t *testing.T) {
 	cases := []struct{ path, body string }{
-		{handler.EntityScopeValidatePath, `{"principal_id":"p-1","legal_entity_ids":["le-1"]}`},
-		{handler.SoDValidatePath, `{"principal_id":"p-1","legal_entity_id":"le-1","candidate_actions":["PAYMENT_APPROVE"]}`},
-		{handler.DelegatedAccessEvaluatePath, `{"principal_id":"p-1","legal_entity_id":"le-1"}`},
+		{handler.EntityScopeValidatePath, `{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"]}`},
+		{handler.SoDValidatePath, `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","candidate_actions":["PAYMENT_APPROVE"]}`},
+		{handler.DelegatedAccessEvaluatePath, `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1"}`},
 	}
 	for _, c := range cases {
 		store := &stubStore{principalStatus: "SUSPENDED", rbacActions: []string{"PAYMENT_APPROVE"}}

@@ -35,16 +35,16 @@ func postJSON(t *testing.T, r chi.Router, path, body string, headers map[string]
 }
 
 func adminHeaders() map[string]string {
-	return map[string]string{"X-Principal-Id": "p-caller", "X-Tenant-Id": "t-1"}
+	return map[string]string{"X-Principal-Id": "p-caller", "X-Tenant-Id": "11111111-1111-4111-8111-111111111111"}
 }
 
 // ── POST /v1/entity-scope/validate ──────────────────────────────────────────
 
 func TestValidateEntityScope_RequiresPrincipalAndTenant(t *testing.T) {
-	body := `{"principal_id":"p-1","legal_entity_ids":["le-1"]}`
+	body := `{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"]}`
 
 	r := newTestRouter(&stubStore{})
-	if w := postJSON(t, r, handler.EntityScopeValidatePath, body, map[string]string{"X-Tenant-Id": "t-1"}); w.Code != http.StatusUnauthorized {
+	if w := postJSON(t, r, handler.EntityScopeValidatePath, body, map[string]string{"X-Tenant-Id": "11111111-1111-4111-8111-111111111111"}); w.Code != http.StatusUnauthorized {
 		t.Errorf("no principal: expected 401, got %d", w.Code)
 	}
 
@@ -56,10 +56,10 @@ func TestValidateEntityScope_RequiresPrincipalAndTenant(t *testing.T) {
 
 func TestValidateEntityScope_MissingFields(t *testing.T) {
 	for _, body := range []string{
-		`{"legal_entity_ids":["le-1"]}`,
+		`{"legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"]}`,
 		`{"principal_id":"p-1"}`,
 		`{"principal_id":"p-1","legal_entity_ids":[]}`,
-		`{"principal_id":"p-1","legal_entity_ids":["le-1",""]}`,
+		`{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1",""]}`,
 	} {
 		r := newTestRouter(&stubStore{rbacActions: []string{"X"}})
 		w := postJSON(t, r, handler.EntityScopeValidatePath, body, adminHeaders())
@@ -82,7 +82,7 @@ func TestValidateEntityScope_NoActionReturnsWholePermittedSet(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.EntityScopeValidatePath,
-		`{"principal_id":"p-1","legal_entity_ids":["le-1"]}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"]}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -126,7 +126,7 @@ func TestValidateEntityScope_WithActionSuppressesPermittedActions(t *testing.T) 
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.EntityScopeValidatePath,
-		`{"principal_id":"p-1","legal_entity_ids":["le-1"],"action_type":"PAYMENT_APPROVE"}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"],"action_type":"PAYMENT_APPROVE"}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -156,7 +156,7 @@ func TestValidateEntityScope_NotInScopeReadsAsNoGrant(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
 	w := postJSON(t, r, handler.EntityScopeValidatePath,
-		`{"principal_id":"p-nobody","legal_entity_ids":["le-1"],"action_type":"PAYMENT_APPROVE"}`, adminHeaders())
+		`{"principal_id":"p-nobody","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"],"action_type":"PAYMENT_APPROVE"}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -184,7 +184,7 @@ func TestValidateEntityScope_BatchWritesNoDecisionArtifact(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.EntityScopeValidatePath,
-		`{"principal_id":"p-1","legal_entity_ids":["le-1","le-2","le-3"],"action_type":"PAYMENT_APPROVE"}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1","11111111-1111-4111-8111-aaaaaaaaaaa2","11111111-1111-4111-8111-aaaaaaaaaaa3"],"action_type":"PAYMENT_APPROVE"}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -219,7 +219,7 @@ func TestValidateEntityScope_RefusesOversizedBatch(t *testing.T) {
 func TestValidateEntityScope_RefusesForeignBodyTenant(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 	w := postJSON(t, r, handler.EntityScopeValidatePath,
-		`{"principal_id":"p-1","legal_entity_ids":["le-1"],"tenant_id":"t-someone-else"}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"],"tenant_id":"t-someone-else"}`, adminHeaders())
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for a body tenant that disagrees with the header, got %d: %s", w.Code, w.Body.String())
 	}
@@ -228,7 +228,7 @@ func TestValidateEntityScope_RefusesForeignBodyTenant(t *testing.T) {
 func TestValidateEntityScope_StoreUnavailableIs503(t *testing.T) {
 	r := newTestRouter(&stubStore{rbacErr: domain.ErrStoreUnavailable})
 	w := postJSON(t, r, handler.EntityScopeValidatePath,
-		`{"principal_id":"p-1","legal_entity_ids":["le-1"]}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_ids":["11111111-1111-4111-8111-aaaaaaaaaaa1"]}`, adminHeaders())
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
 	}
@@ -246,7 +246,7 @@ func TestValidateEntityScope_ResolvesPlatformSentinel(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	// newTestRouter configures "platform-scope-entity" as the platform id.
-	if store.grantedTenantArg != "t-1" {
+	if store.grantedTenantArg != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("grant lookup tenant = %q, want the verified tenant", store.grantedTenantArg)
 	}
 
@@ -313,7 +313,7 @@ func TestValidateSoD_ReportsConflictWithAHeldAction(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.SoDValidatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","candidate_actions":["PAYMENT_APPROVE"]}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","candidate_actions":["PAYMENT_APPROVE"]}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -386,7 +386,7 @@ func TestValidateSoD_ConflictFreeWhenNoRuleFires(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.SoDValidatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","candidate_actions":["PAYMENT_APPROVE"]}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","candidate_actions":["PAYMENT_APPROVE"]}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -442,11 +442,11 @@ func TestValidateSoD_IncludesDelegatedGrantsInHeldSet(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.SoDValidatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","candidate_actions":["PAYMENT_APPROVE"]}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","candidate_actions":["PAYMENT_APPROVE"]}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if store.delegatedTenantArg != "t-1" {
+	if store.delegatedTenantArg != "11111111-1111-4111-8111-111111111111" {
 		t.Fatal("the delegation lookup was not made — a conflict reached through a delegation would be missed")
 	}
 }
@@ -481,7 +481,7 @@ func TestValidateSoD_RefusesOversizedCandidateSet(t *testing.T) {
 // ── POST /v1/delegated-access/evaluate ──────────────────────────────────────
 
 func TestEvaluateDelegatedAccess_MissingFields(t *testing.T) {
-	for _, body := range []string{`{"legal_entity_id":"le-1"}`, `{"principal_id":"p-1"}`} {
+	for _, body := range []string{`{"legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1"}`, `{"principal_id":"p-1"}`} {
 		r := newTestRouter(&stubStore{})
 		w := postJSON(t, r, handler.DelegatedAccessEvaluatePath, body, adminHeaders())
 		if w.Code != http.StatusBadRequest {
@@ -498,7 +498,7 @@ func TestEvaluateDelegatedAccess_ReportsTheDelegator(t *testing.T) {
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -537,7 +537,7 @@ func TestEvaluateDelegatedAccess_DistinguishesBorrowedFromOwnAuthority(t *testin
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -561,7 +561,7 @@ func TestEvaluateDelegatedAccess_NoActionReturnsWholeDelegatedSet(t *testing.T) 
 	r := newTestRouter(store)
 
 	w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1"}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1"}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -583,7 +583,7 @@ func TestEvaluateDelegatedAccess_NoDelegationReadsAsNoDelegatedGrant(t *testing.
 	r := newTestRouter(&stubStore{})
 
 	w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`, adminHeaders())
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`, adminHeaders())
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
@@ -606,7 +606,7 @@ func TestEvaluateDelegatedAccess_WritesNoDecisionArtifact(t *testing.T) {
 	r := newTestRouter(store)
 
 	if w := postJSON(t, r, handler.DelegatedAccessEvaluatePath,
-		`{"principal_id":"p-1","legal_entity_id":"le-1"}`, adminHeaders()); w.Code != http.StatusOK {
+		`{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1"}`, adminHeaders()); w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
 	if store.recordedParams.ActionType != "" {
@@ -615,10 +615,10 @@ func TestEvaluateDelegatedAccess_WritesNoDecisionArtifact(t *testing.T) {
 }
 
 func TestEvaluateDelegatedAccess_RequiresPrincipalAndTenant(t *testing.T) {
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1"}`
 
 	r := newTestRouter(&stubStore{})
-	if w := postJSON(t, r, handler.DelegatedAccessEvaluatePath, body, map[string]string{"X-Tenant-Id": "t-1"}); w.Code != http.StatusUnauthorized {
+	if w := postJSON(t, r, handler.DelegatedAccessEvaluatePath, body, map[string]string{"X-Tenant-Id": "11111111-1111-4111-8111-111111111111"}); w.Code != http.StatusUnauthorized {
 		t.Errorf("no principal: expected 401, got %d", w.Code)
 	}
 

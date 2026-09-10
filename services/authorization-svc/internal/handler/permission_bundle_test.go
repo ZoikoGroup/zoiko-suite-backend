@@ -37,7 +37,7 @@ func TestListPermissionBundles_RequiresPrincipal(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/roles/r-1/permission-bundles", nil)
-	req.Header.Set("X-Tenant-Id", "tenant-1") // tenant present, principal absent
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111") // tenant present, principal absent
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -75,14 +75,14 @@ func TestListPermissionBundles_ScopeFromHeader_RoleFromPath(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/roles/r-9/permission-bundles?tenant_id=someone-elses-tenant", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if store.bundlesTenantID != "tenant-1" {
+	if store.bundlesTenantID != "11111111-1111-4111-8111-111111111111" {
 		t.Errorf("store scoped to %q; a query param overrode the verified header", store.bundlesTenantID)
 	}
 	if store.bundlesRoleID != "r-9" {
@@ -105,7 +105,7 @@ func TestListPermissionBundles_IncludesRetired(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/roles/r-1/permission-bundles", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -135,7 +135,7 @@ func TestListPermissionBundles_EmptyIsArrayNotNull(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/roles/r-unknown/permission-bundles", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -153,7 +153,7 @@ func TestListPermissionBundles_StoreFailureIs503(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/admin/roles/r-1/permission-bundles", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -169,7 +169,7 @@ func TestRetirePermissionBundle_RequiresPrincipal(t *testing.T) {
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-1/retire", nil)
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -214,7 +214,7 @@ func TestPermissionBundleLifecycle_RoutesPassTheRightFlag(t *testing.T) {
 
 		req := httptest.NewRequest(http.MethodPost, tc.path, nil)
 		req.Header.Set("X-Principal-Id", "admin-1")
-		req.Header.Set("X-Tenant-Id", "tenant-1")
+		req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, req)
 
@@ -224,7 +224,7 @@ func TestPermissionBundleLifecycle_RoutesPassTheRightFlag(t *testing.T) {
 		if len(store.bundleActiveWant) != 1 || store.bundleActiveWant[0] != tc.want {
 			t.Errorf("%s: store received active=%v, want %v", tc.path, store.bundleActiveWant, tc.want)
 		}
-		if store.bundleActiveTenant != "tenant-1" {
+		if store.bundleActiveTenant != "11111111-1111-4111-8111-111111111111" {
 			t.Errorf("%s: store scoped to %q, want the verified header", tc.path, store.bundleActiveTenant)
 		}
 		if store.bundleActiveID != "b-1" {
@@ -241,7 +241,7 @@ func TestRetirePermissionBundle_NotFoundIs404(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-elsewhere/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -261,7 +261,7 @@ func TestRetirePermissionBundle_StoreFailureIs503(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/permission-bundles/b-1/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -279,7 +279,7 @@ func TestRetirePermissionBundle_StoreFailureIs503(t *testing.T) {
 // replaced", which is a destructive edit the caller is entitled to know about.
 func TestCreatePermissionBundle_ReplacedAnswers200NotCreated(t *testing.T) {
 	store := &stubStore{
-		role:          &domain.Role{RoleID: "r-1", TenantID: "tenant-1"},
+		role:          &domain.Role{RoleID: "r-1", TenantID: "11111111-1111-4111-8111-111111111111"},
 		bundle:        &domain.PermissionBundle{PermissionBundleID: "b-1", RoleID: "r-1", BundleCode: "default"},
 		bundleCreated: false, // the DO UPDATE path
 	}
@@ -288,7 +288,7 @@ func TestCreatePermissionBundle_ReplacedAnswers200NotCreated(t *testing.T) {
 	body := `{"bundle_code":"default","permitted_actions":["PAYMENT_APPROVE"]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/permission-bundles", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
