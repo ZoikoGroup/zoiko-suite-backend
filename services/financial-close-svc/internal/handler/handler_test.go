@@ -1046,6 +1046,9 @@ type stubClients struct {
 	arSubledgerErr      error
 	assetNBVTotal       float64
 	assetNBVErr         error
+	depCoveredCount     int
+	depEligibleCount    int
+	depCompletenessErr  error
 
 	postJournalErr   error
 	postedJournalID  string
@@ -1138,6 +1141,10 @@ func (c *stubClients) GetARSubledgerTotal(_ context.Context, _, _ string) (float
 
 func (c *stubClients) GetAssetNetBookValueTotal(_ context.Context, _, _, _ string) (float64, error) {
 	return c.assetNBVTotal, c.assetNBVErr
+}
+
+func (c *stubClients) GetAssetDepreciationCompleteness(_ context.Context, _, _, _ string) (int, int, error) {
+	return c.depCoveredCount, c.depEligibleCount, c.depCompletenessErr
 }
 
 func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
@@ -1828,6 +1835,85 @@ func TestRunSubledgerControl_AssetsMatched_RecordsRun(t *testing.T) {
 	}
 	if run.Subledger != "ASSETS" {
 		t.Errorf("expected ASSETS, got %q", run.Subledger)
+	}
+}
+
+// TestRunSubledgerControl_DepreciationCompletenessMatched_RecordsRun
+// proves ACC-06's own run mechanism now also serves the AST/INV/PRJ
+// domain spec's own §9 "Depreciation completeness" assertion — a
+// coverage check, not a GL balance comparison, so no control account is
+// ever resolved for this subledger type.
+func TestRunSubledgerControl_DepreciationCompletenessMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{depCoveredCount: 5, depEligibleCount: 5}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "DEPRECIATION_COMPLETENESS",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+	if run.SubledgerTotalAmount != 5 || run.GLControlBalanceAmount != 5 {
+		t.Errorf("expected covered=5 eligible=5, got %v / %v", run.SubledgerTotalAmount, run.GLControlBalanceAmount)
+	}
+}
+
+func TestRunSubledgerControl_DepreciationCompletenessGap_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{depCoveredCount: 3, depEligibleCount: 5}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "DEPRECIATION_COMPLETENESS",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION (2 schedules not covered), got %q", run.Status)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+// TestRunSubledgerControl_DepreciationCompleteness_NoMappingKeyRequired
+// proves the mapping-key requirement is skipped for this subledger type
+// — it has no GL side to resolve a control account against.
+func TestRunSubledgerControl_DepreciationCompleteness_NoMappingKeyRequired(t *testing.T) {
+	cl := &stubClients{depCoveredCount: 1, depEligibleCount: 1}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, cl)
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "DEPRECIATION_COMPLETENESS",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (no mapping key needed), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRunSubledgerControl_APMissingMappingKey_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "AP"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 missing control_account_mapping_key, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

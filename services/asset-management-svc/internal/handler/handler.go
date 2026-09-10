@@ -27,6 +27,11 @@ type Store interface {
 	// AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
 	// assertion, consumed by financial-close-svc's ACC-06.
 	GetNetBookValueTotal(ctx context.Context, legalEntityID, bookID string) (float64, error)
+	// GetDepreciationCompleteness backs GET /v1/depreciation/completeness
+	// — see internal/store/depreciation_store.go's own doc comment.
+	// Serves the AST/INV/PRJ domain spec's own §9 "Depreciation
+	// completeness" assertion.
+	GetDepreciationCompleteness(ctx context.Context, legalEntityID, fiscalPeriod string) (coveredCount, eligibleCount int, err error)
 	AddComponent(ctx context.Context, c *domain.AssetComponent) error
 	AssignBookProfile(ctx context.Context, b *domain.AssetBookAssignment) error
 	RegisterAsset(ctx context.Context, assetID, principalID string, at time.Time) error
@@ -185,6 +190,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 	r.Route("/v1/depreciation-schedules", func(r chi.Router) {
 		r.Post("/", h.BuildDepreciationSchedule)
+		r.Get("/completeness", h.GetDepreciationCompleteness)
 		r.Get("/{id}", h.GetDepreciationSchedule)
 		r.Post("/{id}/recalculate", h.RecalculateSchedule)
 	})

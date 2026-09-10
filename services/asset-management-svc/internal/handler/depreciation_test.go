@@ -282,6 +282,60 @@ func TestGetNetBookValueTotal_SumsCostBasisForBookAndLegalEntity(t *testing.T) {
 	}
 }
 
+// ── GetDepreciationCompleteness (§9 "Depreciation completeness") ────────────
+
+func TestGetDepreciationCompleteness_MissingParams_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/depreciation-schedules/completeness?legal_entity_id=le-1", nil, "reader-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 missing fiscal_period, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetDepreciationCompleteness_FullyCovered(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	assetID := createActiveAsset(t, s, r, "le-1")
+	_ = doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
+
+	runReq := domain.CreateDepreciationRunRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
+	}
+	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
+	var run domain.DepreciationRun
+	_ = json.NewDecoder(createRunRR.Body).Decode(&run)
+	_ = doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/freeze", nil, "preparer-1")
+	_ = doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/validate", nil, "preparer-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/depreciation-schedules/completeness?legal_entity_id=le-1&fiscal_period=2026-01", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]int
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["eligible_count"] != 1 || out["covered_count"] != 1 {
+		t.Fatalf("expected eligible=1 covered=1, got %+v", out)
+	}
+}
+
+func TestGetDepreciationCompleteness_NeverRun_ZeroCovered(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	assetID := createActiveAsset(t, s, r, "le-1")
+	_ = doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/depreciation-schedules/completeness?legal_entity_id=le-1&fiscal_period=2026-01", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]int
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["eligible_count"] != 1 || out["covered_count"] != 0 {
+		t.Fatalf("expected eligible=1 covered=0 (schedule exists but no run for this period yet), got %+v", out)
+	}
+}
+
 func TestGetNetBookValueTotal_DifferentBook_ExcludedFromTotal(t *testing.T) {
 	s := newStubStore()
 	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})

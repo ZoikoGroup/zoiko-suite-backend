@@ -311,6 +311,36 @@ func (s *stubStore) GetNetBookValueTotal(_ context.Context, legalEntityID, bookI
 	return total, nil
 }
 
+// GetDepreciationCompleteness is a simplified stub: eligible counts
+// ACTIVE schedules on ACTIVE assets for the entity; covered counts
+// distinct schedules with at least one line on a non-SUPERSEDED run for
+// the given period. Enough to exercise the handler's own routing/authz
+// plumbing — the real eligible-vs-covered SQL is verified in
+// internal/store's own Postgres tests.
+func (s *stubStore) GetDepreciationCompleteness(_ context.Context, legalEntityID, fiscalPeriod string) (covered, eligible int, err error) {
+	for _, sch := range s.schedules {
+		if sch.LegalEntityID != legalEntityID || sch.Status != domain.DepreciationScheduleStatusActive {
+			continue
+		}
+		a, ok := s.assets[sch.AssetID]
+		if !ok || a.Status != domain.AssetStatusActive {
+			continue
+		}
+		eligible++
+	}
+	coveredSchedules := make(map[string]bool)
+	for _, run := range s.runs {
+		if run.LegalEntityID != legalEntityID || run.FiscalPeriod != fiscalPeriod || run.Status == domain.DepreciationRunStatusSuperseded {
+			continue
+		}
+		for _, line := range run.Lines {
+			coveredSchedules[line.ScheduleVersionID] = true
+		}
+	}
+	covered = len(coveredSchedules)
+	return covered, eligible, nil
+}
+
 func (s *stubStore) AddComponent(_ context.Context, c *domain.AssetComponent) error {
 	s.components[c.AssetID] = append(s.components[c.AssetID], *c)
 	return nil

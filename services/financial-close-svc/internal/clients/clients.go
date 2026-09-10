@@ -1182,6 +1182,50 @@ func (c *Clients) GetAssetNetBookValueTotal(ctx context.Context, tenantID, legal
 	return out.NetBookValueTotal, nil
 }
 
+// assetDepreciationCompletenessResponse mirrors asset-management-svc's
+// own GET /v1/depreciation-schedules/completeness wire shape.
+type assetDepreciationCompletenessResponse struct {
+	CoveredCount  int `json:"covered_count"`
+	EligibleCount int `json:"eligible_count"`
+}
+
+// GetAssetDepreciationCompleteness is ACC-06's DEPRECIATION_COMPLETENESS
+// source — a coverage check, not a balance, satisfying the AST/INV/PRJ
+// domain spec's own §9 "Depreciation completeness" assertion.
+func (c *Clients) GetAssetDepreciationCompleteness(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (covered, eligible int, err error) {
+	u, err := url.Parse(c.assetURL + "/v1/depreciation-schedules/completeness")
+	if err != nil {
+		return 0, 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch depreciation completeness from asset-management-svc", zap.Error(err))
+		return 0, 0, domain.ErrAssetServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, domain.ErrAssetServiceUnavailable
+	}
+
+	var out assetDepreciationCompletenessResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, 0, err
+	}
+	return out.CoveredCount, out.EligibleCount, nil
+}
+
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that
 // are not PAID. Period-bounded for the same reason as the payables count above.
 func (c *Clients) GetUnsettledARInvoicesCount(ctx context.Context, tenantID, legalEntityID string, periodStart, periodEnd time.Time) (int, error) {

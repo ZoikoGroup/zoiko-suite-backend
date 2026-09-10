@@ -75,6 +75,40 @@ func (h *Handler) BuildDepreciationSchedule(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusCreated, sch)
 }
 
+// ── GET /v1/depreciation-schedules/completeness ───────────────────────────────
+
+// GetDepreciationCompleteness is a read-only coverage check — never a
+// caller-declared figure. financial-close-svc's ACC-06 calls this
+// directly for the AST/INV/PRJ domain spec's own §9 "Depreciation
+// completeness" assertion; see internal/store's own doc comment for the
+// exact eligible-vs-covered calculation.
+func (h *Handler) GetDepreciationCompleteness(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	fiscalPeriod := r.URL.Query().Get("fiscal_period")
+	if legalEntityID == "" || fiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionDepreciationView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	covered, eligible, err := h.store.GetDepreciationCompleteness(r.Context(), legalEntityID, fiscalPeriod)
+	if err != nil {
+		h.log.Error("GetDepreciationCompleteness: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"covered_count": covered, "eligible_count": eligible})
+}
+
 // ── GET /v1/depreciation-schedules/{id} ──────────────────────────────────────
 
 func (h *Handler) GetDepreciationSchedule(w http.ResponseWriter, r *http.Request) {
