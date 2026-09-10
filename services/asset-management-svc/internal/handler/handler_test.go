@@ -293,6 +293,54 @@ func (s *stubStore) ListAssets(_ context.Context, legalEntityID string) ([]domai
 	return out, nil
 }
 
+// GetNetBookValueTotal is a simplified stub: sums CostBasis for ACTIVE
+// schedules in the given book, for ACTIVE assets — accumulated
+// depreciation isn't modeled in this in-memory stub (that math is
+// verified for real in internal/store's own Postgres tests). Enough to
+// exercise the handler's own routing/authz/validation plumbing.
+func (s *stubStore) GetNetBookValueTotal(_ context.Context, legalEntityID, bookID string) (float64, error) {
+	var total float64
+	for _, sch := range s.schedules {
+		if sch.LegalEntityID != legalEntityID || sch.BookID != bookID || sch.Status != domain.DepreciationScheduleStatusActive {
+			continue
+		}
+		if a, ok := s.assets[sch.AssetID]; ok && a.Status == domain.AssetStatusActive {
+			total += sch.CostBasis
+		}
+	}
+	return total, nil
+}
+
+// GetDepreciationCompleteness is a simplified stub: eligible counts
+// ACTIVE schedules on ACTIVE assets for the entity; covered counts
+// distinct schedules with at least one line on a non-SUPERSEDED run for
+// the given period. Enough to exercise the handler's own routing/authz
+// plumbing — the real eligible-vs-covered SQL is verified in
+// internal/store's own Postgres tests.
+func (s *stubStore) GetDepreciationCompleteness(_ context.Context, legalEntityID, fiscalPeriod string) (covered, eligible int, err error) {
+	for _, sch := range s.schedules {
+		if sch.LegalEntityID != legalEntityID || sch.Status != domain.DepreciationScheduleStatusActive {
+			continue
+		}
+		a, ok := s.assets[sch.AssetID]
+		if !ok || a.Status != domain.AssetStatusActive {
+			continue
+		}
+		eligible++
+	}
+	coveredSchedules := make(map[string]bool)
+	for _, run := range s.runs {
+		if run.LegalEntityID != legalEntityID || run.FiscalPeriod != fiscalPeriod || run.Status == domain.DepreciationRunStatusSuperseded {
+			continue
+		}
+		for _, line := range run.Lines {
+			coveredSchedules[line.ScheduleVersionID] = true
+		}
+	}
+	covered = len(coveredSchedules)
+	return covered, eligible, nil
+}
+
 func (s *stubStore) AddComponent(_ context.Context, c *domain.AssetComponent) error {
 	s.components[c.AssetID] = append(s.components[c.AssetID], *c)
 	return nil
@@ -429,6 +477,14 @@ func (p *stubPublisher) PublishAssetMetadataChanged(_ context.Context, _, _ stri
 	p.calls++
 }
 func (p *stubPublisher) PublishAssetSuspended(_ context.Context, _, _ string, _ domain.FixedAsset) {
+	p.calls++
+}
+
+func (p *stubPublisher) PublishDepreciationRunAccountingEventEmitted(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
+
+func (p *stubPublisher) PublishAssetEventAccountingEventEmitted(_ context.Context, _, _, _, _, _, _ string) {
 	p.calls++
 }
 

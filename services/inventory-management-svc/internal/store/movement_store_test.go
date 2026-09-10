@@ -263,3 +263,61 @@ func TestPgStore_CreateCorrectionMovement_ReversalRevertsOnHand(t *testing.T) {
 		t.Fatalf("expected on_hand=0 after reversal, got %v", onHand)
 	}
 }
+
+// TestPgStore_GetNegativeOnHandCount_RealDB proves the real aggregation
+// query. A negative combination cannot be produced through this
+// service's own CommitMovement (TestPgStore_CommitMovement_NegativeStockRefused
+// already proves that refusal) — so a violating COMMITTED row is
+// inserted directly, the same way a migration/backfill bypass would,
+// exactly the scenario this check exists to catch.
+func TestPgStore_GetNegativeOnHandCount_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-MV-7")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-MV-7")
+
+	receipt := newDraftReceiptForEntity(legalEntityID, itemID, locID, "idem-neg-real-1", 5, "")
+	if err := s.CreateMovement(ctx, receipt); err != nil {
+		t.Fatalf("CreateMovement failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := s.ValidateMovement(ctx, receipt.MovementID, now); err != nil {
+		t.Fatalf("ValidateMovement failed: %v", err)
+	}
+	if err := s.CommitMovement(ctx, receipt.MovementID, "preparer-1", now); err != nil {
+		t.Fatalf("CommitMovement failed: %v", err)
+	}
+
+	count, err := s.GetNegativeOnHandCount(ctx, legalEntityID)
+	if err != nil {
+		t.Fatalf("GetNegativeOnHandCount (before bypass): %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 before any violation, got %d", count)
+	}
+
+	// Bypass the application layer entirely — a raw INSERT of an
+	// already-COMMITTED issue that would never survive CommitMovement's
+	// own guard.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO inventory_movements (
+			movement_id, tenant_id, legal_entity_id, movement_type, status, item_id,
+			source_location_id, quantity, uom, source_reference, source_idempotency_key,
+			business_date, fiscal_period, created_at, created_by_principal_id, committed_at, committed_by_principal_id
+		) VALUES ($1, $2, $3, 'ISSUE', 'COMMITTED', $4, $5, 8, 'EACH', 'BYPASS', 'idem-neg-real-2', $6::date, '2026-09', $7::timestamptz, 'preparer-1', $7::timestamptz, 'preparer-1')
+	`, uuid.New().String(), tenantID, legalEntityID, itemID, locID, now, now); err != nil {
+		t.Fatalf("bypass INSERT failed: %v", err)
+	}
+
+	count, err = s.GetNegativeOnHandCount(ctx, legalEntityID)
+	if err != nil {
+		t.Fatalf("GetNegativeOnHandCount (after bypass): %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 negative combination (5 received, 8 issued via bypass, net -3), got %d", count)
+	}
+}

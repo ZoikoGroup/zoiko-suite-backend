@@ -122,6 +122,55 @@ func (p *Publisher) PublishProjectCostPopulationCertified(ctx context.Context, c
 	})
 }
 
+// PRJ-03's own named events (a subset — "ProjectWIPCalculated" is folded
+// into the same calculation ProjectRecognitionCalculated already covers,
+// since this v1 collapses CalculateProjectRevenue/CalculateProjectWIP
+// into one real step; stated honestly in the findings doc):
+// "ProjectRecognitionCalculated; ProjectRevenueApproved;
+// ProjectRecognitionAccountingEventEmitted; ProjectRecognitionSuperseded."
+
+func (p *Publisher) PublishProjectRecognitionCalculated(ctx context.Context, correlationID, actorID, tenantID string, r domain.RecognitionRun) {
+	p.emit(ctx, "project.recognition.calculated", correlationID, tenantID, r.LegalEntityID, actorID, r.RunID, map[string]any{
+		"run_id": r.RunID, "project_id": r.ProjectID, "cumulative_recognized_revenue": r.CumulativeRecognizedRevenue,
+	})
+}
+
+func (p *Publisher) PublishProjectRevenueApproved(ctx context.Context, correlationID, actorID, tenantID string, r domain.RecognitionRun) {
+	p.emit(ctx, "project.revenue.approved", correlationID, tenantID, r.LegalEntityID, actorID, r.RunID, map[string]any{
+		"run_id": r.RunID, "approved_at": r.ApprovedAt,
+	})
+}
+
+func (p *Publisher) PublishProjectRecognitionAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string) {
+	p.emit(ctx, "project.recognition.accounting_event.emitted", correlationID, tenantID, legalEntityID, actorID, runID, map[string]any{
+		"run_id": runID, "journal_id": journalID,
+	})
+}
+
+func (p *Publisher) PublishProjectRecognitionSuperseded(ctx context.Context, correlationID, actorID, tenantID string, r domain.RecognitionRun) {
+	p.emit(ctx, "project.recognition.superseded", correlationID, tenantID, r.LegalEntityID, actorID, r.RunID, map[string]any{
+		"run_id": r.RunID, "superseded_by_run_id": r.SupersededByRunID,
+	})
+}
+
+// PRJ-04's own named events (a subset — "ProjectProfitabilityBecameStale"
+// is not published as a distinct event in this v1; staleness is detected
+// lazily on read/certify and surfaced as a field, not an event — stated
+// honestly in the findings doc): "ProjectProfitabilityRefreshed;
+// ProjectProfitabilitySnapshotCertified."
+
+func (p *Publisher) PublishProjectProfitabilityRefreshed(ctx context.Context, correlationID, actorID, tenantID string, proj domain.ProfitabilityProjection) {
+	p.emit(ctx, "project.profitability.refreshed", correlationID, tenantID, proj.LegalEntityID, actorID, proj.ProjectID, map[string]any{
+		"projection_id": proj.ProjectionID, "project_id": proj.ProjectID, "margin": proj.Margin,
+	})
+}
+
+func (p *Publisher) PublishProjectProfitabilitySnapshotCertified(ctx context.Context, correlationID, actorID, tenantID string, snap domain.ProfitabilitySnapshot) {
+	p.emit(ctx, "project.profitability.snapshot.certified", correlationID, tenantID, snap.LegalEntityID, actorID, snap.SnapshotID, map[string]any{
+		"snapshot_id": snap.SnapshotID, "project_id": snap.ProjectID, "certified_at": snap.CertifiedAt,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

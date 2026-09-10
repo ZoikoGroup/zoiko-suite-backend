@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/project-accounting-svc/internal/clients"
 	"zoiko.io/project-accounting-svc/internal/domain"
 	svcmiddleware "zoiko.io/project-accounting-svc/internal/middleware"
 )
@@ -43,6 +44,46 @@ type Store interface {
 	MarkBillableEligibility(ctx context.Context, entryID string, billable, capitalizable bool) error
 	CreateLinkedCostEntry(ctx context.Context, originalEntryID, principalID, reason string, isReversal bool, newEntryID string, amountOverride *float64, costCategory *string, billable, capitalizable *bool, at time.Time) (*domain.CostEntry, error)
 	CertifyCostPopulation(ctx context.Context, projectID, principalID string, at time.Time) (*domain.CostCertification, error)
+
+	// PRJ-03 (Project Revenue & WIP) — see internal/store/recognition_store.go's
+	// own doc comments for the authority boundary these implement.
+	SetApprovedEstimate(ctx context.Context, newVersion *domain.RecognitionEstimate) error
+	GetCurrentEstimate(ctx context.Context, projectID string) (*domain.RecognitionEstimate, error)
+	CreateRecognitionRun(ctx context.Context, r *domain.RecognitionRun) error
+	GetRecognitionRun(ctx context.Context, runID string) (*domain.RecognitionRun, error)
+	FreezeAndCalculate(ctx context.Context, runID string, at time.Time) error
+	ValidateRecognitionRun(ctx context.Context, runID string, at time.Time) error
+	ApproveRecognitionRun(ctx context.Context, runID, principalID string, at time.Time) error
+	MarkRecognitionRunEmitted(ctx context.Context, runID, journalID string, at time.Time) error
+	SupersedeRecognitionRun(ctx context.Context, runID, principalID string, at time.Time) error
+	// GetPostedRevenueTotal backs GET /v1/recognition/posted-revenue —
+	// see internal/store/recognition_store.go's own doc comment. Serves
+	// the AST/INV/PRJ domain spec's own §9 "Project revenue/WIP → GL"
+	// assertion.
+	GetPostedRevenueTotal(ctx context.Context, legalEntityID, fiscalPeriod string) (float64, error)
+
+	// PRJ-04 (Project Profitability) — see internal/store/profitability_store.go's
+	// own doc comments for the authority boundary these implement. Pure
+	// read model: no other capability's own tables are ever written by
+	// these methods.
+	RefreshProfitabilityProjection(ctx context.Context, projectID, principalID string, at time.Time) (*domain.ProfitabilityProjection, error)
+	GetProjectProfitability(ctx context.Context, projectID string) (*domain.ProfitabilityProjection, error)
+	BuildProfitabilitySnapshot(ctx context.Context, projectID, principalID string, at time.Time) (*domain.ProfitabilitySnapshot, error)
+	GetProfitabilitySnapshot(ctx context.Context, snapshotID string) (*domain.ProfitabilitySnapshot, error)
+	CertifyProfitabilitySnapshot(ctx context.Context, snapshotID, principalID string, at time.Time) (*domain.ProfitabilitySnapshot, error)
+}
+
+// RecognitionLedgerClient is PRJ-03's own real "ACC-04" dependency — see
+// internal/clients/ledger.go's own doc comment.
+type RecognitionLedgerClient interface {
+	PostRecognitionAccountingEvent(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []clients.LedgerLine) (journalID string, err error)
+	ReverseRecognitionJournal(ctx context.Context, tenantID, principalID, journalID, reason string) error
+}
+
+// PeriodChecker is PRJ-03's own real "hard-closed-period" dependency on
+// financial-close-svc — see internal/clients/close.go's own doc comment.
+type PeriodChecker interface {
+	CheckPeriodOpen(ctx context.Context, tenantID, legalEntityID, periodName string) error
 }
 
 // Publisher is the event-publishing contract the handler depends on —
@@ -64,6 +105,23 @@ type Publisher interface {
 	PublishProjectCostReclassified(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry)
 	PublishProjectCostReversed(ctx context.Context, correlationID, actorID, tenantID string, e domain.CostEntry)
 	PublishProjectCostPopulationCertified(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, cert domain.CostCertification)
+
+	// PRJ-03 (Project Revenue & WIP) — the spec's own named Events (a
+	// subset — "ProjectWIPCalculated" is not wired in separately; stated
+	// honestly in the findings doc): "ProjectRecognitionCalculated;
+	// ProjectRevenueApproved; ProjectRecognitionAccountingEventEmitted;
+	// ProjectRecognitionSuperseded."
+	PublishProjectRecognitionCalculated(ctx context.Context, correlationID, actorID, tenantID string, r domain.RecognitionRun)
+	PublishProjectRevenueApproved(ctx context.Context, correlationID, actorID, tenantID string, r domain.RecognitionRun)
+	PublishProjectRecognitionAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string)
+	PublishProjectRecognitionSuperseded(ctx context.Context, correlationID, actorID, tenantID string, r domain.RecognitionRun)
+
+	// PRJ-04 (Project Profitability) — the spec's own named Events (a
+	// subset — "ProjectProfitabilityBecameStale" is not wired in
+	// separately; stated honestly in the findings doc):
+	// "ProjectProfitabilityRefreshed; ProjectProfitabilitySnapshotCertified."
+	PublishProjectProfitabilityRefreshed(ctx context.Context, correlationID, actorID, tenantID string, proj domain.ProfitabilityProjection)
+	PublishProjectProfitabilitySnapshotCertified(ctx context.Context, correlationID, actorID, tenantID string, snap domain.ProfitabilitySnapshot)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -97,17 +155,59 @@ const (
 	actionProjectCostReclassify = "PROJECT_COST_RECLASSIFY"
 	actionProjectCostAdjust     = "PROJECT_COST_ADJUST"
 	actionProjectCostCertify    = "PROJECT_COST_CERTIFY"
+
+	// PRJ-03 (Project Revenue & WIP) actions — the spec's own Permissions
+	// field: "project.revenue.read; project.revenue.run;
+	// project.estimate.manage; project.revenue.approve;
+	// project.revenue.supersede." actionProjectRevenueApprove is
+	// deliberately distinct from actionProjectRevenueRun — the spec's own
+	// SoD: "Estimator/preparer cannot self-approve material estimate or
+	// recognition override."
+	actionProjectRevenueRead      = "PROJECT_REVENUE_READ"
+	actionProjectRevenueRun       = "PROJECT_REVENUE_RUN"
+	actionProjectEstimateManage   = "PROJECT_ESTIMATE_MANAGE"
+	actionProjectRevenueApprove   = "PROJECT_REVENUE_APPROVE"
+	actionProjectRevenueSupersede = "PROJECT_REVENUE_SUPERSEDE"
+
+	// PRJ-04 (Project Profitability) actions — the spec's own Permissions
+	// field names only two: "project.profitability.read;
+	// project.profitability.certify." Refresh/rebuild/build-snapshot are
+	// lower-stakes recomputation of a read model with "no accounting
+	// consequence" (the spec's own words, Accounting-Impact matrix) and
+	// are gated behind the read permission; certify is the one action
+	// with real certification consequence and gets its own action.
+	actionProjectProfitabilityRead    = "PROJECT_PROFITABILITY_READ"
+	actionProjectProfitabilityCertify = "PROJECT_PROFITABILITY_CERTIFY"
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	log       *zap.Logger
+	store         Store
+	publisher     Publisher
+	authz         AuthZClient
+	ledger        RecognitionLedgerClient
+	periodChecker PeriodChecker
+	log           *zap.Logger
 }
 
 func New(store Store, publisher Publisher, authz AuthZClient, log *zap.Logger) *Handler {
 	return &Handler{store: store, publisher: publisher, authz: authz, log: log}
+}
+
+// WithLedgerClient sets PRJ-03's own real dependency on general-ledger-svc.
+// Left unconfigured, EmitRecognitionAccountingEvent and
+// SupersedeRecognitionRun refuse with a clear error rather than a nil
+// dereference — the same posture every other Emit-capable handler in
+// this platform takes for a never-optional dependency.
+func (h *Handler) WithLedgerClient(c RecognitionLedgerClient) *Handler {
+	h.ledger = c
+	return h
+}
+
+// WithPeriodChecker sets PRJ-03's own real dependency on
+// financial-close-svc.
+func (h *Handler) WithPeriodChecker(c PeriodChecker) *Handler {
+	h.periodChecker = c
+	return h
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -138,6 +238,30 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/mark-billable", h.MarkBillableEligibility)
 		r.Post("/{id}/reclassify", h.ReclassifyProjectCost)
 		r.Post("/{id}/reverse", h.ReverseProjectCost)
+	})
+	r.Route("/v1/recognition", func(r chi.Router) {
+		r.Post("/estimates", h.SetApprovedEstimate)
+		r.Get("/estimates", h.GetCurrentEstimate)
+		r.Get("/posted-revenue", h.GetPostedRevenueTotal)
+		r.Route("/runs", func(r chi.Router) {
+			r.Post("/", h.CreateRecognitionRun)
+			r.Get("/{id}", h.GetRecognitionRun)
+			r.Post("/{id}/calculate", h.CalculateRecognitionRun)
+			r.Post("/{id}/validate", h.ValidateRecognitionRun)
+			r.Post("/{id}/approve", h.ApproveRecognitionRun)
+			r.Post("/{id}/emit", h.EmitRecognitionAccountingEvent)
+			r.Post("/{id}/supersede", h.SupersedeRecognitionRun)
+		})
+	})
+	r.Route("/v1/profitability", func(r chi.Router) {
+		r.Get("/projections", h.GetProjectProfitability)
+		r.Post("/projections/refresh", h.RefreshProfitabilityProjection)
+		r.Post("/projections/rebuild", h.RefreshProfitabilityProjection)
+		r.Route("/snapshots", func(r chi.Router) {
+			r.Post("/", h.BuildProfitabilitySnapshot)
+			r.Get("/{id}", h.GetProfitabilitySnapshot)
+			r.Post("/{id}/certify", h.CertifyProfitabilitySnapshot)
+		})
 	})
 }
 

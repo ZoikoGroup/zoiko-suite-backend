@@ -171,6 +171,24 @@ type Clients interface {
 	GetControlAccountCode(ctx context.Context, tenantID, mappingKey string) (string, error)
 	GetAPSubledgerTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
 	GetARSubledgerTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
+	// GetAssetNetBookValueTotal is ACC-06's third subledger source — see
+	// its doc comment in internal/clients for why bookID is required.
+	GetAssetNetBookValueTotal(ctx context.Context, tenantID, legalEntityID, bookID string) (float64, error)
+	// GetAssetDepreciationCompleteness is ACC-06's DEPRECIATION_COMPLETENESS
+	// source — see its doc comment in internal/clients.
+	GetAssetDepreciationCompleteness(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (covered, eligible int, err error)
+	// GetInventoryNegativeOnHandCount is ACC-06's INVENTORY_QUANTITY
+	// source — see its doc comment in internal/clients.
+	GetInventoryNegativeOnHandCount(ctx context.Context, tenantID, legalEntityID string) (int, error)
+	// GetInventoryValueTotal is ACC-06's INVENTORY_VALUE source — see its
+	// doc comment in internal/clients.
+	GetInventoryValueTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
+	// GetProjectPostedRevenueTotal is ACC-06's PROJECT_REVENUE source —
+	// see its doc comment in internal/clients.
+	GetProjectPostedRevenueTotal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (float64, error)
+	// GetInventoryUnapprovedVarianceCount is ACC-06's STOCK_COUNT source
+	// — see its doc comment in internal/clients.
+	GetInventoryUnapprovedVarianceCount(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (int, error)
 	// PostAccrualRecognitionJournal is ACC-07's only path to the ledger —
 	// see its doc comment in internal/clients for why.
 	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error)
@@ -833,12 +851,25 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if req.LegalEntityID == "" || req.FiscalPeriod == "" || req.ControlAccountMappingKey == "" {
-		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, fiscal_period and control_account_mapping_key are required")
+	if req.LegalEntityID == "" || req.FiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
 		return
 	}
-	if req.Subledger != "AP" && req.Subledger != "AR" {
+	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" && req.Subledger != "DEPRECIATION_COMPLETENESS" && req.Subledger != "INVENTORY_QUANTITY" && req.Subledger != "INVENTORY_VALUE" && req.Subledger != "PROJECT_REVENUE" && req.Subledger != "STOCK_COUNT" {
 		writeError(w, http.StatusBadRequest, "invalid_subledger", string(domain.ErrInvalidSubledger))
+		return
+	}
+	if req.Subledger == "ASSETS" && req.BookID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", string(domain.ErrBookIDRequiredForAssets))
+		return
+	}
+	// DEPRECIATION_COMPLETENESS and INVENTORY_QUANTITY are integrity
+	// checks, not GL balance comparisons (see writeup below) — neither
+	// ever resolves a control account or compiles a trial balance, so no
+	// mapping key applies to either.
+	isCompletenessType := req.Subledger == "DEPRECIATION_COMPLETENESS" || req.Subledger == "INVENTORY_QUANTITY" || req.Subledger == "STOCK_COUNT"
+	if !isCompletenessType && req.ControlAccountMappingKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "control_account_mapping_key is required")
 		return
 	}
 
@@ -856,6 +887,62 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// DEPRECIATION_COMPLETENESS repurposes this run's own generic
+	// "actual total vs expected total, MATCHED/EXCEPTION" shape for a
+	// coverage check rather than a GL balance tie-out — the AST/INV/PRJ
+	// domain spec's own §9 "Depreciation completeness" assertion has no
+	// GL side at all (it is entirely subledger-internal: did every
+	// eligible schedule actually get depreciated this period?).
+	// subledger_total_amount holds the real, live COVERED count;
+	// gl_control_balance_amount holds the real, live ELIGIBLE count —
+	// neither is a GL balance, and control_account_code is a fixed
+	// sentinel rather than a resolved account, stated honestly rather
+	// than forcing a GL call this assertion has no use for.
+	if req.Subledger == "DEPRECIATION_COMPLETENESS" {
+		covered, eligible, err := h.clients.GetAssetDepreciationCompleteness(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "asset-management-svc")
+			return
+		}
+		h.recordAndRespondControlRun(w, r, correlationID, principalID, tenantID, req, "N/A (completeness check — no GL account)", float64(covered), float64(eligible))
+		return
+	}
+
+	// INVENTORY_QUANTITY is the AST/INV/PRJ domain spec's own §9
+	// "Inventory quantity" assertion: an integrity check (is any
+	// item/location's own derived on-hand negative?), not a balance
+	// comparison — same non-GL shape as DEPRECIATION_COMPLETENESS above.
+	// subledger_total_amount holds the real, live count of negative
+	// on-hand combinations found (the ACTUAL violation count);
+	// gl_control_balance_amount is always 0 (the EXPECTED violation
+	// count — this invariant should never be violated at all). A
+	// non-zero actual count is therefore always an EXCEPTION by
+	// construction, the same MATCHED/EXCEPTION threshold logic every
+	// other subledger type already uses.
+	if req.Subledger == "INVENTORY_QUANTITY" {
+		negativeCount, err := h.clients.GetInventoryNegativeOnHandCount(r.Context(), tenantID, req.LegalEntityID)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "inventory-management-svc")
+			return
+		}
+		h.recordAndRespondControlRun(w, r, correlationID, principalID, tenantID, req, "N/A (integrity check — no GL account)", float64(negativeCount), 0)
+		return
+	}
+
+	// STOCK_COUNT is the AST/INV/PRJ domain spec's own §9 "Stock count"
+	// assertion — an integrity check (does any counted line carry a
+	// real, observed variance that was never approved?), same non-GL
+	// shape as INVENTORY_QUANTITY/DEPRECIATION_COMPLETENESS.
+	if req.Subledger == "STOCK_COUNT" {
+		unapprovedCount, err := h.clients.GetInventoryUnapprovedVarianceCount(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "inventory-management-svc")
+			return
+		}
+		h.recordAndRespondControlRun(w, r, correlationID, principalID, tenantID, req, "N/A (integrity check — no GL account)", float64(unapprovedCount), 0)
+		return
+	}
+
 	controlAccountCode, err := h.clients.GetControlAccountCode(r.Context(), tenantID, req.ControlAccountMappingKey)
 	if err != nil {
 		h.writeSubledgerControlErr(w, err, "general-ledger-svc")
@@ -863,16 +950,35 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var subledgerTotal float64
-	if req.Subledger == "AP" {
+	switch req.Subledger {
+	case "AP":
 		subledgerTotal, err = h.clients.GetAPSubledgerTotal(r.Context(), tenantID, req.LegalEntityID)
 		if err != nil {
 			h.writeSubledgerControlErr(w, err, "accounts-payable-svc")
 			return
 		}
-	} else {
+	case "AR":
 		subledgerTotal, err = h.clients.GetARSubledgerTotal(r.Context(), tenantID, req.LegalEntityID)
 		if err != nil {
 			h.writeSubledgerControlErr(w, err, "accounts-receivable-svc")
+			return
+		}
+	case "ASSETS":
+		subledgerTotal, err = h.clients.GetAssetNetBookValueTotal(r.Context(), tenantID, req.LegalEntityID, req.BookID)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "asset-management-svc")
+			return
+		}
+	case "INVENTORY_VALUE":
+		subledgerTotal, err = h.clients.GetInventoryValueTotal(r.Context(), tenantID, req.LegalEntityID)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "inventory-management-svc")
+			return
+		}
+	case "PROJECT_REVENUE":
+		subledgerTotal, err = h.clients.GetProjectPostedRevenueTotal(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "project-accounting-svc")
 			return
 		}
 	}
@@ -888,6 +994,15 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.recordAndRespondControlRun(w, r, correlationID, principalID, tenantID, req, controlAccountCode, subledgerTotal, glBalance)
+}
+
+// recordAndRespondControlRun is the shared tail every subledger type
+// reaches: diff, threshold, persist (append-only evidence), publish an
+// exception if one occurred, respond. Factored out once
+// DEPRECIATION_COMPLETENESS needed to reach this same tail without the
+// GL-comparison steps above it.
+func (h *Handler) recordAndRespondControlRun(w http.ResponseWriter, r *http.Request, correlationID, principalID, tenantID string, req domain.RunSubledgerControlRequest, controlAccountCode string, subledgerTotal, glBalance float64) {
 	difference := subledgerTotal - glBalance
 	status := "MATCHED"
 	if difference > matchToleranceAmount || difference < -matchToleranceAmount {

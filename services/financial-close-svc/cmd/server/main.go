@@ -21,10 +21,12 @@ import (
 
 	"zoiko.io/financial-close-svc/internal/clients"
 	"zoiko.io/financial-close-svc/internal/config"
+	"zoiko.io/financial-close-svc/internal/consumer"
 	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
 	"zoiko.io/financial-close-svc/internal/events"
 	"zoiko.io/financial-close-svc/internal/handler"
 	"zoiko.io/financial-close-svc/internal/health"
+	svckafka "zoiko.io/financial-close-svc/internal/kafka"
 	svcmiddleware "zoiko.io/financial-close-svc/internal/middleware"
 	"zoiko.io/financial-close-svc/internal/mtls"
 	"zoiko.io/financial-close-svc/internal/store"
@@ -135,9 +137,32 @@ func main() {
 			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
 		}
 		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
-		clientsWrapper = clients.NewWithAuthzHTTPClient(cfg.AuthzMTLSURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log, mtlsHTTPClient)
+		clientsWrapper = clients.NewWithAuthzHTTPClient(cfg.AuthzMTLSURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, cfg.AssetServiceURL, cfg.InventoryServiceURL, cfg.ProjectServiceURL, log, mtlsHTTPClient)
 	} else {
-		clientsWrapper = clients.New(cfg.AuthZServiceURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log)
+		clientsWrapper = clients.New(cfg.AuthZServiceURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, cfg.AssetServiceURL, cfg.InventoryServiceURL, cfg.ProjectServiceURL, log)
+	}
+
+	// ── 4b. Lineage Kafka consumer ─────────────────────────────────────────────
+	// Consumes asset-management-svc's, inventory-management-svc's and
+	// project-accounting-svc's own "accounting event emitted" signals to
+	// build ACC-18 lineage edges — the AST/INV/PRJ domain spec's own §9
+	// "source-to-report" assertion. Event-driven rather than an inbound
+	// HTTP push from those three services: Kafka's own durable,
+	// at-least-once delivery means an outage here delays lineage
+	// recording, never loses it. Started before the HTTP listener, same
+	// reasoning as identity-context-svc's own revocation consumer — an
+	// event published while this service was down must still be
+	// consumed once it's back, not skipped.
+	lineageConsumer := consumer.New(pgStore, log)
+	consumerCtx, stopConsumers := context.WithCancel(context.Background())
+	defer stopConsumers()
+	lineageRunners := []*svckafka.Runner{
+		svckafka.NewRunner(cfg.Kafka.Brokers, cfg.Kafka.GroupID, cfg.AssetEventsTopic, lineageConsumer, metrics, log),
+		svckafka.NewRunner(cfg.Kafka.Brokers, cfg.Kafka.GroupID, cfg.InventoryEventsTopic, lineageConsumer, metrics, log),
+		svckafka.NewRunner(cfg.Kafka.Brokers, cfg.Kafka.GroupID, cfg.ProjectEventsTopic, lineageConsumer, metrics, log),
+	}
+	for _, run := range lineageRunners {
+		go run.Run(consumerCtx)
 	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
@@ -206,6 +231,25 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+
+	log.Info("stopping lineage kafka consumers")
+	stopConsumers()
+	// Bounded — a stuck reader/commit must not block process exit
+	// forever. Close() is called even on timeout so the underlying
+	// connections are released either way.
+	drained := make(chan struct{})
+	go func() {
+		for _, run := range lineageRunners {
+			run.Close()
+		}
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		log.Error("lineage consumer shutdown timed out")
+	}
+
 	log.Info("server stopped")
 }
 

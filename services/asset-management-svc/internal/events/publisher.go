@@ -91,6 +91,29 @@ func (p *Publisher) PublishAssetSuspended(ctx context.Context, correlationID, ac
 	})
 }
 
+// PublishDepreciationRunAccountingEventEmitted and
+// PublishAssetEventAccountingEventEmitted are this service's own
+// "accounting event emitted" signals — previously silent (this service
+// never published them at all), leaving financial-close-svc's ACC-18
+// lineage engine with no way to observe an asset-originated journal.
+// Same event_type naming and {run_id/event_id, journal_id} payload shape
+// as inventory-management-svc's own
+// PublishInventoryAccountingEventEmitted and project-accounting-svc's
+// own PublishProjectRecognitionAccountingEventEmitted, so a single
+// lineage consumer can handle all three with one small per-event-type
+// mapping rather than three different shapes.
+func (p *Publisher) PublishDepreciationRunAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string) {
+	p.emit(ctx, "depreciation.run.accounting_event.emitted", correlationID, tenantID, legalEntityID, actorID, runID, map[string]any{
+		"run_id": runID, "journal_id": journalID,
+	})
+}
+
+func (p *Publisher) PublishAssetEventAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, journalID string) {
+	p.emit(ctx, "asset.event.accounting_event.emitted", correlationID, tenantID, legalEntityID, actorID, eventID, map[string]any{
+		"event_id": eventID, "journal_id": journalID,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

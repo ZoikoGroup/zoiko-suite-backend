@@ -110,7 +110,7 @@ func TestPgStore_ACC09_SupersedeAllocationRule_NoCurrentVersion_Refused(t *testi
 
 	newVersion := &domain.AllocationRule{
 		RuleVersionID: uuid.New().String(), LegalEntityID: "le-1", Name: "x", SourceAccountCode: "5000-X",
-		Drivers: []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}},
+		Drivers:   []domain.AllocationDriver{{RecipientAccountCode: "6100-Sales", WeightPercentage: 100}},
 		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
 	}
 	err := s.SupersedeAllocationRule(ctx, ruleID, newVersion, time.Now().UTC())

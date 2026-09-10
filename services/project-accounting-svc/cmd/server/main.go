@@ -22,6 +22,7 @@ import (
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
+	"zoiko.io/project-accounting-svc/internal/clients"
 	"zoiko.io/project-accounting-svc/internal/config"
 	"zoiko.io/project-accounting-svc/internal/domain"
 	svcenvelope "zoiko.io/project-accounting-svc/internal/envelope"
@@ -231,6 +232,7 @@ func main() {
 		authzBaseURL = cfg.AuthzMTLSURL
 	}
 	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
+	platformClients := clients.New(cfg.CloseServiceURL, cfg.LedgerServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -246,7 +248,7 @@ func main() {
 	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	h := handler.New(pgStore, publisher, authzClient, log).WithPeriodChecker(platformClients).WithLedgerClient(platformClients)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

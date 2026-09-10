@@ -325,3 +325,53 @@ func TestReverseWriteDown_DifferentPrincipal_Succeeds(t *testing.T) {
 		t.Fatalf("expected exactly 1 journal reversal, got %d", ledger.reverseCalls)
 	}
 }
+
+// ── GetInventoryValueTotal (§9 "Inventory value → GL") ───────────────────────
+
+func TestGetInventoryValueTotal_MissingLegalEntity_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/valuation/inventory-value-total", nil, "reader-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetInventoryValueTotal_SumsAcrossItemsAndLocations(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemA, locA := valuationFixture(t, s, r)
+	committedA := createAndCommitReceipt(t, r, itemA, locA, "idem-val-total-1", 10)
+	valueMovement(t, r, committedA.MovementID, f(5.0)) // 10 * 5 = 50
+
+	itemB := createActiveItem(t, s, r, "le-1", "SKU-VAL-"+uniqueSuffix())
+	committedB := createAndCommitReceipt(t, r, itemB, locA, "idem-val-total-2", 4)
+	valueMovement(t, r, committedB.MovementID, f(25.0)) // 4 * 25 = 100
+
+	rr := doReq(r, http.MethodGet, "/v1/valuation/inventory-value-total?legal_entity_id=le-1", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]float64
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["inventory_value_total"] != 150 {
+		t.Fatalf("expected 150 (50 + 100 across two items), got %+v", out)
+	}
+}
+
+func TestGetInventoryValueTotal_DifferentLegalEntity_ExcludedFromTotal(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemA, locA := valuationFixture(t, s, r)
+	committedA := createAndCommitReceipt(t, r, itemA, locA, "idem-val-total-3", 10)
+	valueMovement(t, r, committedA.MovementID, f(5.0))
+
+	rr := doReq(r, http.MethodGet, "/v1/valuation/inventory-value-total?legal_entity_id=le-unrelated", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]float64
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["inventory_value_total"] != 0 {
+		t.Fatalf("expected 0 for an unrelated legal_entity_id, got %+v", out)
+	}
+}
