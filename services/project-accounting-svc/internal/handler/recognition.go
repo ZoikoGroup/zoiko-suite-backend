@@ -65,6 +65,38 @@ func (h *Handler) SetApprovedEstimate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, newVersion)
 }
 
+// GetPostedRevenueTotal is a read-only aggregate over real, live
+// recognition runs — never a caller-declared figure. financial-close-svc's
+// ACC-06 calls this directly for the AST/INV/PRJ domain spec's own §9
+// "Project revenue/WIP → GL" assertion; see internal/store's own doc
+// comment for the exact calculation.
+func (h *Handler) GetPostedRevenueTotal(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	fiscalPeriod := r.URL.Query().Get("fiscal_period")
+	if legalEntityID == "" || fiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionProjectRevenueRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	total, err := h.store.GetPostedRevenueTotal(r.Context(), legalEntityID, fiscalPeriod)
+	if err != nil {
+		h.log.Error("GetPostedRevenueTotal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]float64{"posted_revenue_total": total})
+}
+
 func (h *Handler) GetCurrentEstimate(w http.ResponseWriter, r *http.Request) {
 	projectID := r.URL.Query().Get("project_id")
 	if projectID == "" {

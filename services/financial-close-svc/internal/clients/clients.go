@@ -51,6 +51,7 @@ type Clients struct {
 	vaultURL     string
 	assetURL     string
 	inventoryURL string
+	projectURL   string
 	http         *http.Client
 	log          *zap.Logger
 
@@ -66,7 +67,7 @@ type Clients struct {
 	cacheWrites int
 }
 
-func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL string, log *zap.Logger) *Clients {
+func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL, projectURL string, log *zap.Logger) *Clients {
 	return &Clients{
 		authzURL:     authzURL,
 		ledgerURL:    ledgerURL,
@@ -75,6 +76,7 @@ func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL str
 		vaultURL:     vaultURL,
 		assetURL:     assetURL,
 		inventoryURL: inventoryURL,
+		projectURL:   projectURL,
 		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
 		log:          log,
 		cache:        make(map[string]cachedDecision),
@@ -83,9 +85,9 @@ func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL str
 
 // NewWithAuthzHTTPClient is New but with a caller-supplied *http.Client used
 // solely for calls to authorization-svc — used for the mTLS pilot. Every
-// other outbound client (GL/AP/AR/vault/asset/inventory) built here is
-// unaffected and keeps using the plain, non-mTLS http.Client.
-func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
+// other outbound client (GL/AP/AR/vault/asset/inventory/project) built here
+// is unaffected and keeps using the plain, non-mTLS http.Client.
+func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL, projectURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
 	return &Clients{
 		authzURL:     authzURL,
 		ledgerURL:    ledgerURL,
@@ -94,6 +96,7 @@ func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetUR
 		vaultURL:     vaultURL,
 		assetURL:     assetURL,
 		inventoryURL: inventoryURL,
+		projectURL:   projectURL,
 		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
 		authzHTTP:    authzHTTPClient,
 		log:          log,
@@ -1315,6 +1318,52 @@ func (c *Clients) GetInventoryValueTotal(ctx context.Context, tenantID, legalEnt
 		return 0, err
 	}
 	return out.InventoryValueTotal, nil
+}
+
+// projectPostedRevenueResponse mirrors project-accounting-svc's own
+// GET /v1/recognition/posted-revenue wire shape.
+type projectPostedRevenueResponse struct {
+	PostedRevenueTotal float64 `json:"posted_revenue_total"`
+}
+
+// GetProjectPostedRevenueTotal is ACC-06's PROJECT_REVENUE source — a
+// REAL GL balance comparison, satisfying the AST/INV/PRJ domain spec's
+// own §9 "Project revenue/WIP → GL" assertion the same way
+// GetAssetNetBookValueTotal/GetInventoryValueTotal satisfy their own
+// GL-comparison assertions: a live sum of only-actually-posted revenue,
+// reconciled against a caller-resolved GL revenue control account.
+func (c *Clients) GetProjectPostedRevenueTotal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (float64, error) {
+	u, err := url.Parse(c.projectURL + "/v1/recognition/posted-revenue")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("fiscal_period", fiscalPeriod)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch posted revenue total from project-accounting-svc", zap.Error(err))
+		return 0, domain.ErrProjectServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrProjectServiceUnavailable
+	}
+
+	var out projectPostedRevenueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.PostedRevenueTotal, nil
 }
 
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that

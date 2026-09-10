@@ -283,3 +283,73 @@ func TestPgStore_RecognitionRun_FullLifecycle(t *testing.T) {
 		t.Fatalf("expected a new run for the same period to succeed after supersession, got %v", err)
 	}
 }
+
+// TestPgStore_GetPostedRevenueTotal_RealDB proves the real aggregation —
+// the source financial-close-svc's ACC-06 reconciles against for the
+// AST/INV/PRJ domain spec's own §9 "Project revenue/WIP → GL" assertion.
+// Only a run that actually reached ACCOUNTING_EVENT_EMITTED counts —
+// calculated-but-unposted revenue must never appear as if it were real.
+func TestPgStore_GetPostedRevenueTotal_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newRecognitionReadyProject(t, s, ctx, tenantID, legalEntityID, "PRJ-REC-POSTED-1", 300)
+
+	entry := newDraftCostEntry(projectID, domain.CostSourceTypeAP, "cost-posted-1", 700)
+	if err := s.CaptureProjectCost(ctx, entry); err != nil {
+		t.Fatalf("CaptureProjectCost failed: %v", err)
+	}
+
+	contractValue := 1000.0
+	run := &domain.RecognitionRun{
+		RunID: uuid.New().String(), LegalEntityID: legalEntityID, ProjectID: projectID, FiscalPeriod: "2026-09",
+		Status: domain.RecognitionRunStatusDraft, ContractValue: &contractValue,
+		RevenueAccountCode: "4000", WIPAccountCode: "1300",
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateRecognitionRun(ctx, run); err != nil {
+		t.Fatalf("CreateRecognitionRun failed: %v", err)
+	}
+
+	preEmit, err := s.GetPostedRevenueTotal(ctx, legalEntityID, "2026-09")
+	if err != nil {
+		t.Fatalf("GetPostedRevenueTotal (before calculate) failed: %v", err)
+	}
+	if preEmit != 0 {
+		t.Fatalf("expected 0 before any run reaches ACCOUNTING_EVENT_EMITTED, got %v", preEmit)
+	}
+
+	now := time.Now().UTC()
+	if err := s.FreezeAndCalculate(ctx, run.RunID, now); err != nil {
+		t.Fatalf("FreezeAndCalculate failed: %v", err)
+	}
+
+	postCalculate, err := s.GetPostedRevenueTotal(ctx, legalEntityID, "2026-09")
+	if err != nil {
+		t.Fatalf("GetPostedRevenueTotal (after calculate, before emit) failed: %v", err)
+	}
+	if postCalculate != 0 {
+		t.Fatalf("expected 0 after CALCULATED but before emission, got %v", postCalculate)
+	}
+
+	if err := s.ValidateRecognitionRun(ctx, run.RunID, now); err != nil {
+		t.Fatalf("ValidateRecognitionRun failed: %v", err)
+	}
+	if err := s.ApproveRecognitionRun(ctx, run.RunID, "approver-1", now); err != nil {
+		t.Fatalf("ApproveRecognitionRun failed: %v", err)
+	}
+	if err := s.MarkRecognitionRunEmitted(ctx, run.RunID, "journal-posted-1", now); err != nil {
+		t.Fatalf("MarkRecognitionRunEmitted failed: %v", err)
+	}
+
+	postEmit, err := s.GetPostedRevenueTotal(ctx, legalEntityID, "2026-09")
+	if err != nil {
+		t.Fatalf("GetPostedRevenueTotal (after emit) failed: %v", err)
+	}
+	if postEmit != 700 {
+		t.Fatalf("expected 700 (0.7 percent_complete * 1000 contract_value) after emission, got %v", postEmit)
+	}
+}

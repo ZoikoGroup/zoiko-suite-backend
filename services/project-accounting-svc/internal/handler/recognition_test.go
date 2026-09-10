@@ -187,6 +187,57 @@ func TestSupersedeRecognitionRun_MissingReason_Returns400(t *testing.T) {
 	}
 }
 
+// ── GetPostedRevenueTotal (§9 "Project revenue/WIP → GL") ───────────────────
+
+func TestGetPostedRevenueTotal_MissingParams_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/recognition/posted-revenue?legal_entity_id=le-1", nil, "reader-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 missing fiscal_period, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetPostedRevenueTotal_OnlyCountsEmittedRuns(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{postJournalID: "jrnl-rec-1"}
+	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	id := createRunReadyProject(t, r, "le-1", "REC-11")
+	run := createDraftRun(t, r, id, "2026-09")
+
+	// Before emission: calculated but never posted, must not count. The
+	// stub's own FreezeAndCalculate always derives itd_cost=0 (it doesn't
+	// model project_cost_entries), so period_recognized_revenue is
+	// nudged to a nonzero value directly here — real-Postgres coverage
+	// of the actual calculation already lives in PRJ-03's own store
+	// tests; this test is only proving GetPostedRevenueTotal's own
+	// status filter.
+	doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/calculate", nil, "preparer-1")
+	nonZeroRevenue := 700.0
+	s.runs[run.RunID].PeriodRecognizedRevenue = &nonZeroRevenue
+	preEmitRR := doReq(r, http.MethodGet, "/v1/recognition/posted-revenue?legal_entity_id=le-1&fiscal_period=2026-09", nil, "reader-1")
+	var preEmit map[string]float64
+	_ = json.NewDecoder(preEmitRR.Body).Decode(&preEmit)
+	if preEmit["posted_revenue_total"] != 0 {
+		t.Fatalf("expected 0 before emission, got %v", preEmit["posted_revenue_total"])
+	}
+
+	doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/validate", nil, "preparer-1")
+	doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/approve", nil, "approver-2")
+	emitRR := doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/emit", nil, "preparer-1")
+	if emitRR.Code != http.StatusOK {
+		t.Fatalf("emit failed: %d %s", emitRR.Code, emitRR.Body.String())
+	}
+
+	postEmitRR := doReq(r, http.MethodGet, "/v1/recognition/posted-revenue?legal_entity_id=le-1&fiscal_period=2026-09", nil, "reader-1")
+	var postEmit map[string]float64
+	_ = json.NewDecoder(postEmitRR.Body).Decode(&postEmit)
+	emittedRun := s.runs[run.RunID]
+	if emittedRun.PeriodRecognizedRevenue == nil || postEmit["posted_revenue_total"] != *emittedRun.PeriodRecognizedRevenue {
+		t.Fatalf("expected posted_revenue_total to equal the emitted run's own period_recognized_revenue (%v), got %v",
+			emittedRun.PeriodRecognizedRevenue, postEmit["posted_revenue_total"])
+	}
+}
+
 func TestSupersedeRecognitionRun_Succeeds(t *testing.T) {
 	s := newStubStore()
 	ledger := &stubLedger{}

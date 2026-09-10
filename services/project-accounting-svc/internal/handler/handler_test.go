@@ -262,6 +262,19 @@ func (s *stubStore) SupersedeRecognitionRun(_ context.Context, runID, principalI
 	return nil
 }
 
+func (s *stubStore) GetPostedRevenueTotal(_ context.Context, legalEntityID, fiscalPeriod string) (float64, error) {
+	var total float64
+	for _, r := range s.runs {
+		if r.LegalEntityID != legalEntityID || r.FiscalPeriod != fiscalPeriod || r.Status != domain.RecognitionRunStatusAccountingEventEmitted {
+			continue
+		}
+		if r.PeriodRecognizedRevenue != nil {
+			total += *r.PeriodRecognizedRevenue
+		}
+	}
+	return total, nil
+}
+
 // ── PRJ-02 (Project Cost Capture) ────────────────────────────────────────────
 
 func (s *stubStore) CaptureProjectCost(_ context.Context, e *domain.CostEntry) error {

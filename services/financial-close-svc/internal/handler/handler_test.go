@@ -1053,6 +1053,8 @@ type stubClients struct {
 	invNegativeErr      error
 	invValueTotal       float64
 	invValueErr         error
+	projRevenueTotal    float64
+	projRevenueErr      error
 
 	postJournalErr   error
 	postedJournalID  string
@@ -1157,6 +1159,10 @@ func (c *stubClients) GetInventoryNegativeOnHandCount(_ context.Context, _, _ st
 
 func (c *stubClients) GetInventoryValueTotal(_ context.Context, _, _ string) (float64, error) {
 	return c.invValueTotal, c.invValueErr
+}
+
+func (c *stubClients) GetProjectPostedRevenueTotal(_ context.Context, _, _, _ string) (float64, error) {
+	return c.projRevenueTotal, c.projRevenueErr
 }
 
 func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
@@ -2053,6 +2059,80 @@ func TestRunSubledgerControl_InventoryValueMissingMappingKey_Returns400(t *testi
 	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 (INVENTORY_VALUE is a real GL comparison, mapping key required), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRunSubledgerControl_ProjectRevenueMatched_RecordsRun proves
+// ACC-06's own run mechanism now also serves the AST/INV/PRJ domain
+// spec's own §9 "Project revenue/WIP → GL" assertion — a REAL GL
+// balance comparison, same control-account/trial-balance path as
+// AP/AR/ASSETS/INVENTORY_VALUE.
+func TestRunSubledgerControl_ProjectRevenueMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"PROJECT_REVENUE_CONTROL": "4000-PRJ"},
+		projRevenueTotal:    700.00,
+		trialBalances:       map[string]float64{"4000-PRJ": 700.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "PROJECT_REVENUE",
+		ControlAccountMappingKey: "PROJECT_REVENUE_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+}
+
+func TestRunSubledgerControl_ProjectRevenueMismatch_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"PROJECT_REVENUE_CONTROL": "4000-PRJ"},
+		projRevenueTotal:    700.00,
+		trialBalances:       map[string]float64{"4000-PRJ": 650.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "PROJECT_REVENUE",
+		ControlAccountMappingKey: "PROJECT_REVENUE_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION, got %q", run.Status)
+	}
+	if run.DifferenceAmount != 50.00 {
+		t.Errorf("expected difference 50.00, got %v", run.DifferenceAmount)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+func TestRunSubledgerControl_ProjectRevenueMissingMappingKey_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "PROJECT_REVENUE"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (PROJECT_REVENUE is a real GL comparison, mapping key required), got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

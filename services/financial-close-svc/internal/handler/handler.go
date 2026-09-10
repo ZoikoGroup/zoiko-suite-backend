@@ -183,6 +183,9 @@ type Clients interface {
 	// GetInventoryValueTotal is ACC-06's INVENTORY_VALUE source — see its
 	// doc comment in internal/clients.
 	GetInventoryValueTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
+	// GetProjectPostedRevenueTotal is ACC-06's PROJECT_REVENUE source —
+	// see its doc comment in internal/clients.
+	GetProjectPostedRevenueTotal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod string) (float64, error)
 	// PostAccrualRecognitionJournal is ACC-07's only path to the ledger —
 	// see its doc comment in internal/clients for why.
 	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error)
@@ -849,7 +852,7 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
 		return
 	}
-	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" && req.Subledger != "DEPRECIATION_COMPLETENESS" && req.Subledger != "INVENTORY_QUANTITY" && req.Subledger != "INVENTORY_VALUE" {
+	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" && req.Subledger != "DEPRECIATION_COMPLETENESS" && req.Subledger != "INVENTORY_QUANTITY" && req.Subledger != "INVENTORY_VALUE" && req.Subledger != "PROJECT_REVENUE" {
 		writeError(w, http.StatusBadRequest, "invalid_subledger", string(domain.ErrInvalidSubledger))
 		return
 	}
@@ -953,6 +956,12 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		subledgerTotal, err = h.clients.GetInventoryValueTotal(r.Context(), tenantID, req.LegalEntityID)
 		if err != nil {
 			h.writeSubledgerControlErr(w, err, "inventory-management-svc")
+			return
+		}
+	case "PROJECT_REVENUE":
+		subledgerTotal, err = h.clients.GetProjectPostedRevenueTotal(r.Context(), tenantID, req.LegalEntityID, req.FiscalPeriod)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "project-accounting-svc")
 			return
 		}
 	}

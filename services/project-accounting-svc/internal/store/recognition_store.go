@@ -313,3 +313,31 @@ func (s *PgStore) SupersedeRecognitionRun(ctx context.Context, runID, principalI
 	return s.transitionRecognitionRun(ctx, runID, domain.RecognitionRunStatusAccountingEventEmitted, domain.RecognitionRunStatusSuperseded,
 		", superseded_at = $2, superseded_by_principal_id = $3", at, principalID)
 }
+
+// GetPostedRevenueTotal is the AST/INV/PRJ domain spec's own §9 "Project
+// revenue/WIP → GL" assertion (verbatim): "Certified recognition/WIP run
+// reconciles to posted revenue/contract balance/WIP accounts and AR
+// billing separately." A real GL balance comparison, the same shape as
+// Assets → GL and Inventory value → GL: SUM(period_recognized_revenue)
+// across every run that has actually reached ACCOUNTING_EVENT_EMITTED
+// (and has not since been SUPERSEDED) for this legal entity and fiscal
+// period — the real revenue this service itself posted through
+// general-ledger-svc, never a run that merely calculated a figure but
+// never emitted it.
+func (s *PgStore) GetPostedRevenueTotal(ctx context.Context, legalEntityID, fiscalPeriod string) (float64, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var total float64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(period_recognized_revenue), 0) FROM project_recognition_runs
+			WHERE tenant_id = $1 AND legal_entity_id = $2 AND fiscal_period = $3 AND status = $4
+		`, tenantID, legalEntityID, fiscalPeriod, domain.RecognitionRunStatusAccountingEventEmitted).Scan(&total)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}

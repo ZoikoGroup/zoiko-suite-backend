@@ -37,6 +37,10 @@ type Config struct {
 	// INVENTORY_QUANTITY source, satisfying the AST/INV/PRJ domain
 	// spec's own §9 "Inventory quantity" assertion.
 	InventoryServiceURL string
+	// ProjectServiceURL is project-accounting-svc — ACC-06's own
+	// PROJECT_REVENUE source, satisfying the AST/INV/PRJ domain spec's
+	// own §9 "Project revenue/WIP → GL" assertion.
+	ProjectServiceURL string
 
 	// CloseSigningKey is the HMAC secret the close evidence signature is
 	// computed with. There is deliberately NO default: the signature used to be
@@ -124,6 +128,7 @@ func Load() (*Config, error) {
 		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 		AssetServiceURL:      env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
 		InventoryServiceURL:  env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
+		ProjectServiceURL:    env("PROJECT_SERVICE_URL", "http://project-accounting-svc:8169"),
 		CloseSigningKey:      signingKey,
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil

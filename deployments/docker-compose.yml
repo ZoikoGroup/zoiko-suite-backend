@@ -2204,6 +2204,9 @@ services:
       # ACC-06's INVENTORY_QUANTITY source — same §9 posture, satisfies
       # the "Inventory quantity" assertion.
       INVENTORY_SERVICE_URL: "http://inventory-management-svc:8168"
+      # ACC-06's PROJECT_REVENUE source — same §9 posture, satisfies the
+      # "Project revenue/WIP → GL" assertion.
+      PROJECT_SERVICE_URL: "http://project-accounting-svc:8169"
       # HMAC secret for the close evidence signature. The service refuses to
       # start without one, deliberately: the signature was previously keyed with
       # the tenant id — a public value — so anything it "guaranteed" was
@@ -2229,6 +2232,8 @@ services:
       asset-management-svc:
         condition: service_healthy
       inventory-management-svc:
+        condition: service_healthy
+      project-accounting-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a

@@ -56,6 +56,11 @@ type Store interface {
 	ApproveRecognitionRun(ctx context.Context, runID, principalID string, at time.Time) error
 	MarkRecognitionRunEmitted(ctx context.Context, runID, journalID string, at time.Time) error
 	SupersedeRecognitionRun(ctx context.Context, runID, principalID string, at time.Time) error
+	// GetPostedRevenueTotal backs GET /v1/recognition/posted-revenue —
+	// see internal/store/recognition_store.go's own doc comment. Serves
+	// the AST/INV/PRJ domain spec's own §9 "Project revenue/WIP → GL"
+	// assertion.
+	GetPostedRevenueTotal(ctx context.Context, legalEntityID, fiscalPeriod string) (float64, error)
 
 	// PRJ-04 (Project Profitability) — see internal/store/profitability_store.go's
 	// own doc comments for the authority boundary these implement. Pure
@@ -237,6 +242,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/recognition", func(r chi.Router) {
 		r.Post("/estimates", h.SetApprovedEstimate)
 		r.Get("/estimates", h.GetCurrentEstimate)
+		r.Get("/posted-revenue", h.GetPostedRevenueTotal)
 		r.Route("/runs", func(r chi.Router) {
 			r.Post("/", h.CreateRecognitionRun)
 			r.Get("/{id}", h.GetRecognitionRun)
