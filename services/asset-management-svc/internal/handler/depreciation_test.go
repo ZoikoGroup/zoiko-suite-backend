@@ -153,7 +153,8 @@ func TestFreezeDepreciationPopulation_ExcludesNonActiveAssets(t *testing.T) {
 func TestDepreciationRun_FullLifecycle_EmitsRealJournal(t *testing.T) {
 	s := newStubStore()
 	ledger := &stubLedger{postJournalID: "real-journal-1"}
-	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	pub := &stubPublisher{}
+	r := newRouterWithLedger(s, pub, &stubAuthZ{}, ledger)
 	assetID := createActiveAsset(t, s, r, "le-1")
 
 	buildRR := doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
@@ -178,6 +179,7 @@ func TestDepreciationRun_FullLifecycle_EmitsRealJournal(t *testing.T) {
 	if rr := doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
 		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
 	}
+	callsBeforeEmit := pub.calls
 	emitRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/emit", nil, "approver-1")
 	if emitRR.Code != http.StatusOK {
 		t.Fatalf("emit failed: %d %s", emitRR.Code, emitRR.Body.String())
@@ -187,6 +189,11 @@ func TestDepreciationRun_FullLifecycle_EmitsRealJournal(t *testing.T) {
 	}
 	if ledger.lastPostedSourceEventID != run.RunID {
 		t.Fatalf("expected the run's own ID as the idempotency source_event_id, got %q", ledger.lastPostedSourceEventID)
+	}
+	// PublishDepreciationRunAccountingEventEmitted — financial-close-svc's
+	// own ACC-18 lineage consumer's real source for depreciation journals.
+	if pub.calls != callsBeforeEmit+1 {
+		t.Fatalf("expected exactly 1 new publish call for the accounting-event-emitted signal, got %d", pub.calls-callsBeforeEmit)
 	}
 
 	got, _ := s.GetDepreciationRun(context.Background(), run.RunID)

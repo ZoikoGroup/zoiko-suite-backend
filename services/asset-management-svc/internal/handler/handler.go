@@ -93,6 +93,11 @@ type Publisher interface {
 	PublishAssetCapitalizationRequested(ctx context.Context, correlationID, actorID string, a domain.FixedAsset)
 	PublishAssetMetadataChanged(ctx context.Context, correlationID, actorID string, a domain.FixedAsset)
 	PublishAssetSuspended(ctx context.Context, correlationID, actorID string, a domain.FixedAsset)
+	// PublishDepreciationRunAccountingEventEmitted/PublishAssetEventAccountingEventEmitted
+	// feed financial-close-svc's own ACC-18 lineage consumer — see
+	// internal/events's own doc comment.
+	PublishDepreciationRunAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string)
+	PublishAssetEventAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, journalID string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.

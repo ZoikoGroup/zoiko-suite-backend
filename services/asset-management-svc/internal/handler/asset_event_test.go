@@ -245,7 +245,8 @@ func TestApplyAssetEvent_PeriodCheckUnavailable_Returns503(t *testing.T) {
 func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testing.T) {
 	s := newStubStore()
 	ledger := &stubLedger{postJournalID: "jrnl-1"}
-	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	pub := &stubPublisher{}
+	r := newRouterWithLedger(s, pub, &stubAuthZ{}, ledger)
 	id := createActiveAsset(t, s, r, "le-1")
 	amount := 250.0
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeImpairment, domain.CreateAssetEventRequest{
@@ -253,6 +254,7 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 		DebitAccountCode: "IMPAIRMENT-EXPENSE", CreditAccountCode: "ACCUM-IMPAIRMENT",
 	})
 	walkToApproved(t, r, e.EventID)
+	callsBeforeApply := pub.calls
 
 	rr := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")
 	if rr.Code != http.StatusOK {
@@ -267,15 +269,23 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 	if ledger.lastPostedSourceEventID != e.EventID {
 		t.Fatalf("expected source_event_id keyed by the event's own ID, got %q", ledger.lastPostedSourceEventID)
 	}
+	// PublishAssetEventAccountingEventEmitted — financial-close-svc's own
+	// ACC-18 lineage consumer's real source; must fire exactly once a
+	// journal is actually posted.
+	if pub.calls != callsBeforeApply+1 {
+		t.Fatalf("expected exactly 1 new publish call for the accounting-event-emitted signal, got %d", pub.calls-callsBeforeApply)
+	}
 }
 
 func TestApplyAssetEvent_NoAmount_LandsInAppliedNeverEmitted(t *testing.T) {
 	s := newStubStore()
 	ledger := &stubLedger{}
-	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	pub := &stubPublisher{}
+	r := newRouterWithLedger(s, pub, &stubAuthZ{}, ledger)
 	id := createActiveAsset(t, s, r, "le-1")
 	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
 	walkToApproved(t, r, e.EventID)
+	callsBeforeApply := pub.calls
 
 	rr := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")
 	if rr.Code != http.StatusOK {
@@ -286,6 +296,11 @@ func TestApplyAssetEvent_NoAmount_LandsInAppliedNeverEmitted(t *testing.T) {
 	}
 	if ledger.postCalls != 0 {
 		t.Fatalf("expected no journal post for a $0 event, got %d calls", ledger.postCalls)
+	}
+	// No journal posted means no accounting-event-emitted signal either —
+	// nothing for lineage to trace.
+	if pub.calls != callsBeforeApply {
+		t.Fatalf("expected no new publish calls for a never-emitted event, got %d", pub.calls-callsBeforeApply)
 	}
 }
 

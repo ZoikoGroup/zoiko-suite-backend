@@ -480,6 +480,14 @@ func (p *stubPublisher) PublishAssetSuspended(_ context.Context, _, _ string, _ 
 	p.calls++
 }
 
+func (p *stubPublisher) PublishDepreciationRunAccountingEventEmitted(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
+
+func (p *stubPublisher) PublishAssetEventAccountingEventEmitted(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
+
 var _ handler.Publisher = (*stubPublisher)(nil)
 
 type stubAuthZ struct{ err error }

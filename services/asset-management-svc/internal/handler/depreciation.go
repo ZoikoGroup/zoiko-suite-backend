@@ -419,6 +419,7 @@ func (h *Handler) EmitDepreciationAccountingEvent(w http.ResponseWriter, r *http
 			"the journal IS posted ("+journalID+"), but the run could not be marked ACCOUNTING_EVENT_EMITTED.")
 		return
 	}
+	h.publisher.PublishDepreciationRunAccountingEventEmitted(r.Context(), correlationID, principalID, tenantID, run.LegalEntityID, id, journalID)
 	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.DepreciationRunStatusAccountingEventEmitted, "journal_id": journalID})
 }
 
