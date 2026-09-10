@@ -10,7 +10,6 @@ package clients_test
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -84,116 +83,65 @@ func newClients(t *testing.T, ledgerURL string) *clients.Clients {
 	return clients.New("http://authz.invalid", ledgerURL, "http://ap.invalid", "http://ar.invalid", "http://vault.invalid", zap.NewNop())
 }
 
-// TestCompileTrialBalance_IncludesReversedOriginals is the regression test for
-// an accounting defect that mis-stated the trial balance by exactly double the
-// value of every reversal.
-//
-// A reversal in general-ledger-svc erases nothing: the original moves to
-// REVERSED and keeps its lines, and a NEW journal is posted FINALIZED carrying
-// the exact inverse. Both are real postings and together they net to zero.
-// Compiling from FINALIZED alone dropped the original while keeping its
-// inverse, so a reversed 100.00 debit read as a 100.00 CREDIT — and that
-// balance is what gets hashed, signed and locked as the period's evidence.
-func TestCompileTrialBalance_IncludesReversedOriginals(t *testing.T) {
-	f := &fakeLedger{
-		journals: map[string]journal{
-			// An ordinary posting that stands.
-			"j-standing": {JournalID: "j-standing", Status: "FINALIZED", FiscalPeriod: "2026-01"},
-			// A posting that was reversed...
-			"j-original": {JournalID: "j-original", Status: "REVERSED", FiscalPeriod: "2026-01"},
-			// ...and the journal that reversed it.
-			"j-reversal": {JournalID: "j-reversal", Status: "FINALIZED", FiscalPeriod: "2026-01"},
-		},
-		lines: map[string][]line{
-			"j-standing": {
-				{AccountCode: "1000-Cash", DebitAmount: 250},
-				{AccountCode: "4000-Rev", CreditAmount: 250},
+// TestCompileTrialBalance_ParsesLinesIntoMap proves the client correctly
+// converts general-ledger-svc's own trial-balance response into the
+// map[string]float64 the rest of this service expects. general-ledger-svc
+// now owns the FINALIZED/REVERSED netting rule itself (see master-
+// register-findings-2026-08-27.md §3.32) — this client's only remaining
+// job is to ask its real endpoint and parse the answer, not re-derive
+// ledger semantics a second time.
+func TestCompileTrialBalance_ParsesLinesIntoMap(t *testing.T) {
+	var gotBody map[string]string
+	var gotTenant, gotPrincipal string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/trial-balance/compile" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		gotTenant = r.Header.Get("X-Tenant-Id")
+		gotPrincipal = r.Header.Get("X-Principal-Id")
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"trial_balance_snapshot_id": "tb-1",
+			"ledger_watermark":          42,
+			"lines": []map[string]any{
+				{"account_code": "1000-Cash", "net_balance": 250},
+				{"account_code": "4000-Rev", "net_balance": -250},
 			},
-			"j-original": {
-				{AccountCode: "1000-Cash", DebitAmount: 100},
-				{AccountCode: "4000-Rev", CreditAmount: 100},
-			},
-			"j-reversal": {
-				{AccountCode: "1000-Cash", CreditAmount: 100},
-				{AccountCode: "4000-Rev", DebitAmount: 100},
-			},
-		},
-	}
-	srv := httptest.NewServer(f.handler())
+		})
+	}))
 	defer srv.Close()
 
-	balances, err := newClients(t, srv.URL).CompileTrialBalance(t.Context(), "tenant-1", "le-1", "2026-01")
+	balances, err := newClients(t, srv.URL).CompileTrialBalance(t.Context(), "tenant-1", "le-1", "2026-01", "principal-1")
 	if err != nil {
 		t.Fatalf("CompileTrialBalance: %v", err)
 	}
-
-	// The reversed pair nets to zero, so only the standing journal remains.
 	if got := balances["1000-Cash"]; got != 250 {
-		t.Fatalf("1000-Cash = %v, want 250. The reversed original and its inverse must cancel; "+
-			"150 means the original was dropped and only its inverse counted", got)
+		t.Fatalf("1000-Cash = %v, want 250", got)
 	}
 	if got := balances["4000-Rev"]; got != -250 {
 		t.Fatalf("4000-Rev = %v, want -250", got)
 	}
-
-	// And the balance must actually balance.
-	var total float64
-	for _, v := range balances {
-		total += v
+	if gotTenant != "tenant-1" || gotPrincipal != "principal-1" {
+		t.Fatalf("expected tenant/principal forwarded, got tenant=%q principal=%q", gotTenant, gotPrincipal)
 	}
-	if total != 0 {
-		t.Fatalf("the trial balance does not balance: net %v", total)
-	}
-
-	// It must have asked for both posted states by name.
-	asked := map[string]bool{}
-	for _, s := range f.statusesAsked {
-		asked[s] = true
-	}
-	if !asked["FINALIZED"] || !asked["REVERSED"] {
-		t.Fatalf("expected both FINALIZED and REVERSED to be requested, asked for: %v", f.statusesAsked)
+	if gotBody["legal_entity_id"] != "le-1" || gotBody["fiscal_period"] != "2026-01" {
+		t.Fatalf("expected legal_entity_id/fiscal_period sent in the request body, got %+v", gotBody)
 	}
 }
 
-// A full page means there may be journals this service never saw. The trial
-// balance it would compile is wrong, not merely short — and it is about to be
-// hashed, signed and locked as permanent evidence, so the only honest answer is
-// to refuse. A close that fails loudly can be retried; a close that silently
-// omitted journals cannot be detected afterwards.
-func TestCompileTrialBalance_FullPage_RefusesRatherThanSignPartialBalance(t *testing.T) {
-	f := &fakeLedger{journals: map[string]journal{}, lines: map[string][]line{}}
-	for i := 0; i < 1000; i++ {
-		id := fmt.Sprintf("j-%04d", i)
-		f.journals[id] = journal{JournalID: id, Status: "FINALIZED", FiscalPeriod: "2026-01"}
-		f.lines[id] = []line{{AccountCode: "1000-Cash", DebitAmount: 1}}
-	}
-	srv := httptest.NewServer(f.handler())
-	defer srv.Close()
-
-	_, err := newClients(t, srv.URL).CompileTrialBalance(t.Context(), "tenant-1", "le-1", "2026-01")
-	if !errors.Is(err, domain.ErrLedgerPageTruncated) {
-		t.Fatalf("expected ErrLedgerPageTruncated, got %v", err)
-	}
-}
-
-// The page size has to be asked for explicitly: the ledger's own default is 200,
-// so a request that named no limit silently compiled the trial balance from the
-// most recent 200 journals of a period and reported nothing unusual.
-func TestCompileTrialBalance_AsksForAnExplicitLimit(t *testing.T) {
-	var gotLimit string
+// TestCompileTrialBalance_ServerError_ReturnsErrGLServiceUnavailable proves
+// a non-201 response from general-ledger-svc is surfaced as a real error,
+// never parsed as an empty-but-successful trial balance.
+func TestCompileTrialBalance_ServerError_ReturnsErrGLServiceUnavailable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/journals" {
-			gotLimit = r.URL.Query().Get("limit")
-		}
-		_ = json.NewEncoder(w).Encode([]journal{})
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer srv.Close()
 
-	if _, err := newClients(t, srv.URL).CompileTrialBalance(t.Context(), "tenant-1", "le-1", "2026-01"); err != nil {
-		t.Fatalf("CompileTrialBalance: %v", err)
-	}
-	if gotLimit == "" {
-		t.Fatal("no limit was sent, so the ledger's 200-row default silently bounded the trial balance")
+	_, err := newClients(t, srv.URL).CompileTrialBalance(t.Context(), "tenant-1", "le-1", "2026-01", "principal-1")
+	if !errors.Is(err, domain.ErrGLServiceUnavailable) {
+		t.Fatalf("expected ErrGLServiceUnavailable, got %v", err)
 	}
 }
 

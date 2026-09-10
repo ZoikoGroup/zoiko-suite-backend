@@ -1,6 +1,7 @@
 package clients
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -115,20 +116,59 @@ func (c *Clients) getJournalLines(ctx context.Context, tenantID, journalID strin
 	return detail.Lines, nil
 }
 
+// JournalLine is the exported shape of one posted journal line — used by
+// the elimination path (see FetchJournalLines) as well as internally by
+// FetchTrialBalance's own glJournalLine.
+type JournalLine struct {
+	AccountCode  string  `json:"account_code"`
+	DebitAmount  float64 `json:"debit_amount"`
+	CreditAmount float64 `json:"credit_amount"`
+}
+
+// FetchJournalLines returns the real posted lines of one journal from
+// general-ledger-svc — the authoritative source ACC-12 elimination must
+// read from, rather than any invented per-service mapping of intercompany
+// amounts to elimination accounts (no such mapping exists anywhere on this
+// platform; IntercompanyEntry itself carries no account_code).
+func (c *Clients) FetchJournalLines(ctx context.Context, tenantID, journalID string) ([]JournalLine, error) {
+	lines, err := c.getJournalLines(ctx, tenantID, journalID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]JournalLine, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, JournalLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+	}
+	return out, nil
+}
+
 type IntercompanyEntry struct {
 	IntercompanyEntryID string  `json:"intercompany_entry_id"`
 	SourceLegalEntityID string  `json:"source_legal_entity_id"`
 	TargetLegalEntityID string  `json:"target_legal_entity_id"`
+	SourceJournalID     string  `json:"source_journal_id"`
+	TargetJournalID     *string `json:"target_journal_id,omitempty"`
 	Amount              float64 `json:"amount"`
 	MatchStatus         string  `json:"match_status"`
 }
 
-func (c *Clients) FetchMatchedIntercompanyEntries(ctx context.Context, tenantID string) ([]IntercompanyEntry, error) {
+// FetchMatchedIntercompanyEntries returns every MATCHED intercompany entry
+// for tenantID. principalID is forwarded as X-Principal-Id — intercompany-
+// accounting-svc's ListEntries requires a verified principal
+// (internal/handler/handler.go's requirePrincipal), which this call
+// previously never sent, so every prior invocation of this method failed
+// with 401 before a single entry was ever read (see
+// master-register-findings-2026-08-27.md §3.29). principalID is the same
+// principal already authorized for CONSOLIDATION_RUN_INITIATE on the
+// calling request — reusing it here, rather than inventing a separate
+// system identity that doesn't exist anywhere on this platform.
+func (c *Clients) FetchMatchedIntercompanyEntries(ctx context.Context, tenantID, principalID string) ([]IntercompanyEntry, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.intercompanyURL+"/v1/intercompany/entries", nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -153,4 +193,105 @@ func (c *Clients) FetchMatchedIntercompanyEntries(ctx context.Context, tenantID 
 		}
 	}
 	return matched, nil
+}
+
+// postingEventLine mirrors general-ledger-svc's own
+// domain.PostingEventLineInput — account_code only, never a mapping_key:
+// a consolidation adjustment names its own accounts explicitly.
+type postingEventLine struct {
+	AccountCode  string  `json:"account_code"`
+	DebitAmount  float64 `json:"debit_amount,omitempty"`
+	CreditAmount float64 `json:"credit_amount,omitempty"`
+}
+
+type postAccountingEventRequest struct {
+	LegalEntityID string              `json:"legal_entity_id"`
+	FiscalPeriod  string              `json:"fiscal_period"`
+	Description   string              `json:"description"`
+	SourceEventID string              `json:"source_event_id"`
+	CorrelationID string              `json:"correlation_id"`
+	Lines         []postingEventLine  `json:"lines"`
+}
+
+type postingExecutionResponse struct {
+	JournalID *string `json:"journal_id"`
+	Status    string  `json:"status"`
+}
+
+// PostConsolidationAdjustmentJournal is ACC-12's own real "ACC-04/05
+// consolidation book" dependency: it posts the adjustment's lines to
+// general-ledger-svc via ACC-04's PostAccountingEvent — the system-
+// originated posting path already built for exactly this shape of
+// entry (see general-ledger-svc's own doc comment: "System-originated
+// postings... deliberately skip the human workflow"). sourceEventID is
+// the adjustment's own ID, making a retried Post call idempotent against
+// general-ledger-svc's own UNIQUE(tenant_id, source_event_id) — never a
+// second journal for the same adjustment.
+func (c *Clients) PostConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, legalEntityID, fiscalPeriod, description, sourceEventID, correlationID string, lines []JournalLine) (journalID string, err error) {
+	body := postAccountingEventRequest{
+		LegalEntityID: legalEntityID, FiscalPeriod: fiscalPeriod, Description: description,
+		SourceEventID: sourceEventID, CorrelationID: correlationID,
+	}
+	for _, l := range lines {
+		body.Lines = append(body.Lines, postingEventLine{AccountCode: l.AccountCode, DebitAmount: l.DebitAmount, CreditAmount: l.CreditAmount})
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/postings/events", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to post consolidation adjustment journal to general-ledger-svc", zap.Error(err))
+		return "", domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("%w: general-ledger-svc returned status %d", domain.ErrGLServiceUnavailable, resp.StatusCode)
+	}
+	var execResp postingExecutionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&execResp); err != nil {
+		return "", err
+	}
+	if execResp.JournalID == nil {
+		return "", fmt.Errorf("%w: general-ledger-svc reported no journal_id for a %s posting execution", domain.ErrGLServiceUnavailable, execResp.Status)
+	}
+	return *execResp.JournalID, nil
+}
+
+// ReverseConsolidationAdjustmentJournal calls ACC-04's own
+// CreateReversalPosting — the same reversal primitive every other posted
+// journal on this platform uses, rather than a bespoke undo this service
+// would have to invent.
+func (c *Clients) ReverseConsolidationAdjustmentJournal(ctx context.Context, tenantID, principalID, journalID, reason string) error {
+	payload, err := json.Marshal(map[string]string{"original_journal_id": journalID, "reason": reason})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ledgerURL+"/v1/postings/reversals", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to reverse consolidation adjustment journal via general-ledger-svc", zap.Error(err))
+		return domain.ErrGLServiceUnavailable
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return fmt.Errorf("%w: general-ledger-svc returned status %d", domain.ErrGLServiceUnavailable, resp.StatusCode)
+	}
+	return nil
 }

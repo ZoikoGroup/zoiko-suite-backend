@@ -17,6 +17,7 @@ import (
 
 	"zoiko.io/expense-claim-svc/internal/authz"
 	"zoiko.io/expense-claim-svc/internal/config"
+	"zoiko.io/expense-claim-svc/internal/configflag"
 	"zoiko.io/expense-claim-svc/internal/documentvault"
 	"zoiko.io/expense-claim-svc/internal/employeemaster"
 	"zoiko.io/expense-claim-svc/internal/events"
@@ -70,9 +71,11 @@ func main() {
 	taxClient := tax.NewHTTPClient(cfg.TaxDeterminationServiceURL, logger)
 	policyClient := policy.NewHTTPClient(cfg.PolicyServiceURL, logger)
 	payableClient := payableopenitem.NewHTTPClient(cfg.PayableOpenItemServiceURL, logger)
+	configFlagsClient := configflag.NewHTTPClient(cfg.ConfigFeatureFlagServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, employeeClient, docsClient, taxClient, policyClient, payableClient, handler.Config{
+	h := handler.New(pgStore, publisher, authzClient, employeeClient, docsClient, taxClient, policyClient, payableClient, configFlagsClient, handler.Config{
 		ReceiptRequiredThreshold: cfg.ReceiptRequiredThreshold,
+		Environment:              cfg.Environment,
 	}, logger)
 
 	r := chi.NewRouter()

@@ -74,6 +74,40 @@ func (s *stubStoreReal) UpdateMatch(_ context.Context, id, targetJournalID, matc
 	return nil
 }
 
+func (s *stubStoreReal) AcknowledgeCounterparty(_ context.Context, id, principalID string) error {
+	entry, ok := s.entries[id]
+	if !ok || entry.MatchStatus != domain.MatchStatusUnmatched {
+		return domain.ErrInvalidPairTransition
+	}
+	now := time.Now().UTC()
+	entry.MatchStatus, entry.AcknowledgedAt, entry.AcknowledgedByPrincipalID = domain.MatchStatusAwaitingCounterparty, &now, &principalID
+	return nil
+}
+
+func (s *stubStoreReal) DisputeIntercompany(_ context.Context, id, principalID, reason string) error {
+	entry, ok := s.entries[id]
+	if !ok || entry.MatchStatus != domain.MatchStatusMismatch {
+		return domain.ErrInvalidPairTransition
+	}
+	now := time.Now().UTC()
+	entry.MatchStatus, entry.DisputedAt, entry.DisputedByPrincipalID, entry.DisputeReason = domain.MatchStatusDisputed, &now, &principalID, &reason
+	return nil
+}
+
+func (s *stubStoreReal) ResolveMismatch(_ context.Context, id, principalID, resolutionNote string) error {
+	entry, ok := s.entries[id]
+	if !ok || entry.MatchStatus != domain.MatchStatusDisputed {
+		return domain.ErrInvalidPairTransition
+	}
+	now := time.Now().UTC()
+	entry.MatchStatus, entry.ResolvedAt, entry.ResolvedByPrincipalID, entry.ResolutionNote = domain.MatchStatusResolved, &now, &principalID, &resolutionNote
+	return nil
+}
+
+// Compile-time proof the stub still satisfies the contract the handler
+// depends on.
+var _ handler.Store = (*stubStoreReal)(nil)
+
 type stubPublisher struct {
 	created, posted, mismatched int
 }

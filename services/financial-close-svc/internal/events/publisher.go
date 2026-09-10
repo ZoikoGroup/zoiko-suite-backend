@@ -95,6 +95,37 @@ func (p *Publisher) PublishClosed(ctx context.Context, correlationID, actorID st
 	})
 }
 
+func (p *Publisher) PublishReopened(ctx context.Context, correlationID, actorID string, fp domain.FiscalPeriod, reason string) {
+	p.emit(ctx, "period.reopened", correlationID, fp.TenantID, fp.LegalEntityID, actorID, fp.FiscalPeriodID, map[string]any{
+		"tenant_id":        fp.TenantID,
+		"legal_entity_id":  fp.LegalEntityID,
+		"fiscal_period_id": fp.FiscalPeriodID,
+		"period_name":      fp.PeriodName,
+		"reason":           reason,
+		"timestamp":        time.Now().UTC(),
+	})
+}
+
+// PublishSubledgerControlException announces an ACC-06 control run that
+// found a genuine subledger-to-GL discrepancy — the balance comparison
+// itself, not merely an existence-count of open items. Only EXCEPTION
+// outcomes are published; a MATCHED run is routine and stays in the
+// permanent control_run record without paging anyone.
+func (p *Publisher) PublishSubledgerControlException(ctx context.Context, correlationID, actorID string, run domain.SubledgerControlRun) {
+	p.emit(ctx, "subledger.control.exception", correlationID, run.TenantID, run.LegalEntityID, actorID, run.ControlRunID, map[string]any{
+		"control_run_id":            run.ControlRunID,
+		"tenant_id":                 run.TenantID,
+		"legal_entity_id":           run.LegalEntityID,
+		"fiscal_period":             run.FiscalPeriod,
+		"subledger":                 run.Subledger,
+		"control_account_code":      run.ControlAccountCode,
+		"subledger_total_amount":    run.SubledgerTotalAmount,
+		"gl_control_balance_amount": run.GLControlBalanceAmount,
+		"difference_amount":         run.DifferenceAmount,
+		"timestamp":                 time.Now().UTC(),
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

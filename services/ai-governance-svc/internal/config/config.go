@@ -19,6 +19,14 @@ type Config struct {
 	AuthzMTLSEnabled         bool
 	AuthzMTLSURL             string
 	MTLSManagementServiceURL string
+	// MTLSBootstrapTokenPath points at the shared self-provisioning secret
+	// (see deployments/docker-compose.yml's mtls-bootstrap-keygen). Empty
+	// means no bootstrap token is presented, which is fine when
+	// AuthzMTLSEnabled is false, but will fail provisioning if enabled
+	// without also setting this.
+	MTLSBootstrapTokenPath string
+
+	KillSwitchRegistryServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -40,6 +48,9 @@ func Load() (*Config, error) {
 		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: getEnvOrDefault("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
+		MTLSBootstrapTokenPath:   getEnvOrDefault("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
+
+		KillSwitchRegistryServiceURL: getEnvOrDefault("KILL_SWITCH_REGISTRY_SERVICE_URL", "http://kill-switch-registry-svc:8147"),
 	}, nil
 }
 

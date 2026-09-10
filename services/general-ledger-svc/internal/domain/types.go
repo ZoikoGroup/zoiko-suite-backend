@@ -2,12 +2,18 @@
 //
 // Per docs/architecture/03-microservices.md §10.1, this service is the
 // authoritative owner of journalized financial postings and ledger state.
-// It owns journal headers, journal lines, posting state, fiscal period
-// linkage, and account references — it does NOT own a chart of accounts;
-// no Chart-of-Accounts service exists yet anywhere in this platform, so
-// account_code is a plain caller-supplied string reference, unvalidated,
-// same posture as tenant-entity-registry-svc's fiscal_calendar_id (a
-// documented, honest v1 gap, not an oversight).
+// It owns journal headers, journal lines, posting state, and fiscal period
+// linkage.
+//
+// It also now hosts ACC-01's Chart of Accounts as a SEPARATE authority
+// (see migration 000007 and the Account type below) — co-located in this
+// same deployable process, per this domain spec's own opening statement
+// ("does not require 18 separately deployed microservices... does
+// require that the authority... remain separately testable and
+// non-bypassable regardless of physical deployment grouping"), but never
+// the same authority: journal state, posting consequence, and report
+// presentation remain explicitly outside what ACC-01 may own, per the
+// spec's own Cross-Service Accounting Authority Matrix.
 package domain
 
 import "time"
@@ -36,6 +42,38 @@ var ValidJournalTransitions = map[JournalStatus][]JournalStatus{
 	JournalStatusValidated: {JournalStatusFinalized},
 	JournalStatusFinalized: {JournalStatusReversed},
 	JournalStatusReversed:  {},
+}
+
+// ApprovalStatus implements ACC-03's own state model (verbatim from spec):
+// "Draft → PendingApproval → Approved → PostingRequested → Posted;
+// rejected/cancelled before posting; corrections create new journals."
+// See migration 000010's doc comment for why this is a separate lifecycle
+// from JournalStatus.
+type ApprovalStatus string
+
+const (
+	ApprovalStatusDraft            ApprovalStatus = "DRAFT"
+	ApprovalStatusPendingApproval  ApprovalStatus = "PENDING_APPROVAL"
+	ApprovalStatusApproved         ApprovalStatus = "APPROVED"
+	ApprovalStatusPostingRequested ApprovalStatus = "POSTING_REQUESTED"
+	ApprovalStatusPosted           ApprovalStatus = "POSTED"
+	ApprovalStatusRejected         ApprovalStatus = "REJECTED"
+	ApprovalStatusCancelled        ApprovalStatus = "CANCELLED"
+)
+
+// ValidApprovalTransitions enumerates the only legal ApprovalStatus moves.
+// PENDING_APPROVAL -> DRAFT models AmendDraftJournal being called on a
+// submitted-but-not-yet-approved journal — editing it withdraws it from
+// approval rather than silently leaving a stale approval request pending
+// against content that changed underneath it.
+var ValidApprovalTransitions = map[ApprovalStatus][]ApprovalStatus{
+	ApprovalStatusDraft:            {ApprovalStatusPendingApproval, ApprovalStatusCancelled},
+	ApprovalStatusPendingApproval:  {ApprovalStatusDraft, ApprovalStatusApproved, ApprovalStatusRejected},
+	ApprovalStatusApproved:         {ApprovalStatusPostingRequested},
+	ApprovalStatusPostingRequested: {ApprovalStatusPosted},
+	ApprovalStatusPosted:           {},
+	ApprovalStatusRejected:         {},
+	ApprovalStatusCancelled:        {},
 }
 
 // JournalType is ACC-03's "journal type" input.
@@ -153,6 +191,38 @@ type JournalHeader struct {
 	ValidatedAt            *time.Time `json:"validated_at,omitempty"`
 	PostedAt               *time.Time `json:"posted_at,omitempty"`
 	ReversedAt             *time.Time `json:"reversed_at,omitempty"`
+
+	// ── ACC-03 journal proposal/approval lifecycle (§6) ─────────────────────
+	//
+	// A SEPARATE lifecycle from Status above — Status is ACC-04/05's own
+	// Tri-Phase Commit for the actual ledger write; ApprovalStatus is
+	// whether this proposal is even ELIGIBLE to reach the posting engine.
+	// See migration 000010's doc comment.
+	ApprovalStatus ApprovalStatus `json:"approval_status"`
+
+	// ApprovalFingerprint is the spec's own named evidence: a permanent
+	// hash of exactly what content was approved, captured at ApproveJournal
+	// time. Never used to gate anything after the fact — no endpoint edits
+	// a journal once it leaves DRAFT/PENDING_APPROVAL, so there is nothing
+	// for it to detect a mismatch against; it exists purely so an audit can
+	// prove what a human actually signed off on.
+	ApprovalFingerprint *string `json:"approval_fingerprint,omitempty"`
+
+	SubmittedAt                   *time.Time `json:"submitted_at,omitempty"`
+	SubmittedByPrincipalID        *string    `json:"submitted_by_principal_id,omitempty"`
+	ApprovedAt                    *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID         *string    `json:"approved_by_principal_id,omitempty"`
+	RejectedAt                    *time.Time `json:"rejected_at,omitempty"`
+	RejectedByPrincipalID         *string    `json:"rejected_by_principal_id,omitempty"`
+	RejectionReason               *string    `json:"rejection_reason,omitempty"`
+	PostingRequestedAt            *time.Time `json:"posting_requested_at,omitempty"`
+	PostingRequestedByPrincipalID *string    `json:"posting_requested_by_principal_id,omitempty"`
+
+	// CorrectionOfJournalID is the spec's own "correction chain": set only
+	// on a journal created via RequestCorrection, pointing at the original
+	// it corrects. "Corrections create new journals" — never an in-place
+	// edit of a posted one.
+	CorrectionOfJournalID *string `json:"correction_of_journal_id,omitempty"`
 }
 
 // JournalLine is one debit or credit line within a journal. Exactly one of
@@ -194,6 +264,269 @@ type JournalLine struct {
 type JournalWithLines struct {
 	JournalHeader
 	Lines []JournalLine `json:"lines"`
+}
+
+// TrialBalanceSnapshot is ACC-15's real, durable trial-balance dataset —
+// pinned to an explicit ledger watermark (invariant #11: "trial balances
+// reconcile to an explicit ledger watermark") rather than recompiled ad
+// hoc, client-side, by every caller that needs one. Never updated or
+// deleted once written (database-enforced, see migration 000006).
+type TrialBalanceSnapshot struct {
+	TrialBalanceSnapshotID string `json:"trial_balance_snapshot_id"`
+	TenantID               string `json:"tenant_id"`
+	LegalEntityID          string `json:"legal_entity_id"`
+	FiscalPeriod           string `json:"fiscal_period"`
+	// LedgerWatermark is MAX(journal_seq) among the FINALIZED/REVERSED
+	// journals this snapshot actually included — a real, monotonic,
+	// reproducible answer to "as of what point in the ledger."
+	LedgerWatermark       int64              `json:"ledger_watermark"`
+	CompiledAt            time.Time          `json:"compiled_at"`
+	CompiledByPrincipalID string             `json:"compiled_by_principal_id"`
+	Lines                 []TrialBalanceLine `json:"lines"`
+}
+
+// TrialBalanceLine is one account's net balance (debit - credit) within a
+// TrialBalanceSnapshot, summed across every FINALIZED/REVERSED journal
+// line for that account at the snapshot's watermark.
+type TrialBalanceLine struct {
+	AccountCode string  `json:"account_code"`
+	NetBalance  float64 `json:"net_balance"`
+}
+
+// AccountType is one of the five fundamental account classes.
+type AccountType string
+
+const (
+	AccountTypeAsset     AccountType = "ASSET"
+	AccountTypeLiability AccountType = "LIABILITY"
+	AccountTypeEquity    AccountType = "EQUITY"
+	AccountTypeRevenue   AccountType = "REVENUE"
+	AccountTypeExpense   AccountType = "EXPENSE"
+)
+
+var validAccountTypes = map[AccountType]bool{
+	AccountTypeAsset: true, AccountTypeLiability: true, AccountTypeEquity: true,
+	AccountTypeRevenue: true, AccountTypeExpense: true,
+}
+
+func IsValidAccountType(t AccountType) bool { return validAccountTypes[t] }
+
+// Account is ACC-01's Chart of Accounts entry — the platform's first real
+// posting-account master (see migration 000007's doc comment). Kept as
+// its own authority, separate from JournalHeader/JournalLine, per the
+// spec's own Cross-Service Accounting Authority Matrix.
+type Account struct {
+	AccountID       string      `json:"account_id"`
+	TenantID        string      `json:"tenant_id"`
+	AccountCode     string      `json:"account_code"`
+	AccountName     string      `json:"account_name"`
+	AccountType     AccountType `json:"account_type"`
+	ParentAccountID *string     `json:"parent_account_id,omitempty"`
+
+	// IsControlAccount/DirectPostingRestricted implement invariant #7:
+	// "Control accounts cannot be bypassed by ordinary manual journals
+	// where policy restricts direct posting." Two independent facts — a
+	// control account with no restriction is a real, allowed state, not
+	// every control account blocks direct posting by default.
+	IsControlAccount        bool `json:"is_control_account"`
+	DirectPostingRestricted bool `json:"direct_posting_restricted"`
+
+	Status               string    `json:"status"` // ACTIVE | INACTIVE
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+type CreateAccountRequest struct {
+	AccountCode             string      `json:"account_code"`
+	AccountName             string      `json:"account_name"`
+	AccountType             AccountType `json:"account_type"`
+	ParentAccountID         *string     `json:"parent_account_id,omitempty"`
+	IsControlAccount        bool        `json:"is_control_account,omitempty"`
+	DirectPostingRestricted bool        `json:"direct_posting_restricted,omitempty"`
+}
+
+// AccountMapping is ACC-02's effective-dated mapping of a caller-declared
+// business concept (MappingKey — its meaning belongs to whichever domain
+// declares it; this service never interprets it) to a real, chart-
+// registered AccountCode. Versioned, never mutated in place (see
+// migration 000008's doc comment).
+type AccountMapping struct {
+	AccountMappingID     string     `json:"account_mapping_id"`
+	TenantID             string     `json:"tenant_id"`
+	MappingKey           string     `json:"mapping_key"`
+	AccountCode          string     `json:"account_code"`
+	EffectiveFrom        time.Time  `json:"effective_from"`
+	EffectiveTo          *time.Time `json:"effective_to,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+}
+
+type SetAccountMappingRequest struct {
+	MappingKey  string `json:"mapping_key"`
+	AccountCode string `json:"account_code"`
+}
+
+// Posting execution lifecycle states (ACC-04's state model, verbatim from
+// spec: "Submitted → Validating → Ready → Committed or Failed/Quarantined;
+// no partial committed state").
+const (
+	PostingExecutionStatusSubmitted   = "SUBMITTED"
+	PostingExecutionStatusValidating  = "VALIDATING"
+	PostingExecutionStatusReady       = "READY"
+	PostingExecutionStatusCommitted   = "COMMITTED"
+	PostingExecutionStatusFailed      = "FAILED"
+	PostingExecutionStatusQuarantined = "QUARANTINED"
+)
+
+// PostingExecutionKind distinguishes which ACC-04 command created a
+// posting_executions row.
+const (
+	PostingExecutionKindEvent           = "EVENT"
+	PostingExecutionKindApprovedJournal = "APPROVED_JOURNAL"
+	PostingExecutionKindReversal        = "REVERSAL"
+)
+
+// PostingExecution is ACC-04's own authority — "PostingExecution,
+// calculation trace, rule resolution, posting batch and consequence
+// uniqueness record; ledger entries are committed to ACC-05," explicitly
+// never "Source business fact, tax determination": every posting
+// execution's REQUIRED input is an already-approved journal or event —
+// ACC-04 orchestrates the commit, it never decides what should be posted.
+type PostingExecution struct {
+	ExecutionID          string     `json:"execution_id"`
+	TenantID             string     `json:"tenant_id"`
+	LegalEntityID        string     `json:"legal_entity_id"`
+	Kind                 string     `json:"kind"`
+	SourceEventID        *string    `json:"source_event_id,omitempty"`
+	IdempotencyKey       *string    `json:"idempotency_key,omitempty"`
+	Status               string     `json:"status"`
+	JournalID            *string    `json:"journal_id,omitempty"`
+	CalculationTrace     string     `json:"calculation_trace"` // raw JSON — see ExplainPosting
+	FailureReason        *string    `json:"failure_reason,omitempty"`
+	CorrelationID        string     `json:"correlation_id"`
+	CreatedAt            time.Time  `json:"created_at"`
+	CreatedByPrincipalID string     `json:"created_by_principal_id"`
+	CommittedAt          *time.Time `json:"committed_at,omitempty"`
+}
+
+// PostingEventLineInput is one line of a caller-declared accounting event.
+// Exactly one of AccountCode/MappingKey must be set — both or neither is
+// the spec's own negative path, "Posting rule ambiguity."
+type PostingEventLineInput struct {
+	AccountCode  *string `json:"account_code,omitempty"`
+	MappingKey   *string `json:"mapping_key,omitempty"`
+	DebitAmount  float64 `json:"debit_amount,omitempty"`
+	CreditAmount float64 `json:"credit_amount,omitempty"`
+	Description  string  `json:"description,omitempty"`
+}
+
+// PostAccountingEventRequest is ACC-04's PostAccountingEvent command input
+// — the required source inputs the spec names: "approved accounting
+// event/journal; entity/book; source amounts; dimensions; tax result;
+// source references; idempotency key." (Tax result and dimensions are
+// accepted as opaque, caller-declared pass-through fields where this
+// platform has no owning service for them yet, same posture as ACC-03's
+// own book_id/reporting_basis fields.)
+type PostAccountingEventRequest struct {
+	LegalEntityID string                  `json:"legal_entity_id"`
+	FiscalPeriod  string                  `json:"fiscal_period"`
+	Description   string                  `json:"description"`
+	SourceEventID string                  `json:"source_event_id"`
+	CorrelationID string                  `json:"correlation_id"`
+	Lines         []PostingEventLineInput `json:"lines"`
+}
+
+type PostApprovedJournalRequest struct {
+	JournalID string `json:"journal_id"`
+}
+
+type CreateReversalPostingRequest struct {
+	OriginalJournalID string `json:"original_journal_id"`
+	Reason            string `json:"reason"`
+}
+
+// LedgerEntry is ACC-05's own authority: "LedgerEntry and authoritative
+// posted balance state; no draft/manual business lifecycle." One row per
+// journal line, written exactly once — when the journal that contains it
+// reaches FINALIZED — and never updated or deleted afterward (see
+// migration 000011's doc comment and its append-only trigger). Never
+// constructed directly by a handler; only PgStore.appendLedgerEntries,
+// called from inside TransitionJournal's own transaction, ever inserts one.
+type LedgerEntry struct {
+	LedgerEntryID   string     `json:"ledger_entry_id"`
+	TenantID        string     `json:"tenant_id"`
+	LegalEntityID   string     `json:"legal_entity_id"`
+	BookID          string     `json:"book_id,omitempty"`
+	FiscalPeriod    string     `json:"fiscal_period"`
+	JournalID       string     `json:"journal_id"`
+	JournalLineID   string     `json:"journal_line_id"`
+	LineNumber      int        `json:"line_number"`
+	AccountCode     string     `json:"account_code"`
+	DebitAmount     float64    `json:"debit_amount"`
+	CreditAmount    float64    `json:"credit_amount"`
+	CurrencyCode    string     `json:"currency_code"`
+	Dimensions      Dimensions `json:"dimensions,omitempty"`
+	TransactionDate Date       `json:"transaction_date"`
+	PostingDate     Date       `json:"posting_date"`
+	SourceEventID   *string    `json:"source_event_id,omitempty"`
+	CorrelationID   string     `json:"correlation_id"`
+	EntrySeq        int64      `json:"entry_seq"`
+	CreatedAt       time.Time  `json:"created_at"`
+}
+
+// LedgerBalance is ACC-05's "balance projections versioned/rebuildable
+// from entries" — a derived, replaceable aggregate over ledger_entries,
+// never itself a source of truth. Grouped by entity/book/account/period
+// and a canonicalized dimensions key, matching the spec's "by entity,
+// book, account, dimension and period."
+type LedgerBalance struct {
+	TenantID          string    `json:"tenant_id"`
+	LegalEntityID     string    `json:"legal_entity_id"`
+	BookID            string    `json:"book_id,omitempty"`
+	AccountCode       string    `json:"account_code"`
+	FiscalPeriod      string    `json:"fiscal_period"`
+	DimensionsKey     string    `json:"dimensions_key,omitempty"`
+	DebitTotal        float64   `json:"debit_total"`
+	CreditTotal       float64   `json:"credit_total"`
+	NetBalance        float64   `json:"net_balance"`
+	WatermarkEntrySeq int64     `json:"watermark_entry_seq"`
+	RebuiltAt         time.Time `json:"rebuilt_at"`
+}
+
+// QueryLedgerFilter is QueryLedger's own scope — every field but
+// LegalEntityID is optional narrowing. LegalEntityID is mandatory
+// (ErrLedgerScopeRequired) so a caller can never accidentally receive
+// every entity's entries at once.
+type QueryLedgerFilter struct {
+	LegalEntityID string
+	BookID        string
+	AccountCode   string
+	FiscalPeriod  string
+	JournalID     string
+	MaxEntrySeq   *int64 // set by QueryLedgerAsOf to reconstruct a point-in-time view
+}
+
+// QueryAccountBalanceRequest is QueryAccountBalance's input — reads the
+// ledger_balances projection, not ledger_entries directly.
+type QueryAccountBalanceRequest struct {
+	LegalEntityID string
+	BookID        string
+	AccountCode   string
+	FiscalPeriod  string
+}
+
+// RebuildBalanceProjectionRequest is RebuildDerivedBalanceProjection's
+// input — always scoped to one entity/period so a rebuild's blast radius
+// is explicit and bounded, never a whole-tenant rebuild by accident.
+type RebuildBalanceProjectionRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	BookID        string `json:"book_id,omitempty"`
+	FiscalPeriod  string `json:"fiscal_period"`
+}
+
+type CompileTrialBalanceRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	FiscalPeriod  string `json:"fiscal_period"`
 }
 
 // ── wire types (request bodies) ─────────────────────────────────────────────
@@ -241,11 +574,72 @@ type CreateJournalRequest struct {
 	// references — see JournalHeader's field docs.
 	SourceEventID        *string `json:"source_event_id,omitempty"`
 	GovernanceDecisionID *string `json:"governance_decision_id,omitempty"`
+
+	// OverrideControlAccountRestriction is a caller-declared, never-inferred
+	// opt-in (same doctrine as privacy-decision-svc's ConsentCheckRequired)
+	// — required, and separately authorized, to post directly to a control
+	// account with direct_posting_restricted=true (ACC-01 invariant #7).
+	// False/omitted is the ordinary case and needs no special authority.
+	OverrideControlAccountRestriction bool `json:"override_control_account_restriction,omitempty"`
 }
 
 type ReverseJournalRequest struct {
 	Reason        string `json:"reason"`
 	CorrelationID string `json:"correlation_id"`
+}
+
+// AmendDraftJournalRequest is ACC-03's AmendDraftJournal command — a full
+// replace of the header's editable business fields and every line. Only
+// legal while ApprovalStatus is DRAFT or PENDING_APPROVAL (see
+// ValidApprovalTransitions); the spec's own negative paths #2 ("journal
+// changed after approval") and #4 ("attempt edit after posting") are
+// satisfied by there being no other status this succeeds from.
+type AmendDraftJournalRequest struct {
+	Description     string                   `json:"description"`
+	JournalType     JournalType              `json:"journal_type"`
+	TransactionDate Date                     `json:"transaction_date"`
+	PostingDate     Date                     `json:"posting_date"`
+	CurrencyCode    string                   `json:"currency_code"`
+	BookID          *string                  `json:"book_id,omitempty"`
+	ReportingBasis  *string                  `json:"reporting_basis,omitempty"`
+	EvidenceRefs    []string                 `json:"evidence_refs,omitempty"`
+	Lines           []CreateJournalLineInput `json:"lines"`
+}
+
+// ApproveJournalRequest carries nothing today beyond the implicit actor —
+// its own type exists so a future policy_version/approval-note field has
+// somewhere to land without changing the handler's signature.
+type ApproveJournalRequest struct{}
+
+type RejectJournalRequest struct {
+	Reason string `json:"reason"`
+}
+
+type RequestCorrectionRequest struct {
+	Reason      string                   `json:"reason"`
+	Description string                   `json:"description"`
+	Lines       []CreateJournalLineInput `json:"lines"`
+}
+
+// AvailableActions answers ACC-03's own GetAvailableActions query — which
+// of the lifecycle commands are legal to call on this journal right now,
+// derived directly from ValidApprovalTransitions rather than a second,
+// separately-maintained rulebook that could drift from the one the
+// handlers actually enforce.
+type AvailableActions struct {
+	JournalID string   `json:"journal_id"`
+	Actions   []string `json:"actions"`
+}
+
+// JournalHistoryEntry is one step of ACC-03's own GetJournalHistory query
+// — derived from the header's own timestamp/actor columns, never a
+// separate events table this v1 didn't build; an entry appears only if
+// its corresponding timestamp is actually set.
+type JournalHistoryEntry struct {
+	Event       string    `json:"event"`
+	At          time.Time `json:"at"`
+	PrincipalID string    `json:"principal_id"`
+	Detail      string    `json:"detail,omitempty"`
 }
 
 // ListJournalsFilter holds optional filters for querying journals.
@@ -306,6 +700,45 @@ var (
 	// verification. Fail closed, same posture as ErrIdentityMissing.
 	ErrTenantScopeMissing = errorString("caller tenant scope missing")
 
+	// ErrTrialBalanceNotFound is returned when a requested trial balance
+	// snapshot id does not exist for the caller's tenant.
+	ErrTrialBalanceNotFound = errorString("trial balance snapshot not found")
+
+	ErrAccountNotFound       = errorString("account not found")
+	ErrAccountAlreadyExists  = errorString("an account with this code already exists")
+	ErrInvalidAccountType    = errorString("account_type must be one of ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE")
+	ErrParentAccountNotFound = errorString("parent_account_id does not name an existing account")
+	ErrAccountInactive       = errorString("account is INACTIVE and may not be posted to")
+
+	// ErrControlAccountPostingRestricted is invariant #7 enforced: a
+	// control account with direct_posting_restricted=true was named on an
+	// ordinary journal line with no override — the exact bypass the
+	// invariant exists to prevent.
+	ErrControlAccountPostingRestricted = errorString("account is a control account with direct posting restricted — an explicit, authorized override is required")
+
+	ErrAccountMappingNotFound = errorString("no effective account mapping found for this key")
+	// ErrMappingTargetAccountInvalid is returned when a mapping names an
+	// account_code that either doesn't exist in the Chart of Accounts or
+	// exists but is INACTIVE — ACC-02 must never map a business concept
+	// onto an account that can't legitimately be posted to.
+	ErrMappingTargetAccountInvalid = errorString("account_code does not name an existing ACTIVE account in the Chart of Accounts")
+
+	ErrPostingExecutionNotFound = errorString("posting execution not found")
+
+	// ErrPostingRuleAmbiguous is returned when a posting line names neither
+	// or both of account_code/mapping_key, or a named mapping_key resolves
+	// to no current mapping — the spec's own negative path, "Posting rule
+	// ambiguity": ACC-04 must never guess which account a line posts to.
+	ErrPostingRuleAmbiguous = errorString("posting rule is ambiguous: each line must name exactly one of account_code or mapping_key, and a mapping_key must resolve")
+
+	ErrInvalidPostingTransition = errorString("posting execution is not in a status that allows this action")
+
+	// ErrPostingAlreadyCommitted is returned by ReprocessFailedPosting when
+	// the named execution already reached COMMITTED — a committed posting
+	// consequence is permanent; reprocessing exists for FAILED/QUARANTINED
+	// executions only, never to retry one that already succeeded.
+	ErrPostingAlreadyCommitted = errorString("posting execution is already COMMITTED and cannot be reprocessed")
+
 	// ── ACC-03 input contract ────────────────────────────────────────────
 
 	ErrInvalidJournalType = errorString("journal_type must be one of STANDARD, ADJUSTMENT, ACCRUAL, REVERSAL, OPENING, CLOSING, RECLASS")
@@ -321,6 +754,44 @@ var (
 	// own source document exists is a data-entry error every time, and catching
 	// it here is cheaper than finding it in a period reconciliation.
 	ErrPostingBeforeTransaction = errorString("posting_date cannot precede transaction_date")
+
+	// ── ACC-03 journal proposal/approval lifecycle ──────────────────────
+
+	// ErrInvalidApprovalTransition covers every ACC-03 lifecycle command
+	// called against a journal not in the one status it requires — the
+	// spec's own negative paths #2 ("journal changed after approval") and
+	// #4 ("attempt edit after posting") both resolve to this: there is no
+	// status other than DRAFT/PENDING_APPROVAL from which AmendDraftJournal
+	// succeeds.
+	ErrInvalidApprovalTransition = errorString("journal is not in a status that allows this action")
+
+	// ErrJournalUnbalancedAtSubmit is SubmitJournal's own check — the
+	// spec's own negative path #1 ("debit/credit imbalance"), caught
+	// before an approver's time is spent reviewing a proposal that could
+	// never post.
+	ErrJournalUnbalancedAtSubmit = errorString("journal debits and credits do not balance and cannot be submitted for approval")
+
+	// ErrSelfApprovalNotPermitted is the spec's own negative path #3,
+	// verbatim scenario: "Preparer self-approves protected journal." No
+	// journal-class configuration service exists to say which journals are
+	// "protected" (the spec's own word), so this v1 treats every journal as
+	// protected — maker/checker applies universally, not selectively.
+	ErrSelfApprovalNotPermitted = errorString("the principal who submitted this journal may not also approve it")
+
+	ErrRejectReasonRequired = errorString("reason is required to reject a journal")
+
+	// ErrCorrectionSourceNotPosted is RequestCorrection's own guard — the
+	// spec's own state model, "corrections create new journals," presumes
+	// there is a posted fact to correct; a draft or rejected journal has
+	// nothing yet to correct.
+	ErrCorrectionSourceNotPosted = errorString("only a POSTED journal may be corrected")
+
+	// ── ACC-05 General Ledger ────────────────────────────────────────────
+
+	// ErrLedgerScopeRequired is every ACC-05 query's own negative-path
+	// guard against "Cross-book query leakage": legal_entity_id must
+	// always be supplied and is never inferred or defaulted.
+	ErrLedgerScopeRequired = errorString("legal_entity_id is required to query the ledger")
 )
 
 // ValidCurrencyCode reports whether s has the shape of an ISO 4217 alphabetic

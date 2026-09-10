@@ -13,6 +13,7 @@ import (
 
 	"zoiko.io/ai-governance-svc/internal/domain"
 	"zoiko.io/ai-governance-svc/internal/events"
+	"zoiko.io/ai-governance-svc/internal/killswitch"
 	"zoiko.io/ai-governance-svc/internal/middleware"
 	"zoiko.io/ai-governance-svc/internal/store"
 )
@@ -193,9 +194,24 @@ func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error { retu
 
 var _ AuthzChecker = (*stubAuthz)(nil)
 
+// stubKillSwitch defaults to "not blocked" so every pre-existing test
+// keeps exercising only the store's own static-bool resolution, exactly
+// as before this integration existed. Tests that care about the live
+// kill-switch path construct their own instance directly.
+type stubKillSwitch struct {
+	blocked bool
+	err     error
+	calls   int
+}
+
+func (s *stubKillSwitch) Resolve(_ context.Context, _, _, _ string) (bool, error) {
+	s.calls++
+	return s.blocked, s.err
+}
+
 func newTestHandler() *Handler {
 	logger, _ := zap.NewDevelopment()
-	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, logger)
+	return New(newStubStore(), &stubPublisher{}, &stubAuthz{}, &stubKillSwitch{}, logger)
 }
 
 func newTestRouter(h *Handler) *chi.Mux {
@@ -420,5 +436,117 @@ func TestPolicyChangeApproval_BlocksSelfApproval(t *testing.T) {
 	r.ServeHTTP(wOther, req)
 	if wOther.Code != http.StatusOK {
 		t.Fatalf("expected 200 from a different approver, got %d — %s", wOther.Code, wOther.Body.String())
+	}
+}
+
+// allowlistTool creates an automation policy that would otherwise allow
+// role/tool/action for testTenantA — shared setup for the kill-switch
+// tests below, which all care about what happens to an ALREADY-allowed
+// policy once the live registry is consulted.
+func allowlistTool(t *testing.T, r *chi.Mux, role, tool, actionType string) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/automation-policies", domain.CreateAutomationPolicyRequest{
+		TenantID:   testTenantA,
+		Role:       role,
+		Tool:       tool,
+		ActionType: actionType,
+	}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 creating automation policy, got %d — %s", w.Code, w.Body.String())
+	}
+}
+
+func TestResolveAutomationPolicy_LiveKillSwitchOverridesAllowedPolicy(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	ks := &stubKillSwitch{blocked: true}
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{}, ks, logger)
+	r := newTestRouter(h)
+
+	allowlistTool(t, r, "billing-agent", "stripe-refund-tool", "SEND_REFUND")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodGet,
+		"/v1/automation-policies/resolve?role=billing-agent&tool=stripe-refund-tool&action_type=SEND_REFUND", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d — %s", w.Code, w.Body.String())
+	}
+	var res domain.AutomationPolicyResolution
+	_ = json.NewDecoder(w.Body).Decode(&res)
+	if res.Allowed {
+		t.Fatalf("expected an engaged live kill switch to block an otherwise-allowed policy, got %+v", res)
+	}
+	if res.ReasonCode != "KILL_SWITCH_ENGAGED" {
+		t.Fatalf("expected reason KILL_SWITCH_ENGAGED, got %s", res.ReasonCode)
+	}
+	if ks.calls != 1 {
+		t.Fatalf("expected exactly one live kill-switch check, got %d", ks.calls)
+	}
+}
+
+func TestResolveAutomationPolicy_KillSwitchServiceUnavailable_FailsClosed(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	ks := &stubKillSwitch{err: killswitch.ErrServiceUnavailable}
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{}, ks, logger)
+	r := newTestRouter(h)
+
+	allowlistTool(t, r, "billing-agent", "stripe-refund-tool", "SEND_REFUND")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodGet,
+		"/v1/automation-policies/resolve?role=billing-agent&tool=stripe-refund-tool&action_type=SEND_REFUND", nil))
+	var res domain.AutomationPolicyResolution
+	_ = json.NewDecoder(w.Body).Decode(&res)
+	if res.Allowed {
+		t.Fatalf("expected an unreachable kill-switch-registry-svc to fail closed (not allowed), got %+v", res)
+	}
+	if res.ReasonCode != "KILL_SWITCH_CHECK_UNAVAILABLE" {
+		t.Fatalf("expected reason KILL_SWITCH_CHECK_UNAVAILABLE, got %s", res.ReasonCode)
+	}
+}
+
+// TestResolveAutomationPolicy_NotAllowlisted_SkipsLiveKillSwitchCheck is the
+// negative control's mirror: a policy that is already NOT_ALLOWLISTED must
+// short-circuit before ever calling the live registry — there is nothing
+// for the kill switch to add to an already-denied answer, and calling it
+// anyway would mean every unallowlisted resolve pays a network round trip
+// for no reason.
+func TestResolveAutomationPolicy_NotAllowlisted_SkipsLiveKillSwitchCheck(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	ks := &stubKillSwitch{blocked: true}
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{}, ks, logger)
+	r := newTestRouter(h)
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodGet,
+		"/v1/automation-policies/resolve?role=nobody&tool=nothing&action_type=NOTHING", nil))
+	var res domain.AutomationPolicyResolution
+	_ = json.NewDecoder(w.Body).Decode(&res)
+	if res.ReasonCode != "NOT_ALLOWLISTED" {
+		t.Fatalf("expected NOT_ALLOWLISTED, got %s", res.ReasonCode)
+	}
+	if ks.calls != 0 {
+		t.Fatalf("expected the live kill-switch check to be skipped for an already-denied policy, got %d calls", ks.calls)
+	}
+}
+
+func TestProposeAutomationAction_BlockedByLiveKillSwitch(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	ks := &stubKillSwitch{blocked: true}
+	h := New(newStubStore(), &stubPublisher{}, &stubAuthz{}, ks, logger)
+	r := newTestRouter(h)
+
+	allowlistTool(t, r, "billing-agent", "stripe-refund-tool", "SEND_REFUND")
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, buildRequest(http.MethodPost, "/v1/automation-actions", domain.ProposeAutomationActionRequest{
+		TenantID:       testTenantA,
+		ActionType:     "SEND_REFUND",
+		Role:           "billing-agent",
+		Tool:           "stripe-refund-tool",
+		IdempotencyKey: "idem-killswitch-1",
+	}))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 — an engaged live kill switch must block proposing the action, not just reading its resolution, got %d — %s", w.Code, w.Body.String())
 	}
 }

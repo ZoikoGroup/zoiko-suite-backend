@@ -160,4 +160,7 @@ func TestEmit_ContextMiddleware_SetsTrustedHeaders(t *testing.T) {
 	if mw.Headers.CustomRequestHeaders["X-Zoiko-Resolved-Tenant"] != "acme" {
 		t.Fatal("ctx middleware must set resolved tenant = acme")
 	}
+	if mw.Headers.CustomRequestHeaders["X-Zoiko-Resolved-Tenant-Id"] != "tenant_acme_eu" {
+		t.Fatal("ctx middleware must set resolved tenant id = tenant_acme_eu — gateway-auth-svc compares this against a session token's tenant_id claim (test O)")
+	}
 }

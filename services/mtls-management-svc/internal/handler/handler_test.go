@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"go.uber.org/zap"
+	authzpkg "zoiko.io/mtls-management-svc/internal/authz"
 	internalca "zoiko.io/mtls-management-svc/internal/ca"
 	"zoiko.io/mtls-management-svc/internal/domain"
 	"zoiko.io/mtls-management-svc/internal/handler"
@@ -30,26 +31,43 @@ func (s *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 }
 
 // newRouterWithAuthz is newRouter with an injectable authorization decision.
+// The bootstrap path is disabled ("") — these tests exercise only the
+// normal human/admin principal + authorize flow.
 func newRouterWithAuthz(t *testing.T, az handler.AuthzChecker) http.Handler {
 	t.Helper()
 	c, err := internalca.LoadOrCreate(t.TempDir())
 	if err != nil {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), az, zap.NewNop()))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), az, zap.NewNop(), ""))
 }
 
 // newRouter builds a router backed by a real CA persisted under a per-test
 // temp directory — every test gets its own isolated CA, so tests cannot
 // interfere with each other's issued certificates. Authorization GRANTS by
-// default here; see newRouterWithAuthz to inject a decision.
+// default here; see newRouterWithAuthz to inject a decision. The bootstrap
+// path is disabled ("") — see newRouterWithBootstrapToken to enable it.
 func newRouter(t *testing.T) http.Handler {
 	t.Helper()
 	c, err := internalca.LoadOrCreate(t.TempDir())
 	if err != nil {
 		t.Fatalf("failed to create test CA: %v", err)
 	}
-	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop()))
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), &stubAuthz{}, zap.NewNop(), ""))
+}
+
+// newRouterWithBootstrapToken enables the self-provisioning bootstrap path
+// with the given shared token. Authorization DENIES by default here — the
+// whole point of these tests is to prove the bootstrap path never needs to
+// reach the authorize() call at all.
+func newRouterWithBootstrapToken(t *testing.T, token string) http.Handler {
+	t.Helper()
+	c, err := internalca.LoadOrCreate(t.TempDir())
+	if err != nil {
+		t.Fatalf("failed to create test CA: %v", err)
+	}
+	denyingAuthz := &stubAuthz{err: authzpkg.ErrAuthorizationDenied}
+	return handler.NewRouter(handler.New(store.NewMemoryStore(), c, siem.New("", "mtls-management-svc", zap.NewNop()), denyingAuthz, zap.NewNop(), token))
 }
 
 // mustParsePEMCertificate fails the test if pemBytes is not a real,
@@ -86,6 +104,71 @@ func TestHealthCheck(t *testing.T) {
 	newRouter(t).ServeHTTP(w, r)
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+// TestProvisionCert_BootstrapToken_SkipsAuthorization proves a caller with
+// no principal at all can self-provision by presenting the correct shared
+// bootstrap token — even though authorization-svc would DENY this exact
+// request on its own merits (newRouterWithBootstrapToken wires a denying
+// authz stub), proving the bootstrap path genuinely bypasses that check
+// rather than happening to agree with it.
+func TestProvisionCert_BootstrapToken_SkipsAuthorization(t *testing.T) {
+	router := newRouterWithBootstrapToken(t, "shared-secret-123")
+
+	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "authorization-svc", CommonName: "authorization-svc.zoiko.internal", RotationDays: 90})
+	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
+	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Mtls-Bootstrap-Token", "shared-secret-123")
+	// Deliberately NO X-Principal-Id — the whole point of this defense.
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 201 {
+		t.Fatalf("expected 201 via bootstrap token with no principal, got %d: %s", w.Code, w.Body)
+	}
+	var result domain.ProvisionCertResult
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatalf("failed to decode provision response: %v", err)
+	}
+	mustParsePEMCertificate(t, result.Certificate.CertificatePEM)
+}
+
+// TestProvisionCert_WrongBootstrapToken_FallsBackToDeniedAuthz proves a
+// caller presenting an INCORRECT token gets no special treatment — it
+// falls through to the normal principal/authorize path, which the test's
+// denying authz stub then rejects.
+func TestProvisionCert_WrongBootstrapToken_FallsBackToDeniedAuthz(t *testing.T) {
+	router := newRouterWithBootstrapToken(t, "shared-secret-123")
+
+	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "authorization-svc", CommonName: "authorization-svc.zoiko.internal", RotationDays: 90})
+	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
+	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Mtls-Bootstrap-Token", "wrong-token")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (denied via normal path), got %d: %s", w.Code, w.Body)
+	}
+}
+
+// TestProvisionCert_NoBootstrapTokenHeader_FallsBackToDeniedAuthz proves
+// omitting the header entirely (the normal case for every caller that
+// isn't self-provisioning) behaves exactly as before this defense existed.
+func TestProvisionCert_NoBootstrapTokenHeader_FallsBackToDeniedAuthz(t *testing.T) {
+	router := newRouterWithBootstrapToken(t, "shared-secret-123")
+
+	body, _ := json.Marshal(domain.ProvisionCertRequest{LegalEntityID: "LE-1", ServiceName: "ledger-svc", CommonName: "ledger-svc.zoiko.internal", RotationDays: 90})
+	req := httptest.NewRequest(http.MethodPost, "/v1/mtls/certificates", bytes.NewBuffer(body))
+	req.Header.Set("X-Tenant-ID", "t1")
+	req.Header.Set("X-Principal-Id", "principal-test-01")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (denied via normal path), got %d: %s", w.Code, w.Body)
 	}
 }
 

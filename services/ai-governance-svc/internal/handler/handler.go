@@ -14,9 +14,16 @@ import (
 	authzpkg "zoiko.io/ai-governance-svc/internal/authz"
 	"zoiko.io/ai-governance-svc/internal/domain"
 	"zoiko.io/ai-governance-svc/internal/events"
+	"zoiko.io/ai-governance-svc/internal/killswitch"
 	"zoiko.io/ai-governance-svc/internal/middleware"
 	"zoiko.io/ai-governance-svc/internal/store"
 )
+
+// killSwitchDomain is the fixed domain scope this service resolves against
+// in kill-switch-registry-svc — AI automation is its own incident-response
+// category, distinct from any other plane/domain a future service might
+// register under.
+const killSwitchDomain = "AI_AUTOMATION"
 
 // platformScopeID is the legal_entity_id passed to authorization-svc for
 // governance-configuration actions (action-risk taxonomy, automation
@@ -41,14 +48,48 @@ type AuthzChecker interface {
 }
 
 type Handler struct {
-	store     store.Store
-	publisher events.Publisher
-	authz     AuthzChecker
-	logger    *zap.Logger
+	store      store.Store
+	publisher  events.Publisher
+	authz      AuthzChecker
+	killswitch killswitch.Checker
+	logger     *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, logger *zap.Logger) *Handler {
-	return &Handler{store: st, publisher: pub, authz: az, logger: logger}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, ks killswitch.Checker, logger *zap.Logger) *Handler {
+	return &Handler{store: st, publisher: pub, authz: az, killswitch: ks, logger: logger}
+}
+
+// resolveBlocked layers kill-switch-registry-svc's live, governed halt on
+// top of the store's own resolution, which today can only ever reflect a
+// static automation_policies.kill_switch_engaged bool set at policy-create
+// time. This is the real incident-response capability that static column
+// was standing in for: an operator can halt this tool/tenant's automation
+// through a real ENGAGE event, logged and reason-coded, without touching
+// policy data at all — and the halt takes effect on the very next resolve,
+// not on the next policy edit.
+//
+// Fails closed: if kill-switch-registry-svc cannot be reached, the
+// resolution the store already computed is downgraded to NOT_ALLOWED with
+// a distinct reason code, never silently left as the store's own answer.
+// An unreachable kill-switch check must never look identical to "checked
+// and confirmed not blocked" — the same doctrine already applied to
+// privacy-decision-svc's dependency-unavailable handling.
+func (h *Handler) resolveBlocked(ctx context.Context, resolved *domain.AutomationPolicyResolution, tool, tenantID string) *domain.AutomationPolicyResolution {
+	if !resolved.Allowed {
+		return resolved
+	}
+	if h.killswitch == nil {
+		return resolved
+	}
+	blocked, err := h.killswitch.Resolve(ctx, killSwitchDomain, tool, tenantID)
+	if err != nil {
+		h.logger.Error("kill-switch-registry-svc unavailable during automation policy resolve", zap.Error(err))
+		return &domain.AutomationPolicyResolution{Allowed: false, ReasonCode: "KILL_SWITCH_CHECK_UNAVAILABLE"}
+	}
+	if blocked {
+		return &domain.AutomationPolicyResolution{Allowed: false, ReasonCode: "KILL_SWITCH_ENGAGED"}
+	}
+	return resolved
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -352,6 +393,7 @@ func (h *Handler) ResolveAutomationPolicy(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "failed to resolve automation policy")
 		return
 	}
+	resolved = h.resolveBlocked(r.Context(), resolved, tool, tenantID)
 	writeJSON(w, http.StatusOK, resolved)
 }
 
@@ -399,6 +441,7 @@ func (h *Handler) ProposeAutomationAction(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "failed to resolve automation policy")
 		return
 	}
+	resolution = h.resolveBlocked(r.Context(), resolution, req.Tool, tenantID)
 	if !resolution.Allowed {
 		writeError(w, http.StatusForbidden, "action is not allowlisted: "+resolution.ReasonCode)
 		return

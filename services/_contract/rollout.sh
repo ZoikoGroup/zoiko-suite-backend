@@ -25,7 +25,7 @@ SERVICES_DIR="$PWD/.."
 # already carry legal_entity_id in internal/domain — this reflects the platform as
 # built, not an aspiration.
 ENTITY_SCOPED="access-control-svc accounts-payable-svc accounts-receivable-svc \
-anomaly-detection-svc authorization-svc bank-reconciliation-svc banking-connector-svc \
+anomaly-detection-svc asset-management-svc authorization-svc bank-reconciliation-svc banking-connector-svc \
 benefits-svc board-resolutions-svc carta-svc clause-template-svc commercial-account-svc \
 compensation-svc compliance-risk-scoring-svc compliance-status-svc \
 connectivity-api-bridge-svc consolidation-svc contract-lifecycle-svc \
@@ -34,11 +34,11 @@ delegated-authority-svc document-vault-svc employee-master-svc employment-contra
 esignature-integration-svc evidence-manifest-svc evidence-requirements-svc \
 exception-escalation-svc external-data-feed-svc filing-preparation-svc filing-tracker-svc \
 financial-close-svc forecasting-svc general-ledger-svc governance-decision-log-svc \
-hris-connector-svc identity-context-svc invoice-approval-svc key-management-svc \
+hris-connector-svc identity-context-svc inventory-management-svc invoice-approval-svc key-management-svc \
 leave-absence-svc migration-integrity-svc mtls-management-svc notification-svc \
 obligation-tracking-svc obligations-svc offboarding-severance-svc org-structure-svc \
 payroll-run-svc payroll-tax-svc performance-review-svc policy-svc procurement-workflow-svc \
-purchase-order-svc purchase-request-svc reconciliation-intelligence-svc \
+project-accounting-svc purchase-order-svc purchase-request-svc reconciliation-intelligence-svc \
 reporting-orchestration-svc siem-integration-svc spend-controls-svc \
 tax-authority-interface-svc tax-determination-svc treasury-svc \
 vat-gst-svc vendor-due-diligence-svc withholding-tax-svc workflow-svc workforce-compliance-svc"
@@ -82,7 +82,8 @@ audit-event-store-svc hris-connector-svc"
 # carries book_id today so callers can begin sending it; flipping these to
 # Required is a one-line change per service once REF-06 ships.
 ACCOUNTING="general-ledger-svc accounts-payable-svc accounts-receivable-svc \
-consolidation-svc intercompany-accounting-svc financial-close-svc migration-integrity-svc \
+asset-management-svc consolidation-svc intercompany-accounting-svc financial-close-svc migration-integrity-svc \
+inventory-management-svc project-accounting-svc \
 reporting-orchestration-svc metric-registry-svc corporate-tax-svc vat-gst-svc \
 withholding-tax-svc tax-determination-svc payroll-tax-svc treasury-svc \
 bank-reconciliation-svc reconciliation-intelligence-svc"

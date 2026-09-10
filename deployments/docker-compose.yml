@@ -77,6 +77,9 @@ services:
       - ../services/bank-reconciliation-svc/deployments/migrations:/migrations/bank-reconciliation:ro
       - ../services/intercompany-accounting-svc/deployments/migrations:/migrations/intercompany-accounting:ro
       - ../services/consolidation-svc/deployments/migrations:/migrations/consolidation:ro
+      - ../services/asset-management-svc/deployments/migrations:/migrations/asset-management:ro
+      - ../services/inventory-management-svc/deployments/migrations:/migrations/inventory-management:ro
+      - ../services/project-accounting-svc/deployments/migrations:/migrations/project-accounting:ro
       - ../services/invoice-approval-svc/deployments/migrations:/migrations/invoice-approval:ro
       - ../services/employee-master-svc/deployments/migrations:/migrations/employee-master:ro
       - ../services/employment-contracts-svc/deployments/migrations:/migrations/employment-contracts:ro
@@ -286,6 +289,35 @@ services:
         # identity-svc's runtime image runs as an unprivileged nonroot user
         # (distroless), which needs read access to this file.
         chmod 644 /keys/envelope_signing_key.pem
+    restart: "no"
+
+  # ── One-shot: generate the shared mTLS self-provisioning bootstrap token ──
+  # mtls-management-svc requires a verified principal + authorize() decision
+  # for every certificate request EXCEPT this one bootstrap path: a service
+  # requesting its own first certificate has no principal or session yet to
+  # present (the standard PKI bootstrap problem — see
+  # docs/architecture/master-register-findings-2026-08-27.md §3.28). This
+  # generates one random token into a shared volume, exactly like
+  # identity-svc-keygen above; never used in staging/production, where a
+  # real value is injected via the secrets manager.
+  mtls-bootstrap-keygen:
+    image: alpine:3.19
+    container_name: mtls-bootstrap-keygen
+    mem_limit: 128m
+    cpus: "0.25"
+    volumes:
+      - mtls_bootstrap_token:/bootstrap
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /bootstrap/token ]; then
+          head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /bootstrap/token
+          echo "Generated throwaway dev mTLS bootstrap token"
+        else
+          echo "Dev mTLS bootstrap token already present, skipping"
+        fi
+        chmod 644 /bootstrap/token
     restart: "no"
 
   # ── Docker socket proxy ──────────────────────────────────────────────────────
@@ -1000,6 +1032,7 @@ services:
     cpus: "0.5"
     ports:
       - "8089:8089"
+      - "8449:8449" # mTLS pilot listener — see MTLS_ENABLED below
     environment:
       PORT: "8089"
       DB_HOST: postgres
@@ -1090,11 +1123,27 @@ services:
       # only when that file is up alongside this one. Streaming degrades to
       # a no-op otherwise (see internal/siem's doc comment).
       SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
+      # mTLS pilot (material-path only) — see internal/mtls's doc comment.
+      # authorization-svc is the highest-value pilot target since every
+      # authorization decision in the platform routes through it. Enabled
+      # here as the proof-of-concept slice; the other ~70 inter-service
+      # clients remain on the plain port (master-register-findings-
+      # 2026-08-27.md §3.28).
+      MTLS_ENABLED: "true"
+      MTLS_PORT: "8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      - mtls_bootstrap_token:/bootstrap:ro
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      mtls-management-svc:
+        condition: service_healthy
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8089/healthz"]
       interval: 10s
@@ -2032,8 +2081,18 @@ services:
       PORT: "8140"
       CA_DATA_DIR: "/data/ca"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # Enables the self-provisioning bootstrap path on ProvisionCert — see
+      # master-register-findings-2026-08-27.md §3.28. Empty/unset leaves
+      # that path disabled, requiring every caller to present a real
+      # principal (which mtls-bootstrap-keygen's own consumers cannot, at
+      # their own startup — this is what makes the pilot actually usable).
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
     volumes:
       - mtls_ca_data:/data/ca
+      - mtls_bootstrap_token:/bootstrap:ro
+    depends_on:
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -2322,6 +2381,7 @@ services:
       KAFKA_EVENTS_TOPIC: "zoiko.intercompany.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
       LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      TENANT_REGISTRY_URL: "http://tenant-entity-registry-svc:8081"
     depends_on:
       postgres:
         condition: service_healthy
@@ -2330,6 +2390,8 @@ services:
       authorization-svc:
         condition: service_healthy
       general-ledger-svc:
+        condition: service_healthy
+      tenant-entity-registry-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8105/healthz"]
@@ -2374,6 +2436,123 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8106/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  asset-management-svc:
+    build:
+      context: ../services/asset-management-svc
+      dockerfile: Dockerfile
+    container_name: asset-management-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8167:8167"
+    environment:
+      PORT: "8167"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: asset_management
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.asset.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+      CLOSE_SERVICE_URL: "http://financial-close-svc:8104"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+      financial-close-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8167/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  inventory-management-svc:
+    build:
+      context: ../services/inventory-management-svc
+      dockerfile: Dockerfile
+    container_name: inventory-management-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8168:8168"
+    environment:
+      PORT: "8168"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: inventory_management
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.inventory.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      CLOSE_SERVICE_URL: "http://financial-close-svc:8104"
+      LEDGER_SERVICE_URL: "http://general-ledger-svc:8098"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+      financial-close-svc:
+        condition: service_healthy
+      general-ledger-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8168/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+  project-accounting-svc:
+    build:
+      context: ../services/project-accounting-svc
+      dockerfile: Dockerfile
+    container_name: project-accounting-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8169:8169"
+    environment:
+      PORT: "8169"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: project_accounting
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.project.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      authorization-svc:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8169/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -3326,6 +3505,17 @@ services:
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.ai-governance.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      KILL_SWITCH_REGISTRY_SERVICE_URL: "http://kill-switch-registry-svc:8147"
+      # mTLS pilot (material-path only) — ai-governance-svc is the one
+      # client wired to authorization-svc's mTLS listener for this pilot
+      # slice (master-register-findings-2026-08-27.md §3.28). Plain
+      # AUTHZ_SERVICE_URL above stops being used once this is true.
+      AUTHZ_MTLS_ENABLED: "true"
+      AUTHZ_MTLS_URL: "https://authorization-svc:8449"
+      MTLS_MANAGEMENT_SERVICE_URL: "http://mtls-management-svc:8140"
+      MTLS_BOOTSTRAP_TOKEN_PATH: "/bootstrap/token"
+    volumes:
+      - mtls_bootstrap_token:/bootstrap:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -3333,6 +3523,12 @@ services:
         condition: service_healthy
       authorization-svc:
         condition: service_healthy
+      kill-switch-registry-svc:
+        condition: service_healthy
+      mtls-management-svc:
+        condition: service_healthy
+      mtls-bootstrap-keygen:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
       interval: 10s
@@ -3879,6 +4075,8 @@ services:
       TAX_DETERMINATION_SERVICE_URL: "http://tax-determination-svc:8126"
       POLICY_SERVICE_URL: "http://policy-svc:8085"
       PAYABLE_OPEN_ITEM_SERVICE_URL: "http://payable-open-item-svc:8164"
+      CONFIG_FEATURE_FLAG_SERVICE_URL: "http://configuration-feature-flag-svc:8086"
+      ENVIRONMENT: "production"
     depends_on:
       postgres:
         condition: service_healthy
@@ -3895,6 +4093,8 @@ services:
       policy-svc:
         condition: service_healthy
       payable-open-item-svc:
+        condition: service_healthy
+      configuration-feature-flag-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/app/healthcheck"]
@@ -4259,3 +4459,4 @@ volumes:
   opensearch_data:
   document_vault_storage:
   mtls_ca_data:
+  mtls_bootstrap_token:

@@ -52,7 +52,19 @@ type provisionResult struct {
 // — this identity is a platform-infrastructure cert, not scoped to any one
 // tenant's data, same posture as the AUTHZ_PLATFORM_SCOPE_ID convention used
 // elsewhere in this codebase.
-func ProvisionServerIdentity(ctx context.Context, mtlsServiceURL, serviceName, platformScopeID string) (*ServerIdentity, error) {
+//
+// bootstrapToken authenticates this self-provisioning request — at this
+// point in startup, this service has no principal, no session, and no
+// prior credential of its own to present (the standard PKI bootstrap
+// problem). It is read from a file mtls-management-svc's own
+// mtls-bootstrap-keygen init container also populates (see
+// deployments/docker-compose.yml), never minted or verified by this
+// service itself. An empty bootstrapToken is sent as no header at all,
+// which mtls-management-svc treats as "not attempting the bootstrap
+// path" — this call then falls through to that service's normal
+// principal/authorize check and fails the way it always did before this
+// path existed.
+func ProvisionServerIdentity(ctx context.Context, mtlsServiceURL, serviceName, platformScopeID, bootstrapToken string) (*ServerIdentity, error) {
 	reqBody, err := json.Marshal(provisionRequest{
 		LegalEntityID: platformScopeID,
 		ServiceName:   serviceName,
@@ -68,6 +80,10 @@ func ProvisionServerIdentity(ctx context.Context, mtlsServiceURL, serviceName, p
 		return nil, fmt.Errorf("build provision request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Tenant-ID", platformScopeID)
+	if bootstrapToken != "" {
+		req.Header.Set("X-Mtls-Bootstrap-Token", bootstrapToken)
+	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)

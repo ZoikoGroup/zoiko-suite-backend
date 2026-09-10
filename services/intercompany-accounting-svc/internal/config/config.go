@@ -16,6 +16,10 @@ type Config struct {
 
 	AuthZServiceURL  string
 	LedgerServiceURL string
+	// TenantRegistryURL is tenant-entity-registry-svc's own base URL —
+	// ACC-11's own real dependency for closing "Entity loses group
+	// relationship mid-period" (see internal/entityregistry's doc comment).
+	TenantRegistryURL string
 
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
@@ -72,8 +76,9 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "intercompany-accounting-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.intercompany.events"),
 		},
-		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
-		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		AuthZServiceURL:   env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		LedgerServiceURL:  env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		TenantRegistryURL: env("TENANT_REGISTRY_URL", "http://tenant-entity-registry-svc:8081"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
