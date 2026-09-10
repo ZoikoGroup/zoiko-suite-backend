@@ -38,6 +38,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
+		project_profitability_snapshots, project_profitability_projections,
+		project_recognition_runs, project_recognition_estimates,
 		project_cost_certifications, project_cost_entries,
 		project_financial_profiles, project_work_packages, projects
 		CASCADE;`)

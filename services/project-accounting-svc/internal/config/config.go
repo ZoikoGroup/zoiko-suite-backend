@@ -15,6 +15,14 @@ type Config struct {
 	Kafka KafkaConfig
 
 	AuthZServiceURL string
+	// CloseServiceURL is financial-close-svc's own base URL — PRJ-03
+	// depends on its period-status check per the spec's own negative
+	// path, "closed period ... blocks certification."
+	CloseServiceURL string
+	// LedgerServiceURL is general-ledger-svc's own base URL — PRJ-03
+	// posts through its ACC-04 system-originated posting path
+	// (POST /v1/postings/events), never a bespoke ledger write.
+	LedgerServiceURL string
 
 	// AuthzMTLSEnabled turns on the mTLS pilot for calls to authorization-svc.
 	// OFF by default — when false, nothing about the existing authz call
@@ -74,7 +82,9 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "project-accounting-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.project.events"),
 		},
-		AuthZServiceURL: env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthZServiceURL:  env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		CloseServiceURL:  env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
+		LedgerServiceURL: env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
