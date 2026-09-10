@@ -390,3 +390,41 @@ func (s *PgStore) SupersedeDepreciationRun(ctx context.Context, runID, principal
 func newUUID() string {
 	return uuidNewString()
 }
+
+// GetNetBookValueTotal is the real, live source ACC-06 (financial-
+// close-svc) reconciles against for the AST/INV/PRJ domain spec's own §9
+// "Assets → GL" assertion: SUM(cost_basis - latest accumulated
+// depreciation) over every ACTIVE schedule, for one ACTIVE asset, in one
+// caller-declared book. bookID is required — there is no "primary GL
+// book" concept anywhere in this schema (an asset may carry more than
+// one book, e.g. tax vs GAAP), the same "deliberate bootstrap gap,
+// safety-favoring direction" posture used throughout this domain's own
+// build. A schedule with no depreciation lines yet (never run) counts at
+// its full cost_basis — undepreciated is a real, valid NBV, not zero.
+func (s *PgStore) GetNetBookValueTotal(ctx context.Context, legalEntityID, bookID string) (float64, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var total float64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(ds.cost_basis - COALESCE(latest.accumulated_depreciation_after, 0)), 0)
+			FROM depreciation_schedules ds
+			JOIN fixed_assets fa ON fa.asset_id = ds.asset_id
+			LEFT JOIN LATERAL (
+				SELECT dl.accumulated_depreciation_after
+				FROM depreciation_lines dl
+				WHERE dl.schedule_version_id = ds.schedule_version_id
+				ORDER BY dl.created_at DESC
+				LIMIT 1
+			) latest ON true
+			WHERE ds.tenant_id = $1 AND ds.legal_entity_id = $2 AND ds.book_id = $3
+			  AND ds.status = $4 AND ds.effective_to IS NULL AND fa.status = $5
+		`, tenantID, legalEntityID, bookID, domain.DepreciationScheduleStatusActive, domain.AssetStatusActive).Scan(&total)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}

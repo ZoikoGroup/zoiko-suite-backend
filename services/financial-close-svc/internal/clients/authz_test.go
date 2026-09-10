@@ -40,7 +40,7 @@ func authzServer(t *testing.T, status int, body any) *httptest.Server {
 }
 
 func newAuthzClient(authzURL string) *clients.Clients {
-	return clients.New(authzURL, "http://ledger.invalid", "http://ap.invalid", "http://ar.invalid", "http://vault.invalid", zap.NewNop())
+	return clients.New(authzURL, "http://ledger.invalid", "http://ap.invalid", "http://ar.invalid", "http://vault.invalid", "http://asset.invalid", zap.NewNop())
 }
 
 // The shape authorization-svc actually returns.
@@ -128,7 +128,7 @@ func TestUploadCloseEvidence_ReadsTheDocumentIDFromTheRealShape(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := clients.New("http://authz.invalid", "http://ledger.invalid", "http://ap.invalid", "http://ar.invalid", srv.URL, zap.NewNop())
+	c := clients.New("http://authz.invalid", "http://ledger.invalid", "http://ap.invalid", "http://ar.invalid", srv.URL, "http://asset.invalid", zap.NewNop())
 	id, err := c.UploadCloseEvidence(t.Context(), "tenant-1", "le-1", "2026-01",
 		map[string]float64{"1000-Cash": 10}, "principal-1")
 	if err != nil {
@@ -154,7 +154,7 @@ func TestUploadCloseEvidence_NoDocumentID_IsAnError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := clients.New("http://authz.invalid", "http://ledger.invalid", "http://ap.invalid", "http://ar.invalid", srv.URL, zap.NewNop())
+	c := clients.New("http://authz.invalid", "http://ledger.invalid", "http://ap.invalid", "http://ar.invalid", srv.URL, "http://asset.invalid", zap.NewNop())
 	if _, err := c.UploadCloseEvidence(t.Context(), "tenant-1", "le-1", "2026-01",
 		map[string]float64{"1000-Cash": 10}, "principal-1"); err == nil {
 		t.Fatal("expected an error when the vault returns no document_id")

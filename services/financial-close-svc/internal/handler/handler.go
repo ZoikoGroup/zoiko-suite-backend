@@ -171,6 +171,9 @@ type Clients interface {
 	GetControlAccountCode(ctx context.Context, tenantID, mappingKey string) (string, error)
 	GetAPSubledgerTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
 	GetARSubledgerTotal(ctx context.Context, tenantID, legalEntityID string) (float64, error)
+	// GetAssetNetBookValueTotal is ACC-06's third subledger source — see
+	// its doc comment in internal/clients for why bookID is required.
+	GetAssetNetBookValueTotal(ctx context.Context, tenantID, legalEntityID, bookID string) (float64, error)
 	// PostAccrualRecognitionJournal is ACC-07's only path to the ledger —
 	// see its doc comment in internal/clients for why.
 	PostAccrualRecognitionJournal(ctx context.Context, tenantID, legalEntityID, fiscalPeriod, correlationID, principalID, description, debitAccountCode, creditAccountCode string, amount float64) (journalID string, err error)
@@ -837,8 +840,12 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, fiscal_period and control_account_mapping_key are required")
 		return
 	}
-	if req.Subledger != "AP" && req.Subledger != "AR" {
+	if req.Subledger != "AP" && req.Subledger != "AR" && req.Subledger != "ASSETS" {
 		writeError(w, http.StatusBadRequest, "invalid_subledger", string(domain.ErrInvalidSubledger))
+		return
+	}
+	if req.Subledger == "ASSETS" && req.BookID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", string(domain.ErrBookIDRequiredForAssets))
 		return
 	}
 
@@ -863,16 +870,23 @@ func (h *Handler) RunSubledgerControl(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var subledgerTotal float64
-	if req.Subledger == "AP" {
+	switch req.Subledger {
+	case "AP":
 		subledgerTotal, err = h.clients.GetAPSubledgerTotal(r.Context(), tenantID, req.LegalEntityID)
 		if err != nil {
 			h.writeSubledgerControlErr(w, err, "accounts-payable-svc")
 			return
 		}
-	} else {
+	case "AR":
 		subledgerTotal, err = h.clients.GetARSubledgerTotal(r.Context(), tenantID, req.LegalEntityID)
 		if err != nil {
 			h.writeSubledgerControlErr(w, err, "accounts-receivable-svc")
+			return
+		}
+	case "ASSETS":
+		subledgerTotal, err = h.clients.GetAssetNetBookValueTotal(r.Context(), tenantID, req.LegalEntityID, req.BookID)
+		if err != nil {
+			h.writeSubledgerControlErr(w, err, "asset-management-svc")
 			return
 		}
 	}

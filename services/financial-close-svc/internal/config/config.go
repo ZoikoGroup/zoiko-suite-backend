@@ -29,6 +29,10 @@ type Config struct {
 	APServiceURL             string
 	ARServiceURL             string
 	VaultServiceURL          string
+	// AssetServiceURL is asset-management-svc — ACC-06's own third
+	// subledger source (ASSETS), satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Assets → GL" reconciliation assertion.
+	AssetServiceURL string
 
 	// CloseSigningKey is the HMAC secret the close evidence signature is
 	// computed with. There is deliberately NO default: the signature used to be
@@ -114,6 +118,7 @@ func Load() (*Config, error) {
 		// 8094 is the port document-vault-svc listens on. This defaulted to
 		// 8092, which nothing in this platform serves.
 		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
+		AssetServiceURL:      env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
 		CloseSigningKey:      signingKey,
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil

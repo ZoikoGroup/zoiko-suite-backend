@@ -351,4 +351,6 @@ One real bug caught by the real-Postgres pass, not by inspection: `computeLivePr
 
 This closes the entire ZS-SVC-G-001 domain build: all 12 capabilities across all three sub-domains (AST-01/02/03, INV-01 through INV-05, PRJ-01 through PRJ-04) are now built from scratch across three services (`asset-management-svc`, `inventory-management-svc`, `project-accounting-svc`), each verified against real Postgres with at least one negative control per capability, following the exact same build pattern end to end. No further capabilities remain in this domain.
 
+**Post-closure note (2026-09-10):** a completeness audit against this spec's own §9, "Subledger Reconciliation & Control Framework" — 8 domain-wide reconciliation assertions with no capability code named as owner anywhere in the document — found it unaddressed by any of the 12 capabilities above (each capability's own `Reconciled`/`Certified` state names the concept but no command reaches it, honestly noted per-section above, but never named as one systemic gap until this audit). Work to close it is tracked in `master-register-findings-2026-08-27.md` §3.53 onward, routed through `financial-close-svc`'s own existing ACC-06 subledger-control mechanism rather than a new service — §3.53 itself closes 1 of the 8 assertions (Assets → GL); the remaining 7 are unbuilt as of that section.
+
 ---

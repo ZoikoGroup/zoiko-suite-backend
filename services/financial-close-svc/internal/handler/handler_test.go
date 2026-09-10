@@ -61,16 +61,16 @@ type stubStore struct {
 	activatePrepaymentErr   error
 	completePrepaymentErr   error
 
-	allocationRules map[string]*domain.AllocationRule // keyed by rule_id (current version)
-	allocationRuns  map[string]*domain.AllocationRun  // keyed by run_id
-	createRuleErr   error
-	approveRuleErr  error
+	allocationRules  map[string]*domain.AllocationRule // keyed by rule_id (current version)
+	allocationRuns   map[string]*domain.AllocationRun  // keyed by run_id
+	createRuleErr    error
+	approveRuleErr   error
 	supersedeRuleErr error
-	createRunErr2   error
-	markCalcErr     error
-	markPostedErr   error
-	markFailedErr   error
-	resultLinesErr  error
+	createRunErr2    error
+	markCalcErr      error
+	markPostedErr    error
+	markFailedErr    error
+	resultLinesErr   error
 
 	fxRuns          map[string]*domain.FXRevaluationRun
 	createFXRunErr  error
@@ -85,14 +85,14 @@ type stubStore struct {
 	createSnapshotErr     error
 	transitionSnapshotErr error
 
-	lineageEdges            []domain.LineageEdge
-	tracePathVerifications  []domain.TracePathVerification
-	quarantinedLineageGaps  []domain.QuarantinedLineageGap
-	recordEdgeErr     error
-	postedJournalRefs []domain.PostedJournalRef
-	postedRefsErr     error
-	projectionStatus  map[string]*domain.LineageProjectionStatus
-	upsertStatusErr   error
+	lineageEdges           []domain.LineageEdge
+	tracePathVerifications []domain.TracePathVerification
+	quarantinedLineageGaps []domain.QuarantinedLineageGap
+	recordEdgeErr          error
+	postedJournalRefs      []domain.PostedJournalRef
+	postedRefsErr          error
+	projectionStatus       map[string]*domain.LineageProjectionStatus
+	upsertStatusErr        error
 }
 
 func newStubStore() *stubStore {
@@ -1044,6 +1044,8 @@ type stubClients struct {
 	apSubledgerErr      error
 	arSubledgerTotal    float64
 	arSubledgerErr      error
+	assetNBVTotal       float64
+	assetNBVErr         error
 
 	postJournalErr   error
 	postedJournalID  string
@@ -1132,6 +1134,10 @@ func (c *stubClients) GetAPSubledgerTotal(_ context.Context, _, _ string) (float
 
 func (c *stubClients) GetARSubledgerTotal(_ context.Context, _, _ string) (float64, error) {
 	return c.arSubledgerTotal, c.arSubledgerErr
+}
+
+func (c *stubClients) GetAssetNetBookValueTotal(_ context.Context, _, _, _ string) (float64, error) {
+	return c.assetNBVTotal, c.assetNBVErr
 }
 
 func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
@@ -1785,6 +1791,57 @@ func TestRunSubledgerControl_ARMismatch_RecordsExceptionAndPublishes(t *testing.
 	}
 	if pub.lastControlExceptionRun.ControlRunID != run.ControlRunID {
 		t.Errorf("published exception does not match the persisted run")
+	}
+}
+
+// TestRunSubledgerControl_AssetsMatched_RecordsRun proves ACC-06's own
+// AP/AR reconciliation mechanism now serves the AST/INV/PRJ domain
+// spec's own §9 "Assets → GL" assertion, via the same real
+// compare-and-diff logic, not a new engine.
+func TestRunSubledgerControl_AssetsMatched_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{
+		controlAccountCodes: map[string]string{"FIXED_ASSET_CONTROL": "1500-FA"},
+		assetNBVTotal:       500000.00,
+		trialBalances:       map[string]float64{"1500-FA": 500000.00},
+	}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID:            "le-1",
+		FiscalPeriod:             "2026-08",
+		Subledger:                "ASSETS",
+		ControlAccountMappingKey: "FIXED_ASSET_CONTROL",
+		BookID:                   "GAAP",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+	if run.Subledger != "ASSETS" {
+		t.Errorf("expected ASSETS, got %q", run.Subledger)
+	}
+}
+
+func TestRunSubledgerControl_AssetsMissingBookID_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubClients{})
+	req := domain.RunSubledgerControlRequest{
+		LegalEntityID:            "le-1",
+		FiscalPeriod:             "2026-08",
+		Subledger:                "ASSETS",
+		ControlAccountMappingKey: "FIXED_ASSET_CONTROL",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 book_id required, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

@@ -2196,6 +2196,11 @@ services:
       # upload with "failed to record close evidence in vault", which reads as
       # the vault being broken rather than as never having been contacted.
       VAULT_SERVICE_URL: "http://document-vault-svc:8094"
+      # ACC-06's third subledger source (ASSETS), added to satisfy the
+      # AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
+      # assertion — no new reconciliation engine, just a new caller onto
+      # the existing subledger-control-run mechanism above.
+      ASSET_SERVICE_URL: "http://asset-management-svc:8167"
       # HMAC secret for the close evidence signature. The service refuses to
       # start without one, deliberately: the signature was previously keyed with
       # the tenant id — a public value — so anything it "guaranteed" was
@@ -2217,6 +2222,8 @@ services:
       accounts-receivable-svc:
         condition: service_healthy
       document-vault-svc:
+        condition: service_healthy
+      asset-management-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a

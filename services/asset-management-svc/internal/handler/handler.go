@@ -22,6 +22,11 @@ type Store interface {
 	CreateAsset(ctx context.Context, a *domain.FixedAsset) error
 	GetAsset(ctx context.Context, assetID string) (*domain.FixedAsset, error)
 	ListAssets(ctx context.Context, legalEntityID string) ([]domain.FixedAsset, error)
+	// GetNetBookValueTotal backs GET /v1/assets/net-book-value — see
+	// internal/store/depreciation_store.go's own doc comment. Serves the
+	// AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
+	// assertion, consumed by financial-close-svc's ACC-06.
+	GetNetBookValueTotal(ctx context.Context, legalEntityID, bookID string) (float64, error)
 	AddComponent(ctx context.Context, c *domain.AssetComponent) error
 	AssignBookProfile(ctx context.Context, b *domain.AssetBookAssignment) error
 	RegisterAsset(ctx context.Context, assetID, principalID string, at time.Time) error
@@ -164,6 +169,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/assets", func(r chi.Router) {
 		r.Post("/", h.CreateAssetCandidate)
 		r.Get("/", h.ListAssets)
+		r.Get("/net-book-value", h.GetNetBookValueTotal)
 		r.Get("/{id}", h.GetAsset)
 		r.Post("/{id}/approve", h.ApproveAssetRegistration)
 		r.Post("/{id}/components", h.AddComponent)
@@ -267,6 +273,37 @@ func (h *Handler) GetAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
+}
+
+// GetNetBookValueTotal is a read-only aggregate over real, live schedule
+// data — never a caller-declared or cached figure. financial-close-svc's
+// ACC-06 calls this directly; see internal/store's own doc comment for
+// the calculation and why book_id is required.
+func (h *Handler) GetNetBookValueTotal(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	bookID := r.URL.Query().Get("book_id")
+	if legalEntityID == "" || bookID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and book_id are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionAssetView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	total, err := h.store.GetNetBookValueTotal(r.Context(), legalEntityID, bookID)
+	if err != nil {
+		h.log.Error("GetNetBookValueTotal: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]float64{"net_book_value_total": total})
 }
 
 func (h *Handler) ListAssets(w http.ResponseWriter, r *http.Request) {

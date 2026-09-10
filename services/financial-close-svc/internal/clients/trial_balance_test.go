@@ -80,7 +80,7 @@ func (f *fakeLedger) serveOne(w http.ResponseWriter, r *http.Request) {
 
 func newClients(t *testing.T, ledgerURL string) *clients.Clients {
 	t.Helper()
-	return clients.New("http://authz.invalid", ledgerURL, "http://ap.invalid", "http://ar.invalid", "http://vault.invalid", zap.NewNop())
+	return clients.New("http://authz.invalid", ledgerURL, "http://ap.invalid", "http://ar.invalid", "http://vault.invalid", "http://asset.invalid", zap.NewNop())
 }
 
 // TestCompileTrialBalance_ParsesLinesIntoMap proves the client correctly

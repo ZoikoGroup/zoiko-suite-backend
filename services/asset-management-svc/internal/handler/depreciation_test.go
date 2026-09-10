@@ -250,3 +250,51 @@ func TestSupersedeDepreciationRun_ReversesJournalAndReleasesPeriod(t *testing.T)
 		t.Fatalf("expected 201 creating a fresh run for the same period after supersession, got %d: %s", newRunRR.Code, newRunRR.Body.String())
 	}
 }
+
+// ── GetNetBookValueTotal (ACC-06's own "Assets → GL" source) ────────────────
+
+func TestGetNetBookValueTotal_MissingParams_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/assets/net-book-value?legal_entity_id=le-1", nil, "reader-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 missing book_id, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetNetBookValueTotal_SumsCostBasisForBookAndLegalEntity(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	assetID := createActiveAsset(t, s, r, "le-1")
+
+	rr := doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("build schedule failed: %d %s", rr.Code, rr.Body.String())
+	}
+
+	nbvRR := doReq(r, http.MethodGet, "/v1/assets/net-book-value?legal_entity_id=le-1&book_id=book-1", nil, "reader-1")
+	if nbvRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", nbvRR.Code, nbvRR.Body.String())
+	}
+	var out map[string]float64
+	_ = json.NewDecoder(nbvRR.Body).Decode(&out)
+	if out["net_book_value_total"] != 12000 {
+		t.Fatalf("expected net_book_value_total 12000 (this stub doesn't model accumulated depreciation), got %v", out["net_book_value_total"])
+	}
+}
+
+func TestGetNetBookValueTotal_DifferentBook_ExcludedFromTotal(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	assetID := createActiveAsset(t, s, r, "le-1")
+	_ = doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
+
+	nbvRR := doReq(r, http.MethodGet, "/v1/assets/net-book-value?legal_entity_id=le-1&book_id=some-other-book", nil, "reader-1")
+	if nbvRR.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", nbvRR.Code, nbvRR.Body.String())
+	}
+	var out map[string]float64
+	_ = json.NewDecoder(nbvRR.Body).Decode(&out)
+	if out["net_book_value_total"] != 0 {
+		t.Fatalf("expected 0 for an unrelated book_id, got %v", out["net_book_value_total"])
+	}
+}

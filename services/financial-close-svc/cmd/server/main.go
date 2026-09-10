@@ -135,9 +135,9 @@ func main() {
 			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
 		}
 		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
-		clientsWrapper = clients.NewWithAuthzHTTPClient(cfg.AuthzMTLSURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log, mtlsHTTPClient)
+		clientsWrapper = clients.NewWithAuthzHTTPClient(cfg.AuthzMTLSURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, cfg.AssetServiceURL, log, mtlsHTTPClient)
 	} else {
-		clientsWrapper = clients.New(cfg.AuthZServiceURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, log)
+		clientsWrapper = clients.New(cfg.AuthZServiceURL, cfg.LedgerServiceURL, cfg.APServiceURL, cfg.ARServiceURL, cfg.VaultServiceURL, cfg.AssetServiceURL, log)
 	}
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────

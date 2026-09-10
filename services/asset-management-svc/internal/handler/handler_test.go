@@ -293,6 +293,24 @@ func (s *stubStore) ListAssets(_ context.Context, legalEntityID string) ([]domai
 	return out, nil
 }
 
+// GetNetBookValueTotal is a simplified stub: sums CostBasis for ACTIVE
+// schedules in the given book, for ACTIVE assets — accumulated
+// depreciation isn't modeled in this in-memory stub (that math is
+// verified for real in internal/store's own Postgres tests). Enough to
+// exercise the handler's own routing/authz/validation plumbing.
+func (s *stubStore) GetNetBookValueTotal(_ context.Context, legalEntityID, bookID string) (float64, error) {
+	var total float64
+	for _, sch := range s.schedules {
+		if sch.LegalEntityID != legalEntityID || sch.BookID != bookID || sch.Status != domain.DepreciationScheduleStatusActive {
+			continue
+		}
+		if a, ok := s.assets[sch.AssetID]; ok && a.Status == domain.AssetStatusActive {
+			total += sch.CostBasis
+		}
+	}
+	return total, nil
+}
+
 func (s *stubStore) AddComponent(_ context.Context, c *domain.AssetComponent) error {
 	s.components[c.AssetID] = append(s.components[c.AssetID], *c)
 	return nil

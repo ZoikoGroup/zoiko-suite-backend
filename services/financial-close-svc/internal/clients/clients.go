@@ -1,19 +1,19 @@
 package clients
 
 import (
-	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/financial-close-svc/internal/envelope"
 
 	"go.uber.org/zap"
 	"zoiko.io/financial-close-svc/internal/domain"
@@ -49,6 +49,7 @@ type Clients struct {
 	apURL     string
 	arURL     string
 	vaultURL  string
+	assetURL  string
 	http      *http.Client
 	log       *zap.Logger
 
@@ -64,13 +65,14 @@ type Clients struct {
 	cacheWrites int
 }
 
-func New(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger) *Clients {
+func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL string, log *zap.Logger) *Clients {
 	return &Clients{
 		authzURL:  authzURL,
 		ledgerURL: ledgerURL,
 		apURL:     apURL,
 		arURL:     arURL,
 		vaultURL:  vaultURL,
+		assetURL:  assetURL,
 		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
 		log:       log,
 		cache:     make(map[string]cachedDecision),
@@ -79,15 +81,16 @@ func New(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger) *C
 
 // NewWithAuthzHTTPClient is New but with a caller-supplied *http.Client used
 // solely for calls to authorization-svc — used for the mTLS pilot. Every
-// other outbound client (GL/AP/AR/vault) built here is unaffected and keeps
-// using the plain, non-mTLS http.Client.
-func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
+// other outbound client (GL/AP/AR/vault/asset) built here is unaffected and
+// keeps using the plain, non-mTLS http.Client.
+func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
 	return &Clients{
 		authzURL:  authzURL,
 		ledgerURL: ledgerURL,
 		apURL:     apURL,
 		arURL:     arURL,
 		vaultURL:  vaultURL,
+		assetURL:  assetURL,
 		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
 		authzHTTP: authzHTTPClient,
 		log:       log,
@@ -1128,6 +1131,55 @@ func (c *Clients) GetARSubledgerTotal(ctx context.Context, tenantID, legalEntity
 		}
 	}
 	return total, nil
+}
+
+// assetNetBookValueResponse mirrors asset-management-svc's own
+// GET /v1/assets/net-book-value wire shape — only the field this client
+// needs.
+type assetNetBookValueResponse struct {
+	NetBookValueTotal float64 `json:"net_book_value_total"`
+}
+
+// GetAssetNetBookValueTotal asks asset-management-svc for the real, live
+// sum of cost_basis minus latest accumulated depreciation across every
+// ACTIVE depreciation schedule for one legal entity and one caller-
+// declared book — the ASSETS half of ACC-06, extended to satisfy the
+// AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
+// assertion. Not period-bounded, same posture as GetAPSubledgerTotal/
+// GetARSubledgerTotal: a control account balance is a point-in-time
+// total, not scoped to a fiscal period's own transactions.
+func (c *Clients) GetAssetNetBookValueTotal(ctx context.Context, tenantID, legalEntityID, bookID string) (float64, error) {
+	u, err := url.Parse(c.assetURL + "/v1/assets/net-book-value")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	q.Set("book_id", bookID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch net book value from asset-management-svc", zap.Error(err))
+		return 0, domain.ErrAssetServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrAssetServiceUnavailable
+	}
+
+	var out assetNetBookValueResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.NetBookValueTotal, nil
 }
 
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that
