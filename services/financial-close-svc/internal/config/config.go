@@ -33,6 +33,10 @@ type Config struct {
 	// subledger source (ASSETS), satisfying the AST/INV/PRJ domain
 	// spec's own §9 "Assets → GL" reconciliation assertion.
 	AssetServiceURL string
+	// InventoryServiceURL is inventory-management-svc — ACC-06's own
+	// INVENTORY_QUANTITY source, satisfying the AST/INV/PRJ domain
+	// spec's own §9 "Inventory quantity" assertion.
+	InventoryServiceURL string
 
 	// CloseSigningKey is the HMAC secret the close evidence signature is
 	// computed with. There is deliberately NO default: the signature used to be
@@ -119,6 +123,7 @@ func Load() (*Config, error) {
 		// 8092, which nothing in this platform serves.
 		VaultServiceURL:      env("VAULT_SERVICE_URL", "http://document-vault-svc:8094"),
 		AssetServiceURL:      env("ASSET_SERVICE_URL", "http://asset-management-svc:8167"),
+		InventoryServiceURL:  env("INVENTORY_SERVICE_URL", "http://inventory-management-svc:8168"),
 		CloseSigningKey:      signingKey,
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil

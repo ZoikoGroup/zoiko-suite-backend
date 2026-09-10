@@ -44,14 +44,15 @@ type cachedDecision struct {
 }
 
 type Clients struct {
-	authzURL  string
-	ledgerURL string
-	apURL     string
-	arURL     string
-	vaultURL  string
-	assetURL  string
-	http      *http.Client
-	log       *zap.Logger
+	authzURL     string
+	ledgerURL    string
+	apURL        string
+	arURL        string
+	vaultURL     string
+	assetURL     string
+	inventoryURL string
+	http         *http.Client
+	log          *zap.Logger
 
 	// authzHTTP, when set, is used instead of http for calls to
 	// authorization-svc only — the mTLS pilot's Transport carries this
@@ -65,36 +66,38 @@ type Clients struct {
 	cacheWrites int
 }
 
-func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL string, log *zap.Logger) *Clients {
+func New(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL string, log *zap.Logger) *Clients {
 	return &Clients{
-		authzURL:  authzURL,
-		ledgerURL: ledgerURL,
-		apURL:     apURL,
-		arURL:     arURL,
-		vaultURL:  vaultURL,
-		assetURL:  assetURL,
-		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
-		log:       log,
-		cache:     make(map[string]cachedDecision),
+		authzURL:     authzURL,
+		ledgerURL:    ledgerURL,
+		apURL:        apURL,
+		arURL:        arURL,
+		vaultURL:     vaultURL,
+		assetURL:     assetURL,
+		inventoryURL: inventoryURL,
+		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		log:          log,
+		cache:        make(map[string]cachedDecision),
 	}
 }
 
 // NewWithAuthzHTTPClient is New but with a caller-supplied *http.Client used
 // solely for calls to authorization-svc — used for the mTLS pilot. Every
-// other outbound client (GL/AP/AR/vault/asset) built here is unaffected and
-// keeps using the plain, non-mTLS http.Client.
-func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
+// other outbound client (GL/AP/AR/vault/asset/inventory) built here is
+// unaffected and keeps using the plain, non-mTLS http.Client.
+func NewWithAuthzHTTPClient(authzURL, ledgerURL, apURL, arURL, vaultURL, assetURL, inventoryURL string, log *zap.Logger, authzHTTPClient *http.Client) *Clients {
 	return &Clients{
-		authzURL:  authzURL,
-		ledgerURL: ledgerURL,
-		apURL:     apURL,
-		arURL:     arURL,
-		vaultURL:  vaultURL,
-		assetURL:  assetURL,
-		http:      &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
-		authzHTTP: authzHTTPClient,
-		log:       log,
-		cache:     make(map[string]cachedDecision),
+		authzURL:     authzURL,
+		ledgerURL:    ledgerURL,
+		apURL:        apURL,
+		arURL:        arURL,
+		vaultURL:     vaultURL,
+		assetURL:     assetURL,
+		inventoryURL: inventoryURL,
+		http:         &http.Client{Timeout: 5 * time.Second, Transport: newRetryTransport()},
+		authzHTTP:    authzHTTPClient,
+		log:          log,
+		cache:        make(map[string]cachedDecision),
 	}
 }
 
@@ -1224,6 +1227,49 @@ func (c *Clients) GetAssetDepreciationCompleteness(ctx context.Context, tenantID
 		return 0, 0, err
 	}
 	return out.CoveredCount, out.EligibleCount, nil
+}
+
+// inventoryNegativeOnHandResponse mirrors inventory-management-svc's own
+// GET /v1/on-hand/negative-count wire shape.
+type inventoryNegativeOnHandResponse struct {
+	NegativeOnHandCount int `json:"negative_on_hand_count"`
+}
+
+// GetInventoryNegativeOnHandCount is ACC-06's INVENTORY_QUANTITY
+// source — satisfies the AST/INV/PRJ domain spec's own §9 "Inventory
+// quantity" assertion. Like DEPRECIATION_COMPLETENESS, this is an
+// integrity check with no GL side, not a balance comparison.
+func (c *Clients) GetInventoryNegativeOnHandCount(ctx context.Context, tenantID, legalEntityID string) (int, error) {
+	u, err := url.Parse(c.inventoryURL + "/v1/on-hand/negative-count")
+	if err != nil {
+		return 0, err
+	}
+	q := u.Query()
+	q.Set("legal_entity_id", legalEntityID)
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		c.log.Error("failed to fetch negative on-hand count from inventory-management-svc", zap.Error(err))
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, domain.ErrInventoryServiceUnavailable
+	}
+
+	var out inventoryNegativeOnHandResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, err
+	}
+	return out.NegativeOnHandCount, nil
 }
 
 // GetUnsettledARInvoicesCount counts receivables belonging to THIS period that

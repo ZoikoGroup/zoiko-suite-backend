@@ -838,6 +838,34 @@ func (s *stubStore) GetOnHand(_ context.Context, itemID, locationID string) (flo
 	return onHand, nil
 }
 
+// GetNegativeOnHandCount is a simplified stub: aggregates net on-hand
+// per (item_id, location_id) across COMMITTED movements for the entity,
+// counting how many combinations went negative. Enough to exercise the
+// handler's own routing/authz plumbing — the real SQL is verified in
+// internal/store's own Postgres tests.
+func (s *stubStore) GetNegativeOnHandCount(_ context.Context, legalEntityID string) (int, error) {
+	type key struct{ itemID, locationID string }
+	netByKey := make(map[key]float64)
+	for _, m := range s.movements {
+		if m.Status != domain.MovementStatusCommitted || m.LegalEntityID != legalEntityID {
+			continue
+		}
+		if m.DestinationLocationID != nil {
+			netByKey[key{m.ItemID, *m.DestinationLocationID}] += m.Quantity
+		}
+		if m.SourceLocationID != nil {
+			netByKey[key{m.ItemID, *m.SourceLocationID}] -= m.Quantity
+		}
+	}
+	count := 0
+	for _, net := range netByKey {
+		if net < 0 {
+			count++
+		}
+	}
+	return count, nil
+}
+
 func (s *stubStore) GetOnHandAsOf(ctx context.Context, itemID, locationID string, _ time.Time) (float64, error) {
 	return s.GetOnHand(ctx, itemID, locationID)
 }

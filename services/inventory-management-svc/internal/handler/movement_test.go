@@ -321,3 +321,88 @@ func TestAdjustInventoryFromApprovedCount_UsesDistinctAction(t *testing.T) {
 		t.Fatalf("expected 403 (authz denied for adjust action), got %d: %s", rr.Code, rr.Body.String())
 	}
 }
+
+// ── GetNegativeOnHandCount (§9 "Inventory quantity") ─────────────────────────
+
+func createAndCommitIssue(t *testing.T, r chi.Router, itemID, sourceLocID, idemKey string, qty float64) domain.InventoryMovement {
+	t.Helper()
+	req := domain.CreateInventoryMovementRequest{
+		ItemID: itemID, SourceLocationID: sourceLocID, Quantity: qty, UOM: "EACH",
+		SourceReference: "SO-1", SourceIdempotencyKey: idemKey, FiscalPeriod: "2026-09",
+	}
+	rr := doReq(r, http.MethodPost, "/v1/movements/issue", req, "preparer-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("issue failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var m domain.InventoryMovement
+	_ = json.NewDecoder(rr.Body).Decode(&m)
+
+	v := doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/validate", nil, "preparer-1")
+	if v.Code != http.StatusOK {
+		t.Fatalf("validate failed: %d %s", v.Code, v.Body.String())
+	}
+	c := doReq(r, http.MethodPost, "/v1/movements/"+m.MovementID+"/commit", nil, "preparer-1")
+	if c.Code != http.StatusOK {
+		t.Fatalf("commit failed: %d %s", c.Code, c.Body.String())
+	}
+	var committed domain.InventoryMovement
+	_ = json.NewDecoder(c.Body).Decode(&committed)
+	return committed
+}
+
+func TestGetNegativeOnHandCount_MissingLegalEntity_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/on-hand/negative-count", nil, "reader-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetNegativeOnHandCount_AllPositive_ReturnsZero(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locA, _ := movementFixture(t, s, r)
+	createAndCommitReceipt(t, r, itemID, locA, "idem-neg-1", 10)
+	createAndCommitIssue(t, r, itemID, locA, "idem-neg-2", 4)
+
+	rr := doReq(r, http.MethodGet, "/v1/on-hand/negative-count?legal_entity_id=le-1", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]int
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["negative_on_hand_count"] != 0 {
+		t.Fatalf("expected 0 (10 received, 4 issued, net 6), got %+v", out)
+	}
+}
+
+// TestGetNegativeOnHandCount_IssuedMoreThanReceived_CountsOne proves the
+// counting logic itself. CommitMovement's own real guard already refuses
+// to take on-hand below zero through the normal HTTP path (confirmed by
+// this service's own TestPgStore_CommitMovement_NegativeStockRefused),
+// so a negative combination is injected directly into the stub here, the
+// same way a data-migration bypass or a future guard regression could
+// still produce one — exactly the scenario this check exists to catch as
+// permanent, evidenced defense-in-depth.
+func TestGetNegativeOnHandCount_IssuedMoreThanReceived_CountsOne(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locA, _ := movementFixture(t, s, r)
+	createAndCommitReceipt(t, r, itemID, locA, "idem-neg-3", 5)
+
+	bypassIssue := &domain.InventoryMovement{
+		MovementID: "bypass-issue-1", LegalEntityID: "le-1", MovementType: domain.MovementTypeIssue,
+		Status: domain.MovementStatusCommitted, ItemID: itemID, SourceLocationID: &locA, Quantity: 8,
+	}
+	s.movements[bypassIssue.MovementID] = bypassIssue
+
+	rr := doReq(r, http.MethodGet, "/v1/on-hand/negative-count?legal_entity_id=le-1", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]int
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["negative_on_hand_count"] != 1 {
+		t.Fatalf("expected 1 negative (item,location) combination (5 received, 8 issued, net -3), got %+v", out)
+	}
+}

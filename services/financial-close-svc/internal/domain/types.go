@@ -774,18 +774,19 @@ type errorString string
 func (e errorString) Error() string { return string(e) }
 
 var (
-	ErrFiscalPeriodNotFound    = errorString("fiscal period not found")
-	ErrPeriodAlreadyLocked     = errorString("fiscal period is already locked")
-	ErrStoreUnavailable        = errorString("financial close store unavailable")
-	ErrAuthorizationDenied     = errorString("authorization denied for financial close action")
-	ErrAuthzServiceUnavailable = errorString("authorization-svc unavailable")
-	ErrIdentityMissing         = errorString("caller identity missing")
-	ErrReadinessChecksFailed   = errorString("period close blocked: unresolved balance sheet or ledger discrepancies")
-	ErrGLServiceUnavailable    = errorString("general-ledger-svc unavailable")
-	ErrAPServiceUnavailable    = errorString("accounts-payable-svc unavailable")
-	ErrARServiceUnavailable    = errorString("accounts-receivable-svc unavailable")
-	ErrVaultServiceUnavailable = errorString("document-vault-svc unavailable")
-	ErrAssetServiceUnavailable = errorString("asset-management-svc unavailable")
+	ErrFiscalPeriodNotFound        = errorString("fiscal period not found")
+	ErrPeriodAlreadyLocked         = errorString("fiscal period is already locked")
+	ErrStoreUnavailable            = errorString("financial close store unavailable")
+	ErrAuthorizationDenied         = errorString("authorization denied for financial close action")
+	ErrAuthzServiceUnavailable     = errorString("authorization-svc unavailable")
+	ErrIdentityMissing             = errorString("caller identity missing")
+	ErrReadinessChecksFailed       = errorString("period close blocked: unresolved balance sheet or ledger discrepancies")
+	ErrGLServiceUnavailable        = errorString("general-ledger-svc unavailable")
+	ErrAPServiceUnavailable        = errorString("accounts-payable-svc unavailable")
+	ErrARServiceUnavailable        = errorString("accounts-receivable-svc unavailable")
+	ErrVaultServiceUnavailable     = errorString("document-vault-svc unavailable")
+	ErrAssetServiceUnavailable     = errorString("asset-management-svc unavailable")
+	ErrInventoryServiceUnavailable = errorString("inventory-management-svc unavailable")
 
 	// ErrLedgerPageTruncated is returned when the ledger answered with a full
 	// page, so there may be journals this service never saw. A trial balance
@@ -820,14 +821,15 @@ var (
 	// than logged and swallowed, same posture as ErrEvidenceNotRecorded.
 	ErrReopenEventNotRecorded = errorString("period reopened but the reopen event could not be recorded")
 
-	// ErrInvalidSubledger — extended beyond AP/AR to ASSETS and
-	// DEPRECIATION_COMPLETENESS, satisfying the AST/INV/PRJ domain
-	// spec's own §9 "Subledger Reconciliation & Control Framework,"
-	// which names this same run/exception mechanism as the vehicle for
-	// its "Assets → GL" and "Depreciation completeness" assertions. No
-	// new reconciliation engine was built for that spec — this existing
-	// ACC-06 run gained new sources.
-	ErrInvalidSubledger = errorString("subledger must be AP, AR, ASSETS or DEPRECIATION_COMPLETENESS")
+	// ErrInvalidSubledger — extended beyond AP/AR to ASSETS,
+	// DEPRECIATION_COMPLETENESS and INVENTORY_QUANTITY, satisfying the
+	// AST/INV/PRJ domain spec's own §9 "Subledger Reconciliation &
+	// Control Framework," which names this same run/exception mechanism
+	// as the vehicle for its "Assets → GL," "Depreciation completeness"
+	// and "Inventory quantity" assertions. No new reconciliation engine
+	// was built for that spec — this existing ACC-06 run gained new
+	// sources.
+	ErrInvalidSubledger = errorString("subledger must be AP, AR, ASSETS, DEPRECIATION_COMPLETENESS or INVENTORY_QUANTITY")
 
 	// ErrBookIDRequiredForAssets is ASSETS-subledger's own extra required
 	// field — a fixed asset can carry more than one depreciation book

@@ -1049,6 +1049,8 @@ type stubClients struct {
 	depCoveredCount     int
 	depEligibleCount    int
 	depCompletenessErr  error
+	invNegativeCount    int
+	invNegativeErr      error
 
 	postJournalErr   error
 	postedJournalID  string
@@ -1145,6 +1147,10 @@ func (c *stubClients) GetAssetNetBookValueTotal(_ context.Context, _, _, _ strin
 
 func (c *stubClients) GetAssetDepreciationCompleteness(_ context.Context, _, _, _ string) (int, int, error) {
 	return c.depCoveredCount, c.depEligibleCount, c.depCompletenessErr
+}
+
+func (c *stubClients) GetInventoryNegativeOnHandCount(_ context.Context, _, _ string) (int, error) {
+	return c.invNegativeCount, c.invNegativeErr
 }
 
 func (c *stubClients) ReverseGLJournal(_ context.Context, _, _, _, _, correlationID string) (string, error) {
@@ -1902,6 +1908,67 @@ func TestRunSubledgerControl_DepreciationCompleteness_NoMappingKeyRequired(t *te
 	req := domain.RunSubledgerControlRequest{
 		LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "DEPRECIATION_COMPLETENESS",
 	}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 (no mapping key needed), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestRunSubledgerControl_InventoryQuantityClean_RecordsRun proves
+// ACC-06's own run mechanism now also serves the AST/INV/PRJ domain
+// spec's own §9 "Inventory quantity" assertion — an integrity check
+// (negative on-hand), never a balance comparison, with no control
+// account ever resolved.
+func TestRunSubledgerControl_InventoryQuantityClean_RecordsRun(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{invNegativeCount: 0}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_QUANTITY"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "MATCHED" {
+		t.Errorf("expected MATCHED, got %q", run.Status)
+	}
+}
+
+func TestRunSubledgerControl_InventoryQuantityViolation_RecordsExceptionAndPublishes(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	cl := &stubClients{invNegativeCount: 2}
+	r := newRouter(s, pub, &stubAuthZ{}, cl)
+
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_QUANTITY"}
+	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var run domain.SubledgerControlRun
+	if err := json.NewDecoder(rr.Body).Decode(&run); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if run.Status != "EXCEPTION" {
+		t.Errorf("expected EXCEPTION (2 negative combinations found), got %q", run.Status)
+	}
+	if run.SubledgerTotalAmount != 2 || run.GLControlBalanceAmount != 0 {
+		t.Errorf("expected actual=2 expected=0, got %v / %v", run.SubledgerTotalAmount, run.GLControlBalanceAmount)
+	}
+	if pub.controlException != 1 {
+		t.Fatalf("expected exception published exactly once, got %d", pub.controlException)
+	}
+}
+
+func TestRunSubledgerControl_InventoryQuantity_NoMappingKeyRequired(t *testing.T) {
+	cl := &stubClients{invNegativeCount: 0}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, cl)
+	req := domain.RunSubledgerControlRequest{LegalEntityID: "le-1", FiscalPeriod: "2026-08", Subledger: "INVENTORY_QUANTITY"}
 	rr := doReq(r, http.MethodPost, "/v1/subledger-control/runs/", req, "principal-1")
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("expected 201 (no mapping key needed), got %d: %s", rr.Code, rr.Body.String())

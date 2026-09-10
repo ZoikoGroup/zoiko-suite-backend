@@ -58,6 +58,10 @@ type Store interface {
 	GetOnHand(ctx context.Context, itemID, locationID string) (float64, error)
 	GetOnHandAsOf(ctx context.Context, itemID, locationID string, at time.Time) (float64, error)
 	CreateCorrectionMovement(ctx context.Context, originalMovementID, principalID, reason string, isSupersede bool, newMovementID string, at time.Time) (*domain.InventoryMovement, error)
+	// GetNegativeOnHandCount backs GET /v1/on-hand/negative-count — see
+	// internal/store/movement_store.go's own doc comment. Serves the
+	// AST/INV/PRJ domain spec's own §9 "Inventory quantity" assertion.
+	GetNegativeOnHandCount(ctx context.Context, legalEntityID string) (int, error)
 
 	// INV-04 (Inventory Valuation) — see internal/store/valuation_store.go's
 	// own doc comments for the authority boundary these implement.
@@ -283,6 +287,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{id}/supersede", h.SupersedeMovement)
 	})
 	r.Get("/v1/on-hand", h.GetOnHand)
+	r.Get("/v1/on-hand/negative-count", h.GetNegativeOnHandCount)
 	r.Route("/v1/valuation", func(r chi.Router) {
 		r.Post("/movements/{movementID}/value", h.ValueMovement)
 		r.Get("/entries/{id}", h.GetValuationEntry)

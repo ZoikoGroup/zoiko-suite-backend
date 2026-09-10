@@ -2201,6 +2201,9 @@ services:
       # assertion — no new reconciliation engine, just a new caller onto
       # the existing subledger-control-run mechanism above.
       ASSET_SERVICE_URL: "http://asset-management-svc:8167"
+      # ACC-06's INVENTORY_QUANTITY source — same §9 posture, satisfies
+      # the "Inventory quantity" assertion.
+      INVENTORY_SERVICE_URL: "http://inventory-management-svc:8168"
       # HMAC secret for the close evidence signature. The service refuses to
       # start without one, deliberately: the signature was previously keyed with
       # the tenant id — a public value — so anything it "guaranteed" was
@@ -2224,6 +2227,8 @@ services:
       document-vault-svc:
         condition: service_healthy
       asset-management-svc:
+        condition: service_healthy
+      inventory-management-svc:
         condition: service_healthy
     healthcheck:
       # readyz, not healthz: liveness answers 200 whenever the process is up, so a
