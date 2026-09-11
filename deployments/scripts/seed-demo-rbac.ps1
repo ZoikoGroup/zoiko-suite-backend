@@ -429,9 +429,19 @@ function Invoke-Authz {
         [Parameter(Mandatory)] $Body
     )
     $json = $Body | ConvertTo-Json -Compress -Depth 5
+    $headers = @{
+        "Content-Type"      = "application/json"
+        "X-Tenant-Id"       = $TENANT_ID
+        "X-Principal-Id"    = $PRINCIPAL_ID
+        "X-Legal-Entity-Id" = $LEGAL_ENTITY
+        "X-Request-Id"      = [guid]::NewGuid().ToString()
+        "X-Correlation-ID"  = [guid]::NewGuid().ToString()
+        "X-Source-Channel"  = "system"
+        "Idempotency-Key"   = [guid]::NewGuid().ToString()
+    }
     try {
         $response = Invoke-WebRequest -Uri "$AUTHZ$Path" -Method POST -Body $json `
-            -ContentType "application/json" -UseBasicParsing -TimeoutSec 10
+            -Headers $headers -UseBasicParsing -TimeoutSec 10
         return @{ status = [int] $response.StatusCode; body = $response.Content | ConvertFrom-Json }
     } catch {
         $status = if ($_.Exception.Response) { [int] $_.Exception.Response.StatusCode.value__ } else { 0 }

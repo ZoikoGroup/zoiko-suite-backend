@@ -243,6 +243,18 @@ ORDER BY recorded_at ASC`
 // stored event for the given workflow instance. Returns (zero, false, nil) if no
 // row exists yet.
 func (s *PgStore) GetTenantContext(ctx context.Context, workflowInstanceID string) (TenantContext, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return TenantContext{}, false, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.bypass_rls', 'on', true)"); err != nil {
+		return TenantContext{}, false, fmt.Errorf("set bypass_rls context: %w", err)
+	}
+
 	const q = `
 SELECT tenant_id, legal_entity_id
 FROM workflow_history_events
@@ -251,12 +263,15 @@ ORDER BY recorded_at ASC
 LIMIT 1`
 
 	var tc TenantContext
-	err := s.pool.QueryRow(ctx, q, workflowInstanceID).Scan(&tc.TenantID, &tc.LegalEntityID)
+	err = tx.QueryRow(ctx, q, workflowInstanceID).Scan(&tc.TenantID, &tc.LegalEntityID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return TenantContext{}, false, nil
 		}
 		return TenantContext{}, false, fmt.Errorf("get tenant context for instance %q: %w", workflowInstanceID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TenantContext{}, false, fmt.Errorf("commit transaction: %w", err)
 	}
 	return tc, true, nil
 }

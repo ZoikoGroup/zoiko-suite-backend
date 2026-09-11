@@ -11,6 +11,7 @@ package authz
 
 import (
 	svcenvelope "zoiko.io/purchase-order-svc/internal/envelope"
+	svcmiddleware "zoiko.io/purchase-order-svc/internal/middleware"
 	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
@@ -210,6 +211,14 @@ func (c *HTTPClient) checkAllowedLive(ctx context.Context, principalID, legalEnt
 		if env.CausationID != "" {
 			req.Header.Set("X-Causation-Id", env.CausationID)
 		}
+	}
+	if req.Header.Get("X-Tenant-Id") == "" {
+		if tid := svcmiddleware.TenantFromContext(ctx); tid != "" {
+			req.Header.Set("X-Tenant-Id", tid)
+		}
+	}
+	if authzRequestID == "" {
+		authzRequestID = fmt.Sprintf("po-authz-%d", time.Now().UnixNano())
 	}
 	req.Header.Set("X-Request-Id", authzRequestID)
 	req.Header.Set("X-Source-Channel", authzSourceChannel)

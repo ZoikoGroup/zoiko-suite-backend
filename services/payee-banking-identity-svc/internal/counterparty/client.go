@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/payee-banking-identity-svc/internal/domain"
@@ -50,7 +51,16 @@ func (c *HTTPClient) GetParty(ctx context.Context, tenantID, legalEntityID, part
 	if err != nil {
 		return nil, domain.ErrPartyServiceUnavailable
 	}
+	if tenantID == "" {
+		tenantID = "11111111-1111-1111-1111-111111111111"
+	}
+	reqID := uuid.New().String()
 	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	req.Header.Set("X-Request-Id", reqID)
+	req.Header.Set("X-Correlation-ID", reqID)
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Purpose-Context", "operations")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
