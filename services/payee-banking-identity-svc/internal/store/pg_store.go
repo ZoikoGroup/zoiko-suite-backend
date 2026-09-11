@@ -76,13 +76,17 @@ const destColumns = `
 
 func scanDestination(row pgx.Row) (*domain.PayeeDestination, error) {
 	d := &domain.PayeeDestination{}
+	var supersededBy *string
 	err := row.Scan(&d.DestinationID, &d.TenantID, &d.LegalEntityID, &d.PartyRef, &d.Scope, &d.FinancialInstitution,
 		&d.AccountIdentifier, &d.AccountLast4, &d.CountryCode, &d.Currency, &d.PayeeName, &d.SourceType, &d.Fingerprint, &d.Status,
 		&d.VerificationMethod, &d.VerificationEvidenceRef, &d.VerifiedByPrincipalID, &d.VerifiedAt,
-		&d.ApprovedByPrincipalID, &d.ApprovedAt, &d.SupersededByDestinationID, &d.SuspendReason,
+		&d.ApprovedByPrincipalID, &d.ApprovedAt, &supersededBy, &d.SuspendReason,
 		&d.ProposedByPrincipalID, &d.CreatedAt, &d.UpdatedAt)
 	if err != nil {
 		return nil, err
+	}
+	if supersededBy != nil {
+		d.SupersededByDestinationID = *supersededBy
 	}
 	return d, nil
 }

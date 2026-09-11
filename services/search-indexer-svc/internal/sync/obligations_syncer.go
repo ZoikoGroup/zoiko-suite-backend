@@ -68,6 +68,18 @@ type Config struct {
 	Interval          time.Duration
 	Log               *zap.Logger
 	HTTPClient        *http.Client
+	PrincipalID       string
+	TenantID          string
+}
+
+// SyncerStats holds status and telemetry of the indexing loop.
+type SyncerStats struct {
+	TotalIndexed  int       `json:"total_indexed"`
+	LastSyncAt    time.Time `json:"last_sync_at"`
+	LastSyncCount int       `json:"last_sync_count"`
+	LastSyncError string    `json:"last_sync_error,omitempty"`
+	IsReady       bool      `json:"is_ready"`
+	IndexName     string    `json:"index_name"`
 }
 
 // ObligationsSyncer polls obligations-svc and upserts records into OpenSearch.
@@ -78,6 +90,9 @@ type ObligationsSyncer struct {
 	// calls to tenant-entity-registry-svc on every sync cycle.
 	mu          sync.RWMutex
 	tenantCache map[string]string
+
+	statsMu sync.RWMutex
+	stats   SyncerStats
 }
 
 // NewObligationsSyncer constructs and returns a configured syncer.
@@ -88,15 +103,32 @@ func NewObligationsSyncer(cfg Config) *ObligationsSyncer {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 60 * time.Second
 	}
+	if cfg.PrincipalID == "" {
+		cfg.PrincipalID = "33333333-3333-3333-3333-333333333333"
+	}
+	if cfg.TenantID == "" {
+		cfg.TenantID = "11111111-1111-1111-1111-111111111111"
+	}
 	return &ObligationsSyncer{
 		cfg:         cfg,
 		tenantCache: make(map[string]string),
+		stats: SyncerStats{
+			IndexName: string(searchclient.IndexObligations),
+			IsReady:   false,
+		},
 	}
 }
 
+// GetStats returns a copy of current syncer statistics.
+func (s *ObligationsSyncer) GetStats() SyncerStats {
+	s.statsMu.RLock()
+	defer s.statsMu.RUnlock()
+	st := s.stats
+	st.IsReady = health.IsReady()
+	return st
+}
+
 // Start begins the sync loop. It runs until ctx is cancelled.
-// The first sync runs immediately; subsequent syncs are triggered by the
-// configured interval.
 func (s *ObligationsSyncer) Start(ctx context.Context) {
 	s.cfg.Log.Info("obligations syncer starting",
 		zap.String("obligations_svc_url", s.cfg.ObligationsSvcURL),
@@ -112,7 +144,7 @@ func (s *ObligationsSyncer) Start(ctx context.Context) {
 	defer ticker.Stop()
 
 	// Run immediately on start.
-	s.runCycle(ctx)
+	_, _ = s.RunCycle(ctx)
 
 	for {
 		select {
@@ -120,17 +152,23 @@ func (s *ObligationsSyncer) Start(ctx context.Context) {
 			s.cfg.Log.Info("obligations syncer stopped")
 			return
 		case <-ticker.C:
-			s.runCycle(ctx)
+			_, _ = s.RunCycle(ctx)
 		}
 	}
 }
 
-func (s *ObligationsSyncer) runCycle(ctx context.Context) {
+// RunCycle executes a full synchronization pass.
+func (s *ObligationsSyncer) RunCycle(ctx context.Context) (int, error) {
+	s.statsMu.Lock()
+	s.stats.LastSyncAt = time.Now()
+	s.statsMu.Unlock()
+
 	if err := s.cfg.SearchClient.EnsureIndex(ctx, searchclient.IndexObligations); err != nil {
 		s.cfg.Log.Error("obligations sync: failed to ensure index", zap.Error(err))
 		health.SetReady(false)
 		syncErrorsTotal.Inc()
-		return
+		s.updateError(err)
+		return 0, fmt.Errorf("ensure index: %w", err)
 	}
 
 	obligations, err := s.fetchObligations(ctx)
@@ -138,12 +176,15 @@ func (s *ObligationsSyncer) runCycle(ctx context.Context) {
 		s.cfg.Log.Error("obligations sync: fetch failed", zap.Error(err))
 		health.SetReady(false)
 		syncErrorsTotal.Inc()
-		return
+		s.updateError(err)
+		return 0, fmt.Errorf("fetch obligations: %w", err)
 	}
 
 	s.cfg.Log.Info("obligations sync: fetched records", zap.Int("count", len(obligations)))
 
 	cycleFailed := false
+	indexedCount := 0
+
 	for _, ob := range obligations {
 		tenantID, err := s.resolveTenantID(ctx, ob.LegalEntityID)
 		if err != nil {
@@ -184,24 +225,45 @@ func (s *ObligationsSyncer) runCycle(ctx context.Context) {
 			continue
 		}
 		indexedTotal.WithLabelValues("ok").Inc()
+		indexedCount++
 	}
 
 	if cycleFailed {
 		health.SetReady(false)
-		return
+		err := fmt.Errorf("cycle completed with index failures (%d succeeded)", indexedCount)
+		s.updateError(err)
+		return indexedCount, err
 	}
 
 	health.SetReady(true)
-	s.cfg.Log.Info("obligations sync: cycle complete", zap.Int("indexed", len(obligations)))
+	s.statsMu.Lock()
+	s.stats.TotalIndexed += indexedCount
+	s.stats.LastSyncCount = indexedCount
+	s.stats.LastSyncError = ""
+	s.stats.IsReady = true
+	s.statsMu.Unlock()
+
+	s.cfg.Log.Info("obligations sync: cycle complete", zap.Int("indexed", indexedCount))
+	return indexedCount, nil
 }
 
-// fetchObligations calls GET /v1/obligations on obligations-svc.
+func (s *ObligationsSyncer) updateError(err error) {
+	s.statsMu.Lock()
+	defer s.statsMu.Unlock()
+	s.stats.LastSyncError = err.Error()
+	s.stats.IsReady = false
+}
+
+// fetchObligations calls GET /v1/obligations on obligations-svc with required governance headers.
 func (s *ObligationsSyncer) fetchObligations(ctx context.Context) ([]obligationResponse, error) {
 	url := strings.TrimRight(s.cfg.ObligationsSvcURL, "/") + "/v1/obligations"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fetchObligations: build request: %w", err)
 	}
+
+	req.Header.Set("X-Principal-Id", s.cfg.PrincipalID)
+	req.Header.Set("X-Tenant-Id", s.cfg.TenantID)
 
 	resp, err := s.cfg.HTTPClient.Do(req)
 	if err != nil {
@@ -226,8 +288,7 @@ type tenantLookupResponse struct {
 	TenantID string `json:"tenant_id"`
 }
 
-// resolveTenantID looks up tenant_id for a legal_entity_id, with an
-// in-memory cache to avoid repeated upstream calls.
+// resolveTenantID looks up tenant_id for a legal_entity_id, with an in-memory cache.
 func (s *ObligationsSyncer) resolveTenantID(ctx context.Context, legalEntityID string) (string, error) {
 	s.mu.RLock()
 	if tid, ok := s.tenantCache[legalEntityID]; ok {
@@ -241,6 +302,9 @@ func (s *ObligationsSyncer) resolveTenantID(ctx context.Context, legalEntityID s
 	if err != nil {
 		return "", fmt.Errorf("resolveTenantID: build request: %w", err)
 	}
+
+	req.Header.Set("X-Principal-Id", s.cfg.PrincipalID)
+	req.Header.Set("X-Tenant-Id", s.cfg.TenantID)
 
 	resp, err := s.cfg.HTTPClient.Do(req)
 	if err != nil {

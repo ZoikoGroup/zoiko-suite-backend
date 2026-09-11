@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // ServerIdentity is this service's provisioned mTLS material: its own
@@ -79,8 +81,24 @@ func ProvisionServerIdentity(ctx context.Context, mtlsServiceURL, serviceName, p
 	if err != nil {
 		return nil, fmt.Errorf("build provision request: %w", err)
 	}
+	// Canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4).
+	// mtls-management-svc's envelope middleware validates these headers
+	// before the request reaches the bootstrap token check — missing
+	// tenant_id or actor_subject_id causes a 401 via StatusFor(), which
+	// short-circuits the handler and prevents the bootstrap path from
+	// ever running. All mandatory fields are supplied here so the
+	// middleware passes through; the bootstrap token check then bypasses
+	// the normal principal/authorize flow on the other side.
+	requestID := uuid.New().String()
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Tenant-ID", platformScopeID)
+	req.Header.Set("X-Tenant-Id", platformScopeID)
+	req.Header.Set("X-Workload-Id", serviceName) // workload identity, not a human subject
+	req.Header.Set("X-Legal-Entity-Id", platformScopeID)
+	req.Header.Set("X-Request-Id", requestID)
+	req.Header.Set("X-Correlation-ID", requestID)
+	req.Header.Set("X-Source-Channel", "system")
+	req.Header.Set("X-Purpose-Context", "system")
+	req.Header.Set("Idempotency-Key", "mtls-bootstrap:"+serviceName)
 	if bootstrapToken != "" {
 		req.Header.Set("X-Mtls-Bootstrap-Token", bootstrapToken)
 	}
