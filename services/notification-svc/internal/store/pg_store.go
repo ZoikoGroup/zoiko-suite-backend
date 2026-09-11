@@ -366,6 +366,143 @@ func (s *PgStore) FindDueRetries(ctx context.Context, now time.Time, limit int) 
 	return due, nil
 }
 
+// FindStrandedDeliveries lists notifications that are in flight and have been
+// for longer than any attempt could plausibly take, across every tenant.
+//
+// WHAT A STRANDED ROW IS. PENDING with next_attempt_at NULL means "in flight
+// right now" (domain.Notification says so, and ClaimRetry creates that state
+// deliberately). Nothing ever moves such a row on its own: FindDueRetries
+// requires next_attempt_at IS NOT NULL, so a notification left in flight is
+// invisible to the retry path forever — never delivered, never failed, never
+// re-attempted, and showing in the register as PENDING, which reads as
+// progress rather than as a problem.
+//
+// FOUR WAYS A ROW GETS THERE, all of them real:
+//
+//  1. The process dies between CreateNotification and the statement that
+//     concludes or reschedules the send.
+//  2. ScheduleRetry itself fails. The handler answers 503 and returns, leaving
+//     the row it just created in flight.
+//  3. CompleteDelivery fails, identically.
+//  4. The request context is cancelled mid-attempt. Both the delivery call and
+//     the store write that records its outcome run on r.Context(), and the
+//     server's WriteTimeout is 15s, so a provider that takes longer than the
+//     request lives means the outcome cannot be written.
+//
+// Measured on the dev database on 2026-09-08: five notifications from
+// 2026-09-02 in exactly this state, delivery_attempts = 0, six days old, with
+// no mechanism in the service that would ever have touched them again.
+// internal/retry's own RunOnce comment said a claimed row left "PENDING with
+// nothing scheduled ... is what the sweep below is for". There was no sweep.
+//
+// SAFETY, which is the whole reason for the staleBefore parameter. A row that
+// is genuinely being attempted right now looks identical to a stranded one —
+// the difference is only how long it has looked that way. Reviving a row
+// another replica is mid-SMTP on would send the message twice. staleBefore
+// must therefore be older than the longest attempt the service can make: the
+// SMTP provider's own timeout defaults to 10s and the HTTP server's
+// WriteTimeout is 15s, so an attempt cannot outlive ~30s, and the default
+// threshold is 15 minutes — two orders of magnitude of headroom.
+//
+// COALESCE(last_attempt_at, created_at) is the in-flight-since clock: a row
+// stranded before its first attempt has no last_attempt_at at all, which is
+// the majority of the case above and would be skipped by a predicate on
+// last_attempt_at alone.
+//
+// Same tenant posture as FindDueRetries, for the same reasons: platform-scope
+// SELECT only, transaction-local, and a projection of nothing but the id and
+// the tenant, so no subject, body or recipient address crosses the hatch.
+func (s *PgStore) FindStrandedDeliveries(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.platform_scope', 'true', true)"); err != nil {
+		return nil, fmt.Errorf("set platform scope: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT notification_id, tenant_id
+		FROM notifications
+		WHERE status = 'PENDING'
+		  AND next_attempt_at IS NULL
+		  AND COALESCE(last_attempt_at, created_at) <= $1
+		ORDER BY COALESCE(last_attempt_at, created_at)
+		LIMIT $2
+	`, staleBefore, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	var stranded []domain.DueRetry
+	for rows.Next() {
+		var d domain.DueRetry
+		if err := rows.Scan(&d.NotificationID, &d.TenantID); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		stranded = append(stranded, d)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+	return stranded, nil
+}
+
+// ReviveStranded puts a stranded notification back on the retry schedule,
+// returning whether this caller was the one that did it.
+//
+// It schedules rather than concludes, deliberately. The service does not know
+// whether a stranded attempt reached the provider — that is exactly the
+// information the crash destroyed — so the choice is between a notice that may
+// arrive twice and one that certainly never arrives. For a governed
+// notification the first is the right way to be wrong, and the staleness
+// threshold keeps it rare; SENT rows are never touched, so a delivery that DID
+// record its success is never re-sent.
+//
+// Tenant-scoped, like every other write in the retry path: the platform-scope
+// hatch is read-only and buys the worker the ability to FIND work, never to
+// change it.
+//
+// The staleness predicate is repeated inside the UPDATE and is the claim. A
+// row that stopped being stranded between the find and this statement — a
+// replica concluded it, or a fresh attempt updated last_attempt_at — no longer
+// matches, so this affects zero rows and says so, rather than dragging a
+// live notification back onto the schedule. Same shape as ClaimRetry, where
+// the row itself is the claim and no advisory lock is needed.
+func (s *PgStore) ReviveStranded(ctx context.Context, id, tenantID string, staleBefore, nextAttemptAt time.Time) (bool, error) {
+	if tenantID == "" {
+		return false, domain.ErrIdentityMissing
+	}
+
+	var revived bool
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		res, err := tx.Exec(ctx, `
+			UPDATE notifications SET next_attempt_at = $1
+			WHERE notification_id = $2
+			  AND tenant_id = $3
+			  AND status = 'PENDING'
+			  AND next_attempt_at IS NULL
+			  AND COALESCE(last_attempt_at, created_at) <= $4
+		`, nextAttemptAt, id, tenantID, staleBefore)
+		if err != nil {
+			return err
+		}
+		revived = res.RowsAffected() == 1
+		return nil
+	})
+	if err != nil {
+		return false, mapPgError(err)
+	}
+	return revived, nil
+}
+
 // SetRecipientAddress fills in an address a first attempt could not resolve,
 // for a notification that is still PENDING.
 //
@@ -521,9 +658,20 @@ func (s *PgStore) CountUnread(ctx context.Context, recipientPrincipalID string) 
 // The columns it guards are nullable and read back through COALESCE, so an
 // empty string and NULL are indistinguishable on the way out. They are not
 // indistinguishable to a CHECK constraint: notifications_failed_has_reason
-// tests `failure_reason IS NOT NULL AND failure_reason <> ''`, and a partial
-// index or a future NOT NULL would treat '' as a present value. Storing the
-// absence as absence keeps the column honest.
+// tests
+//
+//	failure_reason IS NOT NULL AND failure_reason <> ''
+//
+// and a partial index or a future NOT NULL would treat the empty string as a
+// present value. Storing the absence as absence keeps the column honest.
+//
+// The SQL is in an indented block rather than inline, and that is not
+// cosmetic. gofmt normalises doc comments (Go 1.19+) and rewrites a bare pair
+// of single quotes into a typographic closing quote — so written inline, this
+// comment silently became `failure_reason <> ”`, which is not valid SQL and no
+// longer describes the constraint. It is why this file failed gofmt for as long
+// as it did: the only way to make it pass was to let gofmt corrupt the one
+// sentence explaining the function. An indented block is preserved verbatim.
 func nullIfEmpty(s string) any {
 	if s == "" {
 		return nil

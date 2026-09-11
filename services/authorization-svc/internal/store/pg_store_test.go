@@ -26,9 +26,46 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
+// setupTestDB resets the schema to a known state before each integration test.
+//
+// DESTRUCTIVE. It DROPs every table this service owns and re-runs the
+// migrations, so TEST_DATABASE_URL must name a database whose contents are
+// expendable. Pointing it at the compose stack's `authorization_svc` erases
+// every role, bundle, assignment, delegation, SoD rule, attribute condition
+// and decision-log row on that stack — done accidentally on 2026-09-08, which
+// is why this comment exists. The SCHEMA survives (the migrations re-apply,
+// row security included) so the service keeps working; the fixtures do not.
+//
+// There is deliberately no heuristic guard on the DSN here: every candidate —
+// refusing a database called authorization_svc, requiring a name suffix,
+// checking the host — either blocks the legitimate throwaway case or gives
+// false confidence against a URL shaped slightly differently. A stated
+// contract is more honest than a check that can be satisfied by accident.
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	// access_decision_log is PARTITIONED since 000009, so its partitions must
+	// go too — DROP TABLE on the parent takes them, but a partition left over
+	// from a previous run under a different name would collide with the
+	// migration's CREATE. The two helper functions and the view are dropped
+	// for the same reason: 000009 creates them, and CREATE OR REPLACE FUNCTION
+	// cannot change a function's return type, so a stale definition from an
+	// earlier schema version fails the migration rather than being replaced.
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS principal_status_projection, abac_rules, access_decision_log, sod_rules, delegated_authorities, principal_role_assignments, permission_bundles, roles CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP VIEW IF EXISTS access_decision_log_retention_status;")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS detach_access_decision_log_partitions_before(DATE);")
+	_, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS create_access_decision_log_partition(DATE);")
+	// Detached partitions are no longer children of the parent, so DROP TABLE
+	// on it does not reach them.
+	_, _ = pool.Exec(ctx, `DO $$
+		DECLARE t text;
+		BEGIN
+			FOR t IN SELECT tablename FROM pg_tables
+			          WHERE schemaname = current_schema()
+			            AND tablename LIKE 'access_decision_log%'
+			LOOP
+				EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', t);
+			END LOOP;
+		END $$;`)
 
 	// Every up migration, in order. This was five copy-pasted blocks naming
 	// four files, and 000005 was never added when it landed — so
@@ -42,6 +79,27 @@ func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 		"000004_add_rls.up.sql",
 		"000005_add_access_decision_tenant.up.sql",
 		"000006_add_delegation_tenant.up.sql",
+		// 000007 was landed but never added here, so every test in this file
+		// ran against a schema where permission_bundles and
+		// principal_role_assignments had no row security at all — which is
+		// most of what the RLS tests below are about.
+		"000007_add_rls_bundles_assignments.up.sql",
+		"000008_fix_delegation_evaluation.up.sql",
+		"000009_partition_access_decision_log.up.sql",
+		"000010_add_abac_rules.up.sql",
+		// 000011 makes the two retention helpers SECURITY DEFINER so the
+		// SERVICE role can call them. Omitted when it landed, which is the
+		// same miss 000007 above records: this pool connects as the owner,
+		// and an owner can create and detach partitions either way, so the
+		// tests pass with or without it and prove nothing about the role the
+		// service actually uses. abac_retention_test.go has the negative
+		// control that does.
+		"000011_retention_callable_by_service_role.up.sql",
+		// 000012 swaps the tenant index for an outcome-aware superset, which
+		// GET /v1/access-decisions relies on. 000013 adds
+		// principal_status_projection, layer 0 of the evaluation.
+		"000012_index_access_decision_log_for_query.up.sql",
+		"000013_add_principal_status_projection.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + name)
 		if err != nil {
@@ -65,7 +123,7 @@ func setupRoleWithGrant(t *testing.T, s *store.PgStore, tenantID, principalID, l
 	if err != nil {
 		t.Fatalf("create role: %v", err)
 	}
-	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
+	if _, _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
 		RoleID: role.RoleID, BundleCode: "default", PermittedActions: actions,
 	}); err != nil {
 		t.Fatalf("create bundle: %v", err)
@@ -169,7 +227,7 @@ func TestPgStore_CreateRoleAssignment_TenantWideRequiresTenantScopedRole(t *test
 	if err != nil {
 		t.Fatalf("create role: %v", err)
 	}
-	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
+	if _, _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
 		RoleID: tenantRole.RoleID, BundleCode: "default", PermittedActions: []string{"PLATFORM_ADMIN"},
 	}); err != nil {
 		t.Fatalf("create bundle: %v", err)
@@ -204,7 +262,7 @@ func TestPgStore_RevokeRoleAssignment_EndsGrant(t *testing.T) {
 	tenantID := "00000000-0000-0000-0000-000000000001"
 	legalEntityID := "00000000-0000-0000-0000-0000000000e1"
 	role, _, _ := s.CreateRole(ctx, domain.CreateRoleParams{TenantID: tenantID, RoleCode: "R1", RoleName: "R1", RoleScopeType: "LEGAL_ENTITY", CreatedByPrincipalID: "admin-1"})
-	_, _ = s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}})
+	_, _, _ = s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}})
 	assignment, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
 		PrincipalID: "principal-1", RoleID: role.RoleID, LegalEntityID: &legalEntityID, EffectiveFrom: time.Now().Add(-time.Hour), AssignedBy: "admin-1",
 	})
@@ -252,7 +310,7 @@ func TestPgStore_TenantIsolation_RevokeRoleAssignment(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create role: %v", err)
 	}
-	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}}); err != nil {
+	if _, _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}}); err != nil {
 		t.Fatalf("create bundle: %v", err)
 	}
 	assignment, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
@@ -301,7 +359,7 @@ func TestPgStore_PlatformScope_FindGrantedActionsAcrossTenants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create role: %v", err)
 	}
-	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}}); err != nil {
+	if _, _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{RoleID: role.RoleID, BundleCode: "default", PermittedActions: []string{"ACTION_X"}}); err != nil {
 		t.Fatalf("create bundle: %v", err)
 	}
 	if _, err := s.CreateRoleAssignment(ctx, domain.CreateRoleAssignmentParams{
@@ -624,7 +682,7 @@ func TestPgStore_FindGrantedActions_DoesNotLeakAcrossTenants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create tenant A role: %v", err)
 	}
-	if _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
+	if _, _, err := s.CreatePermissionBundle(ctx, domain.CreatePermissionBundleParams{
 		RoleID: roleA.RoleID, BundleCode: "default", PermittedActions: []string{"PAYROLL_RUN_FINALIZE"},
 	}); err != nil {
 		t.Fatalf("create tenant A bundle: %v", err)

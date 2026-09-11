@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/access-control-svc/internal/clients"
 	"zoiko.io/access-control-svc/internal/domain"
 	"zoiko.io/access-control-svc/internal/handler"
 	"zoiko.io/access-control-svc/internal/middleware"
@@ -123,16 +124,26 @@ type stubAuthzAdmin struct {
 	// retirement the platform is not enforcing.
 	setRoleActiveErr  error
 	setRoleActiveWant []bool
+
+	// The scope each call was made with. Recorded because two of these three
+	// methods used to be invoked with an empty principal and tenant, which
+	// authorization-svc's admin routes reject — and nothing here noticed,
+	// because the parameters were positional strings the stub discarded.
+	// Asserting on them is what stops that regressing.
+	gotScopes []clients.Scope
 }
 
-func (a *stubAuthzAdmin) CreateRole(_ context.Context, _, _, _, _, _, _, _ string) error {
+func (a *stubAuthzAdmin) CreateRole(_ context.Context, _, _, _, _ string, s clients.Scope) error {
+	a.gotScopes = append(a.gotScopes, s)
 	return a.createRoleErr
 }
-func (a *stubAuthzAdmin) CreatePermissionBundle(_ context.Context, _, _ string, _ []string, _ string) error {
+func (a *stubAuthzAdmin) CreatePermissionBundle(_ context.Context, _, _ string, _ []string, s clients.Scope) error {
+	a.gotScopes = append(a.gotScopes, s)
 	return a.createBundleErr
 }
-func (a *stubAuthzAdmin) SetRoleActive(_ context.Context, _ string, active bool, _ string) error {
+func (a *stubAuthzAdmin) SetRoleActive(_ context.Context, _ string, active bool, s clients.Scope) error {
 	a.setRoleActiveWant = append(a.setRoleActiveWant, active)
+	a.gotScopes = append(a.gotScopes, s)
 	return a.setRoleActiveErr
 }
 

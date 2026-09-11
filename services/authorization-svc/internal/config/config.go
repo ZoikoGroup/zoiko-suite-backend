@@ -4,6 +4,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Config holds all runtime configuration for authorization-svc.
@@ -57,7 +58,40 @@ type Config struct {
 	// has not provisioned the platform-scope entity and its role grant cannot
 	// author platform-wide rules at all. That is the safe direction for a
 	// control whose blast radius is the whole estate.
+	//
+	// It is also what handler.PlatformScopeSentinel resolves to, so a caller
+	// asking for a platform-wide authorization decision
+	// (legal_entity_id=PLATFORM) is evaluated against the same id this
+	// service uses for its own platform-wide acts — one id, configured once,
+	// instead of each calling service inventing its own synthetic uuid
+	// (tracker item 67).
 	PlatformScopeEntityID string
+
+	// CacheTTL bounds how long an evaluation read may be served from memory
+	// on the /v1/authorize path. See internal/cache's package comment for
+	// what is cached (the four evaluation reads plus the ABAC rule lookup)
+	// and what deliberately is not (the decision, and the decision-log
+	// insert, on every path).
+	//
+	// This is an in-process cache, so it is also the bound on how long a
+	// grant revoked through ANOTHER replica can still authorize. Five seconds
+	// by default, deliberately short. AUTHZ_CACHE_TTL_SECONDS=0 disables caching
+	// entirely — a real off switch, not a zero-second TTL — for a deployment
+	// that cannot accept that window.
+	CacheTTL time.Duration
+
+	// AccessDecisionRetentionMonths is how many whole months of decision
+	// artifacts the hot access_decision_log partitions keep, for the
+	// operational tooling that calls
+	// detach_access_decision_log_partitions_before(). 0 means never detach.
+	//
+	// The service itself never deletes or detaches anything — see migration
+	// 000009. This value exists so the retention window is declared next to
+	// the rest of the service's configuration rather than living only in
+	// whatever cron invokes the function.
+	AccessDecisionRetentionMonths int
+	RetentionSweepInterval        time.Duration
+	PartitionMonthsAhead          int
 }
 
 type DBConfig struct {
@@ -149,6 +183,59 @@ type KafkaConfig struct {
 	Brokers []string
 	GroupID string
 	Topic   string
+
+	// DelegationTopic is delegated-authority-svc's event topic, CONSUMED (not
+	// produced) so this service can project authority.delegated /
+	// authority.revoked / authority.expired into its own
+	// delegated_authorities table — see internal/events.Consumer for why
+	// exactly these three and not the other events v1 declined to consume.
+	//
+	// Empty disables consumption entirely, leaving the delegation table fed
+	// only by this service's own admin API, which is where it was before.
+	// That is the off switch for a deployment where delegated-authority-svc
+	// is not running: the consumer would otherwise sit retrying a topic that
+	// never appears.
+	DelegationTopic string
+
+	// DelegationGroupID is the consumer group for the above. Distinct from
+	// GroupID, which names this service as a PRODUCER — sharing one id
+	// between a producer and a consumer reads as a single logical
+	// subscription and makes offsets impossible to reason about.
+	DelegationGroupID string
+
+	// LifecycleTopics are the topics carrying the other three consumed-event
+	// concepts Doc 03 §8.3 names — see internal/events.LifecycleConsumer for
+	// the mapping from spec name to real event, which is not one-to-one:
+	//
+	//	zoiko.identity.events        principal.status.changed
+	//	                             (§8.3's employment.changed) — PROJECTED
+	//	                             into principal_status_projection and read
+	//	                             as layer 0 of /v1/authorize.
+	//	zoiko.access-control.events  role.created / role.updated /
+	//	                             permission.bundle.updated
+	//	                             (§8.3's role.assigned)
+	//	zoiko.entity.events          entity.status.changed /
+	//	                             entity.hierarchy.changed /
+	//	                             entity.jurisdiction.changed
+	//	                             (§8.3's entity.scope.updated)
+	//
+	// ONE reader over three topics, via kafka.ReaderConfig.GroupTopics,
+	// rather than three readers: they share a dispatch table, a dedupe set
+	// and a consumer group, and three readers would mean three offset streams
+	// to reason about for one logical subscription.
+	//
+	// Comma-separated, and EMPTY DISABLES the consumer entirely — the off
+	// switch for a deployment where these services are not running, which
+	// would otherwise leave a reader retrying topics that never appear. With
+	// it off, layer 0 stays inert (no row means ACTIVE) and the cache TTL is
+	// once again the only bound on cross-replica staleness, which is where
+	// this service was before the consumer existed.
+	LifecycleTopics []string
+
+	// LifecycleGroupID is the consumer group for the above. Distinct from
+	// both GroupID and DelegationGroupID for the same reason those are
+	// distinct from each other.
+	LifecycleGroupID string
 }
 
 // Load reads configuration from environment variables.
@@ -183,6 +270,25 @@ func Load() (*Config, error) {
 			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
 			GroupID: env("KAFKA_GROUP_ID", "authorization-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.authorization.events"),
+			// Defaulted rather than opt-in: the topic name is
+			// delegated-authority-svc's own compose default, so a stack
+			// running both services projects delegations with no extra
+			// configuration. Set KAFKA_DELEGATION_TOPIC="" to disable.
+			// envAllowEmpty, not env: env() folds a set-but-empty variable
+			// into its default, so with it there would be no way to express
+			// "off" at all.
+			DelegationTopic:   envAllowEmpty("KAFKA_DELEGATION_TOPIC", "zoiko.delegated-authority.events"),
+			DelegationGroupID: env("KAFKA_DELEGATION_GROUP_ID", "authorization-svc-delegation-projector"),
+
+			// Defaulted to the three producers' own compose defaults, on the
+			// same reasoning as DelegationTopic: a stack running those
+			// services is consumed from with no extra configuration.
+			// envAllowEmpty so KAFKA_LIFECYCLE_TOPICS="" is a real off switch
+			// — env() would fold the empty value back into this default and
+			// there would be no way to express "off".
+			LifecycleTopics: splitTopics(envAllowEmpty("KAFKA_LIFECYCLE_TOPICS",
+				"zoiko.identity.events,zoiko.access-control.events,zoiko.entity.events")),
+			LifecycleGroupID: env("KAFKA_LIFECYCLE_GROUP_ID", "authorization-svc-lifecycle"),
 		},
 		JurisdictionRulesURL: env("JURISDICTION_RULES_URL", "http://jurisdiction-rules-svc:8082"),
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
@@ -193,6 +299,28 @@ func Load() (*Config, error) {
 		MTLSBootstrapTokenPath:   env("MTLS_BOOTSTRAP_TOKEN_PATH", ""),
 		SIEMServiceURL:           env("SIEM_SERVICE_URL", ""),
 		PlatformScopeEntityID:    env("AUTHZ_PLATFORM_SCOPE_ENTITY_ID", ""),
+
+		// Seconds, not a duration string: every other numeric knob in this
+		// service is an int env var, and "5s" vs "5" is the kind of
+		// difference that turns a cache into a no-op without an error.
+		CacheTTL: time.Duration(envInt("AUTHZ_CACHE_TTL_SECONDS", 5)) * time.Second,
+
+		// 24 months by default, which is a retention WINDOW rather than a
+		// deletion: the function it configures detaches partitions, and an
+		// operator archives them. 0 disables detaching entirely.
+		AccessDecisionRetentionMonths: envInt("AUTHZ_ACCESS_DECISION_RETENTION_MONTHS", 24),
+
+		// How often the retention sweep runs. Daily is ample: both halves of the
+		// sweep are month-granular, so the only thing a shorter interval buys is
+		// a faster recovery after a failed sweep. 0 disables the sweeper entirely,
+		// which leaves the partition runway to be extended by hand — the
+		// behaviour before the sweeper existed.
+		RetentionSweepInterval: time.Duration(envInt("AUTHZ_RETENTION_SWEEP_INTERVAL_HOURS", 24)) * time.Hour,
+
+		// How many months of partitions to keep ahead of the current one. Three
+		// is a runway, not a guess: it means the sweep can fail silently for two
+		// consecutive months before any decision lands in the default partition.
+		PartitionMonthsAhead: envInt("AUTHZ_PARTITION_MONTHS_AHEAD", 3),
 	}, nil
 }
 
@@ -201,6 +329,41 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envAllowEmpty is env for a setting whose EMPTY value is meaningful.
+//
+// env() cannot express that: it treats a set-but-empty variable as unset and
+// substitutes the default, so a feature defaulted to on can never be turned
+// off by clearing its variable — the clearing silently re-enables it. This
+// distinguishes "unset" from "set to empty" with LookupEnv.
+func envAllowEmpty(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+
+// splitTopics parses a comma-separated topic list, dropping empties.
+//
+// Returns nil for an empty or all-whitespace value rather than a one-element
+// slice containing "", which is what strings.Split does and which would have
+// the consumer subscribe to a topic named empty string — a subscription that
+// never delivers and never errors, i.e. the off switch appearing to work while
+// leaving a reader spinning. Whitespace around each name is trimmed because
+// "a, b" in an env var or a compose file is what a person writes.
+func splitTopics(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func envInt(key string, def int) int {

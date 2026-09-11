@@ -32,16 +32,32 @@ type stubStore struct {
 	setActiveCalls  int
 	setActiveWanted []bool
 
-	bundle    *domain.PermissionBundle
-	bundleErr error
+	bundle        *domain.PermissionBundle
+	bundleCreated bool
+	bundleErr     error
+
+	bundles            []domain.PermissionBundle
+	bundlesErr         error
+	bundlesRoleID      string
+	bundlesTenantID    string
+	bundleActive       *domain.PermissionBundle
+	bundleActiveErr    error
+	bundleActiveCalls  int
+	bundleActiveWant   []bool
+	bundleActiveID     string
+	bundleActiveTenant string
 
 	assignment      *domain.PrincipalRoleAssignment
 	assignmentErr   error
 	revokedAssign   *domain.PrincipalRoleAssignment
 	revokeAssignErr error
 
-	delegation          *domain.DelegatedAuthority
-	delegationErr       error
+	delegation    *domain.DelegatedAuthority
+	delegationErr error
+	// The params CreateDelegatedAuthority was called with. Recorded because
+	// the store gained delegated_actions and the HTTP request struct did not,
+	// and the only place that is visible is the argument.
+	gotCreateDelegation domain.CreateDelegatedAuthorityParams
 	findDelegation      *domain.DelegatedAuthority // pre-revoke fetch result for RevokeDelegatedAuthority's ownership check
 	findDelegationErr   error
 	revokedDelegation   *domain.DelegatedAuthority
@@ -49,6 +65,39 @@ type stubStore struct {
 
 	sodRule    *domain.SoDRule
 	sodRuleErr error
+
+	// List* results, plus the filters each was called with, so a test can
+	// assert the handler forwarded the query params rather than only that a
+	// list came back.
+	listAssignments     []domain.PrincipalRoleAssignment
+	listAssignmentsErr  error
+	gotAssignTenant     string
+	gotAssignPrincipal  string
+	gotAssignRole       string
+	gotAssignActiveOnly bool
+
+	listSoDRules    []domain.SoDRule
+	listSoDRulesErr error
+	gotSoDTenant    string
+
+	setSoDActiveErr    error
+	gotSoDActiveID     string
+	gotSoDActiveTenant string
+	gotSoDActiveValue  bool
+
+	// The two catalogue reads. Args are captured so a test can assert the
+	// handler passed the VERIFIED tenant scope rather than anything from the
+	// query string — the property that matters on a tenant-scoped read.
+	roles              []domain.Role
+	listRolesErr       error
+	gotRolesTenant     string
+	gotRolesActiveOnly bool
+
+	delegations        []domain.DelegatedAuthority
+	listDelegationsErr error
+	gotDelegTenant     string
+	gotDelegPrincipal  string
+	gotDelegActiveOnly bool
 
 	rbacActions []string
 	rbacBasis   string
@@ -71,11 +120,56 @@ type stubStore struct {
 
 	ownObjectForbidden bool
 	ownObjectErr       error
+	// The tenant CheckOwnObjectSoD was called with. Recorded for the same
+	// reason grantedTenantArg is: the handler used to pass the raw BODY
+	// tenant to this one read while passing the resolved scope to every
+	// other, and the only way that is visible is from the argument.
+	ownObjectTenantArg string
+
+	// ABAC — layer 5. abacRules is what FindABACRules returns;
+	// abacActionArg / abacTenantArg record what it was asked for.
+	abacRules     []domain.ABACRule
+	abacErr       error
+	abacActionArg string
+	abacTenantArg string
+
+	abacRule          *domain.ABACRule
+	abacRuleErr       error
+	setABACActiveRule *domain.ABACRule
+	setABACActiveErr  error
+	setABACActiveWant []bool
+	listABACRules     []domain.ABACRule
+	listABACRulesErr  error
+	gotABACListTenant string
+	gotABACListAction string
+	gotCreateABACRule domain.CreateABACRuleParams
 
 	decision        *domain.AccessDecisionLog
 	recordErr       error
 	findDecision    *domain.AccessDecisionLog
 	findDecisionErr error
+	// The params RecordAccessDecision was called with — the decision artifact
+	// is the evidence, so what it records is worth asserting rather than
+	// assuming.
+	recordedParams domain.RecordAccessDecisionParams
+
+	// The decision-log audit read. listDecisions is the page returned;
+	// gotListDecisionsTenant / gotListDecisionsParams record what it was
+	// asked for, because the property that matters on this read is that the
+	// tenant came from the VERIFIED header and not from a query parameter.
+	listDecisions          *domain.AccessDecisionPage
+	listDecisionsErr       error
+	gotListDecisionsTenant string
+	gotListDecisionsParams domain.ListAccessDecisionsParams
+
+	// Layer 0. principalStatus is what FindPrincipalStatus returns; the zero
+	// value "" is deliberately NOT treated as ACTIVE by the handler, so every
+	// existing test would start failing with a denial if this stub returned
+	// the zero value — see the method below.
+	principalStatus          string
+	principalStatusErr       error
+	gotPrincipalStatusArgs   []string
+	principalStatusCallCount int
 }
 
 func (s *stubStore) CreateRole(_ context.Context, _ domain.CreateRoleParams) (*domain.Role, bool, error) {
@@ -89,8 +183,18 @@ func (s *stubStore) SetRoleActive(_ context.Context, _, _ string, active bool) (
 	s.setActiveWanted = append(s.setActiveWanted, active)
 	return s.setActiveRole, s.setActiveErr
 }
-func (s *stubStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, error) {
-	return s.bundle, s.bundleErr
+func (s *stubStore) CreatePermissionBundle(_ context.Context, _ domain.CreatePermissionBundleParams) (*domain.PermissionBundle, bool, error) {
+	return s.bundle, s.bundleCreated, s.bundleErr
+}
+func (s *stubStore) ListPermissionBundles(_ context.Context, roleID, tenantID string) ([]domain.PermissionBundle, error) {
+	s.bundlesRoleID, s.bundlesTenantID = roleID, tenantID
+	return s.bundles, s.bundlesErr
+}
+func (s *stubStore) SetPermissionBundleActive(_ context.Context, bundleID, tenantID string, active bool) (*domain.PermissionBundle, error) {
+	s.bundleActiveCalls++
+	s.bundleActiveWant = append(s.bundleActiveWant, active)
+	s.bundleActiveID, s.bundleActiveTenant = bundleID, tenantID
+	return s.bundleActive, s.bundleActiveErr
 }
 func (s *stubStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleAssignmentParams) (*domain.PrincipalRoleAssignment, error) {
 	return s.assignment, s.assignmentErr
@@ -98,7 +202,8 @@ func (s *stubStore) CreateRoleAssignment(_ context.Context, _ domain.CreateRoleA
 func (s *stubStore) RevokeRoleAssignment(_ context.Context, _, _ string) (*domain.PrincipalRoleAssignment, error) {
 	return s.revokedAssign, s.revokeAssignErr
 }
-func (s *stubStore) CreateDelegatedAuthority(_ context.Context, _ domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error) {
+func (s *stubStore) CreateDelegatedAuthority(_ context.Context, params domain.CreateDelegatedAuthorityParams) (*domain.DelegatedAuthority, error) {
+	s.gotCreateDelegation = params
 	return s.delegation, s.delegationErr
 }
 func (s *stubStore) FindDelegatedAuthorityByID(_ context.Context, _, _ string) (*domain.DelegatedAuthority, error) {
@@ -107,6 +212,54 @@ func (s *stubStore) FindDelegatedAuthorityByID(_ context.Context, _, _ string) (
 func (s *stubStore) RevokeDelegatedAuthority(_ context.Context, _, _ string) (*domain.DelegatedAuthority, error) {
 	return s.revokedDelegation, s.revokeDelegationErr
 }
+func (s *stubStore) ListRoleAssignments(_ context.Context, tenantID, principalID, roleID string, activeOnly bool) ([]domain.PrincipalRoleAssignment, error) {
+	s.gotAssignTenant = tenantID
+	s.gotAssignPrincipal = principalID
+	s.gotAssignRole = roleID
+	s.gotAssignActiveOnly = activeOnly
+	if s.listAssignmentsErr != nil {
+		return nil, s.listAssignmentsErr
+	}
+	return s.listAssignments, nil
+}
+
+func (s *stubStore) SetSoDRuleActive(_ context.Context, sodRuleID, tenantID string, active bool) (*domain.SoDRule, error) {
+	s.gotSoDActiveID = sodRuleID
+	s.gotSoDActiveTenant = tenantID
+	s.gotSoDActiveValue = active
+	if s.setSoDActiveErr != nil {
+		return nil, s.setSoDActiveErr
+	}
+	return &domain.SoDRule{SoDRuleID: sodRuleID, ActionA: "PAYMENT_APPROVE", ActionB: "PAYMENT_INITIATE", ActiveFlag: active}, nil
+}
+
+func (s *stubStore) ListRoles(_ context.Context, tenantID string, activeOnly bool) ([]domain.Role, error) {
+	s.gotRolesTenant = tenantID
+	s.gotRolesActiveOnly = activeOnly
+	if s.listRolesErr != nil {
+		return nil, s.listRolesErr
+	}
+	return s.roles, nil
+}
+
+func (s *stubStore) ListDelegatedAuthorities(_ context.Context, tenantID, principalID string, activeOnly bool) ([]domain.DelegatedAuthority, error) {
+	s.gotDelegTenant = tenantID
+	s.gotDelegPrincipal = principalID
+	s.gotDelegActiveOnly = activeOnly
+	if s.listDelegationsErr != nil {
+		return nil, s.listDelegationsErr
+	}
+	return s.delegations, nil
+}
+
+func (s *stubStore) ListSoDRules(_ context.Context, tenantID string) ([]domain.SoDRule, error) {
+	s.gotSoDTenant = tenantID
+	if s.listSoDRulesErr != nil {
+		return nil, s.listSoDRulesErr
+	}
+	return s.listSoDRules, nil
+}
+
 func (s *stubStore) CreateSoDRule(_ context.Context, _ domain.CreateSoDRuleParams) (*domain.SoDRule, error) {
 	return s.sodRule, s.sodRuleErr
 }
@@ -121,10 +274,38 @@ func (s *stubStore) FindDelegatedActions(_ context.Context, _, _, tenantID strin
 func (s *stubStore) CheckSoDConflict(_ context.Context, _ []string, _, _ string) (string, bool, error) {
 	return s.sodConflictAction, s.sodHasConflict, s.sodErr
 }
-func (s *stubStore) CheckOwnObjectSoD(_ context.Context, _, _ string) (bool, error) {
+func (s *stubStore) CheckOwnObjectSoD(_ context.Context, _, tenantID string) (bool, error) {
+	s.ownObjectTenantArg = tenantID
 	return s.ownObjectForbidden, s.ownObjectErr
 }
-func (s *stubStore) RecordAccessDecision(_ context.Context, _ domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
+
+func (s *stubStore) FindABACRules(_ context.Context, actionType, tenantID string) ([]domain.ABACRule, error) {
+	s.abacActionArg = actionType
+	s.abacTenantArg = tenantID
+	return s.abacRules, s.abacErr
+}
+
+func (s *stubStore) CreateABACRule(_ context.Context, params domain.CreateABACRuleParams) (*domain.ABACRule, error) {
+	s.gotCreateABACRule = params
+	return s.abacRule, s.abacRuleErr
+}
+
+func (s *stubStore) SetABACRuleActive(_ context.Context, _, _ string, active bool) (*domain.ABACRule, error) {
+	s.setABACActiveWant = append(s.setABACActiveWant, active)
+	return s.setABACActiveRule, s.setABACActiveErr
+}
+
+func (s *stubStore) ListABACRules(_ context.Context, tenantID, actionType string) ([]domain.ABACRule, error) {
+	s.gotABACListTenant = tenantID
+	s.gotABACListAction = actionType
+	if s.listABACRulesErr != nil {
+		return nil, s.listABACRulesErr
+	}
+	return s.listABACRules, nil
+}
+
+func (s *stubStore) RecordAccessDecision(_ context.Context, params domain.RecordAccessDecisionParams) (*domain.AccessDecisionLog, error) {
+	s.recordedParams = params
 	if s.decision != nil {
 		return s.decision, s.recordErr
 	}
@@ -132,6 +313,33 @@ func (s *stubStore) RecordAccessDecision(_ context.Context, _ domain.RecordAcces
 }
 func (s *stubStore) FindAccessDecisionByID(_ context.Context, _, _ string) (*domain.AccessDecisionLog, error) {
 	return s.findDecision, s.findDecisionErr
+}
+
+func (s *stubStore) ListAccessDecisions(_ context.Context, tenantID string, params domain.ListAccessDecisionsParams) (*domain.AccessDecisionPage, error) {
+	s.gotListDecisionsTenant = tenantID
+	s.gotListDecisionsParams = params
+	return s.listDecisions, s.listDecisionsErr
+}
+
+// FindPrincipalStatus defaults to ACTIVE when the test set no status.
+//
+// The default matters more than it looks. Layer 0 denies anything that is not
+// exactly domain.PrincipalStatusActive, so a stub returning the zero value ""
+// would deny every request in every test in this package — and the failures
+// would read as regressions in the RBAC, delegation, SoD and ABAC layers rather
+// than as an unset stub field. Defaulting here keeps every test that does not
+// care about layer 0 testing what it says it tests, and a test that does care
+// sets principalStatus explicitly.
+func (s *stubStore) FindPrincipalStatus(_ context.Context, principalID, tenantID string) (string, error) {
+	s.principalStatusCallCount++
+	s.gotPrincipalStatusArgs = []string{principalID, tenantID}
+	if s.principalStatusErr != nil {
+		return "", s.principalStatusErr
+	}
+	if s.principalStatus == "" {
+		return domain.PrincipalStatusActive, nil
+	}
+	return s.principalStatus, nil
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────
@@ -183,7 +391,7 @@ func TestAuthorize_RBACGrant_NoConflict_Granted(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -206,7 +414,7 @@ func TestAuthorize_NoGrant_Denied(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -237,7 +445,7 @@ func TestAuthorize_SoDConflict_Denied_PublishesSoDEvent(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -267,7 +475,7 @@ func TestAuthorize_DelegatedGrant_Granted(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -300,7 +508,7 @@ func TestAuthorize_StoreUnavailable_FailsClosed(t *testing.T) {
 	pub := &stubPublisher{}
 	r := newTestRouterFull(store, pub, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
@@ -319,10 +527,10 @@ func TestCreateRole_Created(t *testing.T) {
 	store := &stubStore{role: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER"}, roleCreated: true}
 	r := newTestRouter(store)
 
-	body := `{"tenant_id":"t-1","role_code":"FINANCE_APPROVER","role_name":"Finance Approver","role_scope_type":"LEGAL_ENTITY"}`
+	body := `{"tenant_id":"11111111-1111-4111-8111-111111111111","role_code":"FINANCE_APPROVER","role_name":"Finance Approver","role_scope_type":"LEGAL_ENTITY"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -336,7 +544,7 @@ func TestCreateRole_MissingField(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles", bytes.NewBufferString(`{}`))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -350,9 +558,9 @@ func TestCreateRole_MissingField(t *testing.T) {
 func TestCreateRole_NoPrincipal_Refused(t *testing.T) {
 	r := newTestRouter(&stubStore{})
 
-	body := `{"tenant_id":"t-1","role_code":"FINANCE_APPROVER","role_name":"Finance Approver","role_scope_type":"LEGAL_ENTITY"}`
+	body := `{"tenant_id":"11111111-1111-4111-8111-111111111111","role_code":"FINANCE_APPROVER","role_name":"Finance Approver","role_scope_type":"LEGAL_ENTITY"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles", bytes.NewBufferString(body))
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -370,7 +578,7 @@ func TestCreateRole_ForeignTenantBody_Refused(t *testing.T) {
 	body := `{"tenant_id":"other-tenant","role_code":"FINANCE_APPROVER","role_name":"Finance Approver","role_scope_type":"LEGAL_ENTITY"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -386,15 +594,16 @@ func TestCreateRole_ForeignTenantBody_Refused(t *testing.T) {
 
 func TestCreatePermissionBundle_Created(t *testing.T) {
 	store := &stubStore{
-		role:   &domain.Role{RoleID: "r-1", TenantID: "t-1"},
-		bundle: &domain.PermissionBundle{PermissionBundleID: "b-1", RoleID: "r-1"},
+		role:          &domain.Role{RoleID: "r-1", TenantID: "11111111-1111-4111-8111-111111111111"},
+		bundle:        &domain.PermissionBundle{PermissionBundleID: "b-1", RoleID: "r-1"},
+		bundleCreated: true,
 	}
 	r := newTestRouter(store)
 
 	body := `{"bundle_code":"default","permitted_actions":["PAYMENT_APPROVE"]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/permission-bundles", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -410,7 +619,7 @@ func TestCreatePermissionBundle_ForeignTenantRole_Refused(t *testing.T) {
 	body := `{"bundle_code":"default","permitted_actions":["PAYMENT_APPROVE"]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/permission-bundles", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -426,15 +635,15 @@ func TestCreatePermissionBundle_ForeignTenantRole_Refused(t *testing.T) {
 
 func TestCreateRoleAssignment_Created(t *testing.T) {
 	store := &stubStore{
-		role:       &domain.Role{RoleID: "r-1", TenantID: "t-1", RoleScopeType: "LEGAL_ENTITY"},
+		role:       &domain.Role{RoleID: "r-1", TenantID: "11111111-1111-4111-8111-111111111111", RoleScopeType: "LEGAL_ENTITY"},
 		assignment: &domain.PrincipalRoleAssignment{PrincipalRoleAssignmentID: "a-1"},
 	}
 	r := newTestRouter(store)
 
-	body := `{"principal_id":"p-1","role_id":"r-1","legal_entity_id":"e-1","effective_from":"2026-01-01T00:00:00Z"}`
+	body := `{"principal_id":"p-1","role_id":"r-1","legal_entity_id":"11111111-1111-4111-8111-bbbbbbbbbbb1","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/role-assignments", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -447,10 +656,10 @@ func TestCreateRoleAssignment_ForeignTenantRole_Refused(t *testing.T) {
 	store := &stubStore{role: &domain.Role{RoleID: "r-1", TenantID: "other-tenant", RoleScopeType: "LEGAL_ENTITY"}}
 	r := newTestRouter(store)
 
-	body := `{"principal_id":"p-1","role_id":"r-1","legal_entity_id":"e-1","effective_from":"2026-01-01T00:00:00Z"}`
+	body := `{"principal_id":"p-1","role_id":"r-1","legal_entity_id":"11111111-1111-4111-8111-bbbbbbbbbbb1","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/role-assignments", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -465,7 +674,7 @@ func TestRevokeRoleAssignment_Revoked(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/role-assignments/a-1/revoke", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -499,7 +708,7 @@ func TestCreateDelegatedAuthority_Created(t *testing.T) {
 	body := `{"delegator_principal_id":"admin-1","delegate_principal_id":"p-2","scope_type":"FULL","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Tenant-Id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -517,7 +726,7 @@ func TestCreateDelegatedAuthority_NotOwnAuthority_Refused(t *testing.T) {
 	body := `{"delegator_principal_id":"someone-else","delegate_principal_id":"p-2","scope_type":"FULL","effective_from":"2026-01-01T00:00:00Z"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Tenant-Id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -535,14 +744,14 @@ func TestCreateDelegatedAuthority_NotOwnAuthority_Refused(t *testing.T) {
 
 func TestRetireRole_SetsActiveFalse(t *testing.T) {
 	store := &stubStore{
-		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "11111111-1111-4111-8111-111111111111", ActiveFlag: true},
 		setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: false},
 	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -559,14 +768,14 @@ func TestRetireRole_SetsActiveFalse(t *testing.T) {
 
 func TestReactivateRole_SetsActiveTrue(t *testing.T) {
 	store := &stubStore{
-		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: false},
+		role:          &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "11111111-1111-4111-8111-111111111111", ActiveFlag: false},
 		setActiveRole: &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", ActiveFlag: true},
 	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/reactivate", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -582,14 +791,14 @@ func TestRetireRole_UnknownRoleIs404(t *testing.T) {
 	// 404 and not 503: the store reached the database and answered. Collapsing
 	// the two would make a typo'd role id look like an outage.
 	store := &stubStore{
-		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "11111111-1111-4111-8111-111111111111", ActiveFlag: true},
 		setActiveErr: domain.ErrRoleNotFound,
 	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/does-not-exist/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -600,14 +809,14 @@ func TestRetireRole_UnknownRoleIs404(t *testing.T) {
 
 func TestRetireRole_StoreDownIs503(t *testing.T) {
 	store := &stubStore{
-		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "tenant-1", ActiveFlag: true},
+		role:         &domain.Role{RoleID: "r-1", RoleCode: "FINANCE_APPROVER", TenantID: "11111111-1111-4111-8111-111111111111", ActiveFlag: true},
 		setActiveErr: domain.ErrStoreUnavailable,
 	}
 	r := newTestRouter(store)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/roles/r-1/retire", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -621,10 +830,10 @@ func TestRetireRole_StoreDownIs503(t *testing.T) {
 func TestCreateSoDRule_JurisdictionNotFound(t *testing.T) {
 	r := newTestRouterFull(&stubStore{}, &stubPublisher{}, &stubValidator{err: domain.ErrJurisdictionNotFound})
 
-	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","jurisdiction_id":"jur-missing","tenant_id":"tenant-1"}`
+	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","jurisdiction_id":"jur-missing","tenant_id":"11111111-1111-4111-8111-111111111111"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -637,10 +846,10 @@ func TestCreateSoDRule_NoJurisdiction_Created(t *testing.T) {
 	store := &stubStore{sodRule: &domain.SoDRule{SoDRuleID: "sod-1"}}
 	r := newTestRouter(store)
 
-	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","tenant_id":"tenant-1"}`
+	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","tenant_id":"11111111-1111-4111-8111-111111111111"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -657,7 +866,7 @@ func TestCreateSoDRule_ForeignTenantBody_Refused(t *testing.T) {
 	body := `{"domain_code":"FINANCE","action_a":"PAYMENT_INITIATE","action_b":"PAYMENT_APPROVE","conflict_type":"MUTUALLY_EXCLUSIVE","tenant_id":"other-tenant"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/sod-rules", bytes.NewBufferString(body))
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "t-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -677,7 +886,7 @@ func TestRevokeDelegatedAuthority_AlreadyRevoked(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities/d-1/revoke", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Tenant-Id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -696,7 +905,7 @@ func TestRevokeDelegatedAuthority_NotDelegator_Refused(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/admin/delegated-authorities/d-1/revoke", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-a")
+	req.Header.Set("X-Tenant-Id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -713,7 +922,7 @@ func TestGetAccessDecision_NotFound(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/access-decisions/missing", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -728,7 +937,7 @@ func TestGetAccessDecision_Found(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/access-decisions/d-1", nil)
 	req.Header.Set("X-Principal-Id", "admin-1")
-	req.Header.Set("X-Tenant-Id", "tenant-1")
+	req.Header.Set("X-Tenant-Id", "11111111-1111-4111-8111-111111111111")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 
@@ -746,7 +955,7 @@ func TestGetAccessDecision_Found(t *testing.T) {
 // Asserting the ARGUMENT is the only way to catch that regressing: the decision
 // outcome looks identical either way.
 func TestAuthorize_ForwardsVerifiedTenantScopeToStore(t *testing.T) {
-	const tenant = "tenant-a"
+	const tenant = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 	store := &stubStore{
 		rbacActions: []string{"PAYMENT_APPROVE"},
@@ -754,7 +963,7 @@ func TestAuthorize_ForwardsVerifiedTenantScopeToStore(t *testing.T) {
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	req.Header.Set("X-Tenant-Id", tenant)
 	w := httptest.NewRecorder()
@@ -781,7 +990,7 @@ func TestAuthorize_NoTenantHeader_FallsBackToPlatformScope(t *testing.T) {
 	}
 	r := newTestRouterFull(store, &stubPublisher{}, &stubValidator{})
 
-	body := `{"principal_id":"p-1","legal_entity_id":"le-1","action_type":"PAYMENT_APPROVE"}`
+	body := `{"principal_id":"p-1","legal_entity_id":"11111111-1111-4111-8111-aaaaaaaaaaa1","action_type":"PAYMENT_APPROVE"}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/authorize", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)

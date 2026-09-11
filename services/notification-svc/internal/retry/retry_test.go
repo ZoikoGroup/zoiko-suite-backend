@@ -107,6 +107,19 @@ type stubStore struct {
 
 	claimFails  bool
 	tenantsSeen []string
+
+	// The stranded-sweep half.
+	stranded      []domain.DueRetry
+	revived       map[string]bool
+	revivedOrder  []string
+	reviveFails   bool
+	strandedFails bool
+	// staleSeen records the cutoff the worker asked for, so a test can assert
+	// the sweep uses a threshold in the past rather than sweeping everything.
+	staleSeen []time.Time
+	// reviveTenants records the tenant installed on the context for each
+	// revive, the same property tenantsSeen pins for the claim.
+	reviveTenants []string
 }
 
 func newStubStore() *stubStore {
@@ -114,11 +127,33 @@ func newStubStore() *stubStore {
 		byID:      map[string]*domain.Notification{},
 		claimed:   map[string]bool{},
 		addresses: map[string]string{},
+		revived:   map[string]bool{},
 	}
 }
 
 func (s *stubStore) FindDueRetries(_ context.Context, _ time.Time, _ int) ([]domain.DueRetry, error) {
 	return s.due, nil
+}
+
+func (s *stubStore) FindStrandedDeliveries(_ context.Context, staleBefore time.Time, _ int) ([]domain.DueRetry, error) {
+	s.staleSeen = append(s.staleSeen, staleBefore)
+	if s.strandedFails {
+		return nil, errors.New("stranded poll exploded")
+	}
+	return s.stranded, nil
+}
+
+func (s *stubStore) ReviveStranded(ctx context.Context, id, tenantID string, _, _ time.Time) (bool, error) {
+	s.reviveTenants = append(s.reviveTenants, svcmiddleware.TenantFromContext(ctx))
+	if s.reviveFails {
+		return false, errors.New("revive exploded")
+	}
+	if s.revived[id] {
+		return false, nil
+	}
+	s.revived[id] = true
+	s.revivedOrder = append(s.revivedOrder, id)
+	return true, nil
 }
 
 func (s *stubStore) ClaimRetry(ctx context.Context, id, tenantID string) (bool, error) {
