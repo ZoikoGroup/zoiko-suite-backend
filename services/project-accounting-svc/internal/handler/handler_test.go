@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -128,6 +129,40 @@ func (s *stubStore) GetProfitabilitySnapshot(_ context.Context, snapshotID strin
 	return &cp, nil
 }
 
+func (s *stubStore) GetLatestCertifiedSnapshot(_ context.Context, projectID string) (*domain.ProfitabilitySnapshot, error) {
+	var latest *domain.ProfitabilitySnapshot
+	for _, snap := range s.snapshots {
+		if snap.ProjectID != projectID || snap.Status != domain.ProfitabilitySnapshotStatusCertified {
+			continue
+		}
+		if latest == nil || snap.CertifiedAt.After(*latest.CertifiedAt) {
+			latest = snap
+		}
+	}
+	if latest == nil {
+		return nil, domain.ErrSnapshotNotFound
+	}
+	cp := *latest
+	return &cp, nil
+}
+
+func (s *stubStore) GetProfitabilitySnapshotAsOf(_ context.Context, projectID string, asOf time.Time) (*domain.ProfitabilitySnapshot, error) {
+	var latest *domain.ProfitabilitySnapshot
+	for _, snap := range s.snapshots {
+		if snap.ProjectID != projectID || snap.Status != domain.ProfitabilitySnapshotStatusCertified || snap.CertifiedAt == nil || snap.CertifiedAt.After(asOf) {
+			continue
+		}
+		if latest == nil || snap.CertifiedAt.After(*latest.CertifiedAt) {
+			latest = snap
+		}
+	}
+	if latest == nil {
+		return nil, domain.ErrSnapshotNotFound
+	}
+	cp := *latest
+	return &cp, nil
+}
+
 func (s *stubStore) CertifyProfitabilitySnapshot(_ context.Context, snapshotID, principalID string, at time.Time) (*domain.ProfitabilitySnapshot, error) {
 	snap, ok := s.snapshots[snapshotID]
 	if !ok {
@@ -181,6 +216,54 @@ func (s *stubStore) GetRecognitionRun(_ context.Context, runID string) (*domain.
 		return nil, domain.ErrRecognitionRunNotFound
 	}
 	cp := *r
+	return &cp, nil
+}
+
+func (s *stubStore) ListRecognitionRunsForProject(_ context.Context, projectID string) ([]domain.RecognitionRun, error) {
+	var out []domain.RecognitionRun
+	for _, r := range s.runs {
+		if r.ProjectID == projectID {
+			out = append(out, *r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (s *stubStore) GetLatestRecognitionRunForProject(_ context.Context, projectID string) (*domain.RecognitionRun, error) {
+	var latest *domain.RecognitionRun
+	for _, r := range s.runs {
+		if r.ProjectID != projectID || r.SupersededAt != nil {
+			continue
+		}
+		if latest == nil || r.CreatedAt.After(latest.CreatedAt) {
+			latest = r
+		}
+	}
+	if latest == nil {
+		return nil, domain.ErrRecognitionRunNotFound
+	}
+	cp := *latest
+	return &cp, nil
+}
+
+func (s *stubStore) GetRecognitionRunAsOf(_ context.Context, projectID string, asOf time.Time) (*domain.RecognitionRun, error) {
+	var latest *domain.RecognitionRun
+	for _, r := range s.runs {
+		if r.ProjectID != projectID || r.CreatedAt.After(asOf) {
+			continue
+		}
+		if r.SupersededAt != nil && !r.SupersededAt.After(asOf) {
+			continue
+		}
+		if latest == nil || r.CreatedAt.After(latest.CreatedAt) {
+			latest = r
+		}
+	}
+	if latest == nil {
+		return nil, domain.ErrRecognitionRunNotFound
+	}
+	cp := *latest
 	return &cp, nil
 }
 
@@ -308,6 +391,59 @@ func (s *stubStore) ListCostEntries(_ context.Context, projectID, wbsID string) 
 			continue
 		}
 		out = append(out, *e)
+	}
+	return out, nil
+}
+
+// stubCostEntryDescendants returns rootID plus every entry in
+// s.costEntries that reclassifies/reverses rootID, directly or
+// transitively.
+func (s *stubStore) stubCostEntryDescendants(rootID string) []domain.CostEntry {
+	seen := map[string]bool{}
+	var out []domain.CostEntry
+	var walk func(id string)
+	walk = func(id string) {
+		if seen[id] {
+			return
+		}
+		e, ok := s.costEntries[id]
+		if !ok {
+			return
+		}
+		seen[id] = true
+		out = append(out, *e)
+		for _, cand := range s.costEntries {
+			if (cand.ReclassifiesEntryID != nil && *cand.ReclassifiesEntryID == id) ||
+				(cand.ReversesEntryID != nil && *cand.ReversesEntryID == id) {
+				walk(cand.EntryID)
+			}
+		}
+	}
+	walk(rootID)
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+func (s *stubStore) GetCostSourceLineage(_ context.Context, entryID string) ([]domain.CostEntry, error) {
+	return s.stubCostEntryDescendants(entryID), nil
+}
+
+func (s *stubStore) GetUnallocatedCostExceptions(_ context.Context, legalEntityID string) ([]domain.CostEntry, error) {
+	var out []domain.CostEntry
+	for _, e := range s.costEntries {
+		if e.LegalEntityID == legalEntityID && e.Status == domain.CostEntryStatusCaptured {
+			out = append(out, *e)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) GetProjectCostAsOf(_ context.Context, projectID string, asOf time.Time) ([]domain.CostEntry, error) {
+	var out []domain.CostEntry
+	for _, e := range s.costEntries {
+		if e.ProjectID == projectID && !e.CreatedAt.After(asOf) {
+			out = append(out, *e)
+		}
 	}
 	return out, nil
 }

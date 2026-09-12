@@ -40,12 +40,15 @@ func (h *Handler) ValueMovement(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	entry, err := h.store.ValueMovement(r.Context(), movementID, principalID, req.UnitCost, time.Now().UTC())
+	entry, layer, err := h.store.ValueMovement(r.Context(), movementID, principalID, req.UnitCost, time.Now().UTC())
 	if err != nil {
 		h.writeValuationErr(w, err)
 		return
 	}
 	h.publisher.PublishInventoryValued(r.Context(), getCorrelationID(r), principalID, tenantID, *entry)
+	if layer != nil {
+		h.publisher.PublishCostLayerCreated(r.Context(), getCorrelationID(r), principalID, tenantID, m.LegalEntityID, *layer)
+	}
 	writeJSON(w, http.StatusCreated, entry)
 }
 
@@ -166,6 +169,141 @@ func (h *Handler) GetCostLayers(w http.ResponseWriter, r *http.Request) {
 		layers = []domain.CostLayer{}
 	}
 	writeJSON(w, http.StatusOK, layers)
+}
+
+// GetCOGSAssignment backs the spec's own query of the same name — for an
+// OUTBOUND valuation entry, exactly which cost layers (and at what rate)
+// were drawn on to price it. See
+// internal/store/valuation_store.go's own doc comment on
+// GetLayerConsumptions.
+func (h *Handler) GetCOGSAssignment(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	e, err := h.store.GetValuationEntry(r.Context(), id)
+	if err != nil {
+		h.writeValuationErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, e.LegalEntityID, actionInventoryValuationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	consumptions, err := h.store.GetLayerConsumptions(r.Context(), id)
+	if err != nil {
+		h.writeValuationErr(w, err)
+		return
+	}
+	if consumptions == nil {
+		consumptions = []domain.LayerConsumption{}
+	}
+	writeJSON(w, http.StatusOK, consumptions)
+}
+
+// GetInventoryValueAsOf backs the spec's own query of the same name — see
+// internal/store/valuation_store.go's own doc comment.
+func (h *Handler) GetInventoryValueAsOf(w http.ResponseWriter, r *http.Request) {
+	itemID := r.URL.Query().Get("item_id")
+	locationID := r.URL.Query().Get("location_id")
+	if itemID == "" || locationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "item_id and location_id are required")
+		return
+	}
+	atParam := r.URL.Query().Get("at")
+	at := time.Now().UTC()
+	if atParam != "" {
+		parsed, err := time.Parse(time.RFC3339, atParam)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_at", "at must be RFC3339")
+			return
+		}
+		at = parsed
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	item, err := h.store.GetItem(r.Context(), itemID)
+	if err != nil {
+		h.writeItemErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, item.LegalEntityID, actionInventoryValuationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	value, err := h.store.GetInventoryValueAsOf(r.Context(), itemID, locationID, at)
+	if err != nil {
+		h.writeValuationErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"item_id": itemID, "location_id": locationID, "as_of": at, "inventory_value": value})
+}
+
+// GetValuationEvidence backs the spec's own query of the same name — the
+// full evidence trail behind one valuation entry: the entry itself, the
+// movement it valued, and either the cost layers it consumed (OUTBOUND)
+// or the cost layer it created (INBOUND). Composed from existing reads —
+// no new store method, same pattern as asset-management-svc's
+// ExplainAssetState.
+func (h *Handler) GetValuationEvidence(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	e, err := h.store.GetValuationEntry(r.Context(), id)
+	if err != nil {
+		h.writeValuationErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, e.LegalEntityID, actionInventoryValuationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	movement, err := h.store.GetMovement(r.Context(), e.MovementID)
+	if err != nil {
+		h.writeMovementErr(w, err)
+		return
+	}
+	evidence := map[string]any{"entry": e, "movement": movement}
+	if e.EntryType == domain.ValuationEntryTypeOutbound {
+		consumptions, err := h.store.GetLayerConsumptions(r.Context(), id)
+		if err != nil {
+			h.writeValuationErr(w, err)
+			return
+		}
+		if consumptions == nil {
+			consumptions = []domain.LayerConsumption{}
+		}
+		evidence["layer_consumptions"] = consumptions
+	} else {
+		layers, err := h.store.GetCostLayers(r.Context(), e.ItemID, e.LocationID)
+		if err != nil {
+			h.writeValuationErr(w, err)
+			return
+		}
+		var created *domain.CostLayer
+		for i := range layers {
+			if layers[i].SourceMovementID == e.MovementID {
+				created = &layers[i]
+				break
+			}
+		}
+		evidence["cost_layer"] = created
+	}
+	writeJSON(w, http.StatusOK, evidence)
 }
 
 // ── POST /v1/valuation/runs ────────────────────────────────────────────────

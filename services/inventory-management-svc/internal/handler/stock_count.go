@@ -109,6 +109,162 @@ func (h *Handler) GetStockCount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sc)
 }
 
+// GetVarianceReport backs the spec's own query of the same name — only
+// the lines where an observation actually differs from the frozen system
+// quantity, the same comparison RecordBlindCount itself uses to decide
+// whether to publish StockCountVarianceDetected. Composed from
+// GetStockCount — no new store method.
+func (h *Handler) GetVarianceReport(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	sc, err := h.store.GetStockCount(r.Context(), id)
+	if err != nil {
+		h.writeStockCountErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sc.LegalEntityID, actionInventoryCountRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	type varianceLine struct {
+		domain.StockCountLine
+		Variance float64 `json:"variance"`
+	}
+	variances := []varianceLine{}
+	for _, l := range sc.Lines {
+		if l.ObservedQuantity == nil || *l.ObservedQuantity == l.SystemQuantity {
+			continue
+		}
+		variances = append(variances, varianceLine{StockCountLine: l, Variance: *l.ObservedQuantity - l.SystemQuantity})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count_id": id, "variances": variances})
+}
+
+// GetCountSnapshot backs the spec's own query of the same name — the
+// frozen population as of freeze time: item/location/system_quantity
+// only, never an observation, recount or approval — the pre-count
+// evidence baseline everything else in this count is measured against.
+// Composed from GetStockCount — no new store method.
+func (h *Handler) GetCountSnapshot(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	sc, err := h.store.GetStockCount(r.Context(), id)
+	if err != nil {
+		h.writeStockCountErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sc.LegalEntityID, actionInventoryCountRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	type snapshotLine struct {
+		ItemID         string  `json:"item_id"`
+		LocationID     string  `json:"location_id"`
+		SystemQuantity float64 `json:"system_quantity"`
+	}
+	lines := []snapshotLine{}
+	for _, l := range sc.Lines {
+		lines = append(lines, snapshotLine{ItemID: l.ItemID, LocationID: l.LocationID, SystemQuantity: l.SystemQuantity})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"count_id": id, "frozen_at": sc.FrozenAt, "lines": lines})
+}
+
+// GetAdjustmentStatus backs the spec's own query of the same name — how
+// many approved-variance lines still need GenerateAdjustmentMovements run
+// against them, i.e. whether this count's own INV-03 adjustment
+// obligation is fully discharged. Composed from GetStockCount — no new
+// store method.
+func (h *Handler) GetAdjustmentStatus(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	sc, err := h.store.GetStockCount(r.Context(), id)
+	if err != nil {
+		h.writeStockCountErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sc.LegalEntityID, actionInventoryCountRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	var varianceLines, approvedLines, adjustedLines, pendingLines int
+	for _, l := range sc.Lines {
+		if l.ObservedQuantity == nil || *l.ObservedQuantity == l.SystemQuantity {
+			continue
+		}
+		varianceLines++
+		if l.VarianceApprovedAt == nil {
+			continue
+		}
+		approvedLines++
+		if l.AdjustmentMovementID != nil {
+			adjustedLines++
+		} else {
+			pendingLines++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count_id": id, "variance_lines": varianceLines, "approved_lines": approvedLines,
+		"adjusted_lines": adjustedLines, "pending_adjustment_lines": pendingLines,
+	})
+}
+
+// GetCountEvidence backs the spec's own query of the same name — one
+// count line's full evidence trail: the line itself plus, once an
+// adjustment has been generated, the INV-03 movement it produced.
+// Composed from GetCountLine + GetMovement — no new store method.
+func (h *Handler) GetCountEvidence(w http.ResponseWriter, r *http.Request) {
+	lineID := chi.URLParam(r, "lineID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	line, err := h.store.GetCountLine(r.Context(), lineID)
+	if err != nil {
+		h.writeStockCountErr(w, err)
+		return
+	}
+	sc, err := h.store.GetStockCount(r.Context(), line.CountID)
+	if err != nil {
+		h.writeStockCountErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sc.LegalEntityID, actionInventoryCountRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	evidence := map[string]any{"line": line}
+	if line.AdjustmentMovementID != nil {
+		movement, err := h.store.GetMovement(r.Context(), *line.AdjustmentMovementID)
+		if err != nil {
+			h.writeMovementErr(w, err)
+			return
+		}
+		evidence["adjustment_movement"] = movement
+	}
+	writeJSON(w, http.StatusOK, evidence)
+}
+
 // ── POST /v1/stock-counts/{id}/freeze ─────────────────────────────────────────
 
 // FreezeCountPopulation is the spec's own named evidence step — "frozen
@@ -232,7 +388,8 @@ func (h *Handler) RecordBlindCount(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 	line, err := h.store.GetCountLine(r.Context(), lineID)
@@ -253,6 +410,9 @@ func (h *Handler) RecordBlindCount(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.writeStockCountErr(w, err)
 		return
+	}
+	if *updated.ObservedQuantity != updated.SystemQuantity {
+		h.publisher.PublishStockCountVarianceDetected(r.Context(), getCorrelationID(r), principalID, tenantID, sc.LegalEntityID, updated.LineID, updated.SystemQuantity, *updated.ObservedQuantity)
 	}
 	writeJSON(w, http.StatusOK, domain.RecordedBlindCount{
 		LineID: updated.LineID, ItemID: updated.ItemID, LocationID: updated.LocationID,

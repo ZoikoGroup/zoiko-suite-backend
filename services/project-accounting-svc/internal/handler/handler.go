@@ -40,6 +40,12 @@ type Store interface {
 	CaptureProjectCost(ctx context.Context, e *domain.CostEntry) error
 	GetCostEntry(ctx context.Context, entryID string) (*domain.CostEntry, error)
 	ListCostEntries(ctx context.Context, projectID, wbsID string) ([]domain.CostEntry, error)
+	// GetCostSourceLineage, GetUnallocatedCostExceptions and
+	// GetProjectCostAsOf back the spec's own queries of the same names —
+	// see internal/store/cost_entry_store.go's own doc comments.
+	GetCostSourceLineage(ctx context.Context, entryID string) ([]domain.CostEntry, error)
+	GetUnallocatedCostExceptions(ctx context.Context, legalEntityID string) ([]domain.CostEntry, error)
+	GetProjectCostAsOf(ctx context.Context, projectID string, asOf time.Time) ([]domain.CostEntry, error)
 	ValidateProjectCost(ctx context.Context, entryID string, at time.Time) error
 	MarkBillableEligibility(ctx context.Context, entryID string, billable, capitalizable bool) error
 	CreateLinkedCostEntry(ctx context.Context, originalEntryID, principalID, reason string, isReversal bool, newEntryID string, amountOverride *float64, costCategory *string, billable, capitalizable *bool, at time.Time) (*domain.CostEntry, error)
@@ -61,6 +67,14 @@ type Store interface {
 	// the AST/INV/PRJ domain spec's own §9 "Project revenue/WIP → GL"
 	// assertion.
 	GetPostedRevenueTotal(ctx context.Context, legalEntityID, fiscalPeriod string) (float64, error)
+	// ListRecognitionRunsForProject, GetLatestRecognitionRunForProject and
+	// GetRecognitionRunAsOf back the spec's own GetRevenueSchedule,
+	// GetWIPOrContractBalance/GetProgressEvidence/ExplainRecognition and
+	// GetRecognitionAsOf queries — see
+	// internal/store/recognition_store.go's own doc comments.
+	ListRecognitionRunsForProject(ctx context.Context, projectID string) ([]domain.RecognitionRun, error)
+	GetLatestRecognitionRunForProject(ctx context.Context, projectID string) (*domain.RecognitionRun, error)
+	GetRecognitionRunAsOf(ctx context.Context, projectID string, asOf time.Time) (*domain.RecognitionRun, error)
 
 	// PRJ-04 (Project Profitability) — see internal/store/profitability_store.go's
 	// own doc comments for the authority boundary these implement. Pure
@@ -71,6 +85,11 @@ type Store interface {
 	BuildProfitabilitySnapshot(ctx context.Context, projectID, principalID string, at time.Time) (*domain.ProfitabilitySnapshot, error)
 	GetProfitabilitySnapshot(ctx context.Context, snapshotID string) (*domain.ProfitabilitySnapshot, error)
 	CertifyProfitabilitySnapshot(ctx context.Context, snapshotID, principalID string, at time.Time) (*domain.ProfitabilitySnapshot, error)
+	// GetLatestCertifiedSnapshot and GetProfitabilitySnapshotAsOf back the
+	// spec's own GetMarginBridge and GetProfitabilityAsOf queries — see
+	// internal/store/profitability_store.go's own doc comments.
+	GetLatestCertifiedSnapshot(ctx context.Context, projectID string) (*domain.ProfitabilitySnapshot, error)
+	GetProfitabilitySnapshotAsOf(ctx context.Context, projectID string, asOf time.Time) (*domain.ProfitabilitySnapshot, error)
 }
 
 // RecognitionLedgerClient is PRJ-03's own real "ACC-04" dependency — see
@@ -234,6 +253,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/allocate", h.AllocateSharedCostToProject)
 		r.Get("/", h.ListCostEntries)
 		r.Get("/{id}", h.GetCostEntry)
+		r.Get("/{id}/source-lineage", h.GetCostSourceLineage)
+		r.Get("/unallocated-exceptions", h.GetUnallocatedCostExceptions)
+		r.Get("/as-of", h.GetProjectCostAsOf)
 		r.Post("/{id}/validate", h.ValidateProjectCost)
 		r.Post("/{id}/mark-billable", h.MarkBillableEligibility)
 		r.Post("/{id}/reclassify", h.ReclassifyProjectCost)
@@ -243,6 +265,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/estimates", h.SetApprovedEstimate)
 		r.Get("/estimates", h.GetCurrentEstimate)
 		r.Get("/posted-revenue", h.GetPostedRevenueTotal)
+		r.Get("/revenue-schedule", h.GetRevenueSchedule)
+		r.Get("/wip-or-contract-balance", h.GetWIPOrContractBalance)
+		r.Get("/progress-evidence", h.GetProgressEvidence)
+		r.Get("/as-of", h.GetRecognitionAsOf)
+		r.Get("/explain", h.ExplainRecognition)
 		r.Route("/runs", func(r chi.Router) {
 			r.Post("/", h.CreateRecognitionRun)
 			r.Get("/{id}", h.GetRecognitionRun)
@@ -257,6 +284,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/projections", h.GetProjectProfitability)
 		r.Post("/projections/refresh", h.RefreshProfitabilityProjection)
 		r.Post("/projections/rebuild", h.RefreshProfitabilityProjection)
+		r.Get("/margin-bridge", h.GetMarginBridge)
+		r.Get("/cost-revenue-drilldown", h.GetCostRevenueDrilldown)
+		r.Get("/as-of", h.GetProfitabilityAsOf)
 		r.Route("/snapshots", func(r chi.Router) {
 			r.Post("/", h.BuildProfitabilitySnapshot)
 			r.Get("/{id}", h.GetProfitabilitySnapshot)

@@ -202,6 +202,68 @@ func TestDepreciationRun_FullLifecycle_EmitsRealJournal(t *testing.T) {
 	}
 }
 
+// TestDepreciationRun_PublishesRemainingLifecycleEvents proves
+// DepreciationScheduleBuilt/DepreciationRunCalculated/
+// DepreciationRunApproved/DepreciationRunSuperseded — the spec's own
+// remaining named AST-02 events, previously never published — each fire
+// exactly once at their own real lifecycle step.
+func TestDepreciationRun_PublishesRemainingLifecycleEvents(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{postJournalID: "real-journal-2"}
+	pub := &stubPublisher{}
+	r := newRouterWithLedger(s, pub, &stubAuthZ{}, ledger)
+	assetID := createActiveAsset(t, s, r, "le-1")
+
+	callsBeforeBuild := pub.calls
+	buildRR := doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
+	if buildRR.Code != http.StatusCreated {
+		t.Fatalf("build schedule failed: %d %s", buildRR.Code, buildRR.Body.String())
+	}
+	if pub.calls != callsBeforeBuild+1 {
+		t.Fatalf("expected 1 new publish call (DepreciationScheduleBuilt), got %d", pub.calls-callsBeforeBuild)
+	}
+
+	runReq := domain.CreateDepreciationRunRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
+	}
+	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
+	var run domain.DepreciationRun
+	_ = json.NewDecoder(createRunRR.Body).Decode(&run)
+	if rr := doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/freeze", nil, "preparer-1"); rr.Code != http.StatusOK {
+		t.Fatalf("freeze failed: %d %s", rr.Code, rr.Body.String())
+	}
+
+	callsBeforeValidate := pub.calls
+	if rr := doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/validate", nil, "preparer-1"); rr.Code != http.StatusOK {
+		t.Fatalf("validate failed: %d %s", rr.Code, rr.Body.String())
+	}
+	if pub.calls != callsBeforeValidate+1 {
+		t.Fatalf("expected 1 new publish call (DepreciationRunCalculated), got %d", pub.calls-callsBeforeValidate)
+	}
+
+	callsBeforeApprove := pub.calls
+	if rr := doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/approve", nil, "approver-1"); rr.Code != http.StatusOK {
+		t.Fatalf("approve failed: %d %s", rr.Code, rr.Body.String())
+	}
+	if pub.calls != callsBeforeApprove+1 {
+		t.Fatalf("expected 1 new publish call (DepreciationRunApproved), got %d", pub.calls-callsBeforeApprove)
+	}
+
+	if rr := doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/emit", nil, "approver-1"); rr.Code != http.StatusOK {
+		t.Fatalf("emit failed: %d %s", rr.Code, rr.Body.String())
+	}
+
+	callsBeforeSupersede := pub.calls
+	supersedeRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/supersede", domain.SupersedeDepreciationRunRequest{Reason: "correcting an error"}, "preparer-1")
+	if supersedeRR.Code != http.StatusOK {
+		t.Fatalf("supersede failed: %d %s", supersedeRR.Code, supersedeRR.Body.String())
+	}
+	if pub.calls != callsBeforeSupersede+1 {
+		t.Fatalf("expected 1 new publish call (DepreciationRunSuperseded), got %d", pub.calls-callsBeforeSupersede)
+	}
+}
+
 // ── ApproveDepreciationRun (self-approval SoD) ───────────────────────────────
 
 func TestApproveDepreciationRun_SameCreator_Returns403(t *testing.T) {
@@ -340,6 +402,58 @@ func TestGetDepreciationCompleteness_NeverRun_ZeroCovered(t *testing.T) {
 	_ = json.NewDecoder(rr.Body).Decode(&out)
 	if out["eligible_count"] != 1 || out["covered_count"] != 0 {
 		t.Fatalf("expected eligible=1 covered=0 (schedule exists but no run for this period yet), got %+v", out)
+	}
+}
+
+// ── GetAccumulatedDepreciation / GetDepreciationAsOf / ListRunExceptions ─────
+
+func TestGetAccumulatedDepreciation_AfterRun_ReturnsLatestLine(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{postJournalID: "jrnl-acc-dep"}
+	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	assetID := createActiveAsset(t, s, r, "le-1")
+	buildRR := doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
+	var sch domain.DepreciationSchedule
+	_ = json.NewDecoder(buildRR.Body).Decode(&sch)
+
+	runReq := domain.CreateDepreciationRunRequest{
+		LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
+	}
+	createRunRR := doReq(r, http.MethodPost, "/v1/depreciation-runs/", runReq, "preparer-1")
+	var run domain.DepreciationRun
+	_ = json.NewDecoder(createRunRR.Body).Decode(&run)
+	doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/freeze", nil, "preparer-1")
+	doReq(r, http.MethodPost, "/v1/depreciation-runs/"+run.RunID+"/validate", nil, "preparer-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/depreciation-schedules/"+sch.ScheduleID+"/accumulated-depreciation", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]float64
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out["accumulated_depreciation"] != 1000 {
+		t.Fatalf("expected 1000 (12000/12 after one month), got %v", out["accumulated_depreciation"])
+	}
+}
+
+func TestListRunExceptions_UnrunSchedule_ReturnsIt(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	assetID := createActiveAsset(t, s, r, "le-1")
+	buildRR := doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(assetID), "preparer-1")
+	if buildRR.Code != http.StatusCreated {
+		t.Fatalf("build schedule failed: %d %s", buildRR.Code, buildRR.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/depreciation-runs/exceptions?legal_entity_id=le-1&fiscal_period=2026-01", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var list []domain.DepreciationSchedule
+	_ = json.NewDecoder(rr.Body).Decode(&list)
+	if len(list) != 1 {
+		t.Fatalf("expected 1 exception (never run for this period), got %+v", list)
 	}
 }
 

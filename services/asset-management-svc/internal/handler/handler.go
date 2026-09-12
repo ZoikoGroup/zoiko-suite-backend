@@ -22,6 +22,11 @@ type Store interface {
 	CreateAsset(ctx context.Context, a *domain.FixedAsset) error
 	GetAsset(ctx context.Context, assetID string) (*domain.FixedAsset, error)
 	ListAssets(ctx context.Context, legalEntityID string) ([]domain.FixedAsset, error)
+	// AST-01's own remaining named queries.
+	GetAssetComponents(ctx context.Context, assetID string) ([]domain.AssetComponent, error)
+	GetAssetBookProfiles(ctx context.Context, assetID string) ([]domain.AssetBookAssignment, error)
+	GetAssetAsOf(ctx context.Context, assetID string, asOf time.Time) (*domain.FixedAsset, error)
+	GetAssetSourceLineage(ctx context.Context, assetID string) ([]domain.FixedAsset, error)
 	// GetNetBookValueTotal backs GET /v1/assets/net-book-value — see
 	// internal/store/depreciation_store.go's own doc comment. Serves the
 	// AST/INV/PRJ domain spec's own §9 "Assets → GL" reconciliation
@@ -32,6 +37,12 @@ type Store interface {
 	// Serves the AST/INV/PRJ domain spec's own §9 "Depreciation
 	// completeness" assertion.
 	GetDepreciationCompleteness(ctx context.Context, legalEntityID, fiscalPeriod string) (coveredCount, eligibleCount int, err error)
+	// AST-02's own remaining named queries.
+	GetAccumulatedDepreciation(ctx context.Context, scheduleVersionID string) (float64, error)
+	GetDepreciationAsOf(ctx context.Context, scheduleVersionID string, asOf time.Time) (float64, error)
+	ListRunExceptions(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.DepreciationSchedule, error)
+	// AST-03's own remaining named query.
+	GetAssetBookStateAsOf(ctx context.Context, assetID, bookID string, asOf time.Time) (*domain.DepreciationSchedule, error)
 	AddComponent(ctx context.Context, c *domain.AssetComponent) error
 	AssignBookProfile(ctx context.Context, b *domain.AssetBookAssignment) error
 	RegisterAsset(ctx context.Context, assetID, principalID string, at time.Time) error
@@ -98,6 +109,21 @@ type Publisher interface {
 	// internal/events's own doc comment.
 	PublishDepreciationRunAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID, journalID string)
 	PublishAssetEventAccountingEventEmitted(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, journalID string)
+
+	// AST-02's remaining named events — see internal/events's own doc comment.
+	PublishDepreciationScheduleBuilt(ctx context.Context, correlationID, actorID string, s domain.DepreciationSchedule)
+	PublishDepreciationRunCalculated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID string, lineCount int)
+	PublishDepreciationRunApproved(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID string)
+	PublishDepreciationRunSuperseded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID string)
+
+	// AST-03's remaining named events — see internal/events's own doc comment.
+	PublishAssetEventCreated(ctx context.Context, correlationID, actorID string, e domain.AssetEvent)
+	PublishAssetEventApproved(ctx context.Context, correlationID, actorID string, e domain.AssetEvent)
+	PublishAssetEventApplied(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID string)
+	PublishAssetImpaired(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, assetID string, amount *float64)
+	PublishAssetRevalued(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, assetID string, amount *float64)
+	PublishAssetDisposed(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, assetID string, proceeds *float64)
+	PublishAssetEventReversed(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, status string)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -181,6 +207,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/", h.ListAssets)
 		r.Get("/net-book-value", h.GetNetBookValueTotal)
 		r.Get("/{id}", h.GetAsset)
+		r.Get("/{id}/as-of", h.GetAssetAsOf)
+		r.Get("/{id}/components", h.GetAssetComponents)
+		r.Get("/{id}/book-profiles", h.GetAssetBookProfiles)
+		r.Get("/{id}/source-lineage", h.GetAssetSourceLineage)
+		r.Get("/{id}/book-state-as-of", h.GetAssetBookStateAsOf)
+		r.Get("/{id}/explain-state", h.ExplainAssetState)
 		r.Post("/{id}/approve", h.ApproveAssetRegistration)
 		r.Post("/{id}/components", h.AddComponent)
 		r.Post("/{id}/book-profiles", h.AssignAssetBookProfile)
@@ -197,10 +229,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/", h.BuildDepreciationSchedule)
 		r.Get("/completeness", h.GetDepreciationCompleteness)
 		r.Get("/{id}", h.GetDepreciationSchedule)
+		r.Get("/{id}/accumulated-depreciation", h.GetAccumulatedDepreciation)
+		r.Get("/{id}/as-of", h.GetDepreciationAsOf)
 		r.Post("/{id}/recalculate", h.RecalculateSchedule)
 	})
 	r.Route("/v1/depreciation-runs", func(r chi.Router) {
 		r.Post("/", h.CreateDepreciationRun)
+		r.Get("/exceptions", h.ListRunExceptions)
 		r.Get("/{id}", h.GetDepreciationRun)
 		r.Post("/{id}/freeze", h.FreezeDepreciationPopulation)
 		r.Post("/{id}/validate", h.ValidateDepreciationRun)
@@ -284,6 +319,128 @@ func (h *Handler) GetAsset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a)
+}
+
+// ── GET /v1/assets/{id}/as-of, /components, /book-profiles, /source-lineage ──
+
+func (h *Handler) GetAssetAsOf(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	asOf := time.Now().UTC()
+	if dateParam := r.URL.Query().Get("date"); dateParam != "" {
+		parsed, err := time.Parse(time.RFC3339, dateParam)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_date", "date must be RFC3339")
+			return
+		}
+		asOf = parsed
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	a, err := h.store.GetAssetAsOf(r.Context(), id, asOf)
+	if err != nil {
+		h.writeAssetErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, a.LegalEntityID, actionAssetView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, a)
+}
+
+func (h *Handler) GetAssetComponents(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	a, err := h.store.GetAsset(r.Context(), id)
+	if err != nil {
+		h.writeAssetErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, a.LegalEntityID, actionAssetView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	list, err := h.store.GetAssetComponents(r.Context(), id)
+	if err != nil {
+		h.log.Error("GetAssetComponents: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.AssetComponent{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (h *Handler) GetAssetBookProfiles(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	a, err := h.store.GetAsset(r.Context(), id)
+	if err != nil {
+		h.writeAssetErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, a.LegalEntityID, actionAssetView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	list, err := h.store.GetAssetBookProfiles(r.Context(), id)
+	if err != nil {
+		h.log.Error("GetAssetBookProfiles: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.AssetBookAssignment{}
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+func (h *Handler) GetAssetSourceLineage(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	a, err := h.store.GetAsset(r.Context(), id)
+	if err != nil {
+		h.writeAssetErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, a.LegalEntityID, actionAssetView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	list, err := h.store.GetAssetSourceLineage(r.Context(), id)
+	if err != nil {
+		h.log.Error("GetAssetSourceLineage: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.FixedAsset{}
+	}
+	writeJSON(w, http.StatusOK, list)
 }
 
 // GetNetBookValueTotal is a read-only aggregate over real, live schedule

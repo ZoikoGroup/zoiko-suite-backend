@@ -373,3 +373,76 @@ func TestPgStore_GetDepreciationCompleteness_RealDB(t *testing.T) {
 		t.Fatalf("expected eligible=1 covered=0 for an unrun period, got eligible=%d covered=%d", eligibleOtherPeriod, coveredOtherPeriod)
 	}
 }
+
+// TestPgStore_GetAccumulatedDepreciation_And_ListRunExceptions_RealDB
+// proves the real queries against actual Postgres: accumulated
+// depreciation before/after a run, and a schedule that's eligible but
+// was never run showing up as an exception.
+func TestPgStore_GetAccumulatedDepreciation_And_ListRunExceptions_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	a := activeAssetInStore(t, ctx, s, tenantID, "le-1")
+	sch := newTestSchedule(tenantID, a) // cost_basis=12000, useful_life=12 -> 1000/month
+	if err := s.CreateDepreciationSchedule(ctx, sch); err != nil {
+		t.Fatalf("CreateDepreciationSchedule: %v", err)
+	}
+
+	before, err := s.GetAccumulatedDepreciation(ctx, sch.ScheduleVersionID)
+	if err != nil {
+		t.Fatalf("GetAccumulatedDepreciation (before any run): %v", err)
+	}
+	if before != 0 {
+		t.Fatalf("expected 0 before any run, got %v", before)
+	}
+
+	exceptions, err := s.ListRunExceptions(ctx, "le-1", "2026-01")
+	if err != nil {
+		t.Fatalf("ListRunExceptions (before any run): %v", err)
+	}
+	if len(exceptions) != 1 || exceptions[0].ScheduleVersionID != sch.ScheduleVersionID {
+		t.Fatalf("expected exactly 1 exception (this schedule, never run), got %+v", exceptions)
+	}
+
+	run := &domain.DepreciationRun{
+		RunID: uuid.New().String(), LegalEntityID: "le-1", FiscalPeriod: "2026-01",
+		DepreciationExpenseAccountCode: "6400-Depr", AccumulatedDepreciationAccountCode: "1590-AccumDepr",
+		Status: domain.DepreciationRunStatusDraft, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateDepreciationRun(ctx, run); err != nil {
+		t.Fatalf("CreateDepreciationRun: %v", err)
+	}
+	now := time.Now().UTC()
+	if _, err := s.FreezeDepreciationPopulation(ctx, run.RunID, "le-1", now); err != nil {
+		t.Fatalf("FreezeDepreciationPopulation: %v", err)
+	}
+	if _, err := s.ValidateDepreciationRun(ctx, run.RunID, now); err != nil {
+		t.Fatalf("ValidateDepreciationRun: %v", err)
+	}
+
+	after, err := s.GetAccumulatedDepreciation(ctx, sch.ScheduleVersionID)
+	if err != nil {
+		t.Fatalf("GetAccumulatedDepreciation (after run): %v", err)
+	}
+	if after != 1000 {
+		t.Fatalf("expected 1000 after one month, got %v", after)
+	}
+
+	asOfBefore, err := s.GetDepreciationAsOf(ctx, sch.ScheduleVersionID, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatalf("GetDepreciationAsOf (before the run): %v", err)
+	}
+	if asOfBefore != 0 {
+		t.Fatalf("expected 0 as-of a time before the run posted, got %v", asOfBefore)
+	}
+
+	noLongerException, err := s.ListRunExceptions(ctx, "le-1", "2026-01")
+	if err != nil {
+		t.Fatalf("ListRunExceptions (after run): %v", err)
+	}
+	if len(noLongerException) != 0 {
+		t.Fatalf("expected 0 exceptions once the schedule is covered by a run, got %+v", noLongerException)
+	}
+}

@@ -68,7 +68,8 @@ func (h *Handler) createAssetEvent(w http.ResponseWriter, r *http.Request, req d
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 
@@ -100,7 +101,7 @@ func (h *Handler) createAssetEvent(w http.ResponseWriter, r *http.Request, req d
 		effectiveDate = *req.EffectiveDate
 	}
 	e := &domain.AssetEvent{
-		EventID: uuid.NewString(), LegalEntityID: asset.LegalEntityID, AssetID: req.AssetID,
+		EventID: uuid.NewString(), TenantID: tenantID, LegalEntityID: asset.LegalEntityID, AssetID: req.AssetID,
 		EventType: req.EventType, Status: domain.AssetEventStatusDraft,
 		SourceDocumentRef: req.SourceDocumentRef, Amount: req.Amount, EffectiveDate: effectiveDate,
 		FiscalPeriod: req.FiscalPeriod, ProceedsAmount: req.ProceedsAmount,
@@ -139,6 +140,7 @@ func (h *Handler) createAssetEvent(w http.ResponseWriter, r *http.Request, req d
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	h.publisher.PublishAssetEventCreated(r.Context(), getCorrelationID(r), principalID, *e)
 	writeJSON(w, http.StatusCreated, e)
 }
 
@@ -188,6 +190,83 @@ func (h *Handler) RecordComponentReplacement(w http.ResponseWriter, r *http.Requ
 	}
 	req.EventType = domain.AssetEventTypeComponentReplacement
 	h.createAssetEvent(w, r, req)
+}
+
+// ── GET /v1/assets/{id}/book-state-as-of ─────────────────────────────────────
+
+func (h *Handler) GetAssetBookStateAsOf(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	bookID := r.URL.Query().Get("book_id")
+	if bookID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "book_id is required")
+		return
+	}
+	asOf := time.Now().UTC()
+	if dateParam := r.URL.Query().Get("date"); dateParam != "" {
+		parsed, err := time.Parse(time.RFC3339, dateParam)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_date", "date must be RFC3339")
+			return
+		}
+		asOf = parsed
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	asset, err := h.store.GetAsset(r.Context(), id)
+	if err != nil {
+		h.writeAssetErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, asset.LegalEntityID, actionAssetEventView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	sch, err := h.store.GetAssetBookStateAsOf(r.Context(), id, bookID, asOf)
+	if err != nil {
+		h.writeDepreciationErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sch)
+}
+
+// ── GET /v1/assets/{id}/explain-state ────────────────────────────────────────
+
+// ExplainAssetState composes the asset's own current row with its full
+// event history — assembled at the handler layer from existing
+// GetAsset+ListAssetEvents, no new SQL needed.
+func (h *Handler) ExplainAssetState(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	asset, err := h.store.GetAsset(r.Context(), id)
+	if err != nil {
+		h.writeAssetErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, asset.LegalEntityID, actionAssetEventView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	events, err := h.store.ListAssetEvents(r.Context(), id)
+	if err != nil {
+		h.log.Error("ExplainAssetState: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if events == nil {
+		events = []domain.AssetEvent{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"asset": asset, "events": events})
 }
 
 // ── GET /v1/asset-events/{id}, GET /v1/asset-events?asset_id= ───────────────
@@ -317,6 +396,7 @@ func (h *Handler) ApproveAssetEvent(w http.ResponseWriter, r *http.Request) {
 		h.writeAssetEventErr(w, err)
 		return
 	}
+	h.publisher.PublishAssetEventApproved(r.Context(), getCorrelationID(r), principalID, *e)
 	writeJSON(w, http.StatusOK, map[string]string{"event_id": id, "status": domain.AssetEventStatusApproved})
 }
 
@@ -388,6 +468,16 @@ func (h *Handler) ApplyAssetEvent(w http.ResponseWriter, r *http.Request) {
 	if journalID != nil {
 		status = domain.AssetEventStatusAccountingEventEmitted
 		h.publisher.PublishAssetEventAccountingEventEmitted(r.Context(), getCorrelationID(r), principalID, tenantID, e.LegalEntityID, id, *journalID)
+	}
+	correlationID := getCorrelationID(r)
+	h.publisher.PublishAssetEventApplied(r.Context(), correlationID, principalID, tenantID, e.LegalEntityID, id)
+	switch e.EventType {
+	case domain.AssetEventTypeImpairment:
+		h.publisher.PublishAssetImpaired(r.Context(), correlationID, principalID, tenantID, e.LegalEntityID, id, e.AssetID, e.Amount)
+	case domain.AssetEventTypeRevaluation:
+		h.publisher.PublishAssetRevalued(r.Context(), correlationID, principalID, tenantID, e.LegalEntityID, id, e.AssetID, e.Amount)
+	case domain.AssetEventTypeDisposal:
+		h.publisher.PublishAssetDisposed(r.Context(), correlationID, principalID, tenantID, e.LegalEntityID, id, e.AssetID, e.ProceedsAmount)
 	}
 	resp := map[string]any{"event_id": id, "status": status}
 	if journalID != nil {
@@ -461,6 +551,7 @@ func (h *Handler) correctAssetEvent(w http.ResponseWriter, r *http.Request, supe
 		h.writeAssetEventErr(w, err)
 		return
 	}
+	h.publisher.PublishAssetEventReversed(r.Context(), getCorrelationID(r), principalID, tenantID, e.LegalEntityID, id, status)
 	writeJSON(w, http.StatusOK, map[string]string{"event_id": id, "status": status})
 }
 

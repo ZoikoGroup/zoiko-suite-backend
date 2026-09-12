@@ -247,6 +247,16 @@ type LocationHierarchyVersion struct {
 	CreatedByPrincipalID string    `json:"created_by_principal_id"`
 }
 
+// LocationInventorySummaryLine is one row of INV-02's own
+// GetLocationInventorySummary query — the location-centric counterpart to
+// INV-03's item-centric GetOnHand: net on-hand quantity per item currently
+// resident at a given location, derived the same way liveOnHand is (from
+// committed movements, never an editable balance).
+type LocationInventorySummaryLine struct {
+	ItemID         string  `json:"item_id"`
+	OnHandQuantity float64 `json:"on_hand_quantity"`
+}
+
 // ── Request types ────────────────────────────────────────────────────────
 
 type CreateInventoryLocationRequest struct {

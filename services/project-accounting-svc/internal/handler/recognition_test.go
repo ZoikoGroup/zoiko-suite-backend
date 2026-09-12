@@ -253,3 +253,142 @@ func TestSupersedeRecognitionRun_Succeeds(t *testing.T) {
 		t.Fatalf("expected SUPERSEDED, got %q", s.runs[run.RunID].Status)
 	}
 }
+
+// ── GetRevenueSchedule / GetWIPOrContractBalance / GetProgressEvidence /
+// GetRecognitionAsOf / ExplainRecognition ────────────────────────────────────
+
+func TestGetRevenueSchedule_ReturnsFullRunHistory(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createRunReadyProject(t, r, "le-1", "REC-11")
+	createDraftRun(t, r, id, "2026-08")
+	time.Sleep(10 * time.Millisecond)
+	createDraftRun(t, r, id, "2026-09")
+
+	rr := doReq(r, http.MethodGet, "/v1/recognition/revenue-schedule?project_id="+id, nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var runs []domain.RecognitionRun
+	_ = json.NewDecoder(rr.Body).Decode(&runs)
+	if len(runs) != 2 {
+		t.Fatalf("expected 2 runs (one per fiscal period), got %+v", runs)
+	}
+	if runs[0].FiscalPeriod != "2026-08" || runs[1].FiscalPeriod != "2026-09" {
+		t.Fatalf("expected runs ordered oldest first, got %+v", runs)
+	}
+}
+
+func TestGetWIPOrContractBalance_ReturnsLatestLiveRun(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createRunReadyProject(t, r, "le-1", "REC-12")
+	run := createDraftRun(t, r, id, "2026-09")
+	calc := doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/calculate", nil, "preparer-1")
+	if calc.Code != http.StatusOK {
+		t.Fatalf("calculate failed: %d %s", calc.Code, calc.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/recognition/wip-or-contract-balance?project_id="+id, nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if resp["run_id"] != run.RunID {
+		t.Fatalf("expected the live run's own balance, got %+v", resp)
+	}
+}
+
+func TestGetWIPOrContractBalance_AfterSupersede_ExcludesSupersededRun(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{}
+	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	id := createRunReadyProject(t, r, "le-1", "REC-13")
+	run := createDraftRun(t, r, id, "2026-09")
+
+	sup := doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/supersede", domain.SupersedeRecognitionRunRequest{Reason: "wrong estimate"}, "manager-1")
+	if sup.Code != http.StatusOK {
+		t.Fatalf("supersede failed: %d %s", sup.Code, sup.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/recognition/wip-or-contract-balance?project_id="+id, nil, "reader-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 (no live run left), got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetProgressEvidence_ReturnsCalculationInputs(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createRunReadyProject(t, r, "le-1", "REC-14")
+	run := createDraftRun(t, r, id, "2026-09")
+	doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/calculate", nil, "preparer-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/recognition/progress-evidence?project_id="+id, nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]any
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if resp["run_id"] != run.RunID {
+		t.Fatalf("expected run_id=%s, got %+v", run.RunID, resp)
+	}
+	if _, ok := resp["percent_complete"]; !ok {
+		t.Fatal("expected progress evidence to include percent_complete")
+	}
+}
+
+func TestGetRecognitionAsOf_BeforeSupersede_ReturnsOriginalRun(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{}
+	r := newRouterWithLedger(s, &stubPublisher{}, &stubAuthZ{}, ledger)
+	id := createRunReadyProject(t, r, "le-1", "REC-15")
+	run := createDraftRun(t, r, id, "2026-09")
+	cutoff := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond)
+
+	sup := doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/supersede", domain.SupersedeRecognitionRunRequest{Reason: "wrong estimate"}, "manager-1")
+	if sup.Code != http.StatusOK {
+		t.Fatalf("supersede failed: %d %s", sup.Code, sup.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/recognition/as-of?project_id="+id+"&at="+cutoff.Format(time.RFC3339Nano), nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var asOfRun domain.RecognitionRun
+	_ = json.NewDecoder(rr.Body).Decode(&asOfRun)
+	if asOfRun.RunID != run.RunID {
+		t.Fatalf("expected the run as it stood before the supersede, got %+v", asOfRun)
+	}
+
+	// As of now (after the supersede), no live run remains.
+	after := doReq(r, http.MethodGet, "/v1/recognition/as-of?project_id="+id, nil, "reader-1")
+	if after.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 as of now, got %d: %s", after.Code, after.Body.String())
+	}
+}
+
+func TestExplainRecognition_ComposesRunAndEstimate(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createRunReadyProject(t, r, "le-1", "REC-16")
+	run := createDraftRun(t, r, id, "2026-09")
+	doReq(r, http.MethodPost, "/v1/recognition/runs/"+run.RunID+"/calculate", nil, "preparer-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/recognition/explain?project_id="+id, nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]json.RawMessage
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	var explainedRun domain.RecognitionRun
+	if err := json.Unmarshal(resp["run"], &explainedRun); err != nil || explainedRun.RunID != run.RunID {
+		t.Fatalf("expected explain to include the current run, got %s (err=%v)", resp["run"], err)
+	}
+	var estimate domain.RecognitionEstimate
+	if err := json.Unmarshal(resp["approved_estimate"], &estimate); err != nil || estimate.EstimateToComplete != 100 {
+		t.Fatalf("expected explain to include the approved estimate, got %s (err=%v)", resp["approved_estimate"], err)
+	}
+}
