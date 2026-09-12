@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -44,14 +45,14 @@ func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(tx pgx.T
 
 const roleColumns = `
 	role_definition_id, tenant_id, role_code, role_name, role_scope_type,
-	status, created_by_principal_id, correlation_id, created_at, updated_at
+	status, created_by_principal_id, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at
 `
 
 func scanRole(row pgx.Row, r *domain.RoleDefinition) error {
 	var status string
 	if err := row.Scan(
 		&r.RoleDefinitionID, &r.TenantID, &r.RoleCode, &r.RoleName, &r.RoleScopeType,
-		&status, &r.CreatedByPrincipalID, &r.CorrelationID, &r.CreatedAt, &r.UpdatedAt,
+		&status, &r.CreatedByPrincipalID, &r.UpdatedByPrincipalID, &r.CorrelationID, &r.CreatedAt, &r.UpdatedAt,
 	); err != nil {
 		return err
 	}
@@ -112,7 +113,7 @@ func (s *PgStore) GetRole(ctx context.Context, roleDefinitionID string) (*domain
 	return &r, nil
 }
 
-func (s *PgStore) ListRoles(ctx context.Context, status string) ([]domain.RoleDefinition, error) {
+func (s *PgStore) ListRoles(ctx context.Context, filter domain.ListFilter) ([]domain.RoleDefinition, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
@@ -122,11 +123,30 @@ func (s *PgStore) ListRoles(ctx context.Context, status string) ([]domain.RoleDe
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		query := "SELECT " + roleColumns + " FROM role_definitions WHERE tenant_id = $1"
 		args := []any{tenantID}
-		if status != "" {
-			args = append(args, status)
+		if filter.Status != "" {
+			args = append(args, filter.Status)
 			query += fmt.Sprintf(" AND status = $%d", len(args))
 		}
+		if filter.ScopeType != "" {
+			args = append(args, filter.ScopeType)
+			query += fmt.Sprintf(" AND role_scope_type = $%d", len(args))
+		}
+		if filter.Query != "" {
+			args = append(args, "%"+filter.Query+"%")
+			// The user searched, so match on the two human/administrative names
+			// together — a role_code is how the platform scopes its checks, and
+			// role_name is how an administrator thinks about the role.
+			query += fmt.Sprintf(" AND (role_code ILIKE $%d OR role_name ILIKE $%d)", len(args), len(args))
+		}
 		query += " ORDER BY created_at DESC"
+		if filter.Limit > 0 {
+			args = append(args, filter.Limit)
+			query += fmt.Sprintf(" LIMIT $%d", len(args))
+		}
+		if filter.Offset > 0 {
+			args = append(args, filter.Offset)
+			query += fmt.Sprintf(" OFFSET $%d", len(args))
+		}
 
 		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
@@ -148,7 +168,7 @@ func (s *PgStore) ListRoles(ctx context.Context, status string) ([]domain.RoleDe
 	return out, nil
 }
 
-func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, status string) (*domain.RoleDefinition, error) {
+func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string) (*domain.RoleDefinition, error) {
 	tenantID := svcmiddleware.TenantFromContext(ctx)
 	if tenantID == "" {
 		return nil, domain.ErrIdentityMissing
@@ -173,9 +193,9 @@ func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, st
 		}
 
 		if _, err := tx.Exec(ctx, `
-			UPDATE role_definitions SET role_name = $1, status = $2, updated_at = now()
-			WHERE tenant_id = $3 AND role_definition_id = $4
-		`, roleName, status, tenantID, roleDefinitionID); err != nil {
+			UPDATE role_definitions SET role_name = $1, status = $2, updated_by_principal_id = $3, updated_at = now()
+			WHERE tenant_id = $4 AND role_definition_id = $5
+		`, roleName, status, updatedByPrincipalID, tenantID, roleDefinitionID); err != nil {
 			return err
 		}
 
@@ -192,13 +212,13 @@ func (s *PgStore) UpdateRole(ctx context.Context, roleDefinitionID, roleName, st
 
 const bundleColumns = `
 	bundle_id, tenant_id, role_definition_id, bundle_code, permitted_actions,
-	active_flag, correlation_id, created_at, updated_at
+	active_flag, COALESCE(updated_by_principal_id, '') AS updated_by_principal_id, correlation_id, created_at, updated_at
 `
 
 func scanBundle(row pgx.Row, b *domain.PermissionBundleDef) error {
 	return row.Scan(
 		&b.BundleID, &b.TenantID, &b.RoleDefinitionID, &b.BundleCode, &b.PermittedActions,
-		&b.ActiveFlag, &b.CorrelationID, &b.CreatedAt, &b.UpdatedAt,
+		&b.ActiveFlag, &b.UpdatedByPrincipalID, &b.CorrelationID, &b.CreatedAt, &b.UpdatedAt,
 	)
 }
 
@@ -244,6 +264,140 @@ func (s *PgStore) ListBundles(ctx context.Context, roleDefinitionID string) ([]d
 	var out []domain.PermissionBundleDef
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, "SELECT "+bundleColumns+" FROM permission_bundle_defs WHERE tenant_id = $1 AND role_definition_id = $2 ORDER BY created_at DESC", tenantID, roleDefinitionID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var b domain.PermissionBundleDef
+			if err := scanBundle(rows, &b); err != nil {
+				return err
+			}
+			out = append(out, b)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetBundle reads one bundle, addressed by BOTH ids because it is written
+// under a role's collection: a bundle_id that exists but belongs to a
+// different role is indistinguishable from one that does not exist. That is
+// deliberate — see ErrBundleNotFound's stance on existence oracles.
+func (s *PgStore) GetBundle(ctx context.Context, roleDefinitionID, bundleID string) (*domain.PermissionBundleDef, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var b domain.PermissionBundleDef
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, "SELECT "+bundleColumns+" FROM permission_bundle_defs WHERE tenant_id = $1 AND role_definition_id = $2 AND bundle_id = $3", tenantID, roleDefinitionID, bundleID)
+		return scanBundle(row, &b)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrBundleNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+// UpdateBundle applies an edit to one bundle and stamps the verified caller.
+// nil permittedActions / nil activeFlag mean "leave that field alone"; both
+// nil would be a no-op, which the handler refuses before reaching here.
+//
+// Scoped by roleDefinitionID as well as bundleID, matching GetBundle: a write
+// addressed under the wrong role resolves to ErrBundleNotFound rather than
+// editing another role's bundle.
+func (s *PgStore) UpdateBundle(ctx context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string) (*domain.PermissionBundleDef, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out domain.PermissionBundleDef
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, "SELECT "+bundleColumns+" FROM permission_bundle_defs WHERE tenant_id = $1 AND role_definition_id = $2 AND bundle_id = $3 FOR UPDATE", tenantID, roleDefinitionID, bundleID)
+		if err := scanBundle(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrBundleNotFound
+			}
+			return err
+		}
+
+		sets := []string{}
+		args := []any{}
+		if permittedActions != nil {
+			args = append(args, permittedActions)
+			sets = append(sets, fmt.Sprintf("permitted_actions = $%d", len(args)))
+		}
+		if activeFlag != nil {
+			args = append(args, *activeFlag)
+			sets = append(sets, fmt.Sprintf("active_flag = $%d", len(args)))
+		}
+		args = append(args, updatedByPrincipalID)
+		sets = append(sets, fmt.Sprintf("updated_by_principal_id = $%d", len(args)))
+		if len(sets) == 0 {
+			return nil
+		}
+		sets = append(sets, "updated_at = now()")
+		query := fmt.Sprintf("UPDATE permission_bundle_defs SET %s WHERE tenant_id = $%d AND role_definition_id = $%d AND bundle_id = $%d",
+			strings.Join(sets, ", "), len(args)+1, len(args)+2, len(args)+3)
+		if _, err := tx.Exec(ctx, query, append(args, tenantID, roleDefinitionID, bundleID)...); err != nil {
+			return err
+		}
+
+		row = tx.QueryRow(ctx, "SELECT "+bundleColumns+" FROM permission_bundle_defs WHERE tenant_id = $1 AND bundle_id = $2", tenantID, bundleID)
+		return scanBundle(row, &out)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListAllBundles reads every bundle in the tenant, optionally narrowed to one
+// role or one active state. The flat catalogue the role-scoped ListBundles
+// cannot provide, and the read a detach flow needs to pick one bundle across
+// roles.
+func (s *PgStore) ListAllBundles(ctx context.Context, filter domain.BundleListFilter) ([]domain.PermissionBundleDef, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+
+	var out []domain.PermissionBundleDef
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		query := "SELECT " + bundleColumns + " FROM permission_bundle_defs WHERE tenant_id = $1"
+		args := []any{tenantID}
+		if filter.RoleID != "" {
+			args = append(args, filter.RoleID)
+			query += fmt.Sprintf(" AND role_definition_id = $%d", len(args))
+		}
+		if filter.ActiveFlag != nil {
+			args = append(args, *filter.ActiveFlag)
+			query += fmt.Sprintf(" AND active_flag = $%d", len(args))
+		}
+		if filter.Query != "" {
+			args = append(args, "%"+filter.Query+"%")
+			query += fmt.Sprintf(" AND bundle_code ILIKE $%d", len(args))
+		}
+		query += " ORDER BY created_at DESC"
+		if filter.Limit > 0 {
+			args = append(args, filter.Limit)
+			query += fmt.Sprintf(" LIMIT $%d", len(args))
+		}
+		if filter.Offset > 0 {
+			args = append(args, filter.Offset)
+			query += fmt.Sprintf(" OFFSET $%d", len(args))
+		}
+
+		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return err
 		}

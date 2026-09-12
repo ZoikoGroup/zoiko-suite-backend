@@ -331,7 +331,7 @@ func TestStorePredicateScopesReads(t *testing.T) {
 // unscoped query. Defaulting it would make a dropped header look like an empty
 // catalogue.
 func TestStoreRefusesWithoutTenant(t *testing.T) {
-	_, err := testStore.ListRoles(context.Background(), "")
+	_, err := testStore.ListRoles(context.Background(), domain.ListFilter{})
 	require.ErrorIs(t, err, domain.ErrIdentityMissing)
 }
 
@@ -340,7 +340,7 @@ func TestStoreUpdateCannotCrossTenants(t *testing.T) {
 	idB := seedRole(t, tenantB, "UPD_B_"+uuid.NewString()[:8])
 
 	ctxA := svcmiddleware.WithTenant(context.Background(), tenantA)
-	_, err := testStore.UpdateRole(ctxA, idB, "Renamed By Other Tenant", "RETIRED")
+	_, err := testStore.UpdateRole(ctxA, idB, "Renamed By Other Tenant", "RETIRED", "admin-seed")
 	require.ErrorIs(t, err, domain.ErrRoleNotFound,
 		"tenant %s retired tenant %s's role", tenantA, tenantB)
 

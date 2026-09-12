@@ -2417,7 +2417,9 @@ services:
         condition: service_healthy
       general-ledger-svc:
         condition: service_healthy
-      tenant-entity-registry-svc:
+      # depends_on takes the compose KEY, not the container_name — see the
+      # intercompany-accounting-svc block above for the full trap.
+      tenant-svc:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8105/healthz"]

@@ -97,6 +97,8 @@ func (s *stubStore) TransitionInvoice(
 	tenantID, invoiceID string,
 	from, to domain.InvoiceStatus,
 	actorPrincipalID string,
+	paymentDate *domain.CalendarDate,
+	paymentReference *string,
 ) (*domain.CustomerInvoice, error) {
 	if s.transitionErr != nil {
 		return nil, s.transitionErr
@@ -114,6 +116,8 @@ func (s *stubStore) TransitionInvoice(
 		inv.MarkedOverdueByPrincipalID, inv.MarkedOverdueAt = &actorPrincipalID, &now
 	case domain.InvoiceStatusPaid:
 		inv.PaymentReceivedByPrincipalID, inv.PaymentReceivedAt = &actorPrincipalID, &now
+		inv.PaymentDate = paymentDate
+		inv.PaymentReference = paymentReference
 	}
 	copied := *inv
 	return &copied, nil
@@ -265,6 +269,12 @@ func doRequestAs(r chi.Router, method, path string, body any, principalID, tenan
 
 // ── CreateInvoice ────────────────────────────────────────────────────────────
 
+// testDate builds a CalendarDate the way an HTML date input or an RFC3339
+// timestamp would arrive.
+func testDate(y int, m time.Month, d int) domain.CalendarDate {
+	return domain.CalendarDate{Time: time.Date(y, m, d, 0, 0, 0, 0, time.UTC)}
+}
+
 func validCreateReq() domain.CreateCustomerInvoiceRequest {
 	return domain.CreateCustomerInvoiceRequest{
 		TenantID:      "t1",
@@ -273,10 +283,20 @@ func validCreateReq() domain.CreateCustomerInvoiceRequest {
 		InvoiceNumber: "INV-001",
 		Amount:        1500,
 		CurrencyCode:  "USD",
-		DueDate:       time.Now().Add(15 * 24 * time.Hour),
+		DueDate:       testDate(2026, 9, 1),
 		CorrelationID: "corr-1",
+
+		// AR-05: the two required dates and lines accounting for the gross.
+		InvoiceDate: testDate(2026, 8, 1),
+		SupplyDate:  testDate(2026, 8, 1),
+		Lines: []domain.CreateCustomerInvoiceLineInput{
+			{Description: "Professional services", NetAmount: 1000, TaxAmount: 200, TaxCode: ptr("S")},
+			{Description: "Hosting", NetAmount: 250, TaxAmount: 50, TaxCode: ptr("Z")},
+		},
 	}
 }
+
+func ptr(s string) *string { return &s }
 
 func TestCreateInvoice_Success(t *testing.T) {
 	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
@@ -1134,5 +1154,276 @@ func TestListInvoices_MalformedLegalEntityFilter_Returns400(t *testing.T) {
 	}
 	if s.lastFilter.LegalEntityID != valid {
 		t.Fatalf("the valid filter did not reach the store: %q", s.lastFilter.LegalEntityID)
+	}
+}
+
+// ── AR-05 input contract ─────────────────────────────────────────────────────
+
+// TestCreateInvoice_NoLines_Returns400 — before AR-05 this service accepted a
+// flat `amount` and no account of what it was for. A document with no lines has
+// nothing to match, tax, or map to accounts.
+func TestCreateInvoice_NoLines_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
+	req := validCreateReq()
+	req.Lines = nil
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an invoice with no lines, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "no_lines") {
+		t.Fatalf("expected no_lines, got %s", rec.Body.String())
+	}
+}
+
+// TestCreateInvoice_LinesDoNotBalance_Returns400 — what the lines say the
+// invoice is for must add up to what it says is receivable. Compared in cents,
+// so 0.1 + 0.2 == 0.3 even in binary floating point.
+func TestCreateInvoice_LinesDoNotBalance_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
+	req := validCreateReq()
+	req.Lines[0].NetAmount = 900
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unbalanced lines, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invoice_does_not_balance") {
+		t.Fatalf("expected invoice_does_not_balance, got %s", rec.Body.String())
+	}
+}
+
+func TestCreateInvoice_MissingInvoiceDate_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
+	req := validCreateReq()
+	req.InvoiceDate = domain.CalendarDate{}
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a missing invoice_date, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invoice_date") {
+		t.Fatalf("expected invoice_date to be named, got %s", rec.Body.String())
+	}
+}
+
+func TestCreateInvoice_MissingSupplyDate_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
+	req := validCreateReq()
+	req.SupplyDate = domain.CalendarDate{}
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a missing supply_date, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "supply_date") {
+		t.Fatalf("expected supply_date to be named, got %s", rec.Body.String())
+	}
+}
+
+// TestCreateInvoice_InvalidLine_Returns400 — an invoice line without a
+// description, or with a negative amount, is not a line.
+func TestCreateInvoice_InvalidLine_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
+	req := validCreateReq()
+	req.Lines[1] = domain.CreateCustomerInvoiceLineInput{NetAmount: -10, TaxAmount: 0}
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/", req, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an invalid line, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_line") {
+		t.Fatalf("expected invalid_line, got %s", rec.Body.String())
+	}
+}
+
+// TestCreateInvoice_UnknownField_Returns400 — a misspelled key is refused rather
+// than silently discarded, so an invoice can never be created missing the value
+// the caller believed they sent.
+func TestCreateInvoice_UnknownField_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, "")
+	var buf bytes.Buffer
+	_ = json.NewEncoder(&buf).Encode(map[string]any{
+		"tenant_id": "t1", "legal_entity_id": "e1", "customer_id": "c1",
+		"invoice_number": "INV-001", "amount": 1500, "currency_code": "USD",
+		"due_date": "2026-09-01", "correlation_id": "corr-1",
+		"invoice_date": "2026-08-01", "supply_date": "2026-08-01",
+		"lines": []map[string]any{
+			{"description": "x", "net_amount": 1500, "tax_amount": 0},
+		},
+		"customer_billing_refr": "typo",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/invoices/", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", "principal-1")
+	req.Header.Set("X-Tenant-Id", testTenant)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown field, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unknown_field") {
+		t.Fatalf("expected unknown_field, got %s", rec.Body.String())
+	}
+}
+
+// ── the send evidence gate ───────────────────────────────────────────────────
+
+// TestSendInvoice_WithoutDocument_Returns422 — an invoice keyed ahead of its
+// scan is a legitimate working state; one SENT without the customer's document
+// behind it is the audit gap. The gate sits on SEND, not on issue.
+func TestSendInvoice_WithoutDocument_Returns422(t *testing.T) {
+	s := newStubStore()
+	s.invoices["i1"] = &domain.CustomerInvoice{
+		InvoiceID: "i1", TenantID: testTenant, LegalEntityID: "e1",
+		Status: domain.InvoiceStatusIssued,
+		Lines:  []domain.CustomerInvoiceLine{{InvoiceLineID: "l1", LineNumber: 1, Description: "x", NetAmount: 100}},
+	}
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, "")
+
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/send", nil, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 sending an invoice with no document, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "invoice_document_required") {
+		t.Fatalf("expected invoice_document_required, got %s", rec.Body.String())
+	}
+	if s.invoices["i1"].Status != domain.InvoiceStatusIssued {
+		t.Fatalf("status changed on a refused send, to %s", s.invoices["i1"].Status)
+	}
+	if pub.sent != 0 {
+		t.Fatalf("invoice.sent was published for a refused send (%d times)", pub.sent)
+	}
+}
+
+// TestSendInvoice_WithDocument_Succeeds is the other side of the gate: a
+// documented invoice is SENT normally.
+func TestSendInvoice_WithDocument_Succeeds(t *testing.T) {
+	s := newStubStore()
+	s.invoices["i1"] = &domain.CustomerInvoice{
+		InvoiceID: "i1", TenantID: testTenant, LegalEntityID: "e1",
+		Status:            domain.InvoiceStatusIssued,
+		InvoiceDocumentID: ptr("doc-112"),
+		Lines:             []domain.CustomerInvoiceLine{{InvoiceLineID: "l1", LineNumber: 1, Description: "x", NetAmount: 100}},
+	}
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, "")
+
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/send", nil, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if pub.sent != 1 {
+		t.Fatalf("expected invoice.sent to be published once, got %d", pub.sent)
+	}
+}
+
+// ── AR SoD: issuer may not record the payment ────────────────────────────────
+
+// TestReceivePayment_IssuerRecordsOwnPayment_Returns403 — billing and
+// cash-handling are different authorities (doc1 §12.3). Without this, the
+// principal who raised the invoice could also discharge it, and no audit trail
+// would ever separate raising the receivable from cashing it.
+func TestReceivePayment_IssuerRecordsOwnPayment_Returns403(t *testing.T) {
+	gl := fakeLedger(t,
+		[]map[string]any{{"journal_id": "j1", "correlation_id": "i1", "status": "FINALIZED"}},
+		map[string]map[string]any{"j1": journalFor("j1", "i1", "FINALIZED", 24500)},
+	)
+
+	s := newStubStore()
+	inv := sentInvoice("i1", testTenant, 24500)
+	inv.CreatedByPrincipalID = "principal-1" // the payer IS the issuer
+	s.invoices["i1"] = inv
+	pub := &stubPublisher{}
+
+	r := newRouter(s, pub, &stubAuthZ{}, gl.URL)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/pay", nil, "principal-1")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a principal recording their own invoice's payment, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "self_payment_not_allowed") {
+		t.Fatalf("expected self_payment_not_allowed, got %s", rec.Body.String())
+	}
+	if s.invoices["i1"].Status != domain.InvoiceStatusSent {
+		t.Fatalf("status changed on a refused payment, to %s", s.invoices["i1"].Status)
+	}
+	if pub.paymentReceived != 0 {
+		t.Fatalf("payment.received was published for a refused self-payment (%d times)", pub.paymentReceived)
+	}
+}
+
+// TestReceivePayment_AnotherPrincipalRecordsPayment_Succeeds — the SoD gate is
+// about who, not what: a different principal discharging the same invoice is the
+// normal case.
+func TestReceivePayment_AnotherPrincipalRecordsPayment_Succeeds(t *testing.T) {
+	gl := fakeLedger(t,
+		[]map[string]any{{"journal_id": "j1", "correlation_id": "i1", "status": "FINALIZED"}},
+		map[string]map[string]any{"j1": journalFor("j1", "i1", "FINALIZED", 24500)},
+	)
+
+	s := newStubStore()
+	inv := sentInvoice("i1", testTenant, 24500)
+	inv.CreatedByPrincipalID = "principal-1" // someone else issued it
+	s.invoices["i1"] = inv
+	pub := &stubPublisher{}
+
+	r := newRouter(s, pub, &stubAuthZ{}, gl.URL)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/pay", nil, "principal-2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a different principal recording payment, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── AR-08 cash application ───────────────────────────────────────────────────
+
+// TestReceivePayment_CarriesTheCashApplicationPayload — the payment body's
+// payment_date and payment_reference are recorded alongside the lifecycle stamp,
+// so the customer's own remittance detail is on the record.
+func TestReceivePayment_CarriesTheCashApplicationPayload(t *testing.T) {
+	gl := fakeLedger(t,
+		[]map[string]any{{"journal_id": "j1", "correlation_id": "i1", "status": "FINALIZED"}},
+		map[string]map[string]any{"j1": journalFor("j1", "i1", "FINALIZED", 24500)},
+	)
+
+	s := newStubStore()
+	inv := sentInvoice("i1", testTenant, 24500)
+	inv.CreatedByPrincipalID = "principal-1"
+	s.invoices["i1"] = inv
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, gl.URL)
+	body := domain.RecordCustomerPaymentRequest{
+		PaymentDate:       testDate(2026, 9, 10),
+		PaymentReference: "REM-8821",
+	}
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/pay", body, "principal-2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	stored := s.invoices["i1"]
+	if stored.PaymentDate == nil || stored.PaymentDate.Time.Day() != 10 {
+		t.Fatalf("payment_date was not recorded: %#v", stored.PaymentDate)
+	}
+	if stored.PaymentReference == nil || *stored.PaymentReference != "REM-8821" {
+		t.Fatalf("payment_reference was not recorded: %#v", stored.PaymentReference)
+	}
+}
+
+// TestReceivePayment_EmptyPayloadSucceeds — a payment recorded with no customer
+// detail is still a payment: the lifecycle stamp is what an audit reaches for
+// first, and the payload is optional.
+func TestReceivePayment_EmptyPayloadSucceeds(t *testing.T) {
+	gl := fakeLedger(t,
+		[]map[string]any{{"journal_id": "j1", "correlation_id": "i1", "status": "FINALIZED"}},
+		map[string]map[string]any{"j1": journalFor("j1", "i1", "FINALIZED", 24500)},
+	)
+
+	s := newStubStore()
+	inv := sentInvoice("i1", testTenant, 24500)
+	inv.CreatedByPrincipalID = "principal-1"
+	s.invoices["i1"] = inv
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, gl.URL)
+	rec := doRequest(r, http.MethodPost, "/v1/invoices/i1/pay", domain.RecordCustomerPaymentRequest{}, "principal-2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a payment with no cash-application detail, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.invoices["i1"].PaymentDate != nil || s.invoices["i1"].PaymentReference != nil {
+		t.Fatalf("empty payload stored spurious cash-application data: %#v", s.invoices["i1"])
 	}
 }

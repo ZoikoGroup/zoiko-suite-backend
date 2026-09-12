@@ -115,6 +115,21 @@ func newTestInvoice(tenantID string) *domain.CustomerInvoice {
 		Status:               domain.InvoiceStatusIssued,
 		CreatedByPrincipalID: "test-admin",
 		CorrelationID:        "corr-" + uuid.New().String(),
+
+		InvoiceDate: domain.CalendarDate{Time: time.Now().UTC()},
+		SupplyDate:  domain.CalendarDate{Time: time.Now().UTC()},
+		NetAmount:   1500.50,
+		TaxAmount:   0,
+		Lines: []domain.CustomerInvoiceLine{
+			{
+				LineNumber:  1,
+				Description: "Consultancy",
+				Quantity:    1,
+				UnitPrice:   1500.50,
+				NetAmount:   1500.50,
+				TaxAmount:   0,
+			},
+		},
 	}
 }
 
@@ -201,7 +216,7 @@ func TestPgStore_TransitionInvoice_WrongFromStatus_Rejected(t *testing.T) {
 	}
 
 	// Invoice is ISSUED — attempting SENT -> OVERDUE (wrong fromStatus) must be rejected
-	_, err := s.TransitionInvoice(ctx, tenantID, inv.InvoiceID, domain.InvoiceStatusSent, domain.InvoiceStatusOverdue, "test-admin")
+	_, err := s.TransitionInvoice(ctx, tenantID, inv.InvoiceID, domain.InvoiceStatusSent, domain.InvoiceStatusOverdue, "test-admin", nil, nil)
 	if err == nil {
 		t.Fatal("expected an error transitioning from the wrong fromStatus, got nil")
 	}
@@ -243,7 +258,7 @@ func TestPgStore_TenantPredicate_IsolatesTenants(t *testing.T) {
 		t.Fatal("tenant isolation failure: tenant B was able to read tenant A's invoice")
 	}
 
-	_, err = s.TransitionInvoice(ctxB, tenantB, invA.InvoiceID, domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "attacker")
+	_, err = s.TransitionInvoice(ctxB, tenantB, invA.InvoiceID, domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "attacker", nil, nil)
 	if err == nil {
 		t.Fatal("tenant isolation failure: tenant B was able to transition tenant A's invoice")
 	}
@@ -469,7 +484,7 @@ func TestPgStore_TransitionInvoice_ReturnsTheStampedRow(t *testing.T) {
 	}
 
 	sent, err := s.TransitionInvoice(ctx, tenantID, inv.InvoiceID,
-		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "principal-sender")
+		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "principal-sender", nil, nil)
 	if err != nil {
 		t.Fatalf("TransitionInvoice failed: %v", err)
 	}
@@ -509,7 +524,7 @@ func TestPgStore_TransitionInvoice_WrongTenant_IsNotFound(t *testing.T) {
 	}
 
 	got, err := s.TransitionInvoice(ctxB, tenantB, invA.InvoiceID,
-		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "attacker")
+		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "attacker", nil, nil)
 	if !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("expected ErrInvalidTransition, got %v", err)
 	}
@@ -629,14 +644,14 @@ func TestPgStore_Invariants_RejectOverdueBeforeDueDate(t *testing.T) {
 		t.Fatalf("CreateInvoice failed: %v", err)
 	}
 	if _, err := s.TransitionInvoice(tenantCtx, tenantID, inv.InvoiceID,
-		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "p1"); err != nil {
+		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, "p1", nil, nil); err != nil {
 		t.Fatalf("send failed: %v", err)
 	}
 
 	// The handler refuses this too (422 not_yet_due); this proves the schema does
 	// as well, so a direct writer cannot age a receivable early.
 	if _, err := s.TransitionInvoice(tenantCtx, tenantID, inv.InvoiceID,
-		domain.InvoiceStatusSent, domain.InvoiceStatusOverdue, "p1"); err == nil {
+		domain.InvoiceStatusSent, domain.InvoiceStatusOverdue, "p1", nil, nil); err == nil {
 		t.Fatal("the database accepted an invoice declared overdue before its due date")
 	}
 }

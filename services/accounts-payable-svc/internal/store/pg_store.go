@@ -410,9 +410,23 @@ func (s *PgStore) ListInvoices(ctx context.Context, filter domain.ListInvoicesFi
 			  AND ($2 = '' OR legal_entity_id::text = $2)
 			  AND ($3 = '' OR vendor_id = $3)
 			  AND ($4 = '' OR status = $4)
-			ORDER BY created_at DESC
-		`
-		rows, err := tx.Query(ctx, query, filter.TenantID, filter.LegalEntityID, filter.VendorID, filter.Status)
+			ORDER BY created_at DESC`
+
+		// LIMIT/OFFSET are appended to the literal text (never interpolated with
+		// caller data) and their values ride alongside the four filter bounds as
+		// real parameters. An offset with no limit is meaningless — skipping rows
+		// only to read them all again — so it is ignored unless a limit is set.
+		args := []any{filter.TenantID, filter.LegalEntityID, filter.VendorID, filter.Status}
+		if filter.Limit > 0 {
+			query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+			args = append(args, filter.Limit)
+			if filter.Offset > 0 {
+				query += fmt.Sprintf(" OFFSET $%d", len(args)+1)
+				args = append(args, filter.Offset)
+			}
+		}
+
+		rows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return mapPgError(err)
 		}

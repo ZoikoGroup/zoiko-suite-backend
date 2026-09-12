@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ type stubStore struct {
 	rolesByCorrelation   map[string]*domain.RoleDefinition
 	bundlesByRole        map[string][]domain.PermissionBundleDef
 	bundlesByCorrelation map[string]*domain.PermissionBundleDef
+	bundlesByID          map[string]*domain.PermissionBundleDef
 }
 
 func newStubStore() *stubStore {
@@ -35,6 +37,7 @@ func newStubStore() *stubStore {
 		rolesByCorrelation:   make(map[string]*domain.RoleDefinition),
 		bundlesByRole:        make(map[string][]domain.PermissionBundleDef),
 		bundlesByCorrelation: make(map[string]*domain.PermissionBundleDef),
+		bundlesByID:          make(map[string]*domain.PermissionBundleDef),
 	}
 }
 
@@ -58,15 +61,24 @@ func (s *stubStore) GetRole(_ context.Context, roleDefinitionID string) (*domain
 	return &cp, nil
 }
 
-func (s *stubStore) ListRoles(_ context.Context, status string) ([]domain.RoleDefinition, error) {
+func (s *stubStore) ListRoles(_ context.Context, filter domain.ListFilter) ([]domain.RoleDefinition, error) {
 	var out []domain.RoleDefinition
 	for _, r := range s.rolesByID {
+		if filter.Status != "" && string(r.Status) != filter.Status {
+			continue
+		}
+		if filter.ScopeType != "" && r.RoleScopeType != filter.ScopeType {
+			continue
+		}
+		if filter.Query != "" && !strings.Contains(strings.ToLower(r.RoleCode), strings.ToLower(filter.Query)) && !strings.Contains(strings.ToLower(r.RoleName), strings.ToLower(filter.Query)) {
+			continue
+		}
 		out = append(out, *r)
 	}
 	return out, nil
 }
 
-func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, status string) (*domain.RoleDefinition, error) {
+func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, status, updatedByPrincipalID string) (*domain.RoleDefinition, error) {
 	r, ok := s.rolesByID[roleDefinitionID]
 	if !ok {
 		return nil, domain.ErrRoleNotFound
@@ -77,6 +89,7 @@ func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, st
 	if status != "" {
 		r.Status = domain.RoleStatus(status)
 	}
+	r.UpdatedByPrincipalID = updatedByPrincipalID
 	r.UpdatedAt = time.Now().UTC()
 	cp := *r
 	return &cp, nil
@@ -90,11 +103,52 @@ func (s *stubStore) CreateBundle(_ context.Context, b *domain.PermissionBundleDe
 	cp := *b
 	s.bundlesByRole[b.RoleDefinitionID] = append(s.bundlesByRole[b.RoleDefinitionID], cp)
 	s.bundlesByCorrelation[b.CorrelationID] = &cp
+	s.bundlesByID[b.BundleID] = &cp
 	return true, nil
 }
 
 func (s *stubStore) ListBundles(_ context.Context, roleDefinitionID string) ([]domain.PermissionBundleDef, error) {
 	return s.bundlesByRole[roleDefinitionID], nil
+}
+
+func (s *stubStore) GetBundle(_ context.Context, roleDefinitionID, bundleID string) (*domain.PermissionBundleDef, error) {
+	b, ok := s.bundlesByID[bundleID]
+	if !ok || b.RoleDefinitionID != roleDefinitionID {
+		return nil, domain.ErrBundleNotFound
+	}
+	cp := *b
+	return &cp, nil
+}
+
+func (s *stubStore) UpdateBundle(_ context.Context, roleDefinitionID, bundleID string, permittedActions []string, activeFlag *bool, updatedByPrincipalID string) (*domain.PermissionBundleDef, error) {
+	b, ok := s.bundlesByID[bundleID]
+	if !ok || b.RoleDefinitionID != roleDefinitionID {
+		return nil, domain.ErrBundleNotFound
+	}
+	if permittedActions != nil {
+		b.PermittedActions = permittedActions
+	}
+	if activeFlag != nil {
+		b.ActiveFlag = *activeFlag
+	}
+	b.UpdatedByPrincipalID = updatedByPrincipalID
+	b.UpdatedAt = time.Now().UTC()
+	cp := *b
+	return &cp, nil
+}
+
+func (s *stubStore) ListAllBundles(_ context.Context, filter domain.BundleListFilter) ([]domain.PermissionBundleDef, error) {
+	var out []domain.PermissionBundleDef
+	for _, b := range s.bundlesByID {
+		if filter.RoleID != "" && b.RoleDefinitionID != filter.RoleID {
+			continue
+		}
+		if filter.ActiveFlag != nil && b.ActiveFlag != *filter.ActiveFlag {
+			continue
+		}
+		out = append(out, *b)
+	}
+	return out, nil
 }
 
 type stubPublisher struct {
@@ -115,6 +169,12 @@ type stubAuthZ struct{ err error }
 
 func (a *stubAuthZ) CheckAllowed(_ context.Context, _, _, _ string) error { return a.err }
 
+type bundleActiveCall struct {
+	roleID     string
+	bundleCode string
+	active     bool
+}
+
 type stubAuthzAdmin struct {
 	createRoleErr   error
 	createBundleErr error
@@ -124,6 +184,11 @@ type stubAuthzAdmin struct {
 	// retirement the platform is not enforcing.
 	setRoleActiveErr  error
 	setRoleActiveWant []bool
+
+	// setBundleActiveErr and setBundleActiveCalls mirror the role-side
+	// recorders for the bundle retire/reactivate propagation path.
+	setBundleActiveErr   error
+	setBundleActiveCalls []bundleActiveCall
 
 	// The scope each call was made with. Recorded because two of these three
 	// methods used to be invoked with an empty principal and tenant, which
@@ -145,6 +210,11 @@ func (a *stubAuthzAdmin) SetRoleActive(_ context.Context, _ string, active bool,
 	a.setRoleActiveWant = append(a.setRoleActiveWant, active)
 	a.gotScopes = append(a.gotScopes, s)
 	return a.setRoleActiveErr
+}
+func (a *stubAuthzAdmin) SetPermissionBundleActive(_ context.Context, roleID, bundleCode string, active bool, s clients.Scope) error {
+	a.setBundleActiveCalls = append(a.setBundleActiveCalls, bundleActiveCall{roleID: roleID, bundleCode: bundleCode, active: active})
+	a.gotScopes = append(a.gotScopes, s)
+	return a.setBundleActiveErr
 }
 
 // ── router factory ─────────────────────────────────────────────────────────────
@@ -441,5 +511,374 @@ func TestUpdateRole_UnknownStatusRejected(t *testing.T) {
 	}
 	if len(admin.setRoleActiveWant) != 0 {
 		t.Fatalf("an invalid status still reached authorization-svc (%d calls)", len(admin.setRoleActiveWant))
+	}
+}
+
+// ── GetBundle tests ───────────────────────────────────────────────────────────
+
+func createBundle(t *testing.T, r chi.Router) domain.PermissionBundleDef {
+	role := createRole(t, r)
+	rr := doReq(r, http.MethodPost, "/v1/role-definitions/"+role.RoleDefinitionID+"/permission-bundles", bundleBody(uuid.NewString()), "admin-1")
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("bundle setup failed: %d %s", rr.Code, rr.Body.String())
+	}
+	var bundle domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&bundle)
+	return bundle
+}
+
+func TestGetBundle_HappyPath(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	bundle := createBundle(t, r)
+
+	rr := doReq(r, http.MethodGet, "/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID, nil, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var got domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&got)
+	if got.BundleID != bundle.BundleID {
+		t.Fatalf("expected bundle %s got %s", bundle.BundleID, got.BundleID)
+	}
+}
+
+func TestGetBundle_NotOwnedByRole(t *testing.T) {
+	store := newStubStore()
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+
+	// Two roles so a bundle can be addressed under a role that does not own it.
+	var roleID1, roleID2 string
+	for i := 0; i < 2; i++ {
+		rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(uuid.NewString()), "admin-1")
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("role setup failed: %d", rr.Code)
+		}
+	}
+	for id := range store.rolesByID {
+		if roleID1 == "" {
+			roleID1 = id
+		} else if roleID2 == "" {
+			roleID2 = id
+		}
+	}
+
+	bundle := createBundle(t, r) // attached to roleID2 (last created)
+	rr := doReq(r, http.MethodGet, "/v1/role-definitions/"+roleID1+"/permission-bundles/"+bundle.BundleID, nil, "admin-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for a bundle addressed under the wrong role, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── UpdateBundle tests ────────────────────────────────────────────────────────
+
+func TestUpdateBundle_EditActionsHappyPath(t *testing.T) {
+	pub := &stubPublisher{}
+	admin := &stubAuthzAdmin{}
+	store := newStubStore()
+	r := newRouter(store, pub, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+	admin.gotScopes = nil // drop the create-time scopes
+	pub.bundleUpdated = 0
+
+	rr := doReq(r, http.MethodPatch,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID,
+		map[string]any{"legal_entity_id": "le-us", "permitted_actions": []string{"PO_ISSUE", "PO_CLOSE"}}, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var updated domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&updated)
+	if len(updated.PermittedActions) != 2 {
+		t.Errorf("expected 2 actions, got %d", len(updated.PermittedActions))
+	}
+	if updated.UpdatedByPrincipalID != "admin-1" {
+		t.Errorf("updated_by_principal_id not stamped: got %q", updated.UpdatedByPrincipalID)
+	}
+	if got := store.bundlesByID[bundle.BundleID].PermittedActions; len(got) != 2 {
+		t.Errorf("stub store not updated: %v", got)
+	}
+	if pub.bundleUpdated != 1 {
+		t.Errorf("expected 1 permission.bundle.updated event, got %d", pub.bundleUpdated)
+	}
+	// The edit propagates as an upsert-replace on (role_id, bundle_code).
+	if len(admin.gotScopes) != 1 {
+		t.Fatalf("expected 1 admin propagation call, got %d", len(admin.gotScopes))
+	}
+	if admin.gotScopes[0].LegalEntityID != "le-us" {
+		t.Errorf("scope legal entity not forwarded: got %q", admin.gotScopes[0].LegalEntityID)
+	}
+}
+
+// TestUpdateBundle_ActiveFlagFalseClearsEnforcement -- turning a bundle off
+// must reach authorization-svc's retire endpoint, because active_flag is in
+// the JOIN of both evaluation reads there. Without the call the PATCH would
+// record a withdrawal the platform still enforces.
+func TestUpdateBundle_ActiveFlagFalseClearsEnforcement(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+	admin.gotScopes = nil
+
+	rr := doReq(r, http.MethodPatch,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID,
+		map[string]any{"legal_entity_id": "le-us", "active_flag": false}, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setBundleActiveCalls) != 1 {
+		t.Fatalf("expected 1 bundle retire propagation, got %d", len(admin.setBundleActiveCalls))
+	}
+	call := admin.setBundleActiveCalls[0]
+	if call.active {
+		t.Fatalf("asked authorization-svc for active=%v on a detach, expected false", call.active)
+	}
+	if call.bundleCode != bundle.BundleCode {
+		t.Errorf("retire resolved the wrong code: got %q want %q", call.bundleCode, bundle.BundleCode)
+	}
+	var got domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&got)
+	if got.ActiveFlag {
+		t.Error("bundle still active after a detach PATCH")
+	}
+}
+
+func TestUpdateBundle_NoOpReplayReturnsCurrent(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+	admin.gotScopes = nil
+	pub.bundleUpdated = 0
+
+	rr := doReq(r, http.MethodPatch,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID,
+		map[string]any{"legal_entity_id": "le-us", "permitted_actions": bundle.PermittedActions}, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.gotScopes) != 0 {
+		t.Fatalf("a no-op edit made %d propagation calls, expected none", len(admin.gotScopes))
+	}
+	if pub.bundleUpdated != 0 {
+		t.Errorf("published %d events for a no-op edit", pub.bundleUpdated)
+	}
+}
+
+func TestUpdateBundle_EmptyActionsRejected(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+	admin.gotScopes = nil
+
+	rr := doReq(r, http.MethodPatch,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID,
+		map[string]any{"legal_entity_id": "le-us", "permitted_actions": []string{}}, "admin-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an empty action list, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.gotScopes) != 0 {
+		t.Fatalf("an empty action list still reached authorization-svc (%d calls)", len(admin.gotScopes))
+	}
+}
+
+func TestUpdateBundle_NothingToUpdateRejected(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+	admin.gotScopes = nil
+
+	rr := doReq(r, http.MethodPatch,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID,
+		map[string]any{"legal_entity_id": "le-us"}, "admin-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a body that changes nothing, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.gotScopes) != 0 {
+		t.Fatalf("an empty edit still reached authorization-svc (%d calls)", len(admin.gotScopes))
+	}
+}
+
+// TestUpdateBundle_AuthzAdminDown_RefusesTheEdit -- the fail-closed case, the
+// same shape as the role-status one: an unreachable authorization-svc must not
+// leave the register claiming an action list the platform is not enforcing.
+func TestUpdateBundle_AuthzAdminDown_RefusesTheEdit(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	store := newStubStore()
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+
+	admin.createBundleErr = errors.New("authorization-svc admin API unreachable")
+
+	rr := doReq(r, http.MethodPatch,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID,
+		map[string]any{"legal_entity_id": "le-us", "permitted_actions": []string{"PO_ISSUE"}}, "admin-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when the edit could not be propagated, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := store.bundlesByID[bundle.BundleID].PermittedActions; len(got) != 3 {
+		t.Errorf("actions changed to %v after a refused edit; the register now disagrees with what is enforced", got)
+	}
+}
+
+// ── DetachBundle tests ────────────────────────────────────────────────────────
+
+func TestDetachBundle_HappyPath(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+	admin.gotScopes = nil
+
+	rr := doReq(r, http.MethodDelete,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID+"?legal_entity_id=le-us",
+		nil, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setBundleActiveCalls) != 1 {
+		t.Fatalf("expected 1 retire propagation, got %d", len(admin.setBundleActiveCalls))
+	}
+	if admin.setBundleActiveCalls[0].active {
+		t.Fatal("detach asked authorization-svc for active=true")
+	}
+	var got domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&got)
+	if got.ActiveFlag {
+		t.Error("bundle still active after detach")
+	}
+}
+
+func TestDetachBundle_AlreadyDetachedIsIdempotent(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+	admin.gotScopes = nil
+
+	// Detach once, then again.
+	_ = doReq(r, http.MethodDelete,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID+"?legal_entity_id=le-us",
+		nil, "admin-1")
+	admin.setBundleActiveCalls = nil
+
+	rr := doReq(r, http.MethodDelete,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID+"?legal_entity_id=le-us",
+		nil, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(admin.setBundleActiveCalls) != 0 {
+		t.Fatalf("re-detaching made %d retire calls, expected none", len(admin.setBundleActiveCalls))
+	}
+}
+
+func TestDetachBundle_RemoteDown_Refuses(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	store := newStubStore()
+	r := newRouter(store, &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+
+	admin.setBundleActiveErr = errors.New("authorization-svc admin API unreachable")
+
+	rr := doReq(r, http.MethodDelete,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID+"?legal_entity_id=le-us",
+		nil, "admin-1")
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when the retire could not be propagated, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !store.bundlesByID[bundle.BundleID].ActiveFlag {
+		t.Error("bundle was detached locally despite a refused retirement; the register now claims a state the platform is not enforcing")
+	}
+}
+
+// ── ListAllBundles tests ──────────────────────────────────────────────────────
+
+func TestListAllBundles_FlatCatalogue(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	createBundle(t, r)
+	createBundle(t, r)
+
+	rr := doReq(r, http.MethodGet, "/v1/permission-bundles/", nil, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var bundles []domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&bundles)
+	if len(bundles) != 2 {
+		t.Fatalf("expected 2 bundles across roles, got %d", len(bundles))
+	}
+}
+
+func TestListAllBundles_FiltersByActiveFlag(t *testing.T) {
+	admin := &stubAuthzAdmin{}
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, admin)
+	bundle := createBundle(t, r)
+
+	// Detach it, then the active=true read must be empty.
+	_ = doReq(r, http.MethodDelete,
+		"/v1/role-definitions/"+bundle.RoleDefinitionID+"/permission-bundles/"+bundle.BundleID+"?legal_entity_id=le-us",
+		nil, "admin-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/permission-bundles?active_flag=true", nil, "admin-1")
+	var active []domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&active)
+	if len(active) != 0 {
+		t.Fatalf("expected no active bundles after detach, got %d", len(active))
+	}
+
+	rr = doReq(r, http.MethodGet, "/v1/permission-bundles?active_flag=false", nil, "admin-1")
+	var detached []domain.PermissionBundleDef
+	_ = json.NewDecoder(rr.Body).Decode(&detached)
+	if len(detached) != 1 {
+		t.Fatalf("expected 1 detached bundle, got %d", len(detached))
+	}
+}
+
+// ── ListRoles filter tests ────────────────────────────────────────────────────
+
+func TestListRoles_InvalidStatusRejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	rr := doReq(r, http.MethodGet, "/v1/role-definitions/?status=BANANA", nil, "admin-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown status filter, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListRoles_InvalidScopeTypeRejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	rr := doReq(r, http.MethodGet, "/v1/role-definitions/?scope_type=PLANET", nil, "admin-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown scope_type filter, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListRoles_InvalidLimitRejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	rr := doReq(r, http.MethodGet, "/v1/role-definitions/?limit=-1", nil, "admin-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a negative limit, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListRoles_SearchNarrowsResults(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+
+	req := roleBody(uuid.NewString())
+	req["role_code"] = "AP_VENDOR_MANAGER"
+	req["role_name"] = "Vendor Manager"
+	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", req, "admin-1"); rr.Code != http.StatusCreated {
+		t.Fatalf("seed role: %d %s", rr.Code, rr.Body.String())
+	}
+	_ = createBundle(t, r) // this creates another role (PROCUREMENT_OFFICER)
+
+	rr := doReq(r, http.MethodGet, "/v1/role-definitions/?search=AP_VENDOR", nil, "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var roles []domain.RoleDefinition
+	_ = json.NewDecoder(rr.Body).Decode(&roles)
+	if len(roles) != 1 {
+		t.Fatalf("expected 1 role matching the search, got %d", len(roles))
+	}
+	if roles[0].RoleCode != "AP_VENDOR_MANAGER" {
+		t.Errorf("search returned %q, want AP_VENDOR_MANAGER", roles[0].RoleCode)
 	}
 }

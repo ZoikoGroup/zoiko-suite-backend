@@ -1,0 +1,56 @@
+# Minimal limited-stack file for access-control-svc ONLY.
+#
+# WHY THIS FILE EXISTS (and why it is not the whole estate):
+#   - `docker compose up` against docker-compose.yml fails on the pre-existing
+#     asset-management-svc <-> financial-close-svc dependency cycle, so the
+#     full-stack command cannot start even a single service.
+#   - access-control-svc is pulished on :8137 and needs three infra peers that
+#     this repo starts elsewhere: `zoiko-postgres`, `zoiko-kafka` and
+#     `authorization-svc`. Every other service is irrelevant to it.
+#
+# The other three are left OUT of this file on purpose: they are healthy and
+# running as ordinary containers on the shared `deployments_default` network
+# (docker start zoiko-postgres zoiko-kafka authorization-svc), and this
+# service joins that same external network.
+#
+# HEALTHCHECK: exec-form CMD, NOT CMD-SHELL. The image is distroless (no /bin/sh),
+# so the compose lint that produces CMD-SHELL makes Docker mark the container
+# unhealthy no matter what the service answers. `test` as a two-element array
+# runs /healthcheck directly without a shell.
+#
+# Start (from deployments/):  docker compose -f docker-compose.access-control.yml up -d
+# Stop:                        docker compose -f docker-compose.access-control.yml down
+
+services:
+  access-control-svc:
+    image: access-control-svc:local
+    container_name: access-control-svc
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8137:8137"
+    environment:
+      PORT: "8137"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: access_control
+      DB_USER: zoiko_app
+      DB_PASSWORD: zoiko_app_password
+      DB_SSLMODE: disable
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_EVENTS_TOPIC: "zoiko.access-control.events"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+    networks:
+      - access_control_stack
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8137/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+networks:
+  access_control_stack:
+    name: deployments_default
+    external: true

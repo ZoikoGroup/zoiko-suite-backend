@@ -349,6 +349,20 @@ type ListInvoicesFilter struct {
 	LegalEntityID string
 	VendorID      string
 	Status        string
+
+	// Limit caps the rows returned, and Offset skips the first n of the filtered
+	// set — the bounded read every large register needs. A Limit of 0 means
+	// "no bound", which is what keeps every existing caller working; the handler
+	// is the only place a limit enters, and it validates before it sets one.
+	//
+	// The register is deliberately NOT unbounded from the console's point of
+	// view (the console always asks for a page), but the service itself stays
+	// permissive so a data plane caller that genuinely needs every row can have
+	// them. Bounding the console is what stops a growing register from turning
+	// every dashboard read into a full-table scan; the service's cap exists to
+	// make a runaway request refuse rather than die.
+	Limit  int
+	Offset int
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

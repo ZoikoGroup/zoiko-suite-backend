@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"zoiko.io/access-control-svc/internal/domain"
 )
 
 // AuthzAdminClient provisions role and permission-bundle definitions into
@@ -84,6 +86,84 @@ func (c *AuthzAdminClient) CreatePermissionBundle(ctx context.Context, roleID, b
 		"permitted_actions": permittedActions,
 	})
 	return c.post(ctx, fmt.Sprintf("/v1/admin/roles/%s/permission-bundles", roleID), body, s)
+}
+
+// adminPermissionBundle mirrors authorization-svc's
+// GET /v1/admin/roles/{role_id}/permission-bundles response shape. It is kept
+// minimal to the fields this service reads: the two id spaces are connected by
+// bundle_code, and retirement is addressed by authorization-svc's own id.
+type adminPermissionBundle struct {
+	PermissionBundleID string   `json:"permission_bundle_id"`
+	RoleID             string   `json:"role_id"`
+	BundleCode         string   `json:"bundle_code"`
+	PermittedActions   []string `json:"permitted_actions"`
+	ActiveFlag         bool     `json:"active_flag"`
+}
+
+// SetPermissionBundleActive retires or reactivates the bundle with bundleCode
+// on roleID, scoped by the verified caller context.
+//
+// authorization-svc's retire/reactivate endpoints are addressed by ITS
+// permission_bundle_id, which this service does not store locally — the
+// role-scoped list is the join between the two id spaces. Fail-closed: if no
+// bundle with that code exists there, the register and the enforcement plane
+// disagree, and the caller gets domain.ErrAuthzBundleNotFound to investigate
+// rather than a silent local-only change.
+func (c *AuthzAdminClient) SetPermissionBundleActive(ctx context.Context, roleID, bundleCode string, active bool, s Scope) error {
+	bundles, err := c.listPermissionBundles(ctx, roleID, s)
+	if err != nil {
+		return err
+	}
+	for _, b := range bundles {
+		if b.BundleCode != bundleCode {
+			continue
+		}
+		action := "retire"
+		if active {
+			action = "reactivate"
+		}
+		return c.post(ctx, fmt.Sprintf("/v1/admin/permission-bundles/%s/%s", b.PermissionBundleID, action), []byte(`{}`), s)
+	}
+	return domain.ErrAuthzBundleNotFound
+}
+
+// listPermissionBundles calls the read that joins the two id spaces. It sends
+// the five unconditionally mandatory envelope headers only — this is a read, so
+// the contract requires no Content-Type, Idempotency-Key or X-Legal-Entity-Id
+// (those are RequiredOnWrite; see authorization-svc's envelope policy).
+func (c *AuthzAdminClient) listPermissionBundles(ctx context.Context, roleID string, s Scope) ([]adminPermissionBundle, error) {
+	path := fmt.Sprintf("/v1/admin/roles/%s/permission-bundles", roleID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Principal-Id", s.PrincipalID)
+	req.Header.Set("X-Tenant-Id", s.TenantID)
+	correlationID := s.CorrelationID
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set("X-Correlation-ID", correlationID)
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("X-Source-Channel", "system")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("authorization-svc admin API unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return nil, fmt.Errorf("authorization-svc admin API returned %d for GET %s: %s",
+			resp.StatusCode, path, string(detail))
+	}
+	var bundles []adminPermissionBundle
+	if err := json.NewDecoder(resp.Body).Decode(&bundles); err != nil {
+		return nil, fmt.Errorf("authorization-svc admin API returned an unreadable bundle list: %w", err)
+	}
+	return bundles, nil
 }
 
 // post sends one admin call with the complete canonical envelope.

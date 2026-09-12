@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -32,7 +33,7 @@ type Store interface {
 	CreateInvoice(ctx context.Context, inv *domain.CustomerInvoice) (created bool, err error)
 	GetInvoice(ctx context.Context, tenantID, invoiceID string) (*domain.CustomerInvoice, error)
 	ListInvoices(ctx context.Context, filter domain.ListInvoicesFilter) ([]domain.CustomerInvoice, error)
-	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string) (*domain.CustomerInvoice, error)
+	TransitionInvoice(ctx context.Context, tenantID, invoiceID string, fromStatus, toStatus domain.InvoiceStatus, actorPrincipalID string, paymentDate *domain.CalendarDate, paymentReference *string) (*domain.CustomerInvoice, error)
 }
 
 // Publisher is the event publisher contract.
@@ -119,6 +120,38 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 }
 
+// linesFromRequest maps the wire lines onto domain lines. Line numbers are
+// assigned here, from position, rather than taken from the caller: they are the
+// invoice's own ordering and a caller-supplied number could collide with the
+// (invoice_id, line_number) uniqueness the table declares.
+func linesFromRequest(in []domain.CreateCustomerInvoiceLineInput) []domain.CustomerInvoiceLine {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]domain.CustomerInvoiceLine, len(in))
+	for i, l := range in {
+		quantity := l.Quantity
+		if quantity == 0 {
+			// A line keyed as a lump sum has no quantity, and storing zero
+			// would make unit_price x quantity read as nil rather than as the
+			// amount actually charged.
+			quantity = 1
+		}
+		out[i] = domain.CustomerInvoiceLine{
+			LineNumber:        i + 1,
+			Description:       l.Description,
+			Quantity:          quantity,
+			UnitPrice:         l.UnitPrice,
+			NetAmount:         l.NetAmount,
+			TaxCode:           l.TaxCode,
+			TaxAmount:         l.TaxAmount,
+			SalesOrderLineRef: l.SalesOrderLineRef,
+			Dimensions:        l.Dimensions,
+		}
+	}
+	return out
+}
+
 // ── POST /v1/invoices ────────────────────────────────────────────────────────
 func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 	var req domain.CreateCustomerInvoiceRequest
@@ -131,6 +164,10 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Amount <= 0 {
 		writeError(w, http.StatusBadRequest, "invalid_field", "amount must be greater than zero")
+		return
+	}
+	if code, detail := invalidInvoiceLines(req); code != "" {
+		writeError(w, http.StatusBadRequest, code, detail)
 		return
 	}
 
@@ -174,6 +211,8 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	netTotal, taxTotal := req.LineTotals()
+
 	inv := &domain.CustomerInvoice{
 		InvoiceID:            uuid.NewString(),
 		TenantID:             tenantID,
@@ -182,10 +221,19 @@ func (h *Handler) CreateInvoice(w http.ResponseWriter, r *http.Request) {
 		InvoiceNumber:        req.InvoiceNumber,
 		Amount:               req.Amount,
 		CurrencyCode:         req.CurrencyCode,
-		DueDate:              req.DueDate,
+		DueDate:              req.DueDate.Time,
 		Status:               domain.InvoiceStatusIssued,
 		CreatedByPrincipalID: principalID,
 		CorrelationID:        req.CorrelationID,
+
+		InvoiceDate:       req.InvoiceDate,
+		SupplyDate:        req.SupplyDate,
+		NetAmount:         netTotal,
+		TaxAmount:         taxTotal,
+		InvoiceDocumentID: req.InvoiceDocumentID,
+		SalesOrderID:      req.SalesOrderID,
+		CustomerBillingRef: req.CustomerBillingRef,
+		Lines:             linesFromRequest(req.Lines),
 	}
 
 	created, err := h.store.CreateInvoice(r.Context(), inv)
@@ -337,11 +385,29 @@ func (h *Handler) SendInvoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AR-05's "invoice document", enforced at the send boundary rather than at
+	// issue.
+	//
+	// Sending asserts the invoice is real and complete to the customer: it is
+	// the AR equivalent of AP's validation completion, the point at which this
+	// service says the document is genuine. An invoice keyed ahead of its scan
+	// is an ordinary working state; one SENT with no customer document behind
+	// it is the audit gap.
+	//
+	// A pre-contract invoice (recorded before migration 000006, so carrying no
+	// lines) is exempt: it was accepted under the old contract and refusing to
+	// let it move now would strand every historical receivable mid-lifecycle.
+	if inv.InvoiceDocumentID == nil && !inv.IsPreContract() {
+		writeError(w, http.StatusUnprocessableEntity, "invoice_document_required",
+			domain.ErrInvoiceDocumentRequired.Error())
+		return
+	}
+
 	// The UPDATE's own RETURNING, not the invoice read a moment ago with `.Status`
 	// patched by hand. That patched copy carried sent_at: null and
 	// sent_by_principal_id: null for the hop it was reporting.
 	sent, err := h.store.TransitionInvoice(r.Context(), tenantID, invoiceID,
-		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, principalID)
+		domain.InvoiceStatusIssued, domain.InvoiceStatusSent, principalID, nil, nil)
 	if err != nil {
 		h.handleTransitionErr(w, err)
 		return
@@ -390,7 +456,7 @@ func (h *Handler) MarkOverdue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	overdue, err := h.store.TransitionInvoice(r.Context(), tenantID, invoiceID,
-		domain.InvoiceStatusSent, domain.InvoiceStatusOverdue, principalID)
+		domain.InvoiceStatusSent, domain.InvoiceStatusOverdue, principalID, nil, nil)
 	if err != nil {
 		h.handleTransitionErr(w, err)
 		return
@@ -418,12 +484,32 @@ func (h *Handler) ReceivePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// AR-08 cash application: the body is optional and carries the customer's
+	// own detail — when the money arrived and under what reference. An empty
+	// body is a valid payment; it just records the lifecycle stamp alone.
+	var req domain.RecordCustomerPaymentRequest
+	if r.ContentLength != 0 {
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+	}
+
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
 		return
 	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, inv.LegalEntityID, actionPaymentReceive); err != nil {
 		h.writeAuthzErr(w, err)
+		return
+	}
+
+	// Segregation of Duties (docs/original_doc/zoiko_suite_doc1.txt §12.3):
+	// the principal who raised the receivable may not be the principal who
+	// discharges it. Billing and cash-handling are different authorities, and
+	// keeping them apart in the audit trail is the point of the rule. This is
+	// the same doctrine accounts-payable-svc enforces on approval.
+	if inv.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_payment_not_allowed", domain.ErrSelfPaymentNotAllowed.Error())
 		return
 	}
 
@@ -460,7 +546,7 @@ func (h *Handler) ReceivePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	paid, err := h.store.TransitionInvoice(r.Context(), tenantID, invoiceID,
-		fromStatus, domain.InvoiceStatusPaid, principalID)
+		fromStatus, domain.InvoiceStatusPaid, principalID, paymentDate(req), paymentReference(req))
 	if err != nil {
 		h.handleTransitionErr(w, err)
 		return
@@ -468,6 +554,25 @@ func (h *Handler) ReceivePayment(w http.ResponseWriter, r *http.Request) {
 
 	h.publisher.PublishPaymentReceived(r.Context(), *paid)
 	writeJSON(w, http.StatusOK, paid)
+}
+
+// paymentDate returns nil when the cash-application payload carries none, and a
+// pointer to the supplied date otherwise.
+func paymentDate(req domain.RecordCustomerPaymentRequest) *domain.CalendarDate {
+	if req.PaymentDate.IsZero() {
+		return nil
+	}
+	d := req.PaymentDate
+	return &d
+}
+
+// paymentReference returns nil when the cash-application payload carries none.
+func paymentReference(req domain.RecordCustomerPaymentRequest) *string {
+	if req.PaymentReference == "" {
+		return nil
+	}
+	ref := req.PaymentReference
+	return &ref
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -569,6 +674,10 @@ func (h *Handler) handleTransitionErr(w http.ResponseWriter, err error) {
 // X-Tenant-Id scope, and is only checked for agreement when the body carries it
 // (see CreateInvoice) — demanding it would ask the caller for a value they are
 // not allowed to choose.
+//
+// invoice_date and supply_date join the list as AR-05 required inputs. An HTML
+// date input produces "2006-01-02", which CalendarDate accepts; a missing or
+// empty date is the caller forgetting the field.
 func requiredInvoiceFieldMissing(req domain.CreateCustomerInvoiceRequest) string {
 	switch {
 	case req.LegalEntityID == "":
@@ -583,9 +692,40 @@ func requiredInvoiceFieldMissing(req domain.CreateCustomerInvoiceRequest) string
 		return "due_date"
 	case req.CorrelationID == "":
 		return "correlation_id"
+
+	// AR-05 required business/source inputs, reported the same way as the
+	// fields above so a caller gets one consistent missing_field answer.
+	case req.InvoiceDate.IsZero():
+		return "invoice_date"
+	case req.SupplyDate.IsZero():
+		return "supply_date"
 	default:
 		return ""
 	}
+}
+
+// invalidInvoiceLines checks AR-05's "lines" and "tax" inputs.
+//
+// Returns an error code and detail, or empty strings when the lines are
+// acceptable. Separate from requiredInvoiceFieldMissing because a line problem
+// cannot be named by a single field: a caller needs to know which line, and
+// whether the fault is the line itself or the total it rolls up to.
+func invalidInvoiceLines(req domain.CreateCustomerInvoiceRequest) (code, detail string) {
+	if len(req.Lines) == 0 {
+		return "no_lines", domain.ErrNoLines.Error()
+	}
+	for i, l := range req.Lines {
+		if l.Description == "" || l.NetAmount < 0 || l.TaxAmount < 0 {
+			return "invalid_line", fmt.Sprintf("line %d: %s", i+1, domain.ErrInvalidLine.Error())
+		}
+	}
+	if !req.Balances() {
+		net, tax := req.LineTotals()
+		return "invoice_does_not_balance", fmt.Sprintf(
+			"%s (lines: net %.2f + tax %.2f = %.2f, amount: %.2f)",
+			domain.ErrInvoiceDoesNotBalance.Error(), net, tax, net+tax, req.Amount)
+	}
+	return "", ""
 }
 
 // requireTenant reads the caller's verified tenant scope from X-Tenant-Id, set
@@ -640,20 +780,33 @@ func writeError(w http.ResponseWriter, status int, code, detail string) {
 // so without this a single request can make the service allocate whatever the
 // client is willing to send -- no auth needed, and nothing in the metrics to
 // distinguish it from load.
-const maxRequestBytes = 256 << 10 // 256 KiB
+const maxRequestBytes = 64 << 10 // 64 KiB — an invoice header with a few lines is well under
 
 // decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
 // the cap is what stopped it: "too large" and "malformed" are different faults
 // and a caller can only act on the difference.
+//
+// DisallowUnknownFields, matching accounts-payable-svc: without it a misspelled
+// key is silently discarded and the service answers 201 for a record missing the
+// value the caller believed they sent. Accepting a body and ignoring part of it
+// is worse than rejecting it, because nothing downstream can tell the
+// difference. The offending key is named in the answer.
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		switch {
+		case errors.As(err, &maxErr):
 			writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "")
-			return false
+		case strings.HasPrefix(err.Error(), "json: unknown field "):
+			writeError(w, http.StatusBadRequest, "unknown_field", err.Error())
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		}
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
 		return false
 	}
 	return true

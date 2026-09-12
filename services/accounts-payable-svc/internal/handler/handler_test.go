@@ -138,7 +138,7 @@ type stubPayables struct {
 	calls int
 }
 
-func (p *stubPayables) CreatePayableFromApprovedSource(_ context.Context, _, _ string, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
+func (p *stubPayables) CreatePayableFromApprovedSource(_ context.Context, _, _ string, _ payableopenitem.Envelope, req payableopenitem.CreatePayableRequest) (*payableopenitem.PayableOpenItem, error) {
 	p.calls++
 	if p.fail {
 		return nil, payableopenitem.ErrPayableServiceUnavailable
