@@ -96,6 +96,7 @@ func main() {
 	r.Get("/readyz", health.ReadyzHandler(pool))
 
 	handler.RegisterRoutes(r, h)
+	handler.RegisterFindingRoutes(r, h, pgStore)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
