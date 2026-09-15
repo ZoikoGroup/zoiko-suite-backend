@@ -75,6 +75,7 @@ func TestMain(m *testing.M) {
 	for _, migration := range []string{
 		"000001_initial_schema.up.sql",
 		"000002_add_idempotency_index.up.sql",
+		"000003_add_bnk01_identity.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {
@@ -100,11 +101,25 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// cleanTables resets all tables between tests. bank_accounts and
+// bank_account_ownership_evidence are now genuinely delete-blocked in
+// production by migration 000003's own triggers (bank_accounts rows are
+// never deleted; append-only evidence). Test cleanup is the one
+// legitimate place to bypass that — done explicitly via DISABLE/ENABLE
+// TRIGGER around the delete, never by weakening the trigger itself.
 func cleanTables(t *testing.T) {
 	t.Helper()
-	_, err := testPool.Exec(context.Background(), "DELETE FROM transfers; DELETE FROM cash_balances; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;")
-	if err != nil {
-		t.Fatalf("failed to clean tables: %v", err)
+	ctx := context.Background()
+	for _, stmt := range []string{
+		"ALTER TABLE bank_accounts DISABLE TRIGGER trg_reject_bank_account_mutation",
+		"ALTER TABLE bank_account_ownership_evidence DISABLE TRIGGER trg_reject_ownership_evidence_mutation",
+		"DELETE FROM transfers; DELETE FROM cash_balances; DELETE FROM bank_account_ownership_evidence; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;",
+		"ALTER TABLE bank_accounts ENABLE TRIGGER trg_reject_bank_account_mutation",
+		"ALTER TABLE bank_account_ownership_evidence ENABLE TRIGGER trg_reject_ownership_evidence_mutation",
+	} {
+		if _, err := testPool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("failed to clean tables (%s): %v", stmt, err)
+		}
 	}
 }
 
@@ -134,10 +149,10 @@ func TestPgStore_ExecuteTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t *
 
 	src := newTestAccount(tenantID, uuid.New().String())
 	tgt := newTestAccount(tenantID, uuid.New().String())
-	if err := s.CreateBankAccount(ctx, src); err != nil {
+	if _, err := s.CreateBankAccount(ctx, src); err != nil {
 		t.Fatalf("failed to create source account: %v", err)
 	}
-	if err := s.CreateBankAccount(ctx, tgt); err != nil {
+	if _, err := s.CreateBankAccount(ctx, tgt); err != nil {
 		t.Fatalf("failed to create target account: %v", err)
 	}
 
@@ -205,7 +220,7 @@ func TestPgStore_CreateAndGetBankAccount(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	acct := newTestAccount(tenantID, uuid.New().String())
-	if err := s.CreateBankAccount(ctx, acct); err != nil {
+	if _, err := s.CreateBankAccount(ctx, acct); err != nil {
 		t.Fatalf("CreateBankAccount failed: %v", err)
 	}
 
@@ -231,7 +246,7 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 	ctxB := svcmiddleware.WithTenant(context.Background(), tenantB)
 
 	acctA := newTestAccount(tenantA, uuid.New().String())
-	if err := s.CreateBankAccount(ctxA, acctA); err != nil {
+	if _, err := s.CreateBankAccount(ctxA, acctA); err != nil {
 		t.Fatalf("CreateBankAccount (tenant A) failed: %v", err)
 	}
 
@@ -262,10 +277,10 @@ func TestPgStore_ExecuteTransfer_And_Isolation(t *testing.T) {
 
 	acctA1 := newTestAccount(tenantA, uuid.New().String())
 	acctA2 := newTestAccount(tenantA, uuid.New().String())
-	if err := s.CreateBankAccount(ctxA, acctA1); err != nil {
+	if _, err := s.CreateBankAccount(ctxA, acctA1); err != nil {
 		t.Fatalf("failed to create source account A1: %v", err)
 	}
-	if err := s.CreateBankAccount(ctxA, acctA2); err != nil {
+	if _, err := s.CreateBankAccount(ctxA, acctA2); err != nil {
 		t.Fatalf("failed to create target account A2: %v", err)
 	}
 
