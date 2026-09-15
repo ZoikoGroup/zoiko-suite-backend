@@ -108,7 +108,8 @@ func (p *Publisher) PublishWorkflowCompleted(ctx context.Context, w domain.Workf
 // hash chain; this service remains the sole owner of engagement state.
 func (p *Publisher) PublishAuditEngagementEvent(ctx context.Context, eventType string, e domain.AuditEngagement, actorID, correlationID string) error {
 	switch eventType {
-	case "audit.engagement.created", "audit.engagement.acceptance_submitted", "audit.engagement.accepted", "audit.engagement.rejected", "audit.engagement.activated", "audit.engagement.withdrawn":
+	case "audit.engagement.created", "audit.engagement.acceptance_submitted", "audit.engagement.accepted", "audit.engagement.rejected", "audit.engagement.activated", "audit.engagement.withdrawn",
+		"audit.engagement.scope_amended", "audit.engagement.fieldwork_complete", "audit.engagement.completion_review_entered", "audit.engagement.report_ready", "audit.engagement.closed":
 	default:
 		return fmt.Errorf("audit engagement: unsupported event type %q", eventType)
 	}

@@ -29,6 +29,8 @@ type WorkflowStore interface {
 	GetAuditEngagement(ctx context.Context, tenantID, engagementID string) (*domain.AuditEngagement, error)
 	SubmitAuditEngagementAcceptance(ctx context.Context, params domain.SubmitAuditEngagementAcceptanceParams) (*domain.AuditEngagement, bool, error)
 	TransitionAuditEngagement(ctx context.Context, params domain.TransitionAuditEngagementParams) (*domain.AuditEngagement, bool, error)
+	AmendAuditEngagementScope(ctx context.Context, params domain.AmendAuditEngagementScopeParams) (*domain.AuditEngagement, bool, error)
+	GetAuditEngagementCompletionGates(ctx context.Context, tenantID, engagementID, stage string) ([]domain.CompletionGate, error)
 
 	// AUD-02 Planning & Risk Assessment — see internal/store/audit_plan_store.go's
 	// own doc comments for the enforcement mechanisms.
@@ -60,6 +62,20 @@ type WorkflowStore interface {
 	LockWorkpaper(ctx context.Context, params domain.LockWorkpaperParams) (*domain.Workpaper, bool, error)
 	AddPostLockAddendum(ctx context.Context, params domain.AddPostLockAddendumParams) (*domain.WorkpaperAddendum, error)
 	GetAuditEngagementRequiredWorkpapersLocked(ctx context.Context, tenantID, engagementID string) (bool, error)
+
+	// AUD-09 Review & Sign-Off — see internal/store/audit_review_store.go's
+	// own doc comments for the enforcement mechanisms.
+	OpenReview(ctx context.Context, params domain.OpenReviewParams) (*domain.ReviewScope, bool, error)
+	GetReviewScope(ctx context.Context, tenantID, reviewScopeID string) (*domain.ReviewScope, error)
+	AssignReviewer(ctx context.Context, params domain.AssignReviewerParams) (*domain.ReviewAssignment, error)
+	RaiseReviewNote(ctx context.Context, params domain.RaiseReviewNoteParams) (*domain.ReviewNote, error)
+	RespondToReviewNote(ctx context.Context, params domain.RespondToReviewNoteParams) (*domain.ReviewNote, error)
+	ResolveReviewNote(ctx context.Context, params domain.ResolveReviewNoteParams) (*domain.ReviewNote, error)
+	SignOff(ctx context.Context, params domain.SignOffParams) (*domain.SignOff, error)
+	WithdrawSignOff(ctx context.Context, params domain.WithdrawSignOffParams) (*domain.SignOff, error)
+	StartQualityReview(ctx context.Context, params domain.StartQualityReviewParams) (*domain.QualityReviewRecord, bool, error)
+	CompleteQualityReview(ctx context.Context, params domain.CompleteQualityReviewParams) (*domain.QualityReviewRecord, bool, error)
+	GetAuditEngagementReportGates(ctx context.Context, tenantID, engagementID string) (allSignOffsValid bool, noUnresolvedMandatoryNotes bool, err error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -131,6 +147,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{engagement_id}/acceptance-decision", h.RecordAuditAcceptanceDecision)
 		r.Post("/{engagement_id}/activate", h.ActivateAuditEngagement)
 		r.Post("/{engagement_id}/withdraw", h.WithdrawAuditEngagement)
+		r.Post("/{engagement_id}/amend-scope", h.AmendAuditEngagementScope)
+		r.Get("/{engagement_id}/completion-gates", h.GetCompletionGates)
+		r.Post("/{engagement_id}/mark-fieldwork-complete", h.MarkFieldworkComplete)
+		r.Post("/{engagement_id}/enter-completion-review", h.EnterCompletionReview)
+		r.Post("/{engagement_id}/mark-report-ready", h.MarkReportReady)
+		r.Post("/{engagement_id}/close", h.CloseEngagement)
 		r.Post("/{engagement_id}/plan", h.CreateAuditPlan)
 		r.Get("/{engagement_id}/plan", h.GetAuditPlan)
 	})
@@ -160,6 +182,22 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{workpaper_id}/lock", h.LockWorkpaper)
 		r.Post("/{workpaper_id}/addenda", h.AddPostLockAddendum)
 	})
+	r.Route("/v1/audit/engagements/{engagement_id}/reviews", func(r chi.Router) {
+		r.Post("/", h.OpenReview)
+		r.Post("/quality", h.StartQualityReview)
+		r.Get("/release-gates", h.EvaluateReleaseGates)
+	})
+	r.Route("/v1/audit/review-scopes", func(r chi.Router) {
+		r.Post("/{review_scope_id}/reviewers", h.AssignReviewer)
+		r.Post("/{review_scope_id}/notes", h.RaiseReviewNote)
+		r.Post("/{review_scope_id}/sign-off", h.SignOff)
+	})
+	r.Route("/v1/audit/review-notes", func(r chi.Router) {
+		r.Post("/{review_note_id}/respond", h.RespondToReviewNote)
+		r.Post("/{review_note_id}/resolve", h.ResolveReviewNote)
+	})
+	r.Post("/v1/audit/sign-offs/{sign_off_id}/withdraw", h.WithdrawSignOff)
+	r.Post("/v1/audit/quality-reviews/{quality_review_id}/complete", h.CompleteQualityReview)
 }
 
 // requireTenant reads the caller's verified tenant scope, set into

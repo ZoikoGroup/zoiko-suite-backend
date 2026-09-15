@@ -97,6 +97,30 @@ type stubStore struct {
 	addendumErr         error
 	workpapersLockedOK  bool
 	workpapersLockedErr error
+
+	reviewScope        *domain.ReviewScope
+	reviewScopeCreated bool
+	openReviewErr      error
+	reviewScopeGetErr  error
+	reviewAssignment   *domain.ReviewAssignment
+	assignReviewerErr  error
+	reviewNote         *domain.ReviewNote
+	raiseNoteErr       error
+	respondNoteErr     error
+	resolveNoteErr     error
+	signOff            *domain.SignOff
+	signOffErr         error
+	withdrawSignOffErr error
+	qualityReview      *domain.QualityReviewRecord
+	qualityCreated     bool
+	startQualityErr    error
+	completeQualityErr error
+	reportSignOffsOK   bool
+	reportNotesOK      bool
+	reportGatesErr     error
+
+	completionGates    []domain.CompletionGate
+	completionGatesErr error
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
@@ -135,6 +159,12 @@ func (s *stubStore) SubmitAuditEngagementAcceptance(_ context.Context, _ domain.
 }
 func (s *stubStore) TransitionAuditEngagement(_ context.Context, _ domain.TransitionAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
 	return s.auditEngagement, s.auditTransitionChanged, s.auditTransitionErr
+}
+func (s *stubStore) AmendAuditEngagementScope(_ context.Context, _ domain.AmendAuditEngagementScopeParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditTransitionChanged, s.auditTransitionErr
+}
+func (s *stubStore) GetAuditEngagementCompletionGates(_ context.Context, _, _, _ string) ([]domain.CompletionGate, error) {
+	return s.completionGates, s.completionGatesErr
 }
 func (s *stubStore) CreateAuditPlan(_ context.Context, _ domain.CreateAuditPlanParams) (*domain.AuditPlan, bool, error) {
 	return s.auditPlan, s.auditPlanCreated, s.auditPlanCreateErr
@@ -210,6 +240,39 @@ func (s *stubStore) AddPostLockAddendum(_ context.Context, _ domain.AddPostLockA
 }
 func (s *stubStore) GetAuditEngagementRequiredWorkpapersLocked(_ context.Context, _, _ string) (bool, error) {
 	return s.workpapersLockedOK, s.workpapersLockedErr
+}
+func (s *stubStore) OpenReview(_ context.Context, _ domain.OpenReviewParams) (*domain.ReviewScope, bool, error) {
+	return s.reviewScope, s.reviewScopeCreated, s.openReviewErr
+}
+func (s *stubStore) GetReviewScope(_ context.Context, _, _ string) (*domain.ReviewScope, error) {
+	return s.reviewScope, s.reviewScopeGetErr
+}
+func (s *stubStore) AssignReviewer(_ context.Context, _ domain.AssignReviewerParams) (*domain.ReviewAssignment, error) {
+	return s.reviewAssignment, s.assignReviewerErr
+}
+func (s *stubStore) RaiseReviewNote(_ context.Context, _ domain.RaiseReviewNoteParams) (*domain.ReviewNote, error) {
+	return s.reviewNote, s.raiseNoteErr
+}
+func (s *stubStore) RespondToReviewNote(_ context.Context, _ domain.RespondToReviewNoteParams) (*domain.ReviewNote, error) {
+	return s.reviewNote, s.respondNoteErr
+}
+func (s *stubStore) ResolveReviewNote(_ context.Context, _ domain.ResolveReviewNoteParams) (*domain.ReviewNote, error) {
+	return s.reviewNote, s.resolveNoteErr
+}
+func (s *stubStore) SignOff(_ context.Context, _ domain.SignOffParams) (*domain.SignOff, error) {
+	return s.signOff, s.signOffErr
+}
+func (s *stubStore) WithdrawSignOff(_ context.Context, _ domain.WithdrawSignOffParams) (*domain.SignOff, error) {
+	return s.signOff, s.withdrawSignOffErr
+}
+func (s *stubStore) StartQualityReview(_ context.Context, _ domain.StartQualityReviewParams) (*domain.QualityReviewRecord, bool, error) {
+	return s.qualityReview, s.qualityCreated, s.startQualityErr
+}
+func (s *stubStore) CompleteQualityReview(_ context.Context, _ domain.CompleteQualityReviewParams) (*domain.QualityReviewRecord, bool, error) {
+	return s.qualityReview, false, s.completeQualityErr
+}
+func (s *stubStore) GetAuditEngagementReportGates(_ context.Context, _, _ string) (bool, bool, error) {
+	return s.reportSignOffsOK, s.reportNotesOK, s.reportGatesErr
 }
 
 // ── stub publisher ───────────────────────────────────────────────────────────

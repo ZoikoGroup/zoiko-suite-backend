@@ -378,6 +378,19 @@ func (s *PgStore) AddPostLockAddendum(ctx context.Context, p domain.AddPostLockA
 		if err := row.Scan(&a.AddendumID, &a.WorkpaperID, &a.TenantID, &a.AddedByPrincipalID, &a.Reason, &a.Effect, &a.Content, &a.AddedAt); err != nil {
 			return err
 		}
+		// AUD-09's own invariant: "protected change to a signed workpaper...
+		// SHALL invalidate affected downstream sign-offs." A post-lock
+		// addendum is precisely the one way a locked workpaper's content can
+		// still change, so any currently-VALID sign-off bound to it must be
+		// invalidated in this SAME transaction — an empty newFingerprint
+		// never equals the non-empty content_fingerprint every real sign-off
+		// carries (sign_off_fingerprint_present's own CHECK constraint), so
+		// this unconditionally invalidates every VALID sign-off on this
+		// workpaper's review scope(s), same helper AUD-02's RecordMateriality
+		// analog uses for engagement-level invalidation.
+		if err := InvalidateSignOffsForTarget(ctx, tx, domain.ReviewTargetWorkpaper, p.WorkpaperID, ""); err != nil {
+			return err
+		}
 		out = a
 		return nil
 	})

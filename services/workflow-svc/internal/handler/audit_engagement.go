@@ -227,13 +227,162 @@ func (h *Handler) ActivateAuditEngagement(w http.ResponseWriter, r *http.Request
 	h.transitionAuditEngagement(w, r, actionAuditEngagementManage, []string{domain.AuditEngagementAccepted}, domain.AuditEngagementActive, false)
 }
 
-// Later lifecycle gates are intentionally not routed yet. AUD-02, AUD-06,
-// AUD-07, AUD-08, and AUD-09 own the evidence, workpaper, finding, review,
-// and sign-off assertions required before fieldwork can complete or a report
-// can be released. Exposing a generic manager transition before those services
-// enforce their controls would let a caller bypass the specification.
 func (h *Handler) WithdrawAuditEngagement(w http.ResponseWriter, r *http.Request) {
 	h.transitionAuditEngagement(w, r, actionAuditEngagementManage, []string{domain.AuditEngagementProposed, domain.AuditEngagementAcceptanceReview, domain.AuditEngagementAccepted, domain.AuditEngagementActive}, domain.AuditEngagementWithdrawn, false)
+}
+
+type amendScopeRequest struct {
+	ScopeSummary            string `json:"scope_summary"`
+	FrameworkProfileID      string `json:"framework_profile_id"`
+	FrameworkProfileVersion string `json:"framework_profile_version"`
+	MethodologyID           string `json:"methodology_id"`
+	MethodologyVersion      string `json:"methodology_version"`
+}
+
+// AmendAuditEngagementScope is the concrete enforcement point for
+// "scope/framework changes invalidate dependent approvals" — see
+// PgStore.AmendAuditEngagementScope's own doc comment.
+func (h *Handler) AmendAuditEngagementScope(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID, ok := h.requireCorrelationID(w, r)
+	if !ok {
+		return
+	}
+	var req amendScopeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
+	if err != nil {
+		h.writeAuditEngagementErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage); err != nil {
+		h.writeAuditEngagementAuthzErr(w, err)
+		return
+	}
+	amended, changed, err := h.store.AmendAuditEngagementScope(r.Context(), domain.AmendAuditEngagementScopeParams{
+		EngagementID: engagement.EngagementID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID,
+		ScopeSummary: req.ScopeSummary, FrameworkProfileID: req.FrameworkProfileID, FrameworkProfileVersion: req.FrameworkProfileVersion,
+		MethodologyID: req.MethodologyID, MethodologyVersion: req.MethodologyVersion,
+	})
+	if err != nil {
+		h.writeAuditEngagementErr(w, err)
+		return
+	}
+	if changed {
+		h.publishAuditEngagementEvent(r, "audit.engagement.scope_amended", *amended, actor)
+	}
+	writeJSON(w, http.StatusOK, amended)
+}
+
+// GetCompletionGates is the real "why can't I proceed" answer for
+// MarkFieldworkComplete (stage=FIELDWORK) and MarkReportReady
+// (stage=REPORT), also reusable as a plain read.
+func (h *Handler) GetCompletionGates(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
+	if err != nil {
+		h.writeAuditEngagementErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementRead); err != nil {
+		h.writeAuditEngagementAuthzErr(w, err)
+		return
+	}
+	stage := r.URL.Query().Get("stage")
+	if stage == "" {
+		stage = "FIELDWORK"
+	}
+	gates, err := h.store.GetAuditEngagementCompletionGates(r.Context(), tenantID, engagement.EngagementID, stage)
+	if err != nil {
+		h.writeAuditEngagementErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, gates)
+}
+
+// MarkFieldworkComplete only transitions once every FIELDWORK-stage gate
+// is satisfied — the real enforcement of "unresolved high-risk coverage
+// blocks completion" and the workpaper/plan equivalents, not a status flag
+// a caller could set directly.
+func (h *Handler) MarkFieldworkComplete(w http.ResponseWriter, r *http.Request) {
+	h.transitionWithGate(w, r, "FIELDWORK", []string{domain.AuditEngagementActive}, domain.AuditEngagementFieldworkComplete, "audit.engagement.fieldwork_complete")
+}
+
+func (h *Handler) EnterCompletionReview(w http.ResponseWriter, r *http.Request) {
+	h.transitionAuditEngagement(w, r, actionAuditEngagementManage, []string{domain.AuditEngagementFieldworkComplete}, domain.AuditEngagementCompletionReview, false)
+}
+
+// MarkReportReady only transitions once every REPORT-stage gate is
+// satisfied — "report release SHALL be blocked by unresolved mandatory
+// review notes [or] required sign-offs."
+func (h *Handler) MarkReportReady(w http.ResponseWriter, r *http.Request) {
+	h.transitionWithGate(w, r, "REPORT", []string{domain.AuditEngagementCompletionReview}, domain.AuditEngagementReportReady, "audit.engagement.report_ready")
+}
+
+func (h *Handler) CloseEngagement(w http.ResponseWriter, r *http.Request) {
+	h.transitionAuditEngagement(w, r, actionAuditEngagementManage, []string{domain.AuditEngagementReleased}, domain.AuditEngagementClosed, false)
+}
+
+func (h *Handler) transitionWithGate(w http.ResponseWriter, r *http.Request, stage string, expected []string, next, eventType string) {
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID, ok := h.requireCorrelationID(w, r)
+	if !ok {
+		return
+	}
+	engagement, err := h.store.GetAuditEngagement(r.Context(), tenantID, chi.URLParam(r, "engagement_id"))
+	if err != nil {
+		h.writeAuditEngagementErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, engagement.LegalEntityID, actionAuditEngagementManage); err != nil {
+		h.writeAuditEngagementAuthzErr(w, err)
+		return
+	}
+	gates, err := h.store.GetAuditEngagementCompletionGates(r.Context(), tenantID, engagement.EngagementID, stage)
+	if err != nil {
+		h.writeAuditEngagementErr(w, err)
+		return
+	}
+	if !allGatesSatisfied(gates) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": "completion_gate_blocked", "gates": gates})
+		return
+	}
+	updated, changed, err := h.store.TransitionAuditEngagement(r.Context(), domain.TransitionAuditEngagementParams{
+		EngagementID: engagement.EngagementID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID,
+		ExpectedStatuses: expected, NextStatus: next,
+	})
+	if err != nil {
+		h.writeAuditEngagementErr(w, err)
+		return
+	}
+	if changed {
+		h.publishAuditEngagementEvent(r, eventType, *updated, actor)
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (h *Handler) transitionAuditEngagement(w http.ResponseWriter, r *http.Request, action string, expected []string, next string, preventCreator bool) {
@@ -291,6 +440,15 @@ func (h *Handler) publishAuditEngagementEvent(r *http.Request, eventType string,
 	if err := h.publisher.PublishAuditEngagementEvent(r.Context(), eventType, engagement, actor, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.log.Error("failed to publish audit engagement event", zap.String("event_type", eventType), zap.String("engagement_id", engagement.EngagementID), zap.String("correlation_id", r.Header.Get("X-Correlation-ID")), zap.Error(err))
 	}
+}
+
+func allGatesSatisfied(gates []domain.CompletionGate) bool {
+	for _, g := range gates {
+		if !g.Satisfied {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) writeAuditEngagementAuthzErr(w http.ResponseWriter, err error) {

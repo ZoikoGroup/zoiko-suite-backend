@@ -23,6 +23,7 @@ type AuditEngagement struct {
 	AcceptanceDocumentID      *string    `json:"acceptance_document_id,omitempty"`
 	AcceptanceDocumentVersion *int       `json:"acceptance_document_version,omitempty"`
 	Status                    string     `json:"status"`
+	ScopeVersion              int        `json:"scope_version"`
 	CreatedByPrincipalID      string     `json:"created_by_principal_id"`
 	CreatedAt                 time.Time  `json:"created_at"`
 	EffectiveFrom             time.Time  `json:"effective_from"`
@@ -62,6 +63,23 @@ type TransitionAuditEngagementParams struct {
 	NextStatus                                              string
 }
 
+// AmendAuditEngagementScopeParams bumps scope_version — the mechanism
+// behind "scope/framework changes invalidate dependent approvals" (see
+// PgStore.AmendAuditEngagementScope's own doc comment).
+type AmendAuditEngagementScopeParams struct {
+	EngagementID, TenantID, ActorPrincipalID, CorrelationID   string
+	ScopeSummary, FrameworkProfileID, FrameworkProfileVersion string
+	MethodologyID, MethodologyVersion                         string
+}
+
+// CompletionGate is one named precondition for a lifecycle transition,
+// returned so a caller blocked by MarkFieldworkComplete/MarkReportReady
+// can see exactly why, not just a generic 422.
+type CompletionGate struct {
+	Name      string `json:"name"`
+	Satisfied bool   `json:"satisfied"`
+}
+
 var ErrAuditEngagementNotFound = errorString("audit engagement not found")
 var ErrAuditEngagementDuplicateCode = errorString("audit engagement code already exists for this entity")
 var ErrAuditEngagementInvalidState = errorString("audit engagement is not in a state that permits this action")
@@ -69,3 +87,8 @@ var ErrAuditAcceptanceEvidenceRequired = errorString("acceptance evidence docume
 var ErrAuditAcceptanceEvidenceUnavailable = errorString("acceptance evidence cannot be verified")
 var ErrAuditAcceptanceEvidenceInvalid = errorString("acceptance evidence does not belong to this engagement scope")
 var ErrAuditEngagementSelfAcceptance = errorString("engagement creator may not record the acceptance decision")
+
+// ErrAuditEngagementGateBlocked is MarkFieldworkComplete/MarkReportReady's
+// own gate-check failure — see the accompanying []CompletionGate for which
+// gate(s) are unsatisfied.
+var ErrAuditEngagementGateBlocked = errorString("engagement completion gates are not satisfied")
