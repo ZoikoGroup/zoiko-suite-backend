@@ -9,13 +9,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+	"zoiko.io/reporting-orchestration-svc/internal/archivestore"
 	"zoiko.io/reporting-orchestration-svc/internal/authz"
 	"zoiko.io/reporting-orchestration-svc/internal/config"
 	"zoiko.io/reporting-orchestration-svc/internal/events"
 	"zoiko.io/reporting-orchestration-svc/internal/handler"
 	"zoiko.io/reporting-orchestration-svc/internal/mtls"
+	"zoiko.io/reporting-orchestration-svc/internal/retention"
 	"zoiko.io/reporting-orchestration-svc/internal/store"
 	"zoiko.io/reporting-orchestration-svc/internal/telemetry"
 )
@@ -36,6 +39,16 @@ func main() {
 	logger.Info("Starting reporting-orchestration-svc", zap.String("port", cfg.Port))
 
 	var dataStore store.Store
+	// pgStore is kept separately (not just as the store.Store interface
+	// value above) because AUD-10's export routes need the concrete
+	// *store.PgStore's ExportStore methods — MemoryStore is a
+	// DB-unavailable fallback that exists only for the pre-existing report
+	// endpoints; approval/seal/deliver correctness genuinely depends on
+	// real transactional CAS predicates, so there is no in-memory
+	// equivalent to fall back to. When the DB is unavailable, AUD-10's
+	// routes are simply not registered (see below) rather than silently
+	// running against a fake store.
+	var pgStore *store.PgStore
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -55,7 +68,8 @@ func main() {
 		dataStore = store.NewMemoryStore()
 	} else {
 		logger.Info("Connected to PostgreSQL")
-		dataStore = store.NewPgStore(pool)
+		pgStore = store.NewPgStore(pool)
+		dataStore = pgStore
 	}
 
 	brokers := strings.Split(cfg.KafkaBrokers, ",")
@@ -75,6 +89,20 @@ func main() {
 	}
 	h := handler.NewHandler(dataStore, publisher, authzClient, logger)
 	router := handler.NewRouter(h)
+
+	// AUD-10 export/redact/deliver routes — only mounted when a real
+	// Postgres connection is available (see pgStore's own comment above).
+	if pgStore != nil {
+		archiveClient := archivestore.NewHTTPClient(cfg.AuditEventStoreURL, logger)
+		retentionClient := retention.NewHTTPClient(cfg.RetentionRegistryURL, logger)
+		if chiRouter, ok := router.(chi.Router); ok {
+			handler.RegisterExportRoutes(chiRouter, h, pgStore, archiveClient, retentionClient)
+		} else {
+			logger.Error("router does not implement chi.Router — AUD-10 export routes not mounted")
+		}
+	} else {
+		logger.Warn("Database unavailable — AUD-10 export routes not mounted")
+	}
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
