@@ -98,6 +98,18 @@ type stubStore struct {
 	workpapersLockedOK  bool
 	workpapersLockedErr error
 
+	// AUD-03 Audit Population stub state — this capability is owned by a
+	// concurrently active session building it inside workflow-svc; these
+	// stub methods exist only so *stubStore satisfies handler.WorkflowStore
+	// after that session's handler.go additions, not to exercise real
+	// AUD-03 behavior from this test file.
+	auditPopulation    *domain.AuditPopulation
+	auditPopulations   []*domain.AuditPopulation
+	populationChanged  bool
+	populationErr      error
+	populationGetErr   error
+	listPopulationsErr error
+
 	reviewScope        *domain.ReviewScope
 	reviewScopeCreated bool
 	openReviewErr      error
@@ -241,6 +253,33 @@ func (s *stubStore) AddPostLockAddendum(_ context.Context, _ domain.AddPostLockA
 func (s *stubStore) GetAuditEngagementRequiredWorkpapersLocked(_ context.Context, _, _ string) (bool, error) {
 	return s.workpapersLockedOK, s.workpapersLockedErr
 }
+func (s *stubStore) DefinePopulation(_ context.Context, _ domain.DefinePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.auditPopulation, s.populationChanged, s.populationErr
+}
+func (s *stubStore) GetAuditPopulation(_ context.Context, _, _ string) (*domain.AuditPopulation, error) {
+	return s.auditPopulation, s.populationGetErr
+}
+func (s *stubStore) ListAuditPopulationsByEngagement(_ context.Context, _, _ string) ([]*domain.AuditPopulation, error) {
+	return s.auditPopulations, s.listPopulationsErr
+}
+func (s *stubStore) BuildPopulation(_ context.Context, _ domain.BuildPopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.auditPopulation, s.populationChanged, s.populationErr
+}
+func (s *stubStore) ValidatePopulation(_ context.Context, _ domain.ValidatePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.auditPopulation, s.populationChanged, s.populationErr
+}
+func (s *stubStore) FreezePopulation(_ context.Context, _ domain.FreezePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.auditPopulation, s.populationChanged, s.populationErr
+}
+func (s *stubStore) SupersedePopulation(_ context.Context, _ domain.SupersedePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.auditPopulation, s.populationChanged, s.populationErr
+}
+func (s *stubStore) QuarantinePopulation(_ context.Context, _ domain.QuarantinePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.auditPopulation, s.populationChanged, s.populationErr
+}
+func (s *stubStore) AddControlledDelta(_ context.Context, _ domain.AddControlledDeltaParams) (*domain.AuditPopulation, bool, error) {
+	return s.auditPopulation, s.populationChanged, s.populationErr
+}
 func (s *stubStore) OpenReview(_ context.Context, _ domain.OpenReviewParams) (*domain.ReviewScope, bool, error) {
 	return s.reviewScope, s.reviewScopeCreated, s.openReviewErr
 }
@@ -307,6 +346,13 @@ func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.Wor
 	return nil
 }
 func (p *stubPublisher) PublishAuditEngagementEvent(_ context.Context, eventType string, _ domain.AuditEngagement, _, _ string) error {
+	p.auditEvents = append(p.auditEvents, eventType)
+	return nil
+}
+
+// PublishAuditPopulationEvent: stub only — AUD-03 is owned by a
+// concurrently active session, see the stubStore fields' own comment.
+func (p *stubPublisher) PublishAuditPopulationEvent(_ context.Context, eventType string, _ domain.AuditPopulation, _, _ string) error {
 	p.auditEvents = append(p.auditEvents, eventType)
 	return nil
 }

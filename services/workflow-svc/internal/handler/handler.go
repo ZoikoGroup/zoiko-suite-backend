@@ -63,6 +63,18 @@ type WorkflowStore interface {
 	AddPostLockAddendum(ctx context.Context, params domain.AddPostLockAddendumParams) (*domain.WorkpaperAddendum, error)
 	GetAuditEngagementRequiredWorkpapersLocked(ctx context.Context, tenantID, engagementID string) (bool, error)
 
+	// AUD-03 Audit Population — see internal/store/audit_population_store.go's
+	// own doc comments for the enforcement mechanisms.
+	DefinePopulation(ctx context.Context, params domain.DefinePopulationParams) (*domain.AuditPopulation, bool, error)
+	GetAuditPopulation(ctx context.Context, tenantID, populationID string) (*domain.AuditPopulation, error)
+	ListAuditPopulationsByEngagement(ctx context.Context, tenantID, engagementID string) ([]*domain.AuditPopulation, error)
+	BuildPopulation(ctx context.Context, params domain.BuildPopulationParams) (*domain.AuditPopulation, bool, error)
+	ValidatePopulation(ctx context.Context, params domain.ValidatePopulationParams) (*domain.AuditPopulation, bool, error)
+	FreezePopulation(ctx context.Context, params domain.FreezePopulationParams) (*domain.AuditPopulation, bool, error)
+	SupersedePopulation(ctx context.Context, params domain.SupersedePopulationParams) (*domain.AuditPopulation, bool, error)
+	QuarantinePopulation(ctx context.Context, params domain.QuarantinePopulationParams) (*domain.AuditPopulation, bool, error)
+	AddControlledDelta(ctx context.Context, params domain.AddControlledDeltaParams) (*domain.AuditPopulation, bool, error)
+
 	// AUD-09 Review & Sign-Off — see internal/store/audit_review_store.go's
 	// own doc comments for the enforcement mechanisms.
 	OpenReview(ctx context.Context, params domain.OpenReviewParams) (*domain.ReviewScope, bool, error)
@@ -92,6 +104,7 @@ type EventPublisher interface {
 	PublishWorkflowEscalated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishWorkflowCompleted(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishAuditEngagementEvent(ctx context.Context, eventType string, engagement domain.AuditEngagement, actorID, correlationID string) error
+	PublishAuditPopulationEvent(ctx context.Context, eventType string, population domain.AuditPopulation, actorID, correlationID string) error
 }
 
 // DocumentVaultClient verifies evidence references without making workflow-svc
@@ -155,6 +168,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{engagement_id}/close", h.CloseEngagement)
 		r.Post("/{engagement_id}/plan", h.CreateAuditPlan)
 		r.Get("/{engagement_id}/plan", h.GetAuditPlan)
+		r.Post("/{engagement_id}/populations", h.DefinePopulation)
+		r.Get("/{engagement_id}/populations", h.ListAuditPopulations)
 	})
 	r.Route("/v1/audit/plans", func(r chi.Router) {
 		r.Post("/{plan_id}/materiality", h.RecordMateriality)
@@ -181,6 +196,15 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{workpaper_id}/mark-prepared", h.MarkWorkpaperPrepared)
 		r.Post("/{workpaper_id}/lock", h.LockWorkpaper)
 		r.Post("/{workpaper_id}/addenda", h.AddPostLockAddendum)
+	})
+	r.Route("/v1/audit/populations", func(r chi.Router) {
+		r.Get("/{population_id}", h.GetAuditPopulation)
+		r.Post("/{population_id}/build", h.BuildPopulation)
+		r.Post("/{population_id}/validate", h.ValidatePopulation)
+		r.Post("/{population_id}/freeze", h.FreezePopulation)
+		r.Post("/{population_id}/supersede", h.SupersedePopulation)
+		r.Post("/{population_id}/quarantine", h.QuarantinePopulation)
+		r.Post("/{population_id}/delta", h.AddControlledDelta)
 	})
 	r.Route("/v1/audit/engagements/{engagement_id}/reviews", func(r chi.Router) {
 		r.Post("/", h.OpenReview)

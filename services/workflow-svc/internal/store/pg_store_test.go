@@ -44,7 +44,7 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS quality_review_records, sign_offs, review_notes, review_assignments, review_scopes, workpaper_addenda, workpaper_evidence_links, workpaper_cross_references, workpaper_conclusions, workpaper_results, workpaper_procedures, workpapers, planned_procedures, assertion_links, risk_assessments, materiality_records, audit_plan_transitions, audit_plans, audit_engagement_transitions, audit_engagements, workflow_transitions, workflow_stages, workflow_instances CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS quality_review_records, sign_offs, review_notes, review_assignments, review_scopes, audit_population_transitions, audit_populations, workpaper_addenda, workpaper_evidence_links, workpaper_cross_references, workpaper_conclusions, workpaper_results, workpaper_procedures, workpapers, planned_procedures, assertion_links, risk_assessments, materiality_records, audit_plan_transitions, audit_plans, audit_engagement_transitions, audit_engagements, workflow_transitions, workflow_stages, workflow_instances CASCADE;")
 
 	// Apply every *.up.sql in order, not two hardcoded filenames — a
 	// migration added later must not be silently skipped by these tests
