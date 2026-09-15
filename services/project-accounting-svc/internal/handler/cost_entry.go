@@ -62,6 +62,10 @@ func (h *Handler) captureProjectCost(w http.ResponseWriter, r *http.Request, req
 		h.writeProjectErr(w, err)
 		return
 	}
+	if p.Status != domain.ProjectStatusActive {
+		writeError(w, http.StatusUnprocessableEntity, "project_not_active", domain.ErrProjectNotActiveForCostCapture.Error())
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, action); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -148,6 +152,114 @@ func (h *Handler) ListCostEntries(w http.ResponseWriter, r *http.Request) {
 		list = []domain.CostEntry{}
 	}
 	writeJSON(w, http.StatusOK, list)
+}
+
+// GetCostSourceLineage backs the spec's own query of the same name — id
+// itself plus every entry that reclassifies or reverses it, transitively.
+// See internal/store/cost_entry_store.go's own doc comment.
+func (h *Handler) GetCostSourceLineage(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	e, err := h.store.GetCostEntry(r.Context(), id)
+	if err != nil {
+		h.writeCostEntryErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, e.LegalEntityID, actionProjectCostRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	lineage, err := h.store.GetCostSourceLineage(r.Context(), id)
+	if err != nil {
+		h.log.Error("GetCostSourceLineage: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, lineage)
+}
+
+// GetUnallocatedCostExceptions backs the spec's own query of the same
+// name — every CAPTURED entry still open for a legal entity. See
+// internal/store/cost_entry_store.go's own doc comment.
+func (h *Handler) GetUnallocatedCostExceptions(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionProjectCostRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	exceptions, err := h.store.GetUnallocatedCostExceptions(r.Context(), legalEntityID)
+	if err != nil {
+		h.log.Error("GetUnallocatedCostExceptions: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if exceptions == nil {
+		exceptions = []domain.CostEntry{}
+	}
+	writeJSON(w, http.StatusOK, exceptions)
+}
+
+// GetProjectCostAsOf backs the spec's own query of the same name. See
+// internal/store/cost_entry_store.go's own doc comment.
+func (h *Handler) GetProjectCostAsOf(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "project_id is required")
+		return
+	}
+	atParam := r.URL.Query().Get("at")
+	at := time.Now().UTC()
+	if atParam != "" {
+		parsed, err := time.Parse(time.RFC3339, atParam)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_at", "at must be RFC3339")
+			return
+		}
+		at = parsed
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	p, err := h.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		h.writeProjectErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, actionProjectCostRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	entries, err := h.store.GetProjectCostAsOf(r.Context(), projectID, at)
+	if err != nil {
+		h.log.Error("GetProjectCostAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if entries == nil {
+		entries = []domain.CostEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"project_id": projectID, "as_of": at, "entries": entries})
 }
 
 // ── POST /v1/cost-entries/{id}/validate ───────────────────────────────────────

@@ -31,6 +31,7 @@ import (
 
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/config"
+	"zoiko.io/workflow-svc/internal/documentvault"
 	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/events"
 	"zoiko.io/workflow-svc/internal/handler"
@@ -58,6 +59,7 @@ func main() {
 		zap.Int("port", cfg.Port),
 		zap.String("db_host", cfg.DB.Host),
 		zap.String("authorization_service_url", cfg.AuthorizationServiceURL),
+		zap.String("document_vault_service_url", cfg.DocumentVaultServiceURL),
 	)
 
 	shutdownTracing, err := telemetry.InitTracing(context.Background(), "workflow-svc", cfg.OTELExporterEndpoint)
@@ -116,6 +118,7 @@ func main() {
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
 	authzClient := authz.NewHTTPClient(cfg.AuthorizationServiceURL, log)
+	documentVaultClient := documentvault.NewHTTPClient(cfg.DocumentVaultServiceURL, log)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -134,7 +137,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)
 	handler.RegisterRoutes(r, h)
 
 	healthH := health.New(pool, log)

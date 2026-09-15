@@ -48,8 +48,8 @@ func (d DBConfig) DSN() string {
 
 // KafkaConfig carries consumer configuration.
 //
-// This service subscribes to TWO topics (zoiko.identity.events for
-// identity.context.resolved, and zoiko.entity.events for entity.status.changed),
+// This service subscribes to identity, entity, and workflow topics. AUD-01
+// lifecycle facts are produced on zoiko.workflow.events.
 // so Topics is a slice rather than a single string — distinct from the
 // reference services which each subscribe to only one topic.
 //
@@ -63,7 +63,7 @@ type KafkaConfig struct {
 	GroupID string
 
 	// Topics lists all topics this service subscribes to.
-	// Default: zoiko.identity.events,zoiko.entity.events
+	// Default: zoiko.identity.events,zoiko.entity.events,zoiko.workflow.events
 	Topics []string
 }
 
@@ -85,7 +85,7 @@ func Load() (*Config, error) {
 			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
 			GroupID: env("KAFKA_GROUP_ID", "audit-event-store-svc"),
 			Topics: strings.Split(
-				env("KAFKA_TOPICS", "zoiko.identity.events,zoiko.entity.events"),
+				env("KAFKA_TOPICS", "zoiko.identity.events,zoiko.entity.events,zoiko.workflow.events"),
 				",",
 			),
 		},

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
@@ -40,6 +41,7 @@ type stubStore struct {
 	entriesByMovement map[string]string                 // movement_id -> entry_id
 	valuationRuns     map[string]*domain.ValuationRun
 	writeDowns        map[string]*domain.WriteDown
+	layerConsumptions []*domain.LayerConsumption
 
 	stockCounts         map[string]*domain.StockCount
 	stockCountLocations map[string][]string // count_id -> location_ids
@@ -68,20 +70,20 @@ func newStubStore() *stubStore {
 
 // ── INV-04 (Inventory Valuation) ─────────────────────────────────────────────
 
-func (s *stubStore) ValueMovement(_ context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, error) {
+func (s *stubStore) ValueMovement(_ context.Context, movementID, principalID string, unitCost *float64, at time.Time) (*domain.ValuationEntry, *domain.CostLayer, error) {
 	if _, exists := s.entriesByMovement[movementID]; exists {
-		return nil, domain.ErrMovementAlreadyValued
+		return nil, nil, domain.ErrMovementAlreadyValued
 	}
 	m, ok := s.movements[movementID]
 	if !ok {
-		return nil, domain.ErrMovementNotFound
+		return nil, nil, domain.ErrMovementNotFound
 	}
 	if m.Status != domain.MovementStatusCommitted {
-		return nil, domain.ErrMovementNotCommitted
+		return nil, nil, domain.ErrMovementNotCommitted
 	}
 	vp, ok := s.valuationPolicies[m.ItemID]
 	if !ok {
-		return nil, domain.ErrValuationPolicyRequiredForActivation
+		return nil, nil, domain.ErrValuationPolicyRequiredForActivation
 	}
 
 	entryID := "entry-" + movementID
@@ -91,23 +93,25 @@ func (s *stubStore) ValueMovement(_ context.Context, movementID, principalID str
 		CreatedAt: at, CreatedByPrincipalID: principalID,
 	}
 
+	var createdLayer *domain.CostLayer
 	if m.DestinationLocationID != nil {
 		if unitCost == nil {
-			return nil, domain.ErrUnitCostRequired
+			return nil, nil, domain.ErrUnitCostRequired
 		}
 		entry.LocationID = *m.DestinationLocationID
 		entry.EntryType = domain.ValuationEntryTypeInbound
 		entry.Value = m.Quantity * *unitCost
-		s.costLayers = append(s.costLayers, &domain.CostLayer{
+		createdLayer = &domain.CostLayer{
 			LayerID: "layer-" + movementID, ItemID: m.ItemID, LocationID: *m.DestinationLocationID, SourceMovementID: movementID,
 			OriginalQuantity: m.Quantity, RemainingQuantity: m.Quantity, UnitCost: *unitCost, CreatedAt: at,
-		})
+		}
+		s.costLayers = append(s.costLayers, createdLayer)
 	} else if m.SourceLocationID != nil {
 		entry.LocationID = *m.SourceLocationID
 		entry.EntryType = domain.ValuationEntryTypeOutbound
 		if vp.ValuationMethod == domain.ValuationMethodStandardCost {
 			if unitCost == nil {
-				return nil, domain.ErrUnitCostRequired
+				return nil, nil, domain.ErrUnitCostRequired
 			}
 			entry.Value = m.Quantity * *unitCost
 		} else {
@@ -119,7 +123,7 @@ func (s *stubStore) ValueMovement(_ context.Context, movementID, principalID str
 				}
 			}
 			if totalRemaining < m.Quantity {
-				return nil, domain.ErrInsufficientCostLayers
+				return nil, nil, domain.ErrInsufficientCostLayers
 			}
 			averageRate := totalValue / totalRemaining
 			remaining := m.Quantity
@@ -142,17 +146,21 @@ func (s *stubStore) ValueMovement(_ context.Context, movementID, principalID str
 				consumedValue += take * rate
 				l.RemainingQuantity -= take
 				remaining -= take
+				s.layerConsumptions = append(s.layerConsumptions, &domain.LayerConsumption{
+					ConsumptionID: "consumption-" + l.LayerID + "-" + entryID, ValuationEntryID: entryID,
+					LayerID: l.LayerID, QuantityConsumed: take, UnitCostAtConsumption: rate, CreatedAt: at,
+				})
 			}
 			entry.Value = consumedValue
 		}
 	} else {
-		return nil, domain.ErrMovementNotFound
+		return nil, nil, domain.ErrMovementNotFound
 	}
 
 	s.valuationEntries[entryID] = entry
 	s.entriesByMovement[movementID] = entryID
 	cp := *entry
-	return &cp, nil
+	return &cp, createdLayer, nil
 }
 
 func (s *stubStore) GetValuationEntry(_ context.Context, entryID string) (*domain.ValuationEntry, error) {
@@ -194,6 +202,33 @@ func (s *stubStore) GetCostLayers(_ context.Context, itemID, locationID string) 
 		}
 	}
 	return out, nil
+}
+
+func (s *stubStore) GetLayerConsumptions(_ context.Context, valuationEntryID string) ([]domain.LayerConsumption, error) {
+	var out []domain.LayerConsumption
+	for _, c := range s.layerConsumptions {
+		if c.ValuationEntryID == valuationEntryID {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) GetInventoryValueAsOf(_ context.Context, itemID, locationID string, asOf time.Time) (float64, error) {
+	consumedByLayer := map[string]float64{}
+	for _, c := range s.layerConsumptions {
+		if !c.CreatedAt.After(asOf) {
+			consumedByLayer[c.LayerID] += c.QuantityConsumed
+		}
+	}
+	var value float64
+	for _, l := range s.costLayers {
+		if l.ItemID != itemID || l.LocationID != locationID || l.CreatedAt.After(asOf) {
+			continue
+		}
+		value += l.UnitCost * (l.OriginalQuantity - consumedByLayer[l.LayerID])
+	}
+	return value, nil
 }
 
 func (s *stubStore) CreateValuationRun(_ context.Context, r *domain.ValuationRun) (int, error) {
@@ -868,6 +903,29 @@ func (s *stubStore) GetOnHand(_ context.Context, itemID, locationID string) (flo
 	return onHand, nil
 }
 
+func (s *stubStore) GetLocationInventorySummary(_ context.Context, locationID string) ([]domain.LocationInventorySummaryLine, error) {
+	byItem := map[string]float64{}
+	for _, m := range s.movements {
+		if m.Status != domain.MovementStatusCommitted {
+			continue
+		}
+		if m.DestinationLocationID != nil && *m.DestinationLocationID == locationID {
+			byItem[m.ItemID] += m.Quantity
+		}
+		if m.SourceLocationID != nil && *m.SourceLocationID == locationID {
+			byItem[m.ItemID] -= m.Quantity
+		}
+	}
+	var lines []domain.LocationInventorySummaryLine
+	for itemID, qty := range byItem {
+		if qty == 0 {
+			continue
+		}
+		lines = append(lines, domain.LocationInventorySummaryLine{ItemID: itemID, OnHandQuantity: qty})
+	}
+	return lines, nil
+}
+
 // GetNegativeOnHandCount is a simplified stub: aggregates net on-hand
 // per (item_id, location_id) across COMMITTED movements for the entity,
 // counting how many combinations went negative. Enough to exercise the
@@ -935,6 +993,56 @@ func (s *stubStore) CreateCorrectionMovement(_ context.Context, originalMovement
 	s.movements[correction.MovementID] = &cp
 	s.movementsByKey[correction.SourceIdempotencyKey] = correction.MovementID
 	return correction, nil
+}
+
+// stubMovementDescendants returns rootID plus every movement in s.movements
+// that reverses/supersedes rootID, directly or transitively.
+func (s *stubStore) stubMovementDescendants(rootID string) []domain.InventoryMovement {
+	seen := map[string]bool{}
+	var out []domain.InventoryMovement
+	var walk func(id string)
+	walk = func(id string) {
+		if seen[id] {
+			return
+		}
+		m, ok := s.movements[id]
+		if !ok {
+			return
+		}
+		seen[id] = true
+		out = append(out, *m)
+		for _, cand := range s.movements {
+			if (cand.ReversesMovementID != nil && *cand.ReversesMovementID == id) ||
+				(cand.SupersedesMovementID != nil && *cand.SupersedesMovementID == id) {
+				walk(cand.MovementID)
+			}
+		}
+	}
+	walk(rootID)
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+func (s *stubStore) GetMovementLineage(_ context.Context, movementID string) ([]domain.InventoryMovement, error) {
+	return s.stubMovementDescendants(movementID), nil
+}
+
+func (s *stubStore) GetMovementChain(_ context.Context, movementID string) ([]domain.InventoryMovement, error) {
+	rootID := movementID
+	for {
+		m, ok := s.movements[rootID]
+		if !ok {
+			break
+		}
+		if m.ReversesMovementID != nil {
+			rootID = *m.ReversesMovementID
+		} else if m.SupersedesMovementID != nil {
+			rootID = *m.SupersedesMovementID
+		} else {
+			break
+		}
+	}
+	return s.stubMovementDescendants(rootID), nil
 }
 
 var _ handler.Store = (*stubStore)(nil)
@@ -1005,6 +1113,15 @@ func (p *stubPublisher) PublishStockCountVarianceApproved(_ context.Context, _, 
 	p.calls++
 }
 func (p *stubPublisher) PublishStockCountAdjustmentRequested(_ context.Context, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishInventoryMovementExceptionRaised(_ context.Context, _, _, _, _, _, _ string) {
+	p.calls++
+}
+func (p *stubPublisher) PublishCostLayerCreated(_ context.Context, _, _, _, _ string, _ domain.CostLayer) {
+	p.calls++
+}
+func (p *stubPublisher) PublishStockCountVarianceDetected(_ context.Context, _, _, _, _, _ string, _, _ float64) {
 	p.calls++
 }
 func (p *stubPublisher) PublishStockCountCertified(_ context.Context, _, _, _ string, _ domain.StockCount) {

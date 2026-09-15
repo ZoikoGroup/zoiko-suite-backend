@@ -280,3 +280,58 @@ func TestPgStore_RLS_TenantIsolation(t *testing.T) {
 		t.Fatal("expected tenant B to be unable to read tenant A's asset")
 	}
 }
+
+// TestPgStore_GetAssetSourceLineage_TracesRealMerge proves the real
+// recursive-CTE lineage trace against actual Postgres, not just the
+// stub's own single-hop simulation.
+func TestPgStore_GetAssetSourceLineage_TracesRealMerge(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	source := newTestAsset(tenantID, "le-1")
+	target := newTestAsset(tenantID, "le-1")
+	if err := s.CreateAsset(ctx, source); err != nil {
+		t.Fatalf("CreateAsset (source): %v", err)
+	}
+	if err := s.CreateAsset(ctx, target); err != nil {
+		t.Fatalf("CreateAsset (target): %v", err)
+	}
+	now := time.Now().UTC()
+	for _, id := range []string{source.AssetID, target.AssetID} {
+		if err := s.RegisterAsset(ctx, id, "approver-1", now); err != nil {
+			t.Fatalf("RegisterAsset: %v", err)
+		}
+		if err := s.CapitalizeAsset(ctx, id, "approver-1", now); err != nil {
+			t.Fatalf("CapitalizeAsset: %v", err)
+		}
+	}
+	if err := s.MergeAssets(ctx, source.AssetID, target.AssetID, "preparer-1", now); err != nil {
+		t.Fatalf("MergeAssets: %v", err)
+	}
+
+	lineage, err := s.GetAssetSourceLineage(ctx, source.AssetID)
+	if err != nil {
+		t.Fatalf("GetAssetSourceLineage: %v", err)
+	}
+	if len(lineage) != 2 {
+		t.Fatalf("expected source and target both in the lineage, got %d: %+v", len(lineage), lineage)
+	}
+	seen := map[string]bool{}
+	for _, a := range lineage {
+		seen[a.AssetID] = true
+	}
+	if !seen[source.AssetID] || !seen[target.AssetID] {
+		t.Fatalf("expected both %s and %s in the lineage, got %+v", source.AssetID, target.AssetID, lineage)
+	}
+
+	// Querying from the OTHER end of the merge must find the same pair.
+	fromTarget, err := s.GetAssetSourceLineage(ctx, target.AssetID)
+	if err != nil {
+		t.Fatalf("GetAssetSourceLineage (from target): %v", err)
+	}
+	if len(fromTarget) != 2 {
+		t.Fatalf("expected the same 2-asset lineage from the target's own side, got %d: %+v", len(fromTarget), fromTarget)
+	}
+}

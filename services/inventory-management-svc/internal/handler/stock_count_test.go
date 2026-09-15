@@ -81,11 +81,13 @@ func TestFreezeCountPopulation_CapturesSystemQuantity(t *testing.T) {
 
 func TestRecordBlindCount_ResponseNeverExposesSystemQuantity(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
 	countID, _, _ := countFixture(t, s, r)
 	freezeCount(t, r, countID)
 	line := onlyLine(t, s, countID)
 
+	callsBefore := pub.calls
 	req := domain.RecordBlindCountRequest{ObservedQuantity: 18}
 	rr := doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", req, "counter-1")
 	if rr.Code != http.StatusOK {
@@ -97,6 +99,177 @@ func TestRecordBlindCount_ResponseNeverExposesSystemQuantity(t *testing.T) {
 	}
 	var resp domain.RecordedBlindCount
 	_ = json.NewDecoder(rr.Body).Decode(&resp)
+
+	// System quantity is 20 (the committed receipt), observed is 18 — a real
+	// variance, so StockCountVarianceDetected (INV-05) must fire internally
+	// even though the HTTP response above never carries system_quantity.
+	if pub.calls != callsBefore+1 {
+		t.Fatalf("expected exactly 1 new publish call (StockCountVarianceDetected) for the observed/system mismatch, got %d new", pub.calls-callsBefore)
+	}
+}
+
+// ── StockCountVarianceDetected only fires on an actual mismatch ─────────────
+
+func TestRecordBlindCount_NoVariance_DoesNotPublishVarianceEvent(t *testing.T) {
+	s := newStubStore()
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+
+	callsBefore := pub.calls
+	req := domain.RecordBlindCountRequest{ObservedQuantity: 20}
+	rr := doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", req, "counter-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if pub.calls != callsBefore {
+		t.Fatalf("expected no new publish calls when observed quantity matches system quantity, got %d new", pub.calls-callsBefore)
+	}
+}
+
+// ── GetVarianceReport / GetCountSnapshot / GetAdjustmentStatus / GetCountEvidence ─
+
+func TestGetVarianceReport_OnlyIncludesLinesWithAVariance(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 25}, "counter-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/"+countID+"/variance-report", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Variances []struct {
+			domain.StockCountLine
+			Variance float64 `json:"variance"`
+		} `json:"variances"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if len(resp.Variances) != 1 {
+		t.Fatalf("expected 1 line with a variance, got %+v", resp.Variances)
+	}
+	if resp.Variances[0].Variance != 5 { // observed 25 - system 20
+		t.Fatalf("expected variance=5, got %v", resp.Variances[0].Variance)
+	}
+}
+
+func TestGetCountSnapshot_ReturnsFrozenPopulationOnly(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, itemID, locID := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 25}, "counter-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/"+countID+"/snapshot", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "observed_quantity") {
+		t.Fatalf("snapshot must never include the observation, only the frozen population, got: %s", body)
+	}
+	var resp struct {
+		Lines []struct {
+			ItemID         string  `json:"item_id"`
+			LocationID     string  `json:"location_id"`
+			SystemQuantity float64 `json:"system_quantity"`
+		} `json:"lines"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if len(resp.Lines) != 1 || resp.Lines[0].ItemID != itemID || resp.Lines[0].LocationID != locID || resp.Lines[0].SystemQuantity != 20 {
+		t.Fatalf("expected 1 frozen line item=%s loc=%s qty=20, got %+v", itemID, locID, resp.Lines)
+	}
+}
+
+func TestGetAdjustmentStatus_TracksApprovedVsAdjusted(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 25}, "counter-1")
+
+	before := doReq(r, http.MethodGet, "/v1/stock-counts/"+countID+"/adjustment-status", nil, "preparer-1")
+	var beforeResp map[string]float64
+	_ = json.NewDecoder(before.Body).Decode(&beforeResp)
+	if beforeResp["variance_lines"] != 1 || beforeResp["approved_lines"] != 0 || beforeResp["pending_adjustment_lines"] != 0 {
+		t.Fatalf("expected 1 variance, 0 approved before approval, got %+v", beforeResp)
+	}
+
+	approve := doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/approve-variance", nil, "reviewer-2")
+	if approve.Code != http.StatusOK {
+		t.Fatalf("approve variance failed: %d %s", approve.Code, approve.Body.String())
+	}
+	afterApprove := doReq(r, http.MethodGet, "/v1/stock-counts/"+countID+"/adjustment-status", nil, "preparer-1")
+	var afterApproveResp map[string]float64
+	_ = json.NewDecoder(afterApprove.Body).Decode(&afterApproveResp)
+	if afterApproveResp["approved_lines"] != 1 || afterApproveResp["pending_adjustment_lines"] != 1 || afterApproveResp["adjusted_lines"] != 0 {
+		t.Fatalf("expected 1 approved, 1 pending, 0 adjusted after approval, got %+v", afterApproveResp)
+	}
+
+	gen := doReq(r, http.MethodPost, "/v1/stock-counts/"+countID+"/generate-adjustments", nil, "reviewer-2")
+	if gen.Code != http.StatusOK {
+		t.Fatalf("generate adjustments failed: %d %s", gen.Code, gen.Body.String())
+	}
+	afterGen := doReq(r, http.MethodGet, "/v1/stock-counts/"+countID+"/adjustment-status", nil, "preparer-1")
+	var afterGenResp map[string]float64
+	_ = json.NewDecoder(afterGen.Body).Decode(&afterGenResp)
+	if afterGenResp["adjusted_lines"] != 1 || afterGenResp["pending_adjustment_lines"] != 0 {
+		t.Fatalf("expected 1 adjusted, 0 pending after generation, got %+v", afterGenResp)
+	}
+}
+
+func TestGetCountEvidence_AfterAdjustment_IncludesMovement(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/record-count", domain.RecordBlindCountRequest{ObservedQuantity: 25}, "counter-1")
+	doReq(r, http.MethodPost, "/v1/stock-counts/lines/"+line.LineID+"/approve-variance", nil, "reviewer-2")
+	doReq(r, http.MethodPost, "/v1/stock-counts/"+countID+"/generate-adjustments", nil, "reviewer-2")
+
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/lines/"+line.LineID+"/evidence", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]json.RawMessage
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if _, ok := resp["line"]; !ok {
+		t.Fatal("expected evidence to include the count line")
+	}
+	var movement domain.InventoryMovement
+	if err := json.Unmarshal(resp["adjustment_movement"], &movement); err != nil {
+		t.Fatalf("expected evidence to include the adjustment_movement: %v", err)
+	}
+	if movement.MovementType != domain.MovementTypeAdjustment {
+		t.Fatalf("expected an ADJUSTMENT movement, got %+v", movement)
+	}
+}
+
+func TestGetCountEvidence_BeforeAdjustment_OmitsMovement(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	countID, _, _ := countFixture(t, s, r)
+	freezeCount(t, r, countID)
+	line := onlyLine(t, s, countID)
+
+	rr := doReq(r, http.MethodGet, "/v1/stock-counts/lines/"+line.LineID+"/evidence", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]json.RawMessage
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if _, ok := resp["adjustment_movement"]; ok {
+		t.Fatal("expected no adjustment_movement before GenerateAdjustmentMovements has run")
+	}
 }
 
 // ── Negative path #3: variance approved by the same counter ─────────────────

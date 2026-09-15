@@ -819,7 +819,7 @@ services:
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "audit-event-store-svc"
-      KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events"
+      KAFKA_TOPICS: "zoiko.identity.events,zoiko.entity.events,zoiko.workflow.events"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       postgres:

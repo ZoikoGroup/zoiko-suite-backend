@@ -353,3 +353,171 @@ func TestPgStore_GetPostedRevenueTotal_RealDB(t *testing.T) {
 		t.Fatalf("expected 700 (0.7 percent_complete * 1000 contract_value) after emission, got %v", postEmit)
 	}
 }
+
+// TestPgStore_ListRecognitionRunsForProject_ReturnsFullHistory is the
+// real proof of PRJ-03's own GetRevenueSchedule query — every run ever
+// created for a project, ordered oldest first, including a superseded
+// one (SupersedeRecognitionRun never deletes a row).
+func TestPgStore_ListRecognitionRunsForProject_ReturnsFullHistory(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newRecognitionReadyProject(t, s, ctx, tenantID, legalEntityID, "PRJ-REC-7", 100)
+
+	contractValue := 1000.0
+	augRun := &domain.RecognitionRun{
+		RunID: uuid.New().String(), LegalEntityID: legalEntityID, ProjectID: projectID, FiscalPeriod: "2026-08",
+		Status: domain.RecognitionRunStatusDraft, ContractValue: &contractValue,
+		RevenueAccountCode: "4000", WIPAccountCode: "1300",
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateRecognitionRun(ctx, augRun); err != nil {
+		t.Fatalf("CreateRecognitionRun (aug) failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := s.FreezeAndCalculate(ctx, augRun.RunID, now); err != nil {
+		t.Fatalf("FreezeAndCalculate (aug) failed: %v", err)
+	}
+	if err := s.ValidateRecognitionRun(ctx, augRun.RunID, now); err != nil {
+		t.Fatalf("ValidateRecognitionRun (aug) failed: %v", err)
+	}
+	if err := s.ApproveRecognitionRun(ctx, augRun.RunID, "approver-1", now); err != nil {
+		t.Fatalf("ApproveRecognitionRun (aug) failed: %v", err)
+	}
+	if err := s.MarkRecognitionRunEmitted(ctx, augRun.RunID, "journal-aug-1", now); err != nil {
+		t.Fatalf("MarkRecognitionRunEmitted (aug) failed: %v", err)
+	}
+	if err := s.SupersedeRecognitionRun(ctx, augRun.RunID, "manager-1", now); err != nil {
+		t.Fatalf("SupersedeRecognitionRun (aug) failed: %v", err)
+	}
+	sepRun := &domain.RecognitionRun{
+		RunID: uuid.New().String(), LegalEntityID: legalEntityID, ProjectID: projectID, FiscalPeriod: "2026-09",
+		Status: domain.RecognitionRunStatusDraft, ContractValue: &contractValue,
+		RevenueAccountCode: "4000", WIPAccountCode: "1300",
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateRecognitionRun(ctx, sepRun); err != nil {
+		t.Fatalf("CreateRecognitionRun (sep) failed: %v", err)
+	}
+
+	runs, err := s.ListRecognitionRunsForProject(ctx, projectID)
+	if err != nil {
+		t.Fatalf("ListRecognitionRunsForProject failed: %v", err)
+	}
+	if len(runs) != 2 {
+		t.Fatalf("expected 2 runs (including the superseded one), got %+v", runs)
+	}
+	if runs[0].RunID != augRun.RunID || runs[1].RunID != sepRun.RunID {
+		t.Fatalf("expected oldest-first order, got %+v", runs)
+	}
+}
+
+// TestPgStore_GetLatestRecognitionRunForProject_ExcludesSuperseded is the
+// real proof of PRJ-03's own GetWIPOrContractBalance/GetProgressEvidence/
+// ExplainRecognition current-state read.
+func TestPgStore_GetLatestRecognitionRunForProject_ExcludesSuperseded(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newRecognitionReadyProject(t, s, ctx, tenantID, legalEntityID, "PRJ-REC-8", 100)
+
+	contractValue := 1000.0
+	run := &domain.RecognitionRun{
+		RunID: uuid.New().String(), LegalEntityID: legalEntityID, ProjectID: projectID, FiscalPeriod: "2026-09",
+		Status: domain.RecognitionRunStatusDraft, ContractValue: &contractValue,
+		RevenueAccountCode: "4000", WIPAccountCode: "1300",
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateRecognitionRun(ctx, run); err != nil {
+		t.Fatalf("CreateRecognitionRun failed: %v", err)
+	}
+
+	latest, err := s.GetLatestRecognitionRunForProject(ctx, projectID)
+	if err != nil {
+		t.Fatalf("GetLatestRecognitionRunForProject failed: %v", err)
+	}
+	if latest.RunID != run.RunID {
+		t.Fatalf("expected the live run, got %+v", latest)
+	}
+
+	now := time.Now().UTC()
+	if err := s.FreezeAndCalculate(ctx, run.RunID, now); err != nil {
+		t.Fatalf("FreezeAndCalculate failed: %v", err)
+	}
+	if err := s.ValidateRecognitionRun(ctx, run.RunID, now); err != nil {
+		t.Fatalf("ValidateRecognitionRun failed: %v", err)
+	}
+	if err := s.ApproveRecognitionRun(ctx, run.RunID, "approver-1", now); err != nil {
+		t.Fatalf("ApproveRecognitionRun failed: %v", err)
+	}
+	if err := s.MarkRecognitionRunEmitted(ctx, run.RunID, "journal-1", now); err != nil {
+		t.Fatalf("MarkRecognitionRunEmitted failed: %v", err)
+	}
+	if err := s.SupersedeRecognitionRun(ctx, run.RunID, "manager-1", now); err != nil {
+		t.Fatalf("SupersedeRecognitionRun failed: %v", err)
+	}
+	if _, err := s.GetLatestRecognitionRunForProject(ctx, projectID); err != domain.ErrRecognitionRunNotFound {
+		t.Fatalf("expected ErrRecognitionRunNotFound once the only run is superseded, got %v", err)
+	}
+}
+
+// TestPgStore_GetRecognitionRunAsOf_ReconstructsHistoricalState is the
+// real proof of PRJ-03's own GetRecognitionAsOf query — as of a cutoff
+// before the supersede, the original run must still be the answer; as of
+// now, no live run remains.
+func TestPgStore_GetRecognitionRunAsOf_ReconstructsHistoricalState(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	projectID := newRecognitionReadyProject(t, s, ctx, tenantID, legalEntityID, "PRJ-REC-9", 100)
+
+	contractValue := 1000.0
+	run := &domain.RecognitionRun{
+		RunID: uuid.New().String(), LegalEntityID: legalEntityID, ProjectID: projectID, FiscalPeriod: "2026-09",
+		Status: domain.RecognitionRunStatusDraft, ContractValue: &contractValue,
+		RevenueAccountCode: "4000", WIPAccountCode: "1300",
+		CreatedAt: time.Now().UTC(), CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateRecognitionRun(ctx, run); err != nil {
+		t.Fatalf("CreateRecognitionRun failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := s.FreezeAndCalculate(ctx, run.RunID, now); err != nil {
+		t.Fatalf("FreezeAndCalculate failed: %v", err)
+	}
+	if err := s.ValidateRecognitionRun(ctx, run.RunID, now); err != nil {
+		t.Fatalf("ValidateRecognitionRun failed: %v", err)
+	}
+	if err := s.ApproveRecognitionRun(ctx, run.RunID, "approver-1", now); err != nil {
+		t.Fatalf("ApproveRecognitionRun failed: %v", err)
+	}
+	if err := s.MarkRecognitionRunEmitted(ctx, run.RunID, "journal-1", now); err != nil {
+		t.Fatalf("MarkRecognitionRunEmitted failed: %v", err)
+	}
+	cutoff := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond)
+	if err := s.SupersedeRecognitionRun(ctx, run.RunID, "manager-1", time.Now().UTC()); err != nil {
+		t.Fatalf("SupersedeRecognitionRun failed: %v", err)
+	}
+
+	asOfCutoff, err := s.GetRecognitionRunAsOf(ctx, projectID, cutoff)
+	if err != nil {
+		t.Fatalf("GetRecognitionRunAsOf (cutoff) failed: %v", err)
+	}
+	if asOfCutoff.RunID != run.RunID {
+		t.Fatalf("expected the run as it stood before the supersede, got %+v", asOfCutoff)
+	}
+
+	if _, err := s.GetRecognitionRunAsOf(ctx, projectID, time.Now().UTC()); err != domain.ErrRecognitionRunNotFound {
+		t.Fatalf("expected ErrRecognitionRunNotFound as of now (after supersede), got %v", err)
+	}
+}

@@ -19,6 +19,7 @@ import (
 
 type mockStore struct {
 	bankAccounts map[string]*domain.BankAccount
+	evidence     map[string][]domain.OwnershipEvidence
 	cashBalances map[string]*domain.CashBalance
 	thresholds   map[string]*domain.LiquidityThreshold
 	transfers    map[string]bool
@@ -29,23 +30,123 @@ type mockStore struct {
 	balErr       error
 	threshErr    error
 	transferErr  error
+	bnk01Err     error
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
 		bankAccounts: make(map[string]*domain.BankAccount),
+		evidence:     make(map[string][]domain.OwnershipEvidence),
 		cashBalances: make(map[string]*domain.CashBalance),
 		thresholds:   make(map[string]*domain.LiquidityThreshold),
 		transfers:    make(map[string]bool),
 	}
 }
 
-func (m *mockStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccount) error {
+func (m *mockStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccount) (bool, error) {
 	if m.createErr != nil {
-		return m.createErr
+		return false, m.createErr
+	}
+	if acct.CorrelationID != "" {
+		for _, existing := range m.bankAccounts {
+			if existing.CorrelationID == acct.CorrelationID {
+				*acct = *existing
+				return false, nil
+			}
+		}
 	}
 	m.bankAccounts[acct.BankAccountID] = acct
-	return nil
+	return true, nil
+}
+
+// ── BNK-01 ───────────────────────────────────────────────────────────────────
+
+func (m *mockStore) VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error) {
+	if m.bnk01Err != nil {
+		return nil, m.bnk01Err
+	}
+	if _, ok := m.bankAccounts[p.BankAccountID]; !ok {
+		return nil, domain.ErrBankAccountNotFound
+	}
+	for i := range m.evidence[p.BankAccountID] {
+		superseded := "superseded"
+		m.evidence[p.BankAccountID][i].SupersededBy = &superseded
+	}
+	e := domain.OwnershipEvidence{
+		EvidenceID: "ev-" + p.BankAccountID, BankAccountID: p.BankAccountID, TenantID: p.TenantID,
+		VerificationMethod: p.VerificationMethod, EvidenceRef: p.EvidenceRef, VerifiedByPrincipalID: p.VerifiedByPrincipalID,
+		VerifiedAt: time.Now().UTC(),
+	}
+	m.evidence[p.BankAccountID] = append(m.evidence[p.BankAccountID], e)
+	return &e, nil
+}
+
+func (m *mockStore) ListOwnershipEvidence(ctx context.Context, tenantID, bankAccountID string) ([]domain.OwnershipEvidence, error) {
+	if m.bnk01Err != nil {
+		return nil, m.bnk01Err
+	}
+	return m.evidence[bankAccountID], nil
+}
+
+func (m *mockStore) IsOwnershipVerified(ctx context.Context, tenantID, bankAccountID string) (bool, error) {
+	if m.bnk01Err != nil {
+		return false, m.bnk01Err
+	}
+	for _, e := range m.evidence[bankAccountID] {
+		if e.SupersededBy == nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *mockStore) transition(bankAccountID string, allowed func(string) bool, apply func(*domain.BankAccount)) (*domain.BankAccount, error) {
+	if m.bnk01Err != nil {
+		return nil, m.bnk01Err
+	}
+	acct, ok := m.bankAccounts[bankAccountID]
+	if !ok {
+		return nil, domain.ErrBankAccountNotFound
+	}
+	if !allowed(acct.AccountStatus) {
+		return nil, domain.ErrInvalidTransition
+	}
+	apply(acct)
+	return acct, nil
+}
+
+func (m *mockStore) AmendBankAccountMetadata(ctx context.Context, p domain.AmendBankAccountMetadataParams) (*domain.BankAccount, error) {
+	return m.transition(p.BankAccountID, domain.CanAmendMetadata, func(a *domain.BankAccount) {
+		a.AccountName, a.BranchRef, a.BankIdentifier, a.Country, a.AccountType = p.AccountName, p.BranchRef, p.BankIdentifier, p.Country, p.AccountType
+	})
+}
+
+func (m *mockStore) ChangeOperationalUse(ctx context.Context, p domain.ChangeOperationalUseParams) (*domain.BankAccount, error) {
+	return m.transition(p.BankAccountID, domain.CanChangeOperationalUse, func(a *domain.BankAccount) {
+		a.RequestedOperationalUse = p.RequestedOperationalUse
+	})
+}
+
+func (m *mockStore) SuspendBankAccount(ctx context.Context, p domain.SuspendAccountParams) (*domain.BankAccount, error) {
+	return m.transition(p.BankAccountID, domain.CanSuspendAccount, func(a *domain.BankAccount) { a.AccountStatus = domain.BankAccountSuspended })
+}
+
+func (m *mockStore) ReactivateBankAccount(ctx context.Context, p domain.ReactivateAccountParams) (*domain.BankAccount, error) {
+	return m.transition(p.BankAccountID, domain.CanReactivateAccount, func(a *domain.BankAccount) { a.AccountStatus = domain.BankAccountActive })
+}
+
+func (m *mockStore) CloseBankAccount(ctx context.Context, p domain.CloseAccountParams) (*domain.BankAccount, error) {
+	return m.transition(p.BankAccountID, domain.CanCloseAccount, func(a *domain.BankAccount) { a.AccountStatus = domain.BankAccountClosed })
+}
+
+func (m *mockStore) RotateAccountIdentifierToken(ctx context.Context, p domain.RotateAccountTokenParams) (*domain.BankAccount, error) {
+	return m.transition(p.BankAccountID, domain.CanRotateAccountToken, func(a *domain.BankAccount) {
+		a.MaskedAccountNumber = p.NewMaskedAccountNumber
+		if p.NewBankIdentifier != "" {
+			a.BankIdentifier = p.NewBankIdentifier
+		}
+		a.TokenVersion++
+	})
 }
 
 func (m *mockStore) GetBankAccount(ctx context.Context, bankAccountID string) (*domain.BankAccount, error) {

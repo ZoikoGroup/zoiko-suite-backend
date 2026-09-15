@@ -167,6 +167,98 @@ func (s *PgStore) GetRecognitionRun(ctx context.Context, runID string) (*domain.
 	return r, nil
 }
 
+// ListRecognitionRunsForProject is PRJ-03's own GetRevenueSchedule query
+// — every recognition run ever created for a project, oldest first, the
+// full period-by-period revenue/WIP history (SupersedeRecognitionRun
+// never deletes a row, it only sets superseded_at/superseded_by_run_id —
+// see migration 000003's own doc comment — so this is a complete,
+// reproducible schedule, not just the currently-live runs).
+func (s *PgStore) ListRecognitionRunsForProject(ctx context.Context, projectID string) ([]domain.RecognitionRun, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.RecognitionRun
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT `+recognitionRunColumns+` FROM project_recognition_runs WHERE tenant_id = $1 AND project_id = $2 ORDER BY created_at`, tenantID, projectID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			r, err := scanRecognitionRun(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetLatestRecognitionRunForProject is the current-state read behind
+// PRJ-03's own GetWIPOrContractBalance, GetProgressEvidence and
+// ExplainRecognition queries — the most recently created run for a
+// project that has not itself been superseded (SupersedeRecognitionRun
+// always creates a brand-new run rather than editing the old one, so
+// "not superseded" and "most recent" agree — this asserts both as a
+// safety net against ever surfacing a stale, superseded run as current).
+func (s *PgStore) GetLatestRecognitionRunForProject(ctx context.Context, projectID string) (*domain.RecognitionRun, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var r *domain.RecognitionRun
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+recognitionRunColumns+` FROM project_recognition_runs
+			WHERE tenant_id = $1 AND project_id = $2 AND superseded_at IS NULL
+			ORDER BY created_at DESC LIMIT 1`, tenantID, projectID)
+		var err error
+		r, err = scanRecognitionRun(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrRecognitionRunNotFound
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// GetRecognitionRunAsOf is PRJ-03's own GetRecognitionAsOf query — the
+// run that was current as of asOf: the most recent run created on or
+// before asOf that had not itself been superseded by that instant.
+func (s *PgStore) GetRecognitionRunAsOf(ctx context.Context, projectID string, asOf time.Time) (*domain.RecognitionRun, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var r *domain.RecognitionRun
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+recognitionRunColumns+` FROM project_recognition_runs
+			WHERE tenant_id = $1 AND project_id = $2 AND created_at <= $3
+				AND (superseded_at IS NULL OR superseded_at > $3)
+			ORDER BY created_at DESC LIMIT 1`, tenantID, projectID, asOf)
+		var err error
+		r, err = scanRecognitionRun(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrRecognitionRunNotFound
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 // FreezeAndCalculate is CalculateProjectRevenue + CalculateProjectWIP,
 // collapsed into one real step — see migration 000003's doc comment.
 // Moves DRAFT -> CALCULATED, snapshotting the current approved estimate

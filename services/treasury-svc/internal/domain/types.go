@@ -2,18 +2,105 @@ package domain
 
 import "time"
 
-// BankAccount represents a registered bank account.
+// BankAccount represents a registered bank account — BNK-01's own
+// identity/ownership/verification/operational-status model, extending
+// this pre-existing type in place rather than a new service.
 type BankAccount struct {
-	BankAccountID       string    `json:"bank_account_id"`
-	TenantID            string    `json:"tenant_id"`
-	LegalEntityID       string    `json:"legal_entity_id"`
-	AccountName         string    `json:"account_name"`
-	MaskedAccountNumber string    `json:"masked_account_number"`
-	BankIdentifier      string    `json:"bank_identifier"`
-	CurrencyCode        string    `json:"currency_code"`
-	AccountStatus       string    `json:"account_status"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	BankAccountID       string `json:"bank_account_id"`
+	TenantID            string `json:"tenant_id"`
+	LegalEntityID       string `json:"legal_entity_id"`
+	AccountName         string `json:"account_name"`
+	MaskedAccountNumber string `json:"masked_account_number"`
+	BankIdentifier      string `json:"bank_identifier"`
+	CurrencyCode        string `json:"currency_code"`
+	AccountStatus       string `json:"account_status"`
+
+	BranchRef               string `json:"branch_ref"`
+	Country                 string `json:"country"`
+	AccountType             string `json:"account_type"`
+	RequestedOperationalUse string `json:"requested_operational_use"`
+	TokenVersion            int    `json:"token_version"`
+	CreatedByPrincipalID    string `json:"created_by_principal_id,omitempty"`
+	CorrelationID           string `json:"-"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// BNK-01 operational-status lifecycle. account_status keeps its original
+// three values (ACTIVE/SUSPENDED/CLOSED) as the default path for backward
+// compatibility with every existing caller of RegisterBankAccount — see
+// migration 000003's own doc comment for why the create-time default was
+// deliberately NOT changed to PENDING_VERIFICATION. DRAFT/
+// PENDING_VERIFICATION are valid states a caller may explicitly use.
+const (
+	BankAccountDraft               = "DRAFT"
+	BankAccountPendingVerification = "PENDING_VERIFICATION"
+	BankAccountActive              = "ACTIVE"
+	BankAccountSuspended           = "SUSPENDED"
+	BankAccountClosed              = "CLOSED"
+)
+
+func CanAmendMetadata(status string) bool {
+	return status == BankAccountDraft || status == BankAccountPendingVerification || status == BankAccountActive || status == BankAccountSuspended
+}
+func CanChangeOperationalUse(status string) bool { return CanAmendMetadata(status) }
+func CanSuspendAccount(status string) bool       { return status == BankAccountActive }
+func CanReactivateAccount(status string) bool    { return status == BankAccountSuspended }
+func CanCloseAccount(status string) bool {
+	return status == BankAccountDraft || status == BankAccountPendingVerification || status == BankAccountActive || status == BankAccountSuspended
+}
+func CanRotateAccountToken(status string) bool { return status != BankAccountClosed }
+
+// OwnershipEvidence is orthogonal to AccountStatus — append-only,
+// superseded by a new row on re-verification, never edited in place. See
+// migration 000003's own doc comment: IsOwnershipVerified is a derived
+// fact (does at least one non-superseded row exist), never a column.
+type OwnershipEvidence struct {
+	EvidenceID            string    `json:"evidence_id"`
+	BankAccountID         string    `json:"bank_account_id"`
+	TenantID              string    `json:"tenant_id"`
+	VerificationMethod    string    `json:"verification_method"`
+	EvidenceRef           string    `json:"evidence_ref"`
+	VerifiedByPrincipalID string    `json:"verified_by_principal_id"`
+	VerifiedAt            time.Time `json:"verified_at"`
+	SupersededBy          *string   `json:"superseded_by,omitempty"`
+}
+
+// ── BNK-01 command params ───────────────────────────────────────────────────
+
+type VerifyOwnershipParams struct {
+	BankAccountID, TenantID         string
+	VerificationMethod, EvidenceRef string
+	VerifiedByPrincipalID           string
+}
+
+type AmendBankAccountMetadataParams struct {
+	BankAccountID, TenantID                                      string
+	AccountName, BranchRef, BankIdentifier, Country, AccountType string
+	ActorPrincipalID                                             string
+}
+
+type ChangeOperationalUseParams struct {
+	BankAccountID, TenantID, RequestedOperationalUse, ActorPrincipalID string
+}
+
+type SuspendAccountParams struct {
+	BankAccountID, TenantID, Reason, ActorPrincipalID string
+}
+
+type ReactivateAccountParams struct {
+	BankAccountID, TenantID, ActorPrincipalID string
+}
+
+type CloseAccountParams struct {
+	BankAccountID, TenantID, Reason, ActorPrincipalID string
+}
+
+type RotateAccountTokenParams struct {
+	BankAccountID, TenantID                   string
+	NewMaskedAccountNumber, NewBankIdentifier string
+	ActorPrincipalID                          string
 }
 
 // CashBalance represents a balance snapshot for a bank account.
@@ -39,13 +126,22 @@ type LiquidityThreshold struct {
 	CreatedAt              time.Time `json:"created_at"`
 }
 
-// RegisterBankAccountRequest input model.
+// RegisterBankAccountRequest input model. BranchRef/Country/AccountType/
+// RequestedOperationalUse/CorrelationID are additive (BNK-01) fields —
+// all optional so every existing caller's request body keeps working
+// unchanged.
 type RegisterBankAccountRequest struct {
 	LegalEntityID       string `json:"legal_entity_id"`
 	AccountName         string `json:"account_name"`
 	MaskedAccountNumber string `json:"masked_account_number"`
 	BankIdentifier      string `json:"bank_identifier"`
 	CurrencyCode        string `json:"currency_code"`
+
+	BranchRef               string `json:"branch_ref,omitempty"`
+	Country                 string `json:"country,omitempty"`
+	AccountType             string `json:"account_type,omitempty"`
+	RequestedOperationalUse string `json:"requested_operational_use,omitempty"`
+	CorrelationID           string `json:"correlation_id,omitempty"`
 }
 
 // SetThresholdRequest input model.
@@ -112,6 +208,11 @@ var (
 	ErrAPServiceUnavailable    = errorString("accounts-payable-svc unavailable")
 	ErrARServiceUnavailable    = errorString("accounts-receivable-svc unavailable")
 	ErrObligationsUnavailable  = errorString("obligations-svc unavailable")
+
+	// ErrInvalidTransition is BNK-01's own CAS-mismatch sentinel — the
+	// account exists but isn't in a state that permits the attempted
+	// command (e.g. suspending a DRAFT account, or amending a CLOSED one).
+	ErrInvalidTransition = errorString("bank account is not in a state that permits this action")
 )
 
 type ExpectedCashFlow struct {

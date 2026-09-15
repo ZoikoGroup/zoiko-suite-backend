@@ -38,6 +38,9 @@ type envelope struct {
 	EmittedAt     string          `json:"emitted_at"` // RFC3339 string from producer
 	SchemaVersion string          `json:"schema_version"`
 	SourceService string          `json:"source_service"`
+	TenantID      string          `json:"tenant_id,omitempty"`
+	LegalEntityID string          `json:"legal_entity_id,omitempty"`
+	ActorID       string          `json:"actor_id,omitempty"`
 	CorrelationID string          `json:"correlation_id,omitempty"`
 	CausationID   string          `json:"causation_id,omitempty"`
 	Payload       json.RawMessage `json:"payload"`
@@ -81,6 +84,17 @@ type entityStatusChangedPayload struct {
 	LegalEntityID string `json:"legal_entity_id"`
 	// previous_status and new_status are preserved in the JSONB payload;
 	// they do not need to be promoted to top-level columns.
+}
+
+// auditEngagementPayload is deliberately allow-listed rather than a generic
+// "store any workflow event" format. An immutable audit chain is only useful
+// when each admitted event has the tenant, entity, actor, and object context
+// required to answer who did what for which engagement.
+type auditEngagementPayload struct {
+	EngagementID     string `json:"engagement_id"`
+	TenantID         string `json:"tenant_id"`
+	LegalEntityID    string `json:"legal_entity_id"`
+	ActorPrincipalID string `json:"actor_principal_id"`
 }
 
 // Consumer receives raw event messages (bytes), validates them, and delegates
@@ -151,6 +165,8 @@ func (c *Consumer) Handle(ctx context.Context, eventID string, raw []byte) error
 		return c.handleContextResolved(ctx, eventID, env)
 	case "entity.status.changed":
 		return c.handleEntityStatusChanged(ctx, eventID, env)
+	case "audit.engagement.created", "audit.engagement.acceptance_submitted", "audit.engagement.accepted", "audit.engagement.rejected", "audit.engagement.activated", "audit.engagement.withdrawn":
+		return c.handleAuditEngagement(ctx, eventID, env)
 	default:
 		c.log.Warn("unknown event_type — skipped",
 			zap.String("event_id", eventID),
@@ -158,6 +174,41 @@ func (c *Consumer) Handle(ctx context.Context, eventID string, raw []byte) error
 		)
 		return nil
 	}
+}
+
+// handleAuditEngagement stores AUD-01 lifecycle facts. The consumer has no
+// write path to workflow-svc, preserving evidence-service read-only ownership.
+func (c *Consumer) handleAuditEngagement(ctx context.Context, eventID string, env envelope) error {
+	if env.SourceService != "workflow-svc" {
+		c.log.Error("rejected: audit engagement event from unexpected source", zap.String("event_id", eventID), zap.String("source_service", env.SourceService))
+		return nil
+	}
+	var p auditEngagementPayload
+	if err := json.Unmarshal(env.Payload, &p); err != nil {
+		c.log.Error("rejected: cannot unmarshal audit engagement payload", zap.String("event_id", eventID), zap.Error(err))
+		return nil
+	}
+	if p.EngagementID == "" || p.TenantID == "" || p.LegalEntityID == "" || p.ActorPrincipalID == "" || env.CorrelationID == "" {
+		c.log.Error("rejected: audit engagement payload lacks required audit context", zap.String("event_id", eventID), zap.String("event_type", env.EventType))
+		return nil
+	}
+	// Scope appears in both the canonical envelope and payload. Refuse a
+	// disagreement so no malformed producer can place a cross-tenant fact in
+	// the hash chain under an apparently valid payload.
+	if env.TenantID != p.TenantID || env.LegalEntityID != p.LegalEntityID || env.ActorID != p.ActorPrincipalID {
+		c.log.Error("rejected: audit engagement envelope/payload scope mismatch", zap.String("event_id", eventID))
+		return nil
+	}
+	evt := &store.AuditEvent{
+		EventID: eventID, EventType: env.EventType, TenantID: p.TenantID, LegalEntityID: p.LegalEntityID,
+		PrincipalID: p.ActorPrincipalID, SourceService: env.SourceService, SchemaVersion: env.SchemaVersion,
+		Payload: env.Payload, CorrelationID: env.CorrelationID, CausationID: env.CausationID,
+	}
+	if err := c.store.Store(ctx, evt); err != nil {
+		return fmt.Errorf("handleAuditEngagement: store: %w", err)
+	}
+	c.log.Info("audit engagement event stored", zap.String("event_id", eventID), zap.String("event_type", env.EventType), zap.String("engagement_id", p.EngagementID))
+	return nil
 }
 
 // handleContextResolved processes the identity.context.resolved event.
