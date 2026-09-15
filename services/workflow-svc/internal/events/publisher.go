@@ -132,32 +132,6 @@ func (p *Publisher) PublishAuditEngagementEvent(ctx context.Context, eventType s
 	})
 }
 
-// PublishAuditPopulationEvent publishes only an allow-listed AUD-03
-// lifecycle fact. AuditPopulation carries no legal_entity_id of its own
-// (only its owning engagement does), so the envelope's legal_entity_id is
-// left empty here, same as Jurisdiction elsewhere in this file.
-func (p *Publisher) PublishAuditPopulationEvent(ctx context.Context, eventType string, pop domain.AuditPopulation, actorID, correlationID string) error {
-	switch eventType {
-	case "audit.population.built", "audit.population.validation_failed", "audit.population.frozen", "audit.population.delta_added":
-	default:
-		return fmt.Errorf("audit population: unsupported event type %q", eventType)
-	}
-	return p.emit(ctx, eventType, correlationID, pop.TenantID, "", actorID, map[string]any{
-		"population_id":        pop.PopulationID,
-		"engagement_id":        pop.EngagementID,
-		"tenant_id":            pop.TenantID,
-		"status":               pop.Status,
-		"actor_principal_id":   actorID,
-		"source_system":        pop.SourceSystem,
-		"source_object":        pop.SourceObject,
-		"item_count":           pop.ItemCount,
-		"control_total_amount": pop.ControlTotalAmount,
-		"digest":               pop.Digest,
-		"prior_population_id":  pop.PriorPopulationID,
-		"quarantine_reason":    pop.QuarantineReason,
-	})
-}
-
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
