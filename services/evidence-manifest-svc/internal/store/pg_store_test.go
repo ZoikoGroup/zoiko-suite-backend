@@ -27,6 +27,16 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 	t.Cleanup(pool.Close)
 
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS sample_evaluations;
+		DROP TABLE IF EXISTS sample_executions;
+		DROP TABLE IF EXISTS sample_items;
+		DROP TABLE IF EXISTS sample_selections;
+		DROP TABLE IF EXISTS sample_designs;
+		DROP TABLE IF EXISTS sampling_parameter_sets;
+		DROP TABLE IF EXISTS population_deltas;
+		DROP TABLE IF EXISTS population_rows;
+		DROP TABLE IF EXISTS population_control_totals;
+		DROP TABLE IF EXISTS audit_populations;
 		DROP TABLE IF EXISTS manifest_records;
 		DROP TABLE IF EXISTS evidence_manifests;
 	`)

@@ -26,6 +26,39 @@ type stubStore struct {
 	manifests map[string]*domain.EvidenceManifest
 	records   map[string][]domain.ManifestRecord
 	createErr error
+
+	// AUD-03 population stub state — a simple fixture, not a full
+	// in-memory simulation of the real CAS/reconciliation logic (that is
+	// covered by real-Postgres tests in internal/store).
+	population       *domain.AuditPopulation
+	populations      []*domain.AuditPopulation
+	popChanged       bool
+	popErr           error
+	popGetErr        error
+	listPopErr       error
+	controlTotals    []*domain.PopulationControlTotal
+	controlTotalsErr error
+
+	// AUD-04 sampling stub state — a simple fixture, not a simulation of
+	// the real algorithm/CAS logic (covered by real-Postgres tests).
+	paramSet        *domain.SamplingParameterSet
+	paramSetErr     error
+	sampleDesign    *domain.SampleDesign
+	designChanged   bool
+	designErr       error
+	designGetErr    error
+	sampleSelection *domain.SampleSelection
+	sampleItems     []*domain.SampleItem
+	selectErr       error
+	reproducible    bool
+	reproduceErr    error
+	itemResultsErr  error
+	sampleItem      *domain.SampleItem
+	itemChanged     bool
+	itemErr         error
+	evaluation      *domain.SampleEvaluation
+	evalChanged     bool
+	evalErr         error
 }
 
 func newStubStore() *stubStore {
@@ -103,6 +136,73 @@ func (s *stubStore) ListRecords(ctx context.Context, manifestID string) ([]domai
 		return nil, nil
 	}
 	return s.records[manifestID], nil
+}
+
+func (s *stubStore) DefinePopulation(_ context.Context, _ domain.DefinePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) GetAuditPopulation(_ context.Context, _, _ string) (*domain.AuditPopulation, error) {
+	return s.population, s.popGetErr
+}
+func (s *stubStore) ListAuditPopulationsByEngagement(_ context.Context, _, _ string) ([]*domain.AuditPopulation, error) {
+	return s.populations, s.listPopErr
+}
+func (s *stubStore) BuildPopulation(_ context.Context, _ domain.BuildPopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) ValidatePopulation(_ context.Context, _ domain.ValidatePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) FreezePopulation(_ context.Context, _ domain.FreezePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) SupersedePopulation(_ context.Context, _ domain.SupersedePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) QuarantinePopulation(_ context.Context, _ domain.QuarantinePopulationParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) AddControlledDelta(_ context.Context, _ domain.AddControlledDeltaParams) (*domain.AuditPopulation, bool, error) {
+	return s.population, s.popChanged, s.popErr
+}
+func (s *stubStore) GetControlTotals(_ context.Context, _, _ string) ([]*domain.PopulationControlTotal, error) {
+	return s.controlTotals, s.controlTotalsErr
+}
+func (s *stubStore) CreateSamplingParameterSet(_ context.Context, _ domain.CreateSamplingParameterSetParams) (*domain.SamplingParameterSet, error) {
+	return s.paramSet, s.paramSetErr
+}
+func (s *stubStore) CreateSampleDesign(_ context.Context, _ domain.CreateSampleDesignParams) (*domain.SampleDesign, bool, error) {
+	return s.sampleDesign, s.designChanged, s.designErr
+}
+func (s *stubStore) GetSampleDesign(_ context.Context, _, _ string) (*domain.SampleDesign, error) {
+	return s.sampleDesign, s.designGetErr
+}
+func (s *stubStore) ApproveSampleDesign(_ context.Context, _ domain.ApproveSampleDesignParams) (*domain.SampleDesign, bool, error) {
+	return s.sampleDesign, s.designChanged, s.designErr
+}
+func (s *stubStore) SelectSample(_ context.Context, _ domain.SelectSampleParams) (*domain.SampleSelection, []*domain.SampleItem, bool, error) {
+	return s.sampleSelection, s.sampleItems, s.designChanged, s.selectErr
+}
+func (s *stubStore) ReproduceSelection(_ context.Context, _, _ string) (bool, error) {
+	return s.reproducible, s.reproduceErr
+}
+func (s *stubStore) GetItemResults(_ context.Context, _, _ string) ([]*domain.SampleItem, error) {
+	return s.sampleItems, s.itemResultsErr
+}
+func (s *stubStore) RecordItemResult(_ context.Context, _ domain.RecordItemResultParams) (*domain.SampleItem, bool, error) {
+	return s.sampleItem, s.itemChanged, s.itemErr
+}
+func (s *stubStore) RecordNonresponse(_ context.Context, _ domain.RecordNonresponseParams) (*domain.SampleItem, bool, error) {
+	return s.sampleItem, s.itemChanged, s.itemErr
+}
+func (s *stubStore) AddAlternativeProcedure(_ context.Context, _ domain.AddAlternativeProcedureParams) (*domain.SampleItem, bool, error) {
+	return s.sampleItem, s.itemChanged, s.itemErr
+}
+func (s *stubStore) EvaluateSample(_ context.Context, _ domain.EvaluateSampleParams) (*domain.SampleEvaluation, bool, error) {
+	return s.evaluation, s.evalChanged, s.evalErr
+}
+func (s *stubStore) SupersedeSample(_ context.Context, _ domain.SupersedeSampleParams) (*domain.SampleDesign, bool, error) {
+	return s.sampleDesign, s.designChanged, s.designErr
 }
 
 // ── stub aggregator sources ──────────────────────────────────────────────────
