@@ -469,3 +469,124 @@ func (s *PgStore) GetDepreciationCompleteness(ctx context.Context, legalEntityID
 	}
 	return coveredCount, eligibleCount, nil
 }
+
+// GetAssetBookStateAsOf is AST-03's own named query — which depreciation
+// schedule (book) was actually effective for this asset+book at a point
+// in time, reconstructed from the same effective_from/effective_to
+// versioning depreciation_schedules already uses (never rewritten in
+// place — see migration 000002's own doc comment).
+func (s *PgStore) GetAssetBookStateAsOf(ctx context.Context, assetID, bookID string, asOf time.Time) (*domain.DepreciationSchedule, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var sch *domain.DepreciationSchedule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+depreciationScheduleColumns+` FROM depreciation_schedules
+			WHERE tenant_id = $1 AND asset_id = $2 AND book_id = $3
+			  AND created_at <= $4 AND (effective_to IS NULL OR effective_to > $4)
+		`, tenantID, assetID, bookID, asOf)
+		var err error
+		sch, err = scanDepreciationSchedule(row)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrScheduleNotFound
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sch, nil
+}
+
+// GetAccumulatedDepreciation is the spec's own named query — the real,
+// live "as of now" accumulated depreciation for one schedule version,
+// taken from that schedule's own most recent depreciation line. A
+// schedule never run yet has no lines and therefore 0 accumulated
+// depreciation — a real, valid answer, not an error.
+func (s *PgStore) GetAccumulatedDepreciation(ctx context.Context, scheduleVersionID string) (float64, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var total float64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(MAX(accumulated_depreciation_after), 0) FROM depreciation_lines
+			WHERE tenant_id = $1 AND schedule_version_id = $2
+		`, tenantID, scheduleVersionID).Scan(&total)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+// GetDepreciationAsOf is GetAccumulatedDepreciation restricted to lines
+// posted on or before asOf — a genuine point-in-time reconstruction,
+// since depreciation_lines is append-only (never rewritten in place).
+func (s *PgStore) GetDepreciationAsOf(ctx context.Context, scheduleVersionID string, asOf time.Time) (float64, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return 0, domain.ErrIdentityMissing
+	}
+	var total float64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COALESCE(MAX(accumulated_depreciation_after), 0) FROM depreciation_lines
+			WHERE tenant_id = $1 AND schedule_version_id = $2 AND created_at <= $3
+		`, tenantID, scheduleVersionID, asOf).Scan(&total)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+// ListRunExceptions is the spec's own named query — every schedule
+// eligible for depreciation in this legal entity and fiscal period that
+// has NOT been covered by any live (non-SUPERSEDED) run for that
+// period. Reuses the exact eligibility/coverage predicates
+// GetDepreciationCompleteness already proved out — this is that same
+// check's own detail view, not a second, driftable copy of the rule.
+func (s *PgStore) ListRunExceptions(ctx context.Context, legalEntityID, fiscalPeriod string) ([]domain.DepreciationSchedule, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.DepreciationSchedule
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT ds.schedule_version_id, ds.schedule_id, ds.version, ds.tenant_id, ds.legal_entity_id, ds.asset_id, ds.book_id,
+				ds.method, ds.cost_basis, ds.residual_value, ds.useful_life_months, ds.in_service_date, ds.status, ds.effective_to,
+				ds.created_at, ds.created_by_principal_id
+			FROM depreciation_schedules ds
+			JOIN fixed_assets fa ON fa.asset_id = ds.asset_id
+			WHERE ds.tenant_id = $1 AND ds.legal_entity_id = $2
+			  AND ds.status = $3 AND ds.effective_to IS NULL AND fa.status = $4
+			  AND ds.schedule_version_id NOT IN (
+			      SELECT dl.schedule_version_id FROM depreciation_lines dl
+			      JOIN depreciation_runs dr ON dr.run_id = dl.run_id
+			      WHERE dr.tenant_id = $1 AND dr.legal_entity_id = $2 AND dr.fiscal_period = $5 AND dr.status != $6
+			  )
+		`, tenantID, legalEntityID, domain.DepreciationScheduleStatusActive, domain.AssetStatusActive,
+			fiscalPeriod, domain.DepreciationRunStatusSuperseded)
+		if err != nil {
+			return mapPgError(err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			sch, err := scanDepreciationSchedule(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, *sch)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}

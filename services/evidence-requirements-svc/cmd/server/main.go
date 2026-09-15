@@ -184,6 +184,7 @@ func main() {
 
 	h := handler.New(pgStore, publisher, authzClient, docsClient, log)
 	handler.RegisterRoutes(r, h)
+	handler.RegisterPBCRoutes(r, h, pgStore)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
 	healthH := health.New(pool, log)

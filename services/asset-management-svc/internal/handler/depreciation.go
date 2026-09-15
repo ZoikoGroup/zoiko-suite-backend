@@ -33,7 +33,8 @@ func (h *Handler) BuildDepreciationSchedule(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 
@@ -58,7 +59,7 @@ func (h *Handler) BuildDepreciationSchedule(w http.ResponseWriter, r *http.Reque
 	scheduleID := uuid.NewString()
 	sch := &domain.DepreciationSchedule{
 		ScheduleVersionID: uuid.NewString(), ScheduleID: scheduleID, Version: 1,
-		LegalEntityID: asset.LegalEntityID, AssetID: req.AssetID, BookID: req.BookID,
+		TenantID: tenantID, LegalEntityID: asset.LegalEntityID, AssetID: req.AssetID, BookID: req.BookID,
 		Method: domain.DepreciationMethodStraightLine, CostBasis: req.CostBasis, ResidualValue: req.ResidualValue,
 		UsefulLifeMonths: req.UsefulLifeMonths, InServiceDate: inServiceDate,
 		Status: domain.DepreciationScheduleStatusActive, CreatedAt: time.Now().UTC(), CreatedByPrincipalID: principalID,
@@ -72,6 +73,7 @@ func (h *Handler) BuildDepreciationSchedule(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	h.publisher.PublishDepreciationScheduleBuilt(r.Context(), getCorrelationID(r), principalID, *sch)
 	writeJSON(w, http.StatusCreated, sch)
 }
 
@@ -107,6 +109,103 @@ func (h *Handler) GetDepreciationCompleteness(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]int{"covered_count": covered, "eligible_count": eligible})
+}
+
+// ── GET /v1/depreciation-schedules/{id}/accumulated-depreciation, /as-of ─────
+
+func (h *Handler) GetAccumulatedDepreciation(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	sch, err := h.store.GetCurrentDepreciationSchedule(r.Context(), id)
+	if err != nil {
+		h.writeDepreciationErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sch.LegalEntityID, actionDepreciationView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	total, err := h.store.GetAccumulatedDepreciation(r.Context(), sch.ScheduleVersionID)
+	if err != nil {
+		h.log.Error("GetAccumulatedDepreciation: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]float64{"accumulated_depreciation": total})
+}
+
+func (h *Handler) GetDepreciationAsOf(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	asOf := time.Now().UTC()
+	if dateParam := r.URL.Query().Get("date"); dateParam != "" {
+		parsed, err := time.Parse(time.RFC3339, dateParam)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_date", "date must be RFC3339")
+			return
+		}
+		asOf = parsed
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	sch, err := h.store.GetCurrentDepreciationSchedule(r.Context(), id)
+	if err != nil {
+		h.writeDepreciationErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, sch.LegalEntityID, actionDepreciationView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	total, err := h.store.GetDepreciationAsOf(r.Context(), sch.ScheduleVersionID, asOf)
+	if err != nil {
+		h.log.Error("GetDepreciationAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]float64{"accumulated_depreciation": total})
+}
+
+// ── GET /v1/depreciation-runs/exceptions ──────────────────────────────────────
+
+func (h *Handler) ListRunExceptions(w http.ResponseWriter, r *http.Request) {
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	fiscalPeriod := r.URL.Query().Get("fiscal_period")
+	if legalEntityID == "" || fiscalPeriod == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id and fiscal_period are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionDepreciationView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	list, err := h.store.ListRunExceptions(r.Context(), legalEntityID, fiscalPeriod)
+	if err != nil {
+		h.log.Error("ListRunExceptions: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if list == nil {
+		list = []domain.DepreciationSchedule{}
+	}
+	writeJSON(w, http.StatusOK, list)
 }
 
 // ── GET /v1/depreciation-schedules/{id} ──────────────────────────────────────
@@ -295,7 +394,8 @@ func (h *Handler) ValidateDepreciationRun(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 	run, err := h.store.GetDepreciationRun(r.Context(), id)
@@ -312,6 +412,7 @@ func (h *Handler) ValidateDepreciationRun(w http.ResponseWriter, r *http.Request
 		h.writeDepreciationErr(w, err)
 		return
 	}
+	h.publisher.PublishDepreciationRunCalculated(r.Context(), getCorrelationID(r), principalID, tenantID, run.LegalEntityID, id, lineCount)
 	writeJSON(w, http.StatusOK, map[string]any{"run_id": id, "status": domain.DepreciationRunStatusValidated, "line_count": lineCount})
 }
 
@@ -328,7 +429,8 @@ func (h *Handler) ApproveDepreciationRun(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	if _, ok := h.requireTenant(w, r); !ok {
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
 		return
 	}
 	run, err := h.store.GetDepreciationRun(r.Context(), id)
@@ -349,6 +451,7 @@ func (h *Handler) ApproveDepreciationRun(w http.ResponseWriter, r *http.Request)
 		h.writeDepreciationErr(w, err)
 		return
 	}
+	h.publisher.PublishDepreciationRunApproved(r.Context(), getCorrelationID(r), principalID, tenantID, run.LegalEntityID, id)
 	writeJSON(w, http.StatusOK, map[string]string{"run_id": id, "status": domain.DepreciationRunStatusApproved})
 }
 
@@ -474,6 +577,7 @@ func (h *Handler) SupersedeDepreciationRun(w http.ResponseWriter, r *http.Reques
 		h.writeDepreciationErr(w, err)
 		return
 	}
+	h.publisher.PublishDepreciationRunSuperseded(r.Context(), getCorrelationID(r), principalID, tenantID, run.LegalEntityID, id)
 	writeJSON(w, http.StatusOK, map[string]string{"run_id": id, "status": domain.DepreciationRunStatusSuperseded})
 }
 

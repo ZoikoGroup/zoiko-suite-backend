@@ -114,6 +114,88 @@ func (p *Publisher) PublishAssetEventAccountingEventEmitted(ctx context.Context,
 	})
 }
 
+// AST-02's own remaining named events (verbatim, "Events produced"):
+// "DepreciationScheduleBuilt; DepreciationRunCalculated;
+// DepreciationRunApproved; DepreciationAccountingEventEmitted;
+// DepreciationRunSuperseded." DepreciationAccountingEventEmitted is
+// PublishDepreciationRunAccountingEventEmitted above; these four cover
+// the rest of the run/schedule lifecycle.
+
+func (p *Publisher) PublishDepreciationScheduleBuilt(ctx context.Context, correlationID, actorID string, s domain.DepreciationSchedule) {
+	p.emit(ctx, "depreciation.schedule.built", correlationID, s.TenantID, s.LegalEntityID, actorID, s.ScheduleID, map[string]any{
+		"schedule_id": s.ScheduleID, "asset_id": s.AssetID, "book_id": s.BookID, "version": s.Version,
+	})
+}
+
+func (p *Publisher) PublishDepreciationRunCalculated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID string, lineCount int) {
+	p.emit(ctx, "depreciation.run.calculated", correlationID, tenantID, legalEntityID, actorID, runID, map[string]any{
+		"run_id": runID, "line_count": lineCount,
+	})
+}
+
+func (p *Publisher) PublishDepreciationRunApproved(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID string) {
+	p.emit(ctx, "depreciation.run.approved", correlationID, tenantID, legalEntityID, actorID, runID, map[string]any{
+		"run_id": runID,
+	})
+}
+
+func (p *Publisher) PublishDepreciationRunSuperseded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, runID string) {
+	p.emit(ctx, "depreciation.run.superseded", correlationID, tenantID, legalEntityID, actorID, runID, map[string]any{
+		"run_id": runID,
+	})
+}
+
+// AST-03's own remaining named events (verbatim, "Events produced"):
+// "AssetEventCreated; AssetEventApproved; AssetEventApplied;
+// AssetImpaired; AssetRevalued; AssetDisposed; AssetEventReversed." All
+// seven were previously unpublished — only the accounting-event-emitted
+// signal above ever fired.
+
+func (p *Publisher) PublishAssetEventCreated(ctx context.Context, correlationID, actorID string, e domain.AssetEvent) {
+	p.emit(ctx, "asset.event.created", correlationID, e.TenantID, e.LegalEntityID, actorID, e.EventID, map[string]any{
+		"event_id": e.EventID, "event_type": e.EventType, "asset_id": e.AssetID,
+	})
+}
+
+func (p *Publisher) PublishAssetEventApproved(ctx context.Context, correlationID, actorID string, e domain.AssetEvent) {
+	p.emit(ctx, "asset.event.approved", correlationID, e.TenantID, e.LegalEntityID, actorID, e.EventID, map[string]any{
+		"event_id": e.EventID,
+	})
+}
+
+func (p *Publisher) PublishAssetEventApplied(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID string) {
+	p.emit(ctx, "asset.event.applied", correlationID, tenantID, legalEntityID, actorID, eventID, map[string]any{
+		"event_id": eventID,
+	})
+}
+
+func (p *Publisher) PublishAssetImpaired(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, assetID string, amount *float64) {
+	p.emit(ctx, "asset.impaired", correlationID, tenantID, legalEntityID, actorID, eventID, map[string]any{
+		"event_id": eventID, "asset_id": assetID, "amount": amount,
+	})
+}
+
+func (p *Publisher) PublishAssetRevalued(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, assetID string, amount *float64) {
+	p.emit(ctx, "asset.revalued", correlationID, tenantID, legalEntityID, actorID, eventID, map[string]any{
+		"event_id": eventID, "asset_id": assetID, "amount": amount,
+	})
+}
+
+func (p *Publisher) PublishAssetDisposed(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, assetID string, proceeds *float64) {
+	p.emit(ctx, "asset.disposed", correlationID, tenantID, legalEntityID, actorID, eventID, map[string]any{
+		"event_id": eventID, "asset_id": assetID, "proceeds_amount": proceeds,
+	})
+}
+
+// PublishAssetEventReversed covers both REVERSED and SUPERSEDED outcomes
+// — status distinguishes which — since correctAssetEvent is the one
+// real store path both correction commands funnel into.
+func (p *Publisher) PublishAssetEventReversed(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, eventID, status string) {
+	p.emit(ctx, "asset.event.reversed", correlationID, tenantID, legalEntityID, actorID, eventID, map[string]any{
+		"event_id": eventID, "status": status,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

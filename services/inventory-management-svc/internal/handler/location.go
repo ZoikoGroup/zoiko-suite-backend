@@ -448,6 +448,35 @@ func (h *Handler) GetLocationAsOf(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"location_id": id, "as_of": at, "parent_location_id": parent})
 }
 
+// GetLocationInventorySummary backs the spec's own query of the same name
+// — every item currently on-hand at this location, net of committed
+// movements. See internal/store/movement_store.go's own doc comment.
+func (h *Handler) GetLocationInventorySummary(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	l, err := h.store.GetLocation(r.Context(), id)
+	if err != nil {
+		h.writeLocationErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, l.LegalEntityID, actionInventoryLocationRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	lines, err := h.store.GetLocationInventorySummary(r.Context(), id)
+	if err != nil {
+		h.writeLocationErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"location_id": id, "items": lines})
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 func (h *Handler) writeLocationErr(w http.ResponseWriter, err error) {

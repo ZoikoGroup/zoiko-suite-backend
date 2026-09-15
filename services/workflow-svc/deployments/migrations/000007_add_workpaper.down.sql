@@ -1,0 +1,10 @@
+DROP TABLE IF EXISTS workpaper_addenda;
+DROP TABLE IF EXISTS workpaper_evidence_links;
+DROP TABLE IF EXISTS workpaper_cross_references;
+DROP TABLE IF EXISTS workpaper_conclusions;
+DROP TABLE IF EXISTS workpaper_results;
+DROP TABLE IF EXISTS workpaper_procedures;
+DROP TABLE IF EXISTS workpapers;
+DROP FUNCTION IF EXISTS reject_locked_workpaper_mutation();
+DROP FUNCTION IF EXISTS reject_locked_workpaper_child_mutation();
+DROP FUNCTION IF EXISTS reject_workpaper_addendum_mutation();

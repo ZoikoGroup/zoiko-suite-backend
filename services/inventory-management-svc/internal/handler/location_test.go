@@ -244,3 +244,37 @@ func TestListEligibleLocations_OnlyReturnsActive(t *testing.T) {
 		t.Fatalf("expected exactly the ACTIVE location, got %+v", list)
 	}
 }
+
+// ── GetLocationInventorySummary ───────────────────────────────────────────────
+
+func TestGetLocationInventorySummary_NetsMovementsAcrossItems(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemA := createActiveItem(t, s, r, "le-1", "SKU-SUM-A-"+uniqueSuffix())
+	itemB := createActiveItem(t, s, r, "le-1", "SKU-SUM-B-"+uniqueSuffix())
+	loc := createDraftLocation(t, r, "le-1", "WH-SUM-"+uniqueSuffix(), "")
+	activateLocation(t, r, loc.LocationID)
+
+	createAndCommitReceipt(t, r, itemA, loc.LocationID, "idem-sum-a1-"+uniqueSuffix(), 10)
+	createAndCommitReceipt(t, r, itemB, loc.LocationID, "idem-sum-b1-"+uniqueSuffix(), 6)
+
+	rr := doReq(r, http.MethodGet, "/v1/locations/"+loc.LocationID+"/inventory-summary", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		LocationID string                                `json:"location_id"`
+		Items      []domain.LocationInventorySummaryLine `json:"items"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if len(resp.Items) != 2 {
+		t.Fatalf("expected 2 items with on-hand quantity, got %+v", resp.Items)
+	}
+	byItem := map[string]float64{}
+	for _, l := range resp.Items {
+		byItem[l.ItemID] = l.OnHandQuantity
+	}
+	if byItem[itemA] != 10 || byItem[itemB] != 6 {
+		t.Fatalf("expected A=10 B=6, got %+v", byItem)
+	}
+}

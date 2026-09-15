@@ -33,6 +33,12 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 
 	// Fresh schema per test run.
 	_, err = pool.Exec(context.Background(), `
+		DROP TABLE IF EXISTS custody_entries;
+		DROP TABLE IF EXISTS evidence_contradictions;
+		DROP TABLE IF EXISTS evidence_procedure_links;
+		DROP TABLE IF EXISTS evidence_reliability_assessments;
+		DROP TABLE IF EXISTS evidence_versions;
+		DROP TABLE IF EXISTS audit_evidence;
 		DROP TABLE IF EXISTS document_access_log;
 		DROP TABLE IF EXISTS document_versions;
 		DROP TABLE IF EXISTS documents;

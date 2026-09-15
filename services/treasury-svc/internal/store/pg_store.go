@@ -46,29 +46,57 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 	return fallback
 }
 
-// CreateBankAccount registers a new bank account.
-func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccount) error {
+const bankAccountColumns = `
+	bank_account_id, tenant_id, legal_entity_id, account_name,
+	masked_account_number, bank_identifier, currency_code, account_status,
+	branch_ref, country, account_type, requested_operational_use, token_version,
+	created_by_principal_id, created_at, updated_at`
+
+func scanBankAccount(row pgx.Row, acct *domain.BankAccount) error {
+	return row.Scan(&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
+		&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
+		&acct.BranchRef, &acct.Country, &acct.AccountType, &acct.RequestedOperationalUse, &acct.TokenVersion,
+		&acct.CreatedByPrincipalID, &acct.CreatedAt, &acct.UpdatedAt)
+}
+
+// CreateBankAccount registers a new bank account. Idempotent on
+// (tenant_id, correlation_id) when a correlation_id is supplied — a
+// retried request returns the original row (created=false) rather than a
+// second account.
+func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccount) (bool, error) {
 	tenantID := tenantFromCtxOrFallback(ctx, acct.TenantID)
 	now := time.Now().UTC()
 
-	return s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `
+	created := false
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
 			INSERT INTO bank_accounts (
 				bank_account_id, tenant_id, legal_entity_id, account_name,
 				masked_account_number, bank_identifier, currency_code, account_status,
+				branch_ref, country, account_type, requested_operational_use,
+				correlation_id, created_by_principal_id,
 				created_at, updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		`, acct.BankAccountID, tenantID, acct.LegalEntityID, acct.AccountName,
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id <> '' DO NOTHING
+			RETURNING `+bankAccountColumns,
+			acct.BankAccountID, tenantID, acct.LegalEntityID, acct.AccountName,
 			acct.MaskedAccountNumber, acct.BankIdentifier, acct.CurrencyCode, acct.AccountStatus,
+			acct.BranchRef, acct.Country, acct.AccountType, acct.RequestedOperationalUse,
+			acct.CorrelationID, acct.CreatedByPrincipalID,
 			now, now)
-		if err != nil {
+		if err := scanBankAccount(row, acct); err == nil {
+			created = true
+			return nil
+		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		acct.TenantID = tenantID
-		acct.CreatedAt = now
-		acct.UpdatedAt = now
-		return nil
+		// Conflict: a prior call with the same correlation_id already
+		// created the account. Re-select it so the caller gets the real
+		// row back rather than the half-populated one it sent in.
+		return scanBankAccount(tx.QueryRow(ctx, `SELECT `+bankAccountColumns+`
+			FROM bank_accounts WHERE tenant_id = $1 AND correlation_id = $2`, tenantID, acct.CorrelationID), acct)
 	})
+	return created, err
 }
 
 // GetBankAccount retrieves a bank account by ID, tenant-scoped.
@@ -80,18 +108,11 @@ func (s *PgStore) GetBankAccount(ctx context.Context, bankAccountID string) (*do
 
 	var acct domain.BankAccount
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		row := tx.QueryRow(ctx, `
-			SELECT bank_account_id, tenant_id, legal_entity_id, account_name,
-			       masked_account_number, bank_identifier, currency_code, account_status,
-			       created_at, updated_at
+		row := tx.QueryRow(ctx, `SELECT `+bankAccountColumns+`
 			FROM bank_accounts
 			WHERE bank_account_id = $1 AND tenant_id = $2
 		`, bankAccountID, tenantID)
-		return row.Scan(
-			&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
-			&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
-			&acct.CreatedAt, &acct.UpdatedAt,
-		)
+		return scanBankAccount(row, &acct)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -111,10 +132,7 @@ func (s *PgStore) ListBankAccounts(ctx context.Context, legalEntityID string) ([
 
 	var out []domain.BankAccount
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `
-			SELECT bank_account_id, tenant_id, legal_entity_id, account_name,
-			       masked_account_number, bank_identifier, currency_code, account_status,
-			       created_at, updated_at
+		rows, err := tx.Query(ctx, `SELECT `+bankAccountColumns+`
 			FROM bank_accounts
 			WHERE tenant_id = $1 AND ($2 = '' OR legal_entity_id = $2)
 			ORDER BY created_at DESC
@@ -126,11 +144,7 @@ func (s *PgStore) ListBankAccounts(ctx context.Context, legalEntityID string) ([
 
 		for rows.Next() {
 			var acct domain.BankAccount
-			if err := rows.Scan(
-				&acct.BankAccountID, &acct.TenantID, &acct.LegalEntityID, &acct.AccountName,
-				&acct.MaskedAccountNumber, &acct.BankIdentifier, &acct.CurrencyCode, &acct.AccountStatus,
-				&acct.CreatedAt, &acct.UpdatedAt,
-			); err != nil {
+			if err := scanBankAccount(rows, &acct); err != nil {
 				return err
 			}
 			out = append(out, acct)

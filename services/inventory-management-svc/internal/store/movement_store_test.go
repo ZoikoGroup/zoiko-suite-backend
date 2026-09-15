@@ -117,6 +117,137 @@ func TestPgStore_FullReceiptLifecycle_UpdatesOnHand(t *testing.T) {
 	}
 }
 
+// TestPgStore_GetLocationInventorySummary_NetsAcrossItems is the real proof
+// of INV-02's own GetLocationInventorySummary query — that it aggregates
+// net on-hand per item at a location the same way liveOnHand aggregates a
+// single item, and that a fully-consumed item (net zero) drops out.
+func TestPgStore_GetLocationInventorySummary_NetsAcrossItems(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemA := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-SUM-A")
+	itemB := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-SUM-B")
+	itemC := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-SUM-C")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-SUM-1")
+
+	now := time.Now().UTC()
+	commitReceipt := func(itemID, idemKey string, qty float64) {
+		m := newDraftReceipt(itemID, locID, idemKey, qty, "")
+		if err := s.CreateMovement(ctx, m); err != nil {
+			t.Fatalf("CreateMovement failed: %v", err)
+		}
+		if err := s.ValidateMovement(ctx, m.MovementID, now); err != nil {
+			t.Fatalf("ValidateMovement failed: %v", err)
+		}
+		if err := s.CommitMovement(ctx, m.MovementID, "preparer-1", now); err != nil {
+			t.Fatalf("CommitMovement failed: %v", err)
+		}
+	}
+	commitReceipt(itemA, "idem-sum-a1", 12)
+	commitReceipt(itemB, "idem-sum-b1", 8)
+	commitReceipt(itemC, "idem-sum-c1", 5)
+
+	// Fully consume item C so it nets to zero and must not appear.
+	issue := &domain.InventoryMovement{
+		MovementID: uuid.New().String(), MovementType: domain.MovementTypeIssue, Status: domain.MovementStatusDraft,
+		ItemID: itemC, SourceLocationID: &locID, Quantity: 5, UOM: "EACH",
+		SourceReference: "SO-1", SourceIdempotencyKey: "idem-sum-c-issue", BusinessDate: now, FiscalPeriod: "2026-09",
+		CreatedAt: now, CreatedByPrincipalID: "preparer-1",
+	}
+	if err := s.CreateMovement(ctx, issue); err != nil {
+		t.Fatalf("CreateMovement (issue) failed: %v", err)
+	}
+	if err := s.ValidateMovement(ctx, issue.MovementID, now); err != nil {
+		t.Fatalf("ValidateMovement (issue) failed: %v", err)
+	}
+	if err := s.CommitMovement(ctx, issue.MovementID, "preparer-1", now); err != nil {
+		t.Fatalf("CommitMovement (issue) failed: %v", err)
+	}
+
+	lines, err := s.GetLocationInventorySummary(ctx, locID)
+	if err != nil {
+		t.Fatalf("GetLocationInventorySummary failed: %v", err)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 items with non-zero on-hand (C nets to zero), got %+v", lines)
+	}
+	byItem := map[string]float64{}
+	for _, l := range lines {
+		byItem[l.ItemID] = l.OnHandQuantity
+	}
+	if byItem[itemA] != 12 || byItem[itemB] != 8 {
+		t.Fatalf("expected A=12 B=8, got %+v", byItem)
+	}
+	if _, present := byItem[itemC]; present {
+		t.Fatalf("expected item C (net zero) to be absent, got %+v", byItem)
+	}
+}
+
+// TestPgStore_MovementLineageAndChain_CorrectionOfACorrection is the real
+// recursive-CTE proof behind INV-03's own GetMovementLineage/GetMovementChain
+// queries: a chain of length 3 (original -> reversal -> supersession of
+// the reversal) is reachable end-to-end, lineage is forward-only from any
+// point, and chain finds the same 3 movements regardless of which one you
+// start from.
+func TestPgStore_MovementLineageAndChain_CorrectionOfACorrection(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newActiveTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-CHAIN-1")
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-CHAIN-1")
+
+	m := newDraftReceipt(itemID, locID, "idem-chain-1", 20, "")
+	if err := s.CreateMovement(ctx, m); err != nil {
+		t.Fatalf("CreateMovement failed: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := s.ValidateMovement(ctx, m.MovementID, now); err != nil {
+		t.Fatalf("ValidateMovement failed: %v", err)
+	}
+	if err := s.CommitMovement(ctx, m.MovementID, "preparer-1", now); err != nil {
+		t.Fatalf("CommitMovement failed: %v", err)
+	}
+
+	reversal, err := s.CreateCorrectionMovement(ctx, m.MovementID, "preparer-2", "wrong quantity", false, uuid.New().String(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("CreateCorrectionMovement (reversal) failed: %v", err)
+	}
+	supersession, err := s.CreateCorrectionMovement(ctx, reversal.MovementID, "preparer-3", "correcting the reversal itself", true, uuid.New().String(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("CreateCorrectionMovement (supersession) failed: %v", err)
+	}
+
+	lineage, err := s.GetMovementLineage(ctx, m.MovementID)
+	if err != nil {
+		t.Fatalf("GetMovementLineage failed: %v", err)
+	}
+	if len(lineage) != 3 {
+		t.Fatalf("expected lineage of 3 from the original, got %d: %+v", len(lineage), lineage)
+	}
+
+	leafLineage, err := s.GetMovementLineage(ctx, supersession.MovementID)
+	if err != nil {
+		t.Fatalf("GetMovementLineage (leaf) failed: %v", err)
+	}
+	if len(leafLineage) != 1 {
+		t.Fatalf("expected lineage of 1 from the leaf (forward-only), got %d: %+v", len(leafLineage), leafLineage)
+	}
+
+	chain, err := s.GetMovementChain(ctx, supersession.MovementID)
+	if err != nil {
+		t.Fatalf("GetMovementChain failed: %v", err)
+	}
+	if len(chain) != 3 {
+		t.Fatalf("expected chain of 3 starting from the leaf, got %d: %+v", len(chain), chain)
+	}
+}
+
 // TestPgStore_CommitMovement_CommittedRowImmutable is the real proof of
 // the state model's own claim, "committed movement immutable."
 func TestPgStore_CommitMovement_CommittedRowImmutable(t *testing.T) {

@@ -74,12 +74,18 @@ func TestPgStore_ValueMovement_Inbound_CreatesCostLayer(t *testing.T) {
 
 	receipt := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-store-val-1", 10)
 	unitCost := 5.0
-	entry, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &unitCost, time.Now().UTC())
+	entry, layer, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &unitCost, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("ValueMovement failed: %v", err)
 	}
 	if entry.Value != 50 || entry.EntryType != domain.ValuationEntryTypeInbound {
 		t.Fatalf("expected value=50 INBOUND, got %+v", entry)
+	}
+	if layer == nil {
+		t.Fatal("expected a non-nil cost layer for an INBOUND valuation")
+	}
+	if layer.SourceMovementID != receipt.MovementID || layer.RemainingQuantity != 10 || layer.UnitCost != 5.0 {
+		t.Fatalf("expected cost layer sourced from receipt with qty=10 cost=5, got %+v", layer)
 	}
 
 	value, err := s.GetInventoryValue(ctx, itemID, locID)
@@ -105,10 +111,10 @@ func TestPgStore_ValueMovement_SameMovementTwice_Refused(t *testing.T) {
 
 	receipt := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-store-val-2", 10)
 	unitCost := 3.0
-	if _, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &unitCost, time.Now().UTC()); err != nil {
+	if _, _, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &unitCost, time.Now().UTC()); err != nil {
 		t.Fatalf("first ValueMovement failed: %v", err)
 	}
-	if _, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &unitCost, time.Now().UTC()); err != domain.ErrMovementAlreadyValued {
+	if _, _, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &unitCost, time.Now().UTC()); err != domain.ErrMovementAlreadyValued {
 		t.Fatalf("expected ErrMovementAlreadyValued, got %v", err)
 	}
 }
@@ -128,17 +134,17 @@ func TestPgStore_ValueMovement_OutboundFIFO_ConsumesOldestFirst(t *testing.T) {
 
 	r1 := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-fifo-r1", 10)
 	cost1 := 2.0
-	if _, err := s.ValueMovement(ctx, r1.MovementID, "preparer-1", &cost1, time.Now().UTC()); err != nil {
+	if _, _, err := s.ValueMovement(ctx, r1.MovementID, "preparer-1", &cost1, time.Now().UTC()); err != nil {
 		t.Fatalf("value r1 failed: %v", err)
 	}
 	r2 := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-fifo-r2", 10)
 	cost2 := 4.0
-	if _, err := s.ValueMovement(ctx, r2.MovementID, "preparer-1", &cost2, time.Now().UTC()); err != nil {
+	if _, _, err := s.ValueMovement(ctx, r2.MovementID, "preparer-1", &cost2, time.Now().UTC()); err != nil {
 		t.Fatalf("value r2 failed: %v", err)
 	}
 
 	issue := createCommittedIssue(t, s, ctx, legalEntityID, itemID, locID, "idem-fifo-issue", 15)
-	entry, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC())
+	entry, _, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC())
 	if err != nil {
 		t.Fatalf("value issue failed: %v", err)
 	}
@@ -159,6 +165,120 @@ func TestPgStore_ValueMovement_OutboundFIFO_ConsumesOldestFirst(t *testing.T) {
 	}
 }
 
+// TestPgStore_GetLayerConsumptions_OutboundFIFO_ReturnsBothLayers is the
+// real proof of INV-04's own GetCOGSAssignment query: an OUTBOUND
+// valuation that draws on two FIFO layers persists a consumption row per
+// layer it touched, in the order it consumed them.
+func TestPgStore_GetLayerConsumptions_OutboundFIFO_ReturnsBothLayers(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-COGS-1", domain.ValuationMethodFIFO)
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-COGS-1")
+
+	r1 := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-cogs-r1", 10)
+	cost1 := 2.0
+	if _, _, err := s.ValueMovement(ctx, r1.MovementID, "preparer-1", &cost1, time.Now().UTC()); err != nil {
+		t.Fatalf("value r1 failed: %v", err)
+	}
+	r2 := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-cogs-r2", 10)
+	cost2 := 4.0
+	if _, _, err := s.ValueMovement(ctx, r2.MovementID, "preparer-1", &cost2, time.Now().UTC()); err != nil {
+		t.Fatalf("value r2 failed: %v", err)
+	}
+
+	issue := createCommittedIssue(t, s, ctx, legalEntityID, itemID, locID, "idem-cogs-issue", 15)
+	entry, _, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("value issue failed: %v", err)
+	}
+
+	consumptions, err := s.GetLayerConsumptions(ctx, entry.EntryID)
+	if err != nil {
+		t.Fatalf("GetLayerConsumptions failed: %v", err)
+	}
+	if len(consumptions) != 2 {
+		t.Fatalf("expected 2 consumptions (10 from r1's layer, 5 from r2's layer), got %+v", consumptions)
+	}
+	if consumptions[0].QuantityConsumed != 10 || consumptions[0].UnitCostAtConsumption != 2 {
+		t.Fatalf("expected first consumption qty=10 rate=2 (FIFO), got %+v", consumptions[0])
+	}
+	if consumptions[1].QuantityConsumed != 5 || consumptions[1].UnitCostAtConsumption != 4 {
+		t.Fatalf("expected second consumption qty=5 rate=4, got %+v", consumptions[1])
+	}
+}
+
+// TestPgStore_GetInventoryValueAsOf_ReconstructsHistoricalValue is the
+// real proof of INV-04's own GetInventoryValueAsOf query: it must exclude
+// both a layer that did not exist yet AND a consumption that had not
+// happened yet, and it must still equal GetInventoryValue's own live
+// answer at the current instant.
+func TestPgStore_GetInventoryValueAsOf_ReconstructsHistoricalValue(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	itemID := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-ASOF-1", domain.ValuationMethodFIFO)
+	locID := newActiveTestLocation(t, s, ctx, tenantID, legalEntityID, "WH-ASOF-1")
+
+	r1 := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-asof-r1", 10)
+	cost1 := 2.0
+	if _, _, err := s.ValueMovement(ctx, r1.MovementID, "preparer-1", &cost1, time.Now().UTC()); err != nil {
+		t.Fatalf("value r1 failed: %v", err)
+	}
+	afterFirstReceipt := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond)
+
+	r2 := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-asof-r2", 10)
+	cost2 := 4.0
+	if _, _, err := s.ValueMovement(ctx, r2.MovementID, "preparer-1", &cost2, time.Now().UTC()); err != nil {
+		t.Fatalf("value r2 failed: %v", err)
+	}
+	afterSecondReceipt := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond)
+
+	issue := createCommittedIssue(t, s, ctx, legalEntityID, itemID, locID, "idem-asof-issue", 5)
+	if _, _, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC()); err != nil {
+		t.Fatalf("value issue failed: %v", err)
+	}
+
+	valueAfterFirst, err := s.GetInventoryValueAsOf(ctx, itemID, locID, afterFirstReceipt)
+	if err != nil {
+		t.Fatalf("GetInventoryValueAsOf (after first) failed: %v", err)
+	}
+	if valueAfterFirst != 20 { // only r1's layer: 10 * 2
+		t.Fatalf("expected 20 as of right after r1, got %v", valueAfterFirst)
+	}
+
+	valueAfterSecond, err := s.GetInventoryValueAsOf(ctx, itemID, locID, afterSecondReceipt)
+	if err != nil {
+		t.Fatalf("GetInventoryValueAsOf (after second) failed: %v", err)
+	}
+	if valueAfterSecond != 60 { // both layers, nothing consumed yet: 10*2 + 10*4
+		t.Fatalf("expected 60 as of right after r2 (before the issue), got %v", valueAfterSecond)
+	}
+
+	valueNow, err := s.GetInventoryValueAsOf(ctx, itemID, locID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GetInventoryValueAsOf (now) failed: %v", err)
+	}
+	live, err := s.GetInventoryValue(ctx, itemID, locID)
+	if err != nil {
+		t.Fatalf("GetInventoryValue failed: %v", err)
+	}
+	if valueNow != live {
+		t.Fatalf("expected GetInventoryValueAsOf(now)=%v to equal live GetInventoryValue=%v", valueNow, live)
+	}
+	if valueNow != 50 { // 60 - 5*2 (FIFO consumes r1 first)
+		t.Fatalf("expected 50 after the 5-unit issue, got %v", valueNow)
+	}
+}
+
 // TestPgStore_ValueMovement_InsufficientLayers_Refused is a real
 // integrity guard distinct from INV-03's own physical negative-stock
 // check.
@@ -175,7 +295,7 @@ func TestPgStore_ValueMovement_InsufficientLayers_Refused(t *testing.T) {
 	createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-insuf-r1", 5) // never valued — no cost layer
 
 	issue := createCommittedIssue(t, s, ctx, legalEntityID, itemID, locID, "idem-insuf-issue", 5)
-	if _, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC()); err != domain.ErrInsufficientCostLayers {
+	if _, _, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC()); err != domain.ErrInsufficientCostLayers {
 		t.Fatalf("expected ErrInsufficientCostLayers, got %v", err)
 	}
 }
@@ -194,11 +314,11 @@ func TestPgStore_ValuationRun_FullLifecycle(t *testing.T) {
 
 	receipt := createCommittedReceipt(t, s, ctx, legalEntityID, itemID, locID, "idem-run-r1", 10)
 	cost := 2.0
-	if _, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &cost, time.Now().UTC()); err != nil {
+	if _, _, err := s.ValueMovement(ctx, receipt.MovementID, "preparer-1", &cost, time.Now().UTC()); err != nil {
 		t.Fatalf("value receipt failed: %v", err)
 	}
 	issue := createCommittedIssue(t, s, ctx, legalEntityID, itemID, locID, "idem-run-issue", 4)
-	if _, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC()); err != nil {
+	if _, _, err := s.ValueMovement(ctx, issue.MovementID, "preparer-1", nil, time.Now().UTC()); err != nil {
 		t.Fatalf("value issue failed: %v", err)
 	}
 
@@ -277,14 +397,14 @@ func TestPgStore_GetInventoryValueTotal_RealDB(t *testing.T) {
 	itemA := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-VAL-TOTAL-A", domain.ValuationMethodFIFO)
 	receiptA := createCommittedReceipt(t, s, ctx, legalEntityID, itemA, locID, "idem-store-val-total-1", 10)
 	unitCostA := 5.0
-	if _, err := s.ValueMovement(ctx, receiptA.MovementID, "preparer-1", &unitCostA, time.Now().UTC()); err != nil {
+	if _, _, err := s.ValueMovement(ctx, receiptA.MovementID, "preparer-1", &unitCostA, time.Now().UTC()); err != nil {
 		t.Fatalf("ValueMovement (item A) failed: %v", err)
 	}
 
 	itemB := newValuedTestItem(t, s, ctx, tenantID, legalEntityID, "SKU-VAL-TOTAL-B", domain.ValuationMethodFIFO)
 	receiptB := createCommittedReceipt(t, s, ctx, legalEntityID, itemB, locID, "idem-store-val-total-2", 4)
 	unitCostB := 25.0
-	if _, err := s.ValueMovement(ctx, receiptB.MovementID, "preparer-1", &unitCostB, time.Now().UTC()); err != nil {
+	if _, _, err := s.ValueMovement(ctx, receiptB.MovementID, "preparer-1", &unitCostB, time.Now().UTC()); err != nil {
 		t.Fatalf("ValueMovement (item B) failed: %v", err)
 	}
 

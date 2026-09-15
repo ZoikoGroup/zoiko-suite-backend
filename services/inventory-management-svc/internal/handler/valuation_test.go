@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -47,10 +48,12 @@ func TestValueMovement_InboundMissingUnitCost_Returns422(t *testing.T) {
 
 func TestValueMovement_Inbound_CreatesCostLayer(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
 	itemID, locID := valuationFixture(t, s, r)
 	committed := createAndCommitReceipt(t, r, itemID, locID, "idem-val-2", 10)
 
+	callsBefore := pub.calls
 	rr := valueMovement(t, r, committed.MovementID, f(5.0))
 	if rr.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201, got %d", rr.StatusCode)
@@ -59,6 +62,11 @@ func TestValueMovement_Inbound_CreatesCostLayer(t *testing.T) {
 	_ = json.NewDecoder(rr.Body).Decode(&entry)
 	if entry.Value != 50 || entry.EntryType != domain.ValuationEntryTypeInbound {
 		t.Fatalf("expected value=50 INBOUND, got %+v", entry)
+	}
+	// InventoryValued + CostLayerCreated (INV-04) — an INBOUND valuation
+	// always creates a new cost layer.
+	if pub.calls != callsBefore+2 {
+		t.Fatalf("expected exactly 2 new publish calls (InventoryValued, CostLayerCreated) for an INBOUND valuation, got %d new", pub.calls-callsBefore)
 	}
 
 	valReq := doReq(r, http.MethodGet, "/v1/valuation/inventory-value?item_id="+itemID+"&location_id="+locID, nil, "preparer-1")
@@ -91,7 +99,8 @@ func TestValueMovement_SameMovementTwice_Returns422(t *testing.T) {
 
 func TestValueMovement_OutboundFIFO_ConsumesOldestLayerFirst(t *testing.T) {
 	s := newStubStore()
-	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{})
 	itemID, locID := valuationFixture(t, s, r)
 
 	firstReceipt := createAndCommitReceipt(t, r, itemID, locID, "idem-fifo-1", 10)
@@ -121,6 +130,7 @@ func TestValueMovement_OutboundFIFO_ConsumesOldestLayerFirst(t *testing.T) {
 		t.Fatalf("commit issue failed: %d %s", c.Code, c.Body.String())
 	}
 
+	callsBefore := pub.calls
 	rr := valueMovement(t, r, issueM.MovementID, nil)
 	if rr.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201, got %d", rr.StatusCode)
@@ -129,6 +139,11 @@ func TestValueMovement_OutboundFIFO_ConsumesOldestLayerFirst(t *testing.T) {
 	_ = json.NewDecoder(rr.Body).Decode(&entry)
 	if entry.Value != 40 {
 		t.Fatalf("expected FIFO value=40 (10*2 + 5*4), got %v", entry.Value)
+	}
+	// An OUTBOUND valuation must publish InventoryValued only — never
+	// CostLayerCreated, since no new cost layer is created on consumption.
+	if pub.calls != callsBefore+1 {
+		t.Fatalf("expected exactly 1 new publish call (InventoryValued only) for an OUTBOUND valuation, got %d new", pub.calls-callsBefore)
 	}
 }
 
@@ -166,6 +181,134 @@ func TestValueMovement_OutboundInsufficientLayers_Returns422(t *testing.T) {
 	rr := valueMovement(t, r, issueM.MovementID, nil)
 	if rr.StatusCode != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 insufficient cost layers, got %d", rr.StatusCode)
+	}
+}
+
+// ── GetCOGSAssignment / GetInventoryValueAsOf / GetValuationEvidence ────────
+
+func TestGetCOGSAssignment_OutboundFIFO_ReturnsConsumedLayers(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locID := valuationFixture(t, s, r)
+
+	first := createAndCommitReceipt(t, r, itemID, locID, "idem-cogs-1", 10)
+	if rr := valueMovement(t, r, first.MovementID, f(2.0)); rr.StatusCode != http.StatusCreated {
+		t.Fatalf("value first receipt failed: %d", rr.StatusCode)
+	}
+	second := createAndCommitReceipt(t, r, itemID, locID, "idem-cogs-2", 10)
+	if rr := valueMovement(t, r, second.MovementID, f(4.0)); rr.StatusCode != http.StatusCreated {
+		t.Fatalf("value second receipt failed: %d", rr.StatusCode)
+	}
+
+	issueReq := domain.CreateInventoryMovementRequest{
+		ItemID: itemID, SourceLocationID: locID, Quantity: 15, UOM: "EACH",
+		SourceReference: "SO-1", SourceIdempotencyKey: "idem-cogs-issue", FiscalPeriod: "2026-09",
+	}
+	create := doReq(r, http.MethodPost, "/v1/movements/issue", issueReq, "preparer-1")
+	var issueM domain.InventoryMovement
+	_ = json.NewDecoder(create.Body).Decode(&issueM)
+	doReq(r, http.MethodPost, "/v1/movements/"+issueM.MovementID+"/validate", nil, "preparer-1")
+	doReq(r, http.MethodPost, "/v1/movements/"+issueM.MovementID+"/commit", nil, "preparer-1")
+
+	valueRR := valueMovement(t, r, issueM.MovementID, nil)
+	var entry domain.ValuationEntry
+	_ = json.NewDecoder(valueRR.Body).Decode(&entry)
+
+	rr := doReq(r, http.MethodGet, "/v1/valuation/entries/"+entry.EntryID+"/cogs-assignment", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var consumptions []domain.LayerConsumption
+	_ = json.NewDecoder(rr.Body).Decode(&consumptions)
+	if len(consumptions) != 2 {
+		t.Fatalf("expected 2 layer consumptions (10 from layer 1, 5 from layer 2), got %+v", consumptions)
+	}
+	var total float64
+	for _, c := range consumptions {
+		total += c.QuantityConsumed
+	}
+	if total != 15 {
+		t.Fatalf("expected consumed quantities to sum to 15, got %v", total)
+	}
+}
+
+func TestGetInventoryValueAsOf_BeforeSecondReceipt_ExcludesIt(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locID := valuationFixture(t, s, r)
+
+	first := createAndCommitReceipt(t, r, itemID, locID, "idem-asof-1", 10)
+	if rr := valueMovement(t, r, first.MovementID, f(2.0)); rr.StatusCode != http.StatusCreated {
+		t.Fatalf("value first receipt failed: %d", rr.StatusCode)
+	}
+	cutoff := time.Now().UTC()
+	time.Sleep(10 * time.Millisecond) // ensure the second receipt's timestamp is strictly after cutoff
+
+	second := createAndCommitReceipt(t, r, itemID, locID, "idem-asof-2", 10)
+	if rr := valueMovement(t, r, second.MovementID, f(4.0)); rr.StatusCode != http.StatusCreated {
+		t.Fatalf("value second receipt failed: %d", rr.StatusCode)
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/valuation/inventory-value-as-of?item_id="+itemID+"&location_id="+locID+"&at="+cutoff.Format(time.RFC3339Nano), nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]float64
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if resp["inventory_value"] != 20 {
+		t.Fatalf("expected inventory_value=20 (only the first receipt existed as of cutoff), got %v", resp["inventory_value"])
+	}
+
+	current := doReq(r, http.MethodGet, "/v1/valuation/inventory-value?item_id="+itemID+"&location_id="+locID, nil, "preparer-1")
+	var currentResp map[string]float64
+	_ = json.NewDecoder(current.Body).Decode(&currentResp)
+	if currentResp["inventory_value"] != 60 {
+		t.Fatalf("expected current inventory_value=60 (both receipts), got %v", currentResp["inventory_value"])
+	}
+}
+
+func TestGetValuationEvidence_Outbound_IncludesLayerConsumptions(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	itemID, locID := valuationFixture(t, s, r)
+
+	receipt := createAndCommitReceipt(t, r, itemID, locID, "idem-evidence-1", 10)
+	if rr := valueMovement(t, r, receipt.MovementID, f(3.0)); rr.StatusCode != http.StatusCreated {
+		t.Fatalf("value receipt failed: %d", rr.StatusCode)
+	}
+
+	issueReq := domain.CreateInventoryMovementRequest{
+		ItemID: itemID, SourceLocationID: locID, Quantity: 4, UOM: "EACH",
+		SourceReference: "SO-1", SourceIdempotencyKey: "idem-evidence-issue", FiscalPeriod: "2026-09",
+	}
+	create := doReq(r, http.MethodPost, "/v1/movements/issue", issueReq, "preparer-1")
+	var issueM domain.InventoryMovement
+	_ = json.NewDecoder(create.Body).Decode(&issueM)
+	doReq(r, http.MethodPost, "/v1/movements/"+issueM.MovementID+"/validate", nil, "preparer-1")
+	doReq(r, http.MethodPost, "/v1/movements/"+issueM.MovementID+"/commit", nil, "preparer-1")
+
+	valueRR := valueMovement(t, r, issueM.MovementID, nil)
+	var entry domain.ValuationEntry
+	_ = json.NewDecoder(valueRR.Body).Decode(&entry)
+
+	rr := doReq(r, http.MethodGet, "/v1/valuation/entries/"+entry.EntryID+"/evidence", nil, "preparer-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]json.RawMessage
+	_ = json.NewDecoder(rr.Body).Decode(&resp)
+	if _, ok := resp["entry"]; !ok {
+		t.Fatal("expected evidence to include the valuation entry")
+	}
+	if _, ok := resp["movement"]; !ok {
+		t.Fatal("expected evidence to include the movement")
+	}
+	var consumptions []domain.LayerConsumption
+	if err := json.Unmarshal(resp["layer_consumptions"], &consumptions); err != nil {
+		t.Fatalf("expected evidence to include layer_consumptions: %v", err)
+	}
+	if len(consumptions) != 1 || consumptions[0].QuantityConsumed != 4 {
+		t.Fatalf("expected 1 consumption of qty=4, got %+v", consumptions)
 	}
 }
 

@@ -17,7 +17,7 @@ import (
 
 // Store defines persistence contract for treasury service.
 type Store interface {
-	CreateBankAccount(ctx context.Context, acct *domain.BankAccount) error
+	CreateBankAccount(ctx context.Context, acct *domain.BankAccount) (created bool, err error)
 	GetBankAccount(ctx context.Context, bankAccountID string) (*domain.BankAccount, error)
 	ListBankAccounts(ctx context.Context, legalEntityID string) ([]domain.BankAccount, error)
 	UpdateBankAccountStatus(ctx context.Context, bankAccountID, status string) error
@@ -26,6 +26,17 @@ type Store interface {
 	SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error
 	GetLiquidityThreshold(ctx context.Context, legalEntityID, currencyCode string) (*domain.LiquidityThreshold, error)
 	ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (created bool, err error)
+
+	// BNK-01 — see internal/store/bnk01_store.go's own doc comments.
+	VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error)
+	ListOwnershipEvidence(ctx context.Context, tenantID, bankAccountID string) ([]domain.OwnershipEvidence, error)
+	IsOwnershipVerified(ctx context.Context, tenantID, bankAccountID string) (bool, error)
+	AmendBankAccountMetadata(ctx context.Context, p domain.AmendBankAccountMetadataParams) (*domain.BankAccount, error)
+	ChangeOperationalUse(ctx context.Context, p domain.ChangeOperationalUseParams) (*domain.BankAccount, error)
+	SuspendBankAccount(ctx context.Context, p domain.SuspendAccountParams) (*domain.BankAccount, error)
+	ReactivateBankAccount(ctx context.Context, p domain.ReactivateAccountParams) (*domain.BankAccount, error)
+	CloseBankAccount(ctx context.Context, p domain.CloseAccountParams) (*domain.BankAccount, error)
+	RotateAccountIdentifierToken(ctx context.Context, p domain.RotateAccountTokenParams) (*domain.BankAccount, error)
 }
 
 // Publisher defines Kafka event publication contract.
@@ -82,6 +93,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/effective-cash", h.GetEffectiveCash)
 		r.Get("/forecasts", h.GetForecasts)
 		r.Post("/transfers", h.InitiateTransfer)
+
+		// BNK-01 — see internal/handler/bnk01_handler.go.
+		r.Post("/accounts/{accountID}/verify-ownership", h.VerifyBankAccountOwnership)
+		r.Get("/accounts/{accountID}/ownership-evidence", h.GetOwnershipEvidence)
+		r.Post("/accounts/{accountID}/amend-metadata", h.AmendBankAccountMetadata)
+		r.Post("/accounts/{accountID}/change-operational-use", h.ChangeOperationalUse)
+		r.Post("/accounts/{accountID}/suspend", h.SuspendBankAccount)
+		r.Post("/accounts/{accountID}/reactivate", h.ReactivateBankAccount)
+		r.Post("/accounts/{accountID}/close", h.CloseBankAccount)
+		r.Post("/accounts/{accountID}/rotate-token", h.RotateAccountIdentifierToken)
 	})
 }
 
@@ -111,19 +132,32 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	acct := &domain.BankAccount{
-		BankAccountID:       uuid.New().String(),
-		TenantID:            tenantID,
-		LegalEntityID:       req.LegalEntityID,
-		AccountName:         req.AccountName,
-		MaskedAccountNumber: req.MaskedAccountNumber,
-		BankIdentifier:      req.BankIdentifier,
-		CurrencyCode:        req.CurrencyCode,
-		AccountStatus:       "ACTIVE",
+		BankAccountID:           uuid.New().String(),
+		TenantID:                tenantID,
+		LegalEntityID:           req.LegalEntityID,
+		AccountName:             req.AccountName,
+		MaskedAccountNumber:     req.MaskedAccountNumber,
+		BankIdentifier:          req.BankIdentifier,
+		CurrencyCode:            req.CurrencyCode,
+		AccountStatus:           "ACTIVE",
+		BranchRef:               req.BranchRef,
+		Country:                 req.Country,
+		AccountType:             req.AccountType,
+		RequestedOperationalUse: req.RequestedOperationalUse,
+		CorrelationID:           req.CorrelationID,
+		CreatedByPrincipalID:    principalID,
 	}
 
-	if err := h.store.CreateBankAccount(r.Context(), acct); err != nil {
+	created, err := h.store.CreateBankAccount(r.Context(), acct)
+	if err != nil {
 		h.log.Error("failed to create bank account", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+	if !created {
+		// Replay of a prior request with the same correlation_id — return
+		// the original account, don't re-initialize its balance trace.
+		writeJSON(w, http.StatusOK, acct)
 		return
 	}
 

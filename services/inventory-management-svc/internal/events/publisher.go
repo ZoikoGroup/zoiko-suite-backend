@@ -113,11 +113,9 @@ func (p *Publisher) PublishInventoryLocationRetired(ctx context.Context, correla
 	})
 }
 
-// INV-03's own named events (a subset — "InventoryMovementExceptionRaised"
-// is not wired in, since this v1 has no exception-detection logic yet;
-// stated honestly in the findings doc): "InventoryMovementCommitted;
+// INV-03's own named events: "InventoryMovementCommitted;
 // InventoryMovementReversed; InventoryTransferred; InventoryReceived;
-// InventoryIssued."
+// InventoryIssued; InventoryMovementExceptionRaised."
 
 func (p *Publisher) PublishInventoryMovementCommitted(ctx context.Context, correlationID, actorID string, m domain.InventoryMovement) {
 	p.emit(ctx, "inventory.movement.committed", correlationID, m.TenantID, m.LegalEntityID, actorID, m.MovementID, map[string]any{
@@ -149,10 +147,18 @@ func (p *Publisher) PublishInventoryIssued(ctx context.Context, correlationID, a
 	})
 }
 
-// INV-04's own named events (a subset — "CostLayerCreated" is not wired
-// in; stated honestly in the findings doc): "InventoryValued;
-// InventoryWriteDownRecorded; InventoryWriteDownReversed;
-// InventoryAccountingEventEmitted."
+// PublishInventoryMovementExceptionRaised fires from CommitMovement's own
+// error branch for the three named negative-path reasons — never from
+// the store — keyed off the specific error the store already returned.
+func (p *Publisher) PublishInventoryMovementExceptionRaised(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, movementID, reasonCode string) {
+	p.emit(ctx, "inventory.movement.exception_raised", correlationID, tenantID, legalEntityID, actorID, movementID, map[string]any{
+		"movement_id": movementID, "reason_code": reasonCode,
+	})
+}
+
+// INV-04's own named events: "InventoryValued; InventoryWriteDownRecorded;
+// InventoryWriteDownReversed; InventoryAccountingEventEmitted;
+// CostLayerCreated."
 
 func (p *Publisher) PublishInventoryValued(ctx context.Context, correlationID, actorID, tenantID string, e domain.ValuationEntry) {
 	p.emit(ctx, "inventory.valued", correlationID, tenantID, e.LegalEntityID, actorID, e.EntryID, map[string]any{
@@ -178,10 +184,19 @@ func (p *Publisher) PublishInventoryAccountingEventEmitted(ctx context.Context, 
 	})
 }
 
-// INV-05's own named events (a subset — "StockCountVarianceDetected" is
-// not wired in; stated honestly in the findings doc): "StockCountStarted;
-// StockCountPopulationFrozen; StockCountVarianceApproved;
-// StockCountAdjustmentRequested; StockCountCertified."
+// PublishCostLayerCreated fires only when ValueMovement's own INBOUND
+// path actually created a new layer — never for OUTBOUND, which
+// consumes existing layers instead of creating one.
+func (p *Publisher) PublishCostLayerCreated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, l domain.CostLayer) {
+	p.emit(ctx, "inventory.cost_layer.created", correlationID, tenantID, legalEntityID, actorID, l.LayerID, map[string]any{
+		"layer_id": l.LayerID, "item_id": l.ItemID, "location_id": l.LocationID,
+		"source_movement_id": l.SourceMovementID, "unit_cost": l.UnitCost,
+	})
+}
+
+// INV-05's own named events: "StockCountStarted; StockCountPopulationFrozen;
+// StockCountVarianceApproved; StockCountAdjustmentRequested;
+// StockCountCertified; StockCountVarianceDetected."
 
 func (p *Publisher) PublishStockCountStarted(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount) {
 	p.emit(ctx, "inventory.stock_count.started", correlationID, tenantID, sc.LegalEntityID, actorID, sc.CountID, map[string]any{
@@ -210,6 +225,18 @@ func (p *Publisher) PublishStockCountAdjustmentRequested(ctx context.Context, co
 func (p *Publisher) PublishStockCountCertified(ctx context.Context, correlationID, actorID, tenantID string, sc domain.StockCount) {
 	p.emit(ctx, "inventory.stock_count.certified", correlationID, tenantID, sc.LegalEntityID, actorID, sc.CountID, map[string]any{
 		"count_id": sc.CountID, "certified_at": sc.CertifiedAt,
+	})
+}
+
+// PublishStockCountVarianceDetected fires from RecordBlindCount the
+// moment a real variance is OBSERVED — distinct from
+// PublishStockCountVarianceApproved (INV-05's own maker/checker step,
+// which fires later and separately). Never carries system_quantity in
+// its own payload beyond what this internal event legitimately needs —
+// the blind-count HTTP response itself still never exposes it.
+func (p *Publisher) PublishStockCountVarianceDetected(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, lineID string, systemQuantity, observedQuantity float64) {
+	p.emit(ctx, "inventory.stock_count.variance_detected", correlationID, tenantID, legalEntityID, actorID, lineID, map[string]any{
+		"line_id": lineID, "system_quantity": systemQuantity, "observed_quantity": observedQuantity,
 	})
 }
 

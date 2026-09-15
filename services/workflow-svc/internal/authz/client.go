@@ -31,6 +31,10 @@ type Client interface {
 	// callers must fail-closed on the latter, same as every other
 	// synchronous cross-service call in this platform.
 	CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID string) error
+	// CheckAllowed is used by typed workflow-domain modules for actions other
+	// than generic stage approval. It deliberately still delegates the decision
+	// to authorization-svc; a workflow module must not self-authorize.
+	CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error
 }
 
 // HTTPClient implements Client against a real authorization-svc instance.
@@ -69,7 +73,15 @@ type authorizeResponse struct {
 const approvalActionType = "WORKFLOW_APPROVE"
 
 func (c *HTTPClient) CheckApprovalAllowed(ctx context.Context, principalID, legalEntityID string) error {
-	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: approvalActionType})
+	return c.checkAllowed(ctx, principalID, legalEntityID, approvalActionType)
+}
+
+func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	return c.checkAllowed(ctx, principalID, legalEntityID, actionType)
+}
+
+func (c *HTTPClient) checkAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	body, err := json.Marshal(authorizeRequest{PrincipalID: principalID, LegalEntityID: legalEntityID, ActionType: actionType})
 	if err != nil {
 		return fmt.Errorf("marshal authorize request: %w", err)
 	}

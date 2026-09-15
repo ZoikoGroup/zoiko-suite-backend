@@ -128,6 +128,22 @@ func TestPublishApprovalRejected_EnvelopeCarriesRejectingActor(t *testing.T) {
 	assert.Equal(t, "approver-1", env.ActorID)
 }
 
+func TestPublishAuditEngagementEvent_CarriesAuditableScopeAndCorrelation(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisher(zap.NewNop(), "zoiko.workflow.events", w)
+	e := domain.AuditEngagement{
+		EngagementID: "audit-1", TenantID: "tenant-1", LegalEntityID: "entity-1",
+		EngagementCode: "FY26-STAT", EngagementType: "STATUTORY_AUDIT",
+	}
+	require.NoError(t, p.PublishAuditEngagementEvent(context.Background(), "audit.engagement.created", e, "audit-manager-1", "audit-corr-1"))
+	env := decodeOne(t, w)
+	assert.Equal(t, "audit.engagement.created", env.EventType)
+	assert.Equal(t, "tenant-1", env.TenantID)
+	assert.Equal(t, "entity-1", env.LegalEntityID)
+	assert.Equal(t, "audit-manager-1", env.ActorID)
+	assert.Equal(t, "audit-corr-1", env.CorrelationID)
+}
+
 func TestPublish_WriteFailure_ReturnsError(t *testing.T) {
 	w := &failingWriter{}
 	p := events.NewPublisher(zap.NewNop(), "zoiko.workflow.events", w)

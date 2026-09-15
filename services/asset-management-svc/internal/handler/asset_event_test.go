@@ -269,11 +269,13 @@ func TestApplyAssetEvent_WithAmountAndAccountCodes_PostsJournalAndEmits(t *testi
 	if ledger.lastPostedSourceEventID != e.EventID {
 		t.Fatalf("expected source_event_id keyed by the event's own ID, got %q", ledger.lastPostedSourceEventID)
 	}
-	// PublishAssetEventAccountingEventEmitted — financial-close-svc's own
-	// ACC-18 lineage consumer's real source; must fire exactly once a
-	// journal is actually posted.
-	if pub.calls != callsBeforeApply+1 {
-		t.Fatalf("expected exactly 1 new publish call for the accounting-event-emitted signal, got %d", pub.calls-callsBeforeApply)
+	// Three publishes on a successful IMPAIRMENT apply-with-journal:
+	// PublishAssetEventAccountingEventEmitted (financial-close-svc's own
+	// ACC-18 lineage consumer's real source), PublishAssetEventApplied
+	// (fires on every successful apply), and PublishAssetImpaired (the
+	// type-specific event for this event_type).
+	if pub.calls != callsBeforeApply+3 {
+		t.Fatalf("expected exactly 3 new publish calls (accounting-event-emitted + applied + impaired), got %d", pub.calls-callsBeforeApply)
 	}
 }
 
@@ -297,10 +299,70 @@ func TestApplyAssetEvent_NoAmount_LandsInAppliedNeverEmitted(t *testing.T) {
 	if ledger.postCalls != 0 {
 		t.Fatalf("expected no journal post for a $0 event, got %d calls", ledger.postCalls)
 	}
-	// No journal posted means no accounting-event-emitted signal either —
-	// nothing for lineage to trace.
-	if pub.calls != callsBeforeApply {
-		t.Fatalf("expected no new publish calls for a never-emitted event, got %d", pub.calls-callsBeforeApply)
+	// No journal posted means no accounting-event-emitted signal — but
+	// PublishAssetEventApplied still fires on every successful apply
+	// regardless of whether a journal was posted, and ADDITION has no
+	// type-specific event (only IMPAIRMENT/REVALUATION/DISPOSAL do).
+	if pub.calls != callsBeforeApply+1 {
+		t.Fatalf("expected exactly 1 new publish call (applied only, no journal/type-specific event), got %d", pub.calls-callsBeforeApply)
+	}
+}
+
+// TestAssetEvent_PublishesRemainingLifecycleEvents proves
+// AssetEventCreated/AssetEventApproved/AssetEventReversed/AssetRevalued
+// — the spec's own remaining named AST-03 events, previously never
+// published — each fire exactly once at their own real lifecycle step.
+// AssetImpaired/AssetDisposed are already covered by the IMPAIRMENT and
+// DISPOSAL apply tests above/below.
+func TestAssetEvent_PublishesRemainingLifecycleEvents(t *testing.T) {
+	s := newStubStore()
+	ledger := &stubLedger{}
+	pub := &stubPublisher{}
+	r := newRouterWithLedger(s, pub, &stubAuthZ{}, ledger)
+	id := createActiveAsset(t, s, r, "le-1")
+	amount := 300.0
+
+	callsBeforeCreate := pub.calls
+	e := createDraftAssetEvent(t, r, id, domain.AssetEventTypeRevaluation, domain.CreateAssetEventRequest{
+		Amount: &amount, ValuationEvidenceRef: "APPRAISAL-2",
+		DebitAccountCode: "FIXED-ASSETS", CreditAccountCode: "REVALUATION-SURPLUS",
+	})
+	if pub.calls != callsBeforeCreate+1 {
+		t.Fatalf("expected 1 new publish call (AssetEventCreated), got %d", pub.calls-callsBeforeCreate)
+	}
+
+	validateRR := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/validate", nil, "preparer-1")
+	if validateRR.Code != http.StatusOK {
+		t.Fatalf("validate failed: %d %s", validateRR.Code, validateRR.Body.String())
+	}
+
+	callsBeforeApprove := pub.calls
+	approveRR := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/approve", nil, "approver-1")
+	if approveRR.Code != http.StatusOK {
+		t.Fatalf("approve failed: %d %s", approveRR.Code, approveRR.Body.String())
+	}
+	if pub.calls != callsBeforeApprove+1 {
+		t.Fatalf("expected 1 new publish call (AssetEventApproved), got %d", pub.calls-callsBeforeApprove)
+	}
+
+	callsBeforeApply := pub.calls
+	applyRR := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/apply", nil, "approver-1")
+	if applyRR.Code != http.StatusOK {
+		t.Fatalf("apply failed: %d %s", applyRR.Code, applyRR.Body.String())
+	}
+	// Account codes given, so a journal posts: AccountingEventEmitted +
+	// AssetEventApplied + AssetRevalued.
+	if pub.calls != callsBeforeApply+3 {
+		t.Fatalf("expected 3 new publish calls (accounting-event-emitted + applied + revalued), got %d", pub.calls-callsBeforeApply)
+	}
+
+	callsBeforeReverse := pub.calls
+	reverseRR := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/reverse", domain.ReverseAssetEventRequest{Reason: "wrong appraisal"}, "preparer-1")
+	if reverseRR.Code != http.StatusOK {
+		t.Fatalf("reverse failed: %d %s", reverseRR.Code, reverseRR.Body.String())
+	}
+	if pub.calls != callsBeforeReverse+1 {
+		t.Fatalf("expected 1 new publish call (AssetEventReversed), got %d", pub.calls-callsBeforeReverse)
 	}
 }
 
@@ -364,5 +426,58 @@ func TestValidateAssetEvent_AlreadyValidated_Returns422(t *testing.T) {
 	second := doReq(r, http.MethodPost, "/v1/asset-events/"+e.EventID+"/validate", nil, "preparer-1")
 	if second.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422 re-validating an already-VALIDATED event, got %d: %s", second.Code, second.Body.String())
+	}
+}
+
+// ── GetAssetBookStateAsOf / ExplainAssetState ────────────────────────────────
+
+func TestGetAssetBookStateAsOf_MissingBookID_Returns400(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveAsset(t, s, r, "le-1")
+
+	rr := doReq(r, http.MethodGet, "/v1/assets/"+id+"/book-state-as-of", nil, "reader-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetAssetBookStateAsOf_ReturnsSchedule(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveAsset(t, s, r, "le-1")
+	buildRR := doReq(r, http.MethodPost, "/v1/depreciation-schedules/", buildScheduleReq(id), "preparer-1")
+	if buildRR.Code != http.StatusCreated {
+		t.Fatalf("build schedule failed: %d %s", buildRR.Code, buildRR.Body.String())
+	}
+
+	rr := doReq(r, http.MethodGet, "/v1/assets/"+id+"/book-state-as-of?book_id=book-1", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var sch domain.DepreciationSchedule
+	_ = json.NewDecoder(rr.Body).Decode(&sch)
+	if sch.AssetID != id || sch.BookID != "book-1" {
+		t.Fatalf("expected the schedule for this asset/book, got %+v", sch)
+	}
+}
+
+func TestExplainAssetState_ReturnsAssetAndEvents(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{})
+	id := createActiveAsset(t, s, r, "le-1")
+	createDraftAssetEvent(t, r, id, domain.AssetEventTypeAddition, domain.CreateAssetEventRequest{})
+
+	rr := doReq(r, http.MethodGet, "/v1/assets/"+id+"/explain-state", nil, "reader-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var out struct {
+		Asset  domain.FixedAsset   `json:"asset"`
+		Events []domain.AssetEvent `json:"events"`
+	}
+	_ = json.NewDecoder(rr.Body).Decode(&out)
+	if out.Asset.AssetID != id || len(out.Events) != 1 {
+		t.Fatalf("expected 1 asset + 1 event, got %+v", out)
 	}
 }

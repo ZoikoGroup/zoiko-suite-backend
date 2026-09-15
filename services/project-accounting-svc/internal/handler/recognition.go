@@ -204,6 +204,200 @@ func (h *Handler) GetRecognitionRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, run)
 }
 
+// GetRevenueSchedule backs the spec's own query of the same name — every
+// recognition run ever created for a project, the full period-by-period
+// history. See internal/store/recognition_store.go's own doc comment on
+// ListRecognitionRunsForProject.
+func (h *Handler) GetRevenueSchedule(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "project_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	p, err := h.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		h.writeProjectErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, actionProjectRevenueRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	runs, err := h.store.ListRecognitionRunsForProject(r.Context(), projectID)
+	if err != nil {
+		h.log.Error("GetRevenueSchedule: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	if runs == nil {
+		runs = []domain.RecognitionRun{}
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+// GetWIPOrContractBalance backs the spec's own query of the same name —
+// the current live run's own balance_type/balance_amount. See
+// internal/store/recognition_store.go's own doc comment on
+// GetLatestRecognitionRunForProject.
+func (h *Handler) GetWIPOrContractBalance(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "project_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	p, err := h.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		h.writeProjectErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, actionProjectRevenueRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	run, err := h.store.GetLatestRecognitionRunForProject(r.Context(), projectID)
+	if err != nil {
+		h.writeRecognitionErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"project_id": projectID, "balance_type": run.BalanceType, "balance_amount": run.BalanceAmount, "run_id": run.RunID, "fiscal_period": run.FiscalPeriod})
+}
+
+// GetProgressEvidence backs the spec's own query of the same name — the
+// current live run's own percentage-of-completion inputs (contract
+// value, billed-to-date, estimate-to-complete, ITD cost incurred,
+// percent complete), the evidence CalculateProjectRevenue itself used.
+func (h *Handler) GetProgressEvidence(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "project_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	p, err := h.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		h.writeProjectErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, actionProjectRevenueRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	run, err := h.store.GetLatestRecognitionRunForProject(r.Context(), projectID)
+	if err != nil {
+		h.writeRecognitionErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"run_id": run.RunID, "contract_value": run.ContractValue, "billed_to_date": run.BilledToDate,
+		"estimate_to_complete": run.EstimateToComplete, "itd_cost_incurred": run.ITDCostIncurred, "percent_complete": run.PercentComplete,
+	})
+}
+
+// GetRecognitionAsOf backs the spec's own query of the same name — the
+// run that was current as of a past instant. See
+// internal/store/recognition_store.go's own doc comment on
+// GetRecognitionRunAsOf.
+func (h *Handler) GetRecognitionAsOf(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "project_id is required")
+		return
+	}
+	atParam := r.URL.Query().Get("at")
+	at := time.Now().UTC()
+	if atParam != "" {
+		parsed, err := time.Parse(time.RFC3339, atParam)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_at", "at must be RFC3339")
+			return
+		}
+		at = parsed
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	p, err := h.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		h.writeProjectErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, actionProjectRevenueRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	run, err := h.store.GetRecognitionRunAsOf(r.Context(), projectID, at)
+	if err != nil {
+		h.writeRecognitionErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+// ExplainRecognition backs the spec's own query of the same name — the
+// current live run plus the approved estimate that fed it, composed from
+// existing reads (no new store method beyond
+// GetLatestRecognitionRunForProject/GetCurrentEstimate) — the same
+// composition pattern as asset-management-svc's own ExplainAssetState.
+func (h *Handler) ExplainRecognition(w http.ResponseWriter, r *http.Request) {
+	projectID := r.URL.Query().Get("project_id")
+	if projectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "project_id is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	p, err := h.store.GetProject(r.Context(), projectID)
+	if err != nil {
+		h.writeProjectErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, p.LegalEntityID, actionProjectRevenueRead); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	run, err := h.store.GetLatestRecognitionRunForProject(r.Context(), projectID)
+	if err != nil {
+		h.writeRecognitionErr(w, err)
+		return
+	}
+	estimate, err := h.store.GetCurrentEstimate(r.Context(), projectID)
+	if err != nil {
+		h.log.Error("ExplainRecognition: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"run": run, "approved_estimate": estimate})
+}
+
 // ── POST /v1/recognition/runs/{id}/calculate ─────────────────────────────────
 
 // CalculateRecognitionRun is CalculateProjectRevenue + CalculateProjectWIP
