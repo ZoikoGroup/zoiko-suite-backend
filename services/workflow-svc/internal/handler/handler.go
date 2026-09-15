@@ -10,7 +10,9 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/authz"
+	"zoiko.io/workflow-svc/internal/documentvault"
 	"zoiko.io/workflow-svc/internal/domain"
+	"zoiko.io/workflow-svc/internal/evidence"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
 
@@ -23,6 +25,41 @@ type WorkflowStore interface {
 	SubmitAction(ctx context.Context, params domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
 	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
+	CreateAuditEngagement(ctx context.Context, params domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error)
+	GetAuditEngagement(ctx context.Context, tenantID, engagementID string) (*domain.AuditEngagement, error)
+	SubmitAuditEngagementAcceptance(ctx context.Context, params domain.SubmitAuditEngagementAcceptanceParams) (*domain.AuditEngagement, bool, error)
+	TransitionAuditEngagement(ctx context.Context, params domain.TransitionAuditEngagementParams) (*domain.AuditEngagement, bool, error)
+
+	// AUD-02 Planning & Risk Assessment — see internal/store/audit_plan_store.go's
+	// own doc comments for the enforcement mechanisms.
+	CreateAuditPlan(ctx context.Context, params domain.CreateAuditPlanParams) (*domain.AuditPlan, bool, error)
+	GetAuditPlan(ctx context.Context, tenantID, planID string) (*domain.AuditPlan, error)
+	GetAuditPlanByEngagement(ctx context.Context, tenantID, engagementID string) (*domain.AuditPlan, error)
+	RecordMateriality(ctx context.Context, params domain.RecordMaterialityParams) (*domain.MaterialityRecord, error)
+	IdentifyRisk(ctx context.Context, params domain.IdentifyRiskParams) (*domain.RiskAssessment, bool, error)
+	GetRiskAssessment(ctx context.Context, tenantID, riskID string) (*domain.RiskAssessment, error)
+	ListRisksByPlan(ctx context.Context, tenantID, planID string) ([]*domain.RiskAssessment, error)
+	LinkAssertion(ctx context.Context, params domain.LinkAssertionParams) error
+	DesignAuditResponse(ctx context.Context, params domain.DesignAuditResponseParams) error
+	AssessRisk(ctx context.Context, params domain.AssessRiskParams) (*domain.RiskAssessment, bool, error)
+	MarkSignificantRisk(ctx context.Context, params domain.MarkSignificantRiskParams) (*domain.RiskAssessment, error)
+	ApprovePlan(ctx context.Context, params domain.ApprovePlanParams) (*domain.AuditPlan, bool, error)
+	GetAuditEngagementFieldworkGates(ctx context.Context, tenantID, engagementID string) (planApproved bool, noUnresolvedHighRisk bool, err error)
+
+	// AUD-07 Workpaper — see internal/store/workpaper_store.go's own doc
+	// comments for the enforcement mechanisms.
+	CreateWorkpaper(ctx context.Context, params domain.CreateWorkpaperParams) (*domain.Workpaper, bool, error)
+	GetWorkpaper(ctx context.Context, tenantID, workpaperID string) (*domain.Workpaper, error)
+	ListWorkpapersByEngagement(ctx context.Context, tenantID, engagementID string) ([]*domain.Workpaper, error)
+	RecordProcedure(ctx context.Context, params domain.RecordProcedureParams) error
+	RecordResult(ctx context.Context, params domain.RecordResultParams) error
+	RecordConclusion(ctx context.Context, params domain.RecordConclusionParams) error
+	AddWorkpaperCrossReference(ctx context.Context, params domain.AddWorkpaperCrossReferenceParams) error
+	LinkWorkpaperEvidence(ctx context.Context, params domain.LinkWorkpaperEvidenceParams) error
+	MarkWorkpaperPrepared(ctx context.Context, params domain.MarkWorkpaperPreparedParams) (*domain.Workpaper, bool, error)
+	LockWorkpaper(ctx context.Context, params domain.LockWorkpaperParams) (*domain.Workpaper, bool, error)
+	AddPostLockAddendum(ctx context.Context, params domain.AddPostLockAddendumParams) (*domain.WorkpaperAddendum, error)
+	GetAuditEngagementRequiredWorkpapersLocked(ctx context.Context, tenantID, engagementID string) (bool, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -38,17 +75,44 @@ type EventPublisher interface {
 	PublishApprovalRejected(ctx context.Context, w domain.WorkflowInstance, stage domain.WorkflowStage, actorID string) error
 	PublishWorkflowEscalated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishWorkflowCompleted(ctx context.Context, w domain.WorkflowInstance, actorID string) error
+	PublishAuditEngagementEvent(ctx context.Context, eventType string, engagement domain.AuditEngagement, actorID, correlationID string) error
+}
+
+// DocumentVaultClient verifies evidence references without making workflow-svc
+// an evidence owner. The returned version is the immutable vault version that
+// is pinned to the acceptance record.
+type DocumentVaultClient interface {
+	VerifyDocument(ctx context.Context, tenantID, legalEntityID, documentID, actorID, correlationID string) (int, error)
+}
+
+// EvidenceClient is AUD-07's own dependency on AUD-06 — see
+// internal/evidence/client.go's own doc comment. Optional: a nil client
+// means LinkEvidence never surfaces a contradiction flag (evidence-check
+// disabled), used by tests that don't exercise AUD-06 integration.
+type EvidenceClient interface {
+	GetContradictionFlag(ctx context.Context, tenantID, evidenceID, actorID, correlationID string) (bool, error)
 }
 
 type Handler struct {
 	store     WorkflowStore
 	publisher EventPublisher
 	authz     authz.Client
+	documents DocumentVaultClient
+	evidence  EvidenceClient
 	log       *zap.Logger
 }
 
-func New(store WorkflowStore, publisher EventPublisher, authzClient authz.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authzClient, log: log}
+func New(store WorkflowStore, publisher EventPublisher, authzClient authz.Client, documents documentvault.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, authz: authzClient, documents: documents, log: log}
+}
+
+// WithEvidenceClient attaches the optional AUD-06 evidence client — an
+// optional-dependency builder method, same pattern as
+// WithLedgerClient/WithPeriodChecker elsewhere in this build, so New(...)'s
+// required parameter list stays unchanged.
+func (h *Handler) WithEvidenceClient(client evidence.Client) *Handler {
+	h.evidence = client
+	return h
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -60,6 +124,42 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/workflows/{workflow_instance_id}/actions", h.SubmitAction)
 	r.Post("/v1/workflows/{workflow_instance_id}/escalate", h.EscalateWorkflow)
 	r.Post("/v1/workflows/{workflow_instance_id}/cancel", h.CancelWorkflow)
+	r.Route("/v1/audit/engagements", func(r chi.Router) {
+		r.Post("/", h.CreateAuditEngagement)
+		r.Get("/{engagement_id}", h.GetAuditEngagement)
+		r.Post("/{engagement_id}/submit-acceptance", h.SubmitAuditEngagementAcceptance)
+		r.Post("/{engagement_id}/acceptance-decision", h.RecordAuditAcceptanceDecision)
+		r.Post("/{engagement_id}/activate", h.ActivateAuditEngagement)
+		r.Post("/{engagement_id}/withdraw", h.WithdrawAuditEngagement)
+		r.Post("/{engagement_id}/plan", h.CreateAuditPlan)
+		r.Get("/{engagement_id}/plan", h.GetAuditPlan)
+	})
+	r.Route("/v1/audit/plans", func(r chi.Router) {
+		r.Post("/{plan_id}/materiality", h.RecordMateriality)
+		r.Post("/{plan_id}/risks", h.IdentifyRisk)
+		r.Get("/{plan_id}/risks", h.ListRisks)
+		r.Post("/{plan_id}/approve", h.ApprovePlan)
+	})
+	r.Route("/v1/audit/risks", func(r chi.Router) {
+		r.Post("/{risk_id}/assertions", h.LinkAssertion)
+		r.Post("/{risk_id}/response", h.DesignAuditResponse)
+		r.Post("/{risk_id}/assess", h.AssessRisk)
+		r.Post("/{risk_id}/mark-significant", h.MarkSignificantRisk)
+	})
+	r.Route("/v1/audit/engagements/{engagement_id}/workpapers", func(r chi.Router) {
+		r.Post("/", h.CreateWorkpaper)
+	})
+	r.Route("/v1/audit/workpapers", func(r chi.Router) {
+		r.Get("/{workpaper_id}", h.GetWorkpaper)
+		r.Post("/{workpaper_id}/procedures", h.RecordProcedure)
+		r.Post("/{workpaper_id}/results", h.RecordResult)
+		r.Post("/{workpaper_id}/conclusions", h.RecordConclusion)
+		r.Post("/{workpaper_id}/cross-references", h.AddCrossReference)
+		r.Post("/{workpaper_id}/evidence-links", h.LinkEvidence)
+		r.Post("/{workpaper_id}/mark-prepared", h.MarkWorkpaperPrepared)
+		r.Post("/{workpaper_id}/lock", h.LockWorkpaper)
+		r.Post("/{workpaper_id}/addenda", h.AddPostLockAddendum)
+	})
 }
 
 // requireTenant reads the caller's verified tenant scope, set into

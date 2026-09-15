@@ -43,6 +43,60 @@ type stubStore struct {
 	cancelInstance     *domain.WorkflowInstance
 	cancelTransitioned bool
 	cancelErr          error
+
+	auditEngagement        *domain.AuditEngagement
+	auditCreateCreated     bool
+	auditCreateErr         error
+	auditGetErr            error
+	auditSubmitChanged     bool
+	auditSubmitErr         error
+	auditTransitionChanged bool
+	auditTransitionErr     error
+
+	auditPlan          *domain.AuditPlan
+	auditPlanCreated   bool
+	auditPlanCreateErr error
+	auditPlanGetErr    error
+
+	materialityRecord *domain.MaterialityRecord
+	materialityErr    error
+
+	riskAssessment  *domain.RiskAssessment
+	riskCreated     bool
+	riskCreateErr   error
+	riskGetErr      error
+	risks           []*domain.RiskAssessment
+	listRisksErr    error
+	linkAssertErr   error
+	designRespErr   error
+	assessChanged   bool
+	assessErr       error
+	markSigErr      error
+	approvePlanErr  error
+	approveChanged  bool
+	fieldworkPlanOK bool
+	fieldworkRiskOK bool
+	fieldworkErr    error
+
+	workpaper           *domain.Workpaper
+	workpaperCreated    bool
+	workpaperCreateErr  error
+	workpaperGetErr     error
+	workpapers          []*domain.Workpaper
+	listWorkpapersErr   error
+	recordProcedureErr  error
+	recordResultErr     error
+	recordConclusionErr error
+	addCrossRefErr      error
+	linkEvidenceErr     error
+	markPreparedChanged bool
+	markPreparedErr     error
+	lockChanged         bool
+	lockErr             error
+	addendum            *domain.WorkpaperAddendum
+	addendumErr         error
+	workpapersLockedOK  bool
+	workpapersLockedErr error
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
@@ -70,6 +124,93 @@ func (s *stubStore) EscalateWorkflow(_ context.Context, _, _ string) (*domain.Wo
 func (s *stubStore) CancelWorkflow(_ context.Context, _, _ string) (*domain.WorkflowInstance, bool, error) {
 	return s.cancelInstance, s.cancelTransitioned, s.cancelErr
 }
+func (s *stubStore) CreateAuditEngagement(_ context.Context, _ domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditCreateCreated, s.auditCreateErr
+}
+func (s *stubStore) GetAuditEngagement(_ context.Context, _, _ string) (*domain.AuditEngagement, error) {
+	return s.auditEngagement, s.auditGetErr
+}
+func (s *stubStore) SubmitAuditEngagementAcceptance(_ context.Context, _ domain.SubmitAuditEngagementAcceptanceParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditSubmitChanged, s.auditSubmitErr
+}
+func (s *stubStore) TransitionAuditEngagement(_ context.Context, _ domain.TransitionAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
+	return s.auditEngagement, s.auditTransitionChanged, s.auditTransitionErr
+}
+func (s *stubStore) CreateAuditPlan(_ context.Context, _ domain.CreateAuditPlanParams) (*domain.AuditPlan, bool, error) {
+	return s.auditPlan, s.auditPlanCreated, s.auditPlanCreateErr
+}
+func (s *stubStore) GetAuditPlan(_ context.Context, _, _ string) (*domain.AuditPlan, error) {
+	return s.auditPlan, s.auditPlanGetErr
+}
+func (s *stubStore) GetAuditPlanByEngagement(_ context.Context, _, _ string) (*domain.AuditPlan, error) {
+	return s.auditPlan, s.auditPlanGetErr
+}
+func (s *stubStore) RecordMateriality(_ context.Context, _ domain.RecordMaterialityParams) (*domain.MaterialityRecord, error) {
+	return s.materialityRecord, s.materialityErr
+}
+func (s *stubStore) IdentifyRisk(_ context.Context, _ domain.IdentifyRiskParams) (*domain.RiskAssessment, bool, error) {
+	return s.riskAssessment, s.riskCreated, s.riskCreateErr
+}
+func (s *stubStore) GetRiskAssessment(_ context.Context, _, _ string) (*domain.RiskAssessment, error) {
+	return s.riskAssessment, s.riskGetErr
+}
+func (s *stubStore) ListRisksByPlan(_ context.Context, _, _ string) ([]*domain.RiskAssessment, error) {
+	return s.risks, s.listRisksErr
+}
+func (s *stubStore) LinkAssertion(_ context.Context, _ domain.LinkAssertionParams) error {
+	return s.linkAssertErr
+}
+func (s *stubStore) DesignAuditResponse(_ context.Context, _ domain.DesignAuditResponseParams) error {
+	return s.designRespErr
+}
+func (s *stubStore) AssessRisk(_ context.Context, _ domain.AssessRiskParams) (*domain.RiskAssessment, bool, error) {
+	return s.riskAssessment, s.assessChanged, s.assessErr
+}
+func (s *stubStore) MarkSignificantRisk(_ context.Context, _ domain.MarkSignificantRiskParams) (*domain.RiskAssessment, error) {
+	return s.riskAssessment, s.markSigErr
+}
+func (s *stubStore) ApprovePlan(_ context.Context, _ domain.ApprovePlanParams) (*domain.AuditPlan, bool, error) {
+	return s.auditPlan, s.approveChanged, s.approvePlanErr
+}
+func (s *stubStore) GetAuditEngagementFieldworkGates(_ context.Context, _, _ string) (bool, bool, error) {
+	return s.fieldworkPlanOK, s.fieldworkRiskOK, s.fieldworkErr
+}
+func (s *stubStore) CreateWorkpaper(_ context.Context, _ domain.CreateWorkpaperParams) (*domain.Workpaper, bool, error) {
+	return s.workpaper, s.workpaperCreated, s.workpaperCreateErr
+}
+func (s *stubStore) GetWorkpaper(_ context.Context, _, _ string) (*domain.Workpaper, error) {
+	return s.workpaper, s.workpaperGetErr
+}
+func (s *stubStore) ListWorkpapersByEngagement(_ context.Context, _, _ string) ([]*domain.Workpaper, error) {
+	return s.workpapers, s.listWorkpapersErr
+}
+func (s *stubStore) RecordProcedure(_ context.Context, _ domain.RecordProcedureParams) error {
+	return s.recordProcedureErr
+}
+func (s *stubStore) RecordResult(_ context.Context, _ domain.RecordResultParams) error {
+	return s.recordResultErr
+}
+func (s *stubStore) RecordConclusion(_ context.Context, _ domain.RecordConclusionParams) error {
+	return s.recordConclusionErr
+}
+func (s *stubStore) AddWorkpaperCrossReference(_ context.Context, _ domain.AddWorkpaperCrossReferenceParams) error {
+	return s.addCrossRefErr
+}
+func (s *stubStore) LinkWorkpaperEvidence(_ context.Context, _ domain.LinkWorkpaperEvidenceParams) error {
+	return s.linkEvidenceErr
+}
+func (s *stubStore) MarkWorkpaperPrepared(_ context.Context, _ domain.MarkWorkpaperPreparedParams) (*domain.Workpaper, bool, error) {
+	return s.workpaper, s.markPreparedChanged, s.markPreparedErr
+}
+func (s *stubStore) LockWorkpaper(_ context.Context, _ domain.LockWorkpaperParams) (*domain.Workpaper, bool, error) {
+	return s.workpaper, s.lockChanged, s.lockErr
+}
+func (s *stubStore) AddPostLockAddendum(_ context.Context, _ domain.AddPostLockAddendumParams) (*domain.WorkpaperAddendum, error) {
+	return s.addendum, s.addendumErr
+}
+func (s *stubStore) GetAuditEngagementRequiredWorkpapersLocked(_ context.Context, _, _ string) (bool, error) {
+	return s.workpapersLockedOK, s.workpapersLockedErr
+}
 
 // ── stub publisher ───────────────────────────────────────────────────────────
 
@@ -79,6 +220,7 @@ type stubPublisher struct {
 	rejectedCalls  int
 	escalatedCalls int
 	completedCalls int
+	auditEvents    []string
 }
 
 func (p *stubPublisher) PublishWorkflowStarted(_ context.Context, _ domain.WorkflowInstance) error {
@@ -101,12 +243,29 @@ func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.Wor
 	p.completedCalls++
 	return nil
 }
+func (p *stubPublisher) PublishAuditEngagementEvent(_ context.Context, eventType string, _ domain.AuditEngagement, _, _ string) error {
+	p.auditEvents = append(p.auditEvents, eventType)
+	return nil
+}
 
 // ── stub authz client ────────────────────────────────────────────────────────
 
 type stubAuthz struct{ err error }
 
 func (a *stubAuthz) CheckApprovalAllowed(_ context.Context, _, _ string) error { return a.err }
+func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error      { return a.err }
+
+type stubDocuments struct {
+	version int
+	err     error
+}
+
+func (d *stubDocuments) VerifyDocument(_ context.Context, _, _, _, _, _ string) (int, error) {
+	if d.version == 0 && d.err == nil {
+		return 1, nil
+	}
+	return d.version, d.err
+}
 
 func newTestRouter(s *stubStore) chi.Router {
 	return newTestRouterFull(s, &stubPublisher{}, &stubAuthz{})
@@ -115,7 +274,7 @@ func newTestRouter(s *stubStore) chi.Router {
 func newTestRouterFull(s *stubStore, p *stubPublisher, a *stubAuthz) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, p, a, zap.NewNop())
+	h := handler.New(s, p, a, &stubDocuments{}, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }

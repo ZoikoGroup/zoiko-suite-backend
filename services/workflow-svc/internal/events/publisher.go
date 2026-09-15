@@ -103,6 +103,34 @@ func (p *Publisher) PublishWorkflowCompleted(ctx context.Context, w domain.Workf
 	})
 }
 
+// PublishAuditEngagementEvent publishes only an allow-listed AUD-01 lifecycle
+// fact. The audit-event-store consumer persists these events in its immutable
+// hash chain; this service remains the sole owner of engagement state.
+func (p *Publisher) PublishAuditEngagementEvent(ctx context.Context, eventType string, e domain.AuditEngagement, actorID, correlationID string) error {
+	switch eventType {
+	case "audit.engagement.created", "audit.engagement.acceptance_submitted", "audit.engagement.accepted", "audit.engagement.rejected", "audit.engagement.activated", "audit.engagement.withdrawn":
+	default:
+		return fmt.Errorf("audit engagement: unsupported event type %q", eventType)
+	}
+	return p.emit(ctx, eventType, correlationID, e.TenantID, e.LegalEntityID, actorID, map[string]any{
+		"engagement_id":               e.EngagementID,
+		"tenant_id":                   e.TenantID,
+		"legal_entity_id":             e.LegalEntityID,
+		"engagement_code":             e.EngagementCode,
+		"engagement_type":             e.EngagementType,
+		"status":                      e.Status,
+		"actor_principal_id":          actorID,
+		"reporting_period_start":      e.ReportingPeriodStart,
+		"reporting_period_end":        e.ReportingPeriodEnd,
+		"framework_profile_id":        e.FrameworkProfileID,
+		"framework_profile_version":   e.FrameworkProfileVersion,
+		"methodology_id":              e.MethodologyID,
+		"methodology_version":         e.MethodologyVersion,
+		"acceptance_document_id":      e.AcceptanceDocumentID,
+		"acceptance_document_version": e.AcceptanceDocumentVersion,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {

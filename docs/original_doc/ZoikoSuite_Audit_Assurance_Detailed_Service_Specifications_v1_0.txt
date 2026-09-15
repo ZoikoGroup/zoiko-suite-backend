@@ -1,0 +1,1010 @@
+
+ZOIKOSUITE
+Audit &amp; AssuranceDetailed Service Specifications
+ZS-SVC-K-001  •  Version 1.0  •  Build-Ready Audit &amp; Assurance Baseline
+Executive doctrine — ZoikoSuite Audit &amp; Assurance is a controlled evidence, procedure, review and assurance workflow. It consumes authoritative financial and operational facts but never edits them; it preserves contradictory evidence; it separates client-provided information from accepted audit evidence; it freezes populations before testing; and it never allows automation or AI to make the professional audit opinion, materiality, significant-risk, sufficiency-of-evidence or independence judgment on behalf of the responsible auditor.
+
+Field
+Value
+Document ID
+ZS-SVC-K-001
+Version
+1.0 — Build-Ready Audit &amp; Assurance Baseline
+Date
+24 August 2026
+Status
+Engineering baseline — subject to jurisdiction, firm-methodology and professional-standards configuration
+Owner
+ZoikoSuite Product / Audit &amp; Assurance Architecture
+Audience
+Engineering, Product, Audit Methodology, Quality Management, Security, Privacy, Legal/Compliance, QA, Operations
+Language
+American English
+Precedence
+ZS-SVC-SPEC-001 plus applicable Accounting, Data Governance, IAM, Security, NFR and Operations standards
+
+
+0. Critical Analysis &amp; Refined Architecture Decision
+Audit must be read-only with respect to underlying accounting, tax, banking, payroll, operational and reporting facts. Corrections occur in the owning domain and flow back into the audit trail as new evidence or changed populations.
+Engagement acceptance, independence, competence, ethics, materiality, significant-risk assessment, sufficiency/appropriateness of evidence and the audit opinion remain professional judgments of authorized humans under the applicable framework and firm methodology.
+Client-provided information is not automatically audit evidence. Receipt, integrity, relevance, reliability and linkage to an audit procedure are separately modeled.
+Audit populations are frozen, reproducible objects with source identity, query/filter version, watermark, control totals and hash. A live query cannot be used as the evidential population for sampling or conclusion.
+Sampling is a governed design. Statistical and nonstatistical methods are supported, but selected items cannot be silently substituted and selection parameters cannot be changed after execution without invalidating the sample.
+Contradictory or inconsistent evidence is preserved and surfaced. A workpaper cannot delete evidence merely because it does not support the final conclusion.
+Workpapers are purpose/procedure/evidence/conclusion records with preparer/reviewer accountability. After engagement-file lock, additions are explicit addenda with who/when/why/effect—not in-place edits.
+Findings, misstatements, control deficiencies, scope limitations and unresolved matters remain separate from management remediation. Closure never erases the original condition or its communication history.
+Review and sign-off are version-bound. Protected changes to risks, procedures, evidence, conclusions, findings or report content invalidate downstream approvals and require re-review.
+Professional standards are implemented as versioned Audit Framework Profiles and firm-methodology overlays. The platform does not hardcode one jurisdiction’s documentation-retention, sampling or reporting rules as universal law.
+AI may summarize, cross-reference, detect anomalies, suggest procedures or draft narrative, but it cannot autonomously set materiality, classify a significant risk, select an audit opinion, conclude evidence is sufficient/appropriate, close a finding or sign a workpaper.
+Audit exports are governed evidence packages with manifests, hashes, redaction and access controls—not unrestricted copies of production databases.
+
+Figure 1 — Audit authority chain.
+Critical finding — The Audit domain exists to evaluate and document evidence about authoritative facts. If it is permitted to correct those facts, it ceases to be an independent assurance layer and becomes another transactional system of record.
+1. Domain Scope, Service Inventory &amp; Authority Model
+ID
+Service
+Authoritative role
+AUD-01
+Engagement
+Establish engagement identity, scope, criteria/framework profile, period, team, acceptance/continuance evidence and lifecycle.
+AUD-02
+Planning &amp; Risk Assessment
+Maintain entity understanding, assertions, materiality inputs, risk assessments, significant matters and planned audit responses.
+AUD-03
+Audit Population
+Create frozen, reproducible audit populations with source, filters, watermarks, control totals, hashes and completeness evidence.
+AUD-04
+Sampling
+Design, select, execute and evaluate statistical/nonstatistical samples against an immutable population and audit objective.
+AUD-05
+PBC / Evidence Request
+Manage secure prepared-by-client / evidence requests, ownership, deadlines, responses, reminders and receipt lineage.
+AUD-06
+Audit Evidence
+Register, preserve and evaluate evidence source, integrity, relevance, reliability, contradictions, custody and procedure linkage.
+AUD-07
+Workpaper
+Document audit purpose, procedures, results, evidence, conclusions, cross-references, preparer/reviewer and file-lock history.
+AUD-08
+Finding / Exception
+Maintain misstatements, control deficiencies, deviations, scope limitations, findings, management responses and closure evidence.
+AUD-09
+Review &amp; Sign-Off
+Control preparer/reviewer/partner/specialist/EQR review, notes, sign-offs, invalidation and release gating.
+AUD-10
+Audit Trail / Data Export
+Produce controlled engagement archive, inspection/export packages, manifests, redactions, access evidence and integrity seals.
+
+1.1 Non-bypassable Audit &amp; Assurance invariants
+AUD services SHALL NOT write directly to the General Ledger, Tax Ledger, bank settlement facts, payroll results, AR/AP open items, source business documents or certified financial statements.
+Every engagement SHALL bind to a versioned Audit Framework Profile, firm methodology/profile, reporting period, entity/group scope and responsible engagement leadership.
+Engagement acceptance/continuance SHALL preserve evidence of preconditions, conflicts/independence evaluation and authorization; the platform SHALL NOT assert professional independence autonomously.
+Materiality and performance materiality inputs SHALL be explicitly versioned and attributable; changes after dependent testing SHALL trigger impact analysis and potential invalidation/reperformance.
+Every risk SHALL identify affected financial-statement area/assertion/process and planned response; significant-risk classification requires authorized human judgment.
+Every population used for testing SHALL be frozen and reproducible with source identity, query/filter version, watermark, count/control totals and integrity hash.
+Sampling SHALL preserve method, parameters, selection logic, random seed where applicable, selected items and evaluation results.
+A selected sample item SHALL NOT be silently replaced. Unavailable items and alternatives SHALL be documented and evaluated.
+PBC response receipt SHALL NOT automatically mark the item as sufficient, appropriate or accepted audit evidence.
+Every evidence object SHALL preserve source, acquisition method, timestamp, integrity attributes and procedure/purpose linkage.
+Contradictory, inconsistent or negative evidence SHALL remain visible to reviewers and cannot be deleted to support a preferred conclusion.
+Every material workpaper SHALL identify preparer, completion time, reviewer(s), review date(s), procedures, evidence, results and conclusion.
+Workpaper lock SHALL prevent ordinary in-place edits; subsequent changes SHALL be additive, attributable and preserve the prior content.
+Protected change to a signed workpaper, finding, risk assessment, materiality input or report SHALL invalidate affected downstream sign-offs.
+Reviewer and preparer conflicts SHALL be prevented according to the configured methodology and quality-management profile.
+Findings and accumulated misstatements SHALL remain historically reconstructable even after remediation or closure.
+Report release SHALL be blocked by unresolved mandatory review notes, required sign-offs, significant scope limitations or other configured completion gates.
+Engagement archives SHALL be tamper-evident and subject to framework/jurisdiction/firm-policy retention and legal hold.
+Exports SHALL apply least-necessary disclosure, tenant/entity authorization, confidentiality restrictions, redaction policy and integrity sealing.
+AI SHALL remain advisory and SHALL NOT autonomously sign, approve, conclude, determine opinion, set materiality, close findings or declare evidence sufficient/appropriate.
+
+Figure 2 — Engagement lifecycle and release gates.
+1.2 Cross-domain authority matrix
+Authority
+Owns
+Audit boundary
+Accounting / Reporting
+Posted accounting truth, signed snapshots, certified reports
+Audit consumes frozen populations and evidence; no source mutation.
+Tax / Payroll / Banking / AR / AP
+Domain-authoritative transactions and regulatory/settlement facts
+Audit reads/requests evidence and records procedures/conclusions only.
+DATA / Evidence Ledger
+Evidence integrity, retention, legal hold, lineage primitives
+Audit adds engagement-purpose links and workpaper conclusions; does not redefine retention law.
+GOV / IAM / SoD
+Identity, permissions, SoD, privileged access
+Audit records professional roles/methodology and enforces engagement access through IAM.
+ZS-CONTROL
+Financial control/reconciliation results
+Audit may rely/test/reperform according to methodology but does not alter control outcomes.
+REP
+Certified financial/statutory report instances
+Audit may link report assertions/conclusions; released report correction remains REP/Accounting responsibility.
+Audit &amp; Assurance
+Engagement, risk/procedure design, populations, samples, evidence evaluation, workpapers, findings, review/sign-off
+Never authoritative for underlying economic or legal transaction facts.
+
+
+Figure 3 — Risk assessment to audit response.
+2. Shared Audit Engineering Contract
+Contract element
+Mandatory behavior
+Trusted context
+tenant_id, engagement_id, entity/group scope, reporting period, framework_profile_id/version, firm_methodology_id/version, subject identity, assignment/role, confidentiality classification, correlation/cause IDs.
+Audit Framework Profile
+Configures applicable professional-standard family, jurisdictional overlays, methodology controls, required sign-offs, retention profile, sampling rules, completion gates and reporting constraints. No universal hardcoding.
+Assertion / objective model
+Financial statement area, assertion, process/control objective, risk linkage, audit objective, planned procedure and conclusion remain explicitly connected.
+Professional judgment fields
+Materiality, significant-risk designation, reliance strategy, sampling-risk choices, sufficiency/appropriateness conclusion and opinion-related judgments require authorized human attribution.
+Population identity
+source_system/object, query/filter version, as-of/watermark, extraction timestamp, row count, monetary/control totals, digest, completeness checks, late-item handling and lineage.
+Evidence classification
+source type, first/third party, system generated, direct/indirect, original/copy, integrity verification, reliability evaluation, contradictions, confidentiality and retention class.
+Workpaper versioning
+Draft → Prepared → Reviewed → Locked; subsequent changes use addendum/supersession with reason and effect assessment.
+Sign-off fingerprint
+Binds engagement/workpaper/finding/report version, key protected fields, reviewer role, timestamp, session assurance and unresolved-note state.
+Error semantics
+Missing evidence, stale population, invalid signature, unresolved contradiction, access denial, expired assignment, incompatible framework/methodology, retention/hold conflict and external-confirmation ambiguity have stable machine-readable errors.
+Security / privacy
+Engagement access is least privilege; client contributors cannot edit auditor-only workpapers; sensitive evidence uses field/object restrictions, malware scanning, encryption, residency and controlled export.
+Observability
+Population drift, unresolved review notes, PBC aging, evidence-integrity failures, overdue completion gates, unusual post-lock changes and export activity produce structured telemetry.
+AI boundary
+AI outputs carry provenance, model/prompt version and human-acceptance state; no AI output is authoritative merely because it appears in a workpaper.
+
+
+Figure 4 — Frozen audit population architecture.
+
+Figure 5 — Sampling design and evaluation architecture.
+3. Detailed Service Specifications
+3.1 AUD-01 — Engagement
+Contract field
+Build-ready requirement
+Purpose
+Create the governed container for an audit/assurance engagement, including scope, criteria/framework, period, responsible party, team, acceptance/continuance evidence and lifecycle.
+Authoritative ownership
+Engagement, EngagementScope, FrameworkProfileBinding, MethodologyBinding, EngagementAssignment, AcceptanceDecision, EngagementLifecycle.
+Explicit non-ownership
+Professional independence conclusion as a system assertion; client master data; underlying accounting facts; final auditor opinion wording outside governed reporting workflow.
+Required inputs
+Entity/group identity; reporting period; engagement type; applicable framework/methodology candidate; responsible party; prior engagement references; conflicts/independence attestations; competence/resource inputs.
+Named commands
+CreateEngagement; SubmitForAcceptance; RecordAcceptanceDecision; ActivateEngagement; AmendScope; WithdrawEngagement; MarkFieldworkComplete; EnterCompletionReview; MarkReportReady; CloseEngagement.
+Read/query surfaces
+GetEngagement; GetScope; GetAssignments; GetAcceptanceEvidence; GetCompletionGates; ListEngagements.
+State model
+Proposed → AcceptanceReview → Accepted → Active → FieldworkComplete → CompletionReview → ReportReady → Released → Closed; Withdrawn is explicit terminal/side state.
+Authorization / SoD / controls
+Maker-checker for acceptance where required; scope/framework changes invalidate dependent approvals; assignment-based access; engagement-period and entity scope enforced server-side.
+Events
+AuditEngagementCreated; AcceptanceDecided; EngagementActivated; ScopeChanged; EngagementCompletionReviewStarted; EngagementReportReady; EngagementClosed.
+Failure / degradation semantics
+Blocked if entity/period/framework/methodology cannot be resolved or required acceptance evidence is incomplete. Never infer acceptance from workflow timeout.
+Evidence / lineage
+Acceptance/continuance record, conflict/independence attestations, scope change history, assignment history, framework/methodology versions and sign-offs.
+NFR / recovery profile
+C1 authoritative engagement metadata; high durability; RPO ≤15 min engineering target; audit archive survives operational account closure.
+
+AUD-01 — Mandatory engineering controls
+Maker-checker for acceptance where required.
+scope/framework changes invalidate dependent approvals.
+assignment-based access.
+engagement-period and entity scope enforced server-side.
+
+Figure — AUD-01 control flow.
+3.2 AUD-02 — Planning &amp; Risk Assessment
+Contract field
+Build-ready requirement
+Purpose
+Maintain the audit plan, understanding of entity/environment, materiality inputs, financial-statement assertions, identified/assessed risks and planned responses.
+Authoritative ownership
+AuditPlan, RiskAssessment, MaterialityRecord, AssertionMap, ProcessUnderstanding, ControlReliancePlan, PlannedProcedure.
+Explicit non-ownership
+Authoritative business risk register; accounting estimates; professional opinion; underlying controls.
+Required inputs
+Certified financial statements/snapshots; prior-period findings; entity/system/process information; analytics; control inventory; fraud-risk inputs; auditor-set materiality and judgment.
+Named commands
+CreateAuditPlan; RecordMateriality; IdentifyRisk; AssessRisk; MarkSignificantRisk; LinkAssertion; DesignAuditResponse; ReviseRiskAssessment; ApprovePlan.
+Read/query surfaces
+GetAuditPlan; ListRisks; GetMaterialityHistory; GetAssertionCoverage; GetPlannedResponses; GetRiskChangeImpact.
+State model
+Draft → Prepared → Reviewed → Approved; revised plan creates new version or controlled amendment with impact analysis.
+Authorization / SoD / controls
+Significant-risk classification requires authorized human; materiality changes trigger dependency analysis; every risk links to assertions/process and response; unresolved high-risk coverage blocks completion.
+Events
+AuditPlanPrepared; MaterialityChanged; RiskIdentified; RiskAssessmentChanged; SignificantRiskDesignated; AuditResponseDesigned; PlanApproved.
+Failure / degradation semantics
+Ambiguous source population or missing financial-statement/assertion scope blocks dependent procedures. AI suggestions remain Proposal state.
+Evidence / lineage
+Risk rationale, source analytics, meeting notes, entity understanding, materiality computation/rationale, reviewer challenge and plan approval.
+NFR / recovery profile
+C2 workflow with strong versioning; calculations deterministic; complete history retained by engagement archive.
+
+AUD-02 — Mandatory engineering controls
+Significant-risk classification requires authorized human.
+materiality changes trigger dependency analysis.
+every risk links to assertions/process and response.
+unresolved high-risk coverage blocks completion.
+
+Figure — AUD-02 control flow.
+3.3 AUD-03 — Audit Population
+Contract field
+Build-ready requirement
+Purpose
+Create frozen, reproducible populations used for analytics, tests of controls, substantive procedures, sampling and conclusion.
+Authoritative ownership
+AuditPopulation, PopulationSpecification, PopulationSnapshot, PopulationControlTotal, PopulationDelta, PopulationDigest.
+Explicit non-ownership
+Source transaction truth; source-system query engine semantics; audit sampling selections.
+Required inputs
+Authorized source; object/class; period; filter/query specification; source version/watermark; dimensions; assertions/objective; expected completeness checks.
+Named commands
+DefinePopulation; BuildPopulation; ValidatePopulation; FreezePopulation; AddControlledDelta; SupersedePopulation; QuarantinePopulation.
+Read/query surfaces
+GetPopulation; GetManifest; GetControlTotals; GetLineage; ComparePopulationVersions; ListLateItems.
+State model
+Defined → Building → Validating → Frozen → InUse → Superseded; Quarantined on integrity/completeness failure.
+Authorization / SoD / controls
+Frozen population immutable; source/filter/watermark preserved; live queries prohibited for evidential use; late items become delta/new version; counts/control totals/hashes required.
+Events
+AuditPopulationBuilt; PopulationValidationFailed; AuditPopulationFrozen; PopulationDeltaAdded; PopulationSuperseded.
+Failure / degradation semantics
+Population drift, incomplete extract, cross-tenant records or unmatched control totals block freeze.
+Evidence / lineage
+Population manifest, query/filter version, source identifier, extract digest, counts, amounts/control totals, validation outcomes and freeze approval.
+NFR / recovery profile
+C1 evidence population; large-volume streaming allowed; exact reproducibility more important than low latency.
+
+AUD-03 — Mandatory engineering controls
+Frozen population immutable.
+source/filter/watermark preserved.
+live queries prohibited for evidential use.
+late items become delta/new version.
+counts/control totals/hashes required.
+
+Figure — AUD-03 control flow.
+3.4 AUD-04 — Sampling
+Contract field
+Build-ready requirement
+Purpose
+Design, select, execute and evaluate audit samples over a frozen population using statistical or nonstatistical methods.
+Authoritative ownership
+SampleDesign, SampleSelection, SampleItem, SampleExecution, SampleEvaluation, SamplingParameterSet.
+Explicit non-ownership
+Population truth; audit conclusion outside the specific sample objective; universal methodology rules.
+Required inputs
+Frozen population; audit objective/assertion; sampling approach; tolerable misstatement/deviation; expected misstatement/deviation; risk/confidence inputs; strata/key-item rules.
+Named commands
+CreateSampleDesign; ApproveSampleDesign; SelectSample; RecordItemResult; RecordNonresponse; AddAlternativeProcedure; EvaluateSample; SupersedeSample.
+Read/query surfaces
+GetSample; GetSelectionMethod; ReproduceSelection; GetItemResults; GetEvaluation; GetProjection.
+State model
+DraftDesign → ApprovedDesign → Selected → Testing → Evaluated → Reviewed → Locked.
+Authorization / SoD / controls
+Selection method/seed preserved; no silent item replacement; all items have selection opportunity as methodology requires; key items/100% strata explicit; sample-parameter changes invalidate selection.
+Events
+SampleDesignApproved; SampleSelected; SampleItemExceptionRecorded; SampleEvaluated; SampleSuperseded.
+Failure / degradation semantics
+Population mismatch, changed materiality/tolerance, unverifiable selection or incomplete item testing blocks final evaluation.
+Evidence / lineage
+Design rationale, parameters, seed/method, selected-item list, test result per item, exceptions, projections, evaluation and review.
+NFR / recovery profile
+Deterministic/reproducible selection; high integrity; batch-scale efficient; no requirement for subsecond selection.
+
+AUD-04 — Mandatory engineering controls
+Selection method/seed preserved.
+no silent item replacement.
+all items have selection opportunity as methodology requires.
+key items/100% strata explicit.
+sample-parameter changes invalidate selection.
+
+Figure — AUD-04 control flow.
+3.5 AUD-05 — PBC / Evidence Request
+Contract field
+Build-ready requirement
+Purpose
+Manage secure evidence requests to management, client staff, third parties or connected systems without conflating receipt with audit acceptance.
+Authoritative ownership
+EvidenceRequest, RequestAssignment, RequestDeadline, RequestResponse, RequestCommunication, ResponseReceipt.
+Explicit non-ownership
+Audit Evidence acceptance; client task master outside the engagement; evidence conclusion.
+Required inputs
+Engagement; purpose/procedure; requested artifact/data; responsible party; due date; confidentiality; delivery channel; escalation/reminder policy.
+Named commands
+CreateRequest; SendRequest; ReassignRequest; ExtendDueDate; SubmitResponse; AcknowledgeReceipt; RequestClarification; MarkSatisfied; CloseRequest.
+Read/query surfaces
+GetRequest; ListOpenRequests; GetResponseHistory; GetAging; GetCommunications.
+State model
+Draft → Sent → Viewed → ResponseReceived → UnderEvaluation → Satisfied / ClarificationRequired / Closed; Overdue is derived attention state.
+Authorization / SoD / controls
+Secure upload/connectors; malware scan; immutable response versions; client cannot mark own response accepted as audit evidence; audit-only notes hidden from client contributor.
+Events
+EvidenceRequestSent; EvidenceResponseReceived; EvidenceRequestOverdue; ClarificationRequested; EvidenceRequestSatisfied.
+Failure / degradation semantics
+Malware, corrupted upload, cross-engagement file, expired access or unverified external response causes quarantine—not evidence acceptance.
+Evidence / lineage
+Request wording/purpose, send/view timestamps, reminders, response versions, source identity, file hashes and evaluation disposition.
+NFR / recovery profile
+C2 collaboration; resilient uploads; notifications best-effort but request state authoritative.
+
+AUD-05 — Mandatory engineering controls
+Secure upload/connectors.
+malware scan.
+immutable response versions.
+client cannot mark own response accepted as audit evidence.
+audit-only notes hidden from client contributor.
+
+Figure — AUD-05 control flow.
+3.6 AUD-06 — Audit Evidence
+Contract field
+Build-ready requirement
+Purpose
+Register and evaluate evidential items with provenance, integrity, reliability, relevance, contradiction status, custody and linkage to procedures/assertions.
+Authoritative ownership
+AuditEvidence, EvidenceVersion, EvidenceSource, EvidenceReliabilityAssessment, EvidenceLink, EvidenceContradiction, ChainOfCustodyEntry.
+Explicit non-ownership
+Underlying source fact; legal determination of admissibility; automatic sufficiency/appropriateness conclusion.
+Required inputs
+PBC response, system-generated evidence package, external confirmation, direct observation record, inquiry, recalculation output, specialist evidence or other authorized source.
+Named commands
+RegisterEvidence; VerifyIntegrity; AssessReliability; LinkToProcedure; RecordContradiction; RestrictEvidence; SupersedeEvidence; QuarantineEvidence.
+Read/query surfaces
+GetEvidence; GetSource; GetReliabilityAssessment; GetProcedureLinks; ListContradictions; VerifyDigest; GetCustodyHistory.
+State model
+Received → IntegrityChecked → Evaluated → Linked → AcceptedForProcedure / Restricted / Contradictory / Quarantined; states may coexist where orthogonal.
+Authorization / SoD / controls
+Original bytes/read-only source retained where policy permits; evidence source and acquisition method mandatory; contradictory evidence retained; reviewer-visible reliability assessment; no silent replacement.
+Events
+AuditEvidenceRegistered; EvidenceIntegrityFailed; EvidenceReliabilityAssessed; EvidenceContradictionRecorded; EvidenceLinkedToProcedure; EvidenceRestricted.
+Failure / degradation semantics
+Invalid hash/signature, source ambiguity, access violation, malware or legal-hold conflict blocks normal use and routes to quarantine/restriction.
+Evidence / lineage
+Content digest, acquisition log, source identity, authenticity/integrity checks, reliability rationale, contradictions and procedure links.
+NFR / recovery profile
+C1 evidence object; tamper-evident; encryption/residency inherited; archive durability high.
+
+AUD-06 — Mandatory engineering controls
+Original bytes/read-only source retained where policy permits.
+evidence source and acquisition method mandatory.
+contradictory evidence retained.
+reviewer-visible reliability assessment.
+no silent replacement.
+
+Figure — AUD-06 control flow.
+3.7 AUD-07 — Workpaper
+Contract field
+Build-ready requirement
+Purpose
+Document the nature, timing, extent and results of audit procedures, evidence obtained, significant judgments and conclusions in a reviewable record.
+Authoritative ownership
+Workpaper, WorkpaperProcedure, WorkpaperResult, WorkpaperConclusion, CrossReference, ReviewNoteLink, WorkpaperAddendum, WorkpaperLock.
+Explicit non-ownership
+Underlying accounting fact; audit report issuance; client response content ownership.
+Required inputs
+Audit plan/risk; population/sample; procedures; evidence; findings; preparer identity; methodology template; cross-references.
+Named commands
+CreateWorkpaper; RecordProcedure; LinkEvidence; RecordResult; RecordConclusion; MarkPrepared; AddCrossReference; LockWorkpaper; AddPostLockAddendum.
+Read/query surfaces
+GetWorkpaper; GetProcedureEvidenceMap; GetRevisionHistory; GetReviewStatus; VerifyLockDigest; ListPostLockAddenda.
+State model
+Draft → InProgress → Prepared → Reviewed → Locked; Addendum workflow does not unlock prior content.
+Authorization / SoD / controls
+Purpose/procedure/result/conclusion mandatory; preparer/date captured; contradictory evidence linked; lock digest generated; post-lock additions identify who/when/why/effect; prior versions retained.
+Events
+WorkpaperCreated; WorkpaperPrepared; WorkpaperReviewed; WorkpaperLocked; WorkpaperAddendumAdded.
+Failure / degradation semantics
+Missing evidence/procedure link, unresolved required review notes or changed protected content prevents lock/sign-off.
+Evidence / lineage
+All workpaper versions, cross-references, preparer/reviewer identity, timestamps, lock hash and addendum history.
+NFR / recovery profile
+C1 documentation; strong consistency/versioning; low latency secondary to integrity.
+
+AUD-07 — Mandatory engineering controls
+Purpose/procedure/result/conclusion mandatory.
+preparer/date captured.
+contradictory evidence linked.
+lock digest generated.
+post-lock additions identify who/when/why/effect.
+prior versions retained.
+
+Figure — AUD-07 control flow.
+3.8 AUD-08 — Finding / Exception
+Contract field
+Build-ready requirement
+Purpose
+Maintain audit findings, identified/accumulated misstatements, control deficiencies, deviations, scope limitations and related management responses/remediation evidence.
+Authoritative ownership
+AuditFinding, MisstatementRecord, ControlDeficiencyRecord, ScopeLimitation, ManagementResponse, RemediationEvidence, FindingClosureAssessment.
+Explicit non-ownership
+Authoritative business remediation; accounting correction; final deficiency classification where framework requires professional judgment without human action.
+Required inputs
+Procedure result; evidence; affected assertion/account/control; magnitude/qualitative factors; management response; corrected transaction evidence; communication requirement.
+Named commands
+CreateFinding; ClassifyFinding; AccumulateMisstatement; CommunicateFinding; RecordManagementResponse; LinkRemediation; Reperform; CloseFinding; ReopenFinding.
+Read/query surfaces
+GetFinding; ListOpenFindings; GetMisstatementSummary; GetControlDeficiencySummary; GetManagementResponses; GetClosureEvidence.
+State model
+Identified → Evaluating → Communicated → ManagementResponse → RemediationTesting → Closed / OpenAtReport; Reopened explicit.
+Authorization / SoD / controls
+Original finding immutable; corrections linked not overwritten; materiality/qualitative evaluation versioned; closure requires evidence/reperformance where methodology requires; communication history preserved.
+Events
+AuditFindingIdentified; MisstatementAccumulated; FindingCommunicated; ManagementResponseRecorded; FindingClosed; FindingReopened.
+Failure / degradation semantics
+Attempted deletion, self-closure without authority, missing closure evidence or hidden unresolved scope limitation blocks completion gates.
+Evidence / lineage
+Finding basis, supporting evidence, affected assertions, management response, communications, remediation and closure rationale.
+NFR / recovery profile
+C1 engagement quality record; high durability and archive integrity.
+
+AUD-08 — Mandatory engineering controls
+Original finding immutable.
+corrections linked not overwritten.
+materiality/qualitative evaluation versioned.
+closure requires evidence/reperformance where methodology requires.
+communication history preserved.
+
+Figure — AUD-08 control flow.
+3.9 AUD-09 — Review &amp; Sign-Off
+Contract field
+Build-ready requirement
+Purpose
+Control supervisory review, engagement-partner review, specialist review and engagement-quality review/sign-off as required by framework and methodology.
+Authoritative ownership
+ReviewAssignment, ReviewNote, SignOff, ReviewScope, SignOffFingerprint, CompletionGate, QualityReviewRecord.
+Explicit non-ownership
+Identity/authorization authority; professional quality-management standard itself; underlying workpaper content.
+Required inputs
+Prepared workpapers; findings; engagement completion matters; reviewer assignments; methodology; required sign-off roles; protected-content hashes.
+Named commands
+AssignReviewer; OpenReview; RaiseReviewNote; RespondToReviewNote; ResolveReviewNote; SignOff; WithdrawSignOff; StartQualityReview; CompleteQualityReview; EvaluateReleaseGates.
+Read/query surfaces
+GetReviewStatus; ListOpenReviewNotes; GetSignOffs; VerifySignOff; GetCompletionGates; GetQualityReviewStatus.
+State model
+NotStarted → InReview → NotesOpen → ReadyForSignoff → Signed; invalidated/reopened when protected content changes.
+Authorization / SoD / controls
+No self-review where prohibited; sign-off bound to content fingerprint; unresolved mandatory notes block sign-off/release; changed protected content invalidates downstream sign-offs; role/assignment checked server-side.
+Events
+ReviewStarted; ReviewNoteRaised; ReviewNoteResolved; WorkpaperSignedOff; SignOffInvalidated; QualityReviewCompleted; CompletionGateFailed.
+Failure / degradation semantics
+Expired assignment, insufficient session assurance, unresolved notes, hash mismatch or SoD conflict returns explicit denial; cannot force sign-off by admin database update.
+Evidence / lineage
+Review notes/responses, reviewer identity/role, sign-off fingerprints, quality-review record, invalidation/reapproval history.
+NFR / recovery profile
+C0/C1 release-control path; strong consistency; no stale authorization caches for sign-off.
+
+AUD-09 — Mandatory engineering controls
+No self-review where prohibited.
+sign-off bound to content fingerprint.
+unresolved mandatory notes block sign-off/release.
+changed protected content invalidates downstream sign-offs.
+role/assignment checked server-side.
+
+Figure — AUD-09 control flow.
+3.10 AUD-10 — Audit Trail / Data Export
+Contract field
+Build-ready requirement
+Purpose
+Produce tamper-evident engagement archives and controlled export/inspection packages containing authorized workpapers, evidence, populations, findings, review history and manifests.
+Authoritative ownership
+AuditArchive, AuditExportRequest, ExportManifest, ExportArtifact, RedactionDecision, DeliveryReceipt, ArchiveIntegritySeal.
+Explicit non-ownership
+Underlying source database; general tenant backup; regulator legal-entitlement determination.
+Required inputs
+Engagement scope; authorized export purpose/recipient; retention/hold status; requested artifact classes; confidentiality/residency policy; redaction policy.
+Named commands
+CreateArchive; VerifyArchive; RequestExport; ApproveExport; BuildExportPackage; ApplyRedaction; SealPackage; DeliverPackage; RevokeDeliveryAccess.
+Read/query surfaces
+GetArchiveManifest; VerifyArtifactDigest; GetExportStatus; GetDeliveryHistory; GetRedactionLog; ListPackageContents.
+State model
+Requested → Approved → Building → Validating → Sealed → Delivered → Expired/Revoked; Failed/Quarantined explicit.
+Authorization / SoD / controls
+Least-necessary disclosure; legal-hold/retention checks; recipient authorization; artifact manifests/hashes; read-only delivery; restricted PII redaction; export events audited.
+Events
+AuditArchiveCreated; AuditExportRequested; AuditExportApproved; AuditExportSealed; AuditExportDelivered; ExportAccessRevoked.
+Failure / degradation semantics
+Unauthorized scope, cross-border/residency conflict, active restriction, digest mismatch or missing manifest blocks delivery.
+Evidence / lineage
+Export request/approval, package manifest, hashes, redaction decisions, signer/recipient, delivery receipt and access history.
+NFR / recovery profile
+C1 evidence export; potentially large asynchronous jobs; immutable sealed artifacts; resumable packaging.
+
+AUD-10 — Mandatory engineering controls
+Least-necessary disclosure.
+legal-hold/retention checks.
+recipient authorization.
+artifact manifests/hashes.
+read-only delivery.
+restricted PII redaction.
+
+Figure — AUD-10 control flow.
+4. Canonical Audit Data Model
+Entity
+Purpose
+AuditEngagement
+Engagement identity, framework/methodology, scope, period, lifecycle and responsible leadership.
+EngagementAssignment
+Subject, audit role, scope, effective dates and access basis.
+AcceptanceDecision
+Acceptance/continuance decision, evidence, approver and version.
+AuditPlan
+Planning version, materiality references, risk set and approval.
+AuditRisk
+Risk description, affected assertions/process, assessment, significant-risk flag, rationale and version.
+MaterialityRecord
+Overall/performance/specific materiality inputs, benchmark/rationale, preparer/reviewer and version.
+PlannedProcedure
+Objective, assertion, procedure type, timing, extent and planned evidence.
+AuditPopulation
+Frozen population identity and status.
+PopulationManifest
+Source/filter/watermark/count/control totals/hash/lineage.
+SampleDesign
+Sampling method, parameters, risk/tolerance inputs, strata and approval.
+SampleItem
+Selected population item and selection provenance.
+EvidenceRequest
+PBC/third-party request, owner, due date, status and communications.
+AuditEvidence
+Evidence identity, source, integrity, confidentiality and evaluation state.
+EvidenceReliabilityAssessment
+Reliability/relevance evaluation, evaluator and rationale.
+EvidenceContradiction
+Contradictory/inconsistent evidence record and disposition.
+Workpaper
+Procedure documentation, result, conclusion, preparer/reviewer and lock status.
+WorkpaperAddendum
+Post-lock addition with who/when/why/effect.
+AuditFinding
+Finding/misstatement/deficiency/scope limitation and lifecycle.
+ManagementResponse
+Management response/remediation plan and timestamps.
+ReviewNote
+Reviewer challenge, response, resolution and linkage.
+SignOff
+Role-bound sign-off with content fingerprint and session assurance.
+AuditArchive
+Locked engagement archive and retention/hold state.
+ExportManifest
+Controlled export contents, hashes, redactions, recipient and delivery evidence.
+
+
+Figure 13 — Source-to-conclusion lineage.
+5. Commands, APIs &amp; Domain Events
+Illustrative surface
+Contract requirement
+POST /audit/engagements
+Create engagement command; server resolves tenant/entity/framework access.
+POST /audit/engagements/{id}:activate
+Protected activation after acceptance/continuance gates.
+POST /audit/risks
+Create/assess risk through explicit command semantics.
+POST /audit/populations
+Define/build population asynchronously where large.
+POST /audit/populations/{id}:freeze
+Freeze only after completeness/control-total validation.
+POST /audit/samples
+Create governed sample design against a frozen population.
+POST /audit/evidence-requests
+Create secure PBC/third-party evidence request.
+POST /audit/evidence
+Register evidence; content may use controlled file/object references.
+POST /audit/workpapers/{id}:lock
+Lock prepared/reviewed workpaper and generate integrity fingerprint.
+POST /audit/findings/{id}:close
+Close only with authority and required closure evidence.
+POST /audit/signoffs
+Create sign-off bound to protected-content fingerprint.
+POST /audit/exports
+Create asynchronous controlled export/inspection request.
+
+Canonical event
+Meaning
+audit.engagement.activated.v1
+Engagement becomes active after acceptance/authorization.
+audit.risk.assessment.changed.v1
+Risk assessment version changed; dependent procedures may need impact review.
+audit.population.frozen.v1
+Population manifest sealed and eligible for testing.
+audit.sample.selected.v1
+Sample selection completed with reproducibility metadata.
+audit.evidence.registered.v1
+Evidence object registered and available for evaluation.
+audit.evidence.contradiction_recorded.v1
+Potentially contradictory evidence flagged.
+audit.workpaper.locked.v1
+Workpaper frozen at completion state.
+audit.finding.identified.v1
+Finding/misstatement/deficiency/scope limitation created.
+audit.signoff.invalidated.v1
+Protected content changed after sign-off.
+audit.engagement.report_ready.v1
+All configured completion gates satisfied.
+audit.archive.created.v1
+Engagement archive sealed.
+audit.export.delivered.v1
+Controlled package delivered to authorized recipient.
+
+
+Figure 14 — Documentation completion, archive lock and retention.
+6. Canonical Audit Control Catalogue
+Control ID
+Control
+Assertion
+AUD-CTRL-001
+Engagement acceptance/continuance gate
+Required acceptance evidence and approval exist before activation.
+AUD-CTRL-002
+Engagement scope integrity
+Entity/period/framework scope is explicit and versioned.
+AUD-CTRL-003
+Assignment and access
+Only active authorized engagement assignments can access restricted audit content.
+AUD-CTRL-004
+Materiality version integrity
+Changes trigger dependent-test impact analysis.
+AUD-CTRL-005
+Risk-response completeness
+Every assessed material risk has planned response and coverage.
+AUD-CTRL-006
+Significant-risk human designation
+No autonomous algorithm/AI designation as authoritative.
+AUD-CTRL-007
+Population completeness
+Frozen population reconciles to source counts/control totals.
+AUD-CTRL-008
+Population immutability
+Frozen population cannot mutate after testing starts.
+AUD-CTRL-009
+Population lineage
+Filter/query/watermark/source/hash are retained.
+AUD-CTRL-010
+Sample reproducibility
+Selection method and parameters reproduce selected sample.
+AUD-CTRL-011
+Sample replacement control
+Selected items are not silently substituted.
+AUD-CTRL-012
+Sample evaluation completeness
+Every selected item has result, exception, nonresponse or alternative-procedure disposition.
+AUD-CTRL-013
+PBC version history
+Responses cannot overwrite prior submissions.
+AUD-CTRL-014
+PBC receipt versus evidence acceptance
+Receipt alone never satisfies evidence conclusion.
+AUD-CTRL-015
+Evidence integrity
+Digest/signature/source validation where applicable.
+AUD-CTRL-016
+Evidence reliability assessment
+Relevant evidence carries source/reliability evaluation.
+AUD-CTRL-017
+Contradictory evidence preservation
+Contradictory/inconsistent evidence remains reviewable.
+AUD-CTRL-018
+Procedure-evidence linkage
+Material conclusions cross-reference procedures and supporting/contradictory evidence.
+AUD-CTRL-019
+Workpaper completeness
+Purpose, procedure, result and conclusion present.
+AUD-CTRL-020
+Preparer/reviewer attribution
+Who performed/reviewed and when are explicit.
+AUD-CTRL-021
+Workpaper lock integrity
+Locked workpaper digest verifies and in-place edits are blocked.
+AUD-CTRL-022
+Post-lock addendum
+Subsequent additions record who/when/why/effect.
+AUD-CTRL-023
+Finding history
+Original finding and classification history preserved through closure.
+AUD-CTRL-024
+Misstatement accumulation
+Identified misstatements accumulate without silent exclusion.
+AUD-CTRL-025
+Scope limitation visibility
+Unresolved limitations cannot be hidden by workflow completion.
+AUD-CTRL-026
+Review-note completeness
+Mandatory notes resolved or explicitly carried before sign-off.
+AUD-CTRL-027
+Review SoD
+Self-review/prohibited role combinations prevented.
+AUD-CTRL-028
+Sign-off fingerprint
+Sign-off binds to protected-content version/hash.
+AUD-CTRL-029
+Sign-off invalidation
+Protected changes invalidate dependent sign-offs.
+AUD-CTRL-030
+Completion-document gate
+Significant findings/issues and cross-references complete before report-ready.
+AUD-CTRL-031
+Report release gate
+All required reviews/sign-offs valid before release.
+AUD-CTRL-032
+Archive integrity
+Engagement archive has manifest and verifiable digest.
+AUD-CTRL-033
+Retention/hold enforcement
+No disposition while active hold or mandatory retention applies.
+AUD-CTRL-034
+Export authorization
+Purpose, scope, recipient, residency and confidentiality evaluated before export.
+AUD-CTRL-035
+Export redaction
+Restricted data minimized/redacted according to policy.
+AUD-CTRL-036
+Export package integrity
+Manifest/digests/seal verify after delivery.
+AUD-CTRL-037
+Client/auditor separation
+Client contributors cannot edit auditor-only workpapers or sign-offs.
+AUD-CTRL-038
+AI authority boundary
+AI cannot approve, sign, conclude opinion/materiality/sufficiency or close findings.
+AUD-CTRL-039
+Framework profile versioning
+Professional-standard/methodology profile version preserved with engagement.
+AUD-CTRL-040
+Late source change impact
+Changed source/report after population freeze triggers delta/new population and impact assessment.
+
+7. Negative-Path Engineering Certification Scenarios
+Scenario
+Failure condition
+Expected system behavior
+AUD-NEG-001
+Cross-tenant engagement ID is supplied in a valid request.
+Deny before content lookup; log tenant-boundary attempt.
+AUD-NEG-002
+Engagement activated without completed acceptance evidence.
+Block activation.
+AUD-NEG-003
+Framework profile changed after plan approval.
+Invalidate dependent plan/sign-offs and require impact review.
+AUD-NEG-004
+Materiality reduced after sample selection.
+Flag impacted tests; prevent silent continued reliance.
+AUD-NEG-005
+AI marks a risk “significant” without auditor acceptance.
+Remain proposal only; cannot change authoritative risk state.
+AUD-NEG-006
+Risk has no affected assertion or planned response.
+Fail plan completeness gate.
+AUD-NEG-007
+Population is defined as a live database query.
+Not eligible for evidential freeze/testing until materialized and manifested.
+AUD-NEG-008
+Population count matches source but monetary control total differs.
+Quarantine / fail freeze.
+AUD-NEG-009
+Population contains records from another tenant/entity.
+Block freeze; security incident evaluation.
+AUD-NEG-010
+Late journal appears after frozen population.
+Create controlled delta/new version; do not mutate original population.
+AUD-NEG-011
+Sampling seed/parameters changed after selection.
+Invalidate selection; require new sample version.
+AUD-NEG-012
+Auditor silently replaces an unavailable selected item.
+Block replacement; require documented nonresponse/alternative procedure.
+AUD-NEG-013
+Selected item is tested under a different objective than sample design.
+Flag mismatch; cannot count as completed item.
+AUD-NEG-014
+Sampling evaluation omits known exception.
+Fail evaluation completeness gate.
+AUD-NEG-015
+PBC user uploads malware.
+Quarantine file; preserve request state; notify audit team.
+AUD-NEG-016
+PBC submitter marks own file “sufficient evidence.”
+Reject authority; receipt remains separate from evidence evaluation.
+AUD-NEG-017
+New PBC response overwrites prior version.
+Preserve both; latest response creates new version.
+AUD-NEG-018
+External confirmation callback/source cannot be authenticated.
+Do not treat as verified evidence; quarantine or require alternative procedure.
+AUD-NEG-019
+Evidence digest fails after retrieval.
+Mark integrity failure; block normal reliance and escalate.
+AUD-NEG-020
+Evidence source is unknown but workpaper conclusion relies on it.
+Fail procedure/evidence quality gate.
+AUD-NEG-021
+Contradictory evidence is deleted after conclusion drafted.
+Block deletion; retain contradiction and reviewer visibility.
+AUD-NEG-022
+Workpaper conclusion exists without documented procedure.
+Cannot mark prepared/complete.
+AUD-NEG-023
+Workpaper is locked, then text is edited in place.
+Reject edit; require post-lock addendum.
+AUD-NEG-024
+Post-lock addendum lacks reason/effect assessment.
+Reject addendum completion.
+AUD-NEG-025
+Client support role attempts to edit auditor workpaper.
+Deny; record access event.
+AUD-NEG-026
+Finding is closed with no closure evidence where required.
+Block closure.
+AUD-NEG-027
+Original misstatement is removed after management posts correction.
+Retain original and link correction/reperformance.
+AUD-NEG-028
+Uncorrected misstatement is omitted from accumulation summary.
+Fail completion gate.
+AUD-NEG-029
+Scope limitation is hidden by setting finding Closed.
+Preserve limitation state; report/completion gate remains impacted.
+AUD-NEG-030
+Preparer attempts to self-review where methodology prohibits.
+Deny sign-off under dynamic SoD.
+AUD-NEG-031
+Reviewer assignment expired before sign-off.
+Deny and require reassignment.
+AUD-NEG-032
+Protected evidence changes after reviewer sign-off.
+Invalidate downstream sign-off.
+AUD-NEG-033
+Review note is deleted rather than resolved.
+Preserve note history; deletion not allowed.
+AUD-NEG-034
+Report-ready command issued with unresolved mandatory notes.
+Block command.
+AUD-NEG-035
+Engagement file is archived before required completion review.
+Block archive lock.
+AUD-NEG-036
+Archive digest fails verification during inspection.
+Mark archive compromised; block reliance/export and escalate.
+AUD-NEG-037
+Retention job tries to dispose audit file under active legal hold.
+Block disposition; record policy decision.
+AUD-NEG-038
+PCAOB seven-year retention rule is applied to every global engagement.
+Reject universal hardcoding; resolve through framework/jurisdiction/firm policy.
+AUD-NEG-039
+Export request includes unrelated employee PII.
+Apply least-necessary disclosure/redaction; require justification or exclude.
+AUD-NEG-040
+Export recipient is outside allowed residency/transfer policy.
+Block delivery or route through approved transfer mechanism.
+AUD-NEG-041
+Third-party specialist receives unrestricted engagement access.
+Enforce scoped assignment and least privilege.
+AUD-NEG-042
+AI drafts final audit conclusion and system auto-signs it.
+Prohibited; require authorized human conclusion and sign-off.
+AUD-NEG-043
+Automated anomaly detector result is treated as audit evidence without source/procedure linkage.
+Remain analytic signal/proposal until evaluated and linked.
+AUD-NEG-044
+Component-auditor work is referenced but required documentation is inaccessible.
+Fail group/component completion gate according to methodology profile.
+AUD-NEG-045
+Engagement source financial statements are restated after report-ready.
+Trigger impact analysis, new source version/population and re-review before release or amendment workflow.
+
+8. Service Definition of Ready, Definition of Done &amp; Implementation Sequence
+8.1 Definition of Ready
+Applicable framework profile(s), jurisdictional overlays and firm methodology owner are identified.
+Service authority boundary and source-system dependencies are agreed with Accounting/Data Governance/IAM owners.
+Required object/state/event schemas exist in the canonical model and schema registry.
+Retention/legal-hold/confidentiality classification is defined for each material audit object.
+Permissions, dynamic SoD, client-contributor boundaries and reviewer roles are approved.
+Negative-path acceptance tests and evidence requirements are mapped before implementation starts.
+External connectors (confirmation providers, file sources, regulator/inspection exports) have security/residency contracts.
+8.2 Definition of Done
+Named commands, read models, event contracts and error semantics are implemented and contract-tested.
+Frozen population and sample reproducibility tests pass at representative scale.
+Workpaper lock, sign-off invalidation, contradictory evidence and post-lock addendum tests pass.
+Client/auditor separation and cross-tenant access negative tests pass.
+Archive, retention/legal-hold and export/redaction controls are verified end-to-end.
+Every material conclusion can be reconstructed source → population/item → procedure → evidence → workpaper → review/sign-off.
+Operational dashboards/runbooks cover failed extracts, evidence-integrity failures, stale PBCs, blocked sign-offs and archive/export failures.
+Release certificate from ZS-QA-001 includes all mandatory audit-domain control evidence.
+8.3 Recommended engineering implementation sequence
+Wave
+Build objective
+Wave 1
+AUD-01 Engagement + framework/methodology profile binding + access model.
+Wave 2
+AUD-02 Planning/Risk + assertion/materiality model.
+Wave 3
+AUD-03 Population + source connectors + manifest/hash/control totals.
+Wave 4
+AUD-04 Sampling + reproducibility + result evaluation.
+Wave 5
+AUD-05 PBC + AUD-06 Evidence + malware/integrity/provenance controls.
+Wave 6
+AUD-07 Workpaper + cross-references + lock/addenda.
+Wave 7
+AUD-08 Findings/misstatements + management response/remediation.
+Wave 8
+AUD-09 Review/sign-off/EQR + completion gates.
+Wave 9
+AUD-10 Archive/export + inspection package + full certification suite.
+
+9. Controlled Decisions, Prohibited Anti-Patterns &amp; Standards Baseline
+9.1 Controlled pre-production decisions
+Decision
+Required resolution
+Framework coverage at launch
+Define supported engagement families/jurisdictions and authoritative FrameworkProfile versions; do not imply universal professional-standard compliance.
+Firm methodology model
+Determine which controls are platform-mandatory versus methodology-configurable, including materiality workflows, risk ratings, sampling choices and review gates.
+Evidence storage
+Decide native immutable object store versus governed external references for large evidence while retaining integrity verification and residency.
+External confirmations
+Select providers/connectors and define authenticity, callback verification, ambiguous-state and alternate-procedure behavior.
+Sampling engines
+Approve statistical methods, numerical precision, RNG requirements and reproducibility evidence with methodology specialists.
+AI features
+Approve allowed advisory use cases, model/data boundaries, evaluation thresholds and mandatory human acceptance; opinion/materiality/sign-off remain prohibited.
+Retention matrix
+Legal/Compliance and methodology owners define effective-dated retention by engagement framework, jurisdiction, client/firm requirements and legal hold.
+Inspection/export profiles
+Define regulator/peer-review/quality-inspection package templates, redaction policies, transfer rules and recipient authentication.
+Group audits
+Decide component-auditor/other-auditor workflow based on applicable standards and jurisdiction, including accessible documentation and consolidation linkages.
+
+9.2 Prohibited Audit &amp; Assurance anti-patterns
+Anti-pattern
+Required rule
+Audit writes source facts
+Never allow auditor workpapers/findings to edit GL, invoice, tax, payroll or bank truth directly.
+Single mutable “audit status”
+Use lifecycle, review, evidence, finding and attention states separately.
+Live query as audit population
+Materialize/freeze reproducible populations with control totals and hash.
+PBC = evidence
+Receipt is only an input; relevance/reliability and procedure linkage remain separate.
+Delete contradictory evidence
+Preserve and expose it to review.
+Silent sample replacement
+Document unavailable items and alternatives explicitly.
+Spreadsheet-only sampling without lineage
+Selection parameters and source population must be reproducible.
+Unlock workpaper to “fix” history
+Use addendum/supersession with effect assessment.
+Self-review / stale sign-offs
+Enforce SoD and invalidate sign-offs after protected changes.
+Global hardcoded retention period
+Resolve effective rule by framework/jurisdiction/firm policy and legal hold.
+AI as auditor
+AI may assist but cannot become the professional decision maker, approver or signer.
+Raw database export to inspectors
+Build authorized, redacted, sealed evidence packages with manifest and delivery trail.
+
+
+Figure 15 — Controlled inspection and audit-data export.
+9.3 Current professional-standards baseline (24 August 2026)
+Reference
+Engineering implication
+Official source
+IAASB 2025 Handbook
+Current IAASB Handbook (published 17 September 2025) is the current edition and includes ISAs, ISQMs, ISA for LCE, ISSA 5000, ISAEs/ISREs/ISRSs. Architecture therefore uses versioned FrameworkProfile objects rather than embedding standards text.
+IAASB — 2025 Handbook (official)
+ISA 315 (Revised 2019)
+Current risk-identification/assessment baseline; effective for audits of periods beginning on or after 15 December 2021. Supports explicit entity understanding, risk/assertion linkage and response design.
+IAASB — ISA 315 (Revised 2019)
+ISA 600 (Revised)
+Effective for group audits beginning on or after 15 December 2023; strengthens group-auditor/component-auditor planning, communication, skepticism and documentation.
+IAASB — ISA 600 (Revised)
+ISA 330 / ISA 500 / ISA 520
+IAASB issued proposed revisions for consultation on 5 August 2026; comments close 15 December 2026. They are exposure drafts, not yet final. The platform must not label them as operative standards until finalized/adopted.
+IAASB — 5 Aug 2026 Exposure Drafts
+PCAOB AS 1215
+Audit Documentation requires a clear written record of procedures, evidence and conclusions and identifies preparer/reviewer accountability. PCAOB also shows amendments effective 15 December 2026; the current/future effective profiles must remain versioned.
+PCAOB — AS 1215
+PCAOB AS 2315
+Audit Sampling distinguishes statistical/nonstatistical sampling, sampling/nonsampling risk and representative selection. PCAOB publishes amendments effective 15 December 2026; versioning is required.
+PCAOB — AS 2315

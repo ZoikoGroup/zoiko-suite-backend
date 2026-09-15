@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS planned_procedures;
+DROP TABLE IF EXISTS assertion_links;
+DROP TABLE IF EXISTS risk_assessments;
+DROP TABLE IF EXISTS materiality_records;
+DROP TABLE IF EXISTS audit_plan_transitions;
+DROP TABLE IF EXISTS audit_plans;
+DROP FUNCTION IF EXISTS reject_audit_plan_transition_mutation();
+DROP FUNCTION IF EXISTS reject_assertion_link_mutation();
+DROP FUNCTION IF EXISTS reject_planned_procedure_mutation();
+DROP FUNCTION IF EXISTS reject_materiality_record_mutation();
+ALTER TABLE audit_engagements DROP COLUMN IF EXISTS scope_version;

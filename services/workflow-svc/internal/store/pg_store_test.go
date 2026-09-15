@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -43,7 +44,7 @@ func getTestPool(t *testing.T) *pgxpool.Pool {
 func setupTestDB(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
-	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS workflow_transitions, workflow_stages, workflow_instances CASCADE;")
+	_, _ = pool.Exec(ctx, "DROP TABLE IF EXISTS workpaper_addenda, workpaper_evidence_links, workpaper_cross_references, workpaper_conclusions, workpaper_results, workpaper_procedures, workpapers, planned_procedures, assertion_links, risk_assessments, materiality_records, audit_plan_transitions, audit_plans, audit_engagement_transitions, audit_engagements, workflow_transitions, workflow_stages, workflow_instances CASCADE;")
 
 	// Apply every *.up.sql in order, not two hardcoded filenames — a
 	// migration added later must not be silently skipped by these tests
@@ -79,6 +80,60 @@ func twoStageParams() domain.CreateWorkflowParams {
 			{ApproverPrincipalID: "approver-1"},
 			{ApproverPrincipalID: "approver-2"},
 		},
+	}
+}
+
+func auditEngagementParams() domain.CreateAuditEngagementParams {
+	return domain.CreateAuditEngagementParams{
+		TenantID: testTenantID, LegalEntityID: "00000000-0000-0000-0000-0000000000e1",
+		EngagementCode: "FY26-STAT", EngagementType: "STATUTORY_AUDIT",
+		ReportingPeriodStart: time.Date(2025, 4, 1, 0, 0, 0, 0, time.UTC),
+		ReportingPeriodEnd:   time.Date(2026, 3, 31, 0, 0, 0, 0, time.UTC),
+		FrameworkProfileID:   "isa", FrameworkProfileVersion: "2025.1",
+		MethodologyID: "firm-method", MethodologyVersion: "2026.1",
+		ResponsiblePartnerID: "partner-1", ScopeSummary: "Annual statutory audit",
+		CreatedByPrincipalID: "manager-1",
+	}
+}
+
+func TestPgStore_AuditEngagement_PinsEvidenceAndIsIdempotent(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+	p := auditEngagementParams()
+	p.CorrelationID = "audit-create-1"
+	created, wasCreated, err := s.CreateAuditEngagement(ctx, p)
+	if err != nil || !wasCreated {
+		t.Fatalf("create audit engagement: created=%v err=%v", wasCreated, err)
+	}
+
+	replayed, wasCreated, err := s.CreateAuditEngagement(ctx, p)
+	if err != nil || wasCreated || replayed.EngagementID != created.EngagementID {
+		t.Fatalf("create replay must return original engagement without a duplicate: created=%v replay=%+v original=%+v err=%v", wasCreated, replayed, created, err)
+	}
+
+	accepted, changed, err := s.SubmitAuditEngagementAcceptance(ctx, domain.SubmitAuditEngagementAcceptanceParams{
+		EngagementID: created.EngagementID, TenantID: testTenantID,
+		EvidenceDocumentID: "00000000-0000-0000-0000-0000000000d1", EvidenceDocumentVersion: 3,
+		ActorPrincipalID: "manager-1", CorrelationID: "audit-acceptance-1",
+	})
+	if err != nil || !changed {
+		t.Fatalf("submit acceptance: changed=%v err=%v", changed, err)
+	}
+	if accepted.Status != domain.AuditEngagementAcceptanceReview || accepted.AcceptanceDocumentID == nil || *accepted.AcceptanceDocumentID != "00000000-0000-0000-0000-0000000000d1" || accepted.AcceptanceDocumentVersion == nil || *accepted.AcceptanceDocumentVersion != 3 {
+		t.Fatalf("acceptance evidence version was not pinned: %+v", accepted)
+	}
+
+	replayAcceptance, changed, err := s.SubmitAuditEngagementAcceptance(ctx, domain.SubmitAuditEngagementAcceptanceParams{
+		EngagementID: created.EngagementID, TenantID: testTenantID,
+		EvidenceDocumentID: "00000000-0000-0000-0000-0000000000d1", EvidenceDocumentVersion: 3,
+		ActorPrincipalID: "manager-1", CorrelationID: "audit-acceptance-1",
+	})
+	if err != nil || changed || replayAcceptance.EngagementID != created.EngagementID {
+		t.Fatalf("acceptance replay must be a no-op: changed=%v engagement=%+v err=%v", changed, replayAcceptance, err)
 	}
 }
 
