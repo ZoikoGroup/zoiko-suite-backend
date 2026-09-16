@@ -496,6 +496,50 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 	if resp.EffectiveAvailableCash != 600.0 {
 		t.Errorf("expected effective available cash to be 600, got %f", resp.EffectiveAvailableCash)
 	}
+
+	// The fixture never sets CashBalance.AsOfTimestamp, so it's the zero
+	// value — arbitrarily old, and correctly flagged stale rather than
+	// silently presented as a current figure.
+	if !resp.HasStaleComponent {
+		t.Error("expected HasStaleComponent=true for a bank balance with no recorded as_of_timestamp")
+	}
+}
+
+// TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale is the
+// negative control for TestHandler_GetEffectiveCash's staleness
+// assertion above: a bank balance recorded just now must NOT be flagged.
+func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T) {
+	s := newMockStore()
+	p := &mockPublisher{}
+	az := &mockAuthz{allowed: true}
+	c := &mockClients{apCommitments: 200.0, payroll: 150.0, tax: 50.0}
+	log := zap.NewNop()
+
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	s.cashBalances[acctID] = &domain.CashBalance{BankAccountID: acctID, AvailableBalance: 1000.0, AsOfTimestamp: time.Now().UTC()}
+
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/effective-cash?legal_entity_id=ent-123&currency_code=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d. Body: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.EffectiveCashResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.HasStaleComponent {
+		t.Error("expected HasStaleComponent=false for a freshly recorded bank balance")
+	}
 }
 
 func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {

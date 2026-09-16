@@ -346,14 +346,34 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// oldestBankBalanceAsOf tracks the LEAST recent as_of_timestamp across
+	// every account composed into bankSum — the position as a whole is
+	// only as fresh as its stalest contributing account, so a single
+	// out-of-date account is enough to flag the composed figure.
 	var bankSum float64
+	var oldestBankBalanceAsOf time.Time
+	var haveBankBalance bool
 	for _, acct := range accts {
 		if acct.CurrencyCode == currencyCode && acct.AccountStatus == "ACTIVE" {
 			bal, err := h.store.GetLatestCashBalance(r.Context(), acct.BankAccountID)
 			if err == nil && bal != nil {
 				bankSum += bal.AvailableBalance
+				if !haveBankBalance || bal.AsOfTimestamp.Before(oldestBankBalanceAsOf) {
+					oldestBankBalanceAsOf = bal.AsOfTimestamp
+				}
+				haveBankBalance = true
 			}
 		}
+	}
+	// Flagged, not blocked: unlike AP/obligations being fully unreachable
+	// (nothing to show at all, so this handler fails closed), a stale
+	// bank balance is real data that's merely old — the doc's rule is
+	// "never show it AS CURRENT," which HasStaleComponent/IsStale below
+	// satisfies by labeling it, not by withholding the whole response.
+	bankBalanceStale := haveBankBalance && time.Since(oldestBankBalanceAsOf) > domain.BankBalanceStalenessThreshold
+	if bankBalanceStale {
+		h.log.Warn("effective cash: bank balance component is stale",
+			zap.String("legal_entity_id", legalEntityID), zap.Time("oldest_as_of", oldestBankBalanceAsOf))
 	}
 
 	// 2. Pending AP Commitments — fail closed: if AP is unavailable the figure is
@@ -388,6 +408,17 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	now := time.Now().UTC()
+	components := []domain.ComponentFreshness{
+		{Component: "current_bank_balance", AsOfTimestamp: oldestBankBalanceAsOf, StalenessThresholdSeconds: int(domain.BankBalanceStalenessThreshold.Seconds()), IsStale: bankBalanceStale},
+		// AP/obligations are synchronous live queries — see
+		// domain.ComponentFreshness's own doc comment on why they are
+		// always as-of-now and never stale.
+		{Component: "pending_ap_commitments", AsOfTimestamp: now, StalenessThresholdSeconds: 0, IsStale: false},
+		{Component: "payroll_obligations", AsOfTimestamp: now, StalenessThresholdSeconds: 0, IsStale: false},
+		{Component: "tax_liabilities", AsOfTimestamp: now, StalenessThresholdSeconds: 0, IsStale: false},
+	}
+
 	resp := domain.EffectiveCashResponse{
 		TenantID:                 tenantID,
 		LegalEntityID:            legalEntityID,
@@ -398,8 +429,10 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 		TaxLiabilities:           taxSum,
 		ReservedPendingApprovals: 0.0,
 		EffectiveAvailableCash:   effectiveCash,
-		AsOfTimestamp:            time.Now().UTC(),
+		AsOfTimestamp:            now,
 		ThresholdDetails:         details,
+		Components:               components,
+		HasStaleComponent:        bankBalanceStale,
 	}
 
 	if details != nil && details.IsBreached {
