@@ -88,6 +88,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1/treasury", func(r chi.Router) {
 		r.Post("/accounts", h.RegisterBankAccount)
 		r.Get("/accounts", h.ListBankAccounts)
+		r.Get("/accounts/{accountID}", h.GetBankAccountByID)
 		r.Get("/positions", h.GetCashPositions)
 		r.Post("/thresholds", h.SetLiquidityThreshold)
 		r.Get("/effective-cash", h.GetEffectiveCash)

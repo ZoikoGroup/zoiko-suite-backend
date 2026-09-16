@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/banking-connector-svc/internal/authz"
+	"zoiko.io/banking-connector-svc/internal/clients"
 	"zoiko.io/banking-connector-svc/internal/config"
 	svcenvelope "zoiko.io/banking-connector-svc/internal/envelope"
 	"zoiko.io/banking-connector-svc/internal/events"
@@ -84,6 +85,13 @@ func main() {
 
 	h := handler.New(st, publisher, authzClient, logger)
 
+	// BNK-02 dependencies — real HTTP clients to secret-vault-integration-svc
+	// (revoke only — see internal/clients/vault.go's own doc comment on why
+	// minting is out of scope here) and treasury-svc (BNK-01 account
+	// validation). pgStore already satisfies store.BNK02Store.
+	bankAcctClient := clients.NewBankAccountHTTPClient(cfg.TreasuryServiceURL)
+	vaultClient := clients.NewVaultHTTPClient(cfg.VaultServiceURL)
+
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)
 	r.Use(chimiddleware.RealIP)
@@ -100,6 +108,7 @@ func main() {
 
 	r.Get("/healthz", health.Handler())
 	handler.RegisterRoutes(r, h)
+	handler.RegisterBNK02Routes(r, h, st, bankAcctClient, vaultClient)
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
