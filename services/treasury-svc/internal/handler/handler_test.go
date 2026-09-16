@@ -18,28 +18,37 @@ import (
 )
 
 type mockStore struct {
-	bankAccounts map[string]*domain.BankAccount
-	evidence     map[string][]domain.OwnershipEvidence
-	cashBalances map[string]*domain.CashBalance
-	thresholds   map[string]*domain.LiquidityThreshold
-	transfers    map[string]bool
-	createErr    error
-	getErr       error
-	listErr      error
-	updateErr    error
-	balErr       error
-	threshErr    error
-	transferErr  error
-	bnk01Err     error
+	bankAccounts         map[string]*domain.BankAccount
+	evidence             map[string][]domain.OwnershipEvidence
+	cashBalances         map[string]*domain.CashBalance
+	thresholds           map[string]*domain.LiquidityThreshold
+	transfers            map[string]*domain.TreasuryTransfer
+	transfersByCorr      map[string]string
+	createErr            error
+	getErr               error
+	listErr              error
+	updateErr            error
+	balErr               error
+	threshErr            error
+	transferErr          error
+	bnk01Err             error
+	allOwnershipVerified bool
+
+	fxRates map[string]*domain.FXRate
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		bankAccounts: make(map[string]*domain.BankAccount),
-		evidence:     make(map[string][]domain.OwnershipEvidence),
-		cashBalances: make(map[string]*domain.CashBalance),
-		thresholds:   make(map[string]*domain.LiquidityThreshold),
-		transfers:    make(map[string]bool),
+		bankAccounts:    make(map[string]*domain.BankAccount),
+		evidence:        make(map[string][]domain.OwnershipEvidence),
+		cashBalances:    make(map[string]*domain.CashBalance),
+		thresholds:      make(map[string]*domain.LiquidityThreshold),
+		transfers:       make(map[string]*domain.TreasuryTransfer),
+		transfersByCorr: make(map[string]string),
+		// Tests that never call VerifyBankAccountOwnership shouldn't have
+		// to also seed ownership evidence just to get past
+		// CreateTreasuryTransfer's BNK-01 verification gate.
+		allOwnershipVerified: true,
 	}
 }
 
@@ -91,6 +100,9 @@ func (m *mockStore) ListOwnershipEvidence(ctx context.Context, tenantID, bankAcc
 func (m *mockStore) IsOwnershipVerified(ctx context.Context, tenantID, bankAccountID string) (bool, error) {
 	if m.bnk01Err != nil {
 		return false, m.bnk01Err
+	}
+	if m.allOwnershipVerified {
+		return true, nil
 	}
 	for _, e := range m.evidence[bankAccountID] {
 		if e.SupersededBy == nil {
@@ -212,17 +224,130 @@ func (m *mockStore) GetLiquidityThreshold(ctx context.Context, legalEntityID, cu
 	return m.thresholds[key], nil
 }
 
-func (m *mockStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (bool, error) {
+// ── BNK-09 ───────────────────────────────────────────────────────────────────
+
+func (m *mockStore) CreateTreasuryTransfer(ctx context.Context, p domain.CreateTreasuryTransferParams) (*domain.TreasuryTransfer, bool, error) {
 	if m.transferErr != nil {
-		return false, m.transferErr
+		return nil, false, m.transferErr
 	}
-	if correlationID != "" && m.transfers[correlationID] {
-		return false, nil
+	if p.CorrelationID != "" {
+		if id, ok := m.transfersByCorr[p.CorrelationID]; ok {
+			return m.transfers[id], false, nil
+		}
 	}
-	if correlationID != "" {
-		m.transfers[correlationID] = true
+	id := "transfer-" + p.CorrelationID
+	if id == "transfer-" {
+		id = p.SourceBankAccountID + "->" + p.TargetBankAccountID
 	}
-	return true, nil
+	t := &domain.TreasuryTransfer{
+		TransferID: id, TenantID: p.TenantID, SourceBankAccountID: p.SourceBankAccountID, TargetBankAccountID: p.TargetBankAccountID,
+		Amount: p.Amount, CurrencyCode: p.CurrencyCode, CorrelationID: p.CorrelationID, IsCrossEntity: p.IsCrossEntity,
+		Status: domain.TransferPendingApproval, MakerPrincipalID: p.MakerPrincipalID,
+	}
+	m.transfers[id] = t
+	if p.CorrelationID != "" {
+		m.transfersByCorr[p.CorrelationID] = id
+	}
+	return t, true, nil
+}
+
+func (m *mockStore) GetTreasuryTransfer(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	return t, nil
+}
+
+func (m *mockStore) ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveTreasuryTransferParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if t.MakerPrincipalID == p.CheckerPrincipalID {
+		return nil, domain.ErrTransferSelfApproval
+	}
+	if !domain.CanApproveTransfer(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.Status = domain.TransferApproved
+	t.CheckerPrincipalID = p.CheckerPrincipalID
+	return t, nil
+}
+
+func (m *mockStore) RejectTreasuryTransfer(ctx context.Context, p domain.RejectTreasuryTransferParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if !domain.CanRejectTransfer(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.Status = domain.TransferRejected
+	t.CheckerPrincipalID = p.CheckerPrincipalID
+	t.RejectReason = p.Reason
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferSubmitted(ctx context.Context, tenantID, transferID, paymentAttemptID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferSubmitted
+	t.PaymentAttemptID = paymentAttemptID
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferLedgerPosted(ctx context.Context, tenantID, transferID, sourceJournalID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferLedgerPosted
+	t.SourceJournalID = sourceJournalID
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferIntercompanyPaired(ctx context.Context, tenantID, transferID, intercompanyEntryID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferIntercompanyPaired
+	t.IntercompanyEntryID = intercompanyEntryID
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferCompleted(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferCompleted
+	return t, nil
+}
+
+// ── BNK-10 ───────────────────────────────────────────────────────────────────
+
+func (m *mockStore) RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error) {
+	if m.fxRates == nil {
+		m.fxRates = map[string]*domain.FXRate{}
+	}
+	r := &domain.FXRate{
+		RateID: "rate-" + p.CurrencyPair, TenantID: p.TenantID, CurrencyPair: p.CurrencyPair,
+		Rate: p.Rate, EffectiveAt: p.EffectiveAt, RecordedByPrincipalID: p.RecordedByPrincipalID,
+	}
+	m.fxRates[p.CurrencyPair] = r
+	return r, nil
+}
+
+func (m *mockStore) GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error) {
+	r, ok := m.fxRates[currencyPair]
+	if !ok {
+		return nil, domain.ErrFXRateNotFound
+	}
+	return r, nil
 }
 
 type mockPublisher struct {
@@ -290,6 +415,23 @@ func (m *mockClients) GetLiquidityForecastData(ctx context.Context, tenantID, le
 	return m.inflowsData, m.outflowsData, nil
 }
 
+// mockTransferClients is a stub — none of the tests in this file exercise
+// ExecuteTreasuryTransfer's outbound calls, only CreateTreasuryTransfer's
+// HTTP-layer behavior (threshold checks, idempotency, validation).
+type mockTransferClients struct{}
+
+func (m *mockTransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef string, amount float64, currency string) (string, error) {
+	return "attempt-stub", nil
+}
+
+func (m *mockTransferClients) PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount float64) (string, error) {
+	return "journal-stub", nil
+}
+
+func (m *mockTransferClients) PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error) {
+	return "intercompany-stub", nil
+}
+
 func TestHandler_RegisterBankAccount(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
@@ -297,7 +439,7 @@ func TestHandler_RegisterBankAccount(t *testing.T) {
 	c := &mockClients{}
 	log := zap.NewNop()
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -354,7 +496,7 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 		AvailableBalance: 1000.0,
 	}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -378,9 +520,53 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 	if resp.EffectiveAvailableCash != 600.0 {
 		t.Errorf("expected effective available cash to be 600, got %f", resp.EffectiveAvailableCash)
 	}
+
+	// The fixture never sets CashBalance.AsOfTimestamp, so it's the zero
+	// value — arbitrarily old, and correctly flagged stale rather than
+	// silently presented as a current figure.
+	if !resp.HasStaleComponent {
+		t.Error("expected HasStaleComponent=true for a bank balance with no recorded as_of_timestamp")
+	}
 }
 
-func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
+// TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale is the
+// negative control for TestHandler_GetEffectiveCash's staleness
+// assertion above: a bank balance recorded just now must NOT be flagged.
+func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T) {
+	s := newMockStore()
+	p := &mockPublisher{}
+	az := &mockAuthz{allowed: true}
+	c := &mockClients{apCommitments: 200.0, payroll: 150.0, tax: 50.0}
+	log := zap.NewNop()
+
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	s.cashBalances[acctID] = &domain.CashBalance{BankAccountID: acctID, AvailableBalance: 1000.0, AsOfTimestamp: time.Now().UTC()}
+
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/effective-cash?legal_entity_id=ent-123&currency_code=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d. Body: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.EffectiveCashResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.HasStaleComponent {
+		t.Error("expected HasStaleComponent=false for a freshly recorded bank balance")
+	}
+}
+
+func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
@@ -417,7 +603,7 @@ func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
 		MinimumRequiredBalance: 200.0,
 	}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -455,12 +641,19 @@ func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
 	rr2 := httptest.NewRecorder()
 	r.ServeHTTP(rr2, req2.WithContext(svcmiddleware.WithTenant(req2.Context(), "tenant-abc")))
 
-	if rr2.Code != http.StatusOK {
-		t.Fatalf("expected status 200 OK, got %d. Body: %s", rr2.Code, rr2.Body.String())
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("expected status 201 Created (a new PENDING_APPROVAL transfer), got %d. Body: %s", rr2.Code, rr2.Body.String())
+	}
+	var created domain.TreasuryTransfer
+	if err := json.Unmarshal(rr2.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Status != domain.TransferPendingApproval {
+		t.Fatalf("expected a new transfer to be PENDING_APPROVAL, got %q", created.Status)
 	}
 }
 
-func TestHandler_InitiateTransfer_MissingCorrelationID_Rejected(t *testing.T) {
+func TestHandler_CreateTreasuryTransfer_MissingCorrelationID_Rejected(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
@@ -471,7 +664,7 @@ func TestHandler_InitiateTransfer_MissingCorrelationID_Rejected(t *testing.T) {
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -493,7 +686,7 @@ func TestHandler_InitiateTransfer_MissingCorrelationID_Rejected(t *testing.T) {
 	}
 }
 
-func TestHandler_InitiateTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t *testing.T) {
+func TestHandler_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecondTransfer(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
@@ -505,7 +698,7 @@ func TestHandler_InitiateTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t 
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 	s.cashBalances["tgt-2"] = &domain.CashBalance{BankAccountID: "tgt-2", AvailableBalance: 100.0}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -527,16 +720,27 @@ func TestHandler_InitiateTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t 
 	}
 
 	first := doTransfer()
-	if first.Code != http.StatusOK {
-		t.Fatalf("expected 200 on first call, got %d: %s", first.Code, first.Body.String())
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstTransfer domain.TreasuryTransfer
+	if err := json.Unmarshal(first.Body.Bytes(), &firstTransfer); err != nil {
+		t.Fatalf("decode first response: %v", err)
 	}
 
 	retry := doTransfer()
 	if retry.Code != http.StatusOK {
-		t.Fatalf("expected 200 on retried call, got %d: %s", retry.Code, retry.Body.String())
+		t.Fatalf("expected 200 (idempotent replay, not a new creation) on retried call, got %d: %s", retry.Code, retry.Body.String())
 	}
-	if len(p.cashPositions) != 2 {
-		t.Fatalf("expected exactly 2 PublishCashPositionUpdated calls (one transfer, two legs), got %d — a retry must not move money again", len(p.cashPositions))
+	var retryTransfer domain.TreasuryTransfer
+	if err := json.Unmarshal(retry.Body.Bytes(), &retryTransfer); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if retryTransfer.TransferID != firstTransfer.TransferID {
+		t.Fatalf("expected the retried call to return the ORIGINAL transfer id %s, got %s — this is a duplicate-transfer bug if true", firstTransfer.TransferID, retryTransfer.TransferID)
+	}
+	if len(s.transfers) != 1 {
+		t.Fatalf("expected exactly 1 transfer to exist after a retried create, got %d", len(s.transfers))
 	}
 }
 
@@ -573,7 +777,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 		AvailableBalance: 100.0,
 	}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -627,5 +831,122 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 	}
 	if resp.Forecast90Day.ForecastedBalance != 2600.0 {
 		t.Errorf("expected 90-day balance to be 2600, got %f", resp.Forecast90Day.ForecastedBalance)
+	}
+}
+
+// ── BNK-10 FX Exposure ────────────────────────────────────────────────────────
+
+func TestHandler_GetFXExposure_RequiresRecordedRate(t *testing.T) {
+	s := newMockStore()
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure?legal_entity_id=ent-123&exposure_currency=EUR&functional_currency=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 with no FX rate recorded for EUR/USD, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandler_GetFXExposure_ConvertsAtRecordedRate(t *testing.T) {
+	s := newMockStore()
+	now := time.Now().UTC()
+	c := &mockClients{
+		inflowsData:  []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
+		outflowsData: []domain.ExpectedCashFlow{{Amount: 400.0, DueDate: now.AddDate(0, 0, 10), Category: "PAYABLE"}},
+	}
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	// Record a rate: 1 EUR = 1.10 USD.
+	body := []byte(`{"currency_pair":"EUR/USD","rate":1.10}`)
+	recordReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/rates", bytes.NewReader(body))
+	recordReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	recordReq.Header.Set("X-Principal-Id", "usr-999")
+	recordRR := httptest.NewRecorder()
+	r.ServeHTTP(recordRR, recordReq.WithContext(svcmiddleware.WithTenant(recordReq.Context(), "tenant-abc")))
+	if recordRR.Code != http.StatusCreated {
+		t.Fatalf("RecordFXRate: expected 201, got %d: %s", recordRR.Code, recordRR.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure?legal_entity_id=ent-123&exposure_currency=EUR&functional_currency=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.FXExposureResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.RateUsed != 1.10 {
+		t.Errorf("expected rate_used=1.10, got %f", resp.RateUsed)
+	}
+	if resp.RateIsStale {
+		t.Error("expected a just-recorded rate to not be flagged stale")
+	}
+	// net exposure = 1000 - 400 = 600 EUR -> 660 USD at 1.10.
+	wantExposure, wantFunctional := 600.0, 660.0
+	if resp.TotalExposureAmount != wantExposure {
+		t.Errorf("expected total_exposure_currency_amount=%f, got %f", wantExposure, resp.TotalExposureAmount)
+	}
+	if resp.TotalFunctionalAmount != wantFunctional {
+		t.Errorf("expected total_functional_currency_amount=%f, got %f", wantFunctional, resp.TotalFunctionalAmount)
+	}
+}
+
+// TestHandler_RunFXScenario_UsesHypotheticalRate proves the scenario path
+// computes under the CALLER-SUPPLIED rate, not the recorded one, while
+// Current still reflects the real recorded rate for comparison.
+func TestHandler_RunFXScenario_UsesHypotheticalRate(t *testing.T) {
+	s := newMockStore()
+	now := time.Now().UTC()
+	c := &mockClients{
+		inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
+	}
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	recordBody := []byte(`{"currency_pair":"EUR/USD","rate":1.10}`)
+	recordReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/rates", bytes.NewReader(recordBody))
+	recordReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	recordReq.Header.Set("X-Principal-Id", "usr-999")
+	recordRR := httptest.NewRecorder()
+	r.ServeHTTP(recordRR, recordReq.WithContext(svcmiddleware.WithTenant(recordReq.Context(), "tenant-abc")))
+	if recordRR.Code != http.StatusCreated {
+		t.Fatalf("RecordFXRate: expected 201, got %d: %s", recordRR.Code, recordRR.Body.String())
+	}
+
+	scenarioBody := []byte(`{"legal_entity_id":"ent-123","exposure_currency":"EUR","functional_currency":"USD","hypothetical_rate":1.20}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/scenario", bytes.NewReader(scenarioBody))
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.FXScenarioResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Current.RateUsed != 1.10 {
+		t.Errorf("expected Current.RateUsed=1.10 (the recorded rate), got %f", resp.Current.RateUsed)
+	}
+	if resp.Scenario.RateUsed != 1.20 {
+		t.Errorf("expected Scenario.RateUsed=1.20 (the hypothetical rate), got %f", resp.Scenario.RateUsed)
+	}
+	// current = 1000*1.10 = 1100, scenario = 1000*1.20 = 1200, delta = 100.
+	if resp.FunctionalAmountDelta != 100.0 {
+		t.Errorf("expected functional_amount_delta=100, got %f", resp.FunctionalAmountDelta)
 	}
 }

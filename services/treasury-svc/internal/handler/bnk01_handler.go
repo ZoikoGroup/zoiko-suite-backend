@@ -88,6 +88,27 @@ func (h *Handler) VerifyBankAccountOwnership(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, evidence)
 }
 
+// GetBankAccountByID handles GET /v1/treasury/accounts/{accountID} — the
+// single-account read other Banking services (starting with BNK-02's
+// bank_account_id validation) need and which previously didn't exist;
+// only ListBankAccounts (legal-entity-scoped list) was available.
+func (h *Handler) GetBankAccountByID(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	accountID := chi.URLParam(r, "accountID")
+	acct, ok := h.fetchAccountForAuth(w, r, accountID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, acct.LegalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, acct)
+}
+
 func (h *Handler) GetOwnershipEvidence(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {

@@ -1,0 +1,270 @@
+// BNK-02's own persistence — consent/token/health lifecycle for bank
+// connections. Kept separate from pg_store.go's original connection CRUD
+// to keep this capability's own scope self-contained, same pattern used
+// for every other capability added to an existing service in this build.
+package store
+
+import (
+	"context"
+	"errors"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"zoiko.io/banking-connector-svc/internal/domain"
+)
+
+const bnk02Columns = `
+	connection_id, tenant_id, legal_entity_id, bank_name, bic, account_number, currency, status, created_at, updated_at,
+	bank_account_id, provider_ref, consent_scope, token_lease_ref, token_expires_at, health_status, region`
+
+func scanConnection(row pgx.Row, c *domain.BankConnection) error {
+	return row.Scan(&c.ConnectionID, &c.TenantID, &c.LegalEntityID, &c.BankName, &c.BIC, &c.AccountNumber, &c.Currency, &c.Status, &c.CreatedAt, &c.UpdatedAt,
+		&c.BankAccountID, &c.ProviderRef, &c.ConsentScope, &c.TokenLeaseRef, &c.TokenExpiresAt, &c.HealthStatus, &c.Region)
+}
+
+func (p *PgStore) recordConnectionEvent(ctx context.Context, tx pgx.Tx, tenantID, connectionID, eventType, detail, actorPrincipalID string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO bank_connection_events (event_id, connection_id, tenant_id, event_type, detail, actor_principal_id)
+		VALUES ($1,$2,$3,$4,$5,$6)`,
+		uuid.New().String(), connectionID, tenantID, eventType, detail, actorPrincipalID)
+	return err
+}
+
+// InitiateConnection is BNK-02's real entry point — a request record in
+// REQUESTED status, before any provider/user authorization has happened.
+// Idempotent on (tenant_id, correlation_id).
+func (p *PgStore) InitiateConnection(ctx context.Context, params domain.InitiateConnectionParams) (*domain.BankConnection, bool, error) {
+	tenantID := params.TenantID
+	created := false
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		requestedScope := params.RequestedScope
+		if requestedScope == nil {
+			requestedScope = []string{}
+		}
+		row := tx.QueryRow(ctx, `
+			INSERT INTO bank_connections (
+				connection_id, tenant_id, legal_entity_id, bank_name, bic, account_number, currency, status,
+				bank_account_id, provider_ref, consent_scope, region, correlation_id, created_by_principal_id
+			) VALUES ($1,$2,$3,$4,'','',$5,$6,$7,$8,$9,$10,$11,$12)
+			ON CONFLICT (tenant_id, correlation_id) WHERE correlation_id <> '' DO NOTHING
+			RETURNING `+bnk02Columns,
+			uuid.New().String(), tenantID, params.LegalEntityID, params.BankName, "USD", domain.ConnStatusRequested,
+			params.BankAccountID, params.ProviderRef, requestedScope, params.Region, params.CorrelationID, params.CreatedByPrincipalID)
+		if err := scanConnection(row, &c); err == nil {
+			created = true
+			return p.recordConnectionEvent(ctx, tx, tenantID, c.ConnectionID, domain.EventConnectionRequested, "", params.CreatedByPrincipalID)
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		return scanConnection(tx.QueryRow(ctx, `SELECT `+bnk02Columns+` FROM bank_connections WHERE tenant_id=$1 AND correlation_id=$2`, tenantID, params.CorrelationID), &c)
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	return &c, created, nil
+}
+
+// notFoundOrInvalidConnection disambiguates a CAS zero-rows-updated
+// result: either the connection doesn't exist (in this tenant), or it
+// exists but isn't in a state that permits the attempted transition.
+func (p *PgStore) notFoundOrInvalidConnection(ctx context.Context, connectionID string) error {
+	c, err := p.GetConnectionByID(ctx, connectionID)
+	if err != nil {
+		if errors.Is(err, domain.ErrConnectionNotFound) {
+			return domain.ErrConnectionNotFound
+		}
+		return err
+	}
+	if c == nil {
+		return domain.ErrConnectionNotFound
+	}
+	return domain.ErrInvalidConnectionTransition
+}
+
+func (p *PgStore) CompleteConnectionAuthorization(ctx context.Context, params domain.CompleteConnectionAuthorizationParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		grantedScope := params.GrantedScope
+		if grantedScope == nil {
+			grantedScope = []string{}
+		}
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET status=$3, token_lease_ref=$4, token_expires_at=$5, consent_scope=$6, health_status='HEALTHY', updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status IN ('REQUESTED','AUTHORIZING')
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, domain.ConnStatusAuthorizing, params.TokenLeaseRef, params.TokenExpiresAt, grantedScope)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionAuthorized, "", params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+func (p *PgStore) ActivateConnection(ctx context.Context, params domain.ActivateConnectionParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET status=$3, updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status='AUTHORIZING'
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, domain.ConnStatusActive)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionActivated, "", params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+func (p *PgStore) RefreshConnection(ctx context.Context, params domain.RefreshConnectionParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET token_lease_ref=$3, token_expires_at=$4, health_status='HEALTHY', status=$5, updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status IN ('ACTIVE','DEGRADED')
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, params.NewTokenLeaseRef, params.NewTokenExpiresAt, domain.ConnStatusActive)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionRefreshed, "", params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+func (p *PgStore) TriggerReconsent(ctx context.Context, params domain.TriggerReconsentParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET status=$3, health_status='DEGRADED', updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status IN ('ACTIVE','DEGRADED','SUSPENDED')
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, domain.ConnStatusReconsentRequired)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionReconsentTrigger, params.Reason, params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+func (p *PgStore) SuspendConnection(ctx context.Context, params domain.SuspendConnectionParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET status=$3, suspend_reason=$4, updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status IN ('ACTIVE','DEGRADED')
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, domain.ConnStatusSuspended, params.Reason)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionSuspended, params.Reason, params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+// RevokeConnection is the DB-enforced proof of the spec's own named
+// negative path "revoked consent still used" — REVOKED is terminal
+// (migration 003's reject_revoked_connection_mutation trigger blocks any
+// further mutation, including a reactivation attempt), not just a status
+// value a later call could flip back.
+func (p *PgStore) RevokeConnection(ctx context.Context, params domain.RevokeConnectionParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET status=$3, revoke_reason=$4, token_lease_ref='', updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status <> 'REVOKED'
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, domain.ConnStatusRevoked, params.Reason)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionRevoked, params.Reason, params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+func (p *PgStore) ReconnectProvider(ctx context.Context, params domain.ReconnectProviderParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET status=$3, health_status='HEALTHY', updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status IN ('DEGRADED','SUSPENDED','RECONSENT_REQUIRED')
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, domain.ConnStatusActive)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionReconnected, "", params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+func (p *PgStore) RotateConnectionCredential(ctx context.Context, params domain.RotateConnectionCredentialParams) (*domain.BankConnection, error) {
+	var c domain.BankConnection
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE bank_connections SET token_lease_ref=$3, token_expires_at=$4, updated_at=now()
+			WHERE connection_id=$1 AND tenant_id=$2 AND status IN ('ACTIVE','DEGRADED')
+			RETURNING `+bnk02Columns,
+			params.ConnectionID, params.TenantID, params.NewTokenLeaseRef, params.NewTokenExpiresAt)
+		if err := scanConnection(row, &c); err != nil {
+			return err
+		}
+		return p.recordConnectionEvent(ctx, tx, params.TenantID, params.ConnectionID, domain.EventConnectionCredentialRotated, "", params.ActorPrincipalID)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, p.notFoundOrInvalidConnection(ctx, params.ConnectionID)
+	}
+	return &c, err
+}
+
+func (p *PgStore) ListConnectionEvents(ctx context.Context, tenantID, connectionID string) ([]domain.ConnectionEvent, error) {
+	res := make([]domain.ConnectionEvent, 0)
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT event_id, connection_id, tenant_id, event_type, detail, actor_principal_id, created_at
+			FROM bank_connection_events WHERE tenant_id=$1 AND connection_id=$2 ORDER BY created_at ASC`, tenantID, connectionID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var e domain.ConnectionEvent
+			if err := rows.Scan(&e.EventID, &e.ConnectionID, &e.TenantID, &e.EventType, &e.Detail, &e.ActorPrincipalID, &e.CreatedAt); err != nil {
+				return err
+			}
+			res = append(res, e)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}

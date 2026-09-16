@@ -89,7 +89,8 @@ const selectColumns = `
 	amount, currency_code, bank_reference, status,
 	matched_journal_id, matched_by_principal_id, matched_at,
 	exception_reason, flagged_by_principal_id, flagged_at,
-	gl_cash_account_code, correlation_id, created_at
+	gl_cash_account_code, correlation_id, created_at,
+	proposed_journal_id, proposed_by_principal_id, proposed_at
 `
 
 func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) error {
@@ -100,6 +101,7 @@ func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) erro
 		&l.MatchedJournalID, &l.MatchedByPrincipalID, &l.MatchedAt,
 		&l.ExceptionReason, &l.FlaggedByPrincipalID, &l.FlaggedAt,
 		&l.GLCashAccountCode, &l.CorrelationID, &l.CreatedAt,
+		&l.ProposedJournalID, &l.ProposedByPrincipalID, &l.ProposedAt,
 	); err != nil {
 		return err
 	}
@@ -317,6 +319,23 @@ func (s *PgStore) CountUnmatched(ctx context.Context, tenantID, bankAccountID, s
 	return count, nil
 }
 
+// CountMatched returns how many lines are MATCHED for the given bank
+// account + statement date — CompleteStatement's certificate records this
+// as matched_line_count.
+func (s *PgStore) CountMatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error) {
+	var count int
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM statement_lines
+			WHERE tenant_id = $1 AND bank_account_id = $2::uuid AND statement_date = $3::date AND status = 'MATCHED'
+		`, tenantID, bankAccountID, statementDate).Scan(&count)
+	})
+	if err != nil {
+		return 0, mapPgError(err)
+	}
+	return count, nil
+}
+
 // StatementLegalEntities returns the distinct legal entities the lines for
 // this bank account + statement date belong to.
 //
@@ -356,4 +375,159 @@ func (s *PgStore) StatementLegalEntities(ctx context.Context, tenantID, bankAcco
 		return nil, mapPgError(err)
 	}
 	return out, nil
+}
+
+// ProposeMatch is the maker-checker manual-match path's "maker" step:
+// UNMATCHED/EXCEPTION -> PENDING_CONFIRMATION, recording who proposed
+// which journal. It does not touch the matched_* columns at all — those
+// are only ever written by ConfirmMatch.
+func (s *PgStore) ProposeMatch(ctx context.Context, tenantID, statementLineID, journalID, proposedByPrincipalID string) error {
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'PENDING_CONFIRMATION', proposed_journal_id = $1, proposed_by_principal_id = $2, proposed_at = $3
+			WHERE statement_line_id = $4 AND status IN ('UNMATCHED', 'EXCEPTION') AND tenant_id = $5
+		`, journalID, proposedByPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	if affected == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
+}
+
+// ConfirmMatch is the "checker" step: PENDING_CONFIRMATION -> MATCHED,
+// only if confirmingPrincipalID differs from the principal who proposed
+// it — fetched and compared before the CAS update runs, the same
+// fetch-then-compare self-approval idiom used everywhere else in this
+// codebase's maker-checker flows.
+func (s *PgStore) ConfirmMatch(ctx context.Context, tenantID, statementLineID, confirmingPrincipalID string) (*domain.StatementLine, error) {
+	var l domain.StatementLine
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+selectColumns+`
+			FROM statement_lines WHERE statement_line_id = $1 AND tenant_id = $2 FOR UPDATE
+		`, statementLineID, tenantID)
+		if err := scanLine(row, &l); err != nil {
+			return err
+		}
+		if l.Status != domain.StatementLineStatusPendingConfirmation {
+			return domain.ErrInvalidTransition
+		}
+		if l.ProposedByPrincipalID != nil && *l.ProposedByPrincipalID == confirmingPrincipalID {
+			return domain.ErrMatchSelfConfirmation
+		}
+		journalID := ""
+		if l.ProposedJournalID != nil {
+			journalID = *l.ProposedJournalID
+		}
+		now := time.Now().UTC()
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'MATCHED', matched_journal_id = $1, matched_by_principal_id = $2, matched_at = $3
+			WHERE statement_line_id = $4 AND status = 'PENDING_CONFIRMATION' AND tenant_id = $5
+		`, journalID, confirmingPrincipalID, now, statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidTransition
+		}
+		l.Status = domain.StatementLineStatusMatched
+		l.MatchedJournalID = &journalID
+		l.MatchedByPrincipalID = &confirmingPrincipalID
+		l.MatchedAt = &now
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrStatementLineNotFound
+		}
+		if errors.Is(err, domain.ErrInvalidTransition) || errors.Is(err, domain.ErrMatchSelfConfirmation) {
+			return nil, err
+		}
+		return nil, mapPgError(err)
+	}
+	return &l, nil
+}
+
+// RejectProposedMatch lets a checker send a proposed match back for
+// correction rather than confirming it — PENDING_CONFIRMATION ->
+// EXCEPTION, with the rejection reason recorded in exception_reason so
+// it becomes a normal queue item again.
+func (s *PgStore) RejectProposedMatch(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error {
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'EXCEPTION', exception_reason = $1, flagged_by_principal_id = $2, flagged_at = $3,
+				proposed_journal_id = NULL, proposed_by_principal_id = NULL, proposed_at = NULL
+			WHERE statement_line_id = $4 AND status = 'PENDING_CONFIRMATION' AND tenant_id = $5
+		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	if affected == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
+}
+
+// CertifyStatement is CompleteStatement's real persisted evidence step.
+// Idempotent on (tenant_id, bank_account_id, statement_date): a repeat
+// call returns the ORIGINAL certificate rather than creating a second
+// one for the same statement.
+func (s *PgStore) CertifyStatement(ctx context.Context, tenantID, legalEntityID, bankAccountID, statementDate, certifiedByPrincipalID, correlationID string, matchedLineCount int) (*domain.ReconciliationCertificate, bool, error) {
+	created := false
+	var c domain.ReconciliationCertificate
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			INSERT INTO reconciliation_certificates (
+				certificate_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
+				matched_line_count, certified_by_principal_id, correlation_id
+			) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (tenant_id, bank_account_id, statement_date) DO NOTHING
+			RETURNING certificate_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
+				matched_line_count, certified_by_principal_id, certified_at, correlation_id
+		`, tenantID, legalEntityID, bankAccountID, statementDate, matchedLineCount, certifiedByPrincipalID, correlationID)
+		var stmtDate time.Time
+		err := row.Scan(&c.CertificateID, &c.TenantID, &c.LegalEntityID, &c.BankAccountID, &stmtDate,
+			&c.MatchedLineCount, &c.CertifiedByPrincipalID, &c.CertifiedAt, &c.CorrelationID)
+		if err == nil {
+			c.StatementDate = stmtDate.Format("2006-01-02")
+			created = true
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		row = tx.QueryRow(ctx, `
+			SELECT certificate_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
+				matched_line_count, certified_by_principal_id, certified_at, correlation_id
+			FROM reconciliation_certificates WHERE tenant_id = $1 AND bank_account_id = $2 AND statement_date = $3
+		`, tenantID, bankAccountID, statementDate)
+		if err := row.Scan(&c.CertificateID, &c.TenantID, &c.LegalEntityID, &c.BankAccountID, &stmtDate,
+			&c.MatchedLineCount, &c.CertifiedByPrincipalID, &c.CertifiedAt, &c.CorrelationID); err != nil {
+			return err
+		}
+		c.StatementDate = stmtDate.Format("2006-01-02")
+		return nil
+	})
+	if err != nil {
+		return nil, false, mapPgError(err)
+	}
+	return &c, created, nil
 }
