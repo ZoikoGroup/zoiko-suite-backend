@@ -41,7 +41,7 @@ func openAdminPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS bank_statements, bank_connections CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS mapping_exceptions, bank_transactions_canonical, bank_statement_lines, bank_statements, bank_connection_events, bank_connections CASCADE;`)
 
 	// Every migration in filename order, never one hardcoded name — a
 	// suite that names migrations individually silently skips new ones,

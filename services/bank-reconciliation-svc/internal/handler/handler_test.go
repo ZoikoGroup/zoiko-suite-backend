@@ -30,9 +30,13 @@ type stubStore struct {
 	listErr        error
 	transitionErr  error
 	countUnmatched int
+	countMatched   int
 	countErr       error
 	legalEntities  []string
 	entitiesErr    error
+
+	certificates map[string]*domain.ReconciliationCertificate
+	certifyErr   error
 
 	// lastListFilter records what ListStatementLines was actually asked for,
 	// so a test can assert the tenant came from the verified header rather
@@ -114,6 +118,83 @@ func (s *stubStore) CountUnmatched(_ context.Context, _, _, _ string) (int, erro
 		return 0, s.countErr
 	}
 	return s.countUnmatched, nil
+}
+
+func (s *stubStore) CountMatched(_ context.Context, _, _, _ string) (int, error) {
+	if s.countErr != nil {
+		return 0, s.countErr
+	}
+	return s.countMatched, nil
+}
+
+func (s *stubStore) CertifyStatement(_ context.Context, tenantID, legalEntityID, bankAccountID, statementDate, certifiedByPrincipalID, correlationID string, matchedLineCount int) (*domain.ReconciliationCertificate, bool, error) {
+	if s.certifyErr != nil {
+		return nil, false, s.certifyErr
+	}
+	key := tenantID + "|" + bankAccountID + "|" + statementDate
+	if s.certificates == nil {
+		s.certificates = map[string]*domain.ReconciliationCertificate{}
+	}
+	if existing, ok := s.certificates[key]; ok {
+		return existing, false, nil
+	}
+	c := &domain.ReconciliationCertificate{
+		CertificateID: "cert-" + key, TenantID: tenantID, LegalEntityID: legalEntityID, BankAccountID: bankAccountID,
+		StatementDate: statementDate, MatchedLineCount: matchedLineCount, CertifiedByPrincipalID: certifiedByPrincipalID,
+		CertifiedAt: time.Now().UTC(), CorrelationID: correlationID,
+	}
+	s.certificates[key] = c
+	return c, true, nil
+}
+
+func (s *stubStore) ProposeMatch(_ context.Context, _, statementLineID, journalID, proposedByPrincipalID string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok || (l.Status != domain.StatementLineStatusUnmatched && l.Status != domain.StatementLineStatusException) {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusPendingConfirmation
+	l.ProposedJournalID = &journalID
+	l.ProposedByPrincipalID = &proposedByPrincipalID
+	return nil
+}
+
+func (s *stubStore) ConfirmMatch(_ context.Context, _, statementLineID, confirmingPrincipalID string) (*domain.StatementLine, error) {
+	if s.transitionErr != nil {
+		return nil, s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok {
+		return nil, domain.ErrStatementLineNotFound
+	}
+	if l.Status != domain.StatementLineStatusPendingConfirmation {
+		return nil, domain.ErrInvalidTransition
+	}
+	if l.ProposedByPrincipalID != nil && *l.ProposedByPrincipalID == confirmingPrincipalID {
+		return nil, domain.ErrMatchSelfConfirmation
+	}
+	l.Status = domain.StatementLineStatusMatched
+	l.MatchedJournalID = l.ProposedJournalID
+	l.MatchedByPrincipalID = &confirmingPrincipalID
+	return l, nil
+}
+
+func (s *stubStore) RejectProposedMatch(_ context.Context, _, statementLineID, reason, actorPrincipalID string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok || l.Status != domain.StatementLineStatusPendingConfirmation {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusException
+	l.ExceptionReason = &reason
+	l.FlaggedByPrincipalID = &actorPrincipalID
+	l.ProposedJournalID = nil
+	l.ProposedByPrincipalID = nil
+	return nil
 }
 
 func (s *stubStore) StatementLegalEntities(_ context.Context, _, _, _ string) ([]string, error) {

@@ -163,6 +163,13 @@ type CashPositionResponse struct {
 }
 
 // EffectiveCashResponse output model.
+//
+// BNK-08's own "never show stale balance as current" rule: Components
+// carries a per-source freshness record so a caller (or this handler
+// itself) can tell WHICH figure might be old, not just a single
+// top-level AsOfTimestamp that silently blends a fresh live query
+// (AP/obligations, always as-of-now — see ComponentFreshness's own doc
+// comment) with a bank balance that may be hours or days stale.
 type EffectiveCashResponse struct {
 	TenantID                 string                `json:"tenant_id"`
 	LegalEntityID            string                `json:"legal_entity_id"`
@@ -175,7 +182,29 @@ type EffectiveCashResponse struct {
 	EffectiveAvailableCash   float64               `json:"effective_available_cash"`
 	AsOfTimestamp            time.Time             `json:"as_of_timestamp"`
 	ThresholdDetails         *ThresholdAlertDetail `json:"threshold_details,omitempty"`
+
+	Components        []ComponentFreshness `json:"components"`
+	HasStaleComponent bool                 `json:"has_stale_component"`
 }
+
+// ComponentFreshness records one composed figure's own as-of-time and
+// staleness verdict. AP/obligations are synchronous live queries against
+// their owning service — they are always "as of now" by construction, so
+// their StalenessThresholdSeconds is 0 and IsStale is always false. Only
+// CurrentBankBalance carries genuine staleness risk: it is a snapshot
+// (cash_balances.as_of_timestamp) that nothing guarantees is recent.
+type ComponentFreshness struct {
+	Component                 string    `json:"component"`
+	AsOfTimestamp             time.Time `json:"as_of_timestamp"`
+	StalenessThresholdSeconds int       `json:"staleness_threshold_seconds"`
+	IsStale                   bool      `json:"is_stale"`
+}
+
+// BankBalanceStalenessThreshold is the default staleness window for the
+// bank-balance component of EffectiveCashResponse — a snapshot older than
+// this is not "current" per the doc's own rule, and GetEffectiveCash
+// fails closed (503) rather than presenting it as such.
+const BankBalanceStalenessThreshold = 24 * time.Hour
 
 // ThresholdAlertDetail output sub-model.
 type ThresholdAlertDetail struct {
