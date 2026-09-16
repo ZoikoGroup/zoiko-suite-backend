@@ -18,28 +18,35 @@ import (
 )
 
 type mockStore struct {
-	bankAccounts map[string]*domain.BankAccount
-	evidence     map[string][]domain.OwnershipEvidence
-	cashBalances map[string]*domain.CashBalance
-	thresholds   map[string]*domain.LiquidityThreshold
-	transfers    map[string]bool
-	createErr    error
-	getErr       error
-	listErr      error
-	updateErr    error
-	balErr       error
-	threshErr    error
-	transferErr  error
-	bnk01Err     error
+	bankAccounts         map[string]*domain.BankAccount
+	evidence             map[string][]domain.OwnershipEvidence
+	cashBalances         map[string]*domain.CashBalance
+	thresholds           map[string]*domain.LiquidityThreshold
+	transfers            map[string]*domain.TreasuryTransfer
+	transfersByCorr      map[string]string
+	createErr            error
+	getErr               error
+	listErr              error
+	updateErr            error
+	balErr               error
+	threshErr            error
+	transferErr          error
+	bnk01Err             error
+	allOwnershipVerified bool
 }
 
 func newMockStore() *mockStore {
 	return &mockStore{
-		bankAccounts: make(map[string]*domain.BankAccount),
-		evidence:     make(map[string][]domain.OwnershipEvidence),
-		cashBalances: make(map[string]*domain.CashBalance),
-		thresholds:   make(map[string]*domain.LiquidityThreshold),
-		transfers:    make(map[string]bool),
+		bankAccounts:    make(map[string]*domain.BankAccount),
+		evidence:        make(map[string][]domain.OwnershipEvidence),
+		cashBalances:    make(map[string]*domain.CashBalance),
+		thresholds:      make(map[string]*domain.LiquidityThreshold),
+		transfers:       make(map[string]*domain.TreasuryTransfer),
+		transfersByCorr: make(map[string]string),
+		// Tests that never call VerifyBankAccountOwnership shouldn't have
+		// to also seed ownership evidence just to get past
+		// CreateTreasuryTransfer's BNK-01 verification gate.
+		allOwnershipVerified: true,
 	}
 }
 
@@ -91,6 +98,9 @@ func (m *mockStore) ListOwnershipEvidence(ctx context.Context, tenantID, bankAcc
 func (m *mockStore) IsOwnershipVerified(ctx context.Context, tenantID, bankAccountID string) (bool, error) {
 	if m.bnk01Err != nil {
 		return false, m.bnk01Err
+	}
+	if m.allOwnershipVerified {
+		return true, nil
 	}
 	for _, e := range m.evidence[bankAccountID] {
 		if e.SupersededBy == nil {
@@ -212,17 +222,108 @@ func (m *mockStore) GetLiquidityThreshold(ctx context.Context, legalEntityID, cu
 	return m.thresholds[key], nil
 }
 
-func (m *mockStore) ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (bool, error) {
+// ── BNK-09 ───────────────────────────────────────────────────────────────────
+
+func (m *mockStore) CreateTreasuryTransfer(ctx context.Context, p domain.CreateTreasuryTransferParams) (*domain.TreasuryTransfer, bool, error) {
 	if m.transferErr != nil {
-		return false, m.transferErr
+		return nil, false, m.transferErr
 	}
-	if correlationID != "" && m.transfers[correlationID] {
-		return false, nil
+	if p.CorrelationID != "" {
+		if id, ok := m.transfersByCorr[p.CorrelationID]; ok {
+			return m.transfers[id], false, nil
+		}
 	}
-	if correlationID != "" {
-		m.transfers[correlationID] = true
+	id := "transfer-" + p.CorrelationID
+	if id == "transfer-" {
+		id = p.SourceBankAccountID + "->" + p.TargetBankAccountID
 	}
-	return true, nil
+	t := &domain.TreasuryTransfer{
+		TransferID: id, TenantID: p.TenantID, SourceBankAccountID: p.SourceBankAccountID, TargetBankAccountID: p.TargetBankAccountID,
+		Amount: p.Amount, CurrencyCode: p.CurrencyCode, CorrelationID: p.CorrelationID, IsCrossEntity: p.IsCrossEntity,
+		Status: domain.TransferPendingApproval, MakerPrincipalID: p.MakerPrincipalID,
+	}
+	m.transfers[id] = t
+	if p.CorrelationID != "" {
+		m.transfersByCorr[p.CorrelationID] = id
+	}
+	return t, true, nil
+}
+
+func (m *mockStore) GetTreasuryTransfer(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	return t, nil
+}
+
+func (m *mockStore) ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveTreasuryTransferParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if t.MakerPrincipalID == p.CheckerPrincipalID {
+		return nil, domain.ErrTransferSelfApproval
+	}
+	if !domain.CanApproveTransfer(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.Status = domain.TransferApproved
+	t.CheckerPrincipalID = p.CheckerPrincipalID
+	return t, nil
+}
+
+func (m *mockStore) RejectTreasuryTransfer(ctx context.Context, p domain.RejectTreasuryTransferParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if !domain.CanRejectTransfer(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.Status = domain.TransferRejected
+	t.CheckerPrincipalID = p.CheckerPrincipalID
+	t.RejectReason = p.Reason
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferSubmitted(ctx context.Context, tenantID, transferID, paymentAttemptID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferSubmitted
+	t.PaymentAttemptID = paymentAttemptID
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferLedgerPosted(ctx context.Context, tenantID, transferID, sourceJournalID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferLedgerPosted
+	t.SourceJournalID = sourceJournalID
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferIntercompanyPaired(ctx context.Context, tenantID, transferID, intercompanyEntryID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferIntercompanyPaired
+	t.IntercompanyEntryID = intercompanyEntryID
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferCompleted(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[transferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	t.Status = domain.TransferCompleted
+	return t, nil
 }
 
 type mockPublisher struct {
@@ -290,6 +391,23 @@ func (m *mockClients) GetLiquidityForecastData(ctx context.Context, tenantID, le
 	return m.inflowsData, m.outflowsData, nil
 }
 
+// mockTransferClients is a stub — none of the tests in this file exercise
+// ExecuteTreasuryTransfer's outbound calls, only CreateTreasuryTransfer's
+// HTTP-layer behavior (threshold checks, idempotency, validation).
+type mockTransferClients struct{}
+
+func (m *mockTransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef string, amount float64, currency string) (string, error) {
+	return "attempt-stub", nil
+}
+
+func (m *mockTransferClients) PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount float64) (string, error) {
+	return "journal-stub", nil
+}
+
+func (m *mockTransferClients) PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error) {
+	return "intercompany-stub", nil
+}
+
 func TestHandler_RegisterBankAccount(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
@@ -297,7 +415,7 @@ func TestHandler_RegisterBankAccount(t *testing.T) {
 	c := &mockClients{}
 	log := zap.NewNop()
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -354,7 +472,7 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 		AvailableBalance: 1000.0,
 	}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -380,7 +498,7 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 	}
 }
 
-func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
+func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
@@ -417,7 +535,7 @@ func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
 		MinimumRequiredBalance: 200.0,
 	}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -455,12 +573,19 @@ func TestHandler_InitiateTransfer_SuccessAndThreshold(t *testing.T) {
 	rr2 := httptest.NewRecorder()
 	r.ServeHTTP(rr2, req2.WithContext(svcmiddleware.WithTenant(req2.Context(), "tenant-abc")))
 
-	if rr2.Code != http.StatusOK {
-		t.Fatalf("expected status 200 OK, got %d. Body: %s", rr2.Code, rr2.Body.String())
+	if rr2.Code != http.StatusCreated {
+		t.Fatalf("expected status 201 Created (a new PENDING_APPROVAL transfer), got %d. Body: %s", rr2.Code, rr2.Body.String())
+	}
+	var created domain.TreasuryTransfer
+	if err := json.Unmarshal(rr2.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if created.Status != domain.TransferPendingApproval {
+		t.Fatalf("expected a new transfer to be PENDING_APPROVAL, got %q", created.Status)
 	}
 }
 
-func TestHandler_InitiateTransfer_MissingCorrelationID_Rejected(t *testing.T) {
+func TestHandler_CreateTreasuryTransfer_MissingCorrelationID_Rejected(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
@@ -471,7 +596,7 @@ func TestHandler_InitiateTransfer_MissingCorrelationID_Rejected(t *testing.T) {
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -493,7 +618,7 @@ func TestHandler_InitiateTransfer_MissingCorrelationID_Rejected(t *testing.T) {
 	}
 }
 
-func TestHandler_InitiateTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t *testing.T) {
+func TestHandler_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecondTransfer(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
@@ -505,7 +630,7 @@ func TestHandler_InitiateTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t 
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 	s.cashBalances["tgt-2"] = &domain.CashBalance{BankAccountID: "tgt-2", AvailableBalance: 100.0}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -527,16 +652,27 @@ func TestHandler_InitiateTransfer_RetriedCorrelationID_DoesNotDoubleMoveMoney(t 
 	}
 
 	first := doTransfer()
-	if first.Code != http.StatusOK {
-		t.Fatalf("expected 200 on first call, got %d: %s", first.Code, first.Body.String())
+	if first.Code != http.StatusCreated {
+		t.Fatalf("expected 201 on first call, got %d: %s", first.Code, first.Body.String())
+	}
+	var firstTransfer domain.TreasuryTransfer
+	if err := json.Unmarshal(first.Body.Bytes(), &firstTransfer); err != nil {
+		t.Fatalf("decode first response: %v", err)
 	}
 
 	retry := doTransfer()
 	if retry.Code != http.StatusOK {
-		t.Fatalf("expected 200 on retried call, got %d: %s", retry.Code, retry.Body.String())
+		t.Fatalf("expected 200 (idempotent replay, not a new creation) on retried call, got %d: %s", retry.Code, retry.Body.String())
 	}
-	if len(p.cashPositions) != 2 {
-		t.Fatalf("expected exactly 2 PublishCashPositionUpdated calls (one transfer, two legs), got %d — a retry must not move money again", len(p.cashPositions))
+	var retryTransfer domain.TreasuryTransfer
+	if err := json.Unmarshal(retry.Body.Bytes(), &retryTransfer); err != nil {
+		t.Fatalf("decode retry response: %v", err)
+	}
+	if retryTransfer.TransferID != firstTransfer.TransferID {
+		t.Fatalf("expected the retried call to return the ORIGINAL transfer id %s, got %s — this is a duplicate-transfer bug if true", firstTransfer.TransferID, retryTransfer.TransferID)
+	}
+	if len(s.transfers) != 1 {
+		t.Fatalf("expected exactly 1 transfer to exist after a retried create, got %d", len(s.transfers))
 	}
 }
 
@@ -573,7 +709,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 		AvailableBalance: 100.0,
 	}
 
-	h := handler.New(s, p, az, c, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 

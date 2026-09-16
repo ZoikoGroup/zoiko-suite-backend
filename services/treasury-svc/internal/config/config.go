@@ -44,6 +44,16 @@ type Config struct {
 	// ObligationsServiceURL is the base URL of obligations-svc.
 	ObligationsServiceURL string
 
+	// PaymentAdapterServiceURL is the base URL of
+	// payment-initiation-adapter-svc (BNK-06), used by BNK-09's
+	// ExecuteTreasuryTransfer to actually submit a payment.
+	PaymentAdapterServiceURL string
+
+	// IntercompanyServiceURL is the base URL of
+	// intercompany-accounting-svc, used by BNK-09's
+	// ExecuteTreasuryTransfer for cross-entity transfers only.
+	IntercompanyServiceURL string
+
 	// OTELExporterEndpoint is where telemetry sends trace data.
 	OTELExporterEndpoint string
 }
@@ -103,6 +113,8 @@ func Load() (*Config, error) {
 		APServiceURL:             env("AP_SERVICE_URL", "http://accounts-payable-svc:8099"),
 		ARServiceURL:             env("AR_SERVICE_URL", "http://accounts-receivable-svc:8101"),
 		ObligationsServiceURL:    env("OBLIGATIONS_SERVICE_URL", "http://obligations-svc:8088"),
+		PaymentAdapterServiceURL: env("PAYMENT_ADAPTER_SERVICE_URL", "http://payment-initiation-adapter-svc:8162"),
+		IntercompanyServiceURL:   env("INTERCOMPANY_SERVICE_URL", "http://intercompany-accounting-svc:8105"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

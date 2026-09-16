@@ -25,7 +25,19 @@ type Store interface {
 	GetLatestCashBalance(ctx context.Context, bankAccountID string) (*domain.CashBalance, error)
 	SetLiquidityThreshold(ctx context.Context, threshold *domain.LiquidityThreshold) error
 	GetLiquidityThreshold(ctx context.Context, legalEntityID, currencyCode string) (*domain.LiquidityThreshold, error)
-	ExecuteTransfer(ctx context.Context, srcAcctID, tgtAcctID string, amount float64, currencyCode string, correlationID string) (created bool, err error)
+
+	// BNK-09 — see internal/store/bnk09_store.go's own doc comments. The
+	// old ExecuteTransfer (two internal cash_balances rows, no external
+	// consequence) is removed and replaced wholesale by this real
+	// maker-checker flow.
+	CreateTreasuryTransfer(ctx context.Context, p domain.CreateTreasuryTransferParams) (*domain.TreasuryTransfer, bool, error)
+	GetTreasuryTransfer(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error)
+	ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	RejectTreasuryTransfer(ctx context.Context, p domain.RejectTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	MarkTransferSubmitted(ctx context.Context, tenantID, transferID, paymentAttemptID string) (*domain.TreasuryTransfer, error)
+	MarkTransferLedgerPosted(ctx context.Context, tenantID, transferID, sourceJournalID string) (*domain.TreasuryTransfer, error)
+	MarkTransferIntercompanyPaired(ctx context.Context, tenantID, transferID, intercompanyEntryID string) (*domain.TreasuryTransfer, error)
+	MarkTransferCompleted(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error)
 
 	// BNK-01 — see internal/store/bnk01_store.go's own doc comments.
 	VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error)
@@ -59,28 +71,41 @@ type Clients interface {
 	GetLiquidityForecastData(ctx context.Context, tenantID, legalEntityID, currencyCode string) ([]domain.ExpectedCashFlow, []domain.ExpectedCashFlow, error)
 }
 
+// TransferClients defines BNK-09's outbound calls to
+// payment-initiation-adapter-svc, general-ledger-svc and
+// intercompany-accounting-svc — see internal/clients/bnk09_clients.go.
+type TransferClients interface {
+	SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef string, amount float64, currency string) (string, error)
+	PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount float64) (string, error)
+	PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error)
+}
+
 const (
 	actionRegisterAccount  = "TREASURY_ACCOUNT_REGISTER"
 	actionSetThreshold     = "TREASURY_THRESHOLD_SET"
 	actionInitiateTransfer = "TREASURY_TRANSFER_INITIATE"
+	actionApproveTransfer  = "TREASURY_TRANSFER_APPROVE"
+	actionExecuteTransfer  = "TREASURY_TRANSFER_EXECUTE"
 	actionViewPositions    = "TREASURY_POSITIONS_VIEW"
 )
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	clients   Clients
-	log       *zap.Logger
+	store           Store
+	publisher       Publisher
+	authz           AuthZClient
+	clients         Clients
+	transferClients TransferClients
+	log             *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, log *zap.Logger) *Handler {
+func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, transferClients TransferClients, log *zap.Logger) *Handler {
 	return &Handler{
-		store:     store,
-		publisher: publisher,
-		authz:     authz,
-		clients:   clients,
-		log:       log,
+		store:           store,
+		publisher:       publisher,
+		authz:           authz,
+		clients:         clients,
+		transferClients: transferClients,
+		log:             log,
 	}
 }
 
@@ -93,7 +118,13 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/thresholds", h.SetLiquidityThreshold)
 		r.Get("/effective-cash", h.GetEffectiveCash)
 		r.Get("/forecasts", h.GetForecasts)
-		r.Post("/transfers", h.InitiateTransfer)
+
+		// BNK-09 — see internal/handler/bnk09_handler.go.
+		r.Post("/transfers", h.CreateTreasuryTransfer)
+		r.Get("/transfers/{transferID}", h.GetTreasuryTransfer)
+		r.Post("/transfers/{transferID}/approve", h.ApproveTreasuryTransfer)
+		r.Post("/transfers/{transferID}/reject", h.RejectTreasuryTransfer)
+		r.Post("/transfers/{transferID}/execute", h.ExecuteTreasuryTransfer)
 
 		// BNK-01 — see internal/handler/bnk01_handler.go.
 		r.Post("/accounts/{accountID}/verify-ownership", h.VerifyBankAccountOwnership)
@@ -380,112 +411,11 @@ func (h *Handler) GetEffectiveCash(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ── POST /v1/treasury/transfers ──────────────────────────────────────────────────
-
-func (h *Handler) InitiateTransfer(w http.ResponseWriter, r *http.Request) {
-	var req domain.InitiateTransferRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
-		return
-	}
-
-	// BLOCKING FIX #1: Reject non-positive amounts before any account or balance
-	// lookup. A negative amount reverses the transfer direction — draining the
-	// target and crediting the source — bypassing the insufficient-funds check
-	// entirely (srcBal < negativeAmount is trivially false). Zero-amount transfers
-	// are a no-op that must not produce balance records.
-	if req.Amount <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
-		return
-	}
-	correlationID := r.Header.Get("X-Correlation-ID")
-	if req.CorrelationID != "" {
-		correlationID = req.CorrelationID
-	}
-	if correlationID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "correlation_id")
-		return
-	}
-
-	principalID, ok := h.requirePrincipal(w, r)
-	if !ok {
-		return
-	}
-
-	srcAcct, err := h.store.GetBankAccount(r.Context(), req.SourceBankAccountID)
-	if err != nil || srcAcct == nil {
-		writeError(w, http.StatusNotFound, "source_account_not_found", "")
-		return
-	}
-
-	// Authorize against the source account's legal entity.
-	if err := h.authz.CheckAllowed(r.Context(), principalID, srcAcct.LegalEntityID, actionInitiateTransfer); err != nil {
-		h.writeAuthzErr(w, err)
-		return
-	}
-
-	// FIX #3: Also authorize against the TARGET account's legal entity.
-	// A principal authorized over entity A must not be able to move funds into
-	// (or out of, via negative amounts) an entity B account without authorization.
-	tgtAcct, err := h.store.GetBankAccount(r.Context(), req.TargetBankAccountID)
-	if err != nil || tgtAcct == nil {
-		writeError(w, http.StatusNotFound, "target_account_not_found", "")
-		return
-	}
-	if tgtAcct.LegalEntityID != srcAcct.LegalEntityID {
-		if err := h.authz.CheckAllowed(r.Context(), principalID, tgtAcct.LegalEntityID, actionInitiateTransfer); err != nil {
-			h.writeAuthzErr(w, err)
-			return
-		}
-	}
-
-	// FIX #2: Fail CLOSED on liquidity threshold errors (not open).
-	// Every other cross-service check in this codebase fails closed on store error.
-	// If we cannot read the balance or threshold, block the transfer — do not silently
-	// skip the check and allow the transfer to proceed unguarded.
-	bal, balErr := h.store.GetLatestCashBalance(r.Context(), req.SourceBankAccountID)
-	if balErr != nil {
-		h.log.Error("failed to read cash balance for threshold check — failing closed", zap.Error(balErr))
-		writeError(w, http.StatusServiceUnavailable, "balance_check_failed", "cannot verify balance before transfer")
-		return
-	}
-	if bal != nil {
-		threshold, threshErr := h.store.GetLiquidityThreshold(r.Context(), srcAcct.LegalEntityID, req.CurrencyCode)
-		if threshErr != nil {
-			h.log.Error("failed to read liquidity threshold — failing closed", zap.Error(threshErr))
-			writeError(w, http.StatusServiceUnavailable, "threshold_check_failed", "cannot verify liquidity threshold before transfer")
-			return
-		}
-		if threshold != nil && bal.AvailableBalance-req.Amount < threshold.MinimumRequiredBalance {
-			h.log.Warn("transfer blocked: threshold breach on source account", zap.String("account_id", req.SourceBankAccountID))
-			writeError(w, http.StatusPreconditionFailed, "minimum_balance_breach", string(domain.ErrMinimumBalanceBreach))
-			return
-		}
-	}
-
-	created, err := h.store.ExecuteTransfer(r.Context(), req.SourceBankAccountID, req.TargetBankAccountID, req.Amount, req.CurrencyCode, correlationID)
-	if err != nil {
-		h.log.Error("transfer execution failed", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "transfer_failed", err.Error())
-		return
-	}
-	if !created {
-		// Replay of a prior request with the same correlation_id — the
-		// transfer already happened, do not execute it a second time.
-		writeJSON(w, http.StatusOK, map[string]string{"status": "already_transferred", "correlation_id": correlationID})
-		return
-	}
-
-	// Publish updated balances
-	if balSrc, err := h.store.GetLatestCashBalance(r.Context(), req.SourceBankAccountID); err == nil && balSrc != nil {
-		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, srcAcct.LegalEntityID, principalID, *balSrc)
-	}
-	if balTgt, err := h.store.GetLatestCashBalance(r.Context(), req.TargetBankAccountID); err == nil && balTgt != nil {
-		h.publisher.PublishCashPositionUpdated(r.Context(), correlationID, tgtAcct.LegalEntityID, principalID, *balTgt)
-	}
-
-	writeJSON(w, http.StatusOK, map[string]string{"status": "transferred", "correlation_id": correlationID})
-}
+// BNK-09 treasury transfer handlers (CreateTreasuryTransfer,
+// GetTreasuryTransfer, ApproveTreasuryTransfer, RejectTreasuryTransfer,
+// ExecuteTreasuryTransfer) live in internal/handler/bnk09_handler.go —
+// see that file for the real maker-checker flow that replaces the old
+// InitiateTransfer wholesale.
 
 // ── GET /v1/treasury/forecasts ───────────────────────────────────────────────────
 

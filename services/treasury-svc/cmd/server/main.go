@@ -133,6 +133,7 @@ func main() {
 		authzClient = authz.NewHTTPClient(cfg.AuthZServiceURL, log)
 	}
 	clientsWrapper := clients.New(cfg.APServiceURL, cfg.ARServiceURL, cfg.ObligationsServiceURL, log)
+	transferClients := clients.NewTransferClients(cfg.PaymentAdapterServiceURL, cfg.LedgerServiceURL, cfg.IntercompanyServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -152,7 +153,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, clientsWrapper, log)
+	h := handler.New(pgStore, publisher, authzClient, clientsWrapper, transferClients, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
