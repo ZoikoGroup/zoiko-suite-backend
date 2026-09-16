@@ -26,7 +26,15 @@ type Store interface {
 	MatchStatementLine(ctx context.Context, tenantID, statementLineID, journalID, actorPrincipalID string) error
 	FlagException(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
 	CountUnmatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error)
+	CountMatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error)
 	StatementLegalEntities(ctx context.Context, tenantID, bankAccountID, statementDate string) ([]string, error)
+
+	// BNK-05 maker-checker manual matching + certificates — see
+	// internal/store/pg_store.go's own doc comments on each method.
+	ProposeMatch(ctx context.Context, tenantID, statementLineID, journalID, proposedByPrincipalID string) error
+	ConfirmMatch(ctx context.Context, tenantID, statementLineID, confirmingPrincipalID string) (*domain.StatementLine, error)
+	RejectProposedMatch(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
+	CertifyStatement(ctx context.Context, tenantID, legalEntityID, bankAccountID, statementDate, certifiedByPrincipalID, correlationID string, matchedLineCount int) (*domain.ReconciliationCertificate, bool, error)
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -48,6 +56,9 @@ const (
 	actionMatch               = "BANKREC_MATCH"
 	actionFlagException       = "BANKREC_FLAG_EXCEPTION"
 	actionCompleteStatement   = "BANKREC_COMPLETE_STATEMENT"
+	// actionMatch is reused for propose/confirm/reject-match — they are
+	// the same underlying authority (matching a statement line) split
+	// into a dual-control workflow, not a separate permission.
 )
 
 // maxBodyBytes bounds a request body. Every route here takes a small,
@@ -73,6 +84,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{statement_line_id}", h.GetStatementLine)
 		r.Post("/{statement_line_id}/match", h.MatchStatementLine)
 		r.Post("/{statement_line_id}/exception", h.FlagException)
+
+		// BNK-05 maker-checker manual matching — additive alongside the
+		// single-actor /match above.
+		r.Post("/{statement_line_id}/propose-match", h.ProposeMatch)
+		r.Post("/{statement_line_id}/confirm-match", h.ConfirmMatch)
+		r.Post("/{statement_line_id}/reject-match", h.RejectProposedMatch)
 	})
 	r.Post("/v1/bank-accounts/{bank_account_id}/statements/{statement_date}/complete", h.CompleteStatement)
 }
@@ -457,13 +474,23 @@ func (h *Handler) CompleteStatement(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishReconciliationCompleted(r.Context(), r.Header.Get("X-Correlation-ID"), tenantID, principalID, bankAccountID, statementDate)
-	writeJSON(w, http.StatusOK, map[string]string{
-		"tenant_id":       tenantID,
-		"bank_account_id": bankAccountID,
-		"statement_date":  statementDate,
-		"status":          "COMPLETED",
-	})
+	matchedCount, err := h.store.CountMatched(r.Context(), tenantID, bankAccountID, statementDate)
+	if err != nil {
+		h.writeStoreErr(w, "CompleteStatement", err)
+		return
+	}
+
+	cert, created, err := h.store.CertifyStatement(r.Context(), tenantID, legalEntityID, bankAccountID, statementDate,
+		principalID, r.Header.Get("X-Correlation-ID"), matchedCount)
+	if err != nil {
+		h.writeStoreErr(w, "CompleteStatement", err)
+		return
+	}
+
+	if created {
+		h.publisher.PublishReconciliationCompleted(r.Context(), r.Header.Get("X-Correlation-ID"), tenantID, principalID, bankAccountID, statementDate)
+	}
+	writeJSON(w, http.StatusOK, cert)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

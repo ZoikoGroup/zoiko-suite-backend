@@ -24,14 +24,22 @@ const (
 	StatementLineStatusUnmatched StatementLineStatus = "UNMATCHED"
 	StatementLineStatusMatched   StatementLineStatus = "MATCHED"
 	StatementLineStatusException StatementLineStatus = "EXCEPTION"
+
+	// StatementLineStatusPendingConfirmation is the maker-checker manual-
+	// match path's intermediate state: ProposeMatch (maker) sets it,
+	// ConfirmMatch (checker, a different principal) advances it to
+	// MATCHED. This is additive alongside the original single-actor
+	// MatchStatementLine, which is unchanged for backward compatibility.
+	StatementLineStatusPendingConfirmation StatementLineStatus = "PENDING_CONFIRMATION"
 )
 
 // ValidStatementLineTransitions documents the state machine. Enforcement
 // itself lives in the store's atomic conditional UPDATEs, not this map.
 var ValidStatementLineTransitions = map[StatementLineStatus][]StatementLineStatus{
-	StatementLineStatusUnmatched: {StatementLineStatusMatched, StatementLineStatusException},
-	StatementLineStatusException: {StatementLineStatusMatched},
-	StatementLineStatusMatched:   {},
+	StatementLineStatusUnmatched:           {StatementLineStatusMatched, StatementLineStatusException, StatementLineStatusPendingConfirmation},
+	StatementLineStatusException:           {StatementLineStatusMatched, StatementLineStatusPendingConfirmation},
+	StatementLineStatusPendingConfirmation: {StatementLineStatusMatched, StatementLineStatusException},
+	StatementLineStatusMatched:             {},
 }
 
 // StatementLine is one ingested bank statement transaction awaiting
@@ -62,8 +70,31 @@ type StatementLine struct {
 	FlaggedByPrincipalID *string    `json:"flagged_by_principal_id,omitempty"`
 	FlaggedAt            *time.Time `json:"flagged_at,omitempty"`
 
+	// ProposedJournalID/ProposedByPrincipalID/ProposedAt are the
+	// maker-checker manual-match path's "maker" record — set by
+	// ProposeMatch, consumed (and cleared into the Matched* fields above)
+	// by ConfirmMatch.
+	ProposedJournalID     *string    `json:"proposed_journal_id,omitempty"`
+	ProposedByPrincipalID *string    `json:"proposed_by_principal_id,omitempty"`
+	ProposedAt            *time.Time `json:"proposed_at,omitempty"`
+
 	CorrelationID string    `json:"correlation_id"`
 	CreatedAt     time.Time `json:"created_at"`
+}
+
+// ReconciliationCertificate is CompleteStatement's persisted evidence —
+// append-only, one per (tenant, bank_account, statement_date). See
+// migration 000006's own reject_certificate_mutation trigger.
+type ReconciliationCertificate struct {
+	CertificateID          string    `json:"certificate_id"`
+	TenantID               string    `json:"tenant_id"`
+	LegalEntityID          string    `json:"legal_entity_id"`
+	BankAccountID          string    `json:"bank_account_id"`
+	StatementDate          string    `json:"statement_date"`
+	MatchedLineCount       int       `json:"matched_line_count"`
+	CertifiedByPrincipalID string    `json:"certified_by_principal_id"`
+	CertifiedAt            time.Time `json:"certified_at"`
+	CorrelationID          string    `json:"correlation_id,omitempty"`
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -187,4 +218,9 @@ var (
 	// independent: a caller could be authorized against an entity it holds
 	// rights over and then act on a bank account belonging to another.
 	ErrLegalEntityMismatch = errorString("bank account does not belong to the legal entity the caller was authorized against")
+
+	// ErrMatchSelfConfirmation is the maker-checker manual-match path's
+	// real dual-control rule: the principal who proposed a match cannot
+	// also confirm it.
+	ErrMatchSelfConfirmation = errorString("the principal who proposed a match cannot also confirm it")
 )
