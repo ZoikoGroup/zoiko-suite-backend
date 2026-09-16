@@ -32,3 +32,19 @@ type BNK02Store interface {
 	RotateConnectionCredential(ctx context.Context, params domain.RotateConnectionCredentialParams) (*domain.BankConnection, error)
 	ListConnectionEvents(ctx context.Context, tenantID, connectionID string) ([]domain.ConnectionEvent, error)
 }
+
+// BNK0304Store is BNK-03 Statement Ingestion + BNK-04 Transaction
+// Normalization's persistence surface — same composed-interface pattern
+// as BNK02Store, colocated because normalization reads BNK-03's evidence
+// synchronously.
+type BNK0304Store interface {
+	IngestStatement(ctx context.Context, tenantID string, req domain.IngestStatementLinesRequest, actorPrincipalID string) (*domain.IngestStatementResult, error)
+	ValidateStatement(ctx context.Context, tenantID, statementID string) error
+	AcceptStatement(ctx context.Context, tenantID, statementID string) error
+	QuarantineStatement(ctx context.Context, tenantID, statementID, reason string) error
+	ReprocessQuarantinedStatement(ctx context.Context, tenantID, statementID string) error
+	NormalizeTransaction(ctx context.Context, params domain.NormalizeTransactionParams) (*domain.CanonicalTransaction, error)
+	ReNormalizeTransaction(ctx context.Context, params domain.ReNormalizeTransactionParams) (*domain.CanonicalTransaction, error)
+	QuarantineTransaction(ctx context.Context, params domain.QuarantineTransactionParams) (*domain.MappingException, error)
+	ApproveMappingException(ctx context.Context, params domain.ApproveMappingExceptionParams) (*domain.CanonicalTransaction, error)
+}
