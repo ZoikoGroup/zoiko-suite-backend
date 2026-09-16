@@ -33,6 +33,8 @@ type mockStore struct {
 	transferErr          error
 	bnk01Err             error
 	allOwnershipVerified bool
+
+	fxRates map[string]*domain.FXRate
 }
 
 func newMockStore() *mockStore {
@@ -324,6 +326,28 @@ func (m *mockStore) MarkTransferCompleted(ctx context.Context, tenantID, transfe
 	}
 	t.Status = domain.TransferCompleted
 	return t, nil
+}
+
+// ── BNK-10 ───────────────────────────────────────────────────────────────────
+
+func (m *mockStore) RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error) {
+	if m.fxRates == nil {
+		m.fxRates = map[string]*domain.FXRate{}
+	}
+	r := &domain.FXRate{
+		RateID: "rate-" + p.CurrencyPair, TenantID: p.TenantID, CurrencyPair: p.CurrencyPair,
+		Rate: p.Rate, EffectiveAt: p.EffectiveAt, RecordedByPrincipalID: p.RecordedByPrincipalID,
+	}
+	m.fxRates[p.CurrencyPair] = r
+	return r, nil
+}
+
+func (m *mockStore) GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error) {
+	r, ok := m.fxRates[currencyPair]
+	if !ok {
+		return nil, domain.ErrFXRateNotFound
+	}
+	return r, nil
 }
 
 type mockPublisher struct {
@@ -807,5 +831,122 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 	}
 	if resp.Forecast90Day.ForecastedBalance != 2600.0 {
 		t.Errorf("expected 90-day balance to be 2600, got %f", resp.Forecast90Day.ForecastedBalance)
+	}
+}
+
+// ── BNK-10 FX Exposure ────────────────────────────────────────────────────────
+
+func TestHandler_GetFXExposure_RequiresRecordedRate(t *testing.T) {
+	s := newMockStore()
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure?legal_entity_id=ent-123&exposure_currency=EUR&functional_currency=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 with no FX rate recorded for EUR/USD, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandler_GetFXExposure_ConvertsAtRecordedRate(t *testing.T) {
+	s := newMockStore()
+	now := time.Now().UTC()
+	c := &mockClients{
+		inflowsData:  []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
+		outflowsData: []domain.ExpectedCashFlow{{Amount: 400.0, DueDate: now.AddDate(0, 0, 10), Category: "PAYABLE"}},
+	}
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	// Record a rate: 1 EUR = 1.10 USD.
+	body := []byte(`{"currency_pair":"EUR/USD","rate":1.10}`)
+	recordReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/rates", bytes.NewReader(body))
+	recordReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	recordReq.Header.Set("X-Principal-Id", "usr-999")
+	recordRR := httptest.NewRecorder()
+	r.ServeHTTP(recordRR, recordReq.WithContext(svcmiddleware.WithTenant(recordReq.Context(), "tenant-abc")))
+	if recordRR.Code != http.StatusCreated {
+		t.Fatalf("RecordFXRate: expected 201, got %d: %s", recordRR.Code, recordRR.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure?legal_entity_id=ent-123&exposure_currency=EUR&functional_currency=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.FXExposureResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.RateUsed != 1.10 {
+		t.Errorf("expected rate_used=1.10, got %f", resp.RateUsed)
+	}
+	if resp.RateIsStale {
+		t.Error("expected a just-recorded rate to not be flagged stale")
+	}
+	// net exposure = 1000 - 400 = 600 EUR -> 660 USD at 1.10.
+	wantExposure, wantFunctional := 600.0, 660.0
+	if resp.TotalExposureAmount != wantExposure {
+		t.Errorf("expected total_exposure_currency_amount=%f, got %f", wantExposure, resp.TotalExposureAmount)
+	}
+	if resp.TotalFunctionalAmount != wantFunctional {
+		t.Errorf("expected total_functional_currency_amount=%f, got %f", wantFunctional, resp.TotalFunctionalAmount)
+	}
+}
+
+// TestHandler_RunFXScenario_UsesHypotheticalRate proves the scenario path
+// computes under the CALLER-SUPPLIED rate, not the recorded one, while
+// Current still reflects the real recorded rate for comparison.
+func TestHandler_RunFXScenario_UsesHypotheticalRate(t *testing.T) {
+	s := newMockStore()
+	now := time.Now().UTC()
+	c := &mockClients{
+		inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
+	}
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	recordBody := []byte(`{"currency_pair":"EUR/USD","rate":1.10}`)
+	recordReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/rates", bytes.NewReader(recordBody))
+	recordReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	recordReq.Header.Set("X-Principal-Id", "usr-999")
+	recordRR := httptest.NewRecorder()
+	r.ServeHTTP(recordRR, recordReq.WithContext(svcmiddleware.WithTenant(recordReq.Context(), "tenant-abc")))
+	if recordRR.Code != http.StatusCreated {
+		t.Fatalf("RecordFXRate: expected 201, got %d: %s", recordRR.Code, recordRR.Body.String())
+	}
+
+	scenarioBody := []byte(`{"legal_entity_id":"ent-123","exposure_currency":"EUR","functional_currency":"USD","hypothetical_rate":1.20}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/scenario", bytes.NewReader(scenarioBody))
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp domain.FXScenarioResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Current.RateUsed != 1.10 {
+		t.Errorf("expected Current.RateUsed=1.10 (the recorded rate), got %f", resp.Current.RateUsed)
+	}
+	if resp.Scenario.RateUsed != 1.20 {
+		t.Errorf("expected Scenario.RateUsed=1.20 (the hypothetical rate), got %f", resp.Scenario.RateUsed)
+	}
+	// current = 1000*1.10 = 1100, scenario = 1000*1.20 = 1200, delta = 100.
+	if resp.FunctionalAmountDelta != 100.0 {
+		t.Errorf("expected functional_amount_delta=100, got %f", resp.FunctionalAmountDelta)
 	}
 }

@@ -77,6 +77,7 @@ func TestMain(m *testing.M) {
 		"000002_add_idempotency_index.up.sql",
 		"000003_add_bnk01_identity.up.sql",
 		"000004_add_bnk09_treasury_transfer.up.sql",
+		"000005_add_bnk10_fx_rates.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {

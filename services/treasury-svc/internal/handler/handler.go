@@ -39,6 +39,10 @@ type Store interface {
 	MarkTransferIntercompanyPaired(ctx context.Context, tenantID, transferID, intercompanyEntryID string) (*domain.TreasuryTransfer, error)
 	MarkTransferCompleted(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error)
 
+	// BNK-10 — see internal/store/bnk10_store.go's own doc comments.
+	RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error)
+	GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error)
+
 	// BNK-01 — see internal/store/bnk01_store.go's own doc comments.
 	VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error)
 	ListOwnershipEvidence(ctx context.Context, tenantID, bankAccountID string) ([]domain.OwnershipEvidence, error)
@@ -125,6 +129,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/transfers/{transferID}/approve", h.ApproveTreasuryTransfer)
 		r.Post("/transfers/{transferID}/reject", h.RejectTreasuryTransfer)
 		r.Post("/transfers/{transferID}/execute", h.ExecuteTreasuryTransfer)
+
+		// BNK-10 — see internal/handler/bnk10_handler.go.
+		r.Post("/fx/rates", h.RecordFXRate)
+		r.Get("/fx/exposure", h.GetFXExposure)
+		r.Post("/fx/scenario", h.RunFXScenario)
 
 		// BNK-01 — see internal/handler/bnk01_handler.go.
 		r.Post("/accounts/{accountID}/verify-ownership", h.VerifyBankAccountOwnership)
