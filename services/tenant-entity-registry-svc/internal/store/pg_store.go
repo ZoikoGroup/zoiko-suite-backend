@@ -36,6 +36,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 )
 
@@ -43,6 +44,12 @@ import (
 type PgStore struct {
 	pool *pgxpool.Pool
 	log  *zap.Logger
+
+	// outbox is the transactional event enqueuer used by the ORG-02/ORG-03
+	// guarded writes in pg_store_org.go, so a domain event and the fact it
+	// attests commit together. Attached via SetOutbox after construction and
+	// nil-safe: the pre-existing methods in this file do not use it.
+	outbox outbox.Enqueuer
 }
 
 // New returns an open PgStore. Caller must call Close() when done.
@@ -61,18 +68,36 @@ func (s *PgStore) Close() {
 // R2 fix: uses current_setting('app.tenant_id', true) (missing_ok=true) in
 // RLS policies; here we always set the value before querying.
 //
-// F2 fix: tenantID must be non-empty — every caller must supply it.
-// The fallback pattern in individual methods ensures this invariant.
+// F2 fix: tenantID must be non-empty — every caller must supply it. The
+// fallback pattern in individual methods ensures this for writes; for reads,
+// an absent tenant is refused below rather than reaching the query.
 func (s *PgStore) withRLS(ctx context.Context, tenantID string, fn func(pgx.Tx) error) error {
+	// An empty tenant is refused here rather than passed down.
+	//
+	// It used to be passed down, and the result was a 500: every query
+	// interpolates the tenant into `AND tenant_id = $n`, Postgres tried to cast
+	// '' to uuid, and the driver returned "invalid input syntax for type uuid".
+	// No data leaked -- the request failed closed -- but it failed as a SERVER
+	// FAULT, so an unauthenticated read looked like an outage in monitoring and
+	// in the logs, and a real outage would have been indistinguishable from
+	// somebody probing without a header.
+	//
+	// ErrNotFound is the honest answer: a request that names no tenant is
+	// scoped to nothing, so nothing is visible to it. Handlers map it to 404,
+	// which also avoids telling an unscoped caller whether a resource exists.
+	if tenantID == "" {
+		s.log.Debug("read refused: no verified tenant on the request")
+		return registry.ErrNotFound
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
 
-	// Always set app.tenant_id — we do not silently skip it.
-	// If tenantID is empty, RLS will produce empty results. Callers must
-	// guarantee it is non-empty before calling withRLS.
+	// Always set app.tenant_id — we do not silently skip it. It is guaranteed
+	// non-empty by the guard above.
 	if _, err := tx.Exec(ctx,
 		"SELECT set_config('app.tenant_id', $1, true)", tenantID,
 	); err != nil {
@@ -198,14 +223,14 @@ func (s *PgStore) GetTenantByID(ctx context.Context, tenantID string) (*domain.T
 		query := `
 			SELECT tenant_id, tenant_code, legal_name, trading_name, status,
 			       default_currency_code, primary_timezone, primary_locale,
-			       default_data_residency_policy_id, lifecycle_state,
+			       default_data_residency_policy_id, lifecycle_state, record_version,
 			       created_at, updated_at, created_by_principal_id, updated_by_principal_id
 			FROM tenants WHERE tenant_id = $1 AND tenant_id = $2
 		`
 		return tx.QueryRow(ctx, query, tenantID, tid).Scan(
 			&t.TenantID, &t.TenantCode, &t.LegalName, &t.TradingName, &t.Status,
 			&t.DefaultCurrencyCode, &t.PrimaryTimezone, &t.PrimaryLocale,
-			&t.DefaultDataResidencyPolicyID, &t.LifecycleState,
+			&t.DefaultDataResidencyPolicyID, &t.LifecycleState, &t.RecordVersion,
 			&t.CreatedAt, &t.UpdatedAt, &t.CreatedByPrincipalID, &t.UpdatedByPrincipalID,
 		)
 	})
@@ -286,7 +311,7 @@ func (s *PgStore) GetEntityByID(ctx context.Context, legalEntityID string) (*dom
 			       registration_number, tax_identity_bundle_id, entity_type,
 			       incorporation_date, default_currency_code, fiscal_calendar_id,
 			       parent_legal_entity_id, entity_status, primary_jurisdiction_id,
-			       data_residency_policy_id, created_at, updated_at,
+			       data_residency_policy_id, record_version, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id
 			FROM legal_entities WHERE legal_entity_id = $1 AND tenant_id = $2
 		`
@@ -295,7 +320,7 @@ func (s *PgStore) GetEntityByID(ctx context.Context, legalEntityID string) (*dom
 			&e.RegistrationNumber, &e.TaxIdentityBundleID, &e.EntityType,
 			&e.IncorporationDate, &e.DefaultCurrencyCode, &e.FiscalCalendarID,
 			&e.ParentLegalEntityID, &e.EntityStatus, &e.PrimaryJurisdictionID,
-			&e.DataResidencyPolicyID, &e.CreatedAt, &e.UpdatedAt,
+			&e.DataResidencyPolicyID, &e.RecordVersion, &e.CreatedAt, &e.UpdatedAt,
 			&e.CreatedByPrincipalID, &e.UpdatedByPrincipalID,
 		)
 	})
@@ -316,7 +341,7 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 			       registration_number, tax_identity_bundle_id, entity_type,
 			       incorporation_date, default_currency_code, fiscal_calendar_id,
 			       parent_legal_entity_id, entity_status, primary_jurisdiction_id,
-			       data_residency_policy_id, created_at, updated_at,
+			       data_residency_policy_id, record_version, created_at, updated_at,
 			       created_by_principal_id, updated_by_principal_id
 			FROM legal_entities WHERE tenant_id = $1
 		`
@@ -333,7 +358,7 @@ func (s *PgStore) ListEntitiesByTenant(ctx context.Context, tenantID string) ([]
 				&e.RegistrationNumber, &e.TaxIdentityBundleID, &e.EntityType,
 				&e.IncorporationDate, &e.DefaultCurrencyCode, &e.FiscalCalendarID,
 				&e.ParentLegalEntityID, &e.EntityStatus, &e.PrimaryJurisdictionID,
-				&e.DataResidencyPolicyID, &e.CreatedAt, &e.UpdatedAt,
+				&e.DataResidencyPolicyID, &e.RecordVersion, &e.CreatedAt, &e.UpdatedAt,
 				&e.CreatedByPrincipalID, &e.UpdatedByPrincipalID,
 			); err != nil {
 				return err
@@ -554,6 +579,12 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 				legal_name             = COALESCE($1, legal_name),
 				trading_name           = COALESCE($2, trading_name),
 				default_currency_code  = COALESCE($3, default_currency_code),
+				-- Bumped here as well as by the ORG-03 guarded writes. A client
+				-- that reads an entity, PATCHes it, then issues an amendment
+				-- with the version it first read must be told the row moved --
+				-- otherwise this legacy path silently invalidates the
+				-- expected_version contract the amendment path relies on.
+				record_version         = record_version + 1,
 				updated_at             = $4,
 				updated_by_principal_id = $5
 			WHERE legal_entity_id = $6 AND tenant_id = $7
@@ -561,7 +592,7 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 			          registration_number, tax_identity_bundle_id, entity_type,
 			          incorporation_date, default_currency_code, fiscal_calendar_id,
 			          parent_legal_entity_id, entity_status, primary_jurisdiction_id,
-			          data_residency_policy_id, created_at, updated_at,
+			          data_residency_policy_id, record_version, created_at, updated_at,
 			          created_by_principal_id, updated_by_principal_id
 		`
 		now := time.Now().UTC()
@@ -575,7 +606,7 @@ func (s *PgStore) UpdateEntity(ctx context.Context, legalEntityID string, req do
 			&updated.RegistrationNumber, &updated.TaxIdentityBundleID, &updated.EntityType,
 			&updated.IncorporationDate, &updated.DefaultCurrencyCode, &updated.FiscalCalendarID,
 			&updated.ParentLegalEntityID, &updated.EntityStatus, &updated.PrimaryJurisdictionID,
-			&updated.DataResidencyPolicyID, &updated.CreatedAt, &updated.UpdatedAt,
+			&updated.DataResidencyPolicyID, &updated.RecordVersion, &updated.CreatedAt, &updated.UpdatedAt,
 			&updated.CreatedByPrincipalID, &updated.UpdatedByPrincipalID,
 		)
 	})

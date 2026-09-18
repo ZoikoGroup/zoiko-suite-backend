@@ -1,0 +1,495 @@
+asyncapi: "2.6.0"
+
+info:
+  title: Identity Context Service — Event Contract
+  version: "1.0"
+  description: |
+    The published and consumed event surface of identity-context-svc (GOV-01).
+
+    This document closes half of DoD gate 1: the OpenAPI document published the
+    synchronous contract, but the event contract — which is how every
+    revocation, every piece of evidence and every break-glass notification
+    reaches the estate — existed only as Go code.
+
+    ## Delivery semantics
+
+    Every event below is written to a **transactional outbox** in the same
+    Postgres transaction as the fact it attests, and a relay drains that to
+    Kafka. This is the spec's invariant 10: "Outbox publication occurs only
+    after authoritative commit; consumers assume at-least-once delivery."
+
+    Consumers **must** deduplicate on `event_id`. Delivery is at-least-once:
+    a relay that writes to Kafka and then fails to mark the row will redeliver
+    on its next pass, which is a deliberate trade — a duplicate is recoverable,
+    a loss is not.
+
+    ## Ordering
+
+    Ordering is per partition, and the partition key is the SUBJECT of the
+    event (a session id, a principal id, a support context id) rather than the
+    event id. Two events about one session are therefore ordered with respect
+    to each other; two events about different sessions are not.
+
+    ## Self-consumption
+
+    The reader and the writer are pointed at the same topic, so everything this
+    service publishes comes back to it. The consumer drops any event whose
+    `source_service` is `identity-context-svc`. That guard exists because the
+    service once published `session.risk.changed` on a risk-cache miss and
+    subscribed to the same name as the sole writer of that cache.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+  cluster:
+    url: kafka:9092
+    protocol: kafka
+
+channels:
+  zoiko.identity.events:
+    description: |
+      One topic per service. Both the publisher and the consumer are bound to
+      it, which is why the self-source guard exists.
+    publish:
+      summary: Events identity-context-svc produces
+      message:
+        oneOf:
+          - $ref: "#/components/messages/ContextResolved"
+          - $ref: "#/components/messages/ResolutionFailed"
+          - $ref: "#/components/messages/SessionInvalidated"
+          - $ref: "#/components/messages/RiskSignalUnavailable"
+          - $ref: "#/components/messages/PrincipalStatusChanged"
+          - $ref: "#/components/messages/AuthenticationSucceeded"
+          - $ref: "#/components/messages/AuthenticationFailed"
+          - $ref: "#/components/messages/TenantContextCacheInvalidated"
+          - $ref: "#/components/messages/TenantContextInvalidated"
+          - $ref: "#/components/messages/SupportContextAttached"
+          - $ref: "#/components/messages/SupportContextRevoked"
+          - $ref: "#/components/messages/DispositionExecuted"
+          - $ref: "#/components/messages/DispositionBlocked"
+    subscribe:
+      summary: Events identity-context-svc consumes
+      message:
+        oneOf:
+          - $ref: "#/components/messages/AuthorityEnded"
+          - $ref: "#/components/messages/RoleUpdated"
+          - $ref: "#/components/messages/EntityUpdated"
+          - $ref: "#/components/messages/RiskSignalChanged"
+          - $ref: "#/components/messages/LegalHoldIssued"
+          - $ref: "#/components/messages/LegalHoldReleased"
+
+components:
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The platform event contract (Doc 03 §19). Fields with no real value at
+        the call site are OMITTED rather than fabricated — a resolution that
+        failed before a tenant was resolved genuinely has no tenant, and
+        inventing one would put a false fact into the evidence stream.
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, payload]
+      properties:
+        event_id:
+          type: string
+          description: Fresh UUID per publish. The deduplication key.
+        event_type:
+          type: string
+        event_version:
+          type: string
+        emitted_at:
+          type: string
+          format: date-time
+        schema_version:
+          type: string
+        source_service:
+          type: string
+          description: |
+            Consumers use this to drop their own events. This service does.
+        tenant_id:
+          type: string
+        legal_entity_id:
+          type: string
+        actor_id:
+          type: string
+        correlation_id:
+          type: string
+        payload:
+          type: object
+
+  messages:
+    # -- Published --------------------------------------------------------------
+
+    ContextResolved:
+      name: identity.context.resolved
+      title: An identity envelope was issued
+      summary: |
+        GOV-01's §9.1-required event. Written in the SAME transaction as the
+        session_contexts row, so a session with no event and an event with no
+        session are both unreachable states.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [principal_id, tenant_id, session_context_id, evidence_id]
+                properties:
+                  principal_id: { type: string }
+                  tenant_id: { type: string }
+                  legal_entity_id: { type: string }
+                  session_context_id: { type: string }
+                  evidence_id: { type: string }
+                  correlation_id: { type: string }
+
+    ResolutionFailed:
+      name: identity.context.resolution_failed
+      title: A resolution was refused
+      summary: |
+        GOV-01's named TenantContextResolutionFailed. Emitted for every
+        refusal, including ones where no tenant was ever resolved — those carry
+        no tenant_id, which is accurate rather than incomplete.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  principal_id_or_subject: { type: string }
+                  correlation_id: { type: string }
+                  failure_reason:
+                    type: string
+                    enum:
+                      - token_invalid
+                      - principal_inactive_or_not_found
+                      - ingress_tenant_mismatch
+                      - residency_denied
+                      - trust_posture_blocked
+
+    SessionInvalidated:
+      name: session.invalidated
+      title: One session was revoked
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  session_context_id: { type: string }
+                  principal_id: { type: string }
+                  invalidation_reason:
+                    type: string
+                    enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED]
+                  correlation_id: { type: string }
+
+    RiskSignalUnavailable:
+      name: identity.risk_signal.unavailable
+      title: No risk signal was available for a principal
+      summary: |
+        An ALARM, not a signal, and the name now says so.
+
+        It was previously published as `session.risk.changed`, which was wrong
+        twice: nothing had changed (the cache was simply empty), and this
+        service's own consumer subscribes to that name as the sole writer of
+        the risk cache. The service was answering its own alarm. Renaming it
+        was the fix; the consumer's self-source guard prevents the class.
+
+        Its payload carries NO signal_value, deliberately — there is no signal,
+        which is the entire message.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  principal_id: { type: string }
+                  defaulted_to: { type: string, enum: [STANDARD] }
+                  observed_source: { type: string, enum: [UNAVAILABLE] }
+                  correlation_id: { type: string }
+
+    PrincipalStatusChanged:
+      name: principal.status.changed
+      title: A principal was suspended or reactivated
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    AuthenticationSucceeded:
+      name: identity.authentication.succeeded
+      title: A credential was verified
+      summary: |
+        Distinct from identity.context.resolved: that says an envelope was
+        issued, this says a password was verified. Collapsing them would make
+        "logged in but never obtained an envelope" — a resolution that failed
+        on tenant, entity or trust posture AFTER a correct password —
+        invisible.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    AuthenticationFailed:
+      name: identity.authentication.failed
+      title: A credential was rejected
+      summary: |
+        Emitted even when the subject matches no principal: a stream of
+        failures against addresses that do not exist is the signature of an
+        enumeration sweep, and dropping those would hide exactly the attack the
+        constant-time verification path defends against.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    TenantContextCacheInvalidated:
+      name: identity.context.cache_invalidated
+      title: Routing hints were marked stale
+      summary: |
+        GOV-01's named TenantContextCacheInvalidated. Consumers are GOV-03 and
+        the gateways, which hold their own derived context caches — a refresh
+        that only cleared this service's copy would leave the estate
+        disagreeing with itself about a tenant's routing.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  ingress_identifiers:
+                    type: array
+                    items: { type: string }
+                  reason: { type: string }
+                  actor: { type: string }
+
+    TenantContextInvalidated:
+      name: identity.context.tenant_invalidated
+      title: Every live session in a tenant was revoked
+      summary: |
+        Carries the mandatory justification, so a security team watching this
+        topic learns WHY an entire tenant was logged out without querying this
+        service.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  sessions_revoked: { type: integer }
+                  invalidation_reason: { type: string }
+                  justification: { type: string }
+                  actor: { type: string }
+
+    SupportContextAttached:
+      name: identity.support_context.attached
+      title: A privileged elevation was granted
+      summary: |
+        GOV-01's named SupportContextAttached, and the highest-signal event
+        this service produces.
+
+        The justification travels WITH it, deliberately: a security team
+        watching this topic should not have to query this service to learn why
+        somebody was granted access to a customer tenant.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [support_context_id, tenant_id, support_principal_id, approver_principal_id, expires_at]
+                properties:
+                  support_context_id: { type: string }
+                  tenant_id: { type: string }
+                  support_principal_id: { type: string }
+                  subject_principal_id: { type: string }
+                  approver_principal_id: { type: string }
+                  reason_code:
+                    type: string
+                    enum: [INCIDENT_RESPONSE, CUSTOMER_TICKET, DATA_CORRECTION, AUDIT_REQUEST]
+                  justification: { type: string }
+                  ticket_ref: { type: string }
+                  granted_at: { type: string, format: date-time }
+                  expires_at: { type: string, format: date-time }
+                  evidence_id: { type: string }
+
+    SupportContextRevoked:
+      name: identity.support_context.revoked
+      title: A privileged elevation ended
+      summary: |
+        Covers both an explicit early revocation and an expiry observed by the
+        reconciler. The payload's reason distinguishes them; the event does
+        not, because a consumer's response is the same.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+
+    DispositionExecuted:
+      name: identity.retention.disposition_executed
+      title: A retention sweep completed, with its certificate
+      summary: |
+        GOV-09's named required output. Emitted whether or not anything was
+        disposed: a sweep that disposed nothing because everything was HELD is
+        a materially different fact from a sweep that found nothing due, and
+        both belong on the record.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  record_class: { type: string }
+                  considered: { type: integer }
+                  disposed: { type: integer }
+                  held_back: { type: integer }
+                  certificate_id: { type: string }
+                  swept_at: { type: string, format: date-time }
+
+    DispositionBlocked:
+      name: identity.retention.disposition_blocked
+      title: Disposition was refused by an active legal hold
+      summary: |
+        A distinct name rather than GOV-09's DispositionFailed, because a legal
+        hold is not a failure — it is the control working. Reported separately
+        so a sweep that disposed nothing because everything was held does not
+        look like a quiet night in a dashboard.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  record_class: { type: string }
+                  held_back: { type: integer }
+                  reason: { type: string, enum: [LEGAL_HOLD_ACTIVE] }
+
+    # -- Consumed ---------------------------------------------------------------
+
+    AuthorityEnded:
+      name: authority.revoked
+      title: A delegated authority was revoked or expired
+      summary: |
+        Also matches `authority.expired` — an expired authority grants nothing,
+        so the response is identical. Revokes EVERY session the delegate holds:
+        an active session must stop carrying a delegation that no longer
+        exists, and it must stop now rather than at envelope expiry.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RoleUpdated:
+      name: role.updated
+      title: A role's grants changed
+      summary: |
+        Envelopes already issued carry the permission bundles the role granted
+        BEFORE the change, so every holder's sessions are revoked and the next
+        resolve re-derives them.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EntityUpdated:
+      name: entity.updated
+      title: A legal entity changed
+      summary: |
+        Changes what a legal entity IS — its jurisdiction, lifecycle state or
+        residency policy — so envelopes scoped to it are revoked.
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RiskSignalChanged:
+      name: session.risk.changed
+      title: A risk signal for a principal changed
+      summary: |
+        The ONLY writer of the risk cache the resolver reads.
+
+        `valid_to` is REQUIRED. Without it the cached TTL computes negative and
+        the signal is silently dropped, so one that omits it is refused loudly
+        rather than accepted and discarded.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [principal_id, signal_value, valid_to]
+                properties:
+                  risk_signal_id: { type: string }
+                  principal_id: { type: string }
+                  tenant_id: { type: string }
+                  signal_type:
+                    type: string
+                    enum: [IP_REPUTATION, DEVICE_ANOMALY, GEO_VELOCITY, BEHAVIORAL_SCORE]
+                  signal_value: { type: integer, minimum: 0, maximum: 100 }
+                  signal_source: { type: string }
+                  valid_from: { type: string, format: date-time }
+                  valid_to: { type: string, format: date-time }
+
+    LegalHoldIssued:
+      name: legal.hold.issued
+      title: A GOV-10 legal hold was issued or rescoped
+      summary: |
+        Also matches `legal.hold.scope_changed`. Projected into a LOCAL,
+        READ-ONLY view used solely to refuse disposition.
+
+        This service has no capability to issue, release or narrow a hold — the
+        authority matrix says GOV-01 must never own one, and the only way to
+        keep that true in code rather than only in a document is to give the
+        service no such method.
+
+        A hold with no `principal_id` covers the WHOLE TENANT. Getting that
+        backwards would let a sweep delete evidence during litigation.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [hold_id]
+                properties:
+                  hold_id: { type: string }
+                  matter_ref: { type: string }
+                  tenant_id: { type: string }
+                  principal_id:
+                    type: string
+                    description: Omitted means the hold covers the entire tenant.
+                  issued_at: { type: string, format: date-time }
+
+    LegalHoldReleased:
+      name: legal.hold.released
+      title: A GOV-10 legal hold was released
+      summary: Disposition may resume for the records it covered.
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              payload:
+                type: object
+                required: [hold_id]
+                properties:
+                  hold_id: { type: string }
+                  tenant_id: { type: string }
+                  released_at: { type: string, format: date-time }

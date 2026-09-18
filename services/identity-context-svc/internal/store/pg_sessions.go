@@ -22,30 +22,13 @@ func (s *PgStore) InsertSessionContext(ctx context.Context, sc domain.SessionCon
 	if sc.TenantID == "" {
 		return errors.New("InsertSessionContext: tenant_id is required")
 	}
+	// Shares insertSessionContextTx with InsertSessionContextWithEvent so the
+	// column list cannot drift between the plain and transactional paths — a
+	// drift that would show up as a missing ingress_source or evidence_id on
+	// whichever path was forgotten, which is exactly the sort of gap that is
+	// invisible until an audit asks.
 	return s.withRLS(ctx, sc.TenantID, func(tx pgx.Tx) error {
-		var legalEntityID *string
-		if sc.LegalEntityID != "" {
-			legalEntityID = &sc.LegalEntityID
-		}
-		_, err := tx.Exec(ctx, `
-			INSERT INTO session_contexts (
-				session_context_id, principal_id, tenant_id, legal_entity_id,
-				correlation_id, trust_posture, mfa_verified, device_trust_score,
-				adaptive_risk_score, risk_signal_source, envelope_jwt_jti,
-				issued_at, expires_at, data_residency_policy_id,
-				source_service, schema_version)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-			ON CONFLICT (session_context_id) DO NOTHING`,
-			sc.SessionContextID, sc.PrincipalID, sc.TenantID, legalEntityID,
-			sc.CorrelationID, string(sc.TrustPosture), sc.MFAVerified, sc.DeviceTrustScore,
-			sc.AdaptiveRiskScore, sc.RiskSignalSource, sc.EnvelopeJWTJTI,
-			sc.IssuedAt, sc.ExpiresAt, sc.DataResidencyPolicyID,
-			sc.SourceService, sc.SchemaVersion,
-		)
-		if err != nil {
-			return fmt.Errorf("insert session_context: %w", err)
-		}
-		return nil
+		return insertSessionContextTx(ctx, tx, sc)
 	})
 }
 
@@ -97,6 +80,7 @@ func (s *PgStore) FindSessionContext(
 	var sc domain.SessionContext
 	var legalEntityID *string
 	var reason *string
+	var environment string
 
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
@@ -104,7 +88,9 @@ func (s *PgStore) FindSessionContext(
 			       correlation_id, trust_posture, mfa_verified, device_trust_score,
 			       adaptive_risk_score, risk_signal_source, envelope_jwt_jti,
 			       issued_at, expires_at, invalidated_at, invalidation_reason,
-			       data_residency_policy_id, source_service, schema_version
+			       data_residency_policy_id, source_service, schema_version,
+			       ingress_source, environment, evidence_id, support_context_id,
+			       retention_class, disposition_due_at, disposed_at
 			  FROM session_contexts
 			 WHERE session_context_id = $1 AND tenant_id = $2`,
 			sessionContextID, tenantID,
@@ -114,6 +100,8 @@ func (s *PgStore) FindSessionContext(
 			&sc.AdaptiveRiskScore, &sc.RiskSignalSource, &sc.EnvelopeJWTJTI,
 			&sc.IssuedAt, &sc.ExpiresAt, &sc.InvalidatedAt, &reason,
 			&sc.DataResidencyPolicyID, &sc.SourceService, &sc.SchemaVersion,
+			&sc.IngressSource, &environment, &sc.EvidenceID, &sc.SupportContextID,
+			&sc.RetentionClass, &sc.DispositionDueAt, &sc.DisposedAt,
 		)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -130,6 +118,7 @@ func (s *PgStore) FindSessionContext(
 		r := domain.InvalidationReason(*reason)
 		sc.InvalidationReason = &r
 	}
+	sc.Environment = domain.Environment(environment)
 	return &sc, nil
 }
 

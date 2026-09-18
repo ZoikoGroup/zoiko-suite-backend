@@ -592,6 +592,625 @@ paths:
 
   # ── Health ─────────────────────────────────────────────────────────────────
 
+  /v1/tenants/{tenantID}/residency-region:
+    get:
+      operationId: resolveTenantRegion
+      summary: Resolve a tenant's data-residency region
+      description: |
+        The tenant-to-region lookup consumed by the Global Traffic & Residency
+        Manager's ingress layer, resolving
+        Tenant.default_data_residency_policy_id to the policy's region code.
+
+        Returns 409, not 404, when the tenant exists but its active residency
+        policy has no region assigned. That is a real and expected state for
+        policies created before migration 000003 added the column, and
+        collapsing it into "not found" would send an operator looking for a
+        tenant that is plainly there.
+
+        Served since before this contract was written and absent from it until
+        the route/contract parity test was added.
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+      responses:
+        "200":
+          description: Resolved region
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolvedTenantRegion"
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: The tenant's residency policy has no region assigned }
+
+  # ── ORG-02 §4.2: tenant named commands ─────────────────────────────────────
+
+  /v1/tenants/{tenantID}/commands/{command}:
+    post:
+      operationId: executeTenantCommand
+      summary: Execute a named ORG-02 tenant lifecycle command
+      description: |
+        ORG-02 §4.2 names seven commands; the five lifecycle ones are invoked
+        here. ChangeDefaultLocale has its own route (it is not a lifecycle
+        transition) and CreateTenant is POST /v1/tenants.
+
+        The command NAME, not just the destination state, is written to the
+        tenant lifecycle history and carried in the emitted event — which is
+        what distinguishes a suspension from the reversal of a mistaken
+        activation after the fact.
+
+        InitiateTermination and CompleteTermination require maker-checker:
+        approved_by_principal_id is mandatory and must differ from the acting
+        principal. Suspension deliberately does not — it is a containment
+        action taken during an incident, and requiring a second approver would
+        keep a compromised tenant live until one is found.
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/CorrelationID"
+        - name: command
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [ActivateTenant, SuspendTenant, ResumeTenant, InitiateTermination, CompleteTermination]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecuteTenantCommandRequest"
+      responses:
+        "200":
+          description: Command applied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenantCommandResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Tenant not found, or the command is not an ORG-02 command }
+        "409": { description: expected_version is stale, or the tenant moved first }
+        "422": { description: Command not reachable from the current state, or an independent approver is required }
+
+  /v1/tenants/{tenantID}/defaults:
+    get:
+      operationId: getTenantDefaults
+      summary: Get baseline tenancy configuration (ORG-02 GetTenantDefaults)
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+      responses:
+        "200":
+          description: Tenant defaults
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenantDefaults"
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: changeDefaultLocale
+      summary: ORG-02 ChangeDefaultLocale
+      description: |
+        Not a lifecycle transition: lifecycle_state is untouched. Still written
+        to the lifecycle history, because an unrecorded configuration change is
+        one nobody can attribute later.
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeDefaultLocaleRequest"
+      responses:
+        "200":
+          description: Defaults changed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tenant"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: expected_version is stale, or the tenant may not transact }
+
+  /v1/tenants/{tenantID}/lifecycle-history:
+    get:
+      operationId: listTenantLifecycleHistory
+      summary: ORG-02 ListTenantLifecycleHistory
+      description: Durable lifecycle evidence — actor, reason, approver and command, newest first.
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+      responses:
+        "200":
+          description: Lifecycle history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TenantLifecycleEvent"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ── ORG-02 §4.2: host bindings and ResolveTenantByHost ─────────────────────
+
+  /v1/tenants/{tenantID}/host-bindings:
+    get:
+      operationId: listTenantHostBindings
+      summary: List a tenant's bound hostnames
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+      responses:
+        "200":
+          description: Host bindings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TenantHostBinding"
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      operationId: bindTenantHost
+      summary: Bind a hostname to a tenant
+      tags: [Tenants]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BindTenantHostRequest"
+      responses:
+        "201":
+          description: Bound
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TenantHostBinding"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: Hostname already bound, or the tenant already has a primary hostname }
+
+  /v1/resolve-tenant:
+    get:
+      operationId: resolveTenantByHost
+      summary: ORG-02 ResolveTenantByHost
+      description: |
+        Deliberately UNAUTHENTICATED and not tenant-scoped: this is the lookup
+        by which a caller learns which tenant a hostname belongs to, so
+        requiring the answer as input would be circular.
+
+        An unknown hostname returns 404. It never falls back to a default
+        tenant — that fallback is the defect ORG §8 NP3 exists to prevent.
+      tags: [Tenants]
+      parameters:
+        - name: hostname
+          in: query
+          required: false
+          description: Defaults to the request's own Host header if omitted.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Resolved tenant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResolvedTenantByHost"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { description: Hostname is not bound to any tenant }
+
+  # ── ORG-03 §4.3: profile amendment commands ────────────────────────────────
+
+  /v1/entities/{entityID}/profile-amendments:
+    post:
+      operationId: amendLegalProfile
+      summary: ORG-03 AmendLegalProfile — create the next effective-dated profile version
+      description: |
+        Creates a NEW version rather than mutating the entity in place, which
+        is what makes §8 NP6 hold: a legal-name change after financial history
+        exists leaves the prior version intact, so a historical read still
+        resolves the name the history was booked under.
+
+        Every profile field is optional; an omitted field is carried forward
+        from the version in force at effective_from, not blanked.
+
+        effective_from is BUSINESS time and may be in the past — a registry
+        filing learned about late is effective from the filing date. A
+        backdated version does not become the entity's current identity.
+
+        Changes to legal_name, registration_number or
+        incorporation_jurisdiction_id require an independent approver (§4.3:
+        the maker cannot approve their own legal-identity change).
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AmendLegalProfileRequest"
+      responses:
+        "201":
+          description: New profile version created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegalEntityProfileVersion"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: expected_version is stale, the tenant may not transact, or the registry identity is already claimed and has been quarantined }
+        "422": { description: An independent approver is required }
+
+  /v1/entities/{entityID}/legal-name:
+    post:
+      operationId: changeLegalName
+      summary: ORG-03 ChangeLegalName
+      description: |
+        A narrowing of AmendLegalProfile that records change_reason
+        LEGAL_NAME_CHANGE, which is what lets a downstream consumer react to a
+        rename specifically rather than to any amendment.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeLegalNameRequest"
+      responses:
+        "201":
+          description: New profile version created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegalEntityProfileVersion"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: expected_version is stale or the tenant may not transact }
+        "422": { description: An independent approver is required }
+
+  /v1/entities/{entityID}/registered-office:
+    post:
+      operationId: changeRegisteredOffice
+      summary: ORG-03 ChangeRegisteredOffice
+      description: |
+        The registered office is stored as opaque structured JSON. ORG-08 owns
+        address normalization and §1 is explicit that storing an address here
+        must not become a second address authority — this service records what
+        it was told and draws no conclusions from it.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChangeRegisteredOfficeRequest"
+      responses:
+        "201":
+          description: New profile version created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LegalEntityProfileVersion"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: expected_version is stale or the tenant may not transact }
+
+  # ── ORG-03 §4.3: as-of and version reads ───────────────────────────────────
+
+  /v1/entities/{entityID}/versions:
+    get:
+      operationId: listEntityVersions
+      summary: ORG-03 ListEntityVersions
+      description: Every profile version ever recorded for this entity, newest first. Nothing is ever rewritten or removed.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+      responses:
+        "200":
+          description: Profile versions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LegalEntityProfileVersion"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/{entityID}/as-of:
+    get:
+      operationId: getLegalEntityAsOf
+      summary: ORG-03 GetLegalEntityAsOf — reconstruct an entity at a business instant
+      description: |
+        as_of is BUSINESS time: what this entity's legal name was on the date
+        an invoice was issued, not what this platform believed on that date.
+        The two differ for a backdated correction, and business time is the one
+        a financial reconstruction needs.
+
+        The interval is half-open — a version effective from an instant owns
+        that instant, and the one it supersedes does not.
+
+        profile is null when the entity existed but had no recorded profile at
+        that instant (a date before incorporation). That is a true answer, not
+        an error.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/EntityID"
+        - name: as_of
+          in: query
+          required: false
+          description: RFC3339 timestamp or a YYYY-MM-DD date (read as midnight UTC). Defaults to now.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Entity as of the requested instant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntityAsOf"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/entities/by-registry-number:
+    get:
+      operationId: findByRegistryNumber
+      summary: ORG-03 FindByRegistryNumber
+      description: |
+        Returns a LIST, deliberately. §4.3 records that registry number plus
+        jurisdiction is a dedup signal and not a universal identifier.
+        Returning a single entity would present that hint as an identity
+        lookup, which is the assumption that produces silent merges.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: registration_number
+          in: query
+          required: true
+          schema: { type: string }
+        - name: jurisdiction_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Candidate entities
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LegalEntity"
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  # ── ORG-03 §8 NP5: registry conflict quarantine ────────────────────────────
+
+  /v1/registry-conflicts:
+    get:
+      operationId: listRegistryConflicts
+      summary: List quarantined registry-identity conflicts
+      description: |
+        §8 NP5 requires a duplicate registry claim to be quarantined rather
+        than silently merged. The incoming entity is NOT written; the attempt
+        is recorded here with its full payload, because there is no row to
+        point at.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Pass all to include resolved conflicts; the default is open only.
+          schema: { type: string, enum: [open, all] }
+      responses:
+        "200":
+          description: Conflicts
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EntityRegistryConflict"
+
+  /v1/registry-conflicts/{conflictID}/resolution:
+    post:
+      operationId: resolveRegistryConflict
+      summary: Record a conclusion about a quarantined conflict
+      description: |
+        Records a finding. It does NOT merge anything: §1 is explicit that
+        destructive merge is prohibited and that lineage must be preserved, so
+        acting on a RESOLVED_DUPLICATE conclusion is a separate governed
+        operation this service does not perform.
+
+        A conflict can be resolved once. A second attempt is 409 rather than an
+        overwrite of the first resolver's conclusion.
+      tags: [Entities]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+        - name: conflictID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResolveRegistryConflictRequest"
+      responses:
+        "204": { description: Resolution recorded }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: Already resolved }
+
+  # ── Workspaces ─────────────────────────────────────────────────────────────
+  #
+  # These five routes have existed since migration 000005 and were absent from
+  # this contract entirely — found by the route/contract parity test added
+  # alongside the ORG work, not by a reader noticing.
+
+  /v1/workspaces:
+    post:
+      operationId: createWorkspace
+      summary: Create a workspace beneath a tenant
+      description: |
+        billing_classification is mandatory and validated. A non-billable
+        workspace (INTERNAL, DEMO, SANDBOX, QA_AUTOMATION, PILOT_NON_BILLABLE)
+        is legitimate; an unrecognized string is not. Environment name and
+        workspace age are never enough to infer it.
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateWorkspaceRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: Tenant may not transact }
+
+  /v1/tenants/{tenantID}/workspaces:
+    get:
+      operationId: listWorkspaces
+      summary: List a tenant's workspaces
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/TenantID"
+      responses:
+        "200":
+          description: Workspaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Workspace"
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/workspaces/{workspaceID}:
+    get:
+      operationId: getWorkspace
+      summary: Get a workspace
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceID"
+      responses:
+        "200":
+          description: Workspace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      operationId: updateWorkspace
+      summary: Update a workspace
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateWorkspaceRequest"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Workspace"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Tenant may not transact }
+
+  /v1/workspaces/{workspaceID}/status:
+    post:
+      operationId: transitionWorkspaceStatus
+      summary: Archive or restore a workspace
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceID"
+        - $ref: "#/components/parameters/CorrelationID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransitionWorkspaceStatusRequest"
+      responses:
+        "204": { description: Transition applied }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/UnprocessableEntity" }
+
+
   /healthz:
     get:
       operationId: liveness
@@ -646,6 +1265,12 @@ components:
         type: string
     EntityID:
       name: entityID
+      in: path
+      required: true
+      schema:
+        type: string
+    WorkspaceID:
+      name: workspaceID
       in: path
       required: true
       schema:
@@ -912,6 +1537,338 @@ components:
       type: object
       properties:
         error:          { type: string }
+        correlation_id: { type: string }
+
+    ResolvedTenantRegion:
+      type: object
+      properties:
+        tenant_id:   { type: string, format: uuid }
+        region_code: { type: string }
+        region_name: { type: string }
+
+    # ── ORG-02 §4.2: named commands, defaults, host bindings ─────────────────
+
+    ExecuteTenantCommandRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          description: |
+            Mandatory. §4.2 requires the lifecycle actor and reason as
+            evidence, and a history whose reason column is empty answers
+            "why is this tenant suspended?" with silence.
+        expected_version:
+          type: integer
+          format: int64
+          description: |
+            The tenant's record_version as the caller last saw it. Omitting it
+            is accepted and does NOT skip the guard: the service substitutes
+            the version it reads, turning its own read-then-write into a
+            compare-and-swap. Supplying it gives the stronger guarantee that
+            nothing moved since the CALLER read.
+        approved_by_principal_id:
+          type: string
+          description: |
+            The independent approver, required for InitiateTermination and
+            CompleteTermination. Must differ from the acting principal; the
+            database enforces that independently of this service.
+        correlation_id: { type: string }
+
+    TenantCommandResult:
+      type: object
+      properties:
+        from_state:     { type: string, enum: [ONBOARDING, ACTIVE, SUSPENDED, OFFBOARDING, TERMINATED] }
+        to_state:       { type: string, enum: [ONBOARDING, ACTIVE, SUSPENDED, OFFBOARDING, TERMINATED] }
+        record_version: { type: integer, format: int64 }
+        status:         { type: string, enum: [ACTIVE, SUSPENDED, ARCHIVED] }
+
+    ChangeDefaultLocaleRequest:
+      type: object
+      required: [reason]
+      properties:
+        primary_locale:   { type: string }
+        primary_timezone: { type: string }
+        reason:           { type: string }
+        expected_version: { type: integer, format: int64 }
+        correlation_id:   { type: string }
+
+    TenantDefaults:
+      type: object
+      properties:
+        tenant_id:             { type: string, format: uuid }
+        default_currency_code: { type: string }
+        primary_timezone:      { type: string }
+        primary_locale:        { type: string }
+        default_data_residency_policy_id: { type: string, format: uuid }
+        record_version:        { type: integer, format: int64 }
+
+    TenantLifecycleEvent:
+      type: object
+      properties:
+        lifecycle_event_id: { type: string, format: uuid }
+        tenant_id:          { type: string, format: uuid }
+        from_state:         { type: string, nullable: true }
+        to_state:           { type: string }
+        command_name:
+          type: string
+          description: |
+            The ORG-02 named command that caused the transition. Stored rather
+            than inferred from the state pair: SuspendTenant followed by
+            ResumeTenant is otherwise indistinguishable from the correction of
+            a mistaken suspension.
+          enum: [CreateTenant, ActivateTenant, SuspendTenant, ResumeTenant, InitiateTermination, CompleteTermination, ChangeDefaultLocale]
+        reason:                   { type: string }
+        actor_principal_id:       { type: string }
+        approved_by_principal_id: { type: string, nullable: true }
+        correlation_id:           { type: string, nullable: true }
+        occurred_at:              { type: string, format: date-time }
+
+    TenantHostBinding:
+      type: object
+      properties:
+        host_binding_id:          { type: string, format: uuid }
+        hostname:                 { type: string }
+        tenant_id:                { type: string, format: uuid }
+        is_primary:               { type: boolean }
+        active_flag:              { type: boolean }
+        created_at:               { type: string, format: date-time }
+        created_by_principal_id:  { type: string }
+
+    BindTenantHostRequest:
+      type: object
+      required: [hostname]
+      properties:
+        hostname:
+          type: string
+          description: Lowercased on write; case is not meaningful in a hostname.
+        is_primary:     { type: boolean }
+        correlation_id: { type: string }
+
+    ResolvedTenantByHost:
+      type: object
+      description: |
+        Carries the tenant's status and lifecycle state alongside its id,
+        because the caller is an ingress layer deciding whether to admit a
+        request — handing it only an id would force a second round trip to
+        learn the tenant is suspended.
+      properties:
+        hostname:        { type: string }
+        tenant_id:       { type: string, format: uuid }
+        tenant_code:     { type: string }
+        status:          { type: string, enum: [ACTIVE, SUSPENDED, ARCHIVED] }
+        lifecycle_state: { type: string, enum: [ONBOARDING, ACTIVE, SUSPENDED, OFFBOARDING, TERMINATED] }
+        is_primary:      { type: boolean }
+
+    # ── ORG-03 §4.3: bitemporal profile versions ─────────────────────────────
+
+    LegalEntityProfileVersion:
+      type: object
+      description: |
+        One effective-dated version of an entity's legal profile.
+
+        effective_from/effective_to are BUSINESS time — when the fact was true
+        in the world. recorded_at is RECORD time — when this platform learned
+        it. The two differ whenever a change is backdated, which is exactly
+        the case §9.2 requires as-of retrieval to be verified against.
+
+        superseded_at marks a version replaced by a later one. The row is never
+        rewritten or deleted: §8 NP6 requires history to resolve the ORIGINAL
+        version, which is impossible if a correction overwrites what it
+        corrects.
+      properties:
+        profile_version_id: { type: string, format: uuid }
+        tenant_id:          { type: string, format: uuid }
+        legal_entity_id:    { type: string, format: uuid }
+        version_number:     { type: integer }
+        legal_name:         { type: string }
+        trading_name:       { type: string, nullable: true }
+        legal_form_code:    { type: string, nullable: true }
+        legal_form_source:  { type: string, nullable: true }
+        legal_form_local_text: { type: string, nullable: true }
+        registration_number:   { type: string, nullable: true }
+        registry_authority:    { type: string, nullable: true }
+        registered_office:     { type: string, nullable: true, description: Opaque structured JSON; ORG-08 owns address normalization. }
+        incorporation_jurisdiction_id: { type: string, nullable: true }
+        default_currency_code: { type: string, nullable: true }
+        effective_from:  { type: string, format: date-time }
+        effective_to:    { type: string, format: date-time, nullable: true }
+        recorded_at:     { type: string, format: date-time }
+        superseded_at:   { type: string, format: date-time, nullable: true }
+        change_reason:
+          type: string
+          enum: [INITIAL, INITIAL_BACKFILL, LEGAL_NAME_CHANGE, REGISTERED_OFFICE_CHANGE, AMENDMENT, CORRECTION]
+          description: |
+            CORRECTION and AMENDMENT are not interchangeable: a correction
+            means the prior version was WRONG, so reports already issued
+            against it were misstated. INITIAL and INITIAL_BACKFILL are
+            service-assigned and refused if a caller supplies them.
+        source_evidence_ref:      { type: string, nullable: true }
+        created_by_principal_id:  { type: string }
+        approved_by_principal_id: { type: string, nullable: true }
+
+    AmendLegalProfileRequest:
+      type: object
+      description: |
+        Every profile field is optional. An omitted field is CARRIED FORWARD
+        from the version in force at effective_from — which is what makes this
+        an amendment rather than a replacement.
+      properties:
+        legal_name:            { type: string }
+        trading_name:          { type: string }
+        legal_form_code:       { type: string }
+        legal_form_source:     { type: string }
+        legal_form_local_text: { type: string }
+        registration_number:   { type: string }
+        registry_authority:    { type: string }
+        registered_office:     { type: string }
+        incorporation_jurisdiction_id: { type: string }
+        default_currency_code: { type: string }
+        effective_from:
+          type: string
+          format: date-time
+          description: Business time. May be in the past. Defaults to now.
+        change_reason:
+          type: string
+          enum: [LEGAL_NAME_CHANGE, REGISTERED_OFFICE_CHANGE, AMENDMENT, CORRECTION]
+        source_evidence_ref:      { type: string }
+        approved_by_principal_id: { type: string }
+        expected_version:         { type: integer, format: int64 }
+        correlation_id:           { type: string }
+
+    ChangeLegalNameRequest:
+      type: object
+      required: [legal_name]
+      properties:
+        legal_name:               { type: string }
+        effective_from:           { type: string, format: date-time }
+        source_evidence_ref:      { type: string }
+        approved_by_principal_id: { type: string }
+        expected_version:         { type: integer, format: int64 }
+        correlation_id:           { type: string }
+
+    ChangeRegisteredOfficeRequest:
+      type: object
+      required: [registered_office]
+      properties:
+        registered_office:        { type: string }
+        effective_from:           { type: string, format: date-time }
+        source_evidence_ref:      { type: string }
+        approved_by_principal_id: { type: string }
+        expected_version:         { type: integer, format: int64 }
+        correlation_id:           { type: string }
+
+    EntityAsOf:
+      type: object
+      description: |
+        The entity's unchanging identifiers paired with the profile version in
+        force at the requested instant. Both are returned because a caller
+        reconstructing a historical report needs both: the entity carries
+        identifiers that do not change, the profile carries the facts that do.
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        tenant_id:       { type: string, format: uuid }
+        entity_code:     { type: string }
+        entity_type:     { type: string }
+        entity_status:   { type: string }
+        as_of:           { type: string, format: date-time }
+        profile:
+          allOf:
+            - $ref: "#/components/schemas/LegalEntityProfileVersion"
+          nullable: true
+
+    # ── ORG-03 §8 NP5: registry conflict quarantine ──────────────────────────
+
+    EntityRegistryConflict:
+      type: object
+      properties:
+        conflict_id:         { type: string, format: uuid }
+        tenant_id:           { type: string, format: uuid }
+        registration_number: { type: string }
+        jurisdiction_id:     { type: string, format: uuid }
+        existing_legal_entity_id: { type: string, format: uuid }
+        attempted_payload:
+          type: object
+          additionalProperties: true
+          description: |
+            The rejected claim, kept whole. There is no row to point at,
+            because the point is that it was not written.
+        status:
+          type: string
+          enum: [OPEN, RESOLVED_DISTINCT, RESOLVED_DUPLICATE, DISMISSED]
+          description: |
+            RESOLVED_DISTINCT means a human confirmed the two are genuinely
+            different entities sharing a registry number, which happens across
+            registry authorities within one jurisdiction. RESOLVED_DUPLICATE
+            records the opposite conclusion; it does not itself merge anything.
+        resolution_note:          { type: string, nullable: true }
+        resolved_by_principal_id: { type: string, nullable: true }
+        resolved_at:              { type: string, format: date-time, nullable: true }
+        detected_at:              { type: string, format: date-time }
+        detected_by_principal_id: { type: string }
+        correlation_id:           { type: string, nullable: true }
+
+    ResolveRegistryConflictRequest:
+      type: object
+      required: [status, resolution_note]
+      properties:
+        status:
+          type: string
+          enum: [RESOLVED_DISTINCT, RESOLVED_DUPLICATE, DISMISSED]
+        resolution_note:
+          type: string
+          description: Mandatory — a resolution nobody can audit is not one.
+        correlation_id: { type: string }
+
+    # ── Workspaces ───────────────────────────────────────────────────────────
+
+    Workspace:
+      type: object
+      properties:
+        workspace_id:    { type: string, format: uuid }
+        tenant_id:       { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid, nullable: true }
+        name:            { type: string }
+        business_unit:   { type: string, nullable: true }
+        billing_classification:
+          type: string
+          enum: [COMMERCIAL_STANDALONE, COMMERCIAL_ZOIKO_ONE, LEGACY_MIGRATION, PILOT_NON_BILLABLE, INTERNAL, DEMO, SANDBOX, QA_AUTOMATION]
+        billing_source:  { type: string, enum: [NONE, DIRECT, ZOIKO_ONE_BUNDLE] }
+        commercial_account_id: { type: string, format: uuid, nullable: true }
+        status:          { type: string, enum: [ACTIVE, ARCHIVED] }
+        created_at:      { type: string, format: date-time }
+        updated_at:      { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+        updated_by_principal_id: { type: string }
+
+    CreateWorkspaceRequest:
+      type: object
+      required: [tenant_id, name, billing_classification]
+      properties:
+        tenant_id:       { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        name:            { type: string }
+        business_unit:   { type: string }
+        billing_classification: { type: string }
+        billing_source:  { type: string }
+        commercial_account_id:  { type: string, format: uuid }
+        correlation_id:  { type: string }
+
+    UpdateWorkspaceRequest:
+      type: object
+      properties:
+        name:            { type: string }
+        business_unit:   { type: string }
+        billing_classification: { type: string }
+        billing_source:  { type: string }
+        commercial_account_id:  { type: string, format: uuid }
+        correlation_id:  { type: string }
+
+    TransitionWorkspaceStatusRequest:
+      type: object
+      required: [new_status]
+      properties:
+        new_status:     { type: string, enum: [ACTIVE, ARCHIVED] }
         correlation_id: { type: string }
 
   responses:

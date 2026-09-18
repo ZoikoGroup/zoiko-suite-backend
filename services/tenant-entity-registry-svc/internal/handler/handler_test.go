@@ -63,6 +63,18 @@ type stubSvc struct {
 	gotCorrID  string
 	gotEndDate time.Time
 	gotStatus  domain.TransitionEntityStatusRequest
+
+	// ORG-02/ORG-03 recordings — see org_stub_test.go.
+	gotCommand        domain.TenantCommand
+	gotHostname       string
+	gotClaimedTenant  string
+	gotAsOf           time.Time
+	gotRegistryNumber string
+	gotJurisdiction   string
+	gotOpenOnly       bool
+	// hostTenantErr drives VerifyHostTenant only, so the §8 NP3 refusal can be
+	// exercised without every other handler test failing at the host check.
+	hostTenantErr error
 }
 
 func (s *stubSvc) ProvisionTenant(_ context.Context, _ domain.ProvisionTenantRequest, correlationID string) (*domain.Tenant, error) {
@@ -273,6 +285,27 @@ func allRoutes() []route {
 		{"list tax bundles", http.MethodGet, "/v1/entities/" + entityID + "/tax-identity-bundles", "", http.StatusOK, entityID},
 		{"get tax bundle", http.MethodGet, "/v1/tax-identity-bundles/" + bundleID, "", http.StatusOK, bundleID},
 		{"tax bundle status", http.MethodPost, "/v1/tax-identity-bundles/" + bundleID + "/status", `{"new_status":"ACTIVE"}`, http.StatusNoContent, bundleID},
+
+		// ── ORG-02 §4.2 ──────────────────────────────────────────────────────
+		{"tenant named command", http.MethodPost, "/v1/tenants/" + tenantID + "/commands/SuspendTenant", `{"reason":"fraud review"}`, http.StatusOK, tenantID},
+		{"change default locale", http.MethodPost, "/v1/tenants/" + tenantID + "/defaults", `{"primary_locale":"fr-FR","reason":"customer request"}`, http.StatusOK, tenantID},
+		{"lifecycle history", http.MethodGet, "/v1/tenants/" + tenantID + "/lifecycle-history", "", http.StatusOK, tenantID},
+		{"get tenant defaults", http.MethodGet, "/v1/tenants/" + tenantID + "/defaults", "", http.StatusOK, tenantID},
+		{"bind tenant host", http.MethodPost, "/v1/tenants/" + tenantID + "/host-bindings", `{"hostname":"acme.example.com"}`, http.StatusCreated, tenantID},
+		{"list host bindings", http.MethodGet, "/v1/tenants/" + tenantID + "/host-bindings", "", http.StatusOK, tenantID},
+		// No wantID: this route takes no path parameter — it is the lookup that
+		// establishes which tenant a caller belongs to.
+		{"resolve tenant by host", http.MethodGet, "/v1/resolve-tenant?hostname=acme.example.com", "", http.StatusOK, ""},
+
+		// ── ORG-03 §4.3 ──────────────────────────────────────────────────────
+		{"amend legal profile", http.MethodPost, "/v1/entities/" + entityID + "/profile-amendments", `{"change_reason":"AMENDMENT"}`, http.StatusCreated, entityID},
+		{"change legal name", http.MethodPost, "/v1/entities/" + entityID + "/legal-name", `{"legal_name":"Renamed Ltd"}`, http.StatusCreated, entityID},
+		{"change registered office", http.MethodPost, "/v1/entities/" + entityID + "/registered-office", `{"registered_office":"{}"}`, http.StatusCreated, entityID},
+		{"list entity versions", http.MethodGet, "/v1/entities/" + entityID + "/versions", "", http.StatusOK, entityID},
+		{"get entity as-of", http.MethodGet, "/v1/entities/" + entityID + "/as-of?as_of=2026-03-31", "", http.StatusOK, entityID},
+		{"find by registry number", http.MethodGet, "/v1/entities/by-registry-number?registration_number=RC-1", "", http.StatusOK, ""},
+		{"list registry conflicts", http.MethodGet, "/v1/registry-conflicts", "", http.StatusOK, ""},
+		{"resolve registry conflict", http.MethodPost, "/v1/registry-conflicts/conflict-1/resolution", `{"status":"DISMISSED","resolution_note":"n"}`, http.StatusNoContent, "conflict-1"},
 	}
 }
 

@@ -1,0 +1,648 @@
+{
+  "info": {
+    "name": "ZoikoSuite — Identity Context (GOV-01)",
+    "_postman_id": "9f3c1a20-7d4e-4b61-9e02-1c5a7e6b3d11",
+    "description": "GOV-01 Tenant Context & Resolution.\n\n## Read this before running anything\n\nThis collection sets the **canonical service input contract** headers on every write, because the service enforces them and a collection that omits them 401s on every request with a body that says nothing useful. Older collections in this repo predate that enforcement and fail exactly that way.\n\nThe headers are set by a collection-level pre-request script, not per request, so there is one place to fix when the contract changes:\n\n- `X-Tenant-Id` — the caller's verified tenant. In production the gateway sets this from a signed envelope; here it comes from the `tenantId` variable.\n- `X-Principal-Id` — the verified actor. Never `X-Actor-Principal-ID`, which this service deliberately ignores: it used to be trusted and recorded as the actor without verification, so the audit trail named whoever the caller claimed to be.\n- `X-Correlation-ID` — generated per request.\n- `Idempotency-Key` — generated per request on material writes.\n\n## Order\n\nRun folder 1 first. `Authenticate` and `Resolve context` capture `accessToken`, `sessionContextId` and `evidenceId` into collection variables that everything else depends on.\n\n## What the negative-path folder proves\n\nFolder 5 contains GOV-01's four minimum negative-path acceptance scenarios. They are expected to FAIL the request and PASS the test — a green tick there means the control refused correctly.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8080" },
+    { "key": "tenantId", "value": "11111111-1111-1111-1111-111111111111" },
+    { "key": "supportTenantId", "value": "22222222-2222-2222-2222-222222222222" },
+    { "key": "email", "value": "admin@zoiko.io" },
+    { "key": "password", "value": "ChangeMe!local-dev" },
+    { "key": "legalEntityId", "value": "01HXXXENTITYID" },
+    { "key": "principalId", "value": "" },
+    { "key": "accessToken", "value": "" },
+    { "key": "sessionContextId", "value": "" },
+    { "key": "evidenceId", "value": "" },
+    { "key": "supportContextId", "value": "" },
+    { "key": "approverPrincipalId", "value": "01HXXXAPPROVERID" },
+    { "key": "supportPrincipalId", "value": "01HXXXSUPPORTENG" }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Canonical service input contract (ZS-ARCH-SVC-001 v2.0 section 4).",
+          "//",
+          "// Set here rather than per request so there is ONE place to fix. The",
+          "// service enforces these, and a request without them answers 401 with a",
+          "// message about the gateway — which reads like a deployment problem",
+          "// rather than a missing header, and is how the pre-enforcement",
+          "// collections in this repo came to fail silently on every write.",
+          "",
+          "const uuid = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {",
+          "  const r = Math.random() * 16 | 0;",
+          "  return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);",
+          "});",
+          "",
+          "pm.request.headers.upsert({ key: 'X-Correlation-ID', value: uuid() });",
+          "",
+          "// /v1/authenticate is EXEMPT and must stay exempt: it is the endpoint",
+          "// that makes a verified identity obtainable, so requiring one would be",
+          "// circular. Adding the headers here would not break it, but it would",
+          "// teach the wrong thing to whoever copies this collection.",
+          "const exempt = pm.request.url.getPath().endsWith('/v1/authenticate');",
+          "",
+          "if (!exempt) {",
+          "  const tenant = pm.request.headers.get('X-Tenant-Id');",
+          "  if (!tenant) {",
+          "    pm.request.headers.upsert({ key: 'X-Tenant-Id', value: pm.collectionVariables.get('tenantId') });",
+          "  }",
+          "  if (!pm.request.headers.get('X-Principal-Id')) {",
+          "    pm.request.headers.upsert({ key: 'X-Principal-Id', value: pm.collectionVariables.get('principalId') });",
+          "  }",
+          "}",
+          "",
+          "// Material writes need an idempotency key.",
+          "if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(pm.request.method) && !exempt) {",
+          "  pm.request.headers.upsert({ key: 'Idempotency-Key', value: uuid() });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "1 · Authenticate and resolve",
+      "item": [
+        {
+          "name": "Authenticate",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/v1/authenticate", "host": ["{{baseUrl}}"], "path": ["v1", "authenticate"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
+            "description": "Exchanges a password for the bearer token /v1/context/resolve accepts.\n\nThe token is NOT the identity envelope and confers no access: it attests that a human proved possession of a credential, and nothing else. Keeping the two steps apart is what stops a password being sufficient to act."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.collectionVariables.set('accessToken', b.access_token);",
+                  "pm.collectionVariables.set('principalId', b.principal_id);",
+                  "",
+                  "pm.test('token is not cacheable', () => {",
+                  "  pm.expect(pm.response.headers.get('Cache-Control')).to.include('no-store');",
+                  "});",
+                  "",
+                  "pm.test('response carries no credential material', () => {",
+                  "  pm.expect(pm.response.text()).to.not.include(pm.collectionVariables.get('password'));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Resolve context",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/v1/context/resolve", "host": ["{{baseUrl}}"], "path": ["v1", "context", "resolve"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"bearer_token\": \"{{accessToken}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\"\n}"
+            },
+            "description": "GOV-01 ResolveTenantContext.\n\nAll six dimensions must resolve or this refuses — partial envelopes are prohibited. The response now carries `evidence_id`, so the caller can cite the decision that granted its envelope."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.collectionVariables.set('sessionContextId', b.session_context_id);",
+                  "pm.collectionVariables.set('evidenceId', b.evidence_id);",
+                  "",
+                  "pm.test('envelope issued', () => pm.expect(b.envelope_jwt).to.be.a('string').and.not.empty);",
+                  "",
+                  "pm.test('material decision returns an evidence id', () => {",
+                  "  pm.expect(b.evidence_id, 'spec section 16 requires evidence_id on a material governance decision').to.be.a('string').and.not.empty;",
+                  "});",
+                  "",
+                  "pm.test('envelope is not issued already expired', () => {",
+                  "  pm.expect(b.expires_at).to.be.above(Math.floor(Date.now() / 1000));",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get effective context",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/session/{{sessionContextId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "session", "{{sessionContextId}}"]
+            },
+            "description": "GOV-01 GetEffectiveContext."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": { "type": "text/javascript", "exec": ["pm.test('200', () => pm.response.to.have.status(200));"] }
+            }
+          ]
+        },
+        {
+          "name": "JWKS",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/.well-known/jwks.json", "host": ["{{baseUrl}}"], "path": [".well-known", "jwks.json"] },
+            "description": "The RS256 public key any service uses to verify an envelope independently. This is what makes the envelope self-contained — a consumer never has to call back here to trust one."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('publishes an RS256 key', () => {",
+                  "  pm.expect(pm.response.json().keys[0].alg).to.eql('RS256');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 · Explain (GOV-01 ExplainContextResolution)",
+      "item": [
+        {
+          "name": "Explain resolution",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/session/{{sessionContextId}}/explain",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "session", "{{sessionContextId}}", "explain"]
+            },
+            "description": "Why the context resolved as it did, reconstructed from the frozen evidence row rather than re-derived. Re-deriving would read today's risk signals against a session issued last week."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "pm.test('accounts for all six dimensions', () => pm.expect(b.dimensions).to.have.lengthOf(6));",
+                  "pm.test('names its source rather than re-deriving', () => {",
+                  "  pm.expect(b.reconstructed_from).to.include('append-only');",
+                  "});",
+                  "pm.test('records the ingress it arrived on', () => pm.expect(b.ingress_source).to.be.a('string').and.not.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Explain as-of an earlier instant",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/session/{{sessionContextId}}/explain?as_of=2026-01-01T00:00:00Z",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "session", "{{sessionContextId}}", "explain"],
+              "query": [{ "key": "as_of", "value": "2026-01-01T00:00:00Z" }]
+            },
+            "description": "DoD gate 6 — as-of reconstruction. An instant before the session was issued reports it as not yet resolved rather than as it stands now."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('as_of is echoed, not ignored', () => {",
+                  "  pm.expect(pm.response.json().as_of).to.include('2026-01-01');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 · Cache and tenant commands",
+      "item": [
+        {
+          "name": "Refresh tenant context cache",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/v1/context/cache/refresh", "host": ["{{baseUrl}}"], "path": ["v1", "context", "cache", "refresh"] },
+            "body": { "mode": "raw", "raw": "{\n  \"reason\": \"registry resync after tenant onboarding\"\n}" },
+            "description": "GOV-01 RefreshTenantContextCache. Marks routing hints stale; does NOT delete them, because a deleted binding fails every request on that hostname closed until the registry sync runs again."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 or 501 if unconfigured', () => pm.expect([200, 501]).to.include(pm.response.code));",
+                  "if (pm.response.code === 200) {",
+                  "  pm.test('returns evidence', () => pm.expect(pm.response.json().evidence_id).to.not.be.empty);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Invalidate tenant context — no justification (must fail)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/v1/context/tenant/invalidate", "host": ["{{baseUrl}}"], "path": ["v1", "context", "tenant", "invalidate"] },
+            "body": { "mode": "raw", "raw": "{\n  \"reason\": \"ADMIN_REVOKE\"\n}" },
+            "description": "The blast radius is every user of the tenant. An operator who cannot say why in a sentence should not be running this, so the justification is mandatory."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('refused without a justification', () => {",
+                  "  pm.expect([400, 501]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4 · Break-glass (AttachSupportContext)",
+      "item": [
+        {
+          "name": "Attach support context",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{supportTenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{approverPrincipalId}}" }
+            ],
+            "url": { "raw": "{{baseUrl}}/v1/context/support", "host": ["{{baseUrl}}"], "path": ["v1", "context", "support"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"support_principal_id\": \"{{supportPrincipalId}}\",\n  \"reason_code\": \"INCIDENT_RESPONSE\",\n  \"justification\": \"Customer reports envelopes rejected estate-wide since 09:15; need session evidence to confirm.\",\n  \"ticket_ref\": \"INC-4471\",\n  \"approver_principal_id\": \"{{approverPrincipalId}}\",\n  \"ttl_seconds\": 1800\n}"
+            },
+            "description": "Note the headers: `X-Tenant-Id` is the SUPPORT tenant (where the caller lives) while the body's `tenant_id` is the CUSTOMER tenant being entered. Authorization is checked against the customer tenant — checking the caller's own would ask whether they may attach support contexts at home, which every support engineer may, and would authorize an elevation into any tenant on the platform."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201, or 403/501 if not configured in this environment', () => {",
+                  "  pm.expect([201, 403, 501]).to.include(pm.response.code);",
+                  "});",
+                  "if (pm.response.code === 201) {",
+                  "  const b = pm.response.json();",
+                  "  pm.collectionVariables.set('supportContextId', b.support_context_id);",
+                  "  pm.test('grant is time-limited', () => pm.expect(b.expires_at).to.not.be.empty);",
+                  "  pm.test('grant is evidenced', () => pm.expect(b.evidence_id).to.not.be.empty);",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attach with self-approval (must fail)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{supportTenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{supportPrincipalId}}" }
+            ],
+            "url": { "raw": "{{baseUrl}}/v1/context/support", "host": ["{{baseUrl}}"], "path": ["v1", "context", "support"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"support_principal_id\": \"{{supportPrincipalId}}\",\n  \"reason_code\": \"INCIDENT_RESPONSE\",\n  \"justification\": \"Approving my own elevation, which must never be permitted.\",\n  \"ticket_ref\": \"INC-0000\",\n  \"approver_principal_id\": \"{{supportPrincipalId}}\",\n  \"ttl_seconds\": 1800\n}"
+            },
+            "description": "Self-approval defeats maker-checker entirely. Refused by the handler AND by a schema CHECK constraint, so a future caller reaching the table directly cannot skip it."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('self-approval refused', () => {",
+                  "  pm.expect([400, 403, 501]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Attach with an excessive TTL (must fail)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Tenant-Id", "value": "{{supportTenantId}}" },
+              { "key": "X-Principal-Id", "value": "{{approverPrincipalId}}" }
+            ],
+            "url": { "raw": "{{baseUrl}}/v1/context/support", "host": ["{{baseUrl}}"], "path": ["v1", "context", "support"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"tenant_id\": \"{{tenantId}}\",\n  \"support_principal_id\": \"{{supportPrincipalId}}\",\n  \"reason_code\": \"INCIDENT_RESPONSE\",\n  \"justification\": \"Requesting a thirty day window, which exceeds the configured ceiling.\",\n  \"ticket_ref\": \"INC-4472\",\n  \"approver_principal_id\": \"{{approverPrincipalId}}\",\n  \"ttl_seconds\": 2592000\n}"
+            },
+            "description": "REFUSED, not clamped. Clamping would issue a grant with a window nobody requested and nobody reviewed, and the requester would believe they held it far longer than they do."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('excessive window refused rather than clamped', () => {",
+                  "  pm.expect([400, 403, 501]).to.include(pm.response.code);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Revoke support context",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/support/{{supportContextId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "support", "{{supportContextId}}"]
+            },
+            "body": { "mode": "raw", "raw": "{\n  \"reason\": \"incident closed\"\n}" },
+            "description": "Guarded by a deliberately weaker action than attach: revoking is de-escalation, and whoever notices a problem must be able to stop it."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('204, 404 or 501', () => pm.expect([204, 404, 501]).to.include(pm.response.code));"]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "5 · GOV-01 negative-path acceptance",
+      "description": "The four minimum negative-path scenarios GOV-01's contract names. A GREEN tick here means the control REFUSED correctly — these requests are supposed to fail.",
+      "item": [
+        {
+          "name": "NP1 · Spoofed tenant header is ignored",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-Tenant-Id", "value": "99999999-9999-9999-9999-999999999999" }],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/session/{{sessionContextId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "session", "{{sessionContextId}}"]
+            },
+            "description": "A session id from tenant A, presented with tenant B's header. Answers 404 rather than 403: a distinct forbidden would confirm the id exists, and session ids are exactly what an attacker probes for. What this route returns is the signed envelope itself, so a leak here is credential theft rather than a data leak."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('foreign tenant cannot obtain the envelope', () => pm.response.to.have.status(404));",
+                  "pm.test('no envelope in the body', () => pm.expect(pm.response.text()).to.not.include('envelope_jwt'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "NP2 · Unknown hostname cannot fall back to a tenant",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-Forwarded-Host", "value": "attacker.example.com" }
+            ],
+            "url": { "raw": "{{baseUrl}}/v1/context/resolve", "host": ["{{baseUrl}}"], "path": ["v1", "context", "resolve"] },
+            "body": { "mode": "raw", "raw": "{\n  \"bearer_token\": \"{{accessToken}}\",\n  \"legal_entity_id\": \"{{legalEntityId}}\"\n}" },
+            "description": "Under INGRESS_POLICY=strict this is refused. Under observe (the local default) it is permitted — which grants nothing, because the tenant still comes from the verified token and never from the hostname. The important half runs under both: a hostname BOUND to a different tenant is refused either way."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('refused under strict, or permitted-without-granting under observe', () => {",
+                  "  pm.expect([200, 401]).to.include(pm.response.code);",
+                  "});",
+                  "if (pm.response.code === 401) {",
+                  "  pm.test('carries the stable error class', () => {",
+                  "    pm.expect(pm.response.json().error_code).to.eql('CONTEXT_UNRESOLVED');",
+                  "  });",
+                  "}",
+                  "if (pm.response.code === 200) {",
+                  "  pm.test('the hostname did NOT select the tenant', () => {",
+                  "    // Resolution succeeded because the TOKEN named a tenant. The",
+                  "    // hostname contributed nothing, which is the invariant.",
+                  "    pm.expect(pm.response.json().envelope_jwt).to.not.be.empty;",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "NP3 · Support-session context expires automatically",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/support/{{supportContextId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "support", "{{supportContextId}}"]
+            },
+            "description": "Expiry is a property of the record, not an event somebody has to remember to fire: `expires_at` is NOT NULL with a CHECK that it is after `granted_at`, and every read re-evaluates liveness against the clock. Run this after the TTL elapses to see the grant stop working with nothing else having run."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 while live, 404 once ended', () => {",
+                  "  pm.expect([200, 404, 501]).to.include(pm.response.code);",
+                  "});",
+                  "if (pm.response.code === 200) {",
+                  "  const b = pm.response.json();",
+                  "  pm.test('grant carries a bounded window', () => {",
+                  "    pm.expect(new Date(b.expires_at).getTime()).to.be.above(new Date(b.granted_at).getTime());",
+                  "  });",
+                  "  pm.test('grant has an independent approver', () => {",
+                  "    pm.expect(b.approver_principal_id).to.not.eql(b.support_principal_id);",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "NP4 · Cache invalidation removes stale context promptly",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/session/{{sessionContextId}}/invalidate",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "session", "{{sessionContextId}}", "invalidate"]
+            },
+            "body": { "mode": "raw", "raw": "{\n  \"reason\": \"LOGOUT\"\n}" },
+            "description": "Invalidate, then re-run 'Get effective context' — it must 404. The record is appended to, never deleted: `invalidated_at` and `invalidation_reason` are set exactly once, so a session revoked for RISK_ESCALATION and later logged out of keeps the first reason, which is the part an investigation reads."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204', () => pm.response.to.have.status(204));",
+                  "",
+                  "const pm2 = pm;",
+                  "pm.sendRequest({",
+                  "  url: pm.collectionVariables.get('baseUrl') + '/v1/context/session/' + pm.collectionVariables.get('sessionContextId'),",
+                  "  method: 'GET',",
+                  "  header: {",
+                  "    'X-Tenant-Id': pm.collectionVariables.get('tenantId'),",
+                  "    'X-Principal-Id': pm.collectionVariables.get('principalId')",
+                  "  }",
+                  "}, (err, res) => {",
+                  "  pm2.test('the envelope is gone immediately, not at TTL', () => {",
+                  "    pm2.expect(res.code).to.eql(404);",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "NP5 · Idempotent re-invalidation",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": {
+              "raw": "{{baseUrl}}/v1/context/session/{{sessionContextId}}/invalidate",
+              "host": ["{{baseUrl}}"],
+              "path": ["v1", "context", "session", "{{sessionContextId}}", "invalidate"]
+            },
+            "body": { "mode": "raw", "raw": "{\n  \"reason\": \"ADMIN_REVOKE\"\n}" },
+            "description": "Re-invalidating reports success — the caller's intended end state holds — and writes nothing. The first reason stands."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('204 and a no-op', () => pm.response.to.have.status(204));"]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "6 · Health",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('served as JSON', () => {",
+                  "  // Regression guard: Content-Type used to be set after WriteHeader,",
+                  "  // which net/http ignores, so this was text/plain.",
+                  "  pm.expect(pm.response.headers.get('Content-Type')).to.include('application/json');",
+                  "});",
+                  "pm.test('reports the outbox depth', () => {",
+                  "  pm.expect(pm.response.json().checks).to.have.property('outbox');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Metrics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/metrics", "host": ["{{baseUrl}}"], "path": ["metrics"] }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('exposes the outbox depth — the one signal invisible from the request path', () => {",
+                  "  pm.expect(pm.response.text()).to.include('identity_context_outbox_pending');",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -21,7 +21,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"os"
 	"strings"
@@ -197,15 +199,64 @@ var devPlaceholderURLs = map[string]bool{
 	"http://tenant-svc:8081":   true,
 }
 
+// reservedHostSuffixes are the domains RFC 2606 and RFC 6761 reserve for
+// documentation and testing. Nothing deployed lives on one.
+var reservedHostSuffixes = []string{
+	".example.com", ".example.net", ".example.org",
+	".example", ".invalid", ".test",
+}
+
+// nonProductionURL reports why baseURL cannot be a deployed authorization-svc,
+// or "" if it might be one.
+//
+// It is a POSITIVE test for addresses that are provably local or reserved,
+// never a guess at what a real hostname looks like. An unrecognised host is
+// assumed real: a false positive here is a refusal to boot in production,
+// which is a worse failure than the one this guard exists to prevent.
+func nonProductionURL(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "not a parseable URL"
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "not an absolute URL with a host"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		switch {
+		case ip.IsLoopback():
+			return "a loopback address"
+		case ip.IsUnspecified():
+			return "an unspecified address"
+		}
+		return ""
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return "a loopback address"
+	}
+	for _, suffix := range reservedHostSuffixes {
+		if host == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(host, suffix) {
+			return "a reserved documentation or test domain"
+		}
+	}
+	return ""
+}
+
 // NewClient constructs an AuthorizationClient based on environment and config.
 // In production or staging a placeholder or empty baseURL is a fatal
 // misconfiguration rather than a silent fallback to StubAuthZClient.
 func NewClient(env string, baseURL string, log *zap.Logger) (AuthorizationClient, error) {
 	isProdOrStaging := strings.EqualFold(env, "production") || strings.EqualFold(env, "staging")
-	isPlaceholder := devPlaceholderURLs[strings.TrimRight(baseURL, "/")]
+	trimmed := strings.TrimRight(baseURL, "/")
+	isPlaceholder := devPlaceholderURLs[trimmed]
 
-	if isProdOrStaging && isPlaceholder {
-		return nil, fmt.Errorf("security violation: cannot use StubAuthZClient or placeholder AuthZServiceURL (%q) in %s environment", baseURL, env)
+	if isProdOrStaging {
+		if isPlaceholder {
+			return nil, fmt.Errorf("security violation: cannot use StubAuthZClient or placeholder AuthZServiceURL (%q) in %s environment", baseURL, env)
+		}
+		if reason := nonProductionURL(trimmed); reason != "" {
+			return nil, fmt.Errorf("security violation: AUTHZ_SERVICE_URL (%q) is %s and cannot address authorization-svc in %s environment", baseURL, reason, env)
+		}
 	}
 
 	if !isPlaceholder {

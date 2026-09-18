@@ -78,6 +78,9 @@ type Service interface {
 	GetTaxIdentityBundle(ctx context.Context, bundleID string) (*domain.TaxIdentityBundle, error)
 	ListTaxIdentityBundles(ctx context.Context, legalEntityID string) ([]*domain.TaxIdentityBundle, error)
 	TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, req domain.TransitionTaxIdentityBundleStatusRequest) error
+
+	// ORG-02/ORG-03 named commands and read surfaces — see org_handler.go.
+	ORGService
 }
 
 // Handler holds all HTTP handler methods.
@@ -95,6 +98,10 @@ func New(s Service, log *zap.Logger) *Handler {
 // Route convention: /v1/<resource> — URI-versioned per API-first doctrine.
 func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Route("/v1", func(r chi.Router) {
+		// ORG-02/ORG-03 surfaces, registered inside this same /v1 group so
+		// chi's static-before-parameter matching applies across all of them.
+		registerORGRoutes(r, h)
+
 		// ── Tenants ─────────────────────────────────────────────────────────
 		r.Post("/tenants", h.ProvisionTenant)
 		r.Get("/tenants/{tenantID}", h.GetTenant)
@@ -498,6 +505,16 @@ func (h *Handler) TransitionTaxIdentityBundleStatus(w http.ResponseWriter, r *ht
 
 func (h *Handler) writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	corrID := correlationID(r)
+
+	// ORG-02/ORG-03 sentinels first. They must be checked ahead of the switch
+	// below because several of them wrap ErrConflict-adjacent meanings that a
+	// broader case would otherwise absorb, losing the distinction between
+	// "your version is stale" and "this tenant may not transact at all".
+	if status, msg, ok := mapORGError(err); ok {
+		writeErrJSON(w, status, msg, corrID)
+		return
+	}
+
 	switch {
 	case errors.Is(err, registry.ErrNotFound):
 		writeErrJSON(w, http.StatusNotFound, "not found", corrID)

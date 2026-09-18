@@ -5,12 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"zoiko.io/secret-vault-integration-svc/internal/authz"
@@ -79,7 +81,42 @@ type Handler struct {
 	// administration, which is platform-scoped rather than entity-scoped.
 	// authorization-svc rejects an empty legal_entity_id.
 	authzPlatformScopeID string
+
+	// metrics is never nil -- New installs nopMetrics.
+	metrics DomainMetrics
 }
+
+// DomainMetrics records the business-level outcomes this service's HTTP
+// metrics cannot express.
+//
+// Declared here, in the package that produces the events, rather than the
+// handler importing internal/telemetry: that keeps the handler's tests free of
+// a Prometheus registry, and stops a second registration of the same collector
+// inside a test binary. internal/telemetry.Metrics satisfies it.
+type DomainMetrics interface {
+	// BrokerDecision records a terminal outcome of a brokerage request:
+	// granted, denied, no_policy, vault_error or error.
+	BrokerDecision(outcome string)
+	// LeaseRevoked records a revocation by cause: "explicit" or "rotation".
+	LeaseRevoked(cause string)
+	// SecretRotated records a completed rotation and the leases it killed.
+	SecretRotated(revokedLeases int)
+	// AuthzDecision records an authorization-svc outcome per action:
+	// allowed, denied or unavailable.
+	AuthzDecision(action, outcome string)
+	// VaultBackendError records a vault backend failure by operation.
+	VaultBackendError(operation string)
+}
+
+// nopMetrics is the default, so a Handler built without metrics -- every
+// handler unit test -- behaves identically and needs no wiring.
+type nopMetrics struct{}
+
+func (nopMetrics) BrokerDecision(string)        {}
+func (nopMetrics) LeaseRevoked(string)          {}
+func (nopMetrics) SecretRotated(int)            {}
+func (nopMetrics) AuthzDecision(string, string) {}
+func (nopMetrics) VaultBackendError(string)     {}
 
 // New constructs a Handler.
 func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
@@ -90,7 +127,17 @@ func New(store SecretVaultStore, vault VaultBackend, publisher EventPublisher, a
 		authz:                authzClient,
 		authzPlatformScopeID: authzPlatformScopeID,
 		log:                  log,
+		metrics:              nopMetrics{},
 	}
+}
+
+// UseMetrics attaches a domain metrics recorder. Separate from New so the
+// existing constructor signature -- and every caller of it -- is unchanged.
+func (h *Handler) UseMetrics(m DomainMetrics) *Handler {
+	if m != nil {
+		h.metrics = m
+	}
+	return h
 }
 
 // RegisterRoutes mounts all routes on the given chi router.
@@ -226,7 +273,10 @@ func (req createSecretPolicyVersionRequest) missingField() string {
 // POST /v1/secret-policies/{secret_policy_id}/versions. New versions are
 // always created in DRAFT status.
 func (h *Handler) CreateSecretPolicyVersion(w http.ResponseWriter, r *http.Request) {
-	secretPolicyID := chi.URLParam(r, "secret_policy_id")
+	secretPolicyID, ok := requireUUIDParam(w, r, "secret_policy_id")
+	if !ok {
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -330,8 +380,14 @@ type activateVersionResponse struct {
 // ActivateVersion handles
 // POST /v1/secret-policies/{secret_policy_id}/versions/{version_id}/activate.
 func (h *Handler) ActivateVersion(w http.ResponseWriter, r *http.Request) {
-	secretPolicyID := chi.URLParam(r, "secret_policy_id")
-	versionID := chi.URLParam(r, "version_id")
+	secretPolicyID, ok := requireUUIDParam(w, r, "secret_policy_id")
+	if !ok {
+		return
+	}
+	versionID, ok := requireUUIDParam(w, r, "version_id")
+	if !ok {
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -403,7 +459,10 @@ type putSecretMaterialRequest struct {
 // endpoints — it never runs on the request path, only when an operator
 // is provisioning a secret.
 func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
-	secretPolicyID := chi.URLParam(r, "secret_policy_id")
+	secretPolicyID, ok := requireUUIDParam(w, r, "secret_policy_id")
+	if !ok {
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -465,6 +524,7 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.vault.Put(r.Context(), policy.SecretPath, material); err != nil {
 		h.log.Error("PutSecretMaterial: vault backend put failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
+		h.metrics.VaultBackendError("put")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
 		return
 	}
@@ -483,7 +543,10 @@ func (h *Handler) PutSecretMaterial(w http.ResponseWriter, r *http.Request) {
 // Now requires X-Tenant-Id, same as its sibling read endpoints
 // (GetLease, ListLeases).
 func (h *Handler) ListVersionHistory(w http.ResponseWriter, r *http.Request) {
-	secretPolicyID := chi.URLParam(r, "secret_policy_id")
+	secretPolicyID, ok := requireUUIDParam(w, r, "secret_policy_id")
+	if !ok {
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	tenantScope, ok := h.requireTenant(w, r)
@@ -654,9 +717,11 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 			// scope. secret_class is genuinely unknown here — no policy
 			// was ever resolved to read it from.
 			h.recordDenial(r.Context(), req, "", nil, "no applicable secret policy for this path/scope", correlationID)
+			h.metrics.BrokerDecision("no_policy")
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no_applicable_secret_policy", "secret_path": req.SecretPath})
 		default:
 			h.log.Error("Broker: store unavailable resolving policy", zap.String("correlation_id", correlationID), zap.Error(err))
+			h.metrics.BrokerDecision("error")
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 		}
 		return
@@ -666,6 +731,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	var allowedWorkloads []string
 	if err := json.Unmarshal(applicable.AllowedWorkloadIDs, &allowedWorkloads); err != nil {
 		h.log.Error("Broker: policy version has invalid allowed_workload_ids", zap.String("secret_policy_version_id", applicable.SecretPolicyVersionID), zap.Error(err))
+		h.metrics.BrokerDecision("error")
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "invalid_policy_payload"})
 		return
 	}
@@ -674,6 +740,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		// didn't authorize this caller. Recording it keeps this DENIED
 		// entry as complete evidence as a GRANTED one (context.md §5).
 		h.recordDenial(r.Context(), req, applicable.SecretClass, &applicable.SecretPolicyVersionID, "requesting principal not in allowed_workload_ids", correlationID)
+		h.metrics.BrokerDecision("denied")
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access_denied", "secret_path": req.SecretPath})
 		return
 	}
@@ -683,6 +750,8 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 	leaseToken, err := h.vault.Get(r.Context(), req.SecretPath)
 	if err != nil {
 		h.log.Error("Broker: vault backend unavailable", zap.String("secret_path", req.SecretPath), zap.Error(err))
+		h.metrics.VaultBackendError("get")
+		h.metrics.BrokerDecision("vault_error")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
 		return
 	}
@@ -726,6 +795,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	h.metrics.BrokerDecision("granted")
 	writeJSON(w, http.StatusOK, brokerResponse{
 		LeaseID:    lease.LeaseID,
 		SecretPath: lease.SecretPath,
@@ -762,7 +832,10 @@ func contains(list []string, val string) bool {
 // ── GET /v1/secrets/leases/{lease_id} ────────────────────────────────────────
 
 func (h *Handler) GetLease(w http.ResponseWriter, r *http.Request) {
-	leaseID := chi.URLParam(r, "lease_id")
+	leaseID, ok := requireUUIDParam(w, r, "lease_id")
+	if !ok {
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	tenantScope, ok := h.requireTenant(w, r)
@@ -858,7 +931,10 @@ func (h *Handler) ListLeases(w http.ResponseWriter, r *http.Request) {
 // ── POST /v1/secrets/leases/{lease_id}/revoke ───────────────────────────────
 
 func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
-	leaseID := chi.URLParam(r, "lease_id")
+	leaseID, ok := requireUUIDParam(w, r, "lease_id")
+	if !ok {
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	principalID, ok := h.requirePrincipal(w, r)
@@ -914,6 +990,9 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if transitioned {
+		// Only on a real transition: an idempotent repeat revokes nothing and
+		// must not inflate the count an operator reads during an incident.
+		h.metrics.LeaseRevoked("explicit")
 		spv := lease.SecretPolicyVersionID
 		lid := lease.LeaseID
 		if _, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
@@ -978,10 +1057,19 @@ type rotateResponse struct {
 // silently assumed correct; acceptable for v1, worth a real transaction
 // if this service's reliability bar rises later.
 func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
-	secretPolicyID := chi.URLParam(r, "secret_policy_id")
+	secretPolicyID, ok := requireUUIDParam(w, r, "secret_policy_id")
+	if !ok {
+		return
+	}
 	correlationID := r.Header.Get("X-Correlation-ID")
 
 	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	// The rotating caller's verified tenant scope. Needed for the ROTATED
+	// audit entry below — see the comment on that call.
+	tenantScope, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -1010,10 +1098,16 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if existingEntry != nil {
+		// RevokedLeaseCount is read back out of the original entry's
+		// outcome_detail. A replay used to answer 0 here, which reads as
+		// "this rotation revoked nothing" — the opposite of what the first
+		// call actually did, and materially misleading in an evidence trail
+		// where the count is the whole point of the record.
 		writeJSON(w, http.StatusOK, rotateResponse{
-			SecretPolicyID: secretPolicyID,
-			SecretPath:     existingEntry.SecretPath,
-			RotatedAt:      existingEntry.RecordedAt,
+			SecretPolicyID:    secretPolicyID,
+			SecretPath:        existingEntry.SecretPath,
+			RevokedLeaseCount: revokedCountFromOutcomeDetail(existingEntry.OutcomeDetail),
+			RotatedAt:         existingEntry.RecordedAt,
 		})
 		return
 	}
@@ -1032,6 +1126,7 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.vault.Rotate(r.Context(), policy.SecretPath); err != nil {
 		h.log.Error("Rotate: vault backend rotate failed", zap.String("secret_path", policy.SecretPath), zap.Error(err))
+		h.metrics.VaultBackendError("rotate")
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault_backend_unavailable"})
 		return
 	}
@@ -1061,13 +1156,28 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// TenantID is the rotating caller's verified scope. It used to be left
+	// unset, so every ROTATED row landed with tenant_id = NULL — and
+	// ListAuditLog always filters on the caller's tenant, so a rotation was
+	// invisible in the audit log of every tenant, including the one that
+	// performed it. The one event that invalidates every lease on a path
+	// was the one event no one could retrieve evidence of.
+	//
+	// Bound to the rotating tenant rather than made globally visible: a
+	// secret_path is a platform-wide address, so a NULL-tenant row readable
+	// by everyone would let any tenant enumerate every other tenant's secret
+	// paths and the principals administering them. Tenants other than the
+	// rotator are not left without evidence — the mass revocation above
+	// writes each of them a REVOKED row in their own scope, carrying
+	// "revoked as a side effect of secret rotation".
 	rotatedEntry, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
 		EventType:              "ROTATED",
 		SecretClass:            policy.SecretClass,
 		SecretPath:             policy.SecretPath,
 		RequestedByPrincipalID: req.RotatedByPrincipalID,
+		TenantID:               &tenantScope,
 		RequestID:              &req.RequestID,
-		OutcomeDetail:          "",
+		OutcomeDetail:          rotationOutcomeDetail(len(revokedLeases)),
 		CorrelationID:          correlationID,
 	})
 	if err != nil {
@@ -1080,12 +1190,47 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("Rotate: failed to publish secret.rotation.completed", zap.Error(err))
 	}
 
+	h.metrics.SecretRotated(len(revokedLeases))
 	writeJSON(w, http.StatusOK, rotateResponse{
 		SecretPolicyID:    secretPolicyID,
 		SecretPath:        policy.SecretPath,
 		RevokedLeaseCount: len(revokedLeases),
 		RotatedAt:         rotatedEntry.RecordedAt,
 	})
+}
+
+// rotationOutcomeDetail renders the number of leases a rotation revoked into
+// the ROTATED entry's outcome_detail.
+//
+// The count is recorded because it is the part of a rotation that cannot be
+// reconstructed afterwards: the REVOKED rows it produced are scattered across
+// the tenants that held those leases, and an auditor reading one tenant's log
+// can see its own revocations but never the size of the event that caused
+// them. Stored as text in the existing free-form column rather than as a new
+// typed column, so no migration is needed to make a replay answer honestly.
+func rotationOutcomeDetail(revokedLeaseCount int) string {
+	return fmt.Sprintf("%s%d", rotationOutcomePrefix, revokedLeaseCount)
+}
+
+// rotationOutcomePrefix is the machine-readable lead-in the count is parsed
+// back out of. Kept deliberately boring — this string is written into an
+// append-only evidence table, so changing it later would silently orphan the
+// count on every row already recorded.
+const rotationOutcomePrefix = "revoked_lease_count="
+
+// revokedCountFromOutcomeDetail recovers the count written by
+// rotationOutcomeDetail, returning 0 when the entry predates it or is not a
+// rotation entry. 0 is the honest answer there: the original count was never
+// recorded, so there is nothing to report.
+func revokedCountFromOutcomeDetail(detail string) int {
+	if !strings.HasPrefix(detail, rotationOutcomePrefix) {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(detail, rotationOutcomePrefix))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // ── GET /v1/secrets/audit ─────────────────────────────────────────────────────
@@ -1145,6 +1290,35 @@ func (h *Handler) ListAuditLog(w http.ResponseWriter, r *http.Request) {
 		results = []*domain.SecretAccessAuditLog{}
 	}
 	writeJSON(w, http.StatusOK, results)
+}
+
+// requireUUIDParam reads a UUID-typed path parameter, answering 400 rather than
+// letting a malformed value reach the store.
+//
+// Every id in this service's routes maps to a Postgres UUID column. A value
+// that is not a UUID is rejected by the driver, which surfaces as a generic
+// query error — and the handlers translate an unrecognised store error into
+// 503 store_unavailable. So GET /v1/secrets/leases/not-a-uuid used to answer
+// "this service is down" to what is purely a caller mistake: the client then
+// retries, backs off, and trips an availability alert over a bad id. The value
+// never reaches the database now, and the caller is told which parameter it got
+// wrong.
+//
+// 400 rather than 404 on purpose: a syntactically invalid id is not a row that
+// might exist, and reporting "not found" would tell a caller to go looking for
+// something it can never have addressed. Well-formed ids that match no row
+// still answer 404 through the normal store path.
+func requireUUIDParam(w http.ResponseWriter, r *http.Request, param string) (string, bool) {
+	raw := chi.URLParam(r, param)
+	if _, err := uuid.Parse(raw); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_path_parameter",
+			"field":   param,
+			"message": param + " must be a UUID",
+		})
+		return "", false
+	}
+	return raw, true
 }
 
 // writeJSON serialises v as JSON and writes it to w with the given status code.
@@ -1240,10 +1414,17 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType)
 	switch {
 	case err == nil:
+		h.metrics.AuthzDecision(actionType, "allowed")
 		return true
 	case errors.Is(err, authz.ErrDenied):
+		h.metrics.AuthzDecision(actionType, "denied")
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
 	default:
+		// "unavailable", not "denied": this service fails closed, so an
+		// authorization-svc outage refuses every mutation. Without the
+		// distinction that outage is indistinguishable in metrics from a
+		// wave of legitimate denials.
+		h.metrics.AuthzDecision(actionType, "unavailable")
 		h.log.Error("authorization check failed — refusing the mutation",
 			zap.String("principal_id", principalID),
 			zap.String("action_type", actionType),

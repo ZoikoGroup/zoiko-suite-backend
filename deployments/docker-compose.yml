@@ -539,12 +539,69 @@ services:
       AUTH_LOCK_DURATION_SECONDS: "900"
       TENANT_REGISTRY_URL: "http://tenant-svc:8081"
       DELEGATED_AUTHORITY_URL: "http://identity-svc:8080"
-      ACCESS_CONTROL_URL: "http://identity-svc:8080"
+      # access-control-svc, NOT this service. internal/upstream calls
+      # GET {ACCESS_CONTROL_URL}/v1/role-definitions/{id}/permission-bundles,
+      # a route identity-svc does not serve, so pointing this at itself made
+      # every context resolution 404 upstream and return 503 — fail-closed and
+      # correct, but for a wiring reason rather than a real outage.
+      ACCESS_CONTROL_URL: "http://access-control-svc:8137"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # siem-integration-svc lives in docker-compose.phase6.yml — reachable
       # only when that file is up alongside this one. Streaming degrades to
       # a no-op otherwise (see internal/siem's doc comment).
       SIEM_SERVICE_URL: "http://siem-integration-svc:8141"
+
+      # ── GOV-01 completion ─────────────────────────────────────────────────
+      #
+      # The deployment tier, written onto every TenantContextDecision. The
+      # column has a CHECK on these four values, so an invalid one here fails
+      # at startup rather than on the first resolution.
+      DEPLOY_ENVIRONMENT: "local"
+      DEPLOYMENT_REGION: "local"
+
+      # Data residency enforcement. EMPTY MEANS OFF, which is correct for the
+      # local stack: no residency policies exist to check against, and
+      # refusing every resolution until somebody invents some would make the
+      # stack unusable. Set to a comma-separated policy id list per region in
+      # staging and production.
+      ALLOWED_RESIDENCY_POLICIES: "${ALLOWED_RESIDENCY_POLICIES:-}"
+
+      # observe: records the ingress and refuses a MISMATCH, but permits a
+      # hostname nobody has bound yet. strict also refuses the unbound case.
+      #
+      # observe is right for local and for any environment whose
+      # tenant_ingress_bindings table is not fully seeded — turning on strict
+      # first would refuse every request. The important half runs under both:
+      # a token for tenant B on tenant A's hostname is refused either way.
+      INGRESS_POLICY: "${INGRESS_POLICY:-observe}"
+
+      # GOV-04. Empty gives the no-conflict stub, which sod.NewChecker permits
+      # in development and REFUSES in staging/production — paired with the
+      # authz stub on purpose, because a deployment with a real GOV-03 and a
+      # stubbed GOV-04 would satisfy "authorization enforced" while having no
+      # segregation control at all.
+      SOD_SERVICE_URL: "${SOD_SERVICE_URL:-}"
+
+      # Break-glass bounds. The maximum is the ceiling on how long a support
+      # engineer can hold standing inside a customer tenant; raising it is a
+      # governance decision, not a tuning one.
+      SUPPORT_CONTEXT_MAX_TTL_SECONDS: "14400"
+      SUPPORT_CONTEXT_DEFAULT_TTL_SECONDS: "3600"
+      SUPPORT_REVIEW_INTERVAL_MINUTES: "60"
+
+      # Retention (GOV-09). 0 means NEVER dispose, which is the safe default:
+      # a misconfigured period should keep evidence too long rather than
+      # delete it early, and there is no recovering from the second.
+      SESSION_EVIDENCE_RETENTION_DAYS: "${SESSION_EVIDENCE_RETENTION_DAYS:-0}"
+      RETENTION_SWEEP_INTERVAL_MINUTES: "360"
+
+      # Transactional outbox. Events are written to Postgres in the same
+      # transaction as the fact they attest; the relay drains them to Kafka.
+      # A poll interval of 1s is the IDLE cadence — a full batch loops
+      # straight back, so a burst is delivered at broker speed.
+      OUTBOX_RELAY_BATCH_SIZE: "100"
+      OUTBOX_RELAY_POLL_MILLIS: "1000"
+      OUTBOX_RETENTION_DAYS: "7"
     volumes:
       - identity_jwt_keys:/keys:ro
     depends_on:
@@ -2501,8 +2558,18 @@ services:
         condition: service_healthy
       general-ledger-svc:
         condition: service_healthy
-      financial-close-svc:
-        condition: service_healthy
+      # DELIBERATELY NOT financial-close-svc, although CLOSE_SERVICE_URL above
+      # points at it. financial-close-svc depends_on THIS service — a period
+      # cannot close until the fixed-asset subledger is up to post depreciation
+      # into it — and declaring the reverse edge as well made a cycle that
+      # docker compose refuses to resolve. It does not fail the two services:
+      # it fails EVERY `docker compose` command against this file, including
+      # `up postgres`, with "dependency cycle detected".
+      #
+      # depends_on is START ORDER, not a runtime contract. The call this
+      # service makes to financial-close-svc happens long after boot and must
+      # tolerate it being briefly absent, which is true of every inter-service
+      # call in this stack. Do not re-add this edge.
     healthcheck:
       test: ["CMD", "/healthcheck", "http://localhost:8167/healthz"]
       interval: 10s
@@ -2540,8 +2607,12 @@ services:
         condition: service_healthy
       authorization-svc:
         condition: service_healthy
-      financial-close-svc:
-        condition: service_healthy
+      # DELIBERATELY NOT financial-close-svc. financial-close-svc
+      # depends_on THIS service — a period cannot close until the
+      # subledger is up — and declaring the reverse edge as well made a
+      # cycle that docker compose refuses to resolve, failing EVERY
+      # command against this file rather than just these two services.
+      # depends_on is start order, not a runtime contract. Do not re-add.
       general-ledger-svc:
         condition: service_healthy
     healthcheck:
@@ -2581,8 +2652,12 @@ services:
         condition: service_healthy
       authorization-svc:
         condition: service_healthy
-      financial-close-svc:
-        condition: service_healthy
+      # DELIBERATELY NOT financial-close-svc. financial-close-svc
+      # depends_on THIS service — a period cannot close until the
+      # subledger is up — and declaring the reverse edge as well made a
+      # cycle that docker compose refuses to resolve, failing EVERY
+      # command against this file rather than just these two services.
+      # depends_on is start order, not a runtime contract. Do not re-add.
       general-ledger-svc:
         condition: service_healthy
     healthcheck:

@@ -175,7 +175,7 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 // no cap: paging is something a caller asks for, because a silently truncated
 // catalogue would make its totals wrong.
 func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.requirePrincipal(w, r)
+	_, ok := h.requireCaller(w, r)
 	if !ok {
 		return
 	}
@@ -232,7 +232,7 @@ func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) GetRole(w http.ResponseWriter, r *http.Request) {
 	roleDefinitionID := chi.URLParam(r, "role_definition_id")
 
-	_, ok := h.requirePrincipal(w, r)
+	_, ok := h.requireCaller(w, r)
 	if !ok {
 		return
 	}
@@ -418,7 +418,7 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) ListBundles(w http.ResponseWriter, r *http.Request) {
 	roleDefinitionID := chi.URLParam(r, "role_definition_id")
 
-	_, ok := h.requirePrincipal(w, r)
+	_, ok := h.requireCaller(w, r)
 	if !ok {
 		return
 	}
@@ -445,7 +445,7 @@ func (h *Handler) GetBundle(w http.ResponseWriter, r *http.Request) {
 	roleDefinitionID := chi.URLParam(r, "role_definition_id")
 	bundleID := chi.URLParam(r, "bundle_id")
 
-	_, ok := h.requirePrincipal(w, r)
+	_, ok := h.requireCaller(w, r)
 	if !ok {
 		return
 	}
@@ -661,7 +661,7 @@ func (h *Handler) DetachBundle(w http.ResponseWriter, r *http.Request) {
 // search, and paging. This is the view the detach flow and cross-role reviews
 // need, and the role-scoped ListBundles cannot provide.
 func (h *Handler) ListAllBundles(w http.ResponseWriter, r *http.Request) {
-	_, ok := h.requirePrincipal(w, r)
+	_, ok := h.requireCaller(w, r)
 	if !ok {
 		return
 	}
@@ -729,6 +729,33 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 		return "", false
 	}
 	return principalID, true
+}
+
+// requireCaller accepts EITHER a human principal or a workload identity.
+//
+// The canonical input contract defines actor_subject_id as "X-Principal-Id for
+// a human subject or X-Workload-Id for a workload" — both satisfy it. Reads
+// that only need to know the caller is somebody, and never attribute anything
+// to them, must honour both halves; requirePrincipal honours only the first.
+//
+// This was not a theoretical gap. identity-context-svc reads
+// GET /v1/role-definitions/{id}/permission-bundles on its session-resolution
+// hot path and identifies itself, correctly, as X-Workload-Id. It was refused
+// 401 identity_missing, which its resolver reported fail-closed as "upstream
+// dependency unavailable" — so every context resolution in the stack returned
+// 503, and the reason looked like an outage rather than a contract mismatch.
+//
+// Writes keep requirePrincipal. A workload may read the catalogue; only a
+// named human changes it, because the principal is what the evidence records.
+func (h *Handler) requireCaller(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if principalID := r.Header.Get("X-Principal-Id"); principalID != "" {
+		return principalID, true
+	}
+	if workloadID := r.Header.Get("X-Workload-Id"); workloadID != "" {
+		return workloadID, true
+	}
+	writeError(w, http.StatusUnauthorized, "identity_missing", string(domain.ErrIdentityMissing))
+	return "", false
 }
 
 func (h *Handler) requireTenant(w http.ResponseWriter, r *http.Request) (string, bool) {

@@ -37,6 +37,7 @@ import (
 	"zoiko.io/tenant-entity-registry-svc/internal/health"
 	"zoiko.io/tenant-entity-registry-svc/internal/jurisdiction"
 	svcmiddleware "zoiko.io/tenant-entity-registry-svc/internal/middleware"
+	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 	"zoiko.io/tenant-entity-registry-svc/internal/registry"
 	"zoiko.io/tenant-entity-registry-svc/internal/store"
 	"zoiko.io/tenant-entity-registry-svc/internal/telemetry"
@@ -130,6 +131,25 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	eventPublisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
+	// ── Transactional outbox (ORG §9.2) ──────────────────────────────────────
+	//
+	// The ORG-02/ORG-03 guarded writes enqueue their events into event_outbox
+	// inside the business transaction; this relay drains that table to Kafka.
+	// The pre-existing write paths still publish directly through
+	// eventPublisher, so both mechanisms are live at once and deliver the same
+	// envelope to the same topic — a consumer cannot tell them apart.
+	//
+	// An unreachable broker is not fatal. Events accumulate in Postgres and are
+	// delivered when it returns; a registry that refuses to start because Kafka
+	// is down would be a worse outage than the one it is reacting to.
+	outboxStore := outbox.NewStore(pool, log)
+	pgStore.SetOutbox(outboxStore)
+
+	relay := outbox.NewRelay(pool, kafkaWriterAdapter{kafkaWriter}, outbox.DefaultRelayConfig(), log)
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	go relay.Run(relayCtx)
 
 	// Authorization client. Refuses to start in production or staging against
 	// a placeholder URL, rather than silently falling back to a permit-all
@@ -225,7 +245,26 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+	// Stop the relay after the HTTP server, not before: a request in flight
+	// during shutdown can still enqueue an event, and draining first would
+	// leave it for the next process start rather than delivering it now.
+	stopRelay()
 	log.Info("server stopped")
+}
+
+// kafkaWriterAdapter bridges outbox.KafkaMessage to kafka.Message.
+//
+// The outbox package declares its own two-field message type rather than
+// importing kafka-go, so a test fake for the relay does not drag the broker
+// client in with it. This adapter is the one place the two meet.
+type kafkaWriterAdapter struct{ w *kafka.Writer }
+
+func (a kafkaWriterAdapter) WriteMessages(ctx context.Context, msgs ...outbox.KafkaMessage) error {
+	out := make([]kafka.Message, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, kafka.Message{Key: m.Key, Value: m.Value})
+	}
+	return a.w.WriteMessages(ctx, out...)
 }
 
 // correlationIDMiddleware propagates X-Correlation-ID through every request.

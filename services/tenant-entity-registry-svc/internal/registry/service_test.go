@@ -27,17 +27,35 @@ type memStore struct {
 	bundles           map[string]*domain.TaxIdentityBundle
 	residencyPolicies map[string]*domain.DataResidencyPolicy
 	lastUpdateActor   string // records ActorPrincipalID from the last UpdateEntity call
+	// orgs holds the ORG-02/ORG-03 state. Lazily built by memStore.org() so
+	// the existing newMemStore() stays as it was; see org_memstore_test.go.
+	orgs *orgState
 	// Minimal set — add more maps as tests require.
 }
 
 func newMemStore() *memStore {
-	return &memStore{
+	m := &memStore{
 		tenants:           make(map[string]*domain.Tenant),
 		entities:          make(map[string]*domain.LegalEntity),
 		workspaces:        make(map[string]*domain.Workspace),
 		bundles:           make(map[string]*domain.TaxIdentityBundle),
 		residencyPolicies: make(map[string]*domain.DataResidencyPolicy),
 	}
+	// Seed the fixture tenants in ACTIVE lifecycle state.
+	//
+	// Needed since the ORG §8 NP4 guard: every protected write now reads its
+	// tenant and refuses one whose lifecycle state forbids transacting. A test
+	// creating an entity under a tenant that was never provisioned used to
+	// succeed and now correctly gets "not found" — which is the guard working,
+	// not a regression, but it is not what those tests are about. Seeding here
+	// keeps each test asserting the thing it was written to assert.
+	//
+	// Tests that DO exercise the guard override the lifecycle state on one of
+	// these, or seed a tenant of their own; see org_service_test.go.
+	for _, id := range fixtureTenants {
+		seedActiveTenant(m, id)
+	}
+	return m
 }
 
 func (m *memStore) CreateTenant(_ context.Context, t *domain.Tenant) error {
@@ -341,6 +359,31 @@ func baseSvc(t *testing.T) (*registry.Service, *memStore) {
 	return svc, ms
 }
 
+// fixtureTenants are the tenant ids this suite uses as scenery.
+var fixtureTenants = []string{
+	"tenant-1", "tenant-001", "tenant-a", "tenant-b", "ten-verified", "ten-001",
+}
+
+// seedActiveTenant puts a transactable tenant into the store.
+func seedActiveTenant(ms *memStore, id string) *domain.Tenant {
+	t := &domain.Tenant{
+		TenantID:                     id,
+		TenantCode:                   "CODE-" + id,
+		LegalName:                    "Fixture " + id,
+		Status:                       domain.TenantStatusActive,
+		DefaultCurrencyCode:          "USD",
+		PrimaryTimezone:              "UTC",
+		PrimaryLocale:                "en-US",
+		DefaultDataResidencyPolicyID: "drp-" + id,
+		LifecycleState:               domain.TenantLifecycleActive,
+		RecordVersion:                1,
+		CreatedAt:                    time.Now().UTC(),
+		CreatedByPrincipalID:         testPrincipal,
+	}
+	ms.tenants[id] = t
+	return t
+}
+
 // ---------------------------------------------------------------------------
 // Tenant tests
 // ---------------------------------------------------------------------------
@@ -519,7 +562,7 @@ func TestCreateEntity_Success(t *testing.T) {
 		CorrelationID:         "corr-004",
 	}
 
-	entity, err := svc.CreateEntity(authCtx(), req)
+	entity, err := svc.CreateEntity(tenantCtx("tenant-001"), req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, entity.LegalEntityID)
 	assert.Equal(t, domain.EntityStatusActive, entity.EntityStatus)
@@ -545,7 +588,7 @@ func TestCreateEntity_JurisdictionNotFound_FailsClosed(t *testing.T) {
 		CorrelationID:         "corr-005",
 	}
 
-	_, err := svc.CreateEntity(authCtx(), req)
+	_, err := svc.CreateEntity(tenantCtx("tenant-001"), req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -565,7 +608,7 @@ func TestCreateEntity_JurisdictionServiceUnavailable_FailsClosed(t *testing.T) {
 		CorrelationID:         "corr-006",
 	}
 
-	_, err := svc.CreateEntity(authCtx(), req)
+	_, err := svc.CreateEntity(tenantCtx("tenant-001"), req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -609,7 +652,7 @@ func TestTransitionEntityStatus_ValidTransition(t *testing.T) {
 		EntityStatus:  domain.EntityStatusActive,
 	}
 
-	err := svc.TransitionEntityStatus(authCtx(), "ent-001",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-001",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-007",
@@ -628,7 +671,7 @@ func TestTransitionEntityStatus_Idempotent_SameStatus(t *testing.T) {
 	}
 
 	// Applying the same status must be a no-op (idempotent)
-	err := svc.TransitionEntityStatus(authCtx(), "ent-002",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-002",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusDormant,
 			CorrelationID: "corr-008",
@@ -647,7 +690,7 @@ func TestTransitionEntityStatus_InvalidTransition_Rejected(t *testing.T) {
 		EntityStatus:  domain.EntityStatusDissolved, // terminal state
 	}
 
-	err := svc.TransitionEntityStatus(authCtx(), "ent-003",
+	err := svc.TransitionEntityStatus(tenantCtx("tenant-001"), "ent-003",
 		domain.TransitionEntityStatusRequest{
 			NewStatus:     domain.EntityStatusActive,
 			CorrelationID: "corr-009",
@@ -674,7 +717,7 @@ func TestCreateTaxIdentityBundle_Success(t *testing.T) {
 		CorrelationID:  "corr-010",
 	}
 
-	bundle, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	bundle, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	require.NoError(t, err)
 	assert.NotEmpty(t, bundle.TaxIdentityBundleID)
 	assert.Equal(t, "ent-100", bundle.LegalEntityID)
@@ -704,7 +747,7 @@ func TestCreateTaxIdentityBundle_InvalidDataClassification_Fails(t *testing.T) {
 		DataClassification: "INVALID_CLASSIFICATION",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -718,7 +761,7 @@ func TestCreateTaxIdentityBundle_InvalidJurisdiction_FailsClosed(t *testing.T) {
 		CorrelationID:  "corr-011",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrInvalidInput)
 }
 
@@ -732,7 +775,7 @@ func TestCreateTaxIdentityBundle_JurisdictionUnavailable_FailsClosed(t *testing.
 		CorrelationID:  "corr-012",
 	}
 
-	_, err := svc.CreateTaxIdentityBundle(authCtx(), "ent-100", req)
+	_, err := svc.CreateTaxIdentityBundle(tenantCtx("tenant-001"), "ent-100", req)
 	assert.ErrorIs(t, err, registry.ErrServiceUnavailable)
 }
 
@@ -765,7 +808,7 @@ func TestUpdateEntity_WritesVerifiedActorPrincipalID(t *testing.T) {
 	seedEntity(ms, entityID)
 
 	newName := "Updated Name"
-	_, err := svc.UpdateEntity(authCtx(), entityID, domain.UpdateEntityRequest{
+	_, err := svc.UpdateEntity(tenantCtx("tenant-001"), entityID, domain.UpdateEntityRequest{
 		LegalName:     &newName,
 		CorrelationID: "corr-actor-test",
 	})

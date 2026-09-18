@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"testing"
 	"time"
 
@@ -23,6 +24,15 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		// A SILENT SKIP HERE TURNS THE WHOLE STORE SUITE INTO NOTHING while
+		// `go test ./...` still prints ok. Skip locally, where a developer
+		// without Postgres is a normal state, and FAIL wherever the run claims
+		// to be a verification. CI is set by GitHub Actions; REQUIRE_DB_TESTS
+		// is the local opt-in for reproducing a certification run by hand.
+		if os.Getenv("CI") != "" || os.Getenv("REQUIRE_DB_TESTS") != "" {
+			t.Fatal("TEST_DATABASE_URL is not set, but CI or REQUIRE_DB_TESTS is: " +
+				"this run claims to verify the store and would instead have skipped every test in it")
+		}
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
 
@@ -36,23 +46,22 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS workspaces, tax_identity_bundles, entity_jurisdiction_assignments, entity_hierarchies, legal_entities, data_residency_policies, tenants, residency_regions CASCADE;`)
-
-	for _, mig := range []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_tenant_id_to_junction_tables.up.sql",
-		"000003_add_residency_region_to_policies.up.sql",
-		"000004_add_data_classification.up.sql",
-		"000005_add_workspaces.up.sql",
-	} {
-		sql, err := os.ReadFile(filepath.Join(base, "../../deployments/migrations", mig))
-		if err != nil {
-			t.Fatalf("failed to read migration %s: %v", mig, err)
-		}
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to apply migration %s: %v", mig, err)
-		}
+	// Drop EVERY table in the public schema rather than a hand-written list.
+	// A named list has the same failure mode as a named migration list: the
+	// table a later migration adds is not in it, so it survives into the next
+	// run and the migration that creates it fails with "already exists".
+	if _, err := pool.Exec(ctx, `
+		DO $$
+		DECLARE r RECORD;
+		BEGIN
+			FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+			LOOP EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
+			END LOOP;
+		END $$;`); err != nil {
+		t.Fatalf("failed to drop existing tables: %v", err)
 	}
+
+	applyAllMigrations(t, ctx, pool, filepath.Join(base, "../../deployments/migrations"))
 
 	return pool
 }
@@ -434,5 +443,37 @@ func TestPgStore_TransitionWorkspaceStatus_AbsentReturnsZero(t *testing.T) {
 	}
 	if affected != 0 {
 		t.Fatalf("rowsAffected = %d, want 0", affected)
+	}
+}
+
+// applyAllMigrations applies every *.up.sql in dir, in filename order.
+//
+// Discovered rather than listed. Both store test files used to name the
+// migrations inline, which meant a migration added later was silently skipped
+// and the tables it creates were absent from every test -- the exact trap
+// docs/architecture/backend-completion-tracker.md records this estate hitting
+// once already (row 8: "fixed the suite's setup naming only 000001, which
+// would have left this migration untested").
+//
+// Fails if it finds none: an empty glob would otherwise produce a suite that
+// runs against no schema at all and reports ok.
+func applyAllMigrations(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dir string) {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to list migrations: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("no migrations found in %s", dir)
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		sql, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("failed to read migration %s: %v", f, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			t.Fatalf("failed to apply migration %s: %v", filepath.Base(f), err)
+		}
 	}
 }

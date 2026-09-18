@@ -101,6 +101,39 @@ type SessionContext struct {
 	DataResidencyPolicyID string `json:"data_residency_policy_id"`
 	SourceService         string `json:"source_service"`
 	SchemaVersion         string `json:"schema_version"`
+
+	// ── TenantContextDecision fields (spec section 18) ───────────────────────
+	//
+	// The spec defines this entity as "decision_id, subject, ingress source,
+	// tenant, entity, environment, assurance, expires_at". Ingress source and
+	// environment had no home before, so a decision could not be explained
+	// after the fact and an ingress-bound tenant check had nothing to record.
+
+	// IngressSource is the canonical ingress identifier the request arrived
+	// on, or IngressUnknown when none was presented.
+	IngressSource string `json:"ingress_source"`
+
+	// Environment is the deployment tier the decision was made in. Recorded so
+	// a session cannot be replayed across tiers without that being visible in
+	// the evidence.
+	Environment Environment `json:"environment"`
+
+	// EvidenceID is the evidence object this decision produced, returned to
+	// the caller so it can cite the decision that granted it.
+	EvidenceID string `json:"evidence_id"`
+
+	// SupportContextID is set only when the session was issued under a support
+	// elevation, making every action taken during support attributable to the
+	// grant that allowed it.
+	SupportContextID *string `json:"support_context_id,omitempty"`
+
+	// ── Retention (GOV-09) ───────────────────────────────────────────────────
+
+	RetentionClass string `json:"retention_class"`
+	// DispositionDueAt is computed at write time so the sweep is an index scan
+	// rather than a policy evaluation per row.
+	DispositionDueAt *time.Time `json:"disposition_due_at,omitempty"`
+	DisposedAt       *time.Time `json:"disposed_at,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +238,31 @@ type ResolveRequest struct {
 	SAMLAssertion string `json:"saml_assertion,omitempty"`
 	LegalEntityID string `json:"legal_entity_id"`
 	CorrelationID string `json:"correlation_id"`
+
+	// ── Server-resolved fields ───────────────────────────────────────────────
+	//
+	// json:"-" is the whole point. These are part of the request as the
+	// RESOLVER sees it, but a client must never be able to set them, and the
+	// spec's second refinement is explicit: "Tenant, entity, book, jurisdiction,
+	// residency and effective policy are server-resolved. Client hints are
+	// never authoritative."
+	//
+	// Tagging them unmarshalable makes that a property of the type rather than
+	// a rule someone has to remember at each decode site. A client that posts
+	// an ingress_source in its body has it silently ignored, which is the
+	// correct handling of a field it has no business supplying.
+
+	// IngressSource is the canonical ingress identifier the request arrived
+	// on, filled by the handler from CanonicalIngress.
+	IngressSource string `json:"-"`
+
+	// Environment is this deployment's tier, filled from config.
+	Environment Environment `json:"-"`
+
+	// SupportContextID is set by the handler when the caller is operating
+	// under a live support elevation, so every session issued during support
+	// is attributable to the grant that allowed it.
+	SupportContextID *string `json:"-"`
 }
 
 type ResolveResponse struct {

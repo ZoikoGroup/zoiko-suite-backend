@@ -16,12 +16,47 @@ import (
 	"zoiko.io/identity-context-svc/internal/store"
 )
 
-func openTestPool(t *testing.T) *pgxpool.Pool {
+// requireTestDSN returns the integration-test DSN, or ends the test.
+//
+// WHY THIS IS NOT ALWAYS A SKIP. Every test in this package is gated on
+// TEST_DATABASE_URL, so an unset variable turns the whole store suite into
+// nothing while `go test ./...` still prints `ok`. That is the failure mode
+// worth engineering against: not a red build, but a green one that proves
+// less than the reader thinks. CI supplies the DSN through a long conditional
+// in .github/workflows/ci.yml; the day this service drops out of that list,
+// the only signal would be a package that got faster.
+//
+// So: skip locally, where a developer without Postgres is a normal state, and
+// FAIL wherever the run claims to be a verification. CI=true is set by GitHub
+// Actions and by most other runners; REQUIRE_DB_TESTS=1 is the local opt-in
+// for anyone reproducing a certification run by hand.
+func requireTestDSN(t *testing.T) string {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
+	if dsn != "" {
+		return dsn
 	}
+	if os.Getenv("CI") != "" || os.Getenv("REQUIRE_DB_TESTS") != "" {
+		t.Fatal("TEST_DATABASE_URL is not set, but CI or REQUIRE_DB_TESTS is: " +
+			"this run claims to verify the store and would instead have skipped every test in it")
+	}
+	t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
+	return ""
+}
+
+// openTestPool connects to TEST_DATABASE_URL and rebuilds the schema.
+//
+// DESTRUCTIVE. It runs DROP SCHEMA public CASCADE before applying the
+// migrations, so it erases whatever is in the target database. Point it only
+// at a throwaway instance — never at a compose stack or a demo database that
+// somebody is using. There is deliberately no heuristic guard on the DSN: a
+// name or host check either blocks the legitimate throwaway case or gives
+// false confidence against a URL shaped slightly differently, and the estate
+// records that decision in docs/architecture/backend-completion-tracker.md
+// (Priority 1, row 82m). A stated contract, not a check passable by accident.
+func openTestPool(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	dsn := requireTestDSN(t)
 
 	ctx := context.Background()
 	pool, err := pgxpool.New(ctx, dsn)

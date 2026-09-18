@@ -42,8 +42,21 @@ var (
 	// sends a user to reset a password that was never the problem.
 	ErrAuthUnavailable = errors.New("authentication unavailable")
 
-	// ErrAuthRequestInvalid means a mandatory field was absent.
-	ErrAuthRequestInvalid = errors.New("tenant_id, email and password are all required")
+	// ErrRequestInvalid means a mandatory field was absent or malformed on
+	// ANY of this service's commands. Handlers map it to 400.
+	//
+	// It exists because ErrAuthRequestInvalid was being used as that generic
+	// sentinel while carrying an authenticate-specific message, so every
+	// break-glass and tenant-invalidate refusal came back reading
+	// "tenant_id, email and password are all required: reason_code ... is not
+	// one of the recognised reasons". An operator reading a break-glass
+	// refusal in the evidence log was being told to check a password.
+	ErrRequestInvalid = errors.New("request is invalid")
+
+	// ErrAuthRequestInvalid means a mandatory field was absent on
+	// Authenticate. It wraps ErrRequestInvalid, so a handler matching the
+	// generic sentinel still catches it.
+	ErrAuthRequestInvalid = fmt.Errorf("%w: tenant_id, email and password are all required", ErrRequestInvalid)
 )
 
 // CredentialStore is the data-access contract for password material.

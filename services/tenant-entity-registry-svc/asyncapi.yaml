@@ -1,0 +1,319 @@
+asyncapi: "2.6.0"
+
+info:
+  title: Tenant & Entity Registry Service — Event Contract
+  version: "1.0.0"
+  description: |
+    The events tenant-entity-registry-svc publishes, and the ORG-02 / ORG-03
+    spec events each one satisfies.
+
+    ORG §9.2's first Definition-of-Done gate requires the AsyncAPI contract to
+    pass compatibility gates. Before this file existed there was no machine
+    contract for this service's events at all: a consumer learned the event
+    names by reading internal/events/publisher.go.
+
+    ## Spec names are not wire names
+
+    The specification names events in PascalCase — TenantActivated,
+    LegalEntityProfileAmended. Those are SPEC names. This estate's wire
+    convention is lower.dotted, already established by `tenant.created` and
+    `entity.status.changed` before this work, and consumers subscribe to the
+    wire name.
+
+    Every message below records both, in `x-spec-event`. The mapping is
+    asserted against the Go constants by internal/events/contract_test.go, so
+    the two cannot drift silently — which is the failure this file exists to
+    make impossible, not merely unlikely.
+
+    ## Delivery
+
+    Events produced by the ORG-02/ORG-03 named commands are written to the
+    `event_outbox` table inside the SAME transaction as the fact they attest
+    (migration 000006), and delivered by a relay. Delivery is therefore
+    AT-LEAST-ONCE: every consumer must dedupe on `event_id`.
+
+    The pre-existing write paths still publish directly to Kafka after commit
+    and retain the crash window the outbox closes. Both paths emit the identical
+    envelope to the identical topic, so a consumer cannot tell them apart and
+    should not try to.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+    description: Local development broker (deployments/docker-compose.yml).
+
+channels:
+  zoiko.entity.events:
+    description: |
+      Every event this service publishes, on one topic.
+
+      The message KEY is the aggregate id — the tenant id for tenant events,
+      the legal entity id for entity events. Kafka guarantees ordering only
+      within a partition, so keying by aggregate is what stops a consumer
+      seeing an entity's profile amendment before its creation.
+    subscribe:
+      summary: Consume tenant and legal-entity domain events.
+      operationId: consumeRegistryEvents
+      message:
+        oneOf:
+          # ── ORG-02 §4.2 ──────────────────────────────────────────────────
+          - $ref: "#/components/messages/TenantCreated"
+          - $ref: "#/components/messages/TenantActivated"
+          - $ref: "#/components/messages/TenantSuspended"
+          - $ref: "#/components/messages/TenantResumed"
+          - $ref: "#/components/messages/TenantTerminationInitiated"
+          - $ref: "#/components/messages/TenantTerminated"
+          - $ref: "#/components/messages/TenantDefaultsChanged"
+          # ── ORG-03 §4.3 ──────────────────────────────────────────────────
+          - $ref: "#/components/messages/LegalEntityCreated"
+          - $ref: "#/components/messages/LegalEntityUpdated"
+          - $ref: "#/components/messages/LegalEntityProfileAmended"
+          - $ref: "#/components/messages/LegalEntityNameChanged"
+          - $ref: "#/components/messages/RegisteredOfficeChanged"
+          - $ref: "#/components/messages/LegalEntityStatusChanged"
+          # ── Structure ────────────────────────────────────────────────────
+          - $ref: "#/components/messages/EntityHierarchyChanged"
+          - $ref: "#/components/messages/EntityJurisdictionChanged"
+          # ── §8 NP5 ───────────────────────────────────────────────────────
+          - $ref: "#/components/messages/RegistryConflictQuarantined"
+          - $ref: "#/components/messages/RegistryConflictResolved"
+          # ── Workspaces ───────────────────────────────────────────────────
+          - $ref: "#/components/messages/WorkspaceCreated"
+          - $ref: "#/components/messages/WorkspaceUpdated"
+          - $ref: "#/components/messages/WorkspaceStatusChanged"
+
+components:
+  messages:
+    TenantCreated:
+      name: tenant.created
+      title: A tenant was provisioned
+      x-spec-event: TenantCreated
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    TenantActivated:
+      name: tenant.activated
+      title: ActivateTenant moved a tenant from ONBOARDING to ACTIVE
+      x-spec-event: TenantActivated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    TenantSuspended:
+      name: tenant.suspended
+      title: SuspendTenant moved a tenant out of ACTIVE
+      description: |
+        A consumer receiving this must stop accepting protected writes for the
+        tenant. The registry itself refuses them (§8 NP4), but a consumer
+        holding its own copy of tenant state will not.
+      x-spec-event: TenantSuspended
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    TenantResumed:
+      name: tenant.resumed
+      title: ResumeTenant returned a suspended tenant to ACTIVE
+      description: |
+        No spec name — ORG-02 §4.2 names ResumeTenant as a command but lists no
+        corresponding event. Published anyway: a consumer told about the
+        suspension and never about its reversal would hold the tenant closed
+        indefinitely.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    TenantTerminationInitiated:
+      name: tenant.termination.initiated
+      title: InitiateTermination moved a tenant to OFFBOARDING
+      x-spec-event: TenantTerminationInitiated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    TenantTerminated:
+      name: tenant.terminated
+      title: CompleteTermination moved a tenant to TERMINATED
+      description: |
+        Terminal. §4.2 requires that termination preserve governed retained
+        records, so this is not a signal to delete the tenant's data.
+      x-spec-event: TenantTerminated
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    TenantDefaultsChanged:
+      name: tenant.defaults.changed
+      title: ChangeDefaultLocale changed baseline tenancy configuration
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    LegalEntityCreated:
+      name: entity.created
+      title: A legal entity was created
+      x-spec-event: LegalEntityCreated
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    LegalEntityUpdated:
+      name: entity.updated
+      title: A legal entity's non-governed fields were patched
+      description: |
+        The pre-ORG in-place update path. A change to legal name, registry
+        identity or jurisdiction produces entity.profile.amended (or one of its
+        narrowings) instead, because those are effective-dated.
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    LegalEntityProfileAmended:
+      name: entity.profile.amended
+      title: A new effective-dated profile version was created
+      description: |
+        Carries `effective_from`, which may be in the PAST. A consumer must not
+        assume this event means "the entity's identity changed now" — a
+        backdated amendment corrects a closed period and leaves the entity's
+        present-day identity untouched.
+      x-spec-event: LegalEntityProfileAmended
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    LegalEntityNameChanged:
+      name: entity.legal_name.changed
+      title: ChangeLegalName created a profile version
+      description: |
+        A narrowing of entity.profile.amended, published instead of it when the
+        change_reason is LEGAL_NAME_CHANGE, so a consumer can react to a rename
+        specifically rather than to any amendment.
+      x-spec-event: null
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegisteredOfficeChanged:
+      name: entity.registered_office.changed
+      title: ChangeRegisteredOffice created a profile version
+      x-spec-event: RegisteredOfficeChanged
+      x-delivery: outbox
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    LegalEntityStatusChanged:
+      name: entity.status.changed
+      title: An entity moved through its status state machine
+      x-spec-event: LegalEntityStatusChanged
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EntityHierarchyChanged:
+      name: entity.hierarchy.changed
+      title: A parent/child relationship was created or end-dated
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    EntityJurisdictionChanged:
+      name: entity.jurisdiction.changed
+      title: A jurisdiction assignment was created or end-dated
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistryConflictQuarantined:
+      name: entity.registry_conflict.quarantined
+      title: A duplicate registry-identity claim was refused and quarantined
+      description: |
+        §8 NP5 requires the quarantine; this event is what makes it actionable.
+        A quarantine nobody is told about is one nobody resolves.
+
+        The entity named in the payload as `existing_legal_entity_id` is the
+        incumbent. The rejected claim was NOT written and has no id.
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    RegistryConflictResolved:
+      name: entity.registry_conflict.resolved
+      title: A human recorded a conclusion about a quarantined conflict
+      description: |
+        Records a finding only. RESOLVED_DUPLICATE does not mean anything was
+        merged — §1 prohibits destructive merge, so acting on the conclusion is
+        a separate governed operation.
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    WorkspaceCreated:
+      name: workspace.created
+      title: A workspace was created beneath a tenant
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    WorkspaceUpdated:
+      name: workspace.updated
+      title: A workspace was reclassified or renamed
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+    WorkspaceStatusChanged:
+      name: workspace.status.changed
+      title: A workspace was archived or restored
+      x-spec-event: null
+      x-delivery: direct
+      payload:
+        $ref: "#/components/schemas/Envelope"
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The platform event envelope (Doc 03 §19). Identical on both delivery
+        paths — an event that travelled through the outbox is byte-for-byte the
+        same shape as one published directly.
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, payload]
+      properties:
+        event_id:
+          type: string
+          description: |
+            Prefixed `evt-` followed by a UUID. Delivery is at-least-once, so
+            this is the key every consumer must dedupe on. The outbox row keys
+            on the bare UUID — the same identity, spelled for two different
+            consumers.
+        event_type:      { type: string, description: The wire name, e.g. tenant.suspended. }
+        event_version:   { type: string }
+        emitted_at:      { type: string, format: date-time }
+        schema_version:  { type: string }
+        source_service:  { type: string, enum: [tenant-entity-registry-svc] }
+        tenant_id:       { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        jurisdiction:    { type: string }
+        actor_id:
+          type: string
+          description: |
+            The gateway-verified acting principal. Never a value the caller
+            supplied — an unverified actor would make the audit trail name
+            whoever the caller claimed to be.
+        correlation_id:  { type: string }
+        payload:
+          type: object
+          additionalProperties: true
+          description: Event-specific body; see each message's title.

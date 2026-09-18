@@ -20,6 +20,14 @@ const (
 	TenantLifecycleActive      TenantLifecycleState = "ACTIVE"
 	TenantLifecycleSuspended   TenantLifecycleState = "SUSPENDED"
 	TenantLifecycleOffboarding TenantLifecycleState = "OFFBOARDING"
+	// TenantLifecycleTerminated is the true terminal state. ORG-02 §4.2's
+	// lifecycle is "Provisioning -> Active -> Suspended -> Terminating ->
+	// Terminated", and OFFBOARDING is this platform's name for Terminating.
+	// Until this existed OFFBOARDING was treated as terminal, which left the
+	// named command CompleteTermination with nowhere to move a tenant to and
+	// made "termination initiated" indistinguishable from "termination
+	// finished" -- the distinction the whole offboarding window exists for.
+	TenantLifecycleTerminated TenantLifecycleState = "TERMINATED"
 )
 
 // ValidTenantLifecycleTransitions maps valid source states to allowed target states.
@@ -28,7 +36,8 @@ var ValidTenantLifecycleTransitions = map[TenantLifecycleState][]TenantLifecycle
 	TenantLifecycleOnboarding:  {TenantLifecycleActive},
 	TenantLifecycleActive:      {TenantLifecycleSuspended, TenantLifecycleOffboarding},
 	TenantLifecycleSuspended:   {TenantLifecycleActive, TenantLifecycleOffboarding},
-	TenantLifecycleOffboarding: {}, // terminal state
+	TenantLifecycleOffboarding: {TenantLifecycleTerminated},
+	TenantLifecycleTerminated:  {}, // terminal state
 }
 
 // EntityType classifies the legal form of a legal entity.

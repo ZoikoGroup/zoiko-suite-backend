@@ -39,6 +39,20 @@ type RiskSignalWriter interface {
 	UpsertSignal(ctx context.Context, signal domain.RiskSignalCache) error
 }
 
+// LegalHoldProjector is the write half of this service's READ-ONLY view of
+// GOV-10's holds.
+//
+// "Write half" of a "read-only view" is not a contradiction: the rows are
+// written here, from GOV-10's events, and nowhere else. There is deliberately
+// no Issue or Release method on this service — the authority matrix states
+// GOV-01 must never own a legal-hold matter, and the only way to keep that
+// true in code rather than only in the document is to give the service no
+// capability to create one.
+type LegalHoldProjector interface {
+	UpsertLegalHold(ctx context.Context, hold domain.LegalHold) error
+	ReleaseLegalHold(ctx context.Context, holdID, tenantID, eventID string, releasedAt time.Time) error
+}
+
 // dedupeTTL bounds how long an event id is remembered. Long enough to cover a
 // broker redelivery or a consumer restart, short enough that the keyspace does
 // not grow without limit.
@@ -92,11 +106,13 @@ func (d *RedisDeduper) Claim(ctx context.Context, eventID string) (bool, error) 
 // why revocation events changed nothing and the risk cache — whose only writer
 // is HandleRiskSignalUpdate — was permanently empty, pinning every resolved
 // session to STANDARD posture with signal source UNAVAILABLE.
+//	legal.hold.*        → project GOV-10's holds so disposition can be refused
 type Consumer struct {
 	log      *zap.Logger
 	sessions SessionRevoker
 	roles    RoleDirectory
 	risk     RiskSignalWriter
+	holds    LegalHoldProjector
 	dedupe   Deduper
 }
 
@@ -105,21 +121,29 @@ func NewConsumer(
 	sessions SessionRevoker,
 	roles RoleDirectory,
 	risk RiskSignalWriter,
+	holds LegalHoldProjector,
 	dedupe Deduper,
 ) *Consumer {
-	return &Consumer{log: log, sessions: sessions, roles: roles, risk: risk, dedupe: dedupe}
+	return &Consumer{log: log, sessions: sessions, roles: roles, risk: risk, holds: holds, dedupe: dedupe}
 }
 
 // inbound is the read side of the platform event contract the publisher emits.
 // Only the fields this service acts on are declared; unknown fields are ignored
 // so a producer adding one does not break consumption.
 type inbound struct {
-	EventID       string          `json:"event_id"`
-	EventType     string          `json:"event_type"`
+	EventID   string `json:"event_id"`
+	EventType string `json:"event_type"`
+	// SourceService is read solely for the self-source guard in Handle. It is
+	// part of the platform envelope every producer sets, so an event without
+	// one is a producer bug — but it is treated as "not us" rather than
+	// dropped, because refusing to consume a real revocation over a missing
+	// provenance field would fail open on the control that matters.
+	SourceService string          `json:"source_service"`
 	TenantID      string          `json:"tenant_id"`
 	LegalEntityID string          `json:"legal_entity_id"`
 	ActorID       string          `json:"actor_id"`
 	CorrelationID string          `json:"correlation_id"`
+	EmittedAt     time.Time       `json:"emitted_at"`
 	Payload       json.RawMessage `json:"payload"`
 }
 
@@ -211,6 +235,28 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 		return
 	}
 
+	// ── Self-source guard ────────────────────────────────────────────────────
+	//
+	// The reader and the writer are pointed at the SAME topic (one topic per
+	// service, set once in cmd/server), so everything this service publishes
+	// comes straight back to it. That is normally harmless — none of the
+	// handlers below match our own event names — but it was not harmless once:
+	// this service published "session.risk.changed" on a risk-cache miss and
+	// subscribed to "session.risk.changed" as the sole writer of that cache,
+	// so it consumed its own telemetry.
+	//
+	// The event has since been renamed to identity.risk_signal.unavailable,
+	// which fixes that instance. This guard fixes the CLASS: any future event
+	// whose name happens to collide with one we consume is dropped here rather
+	// than discovered in production. A service is never an authority on its
+	// own inbound facts.
+	if ev.SourceService == SourceServiceName {
+		c.log.Debug("own event ignored",
+			zap.String("event_type", ev.EventType),
+			zap.String("event_id", ev.EventID))
+		return
+	}
+
 	switch ev.EventType {
 	case "authority.revoked", "authority.expired":
 		c.handleAuthorityEnded(ctx, ev)
@@ -222,6 +268,12 @@ func (c *Consumer) Handle(ctx context.Context, raw []byte) {
 		c.handleEntityUpdated(ctx, ev)
 	case "session.risk.changed", "risk.signal.updated":
 		c.handleRiskSignal(ctx, ev)
+	case "legal.hold.issued", "LegalHoldIssued":
+		c.handleLegalHoldIssued(ctx, ev)
+	case "legal.hold.scope_changed", "HoldScopeChanged":
+		c.handleLegalHoldIssued(ctx, ev)
+	case "legal.hold.released", "LegalHoldReleased":
+		c.handleLegalHoldReleased(ctx, ev)
 	case "tenant.created":
 		// Acknowledged deliberately. There is no tenant cache to pre-warm —
 		// tenant validity is read live from the registry on every resolve.
@@ -385,6 +437,28 @@ func (c *Consumer) handleRiskSignal(ctx context.Context, ev inbound) {
 		return
 	}
 
+	// A signal with no valid_to is not cacheable: UpsertSignal computes its TTL
+	// as time.Until(ValidTo), so a zero time produces a negative TTL and the
+	// write is silently skipped. Refusing it here, loudly, rather than letting
+	// it fall through — the previous code logged "risk signal cached" for
+	// exactly these, which is a log line asserting something that did not
+	// happen, and it is the kind of line an operator reads as proof the
+	// pipeline works.
+	if signal.ValidTo.IsZero() {
+		c.log.Error("risk signal has no valid_to — not cacheable, dropped",
+			zap.String("event_id", ev.EventID),
+			zap.String("principal_id", signal.PrincipalID),
+			zap.String("signal_source", signal.SignalSource))
+		return
+	}
+	if !signal.ValidTo.After(time.Now()) {
+		c.log.Warn("risk signal already expired on arrival — dropped",
+			zap.String("event_id", ev.EventID),
+			zap.String("principal_id", signal.PrincipalID),
+			zap.Time("valid_to", signal.ValidTo))
+		return
+	}
+
 	if err := c.risk.UpsertSignal(ctx, signal); err != nil {
 		c.log.Error("failed to write risk signal",
 			zap.String("principal_id", signal.PrincipalID), zap.Error(err))
@@ -394,7 +468,136 @@ func (c *Consumer) handleRiskSignal(ctx context.Context, ev inbound) {
 		zap.String("principal_id", signal.PrincipalID),
 		zap.Int("signal_value", signal.SignalValue),
 		zap.String("signal_source", signal.SignalSource),
+		zap.Time("valid_to", signal.ValidTo),
 	)
+}
+
+// ── Legal hold projection (GOV-10 → local read model) ────────────────────────
+
+// handleLegalHoldIssued projects an issued or rescoped hold.
+//
+// Issue and scope-change share a handler because the projection is a snapshot,
+// not a log: what matters downstream is "is this record held right now", and
+// both events answer that the same way. The distinction lives in GOV-10, which
+// owns the matter.
+func (c *Consumer) handleLegalHoldIssued(ctx context.Context, ev inbound) {
+	var p struct {
+		HoldID      string     `json:"hold_id"`
+		MatterRef   string     `json:"matter_ref"`
+		PrincipalID string     `json:"principal_id"`
+		TenantID    string     `json:"tenant_id"`
+		IssuedAt    *time.Time `json:"issued_at"`
+	}
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		c.log.Error("undecodable legal hold payload — dropped",
+			zap.String("event_id", ev.EventID), zap.Error(err))
+		return
+	}
+	if p.HoldID == "" {
+		c.log.Error("legal hold names no hold_id — dropped",
+			zap.String("event_id", ev.EventID))
+		return
+	}
+
+	tenantID := firstNonEmpty(p.TenantID, ev.TenantID)
+	if tenantID == "" {
+		// A hold with no tenant cannot be projected — the table is
+		// tenant-scoped by RLS and there is nothing to scope it to. This is
+		// louder than the equivalent case elsewhere because failing to record
+		// a hold means a later sweep will happily delete what it covers.
+		c.log.Error("legal hold names no tenant — CANNOT PROJECT, disposition may proceed",
+			zap.String("event_id", ev.EventID),
+			zap.String("hold_id", p.HoldID))
+		return
+	}
+	if !c.claim(ctx, ev.EventID) {
+		return
+	}
+
+	issuedAt := ev.EmittedAt
+	if p.IssuedAt != nil {
+		issuedAt = *p.IssuedAt
+	}
+	if issuedAt.IsZero() {
+		issuedAt = time.Now().UTC()
+	}
+
+	hold := domain.LegalHold{
+		HoldID:      p.HoldID,
+		TenantID:    tenantID,
+		MatterRef:   p.MatterRef,
+		IssuedAt:    issuedAt,
+		LastEventID: ev.EventID,
+		LastEventAt: orNow(ev.EmittedAt),
+	}
+	if p.PrincipalID != "" {
+		hold.PrincipalID = &p.PrincipalID
+	}
+
+	if err := c.holds.UpsertLegalHold(ctx, hold); err != nil {
+		c.log.Error("failed to project legal hold — disposition may proceed on held records",
+			zap.String("hold_id", p.HoldID), zap.Error(err))
+		return
+	}
+	c.log.Info("legal hold projected",
+		zap.String("hold_id", p.HoldID),
+		zap.String("tenant_id", tenantID),
+		zap.String("matter_ref", p.MatterRef),
+		zap.Bool("tenant_wide", hold.PrincipalID == nil),
+	)
+}
+
+// handleLegalHoldReleased marks a hold released so disposition may resume.
+func (c *Consumer) handleLegalHoldReleased(ctx context.Context, ev inbound) {
+	var p struct {
+		HoldID     string     `json:"hold_id"`
+		TenantID   string     `json:"tenant_id"`
+		ReleasedAt *time.Time `json:"released_at"`
+	}
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		c.log.Error("undecodable legal hold release payload — dropped",
+			zap.String("event_id", ev.EventID), zap.Error(err))
+		return
+	}
+	if p.HoldID == "" {
+		c.log.Error("legal hold release names no hold_id — dropped",
+			zap.String("event_id", ev.EventID))
+		return
+	}
+	tenantID := firstNonEmpty(p.TenantID, ev.TenantID)
+	if tenantID == "" {
+		c.log.Error("legal hold release names no tenant — dropped",
+			zap.String("event_id", ev.EventID), zap.String("hold_id", p.HoldID))
+		return
+	}
+	if !c.claim(ctx, ev.EventID) {
+		return
+	}
+
+	releasedAt := orNow(ev.EmittedAt)
+	if p.ReleasedAt != nil {
+		releasedAt = *p.ReleasedAt
+	}
+
+	if err := c.holds.ReleaseLegalHold(ctx, p.HoldID, tenantID, ev.EventID, releasedAt); err != nil {
+		c.log.Error("failed to release projected legal hold",
+			zap.String("hold_id", p.HoldID), zap.Error(err))
+		return
+	}
+	c.log.Info("legal hold released",
+		zap.String("hold_id", p.HoldID),
+		zap.String("tenant_id", tenantID))
+}
+
+// orNow substitutes the current time for a zero timestamp. Producers should
+// always set emitted_at; one that does not must not leave a NOT NULL column
+// holding the Go zero time, which Postgres renders as year 1 and every report
+// then sorts to the top.
+func orNow(t time.Time) time.Time {
+	if t.IsZero() {
+		return time.Now().UTC()
+	}
+	return t
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

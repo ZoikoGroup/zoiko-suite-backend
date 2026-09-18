@@ -75,10 +75,25 @@ func (m *mockPrincipalStore) UpdateStatus(_ context.Context, _, _ string, _ doma
 }
 
 // mockSessionCache
+//
+// GUARDED BY A MUTEX. The concurrency profile in nfr_test.go drives sixteen
+// goroutines through Resolve at once, and the real DurableCache is safe there
+// because its two backing stores are — Postgres and Redis clients both are.
+// A bare Go map is not, and the unguarded version failed with "concurrent map
+// writes" the moment the load test ran, which is a defect in the fixture
+// rather than in what it stands for.
 type mockSessionCache struct {
+	mu          sync.Mutex
 	stored      map[string]string
 	storedCtx   map[string]*domain.SessionContext
 	invalidated []string
+
+	// persistErr forces the atomic evidence write to fail.
+	persistErr error
+	// resolvedEvents records the identity.context.resolved events that were
+	// written alongside each session, so a test can assert the two really do
+	// travel together rather than merely that the row landed.
+	resolvedEvents []domain.ContextResolvedEvent
 }
 
 func newMockSessionCache() *mockSessionCache {
@@ -88,27 +103,57 @@ func newMockSessionCache() *mockSessionCache {
 	}
 }
 func (m *mockSessionCache) Put(_ context.Context, id, jwt string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.stored[id] = jwt
 	return nil
 }
 func (m *mockSessionCache) Get(_ context.Context, id, _ string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if v, ok := m.stored[id]; ok {
 		return v, nil
 	}
 	return "", errors.New("not found")
 }
 func (m *mockSessionCache) Evict(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	delete(m.stored, id)
 	return nil
 }
 func (m *mockSessionCache) PersistSessionContext(_ context.Context, sc domain.SessionContext) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.storedCtx[sc.SessionContextID] = &sc
 	return nil
 }
+
+// persistErr, when set, makes the atomic evidence write fail — which the
+// resolver now treats as fatal to the resolution. See
+// TestResolveRefusesWhenEvidenceCannotBeRecorded.
+func (m *mockSessionCache) PersistSessionContextWithEvent(
+	_ context.Context,
+	sc domain.SessionContext,
+	ev domain.ContextResolvedEvent,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.persistErr != nil {
+		return m.persistErr
+	}
+	m.storedCtx[sc.SessionContextID] = &sc
+	m.resolvedEvents = append(m.resolvedEvents, ev)
+	return nil
+}
 func (m *mockSessionCache) GetSessionContext(_ context.Context, id, _ string) (*domain.SessionContext, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.storedCtx[id], nil
 }
 func (m *mockSessionCache) Invalidate(_ context.Context, id, _ string, reason domain.InvalidationReason, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.invalidated = append(m.invalidated, id)
 	if sc, ok := m.storedCtx[id]; ok {
 		sc.InvalidatedAt = &at
@@ -240,32 +285,52 @@ func (m *mockEventPublisher) RiskUnavailable() int {
 	return m.riskUnavailable
 }
 
+// notify sends a completion token without ever blocking.
+//
+// The channels are buffered at 10, which is plenty for a test asserting on a
+// handful of publishes and NOT enough for the load profile in nfr_test.go,
+// which drives thousands of resolutions. A blocking send there wedged the
+// publish goroutines forever and made Drain time out — reported as a goroutine
+// leak in the RESOLVER, which was wrong: the resolver was fine and the fixture
+// was the thing that could not keep up.
+//
+// Dropping a token when nobody is waiting is the correct behaviour for what
+// these channels are: a synchronisation aid for tests that call waitN, not an
+// accounting record. The counters above are the accounting record, and they
+// are taken under the mutex before this is reached.
+func (m *mockEventPublisher) notify(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
 func (m *mockEventPublisher) PublishContextResolved(_ context.Context, _, _, _, _, _ string) error {
 	m.mu.Lock()
 	m.resolved++
 	m.mu.Unlock()
-	m.ResolvedCh <- struct{}{}
+	m.notify(m.ResolvedCh)
 	return nil
 }
 func (m *mockEventPublisher) PublishResolutionFailed(_ context.Context, _, _, _ string) error {
 	m.mu.Lock()
 	m.failed++
 	m.mu.Unlock()
-	m.FailedCh <- struct{}{}
+	m.notify(m.FailedCh)
 	return nil
 }
 func (m *mockEventPublisher) PublishSessionInvalidated(_ context.Context, _, _ string, _ domain.InvalidationReason, _ string) error {
 	m.mu.Lock()
 	m.invalidated++
 	m.mu.Unlock()
-	m.InvalidatedCh <- struct{}{}
+	m.notify(m.InvalidatedCh)
 	return nil
 }
 func (m *mockEventPublisher) PublishRiskSignalUnavailable(_ context.Context, _, _ string) error {
 	m.mu.Lock()
 	m.riskUnavailable++
 	m.mu.Unlock()
-	m.RiskUnavailableCh <- struct{}{}
+	m.notify(m.RiskUnavailableCh)
 	return nil
 }
 func (m *mockEventPublisher) PublishPrincipalStatusChanged(_ context.Context, _, _ string, _ domain.PrincipalStatus, _, _ string) error {
@@ -335,19 +400,69 @@ func (f *resolverFixture) build() *identityctx.Resolver {
 
 func TestResolve_AllSixDimensionsSuccess(t *testing.T) {
 	f := defaultFixture()
-	jwt, err := f.build().Resolve(context.Background(), baseRequest)
+	result, err := f.build().Resolve(context.Background(), baseRequest)
 
 	require.NoError(t, err)
-	assert.Equal(t, "signed-envelope-jwt", jwt)
+	assert.Equal(t, "signed-envelope-jwt", result.EnvelopeJWT)
+
+	// The spec's envelope section requires an evidence_id on every material
+	// governance decision, and issuing a signed identity envelope is the most
+	// material one this service makes. Resolve used to return a bare JWT, so
+	// a caller had no way to cite the decision that granted it.
+	assert.NotEmpty(t, result.EvidenceID, "resolution must return an evidence id")
+	assert.NotEmpty(t, result.SessionContextID)
+	assert.True(t, result.ExpiresAt.After(time.Now()), "envelope must not be issued already expired")
 }
 
-func TestResolve_PublishesContextResolvedEvent(t *testing.T) {
+// TestResolve_WritesContextResolvedEventAtomically pins the transactional
+// outbox at the one place it matters.
+//
+// The event is NO LONGER published from a goroutine. It is written into
+// event_outbox in the same transaction as the session_contexts row, so this
+// asserts on the atomic write rather than waiting for a fire-and-forget
+// publish that will never arrive.
+//
+// That is the behaviour change the outbox exists for: before it, the row and
+// the event could fail independently, and both "a session with no event" and
+// "an event for a session that failed to persist" were reachable states.
+func TestResolve_WritesContextResolvedEventAtomically(t *testing.T) {
 	f := defaultFixture()
-	_, err := f.build().Resolve(context.Background(), baseRequest)
+	result, err := f.build().Resolve(context.Background(), baseRequest)
 	require.NoError(t, err)
-	// Block until the fire-and-forget goroutine has completed — no sleep.
-	f.events.waitResolved(t, 1)
-	assert.Equal(t, 1, f.events.Resolved())
+
+	require.Len(t, f.sessions.resolvedEvents, 1,
+		"the context.resolved event must be written with the session row, not published separately")
+
+	ev := f.sessions.resolvedEvents[0]
+	assert.Equal(t, activePrincipal.PrincipalID, ev.PrincipalID)
+	assert.Equal(t, result.SessionContextID, ev.SessionContextID)
+	assert.Equal(t, result.EvidenceID, ev.EvidenceID,
+		"the event must cite the same evidence id the caller was given")
+
+	// And nothing went out through the old fire-and-forget path.
+	assert.Equal(t, 0, f.events.Resolved(),
+		"context.resolved must not also be published out-of-band — that would double-emit")
+}
+
+// TestResolveRefusesWhenEvidenceCannotBeRecorded pins the changed stance on
+// evidence failure.
+//
+// This used to log-and-continue: a resolution that succeeded on all six
+// dimensions was not failed by an evidence-store hiccup. That was right when
+// Postgres held a mere duplicate of the Redis cache. It is wrong now that the
+// same transaction holds the ONLY copy of the event — a failure means no
+// evidence exists anywhere, and the service would be issuing a signed platform
+// credential with no record that it did so.
+func TestResolveRefusesWhenEvidenceCannotBeRecorded(t *testing.T) {
+	f := defaultFixture()
+	f.sessions.persistErr = errors.New("postgres is gone")
+
+	result, err := f.build().Resolve(context.Background(), baseRequest)
+
+	require.Error(t, err)
+	assert.Nil(t, result, "no envelope may be handed out when its issuance was not recorded")
+	assert.ErrorIs(t, err, identityctx.ErrUpstreamUnavailable,
+		"an unrecordable decision is a 503, not a credential")
 }
 
 func TestResolve_PersistsSessionContext(t *testing.T) {
@@ -447,9 +562,9 @@ func TestResolve_RiskCacheUnavailable_DefaultsToStandard_DoesNotBlock(t *testing
 	// nil signal → cache miss — resolver must default to STANDARD and succeed
 	f.riskSignals = &mockRiskSignalCache{signal: nil}
 
-	jwt, err := f.build().Resolve(context.Background(), baseRequest)
+	result, err := f.build().Resolve(context.Background(), baseRequest)
 	require.NoError(t, err)
-	assert.Equal(t, "signed-envelope-jwt", jwt)
+	assert.Equal(t, "signed-envelope-jwt", result.EnvelopeJWT)
 
 	f.events.waitRiskUnavailable(t, 1)
 	assert.Equal(t, 1, f.events.RiskUnavailable())
@@ -459,9 +574,9 @@ func TestResolve_RiskCacheErrors_DefaultsToStandard_DoesNotBlock(t *testing.T) {
 	f := defaultFixture()
 	f.riskSignals = &mockRiskSignalCache{err: errors.New("redis timeout")}
 
-	jwt, err := f.build().Resolve(context.Background(), baseRequest)
+	result, err := f.build().Resolve(context.Background(), baseRequest)
 	require.NoError(t, err)
-	assert.Equal(t, "signed-envelope-jwt", jwt)
+	assert.Equal(t, "signed-envelope-jwt", result.EnvelopeJWT)
 }
 
 // ── Mutual exclusivity of token inputs ────────────────────────────────────────

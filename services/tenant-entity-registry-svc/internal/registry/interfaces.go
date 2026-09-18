@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"zoiko.io/tenant-entity-registry-svc/internal/domain"
+	"zoiko.io/tenant-entity-registry-svc/internal/outbox"
 )
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,9 @@ type Store interface {
 	// TransitionTaxIdentityBundleStatus applies a status transition on a bundle header.
 	// Must be idempotent.
 	TransitionTaxIdentityBundleStatus(ctx context.Context, bundleID string, newStatus domain.TaxIdentityBundleStatus, actorID, correlationID string) error
+
+	// ORG-02/ORG-03 surfaces — see ORGStore at the bottom of this file.
+	ORGStore
 }
 
 // ---------------------------------------------------------------------------
@@ -151,4 +155,88 @@ type JurisdictionValidator interface {
 	// Returns jurisdiction.ErrJurisdictionNotFound if the ID does not exist.
 	// Returns jurisdiction.ErrValidatorUnavailable if the service is unreachable — callers fail-closed.
 	ValidateExists(ctx context.Context, jurisdictionID string) error
+}
+
+// ---------------------------------------------------------------------------
+// ORG-02 / ORG-03 store contract
+//
+// Added for the Organization / Legal Entity specification §4.2, §4.3, §8 and
+// §9.2. Kept as its own interface, embedded into Store below, for two reasons:
+// the ORG surface is coherent on its own and reads as one thing, and a reader
+// asking "what did the ORG completion add" gets an answer without diffing.
+// ---------------------------------------------------------------------------
+
+// TenantCommandParams is one named ORG-02 lifecycle command, ready to apply.
+type TenantCommandParams struct {
+	TenantID    string
+	Command     domain.TenantCommand
+	TargetState domain.TenantLifecycleState
+	// AllowedFrom are the lifecycle states this command may be invoked from.
+	// Passed to the store rather than checked before it so the state-machine
+	// test and the write are a single atomic statement — the same race-free
+	// shape TransitionEntityStatus already uses.
+	AllowedFrom []domain.TenantLifecycleState
+	// ExpectedVersion is always non-zero by the time it reaches the store: the
+	// service substitutes the version it read when the caller supplied none,
+	// which turns its read-then-write into a compare-and-swap.
+	ExpectedVersion int64
+	Reason          string
+	ActorID         string
+	ApprovedBy      string
+	CorrelationID   string
+}
+
+// TenantCommandResult reports what a successful command did.
+type TenantCommandResult struct {
+	FromState  domain.TenantLifecycleState `json:"from_state"`
+	ToState    domain.TenantLifecycleState `json:"to_state"`
+	NewVersion int64                       `json:"record_version"`
+	// Status is the tenant's status column after the command. Suspension moves
+	// it in step with lifecycle_state, because a SUSPENDED tenant whose status
+	// still reads ACTIVE is exactly the inconsistency §8 NP4 turns on.
+	Status domain.TenantStatus `json:"status"`
+}
+
+// ORGStore is the data-access contract for the ORG-02/ORG-03 surfaces.
+//
+// Every write here takes an *outbox.Record and is responsible for writing it
+// in the SAME transaction as the business fact. A nil record means "no event",
+// which is legitimate; an implementation that accepts a non-nil record and
+// does not write it transactionally is not implementing this interface.
+type ORGStore interface {
+	// ── ORG-02: named commands ──────────────────────────────────────────────
+
+	ExecuteTenantCommand(ctx context.Context, p TenantCommandParams, ev *outbox.Record) (*TenantCommandResult, error)
+	ChangeDefaultLocale(ctx context.Context, tenantID, locale, timezone, reason, actorID, correlationID string, expectedVersion int64, ev *outbox.Record) (*domain.Tenant, error)
+
+	// ── ORG-02: read surfaces ───────────────────────────────────────────────
+
+	ListTenantLifecycleHistory(ctx context.Context, tenantID string) ([]*domain.TenantLifecycleEvent, error)
+	GetTenantDefaults(ctx context.Context, tenantID string) (*domain.TenantDefaults, error)
+
+	// ── ORG-02: host bindings (ResolveTenantByHost, §8 NP3) ─────────────────
+
+	BindTenantHost(ctx context.Context, b *domain.TenantHostBinding) error
+	// ResolveTenantByHost is deliberately NOT tenant-scoped: it is the lookup
+	// that establishes which tenant a request belongs to. Returns (nil, nil)
+	// for an unknown hostname.
+	ResolveTenantByHost(ctx context.Context, hostname string) (*domain.ResolvedTenantByHost, error)
+	ListTenantHostBindings(ctx context.Context, tenantID string) ([]*domain.TenantHostBinding, error)
+
+	// ── ORG-03: profile versions ────────────────────────────────────────────
+
+	CreateInitialProfileVersion(ctx context.Context, v *domain.LegalEntityProfileVersion) error
+	AmendLegalProfile(ctx context.Context, legalEntityID string, next *domain.LegalEntityProfileVersion, expectedVersion int64, ev *outbox.Record) (*domain.LegalEntityProfileVersion, error)
+	ListEntityProfileVersions(ctx context.Context, legalEntityID string) ([]*domain.LegalEntityProfileVersion, error)
+	GetEntityProfileAsOf(ctx context.Context, legalEntityID string, asOf time.Time) (*domain.EntityAsOf, error)
+	FindEntitiesByRegistryNumber(ctx context.Context, registrationNumber, jurisdictionID string) ([]*domain.LegalEntity, error)
+
+	// ── ORG-03: registry conflict quarantine (§8 NP5) ───────────────────────
+
+	// FindActiveEntityByRegistry returns the ACTIVE entity already holding this
+	// registry identity in this jurisdiction, or (nil, nil) if there is none.
+	FindActiveEntityByRegistry(ctx context.Context, registrationNumber, jurisdictionID string) (*domain.LegalEntity, error)
+	RecordRegistryConflict(ctx context.Context, c *domain.EntityRegistryConflict) error
+	ListRegistryConflicts(ctx context.Context, openOnly bool) ([]*domain.EntityRegistryConflict, error)
+	ResolveRegistryConflict(ctx context.Context, conflictID string, status domain.RegistryConflictStatus, note, actorID string) error
 }

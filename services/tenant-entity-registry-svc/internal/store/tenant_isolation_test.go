@@ -26,6 +26,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -95,24 +97,29 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Run migrations
-	migrations := []string{
-		"000001_initial_schema.up.sql",
-		"000002_add_tenant_id_to_junction_tables.up.sql",
-		"000003_add_residency_region_to_policies.up.sql",
-		"000004_add_data_classification.up.sql",
-		"000005_add_workspaces.up.sql",
+	// Run migrations. Discovered from the directory, NOT listed inline: a
+	// hand-written list silently skips the migration added after it was
+	// written, and every test in this file then runs against a schema missing
+	// those tables while still reporting ok. backend-completion-tracker.md
+	// records this estate hitting that exact trap once already.
+	migrations, globErr := filepath.Glob("../../deployments/migrations/*.up.sql")
+	if globErr != nil || len(migrations) == 0 {
+		fmt.Printf("no migrations found: %v\n", globErr)
+		testPool.Close()
+		_ = pg.Stop()
+		os.Exit(1)
 	}
+	sort.Strings(migrations)
 	for _, mig := range migrations {
-		sql, err := os.ReadFile("../../deployments/migrations/" + mig)
-		if err != nil {
-			fmt.Printf("failed to read migration %s: %v\n", mig, err)
+		sql, readErr := os.ReadFile(mig)
+		if readErr != nil {
+			fmt.Printf("failed to read migration %s: %v\n", mig, readErr)
 			testPool.Close()
 			_ = pg.Stop()
 			os.Exit(1)
 		}
 		if _, err = testPool.Exec(ctx, string(sql)); err != nil {
-			fmt.Printf("failed to apply migration %s: %v\n", mig, err)
+			fmt.Printf("failed to apply migration %s: %v\n", filepath.Base(mig), err)
 			testPool.Close()
 			_ = pg.Stop()
 			os.Exit(1)

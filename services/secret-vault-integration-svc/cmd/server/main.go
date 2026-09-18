@@ -167,7 +167,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, vaultBackend, publisher, authzClient, cfg.AuthZPlatformScopeID, log)
+	h := handler.New(pgStore, vaultBackend, publisher, authzClient, cfg.AuthZPlatformScopeID, log).UseMetrics(metrics)
 	handler.RegisterRoutes(r, h)
 
 	// ── 8. Health probes + metrics ────────────────────────────────────────────

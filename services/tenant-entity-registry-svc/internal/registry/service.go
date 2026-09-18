@@ -253,30 +253,95 @@ func (s *Service) CreateEntity(
 		return nil, err
 	}
 
+	// The body's tenant_id must be the caller's own verified tenant.
+	//
+	// Previously unchecked: row-level security refused the insert when they
+	// disagreed (the INSERT names the body tenant while the policy checks the
+	// verified one), so nothing could be written cross-tenant -- but the
+	// refusal arrived as a policy violation mapped to a 500, and every check
+	// before it had been evaluated against the wrong tenant. Refusing here
+	// makes the answer a 404 and makes the checks that follow meaningful.
+	if err := s.assertTenantScope(ctx, req.TenantID); err != nil {
+		return nil, err
+	}
+
+	// ORG §8 NP4: a tenant that is suspended, offboarding or terminated may not
+	// perform protected writes. Creating a legal entity is as protected as a
+	// write gets in this service.
+	if err := s.assertTenantMayTransact(ctx, req.TenantID); err != nil {
+		return nil, err
+	}
+
 	// Synchronous jurisdiction validation — fail-closed per Q2 resolution.
 	if err := s.jurisd.ValidateExists(ctx, req.PrimaryJurisdictionID); err != nil {
 		return nil, s.mapJurisdictionErr(err, req.PrimaryJurisdictionID)
 	}
 
+	// ORG §8 NP5: refuse and QUARANTINE if an active entity in this
+	// jurisdiction already claims this registry identity. Deliberately before
+	// the insert: writing the entity and flagging it afterwards would leave two
+	// active entities holding one registry identity in the authoritative table,
+	// which is the state this negative path exists to prevent.
+	if err := s.CheckRegistryIdentity(ctx, req.TenantID, req.RegistrationNumber, req.PrimaryJurisdictionID,
+		map[string]any{
+			"entity_code":         req.EntityCode,
+			"legal_name":          req.LegalName,
+			"entity_type":         string(req.EntityType),
+			"registration_number": req.RegistrationNumber,
+			"attempted_by":        "CreateEntity",
+		}, req.CorrelationID); err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
 	e := &domain.LegalEntity{
 		LegalEntityID:         newID(),
 		TenantID:              req.TenantID,
 		EntityCode:            req.EntityCode,
 		LegalName:             req.LegalName,
 		TradingName:           nullableString(req.TradingName),
+		RegistrationNumber:    nullableString(req.RegistrationNumber),
+		IncorporationDate:     req.IncorporationDate,
 		EntityType:            req.EntityType,
 		DefaultCurrencyCode:   req.DefaultCurrencyCode,
 		FiscalCalendarID:      req.FiscalCalendarID,
 		PrimaryJurisdictionID: req.PrimaryJurisdictionID,
 		EntityStatus:          domain.EntityStatusActive,
 		DataResidencyPolicyID: req.DataResidencyPolicyID,
-		CreatedAt:             time.Now().UTC(),
+		RecordVersion:         1,
+		CreatedAt:             now,
 		CreatedByPrincipalID:  domain.PrincipalFromContext(ctx),
 	}
 
 	if err := s.store.CreateEntity(ctx, e); err != nil {
 		s.log.Error("create entity failed", zap.Error(err), zap.String("correlation_id", req.CorrelationID))
 		return nil, fmt.Errorf("store.CreateEntity: %w", err)
+	}
+
+	// ORG-03 version 1. Written after the entity because of the foreign key,
+	// and NOT fatal if it fails: the entity itself is already durable and
+	// refusing to return it would leave the caller believing a create failed
+	// that did not. A missing version 1 degrades as-of reads for this entity
+	// only, is visible in the log, and AmendLegalProfile reseeds from the
+	// entity's own identity when it finds no prior version.
+	initial := &domain.LegalEntityProfileVersion{
+		ProfileVersionID:            newID(),
+		TenantID:                    e.TenantID,
+		LegalEntityID:               e.LegalEntityID,
+		VersionNumber:               1,
+		LegalName:                   e.LegalName,
+		TradingName:                 e.TradingName,
+		RegistrationNumber:          e.RegistrationNumber,
+		IncorporationJurisdictionID: &e.PrimaryJurisdictionID,
+		DefaultCurrencyCode:         &e.DefaultCurrencyCode,
+		EffectiveFrom:               now,
+		ChangeReason:                domain.ProfileChangeInitial,
+		CreatedByPrincipalID:        e.CreatedByPrincipalID,
+	}
+	if err := s.store.CreateInitialProfileVersion(ctx, initial); err != nil {
+		s.log.Error("initial profile version write failed; as-of reads for this entity will be incomplete",
+			zap.String("legal_entity_id", e.LegalEntityID),
+			zap.Error(err))
 	}
 
 	go s.events.PublishEntityCreated(ctx, e, req.CorrelationID)
@@ -299,6 +364,12 @@ func (s *Service) CreateWorkspace(
 	req domain.CreateWorkspaceRequest,
 ) (*domain.Workspace, error) {
 	if err := s.authorize(ctx, "workspace", "create"); err != nil {
+		return nil, err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return nil, err
 	}
 
@@ -356,6 +427,12 @@ func (s *Service) UpdateWorkspace(
 	if err := s.authorize(ctx, "workspace", "update"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
 
 	if req.BillingClassification != nil {
 		if !domain.ValidBillingClassifications[domain.BillingClassification(*req.BillingClassification)] {
@@ -410,6 +487,12 @@ func (s *Service) TransitionWorkspaceStatus(
 	req domain.TransitionWorkspaceStatusRequest,
 ) error {
 	if err := s.authorize(ctx, "workspace", "status.transition"); err != nil {
+		return err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return err
 	}
 
@@ -519,6 +602,12 @@ func (s *Service) UpdateEntity(
 	if err := s.authorize(ctx, "entity", "update"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
 
 	// Populate audit actor from the verified envelope JWT.
 	// actorFromJWT performs payload-only decoding — signature is already
@@ -568,6 +657,12 @@ func (s *Service) TransitionEntityStatus(
 	req domain.TransitionEntityStatusRequest,
 ) error {
 	if err := s.authorize(ctx, "entity", "status.transition"); err != nil {
+		return err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return err
 	}
 
@@ -636,6 +731,12 @@ func (s *Service) CreateHierarchy(
 	if err := s.authorize(ctx, "entity.hierarchy", "create"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
 
 	h := &domain.EntityHierarchy{
 		HierarchyID:          newID(),
@@ -667,6 +768,12 @@ func (s *Service) EndDateHierarchy(
 	if err := s.authorize(ctx, "entity.hierarchy", "end-date"); err != nil {
 		return err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return err
+	}
 
 	if err := s.store.EndDateHierarchy(ctx, hierarchyID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateHierarchy: %w", err)
@@ -694,6 +801,12 @@ func (s *Service) AssignJurisdiction(
 	req domain.AssignJurisdictionRequest,
 ) (*domain.EntityJurisdictionAssignment, error) {
 	if err := s.authorize(ctx, "entity.jurisdiction", "assign"); err != nil {
+		return nil, err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return nil, err
 	}
 
@@ -738,6 +851,12 @@ func (s *Service) EndDateJurisdictionAssignment(
 	if err := s.authorize(ctx, "entity.jurisdiction", "end-date"); err != nil {
 		return err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return err
+	}
 
 	if err := s.store.EndDateJurisdictionAssignment(ctx, assignmentID, endDate, domain.PrincipalFromContext(ctx), correlationID); err != nil {
 		return fmt.Errorf("store.EndDateJurisdictionAssignment: %w", err)
@@ -762,6 +881,12 @@ func (s *Service) CreateResidencyPolicy(
 	req domain.CreateResidencyPolicyRequest,
 ) (*domain.DataResidencyPolicy, error) {
 	if err := s.authorize(ctx, "residency.policy", "create"); err != nil {
+		return nil, err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return nil, err
 	}
 
@@ -883,6 +1008,12 @@ func (s *Service) CreateTaxIdentityBundle(
 	if err := s.authorize(ctx, "tax-identity-bundle", "create"); err != nil {
 		return nil, err
 	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
+		return nil, err
+	}
 
 	if req.DataClassification != "" {
 		if !classification.Classification(req.DataClassification).Valid() {
@@ -938,6 +1069,12 @@ func (s *Service) TransitionTaxIdentityBundleStatus(
 	req domain.TransitionTaxIdentityBundleStatusRequest,
 ) error {
 	if err := s.authorize(ctx, "tax-identity-bundle", "status.transition"); err != nil {
+		return err
+	}
+	// ORG §8 NP4: protected writes are refused while the tenant's lifecycle
+	// state forbids transacting. The tenant comes from the verified context,
+	// not from the request body.
+	if err := s.assertTenantMayTransact(ctx, ""); err != nil {
 		return err
 	}
 	return s.store.TransitionTaxIdentityBundleStatus(ctx, bundleID, req.NewStatus, domain.PrincipalFromContext(ctx), req.CorrelationID)

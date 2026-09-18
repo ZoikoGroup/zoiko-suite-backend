@@ -119,6 +119,56 @@ filtering that was always the case. Adding real RLS policies to those is a
 separate, larger effort (each needs its own policy design, not just a
 credential change).
 
+## Resolved: tenant-entity-registry-svc had no ORG-02/ORG-03 command or as-of surface
+
+Closed 2026-09-18. Verified against a running service and a real Postgres;
+`services/tenant-entity-registry-svc/scripts/audit.sh` re-runs the proof (37
+checks) and `RELEASE_CERTIFICATE.md` records what was NOT done as well as what
+was.
+
+The central one was ORG-03's: `UpdateEntity` mutated `legal_entities` in place,
+so changing a legal name destroyed the name the financial history had been
+booked under. §8 NP6 requires the opposite — a historical read must resolve the
+ORIGINAL version — and that is not expressible against a single mutable row.
+`legal_entity_profile_versions` is bitemporal (business time and record time
+kept apart, because they differ exactly when a change is backdated, which is
+the case §9.2 requires as-of retrieval to be verified against).
+
+Also closed: the five named lifecycle commands (a generic "set target state"
+route satisfies the state machine but not the DoD gate, because the evidence
+record then cannot say which governance command was invoked); durable lifecycle
+evidence with actor, reason and approver; `expected_version` on every command;
+host→tenant bindings, without which §8 NP3 was not merely untested but
+untestable; the §8 NP5 duplicate-registry quarantine; and a transactional
+outbox for the command paths.
+
+Four defects in EXISTING code surfaced while doing it, all pre-existing:
+
+1. Both store test files named their migrations inline, so `000006` would have
+   been silently skipped and every test would have run against a schema missing
+   its tables while still reporting `ok` — the same trap
+   backend-completion-tracker.md row 8 records. Both now discover `*.up.sql`
+   from the directory and fail if they find none.
+2. `openapi.yaml` was missing six live routes (all five workspace routes and
+   `/v1/tenants/{id}/residency-region`). Found by a new route/contract parity
+   test, not by reading. A consumer generating a client got no workspace methods.
+3. An unscoped read returned **500**, not 404: the empty tenant reached the
+   query and Postgres refused to cast `''` to uuid. Failed closed, but reported
+   as a server fault, so an unauthenticated probe was indistinguishable from an
+   outage.
+4. `CreateEntity` never checked the body's `tenant_id` against the verified
+   tenant, and the lifecycle gate preferred the body value over it. RLS refused
+   the insert when they disagreed, so nothing could be written cross-tenant —
+   but every check before that point had run against a tenant the caller named.
+
+Carried forward, deliberately: `MergeDuplicateCandidate` is not implemented (a
+correct merge must re-point references this service has no inventory of, and §1
+prohibits destructive merge, so a merge here would either orphan references or
+be one in name only); `Idempotency-Key` is required but not yet used to
+deduplicate a retried command; and the pre-existing write paths still publish to
+Kafka after commit rather than through the outbox. `asyncapi.yaml` marks which
+events take which path, and a test refuses a false claim.
+
 ## Resolved: tenant-entity-registry-svc trusted an unsigned JWT for tenant isolation
 
 Three defects that compounded, all closed 2026-08-05 and verified against

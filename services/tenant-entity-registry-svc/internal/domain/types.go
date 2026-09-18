@@ -19,10 +19,15 @@ type Tenant struct {
 	PrimaryLocale                string               `json:"primary_locale"`
 	DefaultDataResidencyPolicyID string               `json:"default_data_residency_policy_id"`
 	LifecycleState               TenantLifecycleState `json:"lifecycle_state"`
-	CreatedAt                    time.Time            `json:"created_at"`
-	UpdatedAt                    time.Time            `json:"updated_at"`
-	CreatedByPrincipalID         string               `json:"created_by_principal_id"`
-	UpdatedByPrincipalID         string               `json:"updated_by_principal_id"`
+	// RecordVersion is the optimistic-concurrency token ORG-02 requires on
+	// lifecycle commands ("lifecycle commands use expected_version").
+	// Incremented by every guarded write; a command carrying a stale value is
+	// refused rather than silently overwriting the change that moved it.
+	RecordVersion        int64     `json:"record_version"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -48,11 +53,14 @@ type LegalEntity struct {
 	PrimaryJurisdictionID string       `json:"primary_jurisdiction_id"`
 	// DataResidencyPolicyID is MANDATORY per data-model §05.3 modeling rule 2.
 	// No LegalEntity may be created without a valid residency policy.
-	DataResidencyPolicyID string    `json:"data_residency_policy_id"`
-	CreatedAt             time.Time `json:"created_at"`
-	UpdatedAt             time.Time `json:"updated_at"`
-	CreatedByPrincipalID  string    `json:"created_by_principal_id"`
-	UpdatedByPrincipalID  string    `json:"updated_by_principal_id"`
+	DataResidencyPolicyID string `json:"data_residency_policy_id"`
+	// RecordVersion is the optimistic-concurrency token ORG-03 requires
+	// ("commands use UUID and expected_version"). See Tenant.RecordVersion.
+	RecordVersion        int64     `json:"record_version"`
+	CreatedAt            time.Time `json:"created_at"`
+	UpdatedAt            time.Time `json:"updated_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+	UpdatedByPrincipalID string    `json:"updated_by_principal_id"`
 }
 
 // ---------------------------------------------------------------------------
@@ -210,11 +218,20 @@ type TransitionTenantLifecycleRequest struct {
 }
 
 type CreateEntityRequest struct {
-	TenantID              string     `json:"tenant_id"`
-	EntityCode            string     `json:"entity_code"`
-	LegalName             string     `json:"legal_name"`
-	TradingName           string     `json:"trading_name,omitempty"`
-	EntityType            EntityType `json:"entity_type"`
+	TenantID    string     `json:"tenant_id"`
+	EntityCode  string     `json:"entity_code"`
+	LegalName   string     `json:"legal_name"`
+	TradingName string     `json:"trading_name,omitempty"`
+	EntityType  EntityType `json:"entity_type"`
+	// RegistrationNumber is ORG-03's "registry number", listed among the
+	// required source inputs in §4.3. It was absent from this request until the
+	// ORG completion, which meant an entity could never claim a registry
+	// identity at creation -- and so §8 NP5 ("same registry number claimed by
+	// two active entities in the same jurisdiction") was not merely untested
+	// but unreachable. Optional: not every entity type has one.
+	RegistrationNumber string `json:"registration_number,omitempty"`
+	// IncorporationDate is §4.3's "registry ... date".
+	IncorporationDate     *time.Time `json:"incorporation_date,omitempty"`
 	DefaultCurrencyCode   string     `json:"default_currency_code"`
 	FiscalCalendarID      string     `json:"fiscal_calendar_id"`
 	PrimaryJurisdictionID string     `json:"primary_jurisdiction_id"`

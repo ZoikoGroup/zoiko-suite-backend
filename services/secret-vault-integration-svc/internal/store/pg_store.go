@@ -963,18 +963,32 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 // Returns domain.ErrLeaseNotFound-shaped semantics via a plain nil,nil on
 // no match (not found is a valid, expected outcome here, not an error).
 //
-// No withRLS/withPlatformScope wrapping needed: Rotate's handler never
-// sets TenantID on a ROTATED RecordAuditEntry call (rotation is a
-// property of the secret path, not any one tenant), so every ROTATED row
-// has tenant_id = NULL and always satisfies the policy's "tenant_id IS
-// NULL" branch regardless of session state.
+// Runs under withPlatformScope, and must: ROTATED rows now carry the
+// rotating caller's tenant_id (they used to be written with tenant_id =
+// NULL, which made every rotation invisible in the audit query of the
+// very tenants whose leases it revoked). A tenant-bound row is hidden by
+// this table's FORCE-ROW-LEVEL-SECURITY policy from a connection with no
+// app.tenant_id set — which is what this dedup lookup would be if it ran
+// on the bare pool. It would then find nothing, report "no prior
+// rotation", and let a retried request rotate the material a second
+// time: the exact double-rotation the request_id dedup exists to
+// prevent. Platform scope is the correct authority here rather than a
+// tenant one, because the dedup question — "has THIS request_id already
+// rotated anything, anywhere" — is platform-wide by definition, and
+// SECRET_ROTATE is already authorized at platform scope before the
+// handler reaches this call.
 func (s *PgStore) FindAuditEntryByRotationRequestID(ctx context.Context, requestID string) (*domain.SecretAccessAuditLog, error) {
 	const query = `
 		SELECT ` + auditLogColumns + `
 		FROM secret_access_audit_log
 		WHERE event_type = 'ROTATED' AND request_id = $1;`
 
-	a, err := scanAuditEntry(s.pool.QueryRow(ctx, query, requestID))
+	var a *domain.SecretAccessAuditLog
+	err := s.withPlatformScope(ctx, func(tx pgx.Tx) error {
+		var scanErr error
+		a, scanErr = scanAuditEntry(tx.QueryRow(ctx, query, requestID))
+		return scanErr
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil

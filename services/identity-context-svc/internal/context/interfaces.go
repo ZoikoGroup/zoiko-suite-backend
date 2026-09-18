@@ -34,6 +34,20 @@ type SessionCache interface {
 	Get(ctx context.Context, sessionContextID, tenantID string) (string, error)
 	Evict(ctx context.Context, sessionContextID string) error
 	PersistSessionContext(ctx context.Context, sc domain.SessionContext) error
+
+	// PersistSessionContextWithEvent writes the durable evidence row and its
+	// identity.context.resolved event in ONE transaction.
+	//
+	// This is the transactional outbox at the one place where atomicity
+	// between a business write and its evidence actually matters. A session
+	// that exists with no event, and an event for a session that failed to
+	// persist, are both states an audit cannot explain — and before the outbox
+	// landed, both were reachable.
+	//
+	// Unlike PersistSessionContext, a failure here is FATAL to the resolution.
+	// See the call site in Resolve for why the stance changed.
+	PersistSessionContextWithEvent(ctx context.Context, sc domain.SessionContext, ev domain.ContextResolvedEvent) error
+
 	GetSessionContext(ctx context.Context, sessionContextID, tenantID string) (*domain.SessionContext, error)
 	Invalidate(ctx context.Context, sessionContextID, tenantID string, reason domain.InvalidationReason, at time.Time) error
 

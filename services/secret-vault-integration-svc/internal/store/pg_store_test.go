@@ -18,6 +18,15 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		// A SILENT SKIP HERE TURNS THE WHOLE STORE SUITE INTO NOTHING while
+		// `go test ./...` still prints ok. Skip locally, where a developer
+		// without Postgres is a normal state, and FAIL wherever the run claims
+		// to be a verification. CI is set by GitHub Actions; REQUIRE_DB_TESTS
+		// is the local opt-in for reproducing a certification run by hand.
+		if os.Getenv("CI") != "" || os.Getenv("REQUIRE_DB_TESTS") != "" {
+			t.Fatal("TEST_DATABASE_URL is not set, but CI or REQUIRE_DB_TESTS is: " +
+				"this run claims to verify the store and would instead have skipped every test in it")
+		}
 		t.Skip("Skipping Postgres integration test: TEST_DATABASE_URL not set")
 	}
 
@@ -639,5 +648,119 @@ func TestPgStore_PlatformScope_RevokeLeasesBySecretPath_AcrossTenants(t *testing
 		if err != nil || got.Status != "REVOKED" {
 			t.Errorf("expected lease %s (tenant %s) to be REVOKED after rotation, got %+v err=%v", tc.leaseID, tc.tenant, got, err)
 		}
+	}
+}
+
+// TestPgStore_RotationAuditDedup_TenantBoundEntry covers the case the original
+// dedup test did not: a ROTATED entry that carries a tenant_id.
+//
+// ROTATED rows used to be written with tenant_id = NULL, which made every
+// rotation invisible in the audit query of the tenants whose leases it
+// revoked. Binding the row to the rotating tenant fixes that — but it also
+// puts the row behind this table's RLS policy, and this lookup is the
+// idempotency check that stops a retried request from rotating the material
+// twice. If the lookup cannot see a tenant-bound row it reports "no prior
+// rotation" and the retry rotates again, which is the exact failure the
+// request_id dedup exists to prevent. Hence withPlatformScope on the query.
+//
+// Note on what this test can and cannot prove here: TEST_DATABASE_URL
+// normally points at a superuser, and Postgres exempts superusers from RLS
+// entirely, so this asserts the query's correctness rather than the policy's
+// enforcement. The enforcement half is proven by scripts/audit.sh, which
+// drives the running container — that connects as app_secret_vault_integration,
+// an ordinary role the policy genuinely applies to.
+func TestPgStore_RotationAuditDedup_TenantBoundEntry(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	requestID := "rot-tenant-bound-1"
+	rid := requestID
+	tenant := "11111111-1111-1111-1111-111111111111"
+
+	entry, err := s.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
+		EventType:              "ROTATED",
+		SecretPath:             "kv/payroll/db",
+		RequestedByPrincipalID: "admin-1",
+		TenantID:               &tenant,
+		RequestID:              &rid,
+		OutcomeDetail:          "revoked_lease_count=2",
+	})
+	if err != nil {
+		t.Fatalf("failed to record tenant-bound ROTATED entry: %v", err)
+	}
+	if entry.TenantID == nil || *entry.TenantID != tenant {
+		t.Fatalf("recorded entry lost its tenant binding: %+v", entry.TenantID)
+	}
+
+	found, err := s.FindAuditEntryByRotationRequestID(ctx, requestID)
+	if err != nil {
+		t.Fatalf("dedup lookup failed: %v", err)
+	}
+	if found == nil {
+		t.Fatal("dedup lookup did not find a tenant-bound ROTATED entry: a retried rotate would rotate the material a second time")
+	}
+	if found.AuditLogID != entry.AuditLogID {
+		t.Errorf("dedup found %s, want %s", found.AuditLogID, entry.AuditLogID)
+	}
+	// The count has to survive the round trip: the replay response reads it
+	// back out of this field, and reporting 0 there says the rotation revoked
+	// nothing.
+	if found.OutcomeDetail != "revoked_lease_count=2" {
+		t.Errorf("outcome_detail = %q, want revoked_lease_count=2", found.OutcomeDetail)
+	}
+}
+
+// TestPgStore_ListAuditLog_TenantScopedRotationIsVisible is the read half of
+// the same fix, and the assertion that would have caught the original bug:
+// the rotating tenant must actually get its ROTATED row back from the query
+// the console and any auditor use. Before the fix this returned nothing,
+// because ListAuditLog filters on tenant_id and the row had none.
+func TestPgStore_ListAuditLog_TenantScopedRotationIsVisible(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	tenant := "11111111-1111-1111-1111-111111111111"
+	rid := "rot-visible-1"
+	secretPath := "kv/visible/db"
+
+	if _, err := s.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
+		EventType:              "ROTATED",
+		SecretPath:             secretPath,
+		RequestedByPrincipalID: "admin-1",
+		TenantID:               &tenant,
+		RequestID:              &rid,
+		OutcomeDetail:          "revoked_lease_count=1",
+	}); err != nil {
+		t.Fatalf("failed to record ROTATED entry: %v", err)
+	}
+
+	got, err := s.ListAuditLog(ctx, store.AuditListFilter{
+		TenantID:   &tenant,
+		SecretPath: secretPath,
+		EventType:  "ROTATED",
+	})
+	if err != nil {
+		t.Fatalf("ListAuditLog failed: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected the rotating tenant to see 1 ROTATED entry, got %d: rotation is invisible in its own audit trail", len(got))
+	}
+
+	// And it must NOT leak to a tenant that had nothing to do with it: a
+	// secret_path is a platform-wide address, so a globally-readable rotation
+	// row would let any tenant enumerate every other tenant's secret paths.
+	other := "22222222-2222-2222-2222-222222222222"
+	leaked, err := s.ListAuditLog(ctx, store.AuditListFilter{
+		TenantID:   &other,
+		SecretPath: secretPath,
+		EventType:  "ROTATED",
+	})
+	if err != nil {
+		t.Fatalf("ListAuditLog for the other tenant failed: %v", err)
+	}
+	if len(leaked) != 0 {
+		t.Errorf("an unrelated tenant can see %d rotation entries for %s", len(leaked), secretPath)
 	}
 }

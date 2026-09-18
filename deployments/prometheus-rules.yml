@@ -26,3 +26,252 @@ groups:
           severity: page
         annotations:
           summary: "{{ $labels.service }} readiness probe reports DB unreachable for 2m"
+
+  # ---------------------------------------------------------------------------
+  # GOV-01 (identity-context-svc)
+  # ---------------------------------------------------------------------------
+  #
+  # Every alert here fires on something that produces NO 5xx and NO latency, so
+  # none of them would be caught by the two baseline rules above. That is the
+  # selection criterion: if the golden signals already show it, it is not here.
+  #
+  # Runbook: services/identity-context-svc/RUNBOOK.md
+  - name: gov-01-identity-context
+    rules:
+      - alert: IdentityOutboxBacklogGrowing
+        # A stopped relay is invisible from the request path: every request
+        # succeeds, latency is normal, and governance events silently pile up
+        # in a table. This is the single most important alert on the service.
+        #
+        # 15m rather than 5m because a broker restart legitimately produces a
+        # short spike, and the outbox existing is precisely what makes that
+        # spike harmless.
+        expr: identity_context_outbox_pending > 1000
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc outbox backlog above 1000 for 15m"
+          description: >-
+            Governance events are durable but undelivered. Check the relay is
+            running and the broker is reachable. RUNBOOK section 4.1. Do NOT
+            delete rows to clear the backlog.
+
+      - alert: IdentityOutboxDeadLetters
+        # Exhausted retries. Nothing drains these automatically and a restart
+        # will not fix one, so this is a ticket rather than a page — but it
+        # must not be invisible, because the events are governance evidence
+        # that never reached the estate.
+        expr: identity_context_outbox_dead_letter > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "identity-context-svc has {{ $value }} dead-lettered events"
+          description: >-
+            Events that exhausted delivery attempts. They remain in
+            event_outbox with last_error set. RUNBOOK section 4.2.
+
+      - alert: IdentityIngressTenantMismatch
+        # A request on tenant A's hostname bearing tenant B's token. There is
+        # no legitimate request of this shape — it is either an ingress
+        # misconfiguration serving one customer's hostname to another's
+        # backend, or somebody probing the boundary.
+        #
+        # ANY sustained rate pages. The threshold is deliberately just above
+        # zero rather than a round number.
+        expr: sum(rate(identity_context_resolution_failed_total{reason="ingress_tenant_mismatch"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc refusing cross-tenant ingress requests"
+          description: >-
+            Requests arriving on one tenant's ingress with another tenant's
+            token. Nothing leaked — the check runs before any tenant-scoped
+            query — but this is either a routing fault or an attack.
+            RUNBOOK section 5.1.
+
+      - alert: IdentityResidencyDenials
+        expr: sum(rate(identity_context_resolution_failed_total{reason="residency_denied"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "identity-context-svc refusing resolutions on data residency"
+          description: >-
+            An entity's residency policy is not servable from this region.
+            After a deploy this usually means ALLOWED_RESIDENCY_POLICIES was
+            not updated for the region. RUNBOOK section 5.2.
+
+      - alert: IdentityRiskSignalPipelineDead
+        # Every resolution defaulting its trust posture means the Intelligence
+        # Plane is not publishing. No request fails, so nothing else would show
+        # it — and this alarm used to silence itself, because the service
+        # published it on the same topic it consumed risk signals from.
+        expr: |
+          sum(rate(identity_context_risk_signal_unavailable_total[15m]))
+          /
+          clamp_min(sum(rate(http_requests_total{service="identity-context-svc", route="/v1/context/resolve", status_code="200"}[15m])), 0.001) > 0.9
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "identity-context-svc: >90% of sessions have no risk signal"
+          description: >-
+            Trust posture is being DEFAULTED rather than measured on almost
+            every session. The Intelligence Plane is probably not publishing
+            session.risk.changed.
+
+      - alert: IdentitySoDUnavailable
+        # Break-glass and status changes are refused while GOV-04 is down.
+        # Correct — a conflict check that did not run is not one that passed —
+        # but it means the emergency control is unavailable during an
+        # emergency, which is when it is wanted.
+        expr: sum(rate(identity_context_sod_checks_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "identity-context-svc cannot reach GOV-04 — privileged commands refused"
+          description: >-
+            Segregation of duties cannot be evaluated, so support contexts and
+            principal status changes are being refused. RUNBOOK section 6.2.
+
+      - alert: IdentitySupportContextAwaitingReview
+        # The half of break-glass that is normally missing: the grant expires,
+        # nobody looks, and the control is decorative.
+        expr: identity_context_support_contexts_unreviewed > 0
+        for: 24h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} support contexts ended without review for over 24h"
+          description: >-
+            Privileged elevations into customer tenants that were never
+            reconciled. RUNBOOK section 6.1.
+
+      - alert: IdentityLiveSupportContexts
+        # Informational by design. Not a fault — every grant is scoped,
+        # time-limited, independently approved and evidenced — but somebody
+        # having standing inside a customer's data should be visible without
+        # anyone having to query this service.
+        expr: sum(identity_context_support_contexts_live) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $value }} live support elevations into customer tenants"
+
+  # ---------------------------------------------------------------------------
+  # secret-vault-integration-svc
+  # ---------------------------------------------------------------------------
+  #
+  # Same selection criterion as the GOV-01 block above: every alert here fires
+  # on something the two baseline rules cannot see. Three of these six produce
+  # no 5xx at all — a denial is a 403 and a deny-by-absence is a 404, both
+  # correct responses that the golden signals are right to ignore — and they
+  # are exactly the shapes that matter on a service that brokers credentials.
+  #
+  # Runbook: services/secret-vault-integration-svc/RUNBOOK.md
+  - name: secret-vault-integration
+    rules:
+      - alert: SecretBrokerDenialRateHigh
+        # A workload being refused material it used to get. Every request here
+        # is a well-formed 403, so error-rate alerting never sees it, and the
+        # symptom the on-call actually gets paged for is some other service
+        # failing to start. Ratio rather than a raw count: a busy path and a
+        # quiet one should not need different thresholds.
+        expr: |
+          sum(rate(secret_vault_broker_decisions_total{outcome="denied"}[10m]))
+          /
+          clamp_min(sum(rate(secret_vault_broker_decisions_total[10m])), 0.001) > 0.2
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc refusing over 20% of brokerage for 10m"
+          description: >-
+            Workloads are being denied secret material. Usually an
+            allowed_workload_ids list that no longer matches the caller after a
+            deployment changed a workload identity. RUNBOOK section 4.1.
+
+      - alert: SecretPathNotProvisioned
+        # Policy resolves but no material was ever seeded, or the path is
+        # unknown entirely. This is the single most common way a correctly
+        # configured secret still cannot be brokered, and it answers 404 — so
+        # it is invisible to every error-rate rule. A steady trickle is normal
+        # probing; a sustained rate means something real is misconfigured.
+        expr: sum(rate(secret_vault_broker_decisions_total{outcome="no_policy"}[10m])) > 0.1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "secret-vault-integration-svc: sustained brokerage for unregistered secret paths"
+          description: >-
+            A caller is asking for a secret_path with no ACTIVE policy version
+            in its scope. Either the path was never registered, its version was
+            never activated, or the caller's scope is wrong. RUNBOOK section 4.2.
+
+      - alert: SecretVaultBackendFailing
+        # The vault backend is the only thing here that actually holds
+        # material. A get failure means policy says yes and the material
+        # cannot be produced — every dependent workload fails to start, and
+        # this service reports it as a 503 that reads like its own outage.
+        expr: sum(rate(secret_vault_backend_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc vault backend failing ({{ $labels.operation }})"
+          description: >-
+            Secret material cannot be read, written or rotated. Nothing
+            downstream can obtain credentials. RUNBOOK section 4.3.
+
+      - alert: SecretVaultAuthorizationUnavailable
+        # This service fails closed, so an authorization-svc outage is a total
+        # write outage here. Separated from denials on purpose: without the
+        # distinction the two are indistinguishable, and they need opposite
+        # responses — one is a permissions problem, the other a dependency
+        # that is down.
+        expr: sum(rate(secret_vault_authz_decisions_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc cannot reach authorization-svc"
+          description: >-
+            Every secret policy mutation is being refused fail-closed. This is
+            a dependency outage, not a permissions problem. RUNBOOK section 4.4.
+
+      - alert: SecretMassRevocation
+        # Rotation revokes every lease on a path. That is correct behaviour and
+        # produces no errors at all — but a rotation that cuts off a large
+        # fleet is worth knowing about as it happens rather than from the
+        # resulting incident, because every affected workload will fail on its
+        # next credential fetch.
+        expr: sum(increase(secret_vault_rotation_revoked_leases_total[10m])) > 50
+        for: 0m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "secret-vault-integration-svc rotation revoked {{ $value }} leases in 10m"
+          description: >-
+            A rotation invalidated a large number of live leases. Expect
+            dependent workloads to re-broker; confirm the rotation was
+            intended. RUNBOOK section 4.5.
+
+      - alert: SecretVaultReadinessFailing
+        # Duplicated from the baseline ReadinessProbeFailing on purpose, at a
+        # tighter threshold. This service sits on the startup path of anything
+        # that needs a credential, so two minutes of it being unready is a
+        # longer outage here than the same two minutes elsewhere.
+        expr: readiness_up{service="secret-vault-integration-svc"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "secret-vault-integration-svc not ready for 1m"
+          description: >-
+            The database pool is unreachable. No lease, policy or audit read
+            will succeed. RUNBOOK section 4.6.

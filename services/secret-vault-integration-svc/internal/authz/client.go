@@ -10,18 +10,20 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/secret-vault-integration-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/secret-vault-integration-svc/internal/envelope"
 
 	"go.uber.org/zap"
 )
@@ -118,7 +120,7 @@ type authorizeResponse struct {
 }
 
 func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+	key := cacheKey(ctx, principalID, legalEntityID, actionType)
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
@@ -133,6 +135,45 @@ func (c *HTTPClient) CheckAllowed(ctx context.Context, principalID, legalEntityI
 	}
 
 	return err
+}
+
+// cacheKey identifies a decision by everything authorization-svc actually uses
+// to reach it.
+//
+// The tenant is the part that was missing, and leaving it out was a real
+// cross-tenant authorization defect rather than a theoretical one. Roles in
+// authorization-svc are tenant-scoped and its own tables are under row-level
+// security, so the answer to "may this principal perform this action" genuinely
+// differs per tenant — checkAllowedLive forwards X-Tenant-Id precisely because
+// of that. Keying the cache on (principal, entity, action) alone therefore
+// stored an answer under a question it did not ask, and served it to the wrong
+// tenant for the rest of the TTL.
+//
+// It failed in both directions, both confirmed against the running service:
+//
+//   - A principal authorized in tenant A, acting immediately afterwards in
+//     tenant B where it holds no role at all, was served A's cached GRANT and
+//     passed the gate. For this service that is a window in which a caller can
+//     revoke another tenant's leases, write its secret material, or rotate its
+//     secrets.
+//   - The reverse: a denial in tenant B was served to tenant A, locking a
+//     legitimately-authorized operator out of its own tenant.
+//
+// The window is decisionCacheTTL, which is short — but a credential-brokering
+// service is exactly where a short window still matters, and the failure is
+// silent in both directions.
+//
+// The tenant comes from the envelope the middleware already parsed, which is
+// the same source checkAllowedLive sends the header from. When there is no
+// envelope the key gets an empty tenant segment, which is consistent: a
+// request with no tenant produces a call with no X-Tenant-Id, so both share
+// one cache entry and neither can be confused for a tenant-scoped one.
+func cacheKey(ctx context.Context, principalID, legalEntityID, actionType string) string {
+	tenantID := ""
+	if env, ok := svcenvelope.FromContext(ctx); ok {
+		tenantID = env.TenantID
+	}
+	return tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 }
 
 // lookupCache returns the cached decision for key and whether it is still
@@ -289,14 +330,63 @@ var devPlaceholderURLs = map[string]bool{
 	"http://authorization-svc": true,
 }
 
+// reservedHostSuffixes are the domains RFC 2606 and RFC 6761 reserve for
+// documentation and testing. Nothing deployed lives on one.
+var reservedHostSuffixes = []string{
+	".example.com", ".example.net", ".example.org",
+	".example", ".invalid", ".test",
+}
+
+// nonProductionURL reports why baseURL cannot be a deployed authorization-svc,
+// or "" if it might be one.
+//
+// It is a POSITIVE test for addresses that are provably local or reserved,
+// never a guess at what a real hostname looks like. An unrecognised host is
+// assumed real: a false positive here is a refusal to boot in production,
+// which is a worse failure than the one this guard exists to prevent.
+func nonProductionURL(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "not a parseable URL"
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "not an absolute URL with a host"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		switch {
+		case ip.IsLoopback():
+			return "a loopback address"
+		case ip.IsUnspecified():
+			return "an unspecified address"
+		}
+		return ""
+	}
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return "a loopback address"
+	}
+	for _, suffix := range reservedHostSuffixes {
+		if host == strings.TrimPrefix(suffix, ".") || strings.HasSuffix(host, suffix) {
+			return "a reserved documentation or test domain"
+		}
+	}
+	return ""
+}
+
 // NewClient picks the client for the environment, refusing to start
 // production or staging without a real Authorization Service.
 func NewClient(env, baseURL string, log *zap.Logger) (Client, error) {
 	isProdOrStaging := strings.EqualFold(env, "production") || strings.EqualFold(env, "staging")
-	isPlaceholder := devPlaceholderURLs[strings.TrimRight(baseURL, "/")]
+	trimmed := strings.TrimRight(baseURL, "/")
+	isPlaceholder := devPlaceholderURLs[trimmed]
 
-	if isProdOrStaging && isPlaceholder {
-		return nil, fmt.Errorf("security violation: AUTHZ_SERVICE_URL (%q) is a placeholder in %s environment", baseURL, env)
+	if isProdOrStaging {
+		if isPlaceholder {
+			return nil, fmt.Errorf("security violation: AUTHZ_SERVICE_URL (%q) is a placeholder in %s environment", baseURL, env)
+		}
+		if reason := nonProductionURL(trimmed); reason != "" {
+			return nil, fmt.Errorf("security violation: AUTHZ_SERVICE_URL (%q) is %s and cannot address authorization-svc in %s environment", baseURL, reason, env)
+		}
 	}
 	if !isPlaceholder {
 		log.Info("using HTTP authorization client", zap.String("url", baseURL))

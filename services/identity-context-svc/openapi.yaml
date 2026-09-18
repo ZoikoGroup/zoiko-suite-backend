@@ -178,12 +178,299 @@ components:
         reason:
           type: string
 
+    # -- GOV-01 completion schemas ----------------------------------------------
+    #
+    # NOTE: this replaces an earlier ErrorResponse that declared `statusCode`
+    # and `message`. Nothing in this service has ever returned that shape —
+    # writeError has always emitted `error` and `correlation_id` — so the
+    # published schema described a response no client could have parsed. It
+    # went unnoticed because nothing checked the contract against the code;
+    # internal/context/contract_test.go now does, and found this duplicate on
+    # its first run.
+
     ErrorResponse:
       type: object
+      description: |
+        Every refusal from this service carries one of the control plane's
+        stable error classes. The message is for a human reading a log; the
+        CODE is what a client branches on, and it is the half that must not
+        change with a refactor. Before these existed a caller could only
+        distinguish a wrong password from a residency denial by matching prose.
       properties:
-        statusCode:
+        error:
+          type: string
+        error_code:
+          type: string
+          enum:
+            - CONTEXT_UNRESOLVED
+            - RESIDENCY_DENIED
+            - AUTHORIZATION_DENIED
+            - SOD_CONFLICT
+            - BREAK_GLASS_REQUIRED
+            - BREAK_GLASS_EXPIRED
+            - LEGAL_HOLD_ACTIVE
+            - IDEMPOTENCY_MISMATCH
+            - TRUST_POSTURE_BLOCKED
+            - UPSTREAM_UNAVAILABLE
+            - UNSUPPORTED
+        correlation_id:
+          type: string
+        evidence_id:
+          type: string
+
+    ResolveResponseV2:
+      type: object
+      description: |
+        Adds the evidence id the spec's envelope section requires on a material
+        governance decision. A superset of the original response, so a client
+        reading only envelope_jwt is unaffected.
+      required: [envelope_jwt, evidence_id, session_context_id]
+      properties:
+        envelope_jwt:
+          type: string
+          description: The signed IdentityContextEnvelope (RS256, verifiable from the JWKS).
+        evidence_id:
+          type: string
+          description: The evidence object for this decision, so a caller can cite what granted it.
+        session_context_id:
+          type: string
+        expires_at:
           type: integer
-        message:
+          format: int64
+          description: Unix seconds.
+
+    DimensionOutcome:
+      type: object
+      properties:
+        dimension:
+          type: integer
+          minimum: 1
+          maximum: 6
+        name:
+          type: string
+        result:
+          type: string
+        source:
+          type: string
+          description: |
+            Where the value came from -- the token, this service's own store,
+            an upstream registry, or the async risk cache. An auditor asking
+            "who asserted this" gets the answer here.
+        detail:
+          type: string
+
+    ContextExplanation:
+      type: object
+      description: |
+        The recorded account of one resolution, reconstructed from the frozen
+        session_contexts row.
+      properties:
+        session_context_id:
+          type: string
+        decision_id:
+          type: string
+        evidence_id:
+          type: string
+        outcome:
+          type: string
+          enum: [RESOLVED, INVALIDATED, EXPIRED, RESOLVED_EVIDENCE_DISPOSED]
+          description: |
+            RESOLVED_EVIDENCE_DISPOSED means the skeleton of the decision
+            survives but its personal data was disposed under retention.
+            Presenting redacted fields as original values would be worse than
+            saying nothing.
+        principal_id:
+          type: string
+        tenant_id:
+          type: string
+        legal_entity_id:
+          type: string
+        environment:
+          type: string
+          enum: [local, development, staging, production]
+        ingress_source:
+          type: string
+        dimensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/DimensionOutcome"
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        invalidated_at:
+          type: string
+          format: date-time
+        invalidation_reason:
+          type: string
+        support_context_id:
+          type: string
+        as_of:
+          type: string
+          format: date-time
+        reconstructed_from:
+          type: string
+        correlation_id:
+          type: string
+        schema_version:
+          type: string
+
+    RefreshCacheRequest:
+      type: object
+      required: [reason]
+      properties:
+        ingress_identifiers:
+          type: array
+          items:
+            type: string
+          description: Narrows the refresh. Empty refreshes every binding for the caller's tenant.
+        reason:
+          type: string
+        correlation_id:
+          type: string
+      additionalProperties: false
+
+    RefreshCacheResponse:
+      type: object
+      properties:
+        bindings_refreshed:
+          type: integer
+        evidence_id:
+          type: string
+
+    InvalidateTenantContextRequest:
+      type: object
+      required: [justification]
+      properties:
+        reason:
+          type: string
+          enum: [LOGOUT, ADMIN_REVOKE, RISK_ESCALATION, DELEGATION_REVOKED]
+          default: ADMIN_REVOKE
+        justification:
+          type: string
+          description: |
+            MANDATORY. The blast radius is every user of the tenant. Travels on
+            the event and into SIEM at CRITICAL.
+        correlation_id:
+          type: string
+      additionalProperties: false
+
+    InvalidateTenantContextResponse:
+      type: object
+      properties:
+        sessions_revoked:
+          type: integer
+        evidence_id:
+          type: string
+
+    AttachSupportContextRequest:
+      type: object
+      required: [tenant_id, support_principal_id, reason_code, justification, ticket_ref, approver_principal_id]
+      properties:
+        tenant_id:
+          type: string
+          description: The customer tenant being supported. Authorization is checked against THIS tenant.
+        support_principal_id:
+          type: string
+          description: The staff principal receiving the elevation.
+        subject_principal_id:
+          type: string
+          description: Narrows the grant to one principal's data. Omitted means tenant-wide.
+        reason_code:
+          type: string
+          enum: [INCIDENT_RESPONSE, CUSTOMER_TICKET, DATA_CORRECTION, AUDIT_REQUEST]
+        justification:
+          type: string
+          minLength: 20
+          description: |
+            What a reviewer reads. A justification nobody can act on is not
+            evidence, it is a checkbox, so a minimum length is enforced.
+        ticket_ref:
+          type: string
+        approver_principal_id:
+          type: string
+          description: |
+            MANDATORY and must differ from support_principal_id. There is no
+            single-party form of this command -- self-approval defeats
+            maker-checker entirely and is refused by the handler AND a schema
+            CHECK constraint.
+        ttl_seconds:
+          type: integer
+          description: |
+            Requested window. REFUSED, not clamped, above the configured
+            maximum: clamping would issue a grant nobody requested and nobody
+            reviewed, and the requester would believe they held it longer.
+        correlation_id:
+          type: string
+      additionalProperties: false
+
+    AttachSupportContextResponse:
+      type: object
+      properties:
+        support_context_id:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        evidence_id:
+          type: string
+
+    RevokeSupportContextRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+        correlation_id:
+          type: string
+      additionalProperties: false
+
+    SupportContext:
+      type: object
+      properties:
+        support_context_id:
+          type: string
+        tenant_id:
+          type: string
+        support_principal_id:
+          type: string
+        subject_principal_id:
+          type: string
+          nullable: true
+        reason_code:
+          type: string
+        justification:
+          type: string
+        ticket_ref:
+          type: string
+        approver_principal_id:
+          type: string
+        granted_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        revocation_reason:
+          type: string
+          nullable: true
+        reviewed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            The reconciliation half of the break-glass invariant. A grant that
+            expires and is never reviewed is a control that ran but was never
+            checked, which is the most common silent failure of break-glass.
+        reviewed_by:
+          type: string
+          nullable: true
+        evidence_id:
           type: string
         correlation_id:
           type: string
@@ -462,6 +749,326 @@ paths:
       responses:
         "204":
           description: Status updated
+
+  # -- GOV-01 contract operations ---------------------------------------------
+  #
+  # operationId values are the spec's own command/query names verbatim, so a
+  # contract test can assert this service implements GOV-01's named surface
+  # rather than something that merely resembles it.
+
+  /v1/context/session/{sessionContextId}/explain:
+    get:
+      summary: Explain a context resolution (GOV-01 ExplainContextResolution)
+      operationId: explainContextResolution
+      description: |
+        Returns the recorded account of one resolution: what each of the six
+        dimensions resolved to, from which source, and what the decision's
+        standing was at a given instant.
+
+        **Reconstructed, not re-derived.** Every field comes from the frozen
+        `session_contexts` row. Re-deriving would read today's risk signals,
+        role assignments and entity state against a session issued last week
+        and would confidently report a decision that was never made.
+
+        Reading your OWN resolution needs no grant; reading anyone else's
+        requires `IDENTITY_CONTEXT_EXPLAIN`. A session in another tenant
+        answers 404, never 403 -- a distinct forbidden would let a caller
+        enumerate session ids.
+      parameters:
+        - name: sessionContextId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: as_of
+          in: query
+          required: false
+          description: |
+            RFC3339 instant to reconstruct the decision's standing at. Omitted
+            means now. A session invalidated at 14:30 reports RESOLVED for an
+            as_of of 14:05, which is the point of the parameter.
+          schema:
+            type: string
+            format: date-time
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The recorded account of the resolution
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContextExplanation"
+        "400":
+          description: as_of is not a valid RFC3339 timestamp
+        "401":
+          description: No verified tenant or principal
+        "403":
+          description: Not authorized to explain another principal's resolution
+        "404":
+          description: Session not found, expired, or in another tenant
+
+  /v1/context/cache/refresh:
+    post:
+      summary: Refresh tenant context cache (GOV-01 RefreshTenantContextCache)
+      operationId: refreshTenantContextCache
+      description: |
+        Marks the caller's tenant routing hints stale so the next resolution
+        re-reads them from the registry.
+
+        Does NOT delete the bindings. A deleted binding would make every
+        request on that hostname fail closed until the registry sync ran again,
+        turning a cache refresh into an outage -- and an operator reaching for
+        this during an incident is the last person who should be handed one.
+
+        Scoped to the caller's own verified tenant. There is no all-tenants
+        form: one caller invalidating the estate's context cache is a
+        denial-of-service primitive wearing a maintenance command's clothes.
+
+        Requires `IDENTITY_CONTEXT_CACHE_REFRESH`.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshCacheRequest"
+      responses:
+        "200":
+          description: Bindings marked stale
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RefreshCacheResponse"
+        "401":
+          description: No verified tenant or principal
+        "403":
+          description: Not authorized
+        "501":
+          description: Context cache commands are not configured in this deployment
+
+  /v1/context/tenant/invalidate:
+    post:
+      summary: Invalidate all tenant sessions (GOV-01 InvalidateTenantContext)
+      operationId: invalidateTenantContext
+      description: |
+        Revokes every live session in the caller's tenant.
+
+        A separate route and a separate authorization action from the
+        per-session invalidate, deliberately: "log one user out" and "log an
+        entire tenant out" are not the same decision and must not share a
+        permission.
+
+        `justification` is MANDATORY. The blast radius is every user of the
+        tenant; an operator who cannot say why in a sentence should not be
+        running this. The justification travels on the event and is streamed to
+        SIEM at CRITICAL.
+
+        Requires `IDENTITY_CONTEXT_TENANT_INVALIDATE`. No self-exemption.
+      parameters:
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InvalidateTenantContextRequest"
+      responses:
+        "200":
+          description: Sessions revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvalidateTenantContextResponse"
+        "400":
+          description: justification missing
+        "401":
+          description: No verified tenant or principal
+        "403":
+          description: Not authorized
+        "500":
+          description: |
+            Partial revocation. The body carries sessions_revoked -- those
+            sessions really are revoked, and a caller who assumed otherwise
+            would re-run a command that logs everybody out twice.
+
+  /v1/context/support:
+    post:
+      summary: Attach a support context (GOV-01 AttachSupportContext, privileged)
+      operationId: attachSupportContext
+      description: |
+        Grants a scoped, time-limited, independently-approved elevation letting
+        a support principal operate inside a customer tenant.
+
+        **This is not a role and grants no permissions.** It makes a support
+        principal's session resolvable in a tenant they do not belong to, with
+        every session issued under it tagged by its id. Authorization still
+        runs, unchanged, on every subsequent request. A support engineer with
+        an attached context and no permissions can do exactly nothing.
+
+        Every clause of the break-glass invariant is enforced before the write:
+
+        | Clause | Control |
+        |---|---|
+        | scoped | `tenant_id`, optional `subject_principal_id` |
+        | time-limited | `ttl_seconds`, refused above SUPPORT_CONTEXT_MAX_TTL_SECONDS |
+        | independently approved | `approver_principal_id` differs from grantee; GOV-04 conflict check |
+        | fully evidenced | `reason_code`, `justification`, `ticket_ref`, returned `evidence_id` |
+        | followed by review | reconciler reports expired-and-unreviewed grants |
+
+        Authorization is checked against the **target** tenant, not the
+        caller's own. Checking the caller's own would ask whether they may
+        attach support contexts at home -- which every support engineer may --
+        and would authorize an elevation into any tenant on the platform.
+
+        Requires `IDENTITY_SUPPORT_CONTEXT_ATTACH` in the target tenant.
+      parameters:
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AttachSupportContextRequest"
+      responses:
+        "201":
+          description: Elevation granted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AttachSupportContextResponse"
+        "400":
+          description: |
+            Self-approval, a TTL above the maximum, an unrecognised reason
+            code, a justification under the minimum length, or a missing
+            ticket reference. error_code is BREAK_GLASS_REQUIRED.
+        "401":
+          description: No verified principal
+        "403":
+          description: Not authorized in the target tenant
+        "409":
+          description: Segregation of duties conflict (error_code SOD_CONFLICT)
+        "503":
+          description: |
+            GOV-04 could not be reached, so no grant was made. A conflict check
+            that did not run is not a check that passed.
+        "501":
+          description: Support context is not configured in this deployment
+
+  /v1/context/support/{supportContextId}:
+    get:
+      summary: Read a support context
+      operationId: getSupportContext
+      parameters:
+        - name: supportContextId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The grant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SupportContext"
+        "404":
+          description: Not found in this tenant
+    delete:
+      summary: Revoke a support context early
+      operationId: revokeSupportContext
+      description: |
+        Ends an elevation immediately. Idempotent -- re-revoking reports success
+        without a second event, and the FIRST reason stands, because the reason
+        is the part an investigation reads.
+
+        Guarded by `IDENTITY_SUPPORT_CONTEXT_REVOKE`, a deliberately weaker
+        action than attach: revoking is de-escalation, and requiring the same
+        grant to end a support session as to start one means the person who
+        notices a problem may be unable to stop it.
+      parameters:
+        - name: supportContextId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevokeSupportContextRequest"
+      responses:
+        "204":
+          description: Revoked, or already revoked
+        "404":
+          description: Not found in this tenant
 
   /health:
     get:
