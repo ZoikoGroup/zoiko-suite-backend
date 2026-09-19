@@ -11,6 +11,11 @@ type Config struct {
 	KafkaBrokers     string
 	KafkaEventsTopic string
 	AuthzServiceURL  string
+	// TreasuryServiceURL is the base URL of treasury-svc, used by
+	// PrepareAttempt to verify PayerAccountRef for real (BNK-01's
+	// account_status + is_ownership_verified) instead of trusting the
+	// caller-supplied PayerAccountVerified flag alone.
+	TreasuryServiceURL string
 }
 
 func Load() (*Config, error) {
@@ -27,7 +32,8 @@ func Load() (*Config, error) {
 		DatabaseURL:      dbURL,
 		KafkaBrokers:     getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
 		KafkaEventsTopic: getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.payment-initiation.events"),
-		AuthzServiceURL:  getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		AuthzServiceURL:    getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		TreasuryServiceURL: getEnvOrDefault("TREASURY_SERVICE_URL", "http://treasury-svc:8103"),
 	}, nil
 }
 

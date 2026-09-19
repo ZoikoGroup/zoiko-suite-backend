@@ -162,6 +162,28 @@ const (
 
 var ErrInvalidConnectionTransition = errors.New("bank connection is not in a state that permits this action")
 
+// BankRegionPolicy is one tenant+legal-entity-scoped allowed-region entry
+// (migration 006). A legal entity with zero policy rows has no configured
+// restriction; IsRegionAllowed treats that as unrestricted rather than
+// deny-by-default, so this is an opt-in control per legal entity.
+type BankRegionPolicy struct {
+	PolicyID             string    `json:"policy_id"`
+	TenantID             string    `json:"tenant_id"`
+	LegalEntityID        string    `json:"legal_entity_id"`
+	Region               string    `json:"region"`
+	CreatedByPrincipalID string    `json:"-"`
+	CreatedAt            time.Time `json:"created_at"`
+}
+
+type CreateRegionPolicyParams struct {
+	TenantID, LegalEntityID, Region, ActorPrincipalID string
+}
+
+var (
+	ErrRegionPolicyAlreadyExists = errors.New("this region is already an allowed region for this legal entity")
+	ErrConnectionRegionNotAllowed = errors.New("connection region is not an allowed region for its legal entity")
+)
+
 type BankStatement struct {
 	StatementID      string    `json:"statement_id"`
 	ConnectionID     string    `json:"connection_id"`

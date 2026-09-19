@@ -60,6 +60,18 @@ type Publisher interface {
 	PublishCashPositionUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, balance domain.CashBalance)
 	PublishEffectiveCashUpdated(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
 	PublishLiquidityThresholdBreached(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse)
+
+	// BNK-01 domain events — see internal/events/publisher.go's own doc
+	// comments. Previously this service published nothing at all for the
+	// bank-account lifecycle.
+	PublishBankAccountCreated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountOwnershipVerified(ctx context.Context, correlationID, actorID string, acct domain.BankAccount, evidence domain.OwnershipEvidence)
+	PublishBankAccountMetadataAmended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountOperationalUseChanged(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountSuspended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountReactivated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountClosed(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+	PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
 }
 
 // AuthZClient defines authorization plane contract.
@@ -214,6 +226,7 @@ func (h *Handler) RegisterBankAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = h.store.CreateCashBalance(r.Context(), bal)
 
+	h.publisher.PublishBankAccountCreated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *acct)
 	writeJSON(w, http.StatusCreated, acct)
 }
 

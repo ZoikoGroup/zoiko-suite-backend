@@ -87,10 +87,10 @@ func tenantFromCtxOrFallback(ctx context.Context, fallback string) string {
 const selectColumns = `
 	statement_line_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
 	amount, currency_code, bank_reference, status,
-	matched_journal_id, matched_by_principal_id, matched_at,
+	matched_journal_id, matched_transaction_id, matched_by_principal_id, matched_at,
 	exception_reason, flagged_by_principal_id, flagged_at,
 	gl_cash_account_code, correlation_id, created_at,
-	proposed_journal_id, proposed_by_principal_id, proposed_at
+	proposed_journal_id, proposed_transaction_id, proposed_by_principal_id, proposed_at
 `
 
 func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) error {
@@ -98,10 +98,10 @@ func scanLine(row interface{ Scan(...any) error }, l *domain.StatementLine) erro
 	if err := row.Scan(
 		&l.StatementLineID, &l.TenantID, &l.LegalEntityID, &l.BankAccountID, &l.StatementDate,
 		&l.Amount, &l.CurrencyCode, &l.BankReference, &status,
-		&l.MatchedJournalID, &l.MatchedByPrincipalID, &l.MatchedAt,
+		&l.MatchedJournalID, &l.MatchedTransactionID, &l.MatchedByPrincipalID, &l.MatchedAt,
 		&l.ExceptionReason, &l.FlaggedByPrincipalID, &l.FlaggedAt,
 		&l.GLCashAccountCode, &l.CorrelationID, &l.CreatedAt,
-		&l.ProposedJournalID, &l.ProposedByPrincipalID, &l.ProposedAt,
+		&l.ProposedJournalID, &l.ProposedTransactionID, &l.ProposedByPrincipalID, &l.ProposedAt,
 	); err != nil {
 		return err
 	}
@@ -302,6 +302,45 @@ func (s *PgStore) FlagException(ctx context.Context, tenantID, statementLineID, 
 	return nil
 }
 
+// UnmatchWithReason reverts a MATCHED line back to EXCEPTION with a
+// mandatory reason — the one correction path for a bad match that doesn't
+// require reperforming the whole run. It reuses the same exception_reason
+// / flagged_by_principal_id / flagged_at evidence fields FlagException
+// already writes: a line entering EXCEPTION always carries the same three
+// fields regardless of which transition put it there. The prior
+// matched_journal_id/matched_transaction_id/matched_by_principal_id are
+// deliberately left in place rather than cleared — they are the historical
+// record of what turned out to be a bad match, not something to erase.
+//
+// This only ever touches the line itself; it does not know or care whether
+// the line's run has already been certified. A certificate's
+// matched_line_count is a snapshot at certification time (and is itself
+// append-only/immutable — see migration 000006), not a live invariant this
+// method re-checks, so unmatching a line from an already-certified run's
+// population will not update or invalidate that certificate.
+func (s *PgStore) UnmatchWithReason(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error {
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'EXCEPTION', exception_reason = $1, flagged_by_principal_id = $2, flagged_at = $3
+			WHERE statement_line_id = $4 AND status = 'MATCHED' AND tenant_id = $5
+		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	if affected == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
+}
+
 // CountUnmatched returns how many lines are still UNMATCHED for the given
 // bank account + statement date — used to decide whether the statement can
 // be marked complete. tenantID must be the caller's verified scope.
@@ -428,12 +467,16 @@ func (s *PgStore) ConfirmMatch(ctx context.Context, tenantID, statementLineID, c
 		if l.ProposedJournalID != nil {
 			journalID = *l.ProposedJournalID
 		}
+		var matchedTxnID *string
+		if l.ProposedTransactionID != nil {
+			matchedTxnID = l.ProposedTransactionID
+		}
 		now := time.Now().UTC()
 		tag, err := tx.Exec(ctx, `
 			UPDATE statement_lines
-			SET status = 'MATCHED', matched_journal_id = $1, matched_by_principal_id = $2, matched_at = $3
-			WHERE statement_line_id = $4 AND status = 'PENDING_CONFIRMATION' AND tenant_id = $5
-		`, journalID, confirmingPrincipalID, now, statementLineID, tenantID)
+			SET status = 'MATCHED', matched_journal_id = NULLIF($1, '')::uuid, matched_transaction_id = $2, matched_by_principal_id = $3, matched_at = $4
+			WHERE statement_line_id = $5 AND status = 'PENDING_CONFIRMATION' AND tenant_id = $6
+		`, journalID, matchedTxnID, confirmingPrincipalID, now, statementLineID, tenantID)
 		if err != nil {
 			return err
 		}
@@ -441,7 +484,10 @@ func (s *PgStore) ConfirmMatch(ctx context.Context, tenantID, statementLineID, c
 			return domain.ErrInvalidTransition
 		}
 		l.Status = domain.StatementLineStatusMatched
-		l.MatchedJournalID = &journalID
+		if journalID != "" {
+			l.MatchedJournalID = &journalID
+		}
+		l.MatchedTransactionID = matchedTxnID
 		l.MatchedByPrincipalID = &confirmingPrincipalID
 		l.MatchedAt = &now
 		return nil
@@ -468,7 +514,7 @@ func (s *PgStore) RejectProposedMatch(ctx context.Context, tenantID, statementLi
 		tag, err := tx.Exec(ctx, `
 			UPDATE statement_lines
 			SET status = 'EXCEPTION', exception_reason = $1, flagged_by_principal_id = $2, flagged_at = $3,
-				proposed_journal_id = NULL, proposed_by_principal_id = NULL, proposed_at = NULL
+				proposed_journal_id = NULL, proposed_transaction_id = NULL, proposed_by_principal_id = NULL, proposed_at = NULL
 			WHERE statement_line_id = $4 AND status = 'PENDING_CONFIRMATION' AND tenant_id = $5
 		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
 		if err != nil {
@@ -499,7 +545,7 @@ func (s *PgStore) CertifyStatement(ctx context.Context, tenantID, legalEntityID,
 				certificate_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
 				matched_line_count, certified_by_principal_id, correlation_id
 			) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (tenant_id, bank_account_id, statement_date) DO NOTHING
+			ON CONFLICT (tenant_id, bank_account_id, statement_date) WHERE run_id IS NULL DO NOTHING
 			RETURNING certificate_id, tenant_id, legal_entity_id, bank_account_id, statement_date,
 				matched_line_count, certified_by_principal_id, certified_at, correlation_id
 		`, tenantID, legalEntityID, bankAccountID, statementDate, matchedLineCount, certifiedByPrincipalID, correlationID)
@@ -530,4 +576,50 @@ func (s *PgStore) CertifyStatement(ctx context.Context, tenantID, legalEntityID,
 		return nil, false, mapPgError(err)
 	}
 	return &c, created, nil
+}
+
+func (s *PgStore) MatchStatementLineWithCanonical(ctx context.Context, tenantID, statementLineID, transactionID, actorPrincipalID string) error {
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'MATCHED', matched_transaction_id = $1, matched_by_principal_id = $2, matched_at = $3
+			WHERE statement_line_id = $4 AND status IN ('UNMATCHED', 'EXCEPTION') AND tenant_id = $5
+		`, transactionID, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	if affected == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
+}
+
+func (s *PgStore) ProposeMatchWithCanonical(ctx context.Context, tenantID, statementLineID, transactionID, proposedByPrincipalID string) error {
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'PENDING_CONFIRMATION', proposed_transaction_id = $1, proposed_by_principal_id = $2, proposed_at = $3
+			WHERE statement_line_id = $4 AND status IN ('UNMATCHED', 'EXCEPTION') AND tenant_id = $5
+		`, transactionID, proposedByPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	if affected == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
 }

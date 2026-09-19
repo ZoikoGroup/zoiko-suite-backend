@@ -50,6 +50,7 @@ func RegisterBNK02Routes(r chi.Router, h *Handler, bnk02Store store.BNK02Store, 
 		r.Post("/{id}/reconnect", bh.ReconnectProvider)
 		r.Post("/{id}/rotate-credential", bh.RotateConnectionCredential)
 	})
+	r.Post("/v1/banking/region-policies", bh.CreateRegionPolicy)
 }
 
 func (h *BNK02Handler) fetchConnectionForAuth(w http.ResponseWriter, r *http.Request, id string) (*domain.BankConnection, bool) {
@@ -76,6 +77,72 @@ func (h *BNK02Handler) writeConnectionErr(w http.ResponseWriter, err error) {
 		h.logger.Error("bank connection operation failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "bank connection operation failed")
 	}
+}
+
+// enforceRegionPolicy is BNK-02's region/residency check: it must run
+// before REQUESTED->AUTHORIZING (CompleteConnectionAuthorization) and
+// before AUTHORIZING->ACTIVE (ActivateConnection). A legal entity with no
+// configured bank_region_policies rows has no restriction — see
+// IsRegionAllowed's own doc comment — so this is a no-op for every legal
+// entity that hasn't opted in. Writes the HTTP response itself and
+// returns false on refusal, matching fetchConnectionForAuth's convention.
+func (h *BNK02Handler) enforceRegionPolicy(w http.ResponseWriter, r *http.Request, tenantID string, conn *domain.BankConnection) bool {
+	allowed, err := h.bnk02Store.IsRegionAllowed(r.Context(), tenantID, conn.LegalEntityID, conn.Region)
+	if err != nil {
+		h.logger.Error("enforceRegionPolicy: store unavailable", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to evaluate region policy")
+		return false
+	}
+	if !allowed {
+		writeError(w, http.StatusForbidden, domain.ErrConnectionRegionNotAllowed.Error())
+		return false
+	}
+	return true
+}
+
+type createRegionPolicyRequest struct {
+	LegalEntityID string `json:"legal_entity_id"`
+	Region        string `json:"region"`
+}
+
+// CreateRegionPolicy handles POST /v1/banking/region-policies — the
+// operational entry point that opts a legal entity into region/residency
+// enforcement by naming its first allowed region. Authorized per legal
+// entity, the same boundary as InitiateConnection: deciding which regions
+// a legal entity's connections may use is a business decision scoped to
+// that entity, not a platform-level control activity.
+func (h *BNK02Handler) CreateRegionPolicy(w http.ResponseWriter, r *http.Request) {
+	var req createRegionPolicyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.LegalEntityID == "" || req.Region == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id and region are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, BANKING_CONNECTION_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	tenantID := middleware.GetTenantID(r.Context())
+	rp, err := h.bnk02Store.CreateRegionPolicy(r.Context(), domain.CreateRegionPolicyParams{
+		TenantID: tenantID, LegalEntityID: req.LegalEntityID, Region: req.Region, ActorPrincipalID: principalID,
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrRegionPolicyAlreadyExists) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		h.logger.Error("CreateRegionPolicy: store unavailable", zap.Error(err))
+		writeError(w, http.StatusInternalServerError, "failed to create region policy")
+		return
+	}
+	writeJSON(w, http.StatusCreated, rp)
 }
 
 type initiateConnectionRequest struct {
@@ -198,6 +265,9 @@ func (h *BNK02Handler) CompleteConnectionAuthorization(w http.ResponseWriter, r 
 		return
 	}
 	tenantID := middleware.GetTenantID(r.Context())
+	if !h.enforceRegionPolicy(w, r, tenantID, conn) {
+		return
+	}
 	updated, err := h.bnk02Store.CompleteConnectionAuthorization(r.Context(), domain.CompleteConnectionAuthorizationParams{
 		ConnectionID: id, TenantID: tenantID, TokenLeaseRef: req.TokenLeaseRef, TokenExpiresAt: req.TokenExpiresAt,
 		GrantedScope: req.GrantedScope, ActorPrincipalID: principalID,
@@ -228,6 +298,9 @@ func (h *BNK02Handler) ActivateConnection(w http.ResponseWriter, r *http.Request
 		return
 	}
 	tenantID := middleware.GetTenantID(r.Context())
+	if !h.enforceRegionPolicy(w, r, tenantID, conn) {
+		return
+	}
 	updated, err := h.bnk02Store.ActivateConnection(r.Context(), domain.ActivateConnectionParams{ConnectionID: id, TenantID: tenantID, ActorPrincipalID: principalID})
 	if err != nil {
 		h.writeConnectionErr(w, err)

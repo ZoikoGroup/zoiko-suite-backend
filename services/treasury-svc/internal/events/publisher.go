@@ -99,6 +99,60 @@ func (p *Publisher) PublishLiquidityThresholdBreached(ctx context.Context, corre
 	})
 }
 
+// ── BNK-01 domain events ─────────────────────────────────────────────────────
+//
+// Previously this service published nothing at all for the bank-account
+// lifecycle — the Publisher interface only had Cash* methods. Every
+// bnk01_handler.go command now calls one of these.
+
+func bankAccountPayload(acct domain.BankAccount) map[string]any {
+	return map[string]any{
+		"bank_account_id": acct.BankAccountID,
+		"tenant_id":       acct.TenantID,
+		"legal_entity_id": acct.LegalEntityID,
+		"account_status":  acct.AccountStatus,
+	}
+}
+
+func (p *Publisher) PublishBankAccountCreated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	p.emit(ctx, "bank_account.created", correlationID, acct.TenantID, acct.LegalEntityID, actorID, bankAccountPayload(acct))
+}
+
+func (p *Publisher) PublishBankAccountOwnershipVerified(ctx context.Context, correlationID, actorID string, acct domain.BankAccount, evidence domain.OwnershipEvidence) {
+	payload := bankAccountPayload(acct)
+	payload["evidence_id"] = evidence.EvidenceID
+	payload["verification_method"] = evidence.VerificationMethod
+	p.emit(ctx, "bank_account.ownership_verified", correlationID, acct.TenantID, acct.LegalEntityID, actorID, payload)
+}
+
+func (p *Publisher) PublishBankAccountMetadataAmended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	p.emit(ctx, "bank_account.metadata_amended", correlationID, acct.TenantID, acct.LegalEntityID, actorID, bankAccountPayload(acct))
+}
+
+func (p *Publisher) PublishBankAccountOperationalUseChanged(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	payload := bankAccountPayload(acct)
+	payload["requested_operational_use"] = acct.RequestedOperationalUse
+	p.emit(ctx, "bank_account.operational_use_changed", correlationID, acct.TenantID, acct.LegalEntityID, actorID, payload)
+}
+
+func (p *Publisher) PublishBankAccountSuspended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	p.emit(ctx, "bank_account.suspended", correlationID, acct.TenantID, acct.LegalEntityID, actorID, bankAccountPayload(acct))
+}
+
+func (p *Publisher) PublishBankAccountReactivated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	p.emit(ctx, "bank_account.reactivated", correlationID, acct.TenantID, acct.LegalEntityID, actorID, bankAccountPayload(acct))
+}
+
+func (p *Publisher) PublishBankAccountClosed(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	p.emit(ctx, "bank_account.closed", correlationID, acct.TenantID, acct.LegalEntityID, actorID, bankAccountPayload(acct))
+}
+
+func (p *Publisher) PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	payload := bankAccountPayload(acct)
+	payload["token_version"] = acct.TokenVersion
+	p.emit(ctx, "bank_account.token_rotated", correlationID, acct.TenantID, acct.LegalEntityID, actorID, payload)
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

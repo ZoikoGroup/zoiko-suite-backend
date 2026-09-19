@@ -31,6 +31,8 @@ type BNK02Store interface {
 	ReconnectProvider(ctx context.Context, params domain.ReconnectProviderParams) (*domain.BankConnection, error)
 	RotateConnectionCredential(ctx context.Context, params domain.RotateConnectionCredentialParams) (*domain.BankConnection, error)
 	ListConnectionEvents(ctx context.Context, tenantID, connectionID string) ([]domain.ConnectionEvent, error)
+	CreateRegionPolicy(ctx context.Context, params domain.CreateRegionPolicyParams) (*domain.BankRegionPolicy, error)
+	IsRegionAllowed(ctx context.Context, tenantID, legalEntityID, region string) (bool, error)
 }
 
 // BNK0304Store is BNK-03 Statement Ingestion + BNK-04 Transaction
@@ -43,8 +45,10 @@ type BNK0304Store interface {
 	AcceptStatement(ctx context.Context, tenantID, statementID string) error
 	QuarantineStatement(ctx context.Context, tenantID, statementID, reason string) error
 	ReprocessQuarantinedStatement(ctx context.Context, tenantID, statementID string) error
-	NormalizeTransaction(ctx context.Context, params domain.NormalizeTransactionParams) (*domain.CanonicalTransaction, error)
+	NormalizeTransaction(ctx context.Context, params domain.NormalizeTransactionParams) (*domain.NormalizeTransactionResult, error)
 	ReNormalizeTransaction(ctx context.Context, params domain.ReNormalizeTransactionParams) (*domain.CanonicalTransaction, error)
 	QuarantineTransaction(ctx context.Context, params domain.QuarantineTransactionParams) (*domain.MappingException, error)
 	ApproveMappingException(ctx context.Context, params domain.ApproveMappingExceptionParams) (*domain.CanonicalTransaction, error)
+	GetCanonicalTransaction(ctx context.Context, tenantID, transactionID string) (*domain.CanonicalTransaction, error)
+	CreateTransactionMapping(ctx context.Context, params domain.CreateTransactionMappingParams) (*domain.TransactionMapping, error)
 }

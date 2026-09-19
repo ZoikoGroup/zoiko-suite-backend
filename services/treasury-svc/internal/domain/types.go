@@ -242,6 +242,11 @@ var (
 	// account exists but isn't in a state that permits the attempted
 	// command (e.g. suspending a DRAFT account, or amending a CLOSED one).
 	ErrInvalidTransition = errorString("bank account is not in a state that permits this action")
+
+	// ErrSelfVerificationForbidden is BNK-01's maker-checker rule: the
+	// principal who registered a bank account cannot also be the one who
+	// verifies its ownership — mirrors BNK-09's ErrTransferSelfApproval.
+	ErrSelfVerificationForbidden = errorString("the principal who created this bank account cannot also verify its ownership")
 )
 
 type ExpectedCashFlow struct {

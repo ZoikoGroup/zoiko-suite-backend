@@ -158,8 +158,14 @@ type ProviderCallbackPayload struct {
 }
 
 type LinkStatementRequest struct {
-	StatementReference string
-	ReportedStatus     ExecutionStatus
+	StatementReference string          `json:"statement_reference"`
+	ReportedStatus     ExecutionStatus `json:"reported_status"`
+
+	// BNK-05 correlation fields — carried through to the conflict event so
+	// bank-reconciliation-svc can correlate without fuzzy matching.
+	StatementLineID   string `json:"statement_line_id,omitempty"`    // bank-reconciliation-svc statement_line_id
+	ProviderRequestID string `json:"provider_request_id,omitempty"` // BNK-06 provider_request_id
+	BankRecStatus     string `json:"bank_rec_status,omitempty"`     // bank-rec status at time of link
 }
 
 type ResolveConflictRequest struct {
@@ -189,4 +195,12 @@ const (
 	ErrInvalidCallbackStatus = sentinel("reported_status must be ACCEPTED, PENDING, SETTLED, or REJECTED")
 	ErrOpenConflictExists    = sentinel("payment already has an open, unresolved status conflict")
 	ErrStoreUnavailable      = sentinel("store unavailable")
+	// ErrSelfResolutionForbidden is the SoD rule the spec names as "manual
+	// finality override requires exceptional controlled workflow and
+	// evidence": the principal who created a payment cannot also be the
+	// one who manually settles/resolves its finality. Role-permission
+	// separation (PaymentFinalityConfirm vs the ingest actions) is real
+	// but insufficient alone — a principal holding both roles could
+	// otherwise create then resolve the same payment themselves.
+	ErrSelfResolutionForbidden = sentinel("the principal who created this payment cannot also resolve its finality")
 )

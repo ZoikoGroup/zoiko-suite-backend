@@ -72,6 +72,10 @@ func (h *Handler) VerifyBankAccountOwnership(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	if acct.CreatedByPrincipalID != "" && acct.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, "self_verification_forbidden", string(domain.ErrSelfVerificationForbidden))
+		return
+	}
 	if err := h.authz.CheckAllowed(r.Context(), principalID, acct.LegalEntityID, actionVerifyOwnership); err != nil {
 		h.writeAuthzErr(w, err)
 		return
@@ -85,6 +89,7 @@ func (h *Handler) VerifyBankAccountOwnership(w http.ResponseWriter, r *http.Requ
 		h.writeBankAccountErr(w, err)
 		return
 	}
+	h.publisher.PublishBankAccountOwnershipVerified(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *acct, *evidence)
 	writeJSON(w, http.StatusOK, evidence)
 }
 
@@ -92,6 +97,18 @@ func (h *Handler) VerifyBankAccountOwnership(w http.ResponseWriter, r *http.Requ
 // single-account read other Banking services (starting with BNK-02's
 // bank_account_id validation) need and which previously didn't exist;
 // only ListBankAccounts (legal-entity-scoped list) was available.
+// bankAccountDetailResponse adds the derived IsOwnershipVerified fact
+// (never a column — see migration 000003's own doc comment on
+// domain.OwnershipEvidence) to the single-account read. Deliberately not
+// added to domain.BankAccount itself: ListBankAccounts composes this type
+// for every account in a legal entity (BNK-08 cash position, etc.), and
+// those callers have no use for a per-account ownership-evidence query —
+// this field is only computed on the single-account detail path.
+type bankAccountDetailResponse struct {
+	domain.BankAccount
+	IsOwnershipVerified bool `json:"is_ownership_verified"`
+}
+
 func (h *Handler) GetBankAccountByID(w http.ResponseWriter, r *http.Request) {
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
@@ -106,7 +123,13 @@ func (h *Handler) GetBankAccountByID(w http.ResponseWriter, r *http.Request) {
 		h.writeAuthzErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, acct)
+	verified, err := h.store.IsOwnershipVerified(r.Context(), acct.TenantID, acct.BankAccountID)
+	if err != nil {
+		h.log.Error("GetBankAccountByID: IsOwnershipVerified failed — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_error", "cannot verify ownership status")
+		return
+	}
+	writeJSON(w, http.StatusOK, bankAccountDetailResponse{BankAccount: *acct, IsOwnershipVerified: verified})
 }
 
 func (h *Handler) GetOwnershipEvidence(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +199,7 @@ func (h *Handler) AmendBankAccountMetadata(w http.ResponseWriter, r *http.Reques
 		h.writeBankAccountErr(w, err)
 		return
 	}
+	h.publisher.PublishBankAccountMetadataAmended(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -214,6 +238,7 @@ func (h *Handler) ChangeOperationalUse(w http.ResponseWriter, r *http.Request) {
 		h.writeBankAccountErr(w, err)
 		return
 	}
+	h.publisher.PublishBankAccountOperationalUseChanged(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -247,6 +272,7 @@ func (h *Handler) SuspendBankAccount(w http.ResponseWriter, r *http.Request) {
 		h.writeBankAccountErr(w, err)
 		return
 	}
+	h.publisher.PublishBankAccountSuspended(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -274,6 +300,7 @@ func (h *Handler) ReactivateBankAccount(w http.ResponseWriter, r *http.Request) 
 		h.writeBankAccountErr(w, err)
 		return
 	}
+	h.publisher.PublishBankAccountReactivated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -303,6 +330,7 @@ func (h *Handler) CloseBankAccount(w http.ResponseWriter, r *http.Request) {
 		h.writeBankAccountErr(w, err)
 		return
 	}
+	h.publisher.PublishBankAccountClosed(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -351,5 +379,6 @@ func (h *Handler) RotateAccountIdentifierToken(w http.ResponseWriter, r *http.Re
 		h.writeBankAccountErr(w, err)
 		return
 	}
+	h.publisher.PublishBankAccountTokenRotated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"zoiko.io/banking-connector-svc/internal/domain"
 )
@@ -267,4 +268,53 @@ func (p *PgStore) ListConnectionEvents(ctx context.Context, tenantID, connection
 		return nil, err
 	}
 	return res, nil
+}
+
+// CreateRegionPolicy adds one allowed-region entry for a legal entity.
+// idx_bank_region_policies_tenant_entity_region (migration 006) enforces
+// uniqueness — a duplicate is rejected rather than silently accepted as a
+// no-op, so a caller can tell "already allowed" apart from "just added."
+func (p *PgStore) CreateRegionPolicy(ctx context.Context, params domain.CreateRegionPolicyParams) (*domain.BankRegionPolicy, error) {
+	var rp domain.BankRegionPolicy
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			INSERT INTO bank_region_policies (policy_id, tenant_id, legal_entity_id, region, created_by_principal_id)
+			VALUES ($1,$2,$3,$4,$5)
+			RETURNING policy_id, tenant_id, legal_entity_id, region, created_by_principal_id, created_at`,
+			uuid.New().String(), params.TenantID, params.LegalEntityID, params.Region, params.ActorPrincipalID)
+		return row.Scan(&rp.PolicyID, &rp.TenantID, &rp.LegalEntityID, &rp.Region, &rp.CreatedByPrincipalID, &rp.CreatedAt)
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, domain.ErrRegionPolicyAlreadyExists
+		}
+		return nil, err
+	}
+	return &rp, nil
+}
+
+// IsRegionAllowed reports whether region is permitted for a legal entity.
+// A legal entity with NO configured policy rows has no restriction at all
+// — this returns true unconditionally in that case, so enforcement is
+// opt-in per legal entity rather than retroactively deny-by-default for
+// every legal entity that predates migration 006.
+func (p *PgStore) IsRegionAllowed(ctx context.Context, tenantID, legalEntityID, region string) (bool, error) {
+	var totalPolicies, matchingPolicies int
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM bank_region_policies WHERE tenant_id=$1 AND legal_entity_id=$2`, tenantID, legalEntityID).Scan(&totalPolicies); err != nil {
+			return err
+		}
+		if totalPolicies == 0 {
+			return nil
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM bank_region_policies WHERE tenant_id=$1 AND legal_entity_id=$2 AND region=$3`, tenantID, legalEntityID, region).Scan(&matchingPolicies)
+	})
+	if err != nil {
+		return false, err
+	}
+	if totalPolicies == 0 {
+		return true, nil
+	}
+	return matchingPolicies > 0, nil
 }
