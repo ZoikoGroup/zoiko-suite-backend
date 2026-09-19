@@ -26,6 +26,7 @@ type Store interface {
 	ListStatementLines(ctx context.Context, filter domain.ListStatementLinesFilter) ([]domain.StatementLine, error)
 	MatchStatementLine(ctx context.Context, tenantID, statementLineID, journalID, actorPrincipalID string) error
 	FlagException(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
+	UnmatchWithReason(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
 	CountUnmatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error)
 	CountMatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error)
 	StatementLegalEntities(ctx context.Context, tenantID, bankAccountID, statementDate string) ([]string, error)
@@ -47,6 +48,7 @@ type Store interface {
 	BindPolicy(ctx context.Context, tenantID, runID, policyID string) (*domain.ReconciliationRun, error)
 	CertifyRun(ctx context.Context, tenantID, runID, certifierPrincipalID, correlationID string) (*domain.ReconciliationCertificate, bool, error)
 	SupersedeRun(ctx context.Context, tenantID, existingRunID, principalID, correlationID string) (*domain.ReconciliationRun, error)
+	ListUnmatchedLinesInPopulation(ctx context.Context, tenantID, populationID string) ([]domain.StatementLine, error)
 
 	// Tolerance/materiality policies.
 	CreatePolicy(ctx context.Context, tenantID string, req domain.CreatePolicyRequest, principalID string) (*domain.ReconciliationPolicy, error)
@@ -71,6 +73,7 @@ type Publisher interface {
 	// Run lifecycle events.
 	PublishReconciliationStarted(ctx context.Context, run domain.ReconciliationRun)
 	PublishReconciliationReperformed(ctx context.Context, newRun domain.ReconciliationRun, priorRunID string)
+	PublishReconciliationSuperseded(ctx context.Context, priorRun domain.ReconciliationRun, newRunID string)
 	PublishReconciliationCertified(ctx context.Context, run domain.ReconciliationRun, cert domain.ReconciliationCertificate)
 	// Evidence conflict events.
 	PublishEvidenceConflictRaised(ctx context.Context, conflict domain.EvidenceConflict)
@@ -118,6 +121,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{statement_line_id}", h.GetStatementLine)
 		r.Post("/{statement_line_id}/match", h.MatchStatementLine)
 		r.Post("/{statement_line_id}/exception", h.FlagException)
+		r.Post("/{statement_line_id}/unmatch", h.UnmatchWithReason)
 
 		// BNK-05 maker-checker manual matching — additive alongside the
 		// single-actor /match above.
@@ -135,6 +139,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{run_id}/population", h.GetRunPopulation)
 		r.Post("/{run_id}/certify", h.CertifyRun)
 		r.Post("/{run_id}/reperform", h.ReperformRun)
+		r.Post("/{run_id}/auto-match", h.RunAutomaticMatching)
 		r.Post("/{run_id}/bind-policy", h.BindPolicy)
 	})
 
@@ -494,6 +499,64 @@ func (h *Handler) FlagException(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.FlagException(r.Context(), tenantID, statementLineID, req.Reason, principalID); err != nil {
+		h.handleTransitionErr(w, err)
+		return
+	}
+
+	l.Status = domain.StatementLineStatusException
+	l.ExceptionReason = &req.Reason
+	l.FlaggedByPrincipalID = &principalID
+	h.publisher.PublishReconciliationExceptionRaised(r.Context(), *l)
+	writeJSON(w, http.StatusOK, l)
+}
+
+// ── POST /v1/statement-lines/{statement_line_id}/unmatch ─────────────────────
+//
+// UnmatchWithReason is BNK-05's correction path for a bad match: it
+// reverts a MATCHED line back to EXCEPTION with a mandatory reason,
+// without reperforming the whole run. Unlike FlagException (which only
+// applies to a still-UNMATCHED line), this is the one command that walks
+// a line backwards out of MATCHED — so a reason is required for the same
+// evidentiary reason FlagException requires one.
+func (h *Handler) UnmatchWithReason(w http.ResponseWriter, r *http.Request) {
+	var req domain.FlagExceptionRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "reason")
+		return
+	}
+	if len(req.Reason) > 500 {
+		writeError(w, http.StatusBadRequest, "invalid_field", "reason must be 500 characters or fewer")
+		return
+	}
+
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	statementLineID := chi.URLParam(r, "statement_line_id")
+	l, err := h.store.GetStatementLine(r.Context(), statementLineID)
+	if err != nil {
+		h.writeStoreErr(w, "UnmatchWithReason", err)
+		return
+	}
+	if l == nil {
+		writeError(w, http.StatusNotFound, "statement_line_not_found", "")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, l.LegalEntityID, actionMatch); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if err := h.store.UnmatchWithReason(r.Context(), tenantID, statementLineID, req.Reason, principalID); err != nil {
 		h.handleTransitionErr(w, err)
 		return
 	}

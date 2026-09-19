@@ -589,6 +589,28 @@ func (s *PgStore) CertifyRun(ctx context.Context, tenantID, runID, certifierPrin
 			return domain.ErrRunPopulationNotFrozen
 		}
 
+		// 4b. Run-level SoD: the certifying principal must not be the
+		// matcher of record for any MATCHED line in this run's frozen
+		// population — otherwise the same person who did the matching
+		// could also sign off on it. Line-level maker-checker already
+		// blocks self-confirmation for an individual PENDING_CONFIRMATION
+		// match (ConfirmMatch); this is the run-level analogue, closing
+		// the same class of gap at certification.
+		var selfCertifiedCount int
+		scRow := tx.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM statement_lines sl
+			JOIN reconciliation_population_lines pl ON pl.statement_line_id = sl.statement_line_id
+			WHERE pl.population_id = $1 AND pl.tenant_id = $2::uuid AND pl.included = TRUE
+			  AND sl.status = 'MATCHED' AND sl.matched_by_principal_id = $3
+		`, *run.PopulationID, tenantID, certifierPrincipalID)
+		if err := scRow.Scan(&selfCertifiedCount); err != nil {
+			return err
+		}
+		if selfCertifiedCount > 0 {
+			return domain.ErrRunSelfCertificationForbidden
+		}
+
 		// 5. Count unmatched lines within the frozen population (not live statement_lines).
 		var unmatchedCount int
 		umRow := tx.QueryRow(ctx, `
@@ -730,4 +752,43 @@ func (s *PgStore) SupersedeRun(ctx context.Context, tenantID, existingRunID, pri
 
 	s.log.Info("run superseded", zap.String("old_run_id", existingRunID), zap.String("new_run_id", newRun.RunID))
 	return &newRun, nil
+}
+
+// ListUnmatchedLinesInPopulation returns every UNMATCHED statement line
+// belonging to a run's frozen population — the same join CertifyRun uses
+// to count unmatched lines, reused here so RunAutomaticMatching can only
+// ever act on lines that are genuinely part of THIS run's snapshot, not
+// on any UNMATCHED line the caller happens to name.
+func (s *PgStore) ListUnmatchedLinesInPopulation(ctx context.Context, tenantID, populationID string) ([]domain.StatementLine, error) {
+	var lines []domain.StatementLine
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT sl.statement_line_id, sl.tenant_id, sl.legal_entity_id, sl.bank_account_id, sl.statement_date,
+			       sl.amount, sl.currency_code, sl.bank_reference, sl.status,
+			       sl.matched_journal_id, sl.matched_transaction_id, sl.matched_by_principal_id, sl.matched_at,
+			       sl.exception_reason, sl.flagged_by_principal_id, sl.flagged_at,
+			       sl.gl_cash_account_code, sl.correlation_id, sl.created_at,
+			       sl.proposed_journal_id, sl.proposed_transaction_id, sl.proposed_by_principal_id, sl.proposed_at
+			FROM statement_lines sl
+			JOIN reconciliation_population_lines pl ON pl.statement_line_id = sl.statement_line_id
+			WHERE pl.population_id = $1 AND pl.tenant_id = $2::uuid AND pl.included = TRUE
+			  AND sl.status = 'UNMATCHED'
+		`, populationID, tenantID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var l domain.StatementLine
+			if err := scanLine(rows, &l); err != nil {
+				return err
+			}
+			lines = append(lines, l)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, mapPgError(err)
+	}
+	return lines, nil
 }

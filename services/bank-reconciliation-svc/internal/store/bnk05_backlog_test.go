@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
+	svcmiddleware "zoiko.io/bank-reconciliation-svc/internal/middleware"
 )
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -437,6 +438,126 @@ func TestCertifyRun_ExceedsThreshold_Blocked(t *testing.T) {
 	// Line in population is still UNMATCHED -> exceeds MaxUnmatchedCount (0) -> blocked.
 	_, _, err = testStore.CertifyRun(ctx, tenantID, run.RunID, "certifier-1", newCorr())
 	require.ErrorIs(t, err, domain.ErrMaterialResidualBlocked)
+}
+
+// TestCertifyRun_RejectsSelfCertification is the real proof of the
+// run-level SoD rule: a principal who matched a line in the frozen
+// population cannot also certify the run.
+func TestCertifyRun_RejectsSelfCertification(t *testing.T) {
+	ctx := context.Background()
+	tenantID := newTenant()
+	leID := newLE()
+	acctID := newAcct()
+	date := "2024-08-15"
+
+	pol, err := testStore.CreatePolicy(ctx, tenantID, domain.CreatePolicyRequest{
+		TenantID: tenantID, LegalEntityID: leID, EffectiveFrom: "2024-01-01",
+		MaxUnmatchedCount: 0, MaxUnmatchedPct: 0.0, MaxUnresolvedAmount: 0.0,
+		Currency: "USD", Rationale: "zero tolerance", CorrelationID: newCorr(),
+	}, "actor-1")
+	require.NoError(t, err)
+
+	run, _, err := testStore.StartRun(ctx, tenantID, domain.StartRunRequest{
+		TenantID: tenantID, LegalEntityID: leID, BankAccountID: acctID, StatementDate: date, CorrelationID: newCorr(),
+	}, "actor-1")
+	require.NoError(t, err)
+	_, err = testStore.BindPolicy(ctx, tenantID, run.RunID, pol.PolicyID)
+	require.NoError(t, err)
+
+	line1 := seedLine(t, ctx, tenantID, leID, acctID, date)
+	_, _, err = testStore.FreezePopulation(ctx, tenantID, run.RunID, "actor-1", newCorr())
+	require.NoError(t, err)
+
+	err = testStore.MatchStatementLine(ctx, tenantID, line1.StatementLineID, uuid.New().String(), "matcher-1")
+	require.NoError(t, err)
+
+	// The matcher tries to certify their own work — must be refused.
+	_, _, err = testStore.CertifyRun(ctx, tenantID, run.RunID, "matcher-1", newCorr())
+	require.ErrorIs(t, err, domain.ErrRunSelfCertificationForbidden)
+
+	// A different principal certifying must succeed.
+	cert, created, err := testStore.CertifyRun(ctx, tenantID, run.RunID, "certifier-1", newCorr())
+	require.NoError(t, err)
+	require.True(t, created)
+	require.NotNil(t, cert)
+}
+
+// TestListUnmatchedLinesInPopulation_OnlyReturnsFrozenUnmatchedLines is the
+// real proof behind RunAutomaticMatching's containment check: it must
+// return exactly the lines that are both (a) part of THIS run's frozen
+// population snapshot and (b) still UNMATCHED — not a matched line in the
+// same population, and not an unrelated UNMATCHED line that arrived after
+// the freeze (late data), even though that line is genuinely UNMATCHED
+// somewhere in the tenant's register.
+func TestListUnmatchedLinesInPopulation_OnlyReturnsFrozenUnmatchedLines(t *testing.T) {
+	ctx := context.Background()
+	tenantID := newTenant()
+	leID := newLE()
+	acctID := newAcct()
+	date := "2024-08-20"
+
+	run, _, err := testStore.StartRun(ctx, tenantID, domain.StartRunRequest{
+		TenantID: tenantID, LegalEntityID: leID, BankAccountID: acctID, StatementDate: date, CorrelationID: newCorr(),
+	}, "actor-1")
+	require.NoError(t, err)
+
+	unmatchedLine := seedLine(t, ctx, tenantID, leID, acctID, date)
+	matchedLine := seedLine(t, ctx, tenantID, leID, acctID, date)
+
+	_, _, err = testStore.FreezePopulation(ctx, tenantID, run.RunID, "actor-1", newCorr())
+	require.NoError(t, err)
+
+	err = testStore.MatchStatementLine(ctx, tenantID, matchedLine.StatementLineID, uuid.New().String(), "matcher-1")
+	require.NoError(t, err)
+
+	// Late data: an UNMATCHED line for the same account+date, seeded AFTER
+	// the freeze — genuinely UNMATCHED, but never part of this population.
+	lateLine := seedLine(t, ctx, tenantID, leID, acctID, date)
+
+	run, err = testStore.GetRun(ctx, tenantID, run.RunID)
+	require.NoError(t, err)
+	require.NotNil(t, run.PopulationID)
+
+	lines, err := testStore.ListUnmatchedLinesInPopulation(ctx, tenantID, *run.PopulationID)
+	require.NoError(t, err)
+	require.Len(t, lines, 1)
+	require.Equal(t, unmatchedLine.StatementLineID, lines[0].StatementLineID)
+
+	for _, l := range lines {
+		require.NotEqual(t, matchedLine.StatementLineID, l.StatementLineID, "must not include the MATCHED line")
+		require.NotEqual(t, lateLine.StatementLineID, l.StatementLineID, "must not include a line outside the frozen population")
+	}
+}
+
+// TestUnmatchWithReason_MatchedLine_RevertsToException proves the real
+// correction path: a MATCHED line reverts to EXCEPTION with the reason
+// and actor persisted, and — the negative control — an already-UNMATCHED
+// line has no MATCHED state to revert from and is refused.
+func TestUnmatchWithReason_MatchedLine_RevertsToException(t *testing.T) {
+	ctx := context.Background()
+	tenantID := newTenant()
+	leID := newLE()
+	acctID := newAcct()
+	date := "2024-08-25"
+
+	line := seedLine(t, ctx, tenantID, leID, acctID, date)
+	err := testStore.MatchStatementLine(ctx, tenantID, line.StatementLineID, uuid.New().String(), "matcher-1")
+	require.NoError(t, err)
+
+	err = testStore.UnmatchWithReason(ctx, tenantID, line.StatementLineID, "matched to the wrong journal", "reviewer-1")
+	require.NoError(t, err)
+
+	got, err := testStore.GetStatementLine(svcmiddleware.WithTenant(ctx, tenantID), line.StatementLineID)
+	require.NoError(t, err)
+	require.Equal(t, domain.StatementLineStatusException, got.Status)
+	require.NotNil(t, got.ExceptionReason)
+	require.Equal(t, "matched to the wrong journal", *got.ExceptionReason)
+	require.NotNil(t, got.FlaggedByPrincipalID)
+	require.Equal(t, "reviewer-1", *got.FlaggedByPrincipalID)
+
+	// Negative control: unmatching a line that isn't MATCHED is refused.
+	err = testStore.UnmatchWithReason(ctx, tenantID, line.StatementLineID, "already reverted", "reviewer-1")
+	require.ErrorIs(t, err, domain.ErrInvalidTransition)
 }
 
 // ── Evidence conflict tests ───────────────────────────────────────────────────

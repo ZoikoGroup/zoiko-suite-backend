@@ -125,7 +125,10 @@ func (p *Publisher) PublishReconciliationStarted(ctx context.Context, run domain
 	})
 }
 
-// PublishReconciliationReperformed corresponds to BankReconciliationReperformed.
+// PublishReconciliationReperformed corresponds to BankReconciliationReperformed
+// — the NEW run starting. See PublishReconciliationSuperseded for the OLD
+// run ending; a listener needs both to distinguish the two rather than
+// inferring "old run ended" from this event alone.
 func (p *Publisher) PublishReconciliationReperformed(ctx context.Context, newRun domain.ReconciliationRun, priorRunID string) {
 	p.emit(ctx, "reconciliation.run.reperformed", newRun.CorrelationID, newRun.TenantID, newRun.LegalEntityID, newRun.CreatedByPrincipalID, newRun.RunID, map[string]any{
 		"new_run_id":      newRun.RunID,
@@ -133,6 +136,19 @@ func (p *Publisher) PublishReconciliationReperformed(ctx context.Context, newRun
 		"tenant_id":       newRun.TenantID,
 		"bank_account_id": newRun.BankAccountID,
 		"statement_date":  newRun.StatementDate,
+	})
+}
+
+// PublishReconciliationSuperseded corresponds to BankReconciliationSuperseded
+// — the OLD run's own terminal transition, emitted alongside (not instead
+// of) PublishReconciliationReperformed's "new run started" event.
+func (p *Publisher) PublishReconciliationSuperseded(ctx context.Context, priorRun domain.ReconciliationRun, newRunID string) {
+	p.emit(ctx, "reconciliation.run.superseded", priorRun.CorrelationID, priorRun.TenantID, priorRun.LegalEntityID, priorRun.CreatedByPrincipalID, priorRun.RunID, map[string]any{
+		"run_id":               priorRun.RunID,
+		"superseded_by_run_id": newRunID,
+		"tenant_id":            priorRun.TenantID,
+		"bank_account_id":      priorRun.BankAccountID,
+		"statement_date":       priorRun.StatementDate,
 	})
 }
 
@@ -152,12 +168,12 @@ func (p *Publisher) PublishReconciliationCertified(ctx context.Context, run doma
 // created (first raise, not idempotent replays).
 func (p *Publisher) PublishEvidenceConflictRaised(ctx context.Context, conflict domain.EvidenceConflict) {
 	p.emit(ctx, "reconciliation.evidence_conflict.raised", conflict.CorrelationID, conflict.TenantID, conflict.LegalEntityID, conflict.RaisedByPrincipalID, conflict.ConflictID, map[string]any{
-		"conflict_id":              conflict.ConflictID,
-		"statement_line_id":        conflict.StatementLineID,
-		"payment_id":               conflict.PaymentID,
-		"bank_rec_status":          conflict.BankRecStatus,
+		"conflict_id":               conflict.ConflictID,
+		"statement_line_id":         conflict.StatementLineID,
+		"payment_id":                conflict.PaymentID,
+		"bank_rec_status":           conflict.BankRecStatus,
 		"provider_confirmed_status": conflict.ProviderConfirmedStatus,
-		"conflict_type":            conflict.ConflictType,
+		"conflict_type":             conflict.ConflictType,
 	})
 }
 
@@ -168,7 +184,7 @@ func (p *Publisher) PublishEvidenceConflictResolved(ctx context.Context, conflic
 		resolvedBy = *conflict.ResolvedByPrincipalID
 	}
 	p.emit(ctx, "reconciliation.evidence_conflict.resolved", conflict.CorrelationID, conflict.TenantID, conflict.LegalEntityID, resolvedBy, conflict.ConflictID, map[string]any{
-		"conflict_id":      conflict.ConflictID,
+		"conflict_id":       conflict.ConflictID,
 		"statement_line_id": conflict.StatementLineID,
 		"payment_id":        conflict.PaymentID,
 	})

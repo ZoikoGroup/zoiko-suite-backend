@@ -138,6 +138,40 @@ func HashPopulationLines(items []PopulationLineItem) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// AutoMatchCandidate is one caller-supplied line/journal (or line/canonical
+// transaction) pairing for RunAutomaticMatching to attempt. Supplying the
+// candidate journal/transaction — rather than having the server guess one
+// — keeps the same "never guess" posture as the manual match path; what's
+// automated here is the verification-and-match step, not the sourcing of
+// candidates.
+type AutoMatchCandidate struct {
+	StatementLineID string `json:"statement_line_id"`
+	JournalID       string `json:"journal_id,omitempty"`
+	TransactionID   string `json:"transaction_id,omitempty"`
+}
+
+type RunAutomaticMatchingRequest struct {
+	Candidates []AutoMatchCandidate `json:"candidates"`
+}
+
+// AutoMatchResult reports what happened to one candidate. A candidate is
+// never silently dropped — it either matched or carries a Reason
+// explaining why it didn't, so a caller can tell "verified and matched"
+// apart from "skipped because it wasn't actually an UNMATCHED line in this
+// run's frozen population" or "failed independent verification."
+type AutoMatchResult struct {
+	StatementLineID string `json:"statement_line_id"`
+	Matched         bool   `json:"matched"`
+	Reason          string `json:"reason,omitempty"`
+}
+
+type RunAutomaticMatchingResponse struct {
+	RunID        string            `json:"run_id"`
+	MatchedCount int               `json:"matched_count"`
+	SkippedCount int               `json:"skipped_count"`
+	Results      []AutoMatchResult `json:"results"`
+}
+
 // Sentinel errors for the run model.
 var (
 	ErrRunNotFound                 = errorString("reconciliation run not found")
@@ -151,4 +185,10 @@ var (
 	ErrPolicyWouldWidenActiveRun   = errorString("policy cannot be widened while a reconciliation run is active")
 	ErrPopulationNotFound          = errorString("population snapshot not found")
 	ErrMaterialResidualBlocked     = errorString("material unmatched residual exceeds policy threshold")
+	// ErrRunSelfCertificationForbidden is the run-level SoD rule: a
+	// principal who matched (or confirmed) any MATCHED line in the
+	// frozen population cannot also certify the run — mirrors the
+	// line-level ConfirmMatch self-confirmation block, applied at the
+	// run/certification level.
+	ErrRunSelfCertificationForbidden = errorString("the certifying principal matched at least one line in this population and cannot also certify the run")
 )

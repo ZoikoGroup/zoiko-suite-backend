@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"go.uber.org/zap"
 
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 )
@@ -185,6 +186,8 @@ func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "run_invalid_transition", err.Error())
 		case errors.Is(err, domain.ErrMaterialResidualBlocked):
 			writeError(w, http.StatusUnprocessableEntity, "material_residual_blocked", err.Error())
+		case errors.Is(err, domain.ErrRunSelfCertificationForbidden):
+			writeError(w, http.StatusConflict, "self_certification_forbidden", err.Error())
 		default:
 			h.writeStoreErr(w, "CertifyRun", err)
 		}
@@ -244,8 +247,125 @@ func (h *Handler) ReperformRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.publisher.PublishReconciliationSuperseded(r.Context(), *run, newRun.RunID)
 	h.publisher.PublishReconciliationReperformed(r.Context(), *newRun, runID)
 	writeJSON(w, http.StatusCreated, newRun)
+}
+
+// ── POST /v1/reconciliation-runs/{run_id}/auto-match ─────────────────────────
+//
+// RunAutomaticMatching is BNK-05's batch matcher: for each caller-supplied
+// candidate it runs the exact same deterministic verification as the
+// manual single-actor match path (verifyJournalMatches /
+// verifyCanonicalMatch) and, only on a pass, applies the match directly —
+// no separate propose/confirm step, because the "checker" here is the
+// independent cross-service verification against general-ledger-svc or
+// banking-connector-svc, not a second human's judgment call.
+//
+// Every candidate is checked against ListUnmatchedLinesInPopulation
+// first — a statement_line_id that isn't a genuinely UNMATCHED line in
+// THIS run's frozen population is skipped with a reason, never matched,
+// even if it exists and is UNMATCHED elsewhere. One candidate failing
+// verification or already being resolved never aborts the batch; every
+// candidate gets its own result.
+func (h *Handler) RunAutomaticMatching(w http.ResponseWriter, r *http.Request) {
+	var req domain.RunAutomaticMatchingRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	runID := chi.URLParam(r, "run_id")
+
+	run, err := h.store.GetRun(r.Context(), tenantID, runID)
+	if err != nil {
+		if errors.Is(err, domain.ErrRunNotFound) {
+			writeError(w, http.StatusNotFound, "run_not_found", "")
+			return
+		}
+		h.writeStoreErr(w, "RunAutomaticMatching/GetRun", err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, run.LegalEntityID, actionMatch); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if run.PopulationID == nil {
+		writeError(w, http.StatusConflict, "population_not_frozen", domain.ErrRunPopulationNotFrozen.Error())
+		return
+	}
+
+	unmatched, err := h.store.ListUnmatchedLinesInPopulation(r.Context(), tenantID, *run.PopulationID)
+	if err != nil {
+		h.writeStoreErr(w, "RunAutomaticMatching/ListUnmatchedLinesInPopulation", err)
+		return
+	}
+	byLineID := make(map[string]domain.StatementLine, len(unmatched))
+	for _, l := range unmatched {
+		byLineID[l.StatementLineID] = l
+	}
+
+	resp := domain.RunAutomaticMatchingResponse{RunID: runID}
+	for _, c := range req.Candidates {
+		result := domain.AutoMatchResult{StatementLineID: c.StatementLineID}
+
+		l, inPopulation := byLineID[c.StatementLineID]
+		switch {
+		case !inPopulation:
+			result.Reason = "not an UNMATCHED line in this run's frozen population"
+		case c.JournalID == "" && c.TransactionID == "":
+			result.Reason = "missing journal_id or transaction_id"
+		case c.TransactionID != "":
+			if h.banking == nil {
+				result.Reason = "banking connector integration not configured"
+				break
+			}
+			if err := h.verifyCanonicalMatch(r.Context(), l, c.TransactionID); err != nil {
+				result.Reason = err.Error()
+				break
+			}
+			if err := h.store.MatchStatementLineWithCanonical(r.Context(), tenantID, c.StatementLineID, c.TransactionID, principalID); err != nil {
+				result.Reason = err.Error()
+				break
+			}
+			l.Status = domain.StatementLineStatusMatched
+			l.MatchedTransactionID = &c.TransactionID
+			l.MatchedByPrincipalID = &principalID
+			h.publisher.PublishReconciliationMatched(r.Context(), l)
+			result.Matched = true
+		default:
+			if err := h.verifyJournalMatches(r.Context(), l, c.JournalID); err != nil {
+				result.Reason = err.Error()
+				break
+			}
+			if err := h.store.MatchStatementLine(r.Context(), tenantID, c.StatementLineID, c.JournalID, principalID); err != nil {
+				result.Reason = err.Error()
+				break
+			}
+			l.Status = domain.StatementLineStatusMatched
+			l.MatchedJournalID = &c.JournalID
+			l.MatchedByPrincipalID = &principalID
+			h.publisher.PublishReconciliationMatched(r.Context(), l)
+			result.Matched = true
+		}
+
+		if result.Matched {
+			resp.MatchedCount++
+		} else {
+			resp.SkippedCount++
+			h.log.Info("RunAutomaticMatching: candidate skipped",
+				zap.String("run_id", runID), zap.String("statement_line_id", c.StatementLineID), zap.String("reason", result.Reason))
+		}
+		resp.Results = append(resp.Results, result)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ── POST /v1/reconciliation-runs/{run_id}/bind-policy ────────────────────────

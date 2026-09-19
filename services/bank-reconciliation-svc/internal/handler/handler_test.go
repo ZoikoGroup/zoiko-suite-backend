@@ -55,6 +55,13 @@ type stubStore struct {
 	listConflictsErr    error
 	resolveConflictErr  error
 
+	// RunAutomaticMatching: the set of lines ListUnmatchedLinesInPopulation
+	// returns, an error to inject in its place, and the population_id
+	// GetRun's stubbed run reports as frozen (nil unless a test sets it).
+	unmatchedInPopulation []domain.StatementLine
+	listUnmatchedErr      error
+	runPopulationID       *string
+
 	// lastListFilter records what ListStatementLines was actually asked for,
 	// so a test can assert the tenant came from the verified header rather
 	// than from ?tenant_id.
@@ -123,6 +130,19 @@ func (s *stubStore) FlagException(_ context.Context, _, statementLineID, reason,
 	}
 	l, ok := s.lines[statementLineID]
 	if !ok || l.Status != domain.StatementLineStatusUnmatched {
+		return domain.ErrInvalidTransition
+	}
+	l.Status = domain.StatementLineStatusException
+	l.ExceptionReason = &reason
+	return nil
+}
+
+func (s *stubStore) UnmatchWithReason(_ context.Context, _, statementLineID, reason, _ string) error {
+	if s.transitionErr != nil {
+		return s.transitionErr
+	}
+	l, ok := s.lines[statementLineID]
+	if !ok || l.Status != domain.StatementLineStatusMatched {
 		return domain.ErrInvalidTransition
 	}
 	l.Status = domain.StatementLineStatusException
@@ -269,7 +289,7 @@ func (s *stubStore) GetRun(_ context.Context, _, _ string) (*domain.Reconciliati
 	if s.getRunErr != nil {
 		return nil, s.getRunErr
 	}
-	return &domain.ReconciliationRun{RunID: "run-1", Status: domain.RunStatusDraft, LegalEntityID: "e1"}, nil
+	return &domain.ReconciliationRun{RunID: "run-1", Status: domain.RunStatusDraft, LegalEntityID: "e1", PopulationID: s.runPopulationID}, nil
 }
 func (s *stubStore) FreezePopulation(_ context.Context, _, _, _, _ string) (*domain.ReconciliationPopulation, bool, error) {
 	if s.freezeErr != nil {
@@ -303,6 +323,13 @@ func (s *stubStore) SupersedeRun(_ context.Context, _, _, _, _ string) (*domain.
 		return nil, s.reperformErr
 	}
 	return &domain.ReconciliationRun{RunID: "run-2", Status: domain.RunStatusDraft, LegalEntityID: "e1"}, nil
+}
+
+func (s *stubStore) ListUnmatchedLinesInPopulation(_ context.Context, _, _ string) ([]domain.StatementLine, error) {
+	if s.listUnmatchedErr != nil {
+		return nil, s.listUnmatchedErr
+	}
+	return s.unmatchedInPopulation, nil
 }
 
 // Policy stubs.
@@ -357,6 +384,7 @@ func cashAcct() *string { c := "1000"; return &c }
 
 type stubPublisher struct {
 	ingested, matched, exceptionRaised, completed int
+	reperformed, superseded                       int
 }
 
 func (p *stubPublisher) PublishStatementIngested(_ context.Context, _ domain.StatementLine, _ string) {
@@ -373,6 +401,10 @@ func (p *stubPublisher) PublishReconciliationCompleted(_ context.Context, _, _, 
 }
 func (p *stubPublisher) PublishReconciliationStarted(_ context.Context, _ domain.ReconciliationRun) {}
 func (p *stubPublisher) PublishReconciliationReperformed(_ context.Context, _ domain.ReconciliationRun, _ string) {
+	p.reperformed++
+}
+func (p *stubPublisher) PublishReconciliationSuperseded(_ context.Context, _ domain.ReconciliationRun, _ string) {
+	p.superseded++
 }
 func (p *stubPublisher) PublishReconciliationCertified(_ context.Context, _ domain.ReconciliationRun, _ domain.ReconciliationCertificate) {
 }
@@ -756,6 +788,54 @@ func TestFlagException_AlreadyMatched_Rejected(t *testing.T) {
 	}
 }
 
+// ── UnmatchWithReason ─────────────────────────────────────────────────────────
+
+func TestUnmatchWithReason_MissingReason_Returns400(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusMatched, GLCashAccountCode: cashAcct()}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/unmatch", domain.FlagExceptionRequest{}, "principal-1")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unmatch with no reason, got %d", rec.Code)
+	}
+}
+
+func TestUnmatchWithReason_MatchedLine_RevertsToException(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusMatched, GLCashAccountCode: cashAcct()}
+
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/unmatch", domain.FlagExceptionRequest{Reason: "matched to the wrong journal"}, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusException {
+		t.Fatalf("expected status EXCEPTION, got %s", s.lines["l1"].Status)
+	}
+	if s.lines["l1"].ExceptionReason == nil || *s.lines["l1"].ExceptionReason != "matched to the wrong journal" {
+		t.Fatalf("expected the exception reason to be recorded, got %+v", s.lines["l1"].ExceptionReason)
+	}
+	if pub.exceptionRaised != 1 {
+		t.Errorf("expected PublishReconciliationExceptionRaised to be called once, got %d", pub.exceptionRaised)
+	}
+}
+
+// TestUnmatchWithReason_UnmatchedLine_Rejected is the negative control:
+// unmatch only ever applies to a MATCHED line — an already-UNMATCHED line
+// has nothing to revert.
+func TestUnmatchWithReason_UnmatchedLine_Rejected(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	rec := doRequest(r, http.MethodPost, "/v1/statement-lines/l1/unmatch", domain.FlagExceptionRequest{Reason: "no match to undo"}, "principal-1")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 unmatching an UNMATCHED line, got %d", rec.Code)
+	}
+}
+
 // ── GetStatementLine / ListStatementLines ────────────────────────────────────
 
 func TestGetStatementLine_NotFound(t *testing.T) {
@@ -921,7 +1001,8 @@ func TestCertifyRun_PopulationNotFrozen_Returns409(t *testing.T) {
 }
 
 func TestReperformRun_Success_Returns201(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubLedger{})
 	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/reperform", nil, "principal-1")
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
@@ -933,6 +1014,16 @@ func TestReperformRun_Success_Returns201(t *testing.T) {
 	if run.RunID == "run-1" {
 		t.Error("expected reperform to return a NEW run id, not the superseded one")
 	}
+	// Wave 8c: both the OLD run's own terminal event and the NEW run's
+	// start event must be published — previously only the latter existed,
+	// so a listener had no way to learn a run had ended vs merely that
+	// another one started.
+	if pub.superseded != 1 {
+		t.Errorf("expected PublishReconciliationSuperseded to be called once, got %d", pub.superseded)
+	}
+	if pub.reperformed != 1 {
+		t.Errorf("expected PublishReconciliationReperformed to be called once, got %d", pub.reperformed)
+	}
 }
 
 func TestReperformRun_AlreadySuperseded_Returns409(t *testing.T) {
@@ -942,6 +1033,114 @@ func TestReperformRun_AlreadySuperseded_Returns409(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/reperform", nil, "principal-1")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 reperforming an already-superseded run, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRunAutomaticMatching_VerifiedCandidate_Matches proves the real
+// batch-matching path: a candidate whose statement line is genuinely
+// UNMATCHED in the run's frozen population and whose journal
+// independently verifies (same verifyJournalMatches used by the manual
+// path) is matched directly, with no separate propose/confirm step.
+func TestRunAutomaticMatching_VerifiedCandidate_Matches(t *testing.T) {
+	s := newStubStore()
+	line := domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+	s.lines["l1"] = &line
+	s.unmatchedInPopulation = []domain.StatementLine{line}
+	popID := "pop-1"
+	s.runPopulationID = &popID
+
+	pub := &stubPublisher{}
+	r := newRouter(s, pub, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 1000)})
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp domain.RunAutomaticMatchingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MatchedCount != 1 || resp.SkippedCount != 0 {
+		t.Fatalf("expected 1 matched, 0 skipped, got matched=%d skipped=%d: %+v", resp.MatchedCount, resp.SkippedCount, resp.Results)
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusMatched {
+		t.Fatalf("expected line to be MATCHED, got %s", s.lines["l1"].Status)
+	}
+	if pub.matched != 1 {
+		t.Errorf("expected PublishReconciliationMatched to be called once, got %d", pub.matched)
+	}
+}
+
+// TestRunAutomaticMatching_UnverifiedCandidate_IsSkippedNotMatched is the
+// negative control: a candidate whose journal fails independent
+// verification (wrong amount) is never matched — it is skipped with a
+// reason, and the batch still returns 200 rather than aborting.
+func TestRunAutomaticMatching_UnverifiedCandidate_IsSkippedNotMatched(t *testing.T) {
+	s := newStubStore()
+	line := domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+	s.lines["l1"] = &line
+	s.unmatchedInPopulation = []domain.StatementLine{line}
+	popID := "pop-1"
+	s.runPopulationID = &popID
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 500)}) // amount mismatch
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 even with a skipped candidate, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp domain.RunAutomaticMatchingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MatchedCount != 0 || resp.SkippedCount != 1 || len(resp.Results) != 1 || resp.Results[0].Matched {
+		t.Fatalf("expected 1 skipped with a reason, not matched: %+v", resp)
+	}
+	if resp.Results[0].Reason == "" {
+		t.Fatal("expected a non-empty skip reason")
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusUnmatched {
+		t.Fatalf("expected the line to remain UNMATCHED, got %s", s.lines["l1"].Status)
+	}
+}
+
+// TestRunAutomaticMatching_CandidateOutsidePopulation_IsSkipped proves a
+// candidate naming a statement_line_id that is not actually part of this
+// run's frozen population (even if UNMATCHED elsewhere) is never matched.
+func TestRunAutomaticMatching_CandidateOutsidePopulation_IsSkipped(t *testing.T) {
+	s := newStubStore()
+	s.lines["l1"] = &domain.StatementLine{StatementLineID: "l1", TenantID: "t1", LegalEntityID: "e1", Amount: 1000, Status: domain.StatementLineStatusUnmatched, GLCashAccountCode: cashAcct()}
+	s.unmatchedInPopulation = nil // l1 is NOT part of the frozen population's unmatched set
+	popID := "pop-1"
+	s.runPopulationID = &popID
+
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{journal: finalizedJournal("e1", 1000)})
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp domain.RunAutomaticMatchingResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.MatchedCount != 0 || resp.SkippedCount != 1 {
+		t.Fatalf("expected the out-of-population candidate to be skipped, got %+v", resp)
+	}
+	if s.lines["l1"].Status != domain.StatementLineStatusUnmatched {
+		t.Fatalf("expected the line to remain untouched, got %s", s.lines["l1"].Status)
+	}
+}
+
+// TestRunAutomaticMatching_PopulationNotFrozen_Returns409 proves the run
+// must have a frozen population before auto-matching can run at all.
+func TestRunAutomaticMatching_PopulationNotFrozen_Returns409(t *testing.T) {
+	s := newStubStore() // runPopulationID left nil
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{})
+	req := domain.RunAutomaticMatchingRequest{Candidates: []domain.AutoMatchCandidate{{StatementLineID: "l1", JournalID: "j1"}}}
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/auto-match", req, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 with no frozen population, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

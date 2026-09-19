@@ -302,6 +302,45 @@ func (s *PgStore) FlagException(ctx context.Context, tenantID, statementLineID, 
 	return nil
 }
 
+// UnmatchWithReason reverts a MATCHED line back to EXCEPTION with a
+// mandatory reason — the one correction path for a bad match that doesn't
+// require reperforming the whole run. It reuses the same exception_reason
+// / flagged_by_principal_id / flagged_at evidence fields FlagException
+// already writes: a line entering EXCEPTION always carries the same three
+// fields regardless of which transition put it there. The prior
+// matched_journal_id/matched_transaction_id/matched_by_principal_id are
+// deliberately left in place rather than cleared — they are the historical
+// record of what turned out to be a bad match, not something to erase.
+//
+// This only ever touches the line itself; it does not know or care whether
+// the line's run has already been certified. A certificate's
+// matched_line_count is a snapshot at certification time (and is itself
+// append-only/immutable — see migration 000006), not a live invariant this
+// method re-checks, so unmatching a line from an already-certified run's
+// population will not update or invalidate that certificate.
+func (s *PgStore) UnmatchWithReason(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error {
+	var affected int64
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE statement_lines
+			SET status = 'EXCEPTION', exception_reason = $1, flagged_by_principal_id = $2, flagged_at = $3
+			WHERE statement_line_id = $4 AND status = 'MATCHED' AND tenant_id = $5
+		`, reason, actorPrincipalID, time.Now().UTC(), statementLineID, tenantID)
+		if err != nil {
+			return err
+		}
+		affected = tag.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return mapPgError(err)
+	}
+	if affected == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
+}
+
 // CountUnmatched returns how many lines are still UNMATCHED for the given
 // bank account + statement date — used to decide whether the statement can
 // be marked complete. tenantID must be the caller's verified scope.
