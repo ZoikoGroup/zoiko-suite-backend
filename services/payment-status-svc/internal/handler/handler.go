@@ -312,6 +312,33 @@ func (h *Handler) LinkStatementConfirmation(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+
+	// Publish the conflict event when a new conflict is raised. bank-reconciliation-svc
+	// consumes this event to create an evidence_conflict record. The payload carries
+	// BNK-05 correlation fields so the consumer can correlate without fuzzy matching.
+	if conflict {
+		tenantID := ""
+		if updated.TenantID != nil {
+			tenantID = *updated.TenantID
+		}
+		_ = h.pub.Publish(r.Context(), events.PublishParams{
+			EventType:     domain.EventPaymentStatusConflictRaised,
+			EntityID:      paymentID,
+			TenantID:      tenantID,
+			ActorID:       principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"),
+			Payload: map[string]interface{}{
+				"payment_id":          paymentID,
+				"statement_line_id":   req.StatementLineID,
+				"provider_request_id": updated.ProviderRequestID,
+				"bank_rec_status":     req.BankRecStatus,
+				"reported_status":     req.ReportedStatus,
+				"current_status":      updated.Status,
+				"statement_reference": req.StatementReference,
+			},
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{"payment": updated, "conflict_raised": conflict})
 }
 
@@ -356,6 +383,19 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+
+	tenantID := ""
+	if updated.TenantID != nil {
+		tenantID = *updated.TenantID
+	}
+	_ = h.pub.Publish(r.Context(), events.PublishParams{
+		EventType:     domain.EventPaymentStatusConflictResolved,
+		EntityID:      paymentID,
+		TenantID:      tenantID,
+		ActorID:       principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload:       updated,
+	})
 	writeJSON(w, http.StatusOK, updated)
 }
 

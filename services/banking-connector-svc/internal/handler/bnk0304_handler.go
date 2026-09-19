@@ -46,6 +46,9 @@ func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304S
 		r.Post("/{id}/re-normalize", bh.ReNormalizeTransaction)
 		r.Post("/quarantine", bh.QuarantineTransaction)
 	})
+	r.Route("/v1/banking/canonical-transactions", func(r chi.Router) {
+		r.Get("/{id}", bh.GetCanonicalTransaction)
+	})
 	r.Post("/v1/banking/mapping-exceptions/{id}/approve", bh.ApproveMappingException)
 }
 
@@ -312,3 +315,18 @@ func (h *BNK0304Handler) ApproveMappingException(w http.ResponseWriter, r *http.
 	})
 	writeJSON(w, http.StatusOK, txn)
 }
+
+func (h *BNK0304Handler) GetCanonicalTransaction(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tenantID := middleware.GetTenantID(r.Context())
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	txn, err := h.bnk0304Store.GetCanonicalTransaction(r.Context(), tenantID, id)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, txn)
+}
+

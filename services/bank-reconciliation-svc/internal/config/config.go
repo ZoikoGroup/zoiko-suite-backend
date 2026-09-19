@@ -36,6 +36,12 @@ type Config struct {
 	// before a statement line is allowed to transition to MATCHED.
 	LedgerServiceURL string
 
+	// BankingConnectorURL is the base URL of banking-connector-svc.
+	// When a caller provides a transaction_id instead of a journal_id the
+	// match path calls this service to verify the canonical transaction
+	// before persisting the match. Optional: if empty, the GL path is used.
+	BankingConnectorURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -65,6 +71,14 @@ type KafkaConfig struct {
 	Brokers []string
 	GroupID string
 	Topic   string
+
+	// PaymentStatusEventsTopic and ConflictConsumerGroupID are the
+	// evidence_conflicts consumer's own inputs — a separate topic (owned
+	// by payment-status-svc, not this service) and a separate consumer
+	// group so this subscription never collides with anything else
+	// reading Topic above.
+	PaymentStatusEventsTopic string
+	ConflictConsumerGroupID  string
 }
 
 // Load reads configuration from environment variables.
@@ -83,15 +97,18 @@ func Load() (*Config, error) {
 			SSLMode:  env("DB_SSLMODE", "require"),
 		},
 		Kafka: KafkaConfig{
-			Brokers: strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
-			GroupID: env("KAFKA_GROUP_ID", "bank-reconciliation-svc"),
-			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.bank-reconciliation.events"),
+			Brokers:                  strings.Split(env("KAFKA_BROKERS", "localhost:9092"), ","),
+			GroupID:                  env("KAFKA_GROUP_ID", "bank-reconciliation-svc"),
+			Topic:                    env("KAFKA_EVENTS_TOPIC", "zoiko.bank-reconciliation.events"),
+			PaymentStatusEventsTopic: env("PAYMENT_STATUS_EVENTS_TOPIC", "zoiko.payment-status.events"),
+			ConflictConsumerGroupID:  env("CONFLICT_CONSUMER_GROUP_ID", "bank-reconciliation-svc-evidence-conflicts"),
 		},
 		AuthZServiceURL:          env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		LedgerServiceURL:         env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
+		BankingConnectorURL:      env("BANKING_CONNECTOR_URL", "http://banking-connector-svc:8145"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

@@ -158,8 +158,14 @@ type ProviderCallbackPayload struct {
 }
 
 type LinkStatementRequest struct {
-	StatementReference string
-	ReportedStatus     ExecutionStatus
+	StatementReference string          `json:"statement_reference"`
+	ReportedStatus     ExecutionStatus `json:"reported_status"`
+
+	// BNK-05 correlation fields — carried through to the conflict event so
+	// bank-reconciliation-svc can correlate without fuzzy matching.
+	StatementLineID   string `json:"statement_line_id,omitempty"`    // bank-reconciliation-svc statement_line_id
+	ProviderRequestID string `json:"provider_request_id,omitempty"` // BNK-06 provider_request_id
+	BankRecStatus     string `json:"bank_rec_status,omitempty"`     // bank-rec status at time of link
 }
 
 type ResolveConflictRequest struct {

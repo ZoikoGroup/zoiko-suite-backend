@@ -63,6 +63,7 @@ type StatementLine struct {
 	GLCashAccountCode *string `json:"gl_cash_account_code,omitempty"`
 
 	MatchedJournalID     *string    `json:"matched_journal_id,omitempty"`
+	MatchedTransactionID *string    `json:"matched_transaction_id,omitempty"`
 	MatchedByPrincipalID *string    `json:"matched_by_principal_id,omitempty"`
 	MatchedAt            *time.Time `json:"matched_at,omitempty"`
 
@@ -75,6 +76,7 @@ type StatementLine struct {
 	// ProposeMatch, consumed (and cleared into the Matched* fields above)
 	// by ConfirmMatch.
 	ProposedJournalID     *string    `json:"proposed_journal_id,omitempty"`
+	ProposedTransactionID *string    `json:"proposed_transaction_id,omitempty"`
 	ProposedByPrincipalID *string    `json:"proposed_by_principal_id,omitempty"`
 	ProposedAt            *time.Time `json:"proposed_at,omitempty"`
 
@@ -85,6 +87,8 @@ type StatementLine struct {
 // ReconciliationCertificate is CompleteStatement's persisted evidence —
 // append-only, one per (tenant, bank_account, statement_date). See
 // migration 000006's own reject_certificate_mutation trigger.
+// Migration 000008 adds optional run_id/population_id for the new run model;
+// legacy certificates (created before 000008) carry NULL for these fields.
 type ReconciliationCertificate struct {
 	CertificateID          string    `json:"certificate_id"`
 	TenantID               string    `json:"tenant_id"`
@@ -95,6 +99,60 @@ type ReconciliationCertificate struct {
 	CertifiedByPrincipalID string    `json:"certified_by_principal_id"`
 	CertifiedAt            time.Time `json:"certified_at"`
 	CorrelationID          string    `json:"correlation_id,omitempty"`
+	// Set by CertifyRun (migration 000008); nil for legacy certificates.
+	RunID             *string `json:"run_id,omitempty"`
+	PopulationID      *string `json:"population_id,omitempty"`
+	PopulationVersion int     `json:"population_version,omitempty"`
+}
+
+// EvidenceConflict records a discrepancy between bank-reconciliation-svc's
+// MATCHED decision and payment-status-svc's provider-confirmed status.
+// Written by bank-reconciliation-svc when it receives a
+// payment.status_conflict_raised event. Append-only for OPEN rows;
+// ResolveEvidenceConflict transitions OPEN→RESOLVED.
+type EvidenceConflict struct {
+	ConflictID              string     `json:"conflict_id"`
+	TenantID                string     `json:"tenant_id"`
+	LegalEntityID           string     `json:"legal_entity_id"`
+	RunID                   *string    `json:"run_id,omitempty"`
+	PopulationID            *string    `json:"population_id,omitempty"`
+	StatementLineID         string     `json:"statement_line_id"`
+	MatchedTransactionID    *string    `json:"matched_transaction_id,omitempty"`
+	MatchedJournalID        *string    `json:"matched_journal_id,omitempty"`
+	PaymentID               string     `json:"payment_id"`
+	ProviderRequestID       string     `json:"provider_request_id"`
+	BankRecStatus           string     `json:"bank_rec_status"`
+	ProviderConfirmedStatus string     `json:"provider_confirmed_status"`
+	ConflictType            string     `json:"conflict_type"`
+	ConflictReason          string     `json:"conflict_reason"`
+	ConflictStatus          string     `json:"conflict_status"`
+	SourceEventID           string     `json:"source_event_id"`
+	RaisedAt                time.Time  `json:"raised_at"`
+	RaisedByPrincipalID     string     `json:"raised_by_principal_id"`
+	ResolvedAt              *time.Time `json:"resolved_at,omitempty"`
+	ResolvedByPrincipalID   *string    `json:"resolved_by_principal_id,omitempty"`
+	ResolutionNote          *string    `json:"resolution_note,omitempty"`
+	CorrelationID           string     `json:"correlation_id"`
+}
+
+// RaiseEvidenceConflictRequest is the input for raising an evidence conflict.
+type RaiseEvidenceConflictRequest struct {
+	TenantID                string `json:"tenant_id"`
+	LegalEntityID           string `json:"legal_entity_id"`
+	StatementLineID         string `json:"statement_line_id"`
+	PaymentID               string `json:"payment_id"`
+	ProviderRequestID       string `json:"provider_request_id"`
+	BankRecStatus           string `json:"bank_rec_status"`
+	ProviderConfirmedStatus string `json:"provider_confirmed_status"`
+	ConflictReason          string `json:"conflict_reason"`
+	SourceEventID           string `json:"source_event_id"`
+	CorrelationID           string `json:"correlation_id"`
+}
+
+// ResolveEvidenceConflictRequest closes an OPEN conflict after exceptional
+// review.
+type ResolveEvidenceConflictRequest struct {
+	ResolutionNote string `json:"resolution_note"`
 }
 
 // ── wire types ───────────────────────────────────────────────────────────────
@@ -120,11 +178,13 @@ type CreateStatementLineRequest struct {
 	CorrelationID     string `json:"correlation_id"`
 }
 
-// MatchStatementLineRequest names the general-ledger-svc journal the caller
-// believes this statement line corresponds to. The service verifies this
-// independently — it never trusts the claim at face value.
+// MatchStatementLineRequest names the match candidate. transaction_id is
+// preferred and refers to a banking-connector-svc canonical transaction.
+// journal_id is the deprecated GL-journal path kept for backward
+// compatibility — if both are present, transaction_id wins.
 type MatchStatementLineRequest struct {
-	JournalID string `json:"journal_id"`
+	TransactionID string `json:"transaction_id"` // preferred
+	JournalID     string `json:"journal_id"`     // deprecated: use transaction_id
 }
 
 // FlagExceptionRequest requires a reason — an exception with no stated
@@ -184,6 +244,10 @@ var (
 	// as a pass.
 	ErrLedgerServiceUnavailable = errorString("general-ledger-svc unavailable")
 
+	ErrCanonicalTransactionNotFound = errorString("canonical transaction not found")
+	ErrCanonicalVerificationFailed  = errorString("canonical transaction verification failed")
+	ErrBankingConnectorUnavailable  = errorString("banking-connector-svc unavailable")
+
 	// ErrStatementIncomplete means at least one line for the given bank
 	// account + statement date is still UNMATCHED.
 	ErrStatementIncomplete = errorString("statement has unresolved (UNMATCHED) lines")
@@ -223,4 +287,8 @@ var (
 	// real dual-control rule: the principal who proposed a match cannot
 	// also confirm it.
 	ErrMatchSelfConfirmation = errorString("the principal who proposed a match cannot also confirm it")
+
+	// EvidenceConflict errors.
+	ErrConflictNotFound        = errorString("evidence conflict not found")
+	ErrConflictAlreadyResolved = errorString("evidence conflict is already resolved")
 )

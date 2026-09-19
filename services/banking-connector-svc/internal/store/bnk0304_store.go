@@ -298,3 +298,19 @@ func (p *PgStore) ApproveMappingException(ctx context.Context, params domain.App
 	}
 	return &t, nil
 }
+
+func (p *PgStore) GetCanonicalTransaction(ctx context.Context, tenantID, transactionID string) (*domain.CanonicalTransaction, error) {
+	var t domain.CanonicalTransaction
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `SELECT `+canonicalTxnColumns+` FROM bank_transactions_canonical WHERE transaction_id=$1 AND tenant_id=$2`, transactionID, tenantID)
+		return scanCanonicalTxn(row, &t)
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrTransactionNotFound
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+

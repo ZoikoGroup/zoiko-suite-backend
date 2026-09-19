@@ -113,6 +113,67 @@ func (p *Publisher) PublishReconciliationCompleted(ctx context.Context, correlat
 	})
 }
 
+// PublishReconciliationStarted corresponds to BankReconciliationStarted.
+func (p *Publisher) PublishReconciliationStarted(ctx context.Context, run domain.ReconciliationRun) {
+	p.emit(ctx, "reconciliation.run.started", run.CorrelationID, run.TenantID, run.LegalEntityID, run.CreatedByPrincipalID, run.RunID, map[string]any{
+		"run_id":          run.RunID,
+		"tenant_id":       run.TenantID,
+		"legal_entity_id": run.LegalEntityID,
+		"bank_account_id": run.BankAccountID,
+		"statement_date":  run.StatementDate,
+		"status":          run.Status,
+	})
+}
+
+// PublishReconciliationReperformed corresponds to BankReconciliationReperformed.
+func (p *Publisher) PublishReconciliationReperformed(ctx context.Context, newRun domain.ReconciliationRun, priorRunID string) {
+	p.emit(ctx, "reconciliation.run.reperformed", newRun.CorrelationID, newRun.TenantID, newRun.LegalEntityID, newRun.CreatedByPrincipalID, newRun.RunID, map[string]any{
+		"new_run_id":      newRun.RunID,
+		"prior_run_id":    priorRunID,
+		"tenant_id":       newRun.TenantID,
+		"bank_account_id": newRun.BankAccountID,
+		"statement_date":  newRun.StatementDate,
+	})
+}
+
+// PublishReconciliationCertified corresponds to BankReconciliationCertified.
+func (p *Publisher) PublishReconciliationCertified(ctx context.Context, run domain.ReconciliationRun, cert domain.ReconciliationCertificate) {
+	p.emit(ctx, "reconciliation.run.certified", cert.CorrelationID, run.TenantID, run.LegalEntityID, cert.CertifiedByPrincipalID, run.RunID, map[string]any{
+		"run_id":             run.RunID,
+		"certificate_id":     cert.CertificateID,
+		"tenant_id":          run.TenantID,
+		"bank_account_id":    run.BankAccountID,
+		"statement_date":     run.StatementDate,
+		"matched_line_count": cert.MatchedLineCount,
+	})
+}
+
+// PublishEvidenceConflictRaised emits when a new OPEN evidence conflict is
+// created (first raise, not idempotent replays).
+func (p *Publisher) PublishEvidenceConflictRaised(ctx context.Context, conflict domain.EvidenceConflict) {
+	p.emit(ctx, "reconciliation.evidence_conflict.raised", conflict.CorrelationID, conflict.TenantID, conflict.LegalEntityID, conflict.RaisedByPrincipalID, conflict.ConflictID, map[string]any{
+		"conflict_id":              conflict.ConflictID,
+		"statement_line_id":        conflict.StatementLineID,
+		"payment_id":               conflict.PaymentID,
+		"bank_rec_status":          conflict.BankRecStatus,
+		"provider_confirmed_status": conflict.ProviderConfirmedStatus,
+		"conflict_type":            conflict.ConflictType,
+	})
+}
+
+// PublishEvidenceConflictResolved emits when an OPEN conflict is resolved.
+func (p *Publisher) PublishEvidenceConflictResolved(ctx context.Context, conflict domain.EvidenceConflict) {
+	resolvedBy := ""
+	if conflict.ResolvedByPrincipalID != nil {
+		resolvedBy = *conflict.ResolvedByPrincipalID
+	}
+	p.emit(ctx, "reconciliation.evidence_conflict.resolved", conflict.CorrelationID, conflict.TenantID, conflict.LegalEntityID, resolvedBy, conflict.ConflictID, map[string]any{
+		"conflict_id":      conflict.ConflictID,
+		"statement_line_id": conflict.StatementLineID,
+		"payment_id":        conflict.PaymentID,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
