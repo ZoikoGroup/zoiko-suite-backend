@@ -123,8 +123,32 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 	id := uuid.New().String()
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		var err error
-		a, err = scanAttempt(tx.QueryRow(ctx, `
+		// Invariant #16: a source_reference with an attempt still
+		// unresolved (PREPARED/PENDING_UNKNOWN) must not get a second one,
+		// even under a brand-new idempotency_key — that's the scenario the
+		// unique index on idempotency_key alone doesn't catch. SUBMITTED
+		// is deliberately NOT in this set: once submitted, external
+		// execution/finality belongs to BNK-07 (payment-status-svc), not
+		// this service — from BNK-06's own ownership boundary, SUBMITTED
+		// is a durable, resolved outcome, not something still pending
+		// here. Only checked when the caller actually supplied a
+		// source_reference; an empty one has nothing to dedupe against.
+		if req.SourceReference != "" {
+			existing, err := scanAttempt(tx.QueryRow(ctx, `
+				SELECT `+attemptColumns+` FROM payment_initiation_attempts
+				WHERE source_reference = $1 AND status IN ('PREPARED', 'PENDING_UNKNOWN')
+				LIMIT 1
+			`, req.SourceReference))
+			if err == nil {
+				a = existing
+				return domain.ErrUnresolvedAttemptExists
+			}
+			if !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+		}
+
+		inserted, err := scanAttempt(tx.QueryRow(ctx, `
 			INSERT INTO payment_initiation_attempts (`+attemptColumns+`)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'PREPARED', '', '', '', '', '', NULL, NULL, $14, NOW(), NOW())
 			RETURNING `+attemptColumns,
@@ -135,8 +159,12 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 		if err != nil {
 			return err
 		}
+		a = inserted
 		return s.recordEvent(ctx, tx, a.TenantID, id, domain.EventInitiationPrepared, "", principalID)
 	})
+	if errors.Is(err, domain.ErrUnresolvedAttemptExists) {
+		return a, domain.ErrUnresolvedAttemptExists
+	}
 	if isUniqueViolation(err) {
 		return nil, domain.ErrDuplicateIdempotencyKey
 	}

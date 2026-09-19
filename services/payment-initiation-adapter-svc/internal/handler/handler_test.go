@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/payment-initiation-adapter-svc/internal/authz"
+	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
 	"zoiko.io/payment-initiation-adapter-svc/internal/events"
 	"zoiko.io/payment-initiation-adapter-svc/internal/handler"
@@ -42,6 +43,18 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 	return nil
 }
 
+// ── stub treasury client ─────────────────────────────────────────────────────
+//
+// Defaults to "eligible" so every pre-existing test (none of which is
+// about BNK-06's treasury-svc verification) keeps working unchanged.
+// Tests that specifically exercise the real verification set err.
+
+type stubTreasury struct{ err error }
+
+func (t *stubTreasury) VerifyPayerAccount(_ context.Context, _, _, _, _ string) error {
+	return t.err
+}
+
 // ── test harness ─────────────────────────────────────────────────────────────
 //
 // These tests use the REAL provideradapter.StubProviderAdapter (not a
@@ -53,8 +66,12 @@ const testTenant = "tenant-bnk06-1"
 const testLegalEntity = "le-bnk06-1"
 
 func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *provideradapter.StubProviderAdapter) chi.Router {
+	return newTestRouterWithTreasury(st, pub, az, provider, &stubTreasury{})
+}
+
+func newTestRouterWithTreasury(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, provider, logger)
+	h := handler.New(st, pub, az, provider, treasury, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -118,6 +135,45 @@ func TestPrepareAttempt_NotVerified_Rejected(t *testing.T) {
 	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", req, testTenant)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 unverified account, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_TreasuryRejectsAccount_Returns422 proves
+// PayerAccountVerified alone is no longer sufficient — a caller can set
+// it to true, but if treasury-svc's real BNK-01 record says the account
+// isn't ACTIVE/ownership-verified, PrepareAttempt must still refuse.
+func TestPrepareAttempt_TreasuryRejectsAccount_Returns422(t *testing.T) {
+	r := newTestRouterWithTreasury(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{err: clients.ErrPayerAccountNotEligible})
+	req := newPrepareReq("idem-treasury-1", "invoice-payment")
+	// PayerAccountVerified is still (falsely) asserted true by the caller.
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", req, testTenant)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 when treasury-svc says the account isn't eligible, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_TreasuryUnavailable_FailsClosed proves an
+// unreachable treasury-svc blocks the attempt rather than silently
+// trusting the caller's flag.
+func TestPrepareAttempt_TreasuryUnavailable_FailsClosed(t *testing.T) {
+	r := newTestRouterWithTreasury(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{err: clients.ErrPayerAccountUnavailable})
+	req := newPrepareReq("idem-treasury-2", "invoice-payment")
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", req, testTenant)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when treasury-svc is unreachable, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_TreasuryVerifies_Succeeds is the positive control:
+// a real, ACTIVE, ownership-verified account still succeeds.
+func TestPrepareAttempt_TreasuryVerifies_Succeeds(t *testing.T) {
+	r := newTestRouterWithTreasury(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{})
+	a := prepareAttempt(t, r, newPrepareReq("idem-treasury-3", "invoice-payment"))
+	if a.Status != domain.StatusPrepared {
+		t.Fatalf("expected PREPARED, got %s", a.Status)
 	}
 }
 
