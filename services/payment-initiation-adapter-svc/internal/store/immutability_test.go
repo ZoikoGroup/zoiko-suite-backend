@@ -4,6 +4,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -167,5 +168,97 @@ func TestPgStore_SubmittedAttempt_IsFullyTerminal(t *testing.T) {
 	}
 	if _, err := testPool.Exec(ctx, `DELETE FROM payment_initiation_attempts WHERE attempt_id = $1`, attempt.AttemptID); err == nil {
 		t.Fatal("expected the trigger to refuse deleting any attempt row")
+	}
+}
+
+// TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt is the real
+// proof of Invariant #16: a retry with a BRAND-NEW idempotency_key for
+// the same source_reference must not create a second, concurrent live
+// attempt while the first is still unresolved — the idempotency_key
+// unique index alone doesn't catch this, since the key differs.
+func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := middleware.WithTenant(context.Background(), tenantID)
+	sourceRef := "instruction-" + uuid.New().String()
+
+	first, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+		LegalEntityID: uuid.New().String(), SourceReference: sourceRef,
+		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		IdempotencyKey: "corr-unresolved-1",
+	}, "maker-1")
+	if err != nil {
+		t.Fatalf("first PrepareAttempt: %v", err)
+	}
+
+	// Same source_reference, a DIFFERENT idempotency_key — the exact retry
+	// shape Invariant #16 exists to catch.
+	second, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+		LegalEntityID: uuid.New().String(), SourceReference: sourceRef,
+		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		IdempotencyKey: "corr-unresolved-2",
+	}, "maker-1")
+	if !errors.Is(err, domain.ErrUnresolvedAttemptExists) {
+		t.Fatalf("expected ErrUnresolvedAttemptExists, got err=%v", err)
+	}
+	if second == nil || second.AttemptID != first.AttemptID {
+		t.Fatalf("expected the ORIGINAL attempt id %s to be returned, got %+v", first.AttemptID, second)
+	}
+
+	var count int
+	if err := testPool.QueryRow(ctx, `SELECT COUNT(*) FROM payment_initiation_attempts WHERE source_reference = $1`, sourceRef).Scan(&count); err != nil {
+		t.Fatalf("count query: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 attempt row for this source_reference, got %d — this is a duplicate-attempt bug if not 1", count)
+	}
+
+	// Once the first attempt resolves (submitted), a fresh instruction
+	// with the SAME source_reference must still be allowed — Invariant
+	// #16 only blocks concurrent unresolved attempts, not all reuse ever.
+	if _, err := testStore.MarkSubmitted(ctx, first.AttemptID, "provider-req-1", "provider-resp-1", "maker-1"); err != nil {
+		t.Fatalf("MarkSubmitted: %v", err)
+	}
+	third, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+		LegalEntityID: uuid.New().String(), SourceReference: sourceRef,
+		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		IdempotencyKey: "corr-unresolved-3",
+	}, "maker-1")
+	if err != nil {
+		t.Fatalf("expected a new attempt to be allowed once the prior one resolved (SUBMITTED), got %v", err)
+	}
+	if third.AttemptID == first.AttemptID {
+		t.Fatal("expected a genuinely new attempt row once the prior one resolved")
+	}
+}
+
+// TestPgStore_PrepareAttempt_EmptySourceReference_NeverDeduped proves an
+// empty source_reference (the field is optional) is never treated as a
+// dedup key — otherwise every caller who omits it would collide with
+// every other such caller's unresolved attempts.
+func TestPgStore_PrepareAttempt_EmptySourceReference_NeverDeduped(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := middleware.WithTenant(context.Background(), tenantID)
+
+	first, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+		Amount: 10.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		IdempotencyKey: "corr-empty-ref-1",
+	}, "maker-1")
+	if err != nil {
+		t.Fatalf("first PrepareAttempt: %v", err)
+	}
+	second, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+		Amount: 20.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		IdempotencyKey: "corr-empty-ref-2",
+	}, "maker-1")
+	if err != nil {
+		t.Fatalf("expected two unrelated attempts with no source_reference to both succeed, got %v", err)
+	}
+	if second.AttemptID == first.AttemptID {
+		t.Fatal("expected two genuinely distinct attempts")
 	}
 }

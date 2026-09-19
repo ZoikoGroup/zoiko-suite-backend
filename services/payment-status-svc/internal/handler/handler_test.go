@@ -21,10 +21,14 @@ import (
 
 // ── stub publisher ───────────────────────────────────────────────────────────
 
-type stubPublisher struct{ calls int }
+type stubPublisher struct {
+	calls     int
+	published []events.PublishParams
+}
 
-func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error {
+func (p *stubPublisher) Publish(_ context.Context, params events.PublishParams) error {
 	p.calls++
+	p.published = append(p.published, params)
 	return nil
 }
 
@@ -56,13 +60,21 @@ func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz) chi.Router 
 }
 
 func doRequest(r http.Handler, method, path string, body interface{}, tenantID string) *httptest.ResponseRecorder {
+	return doRequestAs(r, method, path, body, tenantID, "principal-operator")
+}
+
+// doRequestAs lets a test act as a principal OTHER than the default
+// "principal-operator" — needed for the SoD checks on ResolveStatusConflict/
+// RecordReturn, where the resolving principal must differ from whoever
+// created the payment.
+func doRequestAs(r http.Handler, method, path string, body interface{}, tenantID, principalID string) *httptest.ResponseRecorder {
 	var buf bytes.Buffer
 	if body != nil {
 		_ = json.NewEncoder(&buf).Encode(body)
 	}
 	req := httptest.NewRequest(method, path, &buf)
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Principal-Id", "principal-operator")
+	req.Header.Set("X-Principal-Id", principalID)
 	if tenantID != "" {
 		req.Header.Set("X-Tenant-Id", tenantID)
 	}
@@ -209,8 +221,11 @@ func TestResolveStatusConflict(t *testing.T) {
 	doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/link-statement",
 		domain.LinkStatementRequest{StatementReference: "stmt-ref-2", ReportedStatus: domain.StatusRejected}, testTenant)
 
-	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/resolve-conflict",
-		domain.ResolveConflictRequest{FinalStatus: domain.StatusSettled, Reason: "provider record confirmed correct"}, testTenant)
+	// A different principal from the one who created the payment
+	// ("principal-operator", via recordPayment/doRequest's default) —
+	// the SoD rule this endpoint enforces.
+	w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/resolve-conflict",
+		domain.ResolveConflictRequest{FinalStatus: domain.StatusSettled, Reason: "provider record confirmed correct"}, testTenant, "principal-reviewer")
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 resolving, got %d: %s", w.Code, w.Body.String())
 	}
@@ -221,13 +236,30 @@ func TestResolveStatusConflict(t *testing.T) {
 	}
 }
 
+// TestResolveStatusConflict_SamePrincipalAsCreator_Forbidden is the real
+// proof of the SoD rule: the principal who created the payment cannot
+// also resolve its own conflict, even holding PAYMENT_FINALITY_CONFIRM.
+func TestResolveStatusConflict_SamePrincipalAsCreator_Forbidden(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := recordPayment(t, r) // created as "principal-operator"
+	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-3b", ReportedStatus: domain.StatusSettled}, testSecret)
+	doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/link-statement",
+		domain.LinkStatementRequest{StatementReference: "stmt-ref-2b", ReportedStatus: domain.StatusRejected}, testTenant)
+
+	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/resolve-conflict",
+		domain.ResolveConflictRequest{FinalStatus: domain.StatusSettled, Reason: "trying to resolve my own conflict"}, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when the creator tries to resolve their own conflict, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestRecordReturn_FromSettled(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
 	p := recordPayment(t, r)
 	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-4", ReportedStatus: domain.StatusSettled}, testSecret)
 
-	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/return",
-		domain.RecordReturnRequest{ProviderEventRef: "evt-return-1", Reason: "customer disputed"}, testTenant)
+	w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/return",
+		domain.RecordReturnRequest{ProviderEventRef: "evt-return-1", Reason: "customer disputed"}, testTenant, "principal-reviewer")
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 returning, got %d: %s", w.Code, w.Body.String())
 	}
@@ -235,6 +267,20 @@ func TestRecordReturn_FromSettled(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &returned)
 	if returned.Status != domain.StatusReturned {
 		t.Fatalf("expected RETURNED, got %s", returned.Status)
+	}
+}
+
+// TestRecordReturn_SamePrincipalAsCreator_Forbidden mirrors the conflict
+// SoD check for the return path.
+func TestRecordReturn_SamePrincipalAsCreator_Forbidden(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := recordPayment(t, r) // created as "principal-operator"
+	postWebhook(r, domain.ProviderCallbackPayload{PaymentID: p.PaymentID, ProviderEventRef: "evt-settle-4b", ReportedStatus: domain.StatusSettled}, testSecret)
+
+	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/return",
+		domain.RecordReturnRequest{ProviderEventRef: "evt-return-1b", Reason: "trying to return my own payment"}, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when the creator tries to return their own payment, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -250,12 +296,25 @@ func TestRecordReturn_NotSettled_Rejected(t *testing.T) {
 }
 
 func TestCancelPaymentWhereSupported(t *testing.T) {
-	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	pub := &stubPublisher{}
+	r := newTestRouter(newStubStore(), pub, &stubAuthz{})
 	p := recordPayment(t, r)
 
 	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/cancel", domain.CancelRequest{Reason: "duplicate record"}, testTenant)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 cancelling, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Wave 8b: PaymentCancelled was recorded to status_events but never
+	// published to the event bus — this is the real proof it now is.
+	found := false
+	for _, ev := range pub.published {
+		if ev.EventType == domain.EventPaymentCancelled {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a PAYMENT_CANCELLED event to be published, got %+v", pub.published)
 	}
 }
 

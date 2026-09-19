@@ -354,6 +354,15 @@ type mockPublisher struct {
 	cashPositions []domain.CashBalance
 	effectiveCash []domain.EffectiveCashResponse
 	breaches      []domain.EffectiveCashResponse
+
+	bankAccountCreated               []domain.BankAccount
+	bankAccountOwnershipVerified     []domain.BankAccount
+	bankAccountMetadataAmended       []domain.BankAccount
+	bankAccountOperationalUseChanged []domain.BankAccount
+	bankAccountSuspended             []domain.BankAccount
+	bankAccountReactivated           []domain.BankAccount
+	bankAccountClosed                []domain.BankAccount
+	bankAccountTokenRotated          []domain.BankAccount
 }
 
 func (m *mockPublisher) PublishCashPositionUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, balance domain.CashBalance) {
@@ -366,6 +375,38 @@ func (m *mockPublisher) PublishEffectiveCashUpdated(ctx context.Context, correla
 
 func (m *mockPublisher) PublishLiquidityThresholdBreached(ctx context.Context, correlationID, actorID string, resp domain.EffectiveCashResponse) {
 	m.breaches = append(m.breaches, resp)
+}
+
+func (m *mockPublisher) PublishBankAccountCreated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	m.bankAccountCreated = append(m.bankAccountCreated, acct)
+}
+
+func (m *mockPublisher) PublishBankAccountOwnershipVerified(ctx context.Context, correlationID, actorID string, acct domain.BankAccount, evidence domain.OwnershipEvidence) {
+	m.bankAccountOwnershipVerified = append(m.bankAccountOwnershipVerified, acct)
+}
+
+func (m *mockPublisher) PublishBankAccountMetadataAmended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	m.bankAccountMetadataAmended = append(m.bankAccountMetadataAmended, acct)
+}
+
+func (m *mockPublisher) PublishBankAccountOperationalUseChanged(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	m.bankAccountOperationalUseChanged = append(m.bankAccountOperationalUseChanged, acct)
+}
+
+func (m *mockPublisher) PublishBankAccountSuspended(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	m.bankAccountSuspended = append(m.bankAccountSuspended, acct)
+}
+
+func (m *mockPublisher) PublishBankAccountReactivated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	m.bankAccountReactivated = append(m.bankAccountReactivated, acct)
+}
+
+func (m *mockPublisher) PublishBankAccountClosed(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	m.bankAccountClosed = append(m.bankAccountClosed, acct)
+}
+
+func (m *mockPublisher) PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
+	m.bankAccountTokenRotated = append(m.bankAccountTokenRotated, acct)
 }
 
 type mockAuthz struct {
@@ -469,6 +510,132 @@ func TestHandler_RegisterBankAccount(t *testing.T) {
 
 	if acct.AccountName != "Operating Checking" {
 		t.Errorf("expected account name Operating Checking, got %s", acct.AccountName)
+	}
+	if len(p.bankAccountCreated) != 1 {
+		t.Errorf("expected PublishBankAccountCreated to be called once, got %d", len(p.bankAccountCreated))
+	}
+}
+
+// TestHandler_BankAccountLifecycle_PublishesEveryEvent walks every BNK-01
+// command and asserts the matching domain event was published exactly
+// once — previously none of these commands published anything at all.
+func TestHandler_BankAccountLifecycle_PublishesEveryEvent(t *testing.T) {
+	s := newMockStore()
+	p := &mockPublisher{}
+	az := &mockAuthz{allowed: true}
+	c := &mockClients{}
+	h := handler.New(s, p, az, c, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	acctID := "acct-lifecycle-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{
+		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
+		AccountStatus: domain.BankAccountActive, CreatedByPrincipalID: "usr-creator",
+	}
+
+	do := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+		req.Header.Set("X-Tenant-Id", "tenant-abc")
+		req.Header.Set("X-Principal-Id", "usr-verifier")
+		rr := httptest.NewRecorder()
+		r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+		return rr
+	}
+
+	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/verify-ownership", `{"verification_method":"MICRO_DEPOSIT","evidence_ref":"ref-1"}`); rr.Code != http.StatusOK {
+		t.Fatalf("verify-ownership: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/amend-metadata", `{"account_name":"New Name"}`); rr.Code != http.StatusOK {
+		t.Fatalf("amend-metadata: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/change-operational-use", `{"requested_operational_use":"PAYROLL"}`); rr.Code != http.StatusOK {
+		t.Fatalf("change-operational-use: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/suspend", `{"reason":"under review"}`); rr.Code != http.StatusOK {
+		t.Fatalf("suspend: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/reactivate", `{}`); rr.Code != http.StatusOK {
+		t.Fatalf("reactivate: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/rotate-token", `{"new_masked_account_number":"****1111"}`); rr.Code != http.StatusOK {
+		t.Fatalf("rotate-token: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr := do(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/close", `{"reason":"account closed"}`); rr.Code != http.StatusOK {
+		t.Fatalf("close: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	if len(p.bankAccountOwnershipVerified) != 1 {
+		t.Errorf("expected PublishBankAccountOwnershipVerified once, got %d", len(p.bankAccountOwnershipVerified))
+	}
+	if len(p.bankAccountMetadataAmended) != 1 {
+		t.Errorf("expected PublishBankAccountMetadataAmended once, got %d", len(p.bankAccountMetadataAmended))
+	}
+	if len(p.bankAccountOperationalUseChanged) != 1 {
+		t.Errorf("expected PublishBankAccountOperationalUseChanged once, got %d", len(p.bankAccountOperationalUseChanged))
+	}
+	if len(p.bankAccountSuspended) != 1 {
+		t.Errorf("expected PublishBankAccountSuspended once, got %d", len(p.bankAccountSuspended))
+	}
+	if len(p.bankAccountReactivated) != 1 {
+		t.Errorf("expected PublishBankAccountReactivated once, got %d", len(p.bankAccountReactivated))
+	}
+	if len(p.bankAccountTokenRotated) != 1 {
+		t.Errorf("expected PublishBankAccountTokenRotated once, got %d", len(p.bankAccountTokenRotated))
+	}
+	if len(p.bankAccountClosed) != 1 {
+		t.Errorf("expected PublishBankAccountClosed once, got %d", len(p.bankAccountClosed))
+	}
+}
+
+// TestHandler_VerifyBankAccountOwnership_CreatorCannotSelfVerify is the
+// real proof of BNK-01's maker-checker rule: the principal who created
+// the account cannot also verify its ownership.
+func TestHandler_VerifyBankAccountOwnership_CreatorCannotSelfVerify(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{
+		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
+		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
+	}
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	body := []byte(`{"verification_method":"MICRO_DEPOSIT","evidence_ref":"ref-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/verify-ownership", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-creator")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when the creator tries to verify their own account, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandler_VerifyBankAccountOwnership_DifferentPrincipal_Succeeds is
+// the positive control.
+func TestHandler_VerifyBankAccountOwnership_DifferentPrincipal_Succeeds(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{
+		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
+		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
+	}
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	body := []byte(`{"verification_method":"MICRO_DEPOSIT","evidence_ref":"ref-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/treasury/accounts/"+acctID+"/verify-ownership", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-verifier")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
@@ -948,5 +1115,69 @@ func TestHandler_RunFXScenario_UsesHypotheticalRate(t *testing.T) {
 	// current = 1000*1.10 = 1100, scenario = 1000*1.20 = 1200, delta = 100.
 	if resp.FunctionalAmountDelta != 100.0 {
 		t.Errorf("expected functional_amount_delta=100, got %f", resp.FunctionalAmountDelta)
+	}
+}
+
+// ── BNK-01: GetBankAccountByID exposes is_ownership_verified ────────────────
+//
+// payment-initiation-adapter-svc's BNK-06 fix (Wave 7b) depends on this
+// field to stop trusting a caller-supplied PayerAccountVerified flag —
+// this proves it's actually on the wire, not just computed and dropped.
+
+func TestHandler_GetBankAccountByID_IncludesOwnershipVerified(t *testing.T) {
+	s := newMockStore()
+	s.allOwnershipVerified = true
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID, nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		IsOwnershipVerified bool `json:"is_ownership_verified"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.IsOwnershipVerified {
+		t.Error("expected is_ownership_verified=true")
+	}
+}
+
+func TestHandler_GetBankAccountByID_UnverifiedAccount_ReturnsFalse(t *testing.T) {
+	s := newMockStore()
+	s.allOwnershipVerified = false
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID, nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		IsOwnershipVerified bool `json:"is_ownership_verified"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.IsOwnershipVerified {
+		t.Error("expected is_ownership_verified=false for an account with no non-superseded evidence")
 	}
 }

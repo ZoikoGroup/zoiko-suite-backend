@@ -27,8 +27,8 @@ func (h *Handler) ProposeMatch(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.JournalID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "journal_id")
+	if req.JournalID == "" && req.TransactionID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "journal_id or transaction_id")
 		return
 	}
 
@@ -56,26 +56,50 @@ func (h *Handler) ProposeMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.verifyJournalMatches(r.Context(), *l, req.JournalID); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrCashAccountUnknown):
-			writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
-		case errors.Is(err, domain.ErrLedgerVerificationFailed):
-			writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
-		default:
-			h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+	if h.banking != nil && req.TransactionID != "" {
+		if err := h.verifyCanonicalMatch(r.Context(), *l, req.TransactionID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):
+				writeError(w, http.StatusNotFound, "canonical_transaction_not_found", err.Error())
+			case errors.Is(err, domain.ErrCanonicalVerificationFailed):
+				writeError(w, http.StatusBadRequest, "canonical_verification_failed", err.Error())
+			default:
+				h.log.Error("banking connector verification unavailable", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "banking_connector_unavailable", "")
+			}
+			return
 		}
-		return
+		if err := h.store.ProposeMatchWithCanonical(r.Context(), tenantID, statementLineID, req.TransactionID, principalID); err != nil {
+			h.handleTransitionErr(w, err)
+			return
+		}
+		l.Status = domain.StatementLineStatusPendingConfirmation
+		l.ProposedTransactionID = &req.TransactionID
+	} else {
+		if req.JournalID == "" {
+			writeError(w, http.StatusBadRequest, "missing_field", "journal_id is required if transaction_id is omitted")
+			return
+		}
+		if err := h.verifyJournalMatches(r.Context(), *l, req.JournalID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCashAccountUnknown):
+				writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
+			case errors.Is(err, domain.ErrLedgerVerificationFailed):
+				writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
+			default:
+				h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+			}
+			return
+		}
+		if err := h.store.ProposeMatch(r.Context(), tenantID, statementLineID, req.JournalID, principalID); err != nil {
+			h.handleTransitionErr(w, err)
+			return
+		}
+		l.Status = domain.StatementLineStatusPendingConfirmation
+		l.ProposedJournalID = &req.JournalID
 	}
 
-	if err := h.store.ProposeMatch(r.Context(), tenantID, statementLineID, req.JournalID, principalID); err != nil {
-		h.handleTransitionErr(w, err)
-		return
-	}
-
-	l.Status = domain.StatementLineStatusPendingConfirmation
-	l.ProposedJournalID = &req.JournalID
 	l.ProposedByPrincipalID = &principalID
 	writeJSON(w, http.StatusOK, l)
 }
@@ -102,7 +126,7 @@ func (h *Handler) ConfirmMatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "statement_line_not_found", "")
 		return
 	}
-	if l.Status != domain.StatementLineStatusPendingConfirmation || l.ProposedJournalID == nil {
+	if l.Status != domain.StatementLineStatusPendingConfirmation || (l.ProposedJournalID == nil && l.ProposedTransactionID == nil) {
 		writeError(w, http.StatusUnprocessableEntity, "invalid_transition", domain.ErrInvalidTransition.Error())
 		return
 	}
@@ -116,17 +140,32 @@ func (h *Handler) ConfirmMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.verifyJournalMatches(r.Context(), *l, *l.ProposedJournalID); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrCashAccountUnknown):
-			writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
-		case errors.Is(err, domain.ErrLedgerVerificationFailed):
-			writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
-		default:
-			h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+	if h.banking != nil && l.ProposedTransactionID != nil {
+		if err := h.verifyCanonicalMatch(r.Context(), *l, *l.ProposedTransactionID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):
+				writeError(w, http.StatusNotFound, "canonical_transaction_not_found", err.Error())
+			case errors.Is(err, domain.ErrCanonicalVerificationFailed):
+				writeError(w, http.StatusBadRequest, "canonical_verification_failed", err.Error())
+			default:
+				h.log.Error("banking connector verification unavailable", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "banking_connector_unavailable", "")
+			}
+			return
 		}
-		return
+	} else if l.ProposedJournalID != nil {
+		if err := h.verifyJournalMatches(r.Context(), *l, *l.ProposedJournalID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCashAccountUnknown):
+				writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
+			case errors.Is(err, domain.ErrLedgerVerificationFailed):
+				writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
+			default:
+				h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+			}
+			return
+		}
 	}
 
 	confirmed, err := h.store.ConfirmMatch(r.Context(), tenantID, statementLineID, principalID)

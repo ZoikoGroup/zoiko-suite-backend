@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 
 	authzpkg "zoiko.io/payment-initiation-adapter-svc/internal/authz"
+	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/domain"
 	"zoiko.io/payment-initiation-adapter-svc/internal/events"
 	svcmiddleware "zoiko.io/payment-initiation-adapter-svc/internal/middleware"
@@ -39,11 +40,12 @@ type Handler struct {
 	pub      events.Publisher
 	authz    AuthzChecker
 	provider provideradapter.Client
+	treasury clients.TreasuryClient
 	log      *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, provider provideradapter.Client, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, provider: provider, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, provider provideradapter.Client, treasury clients.TreasuryClient, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, provider: provider, treasury: treasury, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -141,6 +143,23 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+
+	// PayerAccountVerified above is a caller-attested flag, not a real
+	// check — this is the actual one, against treasury-svc's own BNK-01
+	// record. Fail closed (503) if treasury-svc is unreachable, reject
+	// (422) if the account doesn't resolve, isn't ACTIVE, or ownership
+	// was never verified. Negative path "payment from a suspended/
+	// unverified account" is what this closes.
+	if err := h.treasury.VerifyPayerAccount(r.Context(), verifiedTenant, req.PayerAccountRef, principalID, r.Header.Get("X-Correlation-ID")); err != nil {
+		if errors.Is(err, clients.ErrPayerAccountNotEligible) {
+			writeError(w, http.StatusUnprocessableEntity, "payer account is not ACTIVE and ownership-verified")
+			return
+		}
+		h.log.Error("PrepareAttempt: treasury-svc payer account verification failed — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "treasury service unavailable")
+		return
+	}
+
 	created, err := h.store.PrepareAttempt(r.Context(), verifiedTenant, req, principalID)
 	if err != nil {
 		if errors.Is(err, domain.ErrDuplicateIdempotencyKey) {
@@ -151,6 +170,15 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			writeJSON(w, http.StatusOK, existing)
+			return
+		}
+		if errors.Is(err, domain.ErrUnresolvedAttemptExists) {
+			// Invariant #16: same posture as the idempotency-key duplicate
+			// above — return the existing, still-unresolved attempt rather
+			// than erroring, since this is very often a legitimate retry
+			// with a fresh idempotency_key for the same instruction, not a
+			// caller mistake.
+			writeJSON(w, http.StatusOK, created)
 			return
 		}
 		h.log.Error("PrepareAttempt: store unavailable", zap.Error(err))

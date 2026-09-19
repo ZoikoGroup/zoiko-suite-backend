@@ -312,6 +312,33 @@ func (h *Handler) LinkStatementConfirmation(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+
+	// Publish the conflict event when a new conflict is raised. bank-reconciliation-svc
+	// consumes this event to create an evidence_conflict record. The payload carries
+	// BNK-05 correlation fields so the consumer can correlate without fuzzy matching.
+	if conflict {
+		tenantID := ""
+		if updated.TenantID != nil {
+			tenantID = *updated.TenantID
+		}
+		_ = h.pub.Publish(r.Context(), events.PublishParams{
+			EventType:     domain.EventPaymentStatusConflictRaised,
+			EntityID:      paymentID,
+			TenantID:      tenantID,
+			ActorID:       principalID,
+			CorrelationID: r.Header.Get("X-Correlation-ID"),
+			Payload: map[string]interface{}{
+				"payment_id":          paymentID,
+				"statement_line_id":   req.StatementLineID,
+				"provider_request_id": updated.ProviderRequestID,
+				"bank_rec_status":     req.BankRecStatus,
+				"reported_status":     req.ReportedStatus,
+				"current_status":      updated.Status,
+				"statement_reference": req.StatementReference,
+			},
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{"payment": updated, "conflict_raised": conflict})
 }
 
@@ -342,6 +369,10 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusConflict, "payment has no open conflict to resolve")
 		return
 	}
+	if p.CreatedByPrincipalID != "" && p.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
+		return
+	}
 	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
 		return
 	}
@@ -356,6 +387,19 @@ func (h *Handler) ResolveStatusConflict(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+
+	tenantID := ""
+	if updated.TenantID != nil {
+		tenantID = *updated.TenantID
+	}
+	_ = h.pub.Publish(r.Context(), events.PublishParams{
+		EventType:     domain.EventPaymentStatusConflictResolved,
+		EntityID:      paymentID,
+		TenantID:      tenantID,
+		ActorID:       principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"),
+		Payload:       updated,
+	})
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -385,6 +429,10 @@ func (h *Handler) RecordReturn(w http.ResponseWriter, r *http.Request) {
 	}
 	if !domain.CanReturn(p.Status) {
 		writeError(w, http.StatusConflict, "only a SETTLED payment may be returned")
+		return
+	}
+	if p.CreatedByPrincipalID != "" && p.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
 		return
 	}
 	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentFinalityConfirm) {
@@ -443,6 +491,15 @@ func (h *Handler) CancelPaymentWhereSupported(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusServiceUnavailable, "store unavailable")
 		return
 	}
+
+	// Wave 8b: previously recorded to status_events (via CancelPayment's
+	// own recordEvent call) but never published to the event bus — any
+	// consumer subscribed to this service's events topic never learned a
+	// payment was cancelled.
+	_ = h.pub.Publish(r.Context(), events.PublishParams{
+		EventType: domain.EventPaymentCancelled, EntityID: updated.PaymentID, ActorID: principalID,
+		CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: updated,
+	})
 	writeJSON(w, http.StatusOK, updated)
 }
 

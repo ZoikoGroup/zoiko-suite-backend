@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/payment-initiation-adapter-svc/internal/authz"
+	"zoiko.io/payment-initiation-adapter-svc/internal/clients"
 	"zoiko.io/payment-initiation-adapter-svc/internal/config"
 	"zoiko.io/payment-initiation-adapter-svc/internal/events"
 	"zoiko.io/payment-initiation-adapter-svc/internal/handler"
@@ -64,8 +65,9 @@ func main() {
 	// StubProviderAdapter — NOT a real bank connection. See
 	// internal/provideradapter's package doc.
 	provider := provideradapter.NewStubProviderAdapter()
+	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, provider, logger)
+	h := handler.New(pgStore, publisher, authzClient, provider, treasuryClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

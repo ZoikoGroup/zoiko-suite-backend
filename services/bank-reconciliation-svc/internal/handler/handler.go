@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/bank-reconciliation-svc/internal/banking"
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 	"zoiko.io/bank-reconciliation-svc/internal/ledger"
 	svcmiddleware "zoiko.io/bank-reconciliation-svc/internal/middleware"
@@ -25,16 +26,42 @@ type Store interface {
 	ListStatementLines(ctx context.Context, filter domain.ListStatementLinesFilter) ([]domain.StatementLine, error)
 	MatchStatementLine(ctx context.Context, tenantID, statementLineID, journalID, actorPrincipalID string) error
 	FlagException(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
+	UnmatchWithReason(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
 	CountUnmatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error)
 	CountMatched(ctx context.Context, tenantID, bankAccountID, statementDate string) (int, error)
 	StatementLegalEntities(ctx context.Context, tenantID, bankAccountID, statementDate string) ([]string, error)
 
-	// BNK-05 maker-checker manual matching + certificates — see
-	// internal/store/pg_store.go's own doc comments on each method.
+	// BNK-05 maker-checker manual matching + certificates.
 	ProposeMatch(ctx context.Context, tenantID, statementLineID, journalID, proposedByPrincipalID string) error
 	ConfirmMatch(ctx context.Context, tenantID, statementLineID, confirmingPrincipalID string) (*domain.StatementLine, error)
 	RejectProposedMatch(ctx context.Context, tenantID, statementLineID, reason, actorPrincipalID string) error
 	CertifyStatement(ctx context.Context, tenantID, legalEntityID, bankAccountID, statementDate, certifiedByPrincipalID, correlationID string, matchedLineCount int) (*domain.ReconciliationCertificate, bool, error)
+	MatchStatementLineWithCanonical(ctx context.Context, tenantID, statementLineID, transactionID, actorPrincipalID string) error
+	ProposeMatchWithCanonical(ctx context.Context, tenantID, statementLineID, transactionID, proposedByPrincipalID string) error
+
+	// Reconciliation run lifecycle (BNK-05 backlog).
+	StartRun(ctx context.Context, tenantID string, req domain.StartRunRequest, principalID string) (*domain.ReconciliationRun, bool, error)
+	GetRun(ctx context.Context, tenantID, runID string) (*domain.ReconciliationRun, error)
+	FreezePopulation(ctx context.Context, tenantID, runID, principalID, correlationID string) (*domain.ReconciliationPopulation, bool, error)
+	GetPopulation(ctx context.Context, tenantID, populationID string) (*domain.ReconciliationPopulation, error)
+	AdvanceRunStatus(ctx context.Context, tenantID, runID string, from, to domain.ReconciliationRunStatus) error
+	BindPolicy(ctx context.Context, tenantID, runID, policyID string) (*domain.ReconciliationRun, error)
+	CertifyRun(ctx context.Context, tenantID, runID, certifierPrincipalID, correlationID string) (*domain.ReconciliationCertificate, bool, error)
+	SupersedeRun(ctx context.Context, tenantID, existingRunID, principalID, correlationID string) (*domain.ReconciliationRun, error)
+	ListUnmatchedLinesInPopulation(ctx context.Context, tenantID, populationID string) ([]domain.StatementLine, error)
+
+	// Tolerance/materiality policies.
+	CreatePolicy(ctx context.Context, tenantID string, req domain.CreatePolicyRequest, principalID string) (*domain.ReconciliationPolicy, error)
+	GetCurrentPolicy(ctx context.Context, tenantID, legalEntityID string) (*domain.ReconciliationPolicy, error)
+	GetPolicy(ctx context.Context, tenantID, policyID string) (*domain.ReconciliationPolicy, error)
+
+	// Evidence conflicts.
+	RaiseEvidenceConflict(ctx context.Context, tenantID string, req domain.RaiseEvidenceConflictRequest) (*domain.EvidenceConflict, bool, error)
+	GetEvidenceConflict(ctx context.Context, tenantID, conflictID string) (*domain.EvidenceConflict, error)
+	ListOpenConflicts(ctx context.Context, tenantID string, limit int) ([]domain.EvidenceConflict, error)
+	ResolveEvidenceConflict(ctx context.Context, tenantID, conflictID, principalID, note string) (*domain.EvidenceConflict, error)
+	IsEventProcessed(ctx context.Context, tenantID, eventID string) (bool, error)
+	MarkEventProcessed(ctx context.Context, tenantID, eventID string) error
 }
 
 // Publisher is the event-publishing contract the handler depends on.
@@ -43,6 +70,14 @@ type Publisher interface {
 	PublishReconciliationMatched(ctx context.Context, l domain.StatementLine)
 	PublishReconciliationExceptionRaised(ctx context.Context, l domain.StatementLine)
 	PublishReconciliationCompleted(ctx context.Context, correlationID, tenantID, actorID, bankAccountID, statementDate string)
+	// Run lifecycle events.
+	PublishReconciliationStarted(ctx context.Context, run domain.ReconciliationRun)
+	PublishReconciliationReperformed(ctx context.Context, newRun domain.ReconciliationRun, priorRunID string)
+	PublishReconciliationSuperseded(ctx context.Context, priorRun domain.ReconciliationRun, newRunID string)
+	PublishReconciliationCertified(ctx context.Context, run domain.ReconciliationRun, cert domain.ReconciliationCertificate)
+	// Evidence conflict events.
+	PublishEvidenceConflictRaised(ctx context.Context, conflict domain.EvidenceConflict)
+	PublishEvidenceConflictResolved(ctx context.Context, conflict domain.EvidenceConflict)
 }
 
 // AuthZClient is the authorization contract the handler depends on.
@@ -56,9 +91,10 @@ const (
 	actionMatch               = "BANKREC_MATCH"
 	actionFlagException       = "BANKREC_FLAG_EXCEPTION"
 	actionCompleteStatement   = "BANKREC_COMPLETE_STATEMENT"
-	// actionMatch is reused for propose/confirm/reject-match — they are
-	// the same underlying authority (matching a statement line) split
-	// into a dual-control workflow, not a separate permission.
+	actionRun                 = "BANKREC_RUN"
+	actionCertify             = "BANKREC_CERTIFY"
+	actionRead                = "BANKREC_READ"
+	actionConflictResolve     = "BANKREC_CONFLICT_RESOLVE"
 )
 
 // maxBodyBytes bounds a request body. Every route here takes a small,
@@ -70,11 +106,12 @@ type Handler struct {
 	publisher Publisher
 	authz     AuthZClient
 	ledger    ledger.Client
+	banking   banking.Client
 	log       *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, ledgerClient ledger.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, ledger: ledgerClient, log: log}
+func New(store Store, publisher Publisher, authz AuthZClient, ledgerClient ledger.Client, bankingClient banking.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, authz: authz, ledger: ledgerClient, banking: bankingClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -84,6 +121,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{statement_line_id}", h.GetStatementLine)
 		r.Post("/{statement_line_id}/match", h.MatchStatementLine)
 		r.Post("/{statement_line_id}/exception", h.FlagException)
+		r.Post("/{statement_line_id}/unmatch", h.UnmatchWithReason)
 
 		// BNK-05 maker-checker manual matching — additive alongside the
 		// single-actor /match above.
@@ -92,6 +130,32 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{statement_line_id}/reject-match", h.RejectProposedMatch)
 	})
 	r.Post("/v1/bank-accounts/{bank_account_id}/statements/{statement_date}/complete", h.CompleteStatement)
+
+	// Reconciliation run lifecycle.
+	r.Route("/v1/reconciliation-runs", func(r chi.Router) {
+		r.Post("/", h.StartRun)
+		r.Get("/{run_id}", h.GetRun)
+		r.Post("/{run_id}/freeze", h.FreezePopulation)
+		r.Get("/{run_id}/population", h.GetRunPopulation)
+		r.Post("/{run_id}/certify", h.CertifyRun)
+		r.Post("/{run_id}/reperform", h.ReperformRun)
+		r.Post("/{run_id}/auto-match", h.RunAutomaticMatching)
+		r.Post("/{run_id}/bind-policy", h.BindPolicy)
+	})
+
+	// Tolerance/materiality policies.
+	r.Route("/v1/reconciliation-policies", func(r chi.Router) {
+		r.Post("/", h.CreatePolicy)
+		r.Get("/current", h.GetCurrentPolicy)
+	})
+
+	// Evidence conflicts.
+	r.Route("/v1/evidence-conflicts", func(r chi.Router) {
+		r.Post("/", h.RaiseConflict)
+		r.Get("/", h.ListConflicts)
+		r.Get("/{conflict_id}", h.GetConflict)
+		r.Post("/{conflict_id}/resolve", h.ResolveConflict)
+	})
 }
 
 // ── POST /v1/statement-lines ─────────────────────────────────────────────────
@@ -238,8 +302,8 @@ func (h *Handler) MatchStatementLine(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	if req.JournalID == "" {
-		writeError(w, http.StatusBadRequest, "missing_field", "journal_id")
+	if req.JournalID == "" && req.TransactionID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "journal_id or transaction_id")
 		return
 	}
 
@@ -267,30 +331,50 @@ func (h *Handler) MatchStatementLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.verifyJournalMatches(r.Context(), *l, req.JournalID); err != nil {
-		switch {
-		case errors.Is(err, domain.ErrCashAccountUnknown):
-			writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
-		case errors.Is(err, domain.ErrLedgerVerificationFailed):
-			writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
-		default:
-			h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
-			writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+	if h.banking != nil && req.TransactionID != "" {
+		if err := h.verifyCanonicalMatch(r.Context(), *l, req.TransactionID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCanonicalTransactionNotFound):
+				writeError(w, http.StatusNotFound, "canonical_transaction_not_found", err.Error())
+			case errors.Is(err, domain.ErrCanonicalVerificationFailed):
+				writeError(w, http.StatusBadRequest, "canonical_verification_failed", err.Error())
+			default:
+				h.log.Error("banking connector verification unavailable", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "banking_connector_unavailable", "")
+			}
+			return
 		}
-		return
+		if err := h.store.MatchStatementLineWithCanonical(r.Context(), tenantID, statementLineID, req.TransactionID, principalID); err != nil {
+			h.handleTransitionErr(w, err)
+			return
+		}
+		l.Status = domain.StatementLineStatusMatched
+		l.MatchedTransactionID = &req.TransactionID
+	} else {
+		if req.JournalID == "" {
+			writeError(w, http.StatusBadRequest, "missing_field", "journal_id is required if transaction_id is omitted")
+			return
+		}
+		if err := h.verifyJournalMatches(r.Context(), *l, req.JournalID); err != nil {
+			switch {
+			case errors.Is(err, domain.ErrCashAccountUnknown):
+				writeError(w, http.StatusUnprocessableEntity, "cash_account_unknown", err.Error())
+			case errors.Is(err, domain.ErrLedgerVerificationFailed):
+				writeError(w, http.StatusBadRequest, "ledger_verification_failed", err.Error())
+			default:
+				h.log.Error("ledger verification unavailable — failing closed", zap.Error(err))
+				writeError(w, http.StatusServiceUnavailable, "ledger_service_unavailable", "")
+			}
+			return
+		}
+		if err := h.store.MatchStatementLine(r.Context(), tenantID, statementLineID, req.JournalID, principalID); err != nil {
+			h.handleTransitionErr(w, err)
+			return
+		}
+		l.Status = domain.StatementLineStatusMatched
+		l.MatchedJournalID = &req.JournalID
 	}
 
-	// The verified tenant, not the stored row's — the row was already read
-	// under that scope, so they agree, and scoping a write by data read from
-	// the database is a habit that stops being safe the moment the read
-	// stops being scoped.
-	if err := h.store.MatchStatementLine(r.Context(), tenantID, statementLineID, req.JournalID, principalID); err != nil {
-		h.handleTransitionErr(w, err)
-		return
-	}
-
-	l.Status = domain.StatementLineStatusMatched
-	l.MatchedJournalID = &req.JournalID
 	l.MatchedByPrincipalID = &principalID
 	h.publisher.PublishReconciliationMatched(r.Context(), *l)
 	writeJSON(w, http.StatusOK, l)
@@ -347,6 +431,29 @@ func (h *Handler) verifyJournalMatches(ctx context.Context, l domain.StatementLi
 	return nil
 }
 
+func (h *Handler) verifyCanonicalMatch(ctx context.Context, l domain.StatementLine, transactionID string) error {
+	t, err := h.banking.GetCanonicalTransaction(ctx, l.TenantID, transactionID)
+	if err != nil {
+		if errors.Is(err, banking.ErrTransactionNotFound) {
+			return domain.ErrCanonicalTransactionNotFound
+		}
+		return domain.ErrBankingConnectorUnavailable
+	}
+	if t.Status != "NORMALIZED" {
+		return domain.ErrCanonicalVerificationFailed
+	}
+	if t.TenantID != l.TenantID {
+		return domain.ErrCanonicalVerificationFailed
+	}
+	if t.Currency != l.CurrencyCode {
+		return domain.ErrCanonicalVerificationFailed
+	}
+	if ledger.ToCents(t.Amount) != ledger.ToCents(l.Amount) {
+		return domain.ErrCanonicalVerificationFailed
+	}
+	return nil
+}
+
 // ── POST /v1/statement-lines/{statement_line_id}/exception ───────────────────
 //
 // UNMATCHED -> EXCEPTION. Requires a reason — an exception with no stated
@@ -392,6 +499,64 @@ func (h *Handler) FlagException(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.store.FlagException(r.Context(), tenantID, statementLineID, req.Reason, principalID); err != nil {
+		h.handleTransitionErr(w, err)
+		return
+	}
+
+	l.Status = domain.StatementLineStatusException
+	l.ExceptionReason = &req.Reason
+	l.FlaggedByPrincipalID = &principalID
+	h.publisher.PublishReconciliationExceptionRaised(r.Context(), *l)
+	writeJSON(w, http.StatusOK, l)
+}
+
+// ── POST /v1/statement-lines/{statement_line_id}/unmatch ─────────────────────
+//
+// UnmatchWithReason is BNK-05's correction path for a bad match: it
+// reverts a MATCHED line back to EXCEPTION with a mandatory reason,
+// without reperforming the whole run. Unlike FlagException (which only
+// applies to a still-UNMATCHED line), this is the one command that walks
+// a line backwards out of MATCHED — so a reason is required for the same
+// evidentiary reason FlagException requires one.
+func (h *Handler) UnmatchWithReason(w http.ResponseWriter, r *http.Request) {
+	var req domain.FlagExceptionRequest
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "reason")
+		return
+	}
+	if len(req.Reason) > 500 {
+		writeError(w, http.StatusBadRequest, "invalid_field", "reason must be 500 characters or fewer")
+		return
+	}
+
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	statementLineID := chi.URLParam(r, "statement_line_id")
+	l, err := h.store.GetStatementLine(r.Context(), statementLineID)
+	if err != nil {
+		h.writeStoreErr(w, "UnmatchWithReason", err)
+		return
+	}
+	if l == nil {
+		writeError(w, http.StatusNotFound, "statement_line_not_found", "")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, l.LegalEntityID, actionMatch); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if err := h.store.UnmatchWithReason(r.Context(), tenantID, statementLineID, req.Reason, principalID); err != nil {
 		h.handleTransitionErr(w, err)
 		return
 	}

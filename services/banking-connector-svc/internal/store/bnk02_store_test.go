@@ -230,3 +230,84 @@ func TestBNK02_InitiateConnection_IdempotentOnCorrelationID(t *testing.T) {
 		t.Fatalf("expected the original bank_name to be preserved, got %q", second.BankName)
 	}
 }
+
+// TestBNK02_IsRegionAllowed_NoPolicyConfigured_IsUnrestricted proves
+// enforcement is opt-in per legal entity: a legal entity with zero
+// bank_region_policies rows has no restriction, so any region — including
+// one that was never explicitly allowed — passes.
+func TestBNK02_IsRegionAllowed_NoPolicyConfigured_IsUnrestricted(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool)
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-region-a")
+
+	allowed, err := s.IsRegionAllowed(ctx, "tenant-bnk02-region-a", "le-unconfigured", "ANY-REGION")
+	if err != nil {
+		t.Fatalf("IsRegionAllowed: %v", err)
+	}
+	if !allowed {
+		t.Fatal("expected an unconfigured legal entity to be unrestricted")
+	}
+}
+
+// TestBNK02_IsRegionAllowed_PolicyConfigured_EnforcesAllowlist is the
+// negative control: once a legal entity has at least one allowed region
+// configured, only that region (and any others explicitly added) passes
+// — everything else, including an empty region, is refused.
+func TestBNK02_IsRegionAllowed_PolicyConfigured_EnforcesAllowlist(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool)
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-region-b")
+
+	if _, err := s.CreateRegionPolicy(ctx, domain.CreateRegionPolicyParams{
+		TenantID: "tenant-bnk02-region-b", LegalEntityID: "le-restricted", Region: "EU", ActorPrincipalID: "ops-admin",
+	}); err != nil {
+		t.Fatalf("create region policy: %v", err)
+	}
+
+	allowed, err := s.IsRegionAllowed(ctx, "tenant-bnk02-region-b", "le-restricted", "EU")
+	if err != nil || !allowed {
+		t.Fatalf("expected EU to be allowed, got allowed=%v err=%v", allowed, err)
+	}
+
+	disallowed, err := s.IsRegionAllowed(ctx, "tenant-bnk02-region-b", "le-restricted", "US")
+	if err != nil {
+		t.Fatalf("IsRegionAllowed: %v", err)
+	}
+	if disallowed {
+		t.Fatal("expected US to be refused once EU is the only configured allowed region")
+	}
+
+	// A different legal entity in the same tenant, with no policy of its
+	// own, must remain unrestricted — the allowlist is per legal entity.
+	otherEntityAllowed, err := s.IsRegionAllowed(ctx, "tenant-bnk02-region-b", "le-other-unconfigured", "US")
+	if err != nil || !otherEntityAllowed {
+		t.Fatalf("expected an unrelated unconfigured legal entity to remain unrestricted, got allowed=%v err=%v", otherEntityAllowed, err)
+	}
+}
+
+// TestBNK02_CreateRegionPolicy_RejectsDuplicate proves
+// idx_bank_region_policies_tenant_entity_region: adding the same region
+// twice for the same legal entity is rejected, not silently accepted as
+// a no-op.
+func TestBNK02_CreateRegionPolicy_RejectsDuplicate(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool)
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-region-c")
+
+	if _, err := s.CreateRegionPolicy(ctx, domain.CreateRegionPolicyParams{
+		TenantID: "tenant-bnk02-region-c", LegalEntityID: "le-dup", Region: "APAC", ActorPrincipalID: "ops-admin",
+	}); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if _, err := s.CreateRegionPolicy(ctx, domain.CreateRegionPolicyParams{
+		TenantID: "tenant-bnk02-region-c", LegalEntityID: "le-dup", Region: "APAC", ActorPrincipalID: "ops-admin",
+	}); err != domain.ErrRegionPolicyAlreadyExists {
+		t.Fatalf("expected ErrRegionPolicyAlreadyExists, got %v", err)
+	}
+}
