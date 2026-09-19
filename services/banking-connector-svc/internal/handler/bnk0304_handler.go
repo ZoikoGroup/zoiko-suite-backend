@@ -20,6 +20,7 @@ const (
 	BANKING_STATEMENT_VALIDATE  = "BANKING_STATEMENT_VALIDATE"
 	BANKING_TRANSACTION_NORMALIZE = "BANKING_TRANSACTION_NORMALIZE"
 	BANKING_MAPPING_EXCEPTION_APPROVE = "BANKING_MAPPING_EXCEPTION_APPROVE"
+	BANKING_MAPPING_MANAGE            = "BANKING_MAPPING_MANAGE"
 )
 
 // BNK0304Handler embeds *Handler — same "separate registration function"
@@ -46,6 +47,7 @@ func RegisterBNK0304Routes(r chi.Router, h *Handler, bnk0304Store store.BNK0304S
 		r.Post("/{id}/re-normalize", bh.ReNormalizeTransaction)
 		r.Post("/quarantine", bh.QuarantineTransaction)
 	})
+	r.Post("/v1/banking/transaction-mappings", bh.CreateTransactionMapping)
 	r.Route("/v1/banking/canonical-transactions", func(r chi.Router) {
 		r.Get("/{id}", bh.GetCanonicalTransaction)
 	})
@@ -103,6 +105,10 @@ func (h *BNK0304Handler) writeTransactionErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "mapping exception is not OPEN")
 	case errors.Is(err, domain.ErrMappingExceptionSelfApproval):
 		writeError(w, http.StatusForbidden, "the principal who raised this exception cannot approve it")
+	case errors.Is(err, domain.ErrStatementLineNotFound):
+		writeError(w, http.StatusNotFound, "statement line not found")
+	case errors.Is(err, domain.ErrMappingAlreadyExists):
+		writeError(w, http.StatusConflict, "a mapping for this bank_code already exists for this tenant")
 	default:
 		h.logger.Error("bank transaction operation failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "bank transaction operation failed")
@@ -154,6 +160,10 @@ func (h *BNK0304Handler) ValidateStatement(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := h.bnk0304Store.ValidateStatement(r.Context(), tenantID, id); err != nil {
+		if errors.Is(err, domain.ErrStatementBalanceMismatch) {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"statement_id": id, "status": domain.StatementQuarantine, "reason": err.Error()})
+			return
+		}
 		h.writeStatementErr(w, err)
 		return
 	}
@@ -214,16 +224,24 @@ func (h *BNK0304Handler) NormalizeTransaction(w http.ResponseWriter, r *http.Req
 	}
 	req.TenantID = middleware.GetTenantID(r.Context())
 	req.ActorPrincipalID = principalID
-	txn, err := h.bnk0304Store.NormalizeTransaction(r.Context(), req)
+	result, err := h.bnk0304Store.NormalizeTransaction(r.Context(), req)
 	if err != nil {
 		h.writeTransactionErr(w, err)
 		return
 	}
+	if result.Transaction != nil {
+		_ = h.publisher.Publish(r.Context(), events.PublishParams{
+			EventType: "banking.transaction.normalized", AggregateID: result.Transaction.TransactionID, TenantID: req.TenantID,
+			ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: result.Transaction,
+		})
+		writeJSON(w, http.StatusCreated, result)
+		return
+	}
 	_ = h.publisher.Publish(r.Context(), events.PublishParams{
-		EventType: "banking.transaction.normalized", AggregateID: txn.TransactionID, TenantID: req.TenantID,
-		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: txn,
+		EventType: "banking.mapping_exception.raised", AggregateID: result.QuarantinedException.ExceptionID, TenantID: req.TenantID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: result.QuarantinedException,
 	})
-	writeJSON(w, http.StatusCreated, txn)
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *BNK0304Handler) ReNormalizeTransaction(w http.ResponseWriter, r *http.Request) {
@@ -314,6 +332,41 @@ func (h *BNK0304Handler) ApproveMappingException(w http.ResponseWriter, r *http.
 		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: txn,
 	})
 	writeJSON(w, http.StatusOK, txn)
+}
+
+// CreateTransactionMapping handles POST /v1/banking/transaction-mappings —
+// the operational entry point that populates the dictionary
+// NormalizeTransaction resolves categories against. Authorized as a
+// platform-level action (empty legal_entity_id), the same posture as
+// ApproveMappingException: maintaining this dictionary is a shared
+// ops/finance control activity, not a legal-entity-scoped business
+// operation.
+func (h *BNK0304Handler) CreateTransactionMapping(w http.ResponseWriter, r *http.Request) {
+	var req domain.CreateTransactionMappingParams
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.BankCode == "" || req.Category == "" {
+		writeError(w, http.StatusBadRequest, "bank_code and category are required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	req.TenantID = middleware.GetTenantID(r.Context())
+	req.ActorPrincipalID = principalID
+	if err := h.authz.CheckAllowed(r.Context(), principalID, "", BANKING_MAPPING_MANAGE); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	m, err := h.bnk0304Store.CreateTransactionMapping(r.Context(), req)
+	if err != nil {
+		h.writeTransactionErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, m)
 }
 
 func (h *BNK0304Handler) GetCanonicalTransaction(w http.ResponseWriter, r *http.Request) {
