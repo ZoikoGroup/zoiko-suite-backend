@@ -33,6 +33,7 @@ type BNK02Store interface {
 	ListConnectionEvents(ctx context.Context, tenantID, connectionID string) ([]domain.ConnectionEvent, error)
 	CreateRegionPolicy(ctx context.Context, params domain.CreateRegionPolicyParams) (*domain.BankRegionPolicy, error)
 	IsRegionAllowed(ctx context.Context, tenantID, legalEntityID, region string) (bool, error)
+	HasRegionPolicy(ctx context.Context, tenantID, legalEntityID string) (bool, error)
 }
 
 // BNK0304Store is BNK-03 Statement Ingestion + BNK-04 Transaction
