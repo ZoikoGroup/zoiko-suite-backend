@@ -573,3 +573,101 @@ func (h *Handler) GetFXExposureSnapshotAsOf(w http.ResponseWriter, r *http.Reque
 	}
 	writeJSON(w, http.StatusOK, snap)
 }
+
+// GetFXCurrencyBreakdown handles
+// GET /v1/treasury/fx/exposure-snapshot/currency-breakdown — the doc's
+// own GetCurrencyBreakdown query for BNK-10: the latest snapshot for
+// every exposure/functional currency pair a legal entity has ever
+// calculated, mirroring BNK-08's identically-named query.
+func (h *Handler) GetFXCurrencyBreakdown(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	legalEntityID := q.Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id is required")
+		return
+	}
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	snaps, err := h.store.ListFXCurrencyBreakdown(r.Context(), tenantID, legalEntityID)
+	if err != nil {
+		h.writeFXExposureErr(w, err)
+		return
+	}
+	if snaps == nil {
+		snaps = []domain.FXExposureSnapshot{}
+	}
+	writeJSON(w, http.StatusOK, snaps)
+}
+
+// GetMaturityProfile handles
+// GET /v1/treasury/fx/exposure-snapshot/maturity-profile — the doc's own
+// GetMaturityProfile query: an honest projection of the latest
+// snapshot's own Buckets, which already carry maturity-bucket data (see
+// buildExposure) — not a new bucketing mechanism.
+func (h *Handler) GetMaturityProfile(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	legalEntityID := q.Get("legal_entity_id")
+	exposureCurrency := q.Get("exposure_currency")
+	functionalCurrency := q.Get("functional_currency")
+	if legalEntityID == "" || exposureCurrency == "" || functionalCurrency == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, exposure_currency and functional_currency are required")
+		return
+	}
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	snap, err := h.store.GetLatestFXExposure(r.Context(), tenantID, legalEntityID, exposureCurrency, functionalCurrency)
+	if err != nil {
+		h.writeFXExposureErr(w, err)
+		return
+	}
+	if snap == nil {
+		writeError(w, http.StatusNotFound, "fx_exposure_snapshot_not_found", "no fx exposure has ever been calculated for this legal entity and currency pair")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"snapshot_id": snap.SnapshotID,
+		"as_of":       snap.AsOfTimestamp,
+		"buckets":     snap.Buckets,
+	})
+}
+
+// GetSourceLineage handles
+// GET /v1/treasury/fx/exposure-snapshot/{snapshotID}/lineage — the doc's
+// own GetSourceLineage query: an honest projection of the evidence
+// fields the snapshot already records (rate version/as-of, netting
+// scope, calculation actor, correlation) — see the doc's own "Evidence &
+// lineage" build requirement for BNK-10.
+func (h *Handler) GetSourceLineage(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	snapshotID := chi.URLParam(r, "snapshotID")
+	snap, err := h.store.GetFXExposureSnapshot(r.Context(), tenantID, snapshotID)
+	if err != nil {
+		h.writeFXExposureErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"snapshot_id":                snap.SnapshotID,
+		"rate_used":                  snap.RateUsed,
+		"rate_as_of":                 snap.RateAsOf,
+		"rate_version":               snap.RateVersion,
+		"netting_scope":              snap.NettingScope,
+		"has_stale_component":        snap.HasStaleComponent,
+		"calculated_by_principal_id": snap.CalculatedByPrincipalID,
+		"correlation_id":             snap.CorrelationID,
+		"created_at":                 snap.CreatedAt,
+	})
+}

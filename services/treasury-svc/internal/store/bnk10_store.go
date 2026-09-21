@@ -175,6 +175,39 @@ func (s *PgStore) GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID
 	return &snap, nil
 }
 
+// ListFXCurrencyBreakdown is GetCurrencyBreakdown's real query for BNK-10
+// — the latest snapshot on file for EACH exposure/functional currency
+// pair a legal entity has ever calculated, mirroring BNK-08's own
+// ListCurrencyBreakdown exactly (a cross-currency view, not a deeper new
+// capability).
+func (s *PgStore) ListFXCurrencyBreakdown(ctx context.Context, tenantID, legalEntityID string) ([]domain.FXExposureSnapshot, error) {
+	var out []domain.FXExposureSnapshot
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT ON (exposure_currency, functional_currency) `+fxExposureColumns+`
+			FROM fx_exposure_snapshots
+			WHERE tenant_id=$1 AND legal_entity_id=$2
+			ORDER BY exposure_currency, functional_currency, created_at DESC`,
+			tenantID, legalEntityID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var snap domain.FXExposureSnapshot
+			if err := scanFXExposureSnapshot(rows, &snap); err != nil {
+				return err
+			}
+			out = append(out, snap)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
 // PublishFXExposureSnapshot: CALCULATED -> PUBLISHED. Refuses a snapshot
 // calculated from a stale rate — the doc's own "never carry forward
 // stale data as current" rule, same as BNK-08's PublishCashPositionSnapshot.

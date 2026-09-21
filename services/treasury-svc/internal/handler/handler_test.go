@@ -644,6 +644,24 @@ func (m *mockStore) GetLatestFXExposure(ctx context.Context, tenantID, legalEnti
 	return latest, nil
 }
 
+func (m *mockStore) ListFXCurrencyBreakdown(ctx context.Context, tenantID, legalEntityID string) ([]domain.FXExposureSnapshot, error) {
+	latestByPair := map[string]*domain.FXExposureSnapshot{}
+	for _, snap := range m.fxExposures {
+		if snap.LegalEntityID != legalEntityID {
+			continue
+		}
+		key := snap.ExposureCurrency + "/" + snap.FunctionalCurrency
+		if existing, ok := latestByPair[key]; !ok || snap.CreatedAt.After(existing.CreatedAt) {
+			latestByPair[key] = snap
+		}
+	}
+	var out []domain.FXExposureSnapshot
+	for _, snap := range latestByPair {
+		out = append(out, *snap)
+	}
+	return out, nil
+}
+
 func (m *mockStore) GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error) {
 	var latest *domain.FXExposureSnapshot
 	for _, snap := range m.fxExposures {
@@ -2537,6 +2555,103 @@ func TestHandler_GetFXExposureSnapshotLatest_NotFound_Returns404(t *testing.T) {
 	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 when no fx exposure snapshot was ever calculated, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── Wave 16d: BNK-10's remaining doc-named queries ───────────────────────────
+
+// TestHandler_GetFXCurrencyBreakdown_ReturnsLatestPerPair proves the new
+// GetCurrencyBreakdown query for BNK-10.
+func TestHandler_GetFXCurrencyBreakdown_ReturnsLatestPerPair(t *testing.T) {
+	now := time.Now().UTC()
+	s := newMockStore()
+	s.fxExposures = map[string]*domain.FXExposureSnapshot{
+		"snap-1": {SnapshotID: "snap-1", LegalEntityID: "ent-123", ExposureCurrency: "EUR", FunctionalCurrency: "USD", CreatedAt: now.Add(-1 * time.Hour)},
+		"snap-2": {SnapshotID: "snap-2", LegalEntityID: "ent-123", ExposureCurrency: "EUR", FunctionalCurrency: "USD", CreatedAt: now},
+		"snap-3": {SnapshotID: "snap-3", LegalEntityID: "ent-123", ExposureCurrency: "GBP", FunctionalCurrency: "USD", CreatedAt: now},
+		"snap-4": {SnapshotID: "snap-4", LegalEntityID: "ent-other", ExposureCurrency: "EUR", FunctionalCurrency: "USD", CreatedAt: now},
+	}
+	r := newCashPositionRouter(s, &mockClients{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure-snapshot/currency-breakdown?legal_entity_id=ent-123", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var snaps []domain.FXExposureSnapshot
+	if err := json.Unmarshal(rr.Body.Bytes(), &snaps); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(snaps) != 2 {
+		t.Fatalf("expected 2 currency pairs (EUR/USD, GBP/USD), got %d: %+v", len(snaps), snaps)
+	}
+	for _, snap := range snaps {
+		if snap.ExposureCurrency == "EUR" && snap.SnapshotID != "snap-2" {
+			t.Fatalf("expected the LATEST EUR/USD snapshot (snap-2), got %s", snap.SnapshotID)
+		}
+	}
+}
+
+// TestHandler_GetMaturityProfile_ReturnsBuckets proves the new
+// GetMaturityProfile query.
+func TestHandler_GetMaturityProfile_ReturnsBuckets(t *testing.T) {
+	s := newMockStore()
+	s.fxExposures = map[string]*domain.FXExposureSnapshot{
+		"snap-1": {
+			SnapshotID: "snap-1", LegalEntityID: "ent-123", ExposureCurrency: "EUR", FunctionalCurrency: "USD",
+			Buckets: []domain.FXExposureBucket{{MaturityBucket: "0-30D", Category: "RECEIVABLE", ExposureCurrencyAmount: 100}},
+		},
+	}
+	r := newCashPositionRouter(s, &mockClients{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure-snapshot/maturity-profile?legal_entity_id=ent-123&exposure_currency=EUR&functional_currency=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Buckets []domain.FXExposureBucket `json:"buckets"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Buckets) != 1 || resp.Buckets[0].MaturityBucket != "0-30D" {
+		t.Fatalf("unexpected buckets: %+v", resp.Buckets)
+	}
+}
+
+// TestHandler_GetSourceLineage_ReturnsEvidenceFields proves the new
+// GetSourceLineage query.
+func TestHandler_GetSourceLineage_ReturnsEvidenceFields(t *testing.T) {
+	s := newMockStore()
+	s.fxExposures = map[string]*domain.FXExposureSnapshot{
+		"snap-1": {
+			SnapshotID: "snap-1", LegalEntityID: "ent-123", RateVersion: "rate-1", NettingScope: "SINGLE_ENTITY:ent-123",
+			CorrelationID: "corr-lineage-1",
+		},
+	}
+	r := newCashPositionRouter(s, &mockClients{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure-snapshot/snap-1/lineage", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var lineage map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &lineage); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if lineage["netting_scope"] != "SINGLE_ENTITY:ent-123" || lineage["correlation_id"] != "corr-lineage-1" {
+		t.Fatalf("unexpected lineage projection: %+v", lineage)
 	}
 }
 

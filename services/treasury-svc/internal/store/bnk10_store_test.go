@@ -318,3 +318,60 @@ func TestPgStore_FXExposureSnapshot_AsOfReconstructsHistory(t *testing.T) {
 		t.Fatalf("expected the SECOND (latest) snapshot's net_exposure_amount=9999 as of now, got %+v err=%v", current, err)
 	}
 }
+
+// TestPgStore_ListFXCurrencyBreakdown_ReturnsLatestPerPair is the real
+// proof of BNK-10's GetCurrencyBreakdown query.
+func TestPgStore_ListFXCurrencyBreakdown_ReturnsLatestPerPair(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	if _, err := s.CreateFXExposureSnapshot(ctx, domain.CalculateFXExposureParams{
+		TenantID: tenantID, LegalEntityID: legalEntityID, ExposureCurrency: "EUR", FunctionalCurrency: "USD",
+		NettingScope: "SINGLE_ENTITY:" + legalEntityID, ActorPrincipalID: "analyst-1",
+	}, sampleFXExposureCalc(false)); err != nil {
+		t.Fatalf("create EUR/USD first: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	second, err := s.CreateFXExposureSnapshot(ctx, domain.CalculateFXExposureParams{
+		TenantID: tenantID, LegalEntityID: legalEntityID, ExposureCurrency: "EUR", FunctionalCurrency: "USD",
+		NettingScope: "SINGLE_ENTITY:" + legalEntityID, ActorPrincipalID: "analyst-1",
+	}, sampleFXExposureCalc(false))
+	if err != nil {
+		t.Fatalf("create EUR/USD second: %v", err)
+	}
+	gbp, err := s.CreateFXExposureSnapshot(ctx, domain.CalculateFXExposureParams{
+		TenantID: tenantID, LegalEntityID: legalEntityID, ExposureCurrency: "GBP", FunctionalCurrency: "USD",
+		NettingScope: "SINGLE_ENTITY:" + legalEntityID, ActorPrincipalID: "analyst-1",
+	}, sampleFXExposureCalc(false))
+	if err != nil {
+		t.Fatalf("create GBP/USD: %v", err)
+	}
+	// A different legal entity's snapshot must never appear.
+	if _, err := s.CreateFXExposureSnapshot(ctx, domain.CalculateFXExposureParams{
+		TenantID: tenantID, LegalEntityID: uuid.New().String(), ExposureCurrency: "EUR", FunctionalCurrency: "USD",
+		NettingScope: "SINGLE_ENTITY:other", ActorPrincipalID: "analyst-1",
+	}, sampleFXExposureCalc(false)); err != nil {
+		t.Fatalf("create other-entity snapshot: %v", err)
+	}
+
+	breakdown, err := s.ListFXCurrencyBreakdown(ctx, tenantID, legalEntityID)
+	if err != nil {
+		t.Fatalf("ListFXCurrencyBreakdown: %v", err)
+	}
+	if len(breakdown) != 2 {
+		t.Fatalf("expected exactly 2 currency pairs (EUR/USD, GBP/USD), got %d: %+v", len(breakdown), breakdown)
+	}
+	byPair := map[string]domain.FXExposureSnapshot{}
+	for _, snap := range breakdown {
+		byPair[snap.ExposureCurrency+"/"+snap.FunctionalCurrency] = snap
+	}
+	if byPair["EUR/USD"].SnapshotID != second.SnapshotID {
+		t.Fatalf("expected the LATEST EUR/USD snapshot (%s), got %s", second.SnapshotID, byPair["EUR/USD"].SnapshotID)
+	}
+	if byPair["GBP/USD"].SnapshotID != gbp.SnapshotID {
+		t.Fatalf("expected the GBP/USD snapshot (%s), got %s", gbp.SnapshotID, byPair["GBP/USD"].SnapshotID)
+	}
+}

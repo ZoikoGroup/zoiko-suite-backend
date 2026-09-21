@@ -55,6 +55,7 @@ type Store interface {
 	GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error)
 	PublishFXExposureSnapshot(ctx context.Context, p domain.PublishFXExposureParams) (*domain.FXExposureSnapshot, error)
 	SupersedeFXExposureSnapshot(ctx context.Context, p domain.SupersedeFXExposureParams) (*domain.FXExposureSnapshot, error)
+	ListFXCurrencyBreakdown(ctx context.Context, tenantID, legalEntityID string) ([]domain.FXExposureSnapshot, error)
 
 	// BNK-08 — see internal/store/bnk08_store.go's own doc comments.
 	CreateCashPositionSnapshot(ctx context.Context, p domain.CalculateCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
@@ -248,6 +249,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/fx/exposure-snapshot/{snapshotID}/supersede", h.SupersedeFXExposureSnapshot)
 		r.Get("/fx/exposure-snapshot", h.GetFXExposureSnapshotLatest)
 		r.Get("/fx/exposure-snapshot/as-of", h.GetFXExposureSnapshotAsOf)
+		r.Get("/fx/exposure-snapshot/currency-breakdown", h.GetFXCurrencyBreakdown)
+		r.Get("/fx/exposure-snapshot/maturity-profile", h.GetMaturityProfile)
+		r.Get("/fx/exposure-snapshot/{snapshotID}/lineage", h.GetSourceLineage)
+		// GetScenario (doc query): no separate route exists — RunFXScenario
+		// (POST /fx/scenario) already returns the full computed scenario
+		// response synchronously, and scenario outputs are explicitly never
+		// persisted ("scenario outputs remain analytical and separate from
+		// approved treasury actions"). There is nothing stored to GET
+		// later; inventing a persisted-scenario retrieval would contradict
+		// that explicit doc constraint rather than fill a real gap.
 
 		// BNK-01 — see internal/handler/bnk01_handler.go.
 		r.Post("/accounts/{accountID}/verify-ownership", h.VerifyBankAccountOwnership)
