@@ -903,6 +903,7 @@ const auditLogColumns = `
 	secret_class,
 	secret_path,
 	requested_by_principal_id,
+	acted_by_principal_id,
 	tenant_id,
 	legal_entity_id,
 	lease_id,
@@ -916,7 +917,8 @@ func scanAuditEntry(row pgx.Row) (*domain.SecretAccessAuditLog, error) {
 	a := &domain.SecretAccessAuditLog{}
 	err := row.Scan(
 		&a.AuditLogID, &a.EventType, &a.SecretClass, &a.SecretPath,
-		&a.RequestedByPrincipalID, &a.TenantID, &a.LegalEntityID,
+		&a.RequestedByPrincipalID, &a.ActedByPrincipalID,
+		&a.TenantID, &a.LegalEntityID,
 		&a.LeaseID, &a.SecretPolicyVersionID, &a.RequestID,
 		&a.OutcomeDetail, &a.CorrelationID, &a.RecordedAt,
 	)
@@ -934,9 +936,10 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 	const query = `
 		INSERT INTO secret_access_audit_log (
 			event_type, secret_class, secret_path, requested_by_principal_id,
-			tenant_id, legal_entity_id, lease_id, secret_policy_version_id,
+			acted_by_principal_id, tenant_id, legal_entity_id,
+			secret_policy_version_id, lease_id,
 			request_id, outcome_detail, correlation_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING ` + auditLogColumns + `;`
 
 	var a *domain.SecretAccessAuditLog
@@ -944,7 +947,8 @@ func (s *PgStore) RecordAuditEntry(ctx context.Context, params domain.RecordAudi
 		var scanErr error
 		a, scanErr = scanAuditEntry(tx.QueryRow(ctx, query,
 			params.EventType, params.SecretClass, params.SecretPath, params.RequestedByPrincipalID,
-			params.TenantID, params.LegalEntityID, params.LeaseID, params.SecretPolicyVersionID,
+			params.ActedByPrincipalID, params.TenantID, params.LegalEntityID,
+			params.SecretPolicyVersionID, params.LeaseID,
 			params.RequestID, params.OutcomeDetail, params.CorrelationID,
 		))
 		return scanErr

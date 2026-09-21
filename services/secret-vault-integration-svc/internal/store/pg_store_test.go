@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -39,16 +41,37 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS secret_access_audit_log, secret_leases, secret_policy_versions, secret_policies CASCADE;`)
 
-	for _, migFile := range []string{"000001_initial_schema.up.sql", "000002_add_data_classification.up.sql", "000003_add_rls.up.sql"} {
-		sql, err := os.ReadFile("../../deployments/migrations/" + migFile)
+	// Every .up.sql in the migrations directory, in filename order — NOT a
+	// hardcoded list. This list used to be literal, so adding a migration and
+	// forgetting to extend it left the whole store suite running against the
+	// previous schema: every test still passed, against a database the service
+	// would never see. The numbering prefix is what makes lexical order the
+	// right order.
+	for _, path := range migrationFiles(t) {
+		sql, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("failed to read migration file %s: %v", migFile, err)
+			t.Fatalf("failed to read migration file %s: %v", path, err)
 		}
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("failed to execute migration %s: %v", migFile, err)
+			t.Fatalf("failed to execute migration %s: %v", path, err)
 		}
 	}
 	return pool
+}
+
+// migrationFiles returns every forward migration, in apply order.
+func migrationFiles(t *testing.T) []string {
+	t.Helper()
+	const dir = "../../deployments/migrations"
+	matches, err := filepath.Glob(filepath.Join(dir, "*.up.sql"))
+	if err != nil {
+		t.Fatalf("failed to list migrations: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatalf("no migrations found in %s — the suite would run against an empty schema", dir)
+	}
+	sort.Strings(matches)
+	return matches
 }
 
 func strPtr(s string) *string { return &s }
@@ -406,6 +429,69 @@ func TestPgStore_RecordAuditEntry_AndListFilters(t *testing.T) {
 	byEventType, err := s.ListAuditLog(ctx, store.AuditListFilter{EventType: "DENIED"})
 	if err != nil || len(byEventType) != 1 {
 		t.Fatalf("expected 1 DENIED entry, got %d err=%v", len(byEventType), err)
+	}
+}
+
+// TestPgStore_ActorIsPersistedAndDistinctFromSubject proves migration 000004's
+// column round-trips through a real Postgres, and that the two principal
+// columns stay independent.
+//
+// The handler-level test asserts the right value is passed in; this asserts it
+// survives the INSERT and comes back on the read path. Both are needed: the
+// column was added by ALTER after the initial schema, so an un-migrated
+// database and a stale column list are the two ways this silently reverts to
+// storing nothing.
+func TestPgStore_ActorIsPersistedAndDistinctFromSubject(t *testing.T) {
+	ctx := context.Background()
+	pool := openTestPool(t)
+	s := store.New(pool, zap.NewNop())
+
+	const holder = "svc-lease-holder"
+	const operator = "principal-on-call"
+
+	if _, err := s.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
+		EventType:              "REVOKED",
+		SecretPath:             "kv/actor",
+		RequestedByPrincipalID: holder,
+		ActedByPrincipalID:     strPtr(operator),
+	}); err != nil {
+		t.Fatalf("failed to record REVOKED entry: %v", err)
+	}
+
+	got, err := s.ListAuditLog(ctx, store.AuditListFilter{EventType: "REVOKED"})
+	if err != nil {
+		t.Fatalf("ListAuditLog failed: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 REVOKED entry, got %d", len(got))
+	}
+	e := got[0]
+	if e.RequestedByPrincipalID != holder {
+		t.Errorf("subject: want %q, got %q", holder, e.RequestedByPrincipalID)
+	}
+	if e.ActedByPrincipalID == nil {
+		t.Fatal("acted_by_principal_id came back nil — the column is not being written or not being read")
+	}
+	if *e.ActedByPrincipalID != operator {
+		t.Errorf("actor: want %q, got %q", operator, *e.ActedByPrincipalID)
+	}
+
+	// An entry written with no actor stays NULL rather than defaulting to the
+	// subject. Pre-000004 rows are genuinely actor-less and must read as such;
+	// silently copying the subject across would manufacture evidence.
+	if _, err := s.RecordAuditEntry(ctx, domain.RecordAuditEntryParams{
+		EventType:              "REQUESTED",
+		SecretPath:             "kv/actor",
+		RequestedByPrincipalID: holder,
+	}); err != nil {
+		t.Fatalf("failed to record actor-less entry: %v", err)
+	}
+	legacy, err := s.ListAuditLog(ctx, store.AuditListFilter{EventType: "REQUESTED"})
+	if err != nil || len(legacy) != 1 {
+		t.Fatalf("expected 1 REQUESTED entry, got %d err=%v", len(legacy), err)
+	}
+	if legacy[0].ActedByPrincipalID != nil {
+		t.Errorf("an entry recorded without an actor should read back NULL, got %q", *legacy[0].ActedByPrincipalID)
 	}
 }
 

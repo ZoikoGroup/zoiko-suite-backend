@@ -701,7 +701,13 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 		SecretClass:            "",
 		SecretPath:             req.SecretPath,
 		RequestedByPrincipalID: req.RequestedByPrincipalID,
-		TenantID:               req.TenantID,
+		// On the broker path the workload asks for its own access, so
+		// actor and subject are the same principal. Recorded anyway
+		// rather than left NULL: "who did this" must be answerable by
+		// one predicate across all five event types, without the reader
+		// having to know which ones happen to coincide.
+		ActedByPrincipalID: &req.RequestedByPrincipalID,
+		TenantID:           req.TenantID,
 		LegalEntityID:          req.LegalEntityID,
 		CorrelationID:          correlationID,
 	}); err != nil {
@@ -782,6 +788,7 @@ func (h *Handler) Broker(w http.ResponseWriter, r *http.Request) {
 			SecretClass:            lease.SecretClass,
 			SecretPath:             lease.SecretPath,
 			RequestedByPrincipalID: lease.RequestedByPrincipalID,
+			ActedByPrincipalID:     &lease.RequestedByPrincipalID,
 			TenantID:               lease.TenantID,
 			LegalEntityID:          lease.LegalEntityID,
 			LeaseID:                &lease.LeaseID,
@@ -810,6 +817,7 @@ func (h *Handler) recordDenial(ctx context.Context, req brokerRequest, secretCla
 		SecretClass:            secretClass,
 		SecretPath:             req.SecretPath,
 		RequestedByPrincipalID: req.RequestedByPrincipalID,
+		ActedByPrincipalID:     &req.RequestedByPrincipalID,
 		TenantID:               req.TenantID,
 		LegalEntityID:          req.LegalEntityID,
 		SecretPolicyVersionID:  secretPolicyVersionID,
@@ -996,15 +1004,23 @@ func (h *Handler) RevokeLease(w http.ResponseWriter, r *http.Request) {
 		spv := lease.SecretPolicyVersionID
 		lid := lease.LeaseID
 		if _, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
-			EventType:              "REVOKED",
-			SecretClass:            lease.SecretClass,
-			SecretPath:             lease.SecretPath,
+			EventType:   "REVOKED",
+			SecretClass: lease.SecretClass,
+			SecretPath:  lease.SecretPath,
+			// Subject: the principal whose access this lease was.
 			RequestedByPrincipalID: lease.RequestedByPrincipalID,
-			TenantID:               lease.TenantID,
-			LegalEntityID:          lease.LegalEntityID,
-			LeaseID:                &lid,
-			SecretPolicyVersionID:  &spv,
-			CorrelationID:          correlationID,
+			// Actor: the operator ending it, which is a DIFFERENT
+			// principal in every case this endpoint exists for. This is
+			// the one place the two genuinely diverge, and until
+			// migration 000004 the actor was authorized against
+			// SECRET_LEASE_REVOKE and then dropped — so the audit trail
+			// could not say who revoked a lease.
+			ActedByPrincipalID:    &principalID,
+			TenantID:              lease.TenantID,
+			LegalEntityID:         lease.LegalEntityID,
+			LeaseID:               &lid,
+			SecretPolicyVersionID: &spv,
+			CorrelationID:         correlationID,
 		}); err != nil {
 			h.log.Error("RevokeLease: failed to record REVOKED audit entry", zap.Error(err))
 		}
@@ -1141,10 +1157,16 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 		spv := lease.SecretPolicyVersionID
 		lid := lease.LeaseID
 		if _, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
-			EventType:              "REVOKED",
-			SecretClass:            lease.SecretClass,
-			SecretPath:             lease.SecretPath,
+			EventType:   "REVOKED",
+			SecretClass: lease.SecretClass,
+			SecretPath:  lease.SecretPath,
+			// Subject: the lease holder, who loses access here without
+			// having asked for anything. Actor: the rotating operator.
+			// These rows land in the HOLDER's tenant, which may not be
+			// the rotator's, so without the actor column a tenant could
+			// see that its lease died and not who did it.
 			RequestedByPrincipalID: lease.RequestedByPrincipalID,
+			ActedByPrincipalID:     &req.RotatedByPrincipalID,
 			TenantID:               lease.TenantID,
 			LegalEntityID:          lease.LegalEntityID,
 			LeaseID:                &lid,
@@ -1171,10 +1193,15 @@ func (h *Handler) Rotate(w http.ResponseWriter, r *http.Request) {
 	// writes each of them a REVOKED row in their own scope, carrying
 	// "revoked as a side effect of secret rotation".
 	rotatedEntry, err := h.store.RecordAuditEntry(r.Context(), domain.RecordAuditEntryParams{
-		EventType:              "ROTATED",
-		SecretClass:            policy.SecretClass,
-		SecretPath:             policy.SecretPath,
+		EventType:   "ROTATED",
+		SecretClass: policy.SecretClass,
+		SecretPath:  policy.SecretPath,
+		// Rotation has no access subject — nobody is asking to read the
+		// material — so the rotator occupies both columns. Filling the
+		// actor column keeps the "everything this principal did" query
+		// complete rather than silently missing rotations.
 		RequestedByPrincipalID: req.RotatedByPrincipalID,
+		ActedByPrincipalID:     &req.RotatedByPrincipalID,
 		TenantID:               &tenantScope,
 		RequestID:              &req.RequestID,
 		OutcomeDetail:          rotationOutcomeDetail(len(revokedLeases)),

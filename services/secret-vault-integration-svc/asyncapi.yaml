@@ -1,0 +1,271 @@
+asyncapi: "2.6.0"
+info:
+  title: Secret Vault Integration Service - Events
+  version: "1.0"
+  description: |
+    Events published by secret-vault-integration-svc onto the Kafka event
+    backbone.
+
+    **Source service:** `secret-vault-integration-svc`
+    **Topic:** `zoiko.secretvault.events` (override with `KAFKA_EVENTS_TOPIC`)
+    **Consumer group of this service:** `secret-vault-integration-svc`
+
+    ## What is NOT on this topic
+
+    Secret material, and the `lease_token` that reaches it. A consumer can learn
+    that a workload was granted access to a path and until when; it cannot learn
+    the value, and nothing on this topic can be replayed into access. Events
+    here are for audit fan-out, alerting and downstream invalidation - never for
+    provisioning.
+
+    ## Publishing posture
+
+    Publishing is best-effort and never blocks the decision. Every emit is
+    wrapped: a broker failure is logged and the HTTP response still carries the
+    grant or refusal. The durable record is the `secret_access_audit_log` row,
+    written before the response, in Postgres - not the event. A consumer that
+    needs completeness should reconcile against `GET /v1/secrets/audit` rather
+    than assume the stream is gapless.
+
+    With no brokers configured (local development) the publisher drops events at
+    debug level and the service runs normally. `cmd/server` refuses to start
+    with a nil producer when `ENV` is production or staging, so that leniency
+    cannot reach a deployed environment.
+
+    ## Idempotent replays emit nothing
+
+    A retried broker request returning an existing `lease_id` publishes no
+    second `secret.access.granted`, and a retried rotation publishes no second
+    `secret.rotation.completed`. Only a real state transition is a new fact. A
+    consumer counting grants is therefore counting grants, not requests.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+    description: Local development broker.
+  cluster:
+    url: kafka:9094
+    protocol: kafka
+    description: In-cluster broker (the value compose sets as KAFKA_BROKERS).
+
+channels:
+  zoiko.secretvault.events:
+    description: |
+      Every event this service emits, on one topic. Consumers discriminate on
+      the envelope's `event_type` rather than by subscribing to separate topics.
+    subscribe:
+      summary: Secret brokerage and rotation events.
+      operationId: consumeSecretVaultEvents
+      message:
+        oneOf:
+          - $ref: "#/components/messages/SecretAccessRequested"
+          - $ref: "#/components/messages/SecretAccessGranted"
+          - $ref: "#/components/messages/SecretRotationCompleted"
+
+components:
+  messages:
+    SecretAccessRequested:
+      name: secret.access.requested
+      title: A workload asked for material
+      summary: |
+        Emitted at the START of every brokerage attempt, before the outcome is
+        known - so it fires for grants and denials alike.
+      description: |
+        Deliberately carries no tenant or legal entity: at this point no policy
+        has been resolved, so there is no verified scope to report and stamping
+        the caller's claimed one would assert something the service has not yet
+        checked.
+
+        A `secret.access.requested` with no following `secret.access.granted`
+        means one of: the request was denied (`403`/`404`), the vault backend
+        was unavailable (`503`), or the service died mid-decision. The audit log
+        distinguishes them; this stream does not.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: secret.access.requested
+              tenant_id:
+                type: string
+                description: Always absent - no scope has been verified yet.
+              payload:
+                type: object
+                required: [secret_path, requested_by_principal_id]
+                properties:
+                  secret_path:
+                    type: string
+                    description: The opaque vault address. Never the value.
+                    example: integrations/stripe/webhook-signing-key
+                  requested_by_principal_id:
+                    type: string
+                    description: The workload asking.
+                    example: 77777777-7777-7777-7777-777777777777
+
+    SecretAccessGranted:
+      name: secret.access.granted
+      title: A lease was issued
+      summary: Emitted only on a real grant, never on an idempotent replay.
+      description: |
+        The consumer-facing signal that a workload now holds live access to a
+        path until `expires_at`.
+
+        Carries no `lease_token`. A lease id identifies a grant; it does not
+        confer one, and possession of this event gives a consumer no path to the
+        material.
+
+        `tenant_id` and `legal_entity_id` are the lease's own scope and are
+        genuinely absent for a platform-wide secret - omitted rather than
+        fabricated.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: secret.access.granted
+              payload:
+                type: object
+                required:
+                  - lease_id
+                  - secret_class
+                  - secret_path
+                  - requested_by_principal_id
+                  - expires_at
+                properties:
+                  lease_id: { type: string, format: uuid }
+                  secret_class:
+                    type: string
+                    example: INTEGRATION_TOKEN
+                  secret_path: { type: string }
+                  requested_by_principal_id: { type: string }
+                  tenant_id:
+                    type: [string, "null"]
+                    format: uuid
+                    description: null for a platform-wide secret.
+                  legal_entity_id:
+                    type: [string, "null"]
+                    format: uuid
+                  expires_at:
+                    type: string
+                    format: date-time
+                    description: |
+                      When the lease stops being valid. `EXPIRED` is computed
+                      from this on read; no further event marks expiry, so a
+                      consumer tracking live access must watch the clock itself.
+
+    SecretRotationCompleted:
+      name: secret.rotation.completed
+      title: Material was replaced and live leases were killed
+      summary: |
+        Emitted after a real rotation. The most operationally significant event
+        on this topic.
+      description: |
+        Every workload holding a lease on this path has just lost it. Consumers
+        that cache brokered material must drop it on this event; continuing to
+        use a lease obtained before the rotation will fail at the vault, not
+        here.
+
+        Carries no tenant: a `secret_path` is a platform-wide address and its
+        leases may span tenants, so the rotation is not one tenant's fact.
+        Per-tenant evidence is in each holder's own `REVOKED` audit row, which
+        carries `revoked as a side effect of secret rotation`.
+
+        `revoked_lease_count` of 0 is normal - it means nothing held live access
+        at rotation time, not that the rotation failed.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/Envelope"
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: secret.rotation.completed
+              actor_id:
+                type: string
+                description: The rotating operator (`rotated_by_principal_id`).
+              payload:
+                type: object
+                required: [secret_policy_id, secret_path, revoked_lease_count]
+                properties:
+                  secret_policy_id: { type: string, format: uuid }
+                  secret_path: { type: string }
+                  revoked_lease_count:
+                    type: integer
+                    minimum: 0
+                    description: Leases killed by this rotation.
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The canonical platform event envelope, identical in shape to the one
+        governance-decision-log-svc emits.
+      required:
+        - event_id
+        - event_type
+        - event_version
+        - emitted_at
+        - schema_version
+        - source_service
+        - correlation_id
+        - payload
+      properties:
+        event_id:
+          type: string
+          description: |
+            `evt-` plus a fresh UUID per publish. Not derived from the payload:
+            a deterministic id would collide across two legitimately identical
+            events.
+          example: evt-8f14e45f-ea8f-4f1b-9c3a-2b7d6e5a1c90
+        event_type:
+          type: string
+          enum:
+            - secret.access.requested
+            - secret.access.granted
+            - secret.rotation.completed
+        event_version:
+          type: string
+          const: "1.0"
+        emitted_at:
+          type: string
+          format: date-time
+          description: UTC, set at publish time.
+        schema_version:
+          type: string
+          const: "1.0"
+        source_service:
+          type: string
+          const: secret-vault-integration-svc
+        tenant_id:
+          type: string
+          format: uuid
+          description: |
+            Omitted when the event has no verified tenant scope - which is the
+            normal case for `secret.access.requested` and
+            `secret.rotation.completed`.
+        legal_entity_id:
+          type: string
+          format: uuid
+          description: Omitted when the scope is the whole tenant or global.
+        actor_id:
+          type: string
+          description: The principal or workload responsible for the event.
+        correlation_id:
+          type: string
+          description: |
+            The caller's `X-Correlation-ID`, carried through the handler, the
+            audit row and this envelope - which is what lets one request be
+            traced across the HTTP log, Postgres and the event backbone.
+        payload:
+          type: object
+          description: Event-specific body. Never contains secret material.

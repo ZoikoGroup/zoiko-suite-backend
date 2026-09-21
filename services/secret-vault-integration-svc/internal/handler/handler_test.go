@@ -608,6 +608,156 @@ func TestRevokeLease_Success(t *testing.T) {
 	}
 }
 
+// TestRevokeLease_RecordsTheRevokerNotTheLeaseHolder pins the one place in this
+// service where the audited SUBJECT and the audited ACTOR are different
+// principals.
+//
+// The REVOKED entry used to be written with the lease holder in
+// requested_by_principal_id and nothing else identifying anyone, so the
+// operator who ended the lease — authenticated, and authorized against
+// SECRET_LEASE_REVOKE moments earlier — appeared nowhere in the evidence. The
+// audit log could say a lease was revoked and whose it was, and could not say
+// who revoked it, which is the first question asked after a credential
+// incident. Migration 000004 added acted_by_principal_id for exactly this row.
+func TestRevokeLease_RecordsTheRevokerNotTheLeaseHolder(t *testing.T) {
+	const holder = "99999999-0000-4000-8000-00000000beef"
+	s := &stubStore{
+		findLeaseResult: &domain.SecretLease{
+			LeaseID:                "33333333-0000-4000-8000-000000000001",
+			Status:                 "ACTIVE",
+			RequestedByPrincipalID: holder,
+		},
+		revokeLeaseResult: &domain.SecretLease{
+			LeaseID:                "33333333-0000-4000-8000-000000000001",
+			Status:                 "REVOKED",
+			RequestedByPrincipalID: holder,
+		},
+		revokeLeaseTransitioned: true,
+	}
+	r := defaultRouter(s)
+	req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/leases/33333333-0000-4000-8000-000000000001/revoke", nil))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.auditEntries) != 1 {
+		t.Fatalf("expected exactly one audit entry, got %d", len(s.auditEntries))
+	}
+	e := s.auditEntries[0]
+	if e.RequestedByPrincipalID != holder {
+		t.Errorf("subject: want the lease holder %q, got %q", holder, e.RequestedByPrincipalID)
+	}
+	if e.ActedByPrincipalID == nil {
+		t.Fatal("actor not recorded: acted_by_principal_id is nil on a REVOKED entry")
+	}
+	if *e.ActedByPrincipalID != testPrincipal {
+		t.Errorf("actor: want the revoking caller %q, got %q", testPrincipal, *e.ActedByPrincipalID)
+	}
+	// The distinction is the whole point — a test that passed with both
+	// columns holding the same value would not notice the regression.
+	if *e.ActedByPrincipalID == e.RequestedByPrincipalID {
+		t.Error("actor and subject are identical; this test no longer proves anything")
+	}
+}
+
+// TestAuditEntries_AlwaysNameAnActor covers the other four event types. Each
+// one has an actor that happens to equal its subject, and each must still
+// populate the column: "everything principal X did" has to be answerable by one
+// predicate, without the reader knowing which event types coincide.
+func TestAuditEntries_AlwaysNameAnActor(t *testing.T) {
+	t.Run("broker grant records REQUESTED and GRANTED", func(t *testing.T) {
+		s := grantingStore()
+		r := defaultRouter(s)
+		req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker",
+			strings.NewReader(brokerBody("kv/db", testWorkload, "req-actor-1"))))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		assertEveryEntryNamesAnActor(t, s.auditEntries, "REQUESTED", "GRANTED")
+	})
+
+	t.Run("broker denial records DENIED", func(t *testing.T) {
+		s := grantingStore()
+		s.applicableByPath.AllowedWorkloadIDs = json.RawMessage(`["somebody-else"]`)
+		r := defaultRouter(s)
+		req := authed(httptest.NewRequest(http.MethodPost, "/v1/secrets/broker",
+			strings.NewReader(brokerBody("kv/db", testWorkload, "req-actor-2"))))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+		}
+		assertEveryEntryNamesAnActor(t, s.auditEntries, "REQUESTED", "DENIED")
+	})
+
+	t.Run("rotation records ROTATED and each cascaded REVOKED", func(t *testing.T) {
+		s := &stubStore{
+			findPolicyResult: &domain.SecretPolicy{
+				SecretPolicyID: "11111111-0000-4000-8000-000000000001",
+				SecretClass:    "DATABASE_CREDENTIAL",
+				SecretPath:     "kv/db",
+			},
+			revokedByPath: []*domain.SecretLease{{
+				LeaseID:                "33333333-0000-4000-8000-000000000009",
+				SecretPolicyVersionID:  "22222222-0000-4000-8000-000000000001",
+				RequestedByPrincipalID: "a-different-workload",
+				SecretPath:             "kv/db",
+			}},
+		}
+		r := defaultRouter(s)
+		req := authed(httptest.NewRequest(http.MethodPost, "/v1/secret-policies/11111111-0000-4000-8000-000000000001/rotate",
+			strings.NewReader(`{"request_id":"rot-actor-1","rotated_by_principal_id":"`+testPrincipal+`"}`)))
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+		assertEveryEntryNamesAnActor(t, s.auditEntries, "REVOKED", "ROTATED")
+
+		// The cascaded REVOKED belongs to a holder who did not ask for it;
+		// the rotator is the actor, same divergence as an explicit revoke.
+		for _, e := range s.auditEntries {
+			if e.EventType != "REVOKED" {
+				continue
+			}
+			if e.RequestedByPrincipalID != "a-different-workload" {
+				t.Errorf("cascaded REVOKED subject: want the lease holder, got %q", e.RequestedByPrincipalID)
+			}
+			if *e.ActedByPrincipalID != testPrincipal {
+				t.Errorf("cascaded REVOKED actor: want the rotator %q, got %q", testPrincipal, *e.ActedByPrincipalID)
+			}
+		}
+	})
+}
+
+// assertEveryEntryNamesAnActor checks that the recorded entries are exactly the
+// expected event types and that none of them left the actor column nil.
+func assertEveryEntryNamesAnActor(t *testing.T, entries []domain.RecordAuditEntryParams, wantTypes ...string) {
+	t.Helper()
+	var got []string
+	for _, e := range entries {
+		got = append(got, e.EventType)
+		if e.ActedByPrincipalID == nil {
+			t.Errorf("%s entry: acted_by_principal_id is nil", e.EventType)
+			continue
+		}
+		if *e.ActedByPrincipalID == "" {
+			t.Errorf("%s entry: acted_by_principal_id is empty", e.EventType)
+		}
+	}
+	if len(got) != len(wantTypes) {
+		t.Fatalf("event types: want %v, got %v", wantTypes, got)
+	}
+	for i, want := range wantTypes {
+		if got[i] != want {
+			t.Errorf("event %d: want %s, got %s", i, want, got[i])
+		}
+	}
+}
+
 func TestRevokeLease_InvalidTransition(t *testing.T) {
 	s := &stubStore{
 		findLeaseResult: &domain.SecretLease{LeaseID: "33333333-0000-4000-8000-000000000001", Status: "REVOKED"},
@@ -724,6 +874,35 @@ const testAuthzScopeID = "00000000-0000-0000-0000-0000000000f3"
 
 // testPrincipal is what the gateway ForwardAuth middleware sets in
 // X-Principal-Id after verifying the caller identity envelope.
+// testWorkload is the workload identity the broker fixtures authorize. Distinct
+// from testPrincipal, which is the human operator running administrative
+// writes — keeping them different is what lets the actor assertions below
+// prove something.
+const testWorkload = "svc-a"
+
+// grantingStore is the stub shape shared by TestBroker_Granted: one ACTIVE
+// policy version for kv/db that allows testWorkload, and a lease to hand back.
+func grantingStore() *stubStore {
+	return &stubStore{
+		applicableByPath: &domain.ApplicableSecretPolicyVersion{
+			SecretPolicyVersion: domain.SecretPolicyVersion{
+				SecretPolicyVersionID:   "22222222-0000-4000-8000-000000000001",
+				AllowedWorkloadIDs:      json.RawMessage(`["` + testWorkload + `"]`),
+				MaxLeaseDurationSeconds: 300,
+			},
+			SecretClass: "DATABASE_CREDENTIAL",
+			SecretPath:  "kv/db",
+		},
+		lease: &domain.SecretLease{
+			LeaseID:                "33333333-0000-4000-8000-000000000001",
+			SecretPath:             "kv/db",
+			RequestedByPrincipalID: testWorkload,
+			ExpiresAt:              time.Now().Add(5 * time.Minute),
+		},
+		leaseCreated: true,
+	}
+}
+
 const testPrincipal = "principal-test-admin"
 
 // testTenant is the caller's verified tenant scope. A UUID because every

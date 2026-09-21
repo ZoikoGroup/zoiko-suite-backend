@@ -1,0 +1,1207 @@
+openapi: "3.1.0"
+info:
+  title: Secret Vault Integration Service
+  version: "1.0"
+  description: |
+    Policy-gated brokerage of secret material. Workloads never hold long-lived
+    credentials; they ask this service, which decides against an effective-dated
+    policy and issues a short-lived lease.
+
+    **Service Class:** Platform Foundation Service
+    **Deployment Tier:** Tier 0
+    **Architecture ref:** docs/architecture/03-microservices.md §9.5 and §5.2,
+    docs/architecture/05-security.md §3.7-3.9 and §9.1-9.6,
+    docs/architecture/06-blueprint.md "PHASE 1 - THE SOVEREIGN SPINE"
+
+    ## What this service never holds
+
+    A secret value. Postgres holds four things and none of them is material:
+    policy metadata (who may read what), version metadata (the effective-dated
+    rules), lease metadata (who was granted access, until when), and an
+    append-only audit log. The material itself lives behind the `VaultBackend`
+    interface and is reachable only as a short-lived `lease_token`.
+
+    `lease_token` is the one credential this API emits. It is never stored,
+    never logged, and must never be rendered in a UI or written to a ticket.
+
+    ## The access path
+
+    Each step is separately observable, and skipping one fails in its own way:
+
+    1. `POST /v1/secret-policies` names a path and a class. Immutable.
+    2. `POST /v1/secret-policies/{id}/versions` says which workloads may broker
+       it, and for how long a lease may live. Created `DRAFT`.
+    3. `POST .../versions/{version_id}/activate` publishes it. A `DRAFT` version
+       is invisible to the broker - activation is what gives it effect.
+    4. `POST /v1/secret-policies/{id}/material` seeds the vault backend. Without
+       this, brokering fails at the vault with `503` even when policy allows it.
+    5. `POST /v1/secrets/broker` resolves the active version for the path and
+       scope, checks the caller against `allowed_workload_ids`, and grants or
+       denies.
+    6. `POST /v1/secret-policies/{id}/rotate` replaces the material and revokes
+       every live lease on the path in the same transaction.
+
+    ## Deny by absence
+
+    If no policy is `ACTIVE` for a path and scope, the broker refuses with
+    `404 no_applicable_secret_policy` - it does not pass the question back to
+    the caller the way `policy-svc`'s evaluate does. An unconfigured secret is
+    an inaccessible secret.
+
+    `404` (no policy for this path) and `403` (policy exists, caller not in
+    `allowed_workload_ids`) are deliberately distinct. Collapsing them would
+    hide, from an operator who has just registered a path and forgotten step 4,
+    the difference between "I got the policy wrong" and "I never seeded the
+    material" - the single most common failure mode of this service. The
+    enumeration this exposes is bounded: the broker is reachable only by a
+    caller that already passed gateway verification and carries a verified
+    tenant. See RUNBOOK.md §3.
+
+    ## Evidence obligation
+
+    Every brokerage attempt writes at least two rows to
+    `secret_access_audit_log`: a `REQUESTED` before the outcome is known, and
+    the outcome (`GRANTED` or `DENIED`). A denial is recorded as fully as a
+    grant - that is what makes the log evidence rather than a success log, and
+    it is the only place a refused request is visible at all, since a denial
+    never becomes a lease.
+
+    Each entry names both a **subject** (`requested_by_principal_id`, whose
+    access the row concerns) and an **actor** (`acted_by_principal_id`, who
+    performed the act). They coincide for `REQUESTED`/`GRANTED`/`DENIED` and
+    diverge for `REVOKED`.
+
+    ## Failure posture
+
+    Fail closed. Authorization unavailable is `503`, not an allow. Vault backend
+    unavailable is `503`, and no lease row is written. Store unavailable is
+    `503`. Nothing in this service degrades to a permissive default.
+
+servers:
+  - url: http://localhost:8087
+    description: Local development (direct port)
+  - url: http://localhost/secret-vault-integration-svc
+    description: Local development (through the Traefik gateway)
+  - url: https://secret-vault-integration-svc.internal.zoiko.io
+    description: Internal cluster (mTLS required)
+
+security:
+  - EnvelopeHeaders: []
+
+tags:
+  - name: Health
+    description: Liveness and readiness probes. Exempt from the input contract.
+  - name: Policy administration
+    description: Registering paths, versioning access rules, seeding and rotating material.
+  - name: Brokering
+    description: The request path. A workload asks for material and gets a lease or a refusal.
+  - name: Leases
+    description: Reading and ending grants.
+  - name: Audit
+    description: The append-only evidence log.
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness
+      operationId: liveness
+      description: |
+        Answers 200 whenever the process is up. Checks no dependencies on
+        purpose - a database outage must not cause the orchestrator to kill a
+        process that would recover on its own. Use `/readyz` to gate traffic.
+      security: []
+      responses:
+        "200":
+          description: The process is running.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthStatus" }
+
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness
+      operationId: readiness
+      description: |
+        Checks database connectivity. This is what the container's own
+        `HEALTHCHECK` invokes, and what Traefik gates traffic on: liveness
+        answers 200 whenever the process is up, so a dead connection pool would
+        otherwise read as healthy while every read returned 503.
+      security: []
+      responses:
+        "200":
+          description: Dependencies reachable; ready for traffic.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthStatus" }
+        "503":
+          description: A dependency is unreachable. Do not route traffic here.
+
+  /metrics:
+    get:
+      tags: [Health]
+      summary: Prometheus exposition
+      operationId: metrics
+      description: |
+        Domain counters under the `secret_vault_` prefix plus the platform
+        baseline. Six alert rules read these - see
+        deployments/prometheus-rules.yml and RUNBOOK.md, which has one section
+        per alert.
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content:
+            text/plain: {}
+
+  /v1/secret-policies:
+    post:
+      tags: [Policy administration]
+      summary: Register a secret path
+      operationId: createSecretPolicy
+      description: |
+        Creates the immutable container for a vault path. Holds no access rules
+        of its own - those live on versions.
+
+        **Idempotent on `secret_path`.** A replay returns `200` with the
+        existing row; a first write returns `201`. The same path registered
+        under a *different* `secret_class` is a genuine conflict, not a replay,
+        and answers `409`.
+
+        Requires the `SECRET_POLICY_CREATE` action.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSecretPolicyRequest" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecretPolicy" }
+        "200":
+          description: Replay - this path was already registered with this class.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecretPolicy" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
+        "409":
+          description: |
+            `secret_policy_conflict` - the path exists under a different
+            `secret_class`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+    get:
+      tags: [Policy administration]
+      summary: Applicable policy versions for a class and scope
+      operationId: listApplicableSecretPolicyVersions
+      description: |
+        Returns the `ACTIVE` versions that apply to the given class and scope,
+        most-specific scope first (legal entity, then tenant, then global).
+
+        `secret_class` is required: without it the query is "every active secret
+        policy on the platform", which is a scope this endpoint will not serve.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: secret_class
+          in: query
+          required: true
+          schema: { $ref: "#/components/schemas/SecretClass" }
+        - name: tenant_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+          description: Scope to resolve for. Must match the caller's verified tenant.
+        - name: legal_entity_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Applicable versions, most-specific scope first. Empty array when none.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ApplicableSecretPolicyVersion" }
+        "400":
+          description: "`missing_field` - `secret_class` was not supplied."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/secret-policies/{secret_policy_id}/versions:
+    post:
+      tags: [Policy administration]
+      summary: Create a DRAFT version
+      operationId: createSecretPolicyVersion
+      description: |
+        Creates an effective-dated access rule in `DRAFT`. A `DRAFT` has no
+        effect on brokering - activation is what publishes it.
+
+        Scope is set by what you supply: both `tenant_id` and `legal_entity_id`
+        binds it to that entity; `tenant_id` alone binds it to the tenant;
+        neither makes it global.
+
+        Requires the `SECRET_POLICY_VERSION_CREATE` action.
+      parameters:
+        - $ref: "#/components/parameters/SecretPolicyId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSecretPolicyVersionRequest" }
+      responses:
+        "201":
+          description: DRAFT version created.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecretPolicyVersion" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
+        "404":
+          description: "`secret_policy_not_found`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`secret_policy_version_conflict`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+    get:
+      tags: [Policy administration]
+      summary: Version history
+      operationId: listVersionHistory
+      description: |
+        Every version of this policy, newest first, in every status. Activation
+        supersedes rather than deletes, so the full lineage is readable here -
+        which version was in force when a given lease was granted is answerable
+        from this plus the lease's `secret_policy_version_id`.
+      parameters:
+        - $ref: "#/components/parameters/SecretPolicyId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/CorrelationId"
+      responses:
+        "200":
+          description: Versions, newest first. Empty array when the policy has none.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SecretPolicyVersion" }
+        "400": { $ref: "#/components/responses/InvalidPathParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/secret-policies/{secret_policy_id}/versions/{version_id}/activate:
+    post:
+      tags: [Policy administration]
+      summary: Activate a version
+      operationId: activateVersion
+      description: |
+        `DRAFT` to `ACTIVE`, atomically superseding whatever was previously
+        `ACTIVE` in the same scope. Supersedes - never deletes.
+
+        **Replay-safe and honest about it.** Activating an already-`ACTIVE`
+        version is a `200` with `transitioned: false`. Without that flag a real
+        transition and a no-op repeat were byte-identical, so a caller could not
+        tell whether its own request changed anything.
+
+        Requires the `SECRET_POLICY_VERSION_ACTIVATE` action.
+      parameters:
+        - $ref: "#/components/parameters/SecretPolicyId"
+        - $ref: "#/components/parameters/VersionId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [activated_by_principal_id]
+              properties:
+                activated_by_principal_id:
+                  type: string
+                  description: The principal accountable for publishing this rule.
+      responses:
+        "200":
+          description: The version, now ACTIVE, plus whether this call is what activated it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ActivatedVersion" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
+        "404":
+          description: "`secret_policy_version_not_found`, or the version belongs to another policy."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`invalid_transition` - the version is SUPERSEDED or RETIRED."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/secret-policies/{secret_policy_id}/material:
+    post:
+      tags: [Policy administration]
+      summary: Seed material into the vault backend
+      operationId: putSecretMaterial
+      description: |
+        Administrative only. **Never on the request path** - the broker reads
+        material, it never writes it.
+
+        This endpoint is not in the original design. It was found missing during
+        live verification, when it became clear the grant path could never
+        succeed in a real deployment: `Broker` calls `VaultBackend.Get`, and
+        nothing else could ever populate the backend, so every correctly
+        configured policy still answered `503 vault_backend_unavailable`.
+
+        The material is written encrypted (AES-256-GCM); the plaintext is not
+        recoverable from the backing store.
+
+        Requires the `SECRET_MATERIAL_WRITE` action.
+      parameters:
+        - $ref: "#/components/parameters/SecretPolicyId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [material_base64]
+              properties:
+                material_base64:
+                  type: string
+                  format: byte
+                  description: |
+                    The secret value, base64-encoded. This is the ONLY field in
+                    this API that carries material. It is written straight
+                    through to the vault backend and is never persisted to
+                    Postgres, never logged, and never echoed in the response.
+                written_by_principal_id:
+                  type: string
+                  description: |
+                    Recorded for provenance. The authorized actor is taken from
+                    `X-Principal-Id`.
+      responses:
+        "200":
+          description: Material stored. The response never echoes it back.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PutMaterialResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
+        "404":
+          description: "`secret_policy_not_found`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: "`vault_backend_unavailable` or `store_unavailable`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/secret-policies/{secret_policy_id}/rotate:
+    post:
+      tags: [Policy administration]
+      summary: Rotate material and revoke every live lease
+      operationId: rotateSecret
+      description: |
+        Replaces the material behind the path and **mass-revokes every currently
+        `GRANTED` lease on it**. The revocation is the point: rotating without
+        it would leave live leases pointing at material that no longer exists,
+        which fails at the workload rather than here.
+
+        Every revoked lease gets its own `REVOKED` audit row in its own holder's
+        tenant, carrying `revoked as a side effect of secret rotation` and
+        naming the rotating operator as actor. The `ROTATED` row itself is bound
+        to the rotating tenant.
+
+        **Idempotent on `request_id`**, enforced by a partial unique index on
+        `secret_access_audit_log (request_id) WHERE event_type = 'ROTATED'`. A
+        replay does not call the vault a second time and reports the ORIGINAL
+        `revoked_lease_count` - reporting `0` would read as "this rotation
+        revoked nothing", the opposite of what happened.
+
+        Requires the `SECRET_ROTATE` action.
+      parameters:
+        - $ref: "#/components/parameters/SecretPolicyId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [request_id, rotated_by_principal_id]
+              properties:
+                request_id:
+                  type: string
+                  description: Idempotency key for the rotation itself.
+                rotated_by_principal_id:
+                  type: string
+                  description: |
+                    The accountable operator. Required because
+                    `secret_access_audit_log.requested_by_principal_id` is NOT
+                    NULL and a rotation has no access subject of its own.
+      responses:
+        "200":
+          description: Rotated, or a faithful replay of a prior rotation.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RotateResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
+        "404":
+          description: "`secret_policy_not_found`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: "`vault_backend_unavailable` - nothing was rotated and no lease was revoked."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/secrets/broker:
+    post:
+      tags: [Brokering]
+      summary: Request a lease over secret material
+      operationId: brokerSecret
+      description: |
+        The core value of this service. Resolves the `ACTIVE` policy version for
+        the path and scope, checks the caller against `allowed_workload_ids`,
+        and either grants a lease or refuses.
+
+        **Not RBAC-gated.** Unlike every administrative endpoint here, this one
+        carries no `SECRET_*` action requirement: the policy version's
+        `allowed_workload_ids` IS the authorization, and requiring an RBAC grant
+        as well would mean every workload needed a role assignment to use the
+        service designed to remove exactly that coupling. The caller
+        authenticates as a workload (`X-Workload-Id`), not a human subject.
+
+        **Idempotent on `request_id`** - with one deliberate asymmetry. The
+        durable state (lease row, audit trail, published events) is fully
+        idempotent: a replay returns the SAME `lease_id` and emits no second
+        `secret.access.granted`. The `lease_token` is re-minted on each call,
+        because a token is a bearer credential with its own lifetime and
+        returning a cached one would hand back a credential closer to expiry
+        than the caller expects.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/WorkloadId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BrokerRequest" }
+      responses:
+        "200":
+          description: Granted. The body carries a live credential - see `lease_token`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BrokerResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403":
+          description: |
+            `access_denied` - a policy IS active for this path and scope, and it
+            does not list this caller in `allowed_workload_ids`. A `DENIED`
+            audit row is written, carrying the resolved `secret_class`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: |
+            `no_applicable_secret_policy` - no policy exists for this path, or
+            none is `ACTIVE` for this scope. Deny by absence. A `DENIED` audit
+            row is written with an empty `secret_class`, which is genuinely
+            unknown here because no policy was resolved to read it from.
+
+            The commonest cause is a version left in `DRAFT`: step 3 of the
+            access path was skipped.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "500":
+          description: "`invalid_policy_payload` - the stored `allowed_workload_ids` is not a JSON array."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503":
+          description: |
+            `vault_backend_unavailable` - policy allowed the request and the
+            backend could not serve it. No lease row is written. The usual cause
+            is step 4 of the access path: material was never seeded.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/secrets/leases/{lease_id}:
+    get:
+      tags: [Leases]
+      summary: Read one lease
+      operationId: getLease
+      description: |
+        Scoped to the caller's own tenant. Another tenant's lease answers `404`,
+        never `403`: a `403` would confirm the row exists, which is enough to
+        enumerate another tenant's leases one guess at a time.
+
+        `status` is a computed read. `EXPIRED` is never stored - it is derived
+        as `status = 'GRANTED' AND expires_at < NOW()`, by design, so no
+        background job is needed and an expired lease can never report
+        `GRANTED` because a sweeper has not run yet.
+      parameters:
+        - $ref: "#/components/parameters/LeaseId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/CorrelationId"
+      responses:
+        "200":
+          description: The lease.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SecretLease" }
+        "400": { $ref: "#/components/responses/InvalidPathParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "404":
+          description: |
+            `lease_not_found`. Returned identically for a lease that does not
+            exist and one belonging to another tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/secrets/leases:
+    get:
+      tags: [Leases]
+      summary: List leases
+      operationId: listLeases
+      description: |
+        Paginated, newest first, scoped to the caller's verified tenant. A
+        `tenant_id` query parameter naming any other tenant is refused rather
+        than silently ignored.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: principal
+          in: query
+          schema: { type: string }
+          description: Filter to one holder (`requested_by_principal_id`).
+        - name: secret_class
+          in: query
+          schema: { $ref: "#/components/schemas/SecretClass" }
+        - name: tenant_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: Must equal the caller's verified tenant; any other value is refused.
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Leases, newest first. Empty array when none match.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SecretLease" }
+        "400":
+          description: "`invalid_from`, `invalid_to`, or `invalid_field`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403":
+          description: "`tenant_scope_mismatch` - a `tenant_id` naming another tenant."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/secrets/leases/{lease_id}/revoke:
+    post:
+      tags: [Leases]
+      summary: End a lease early
+      operationId: revokeLease
+      description: |
+        `GRANTED` to `REVOKED`. Idempotent: revoking an already-`REVOKED` lease
+        is a `200` with `transitioned: false` and writes no second audit entry.
+        A lease that has already `EXPIRED` cannot be revoked - `409`.
+
+        The scope check happens BEFORE the transition, not on the way out: a
+        revocation cannot be undone, so discovering afterwards that the lease
+        belonged to another tenant would be too late.
+
+        The resulting `REVOKED` audit row names both principals, and this is the
+        one event where they differ: the subject is the lease holder, the actor
+        is the operator running this call. Before migration 000004 the actor was
+        authorized and then discarded, so the log could say a lease was revoked
+        and not who revoked it.
+
+        Requires the `SECRET_LEASE_REVOKE` action.
+      parameters:
+        - $ref: "#/components/parameters/LeaseId"
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/PrincipalId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/PurposeContext"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/CorrelationId"
+      requestBody:
+        required: false
+        description: |
+          No fields are read from the body. The revoking principal is taken from
+          `X-Principal-Id`, which is the header the authorization check already
+          uses - accepting a body field would let a caller name someone else as
+          the revoker in the audit trail.
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200":
+          description: The lease, plus whether this call is what revoked it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RevokedLease" }
+        "400": { $ref: "#/components/responses/InvalidPathParameter" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/AuthorizationDenied" }
+        "404":
+          description: "`lease_not_found`, including another tenant's lease."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: "`invalid_transition` - the lease is EXPIRED."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+  /v1/secrets/audit:
+    get:
+      tags: [Audit]
+      summary: The append-only access log
+      operationId: listSecretAudit
+      description: |
+        Every request, grant, denial, revocation and rotation, newest first,
+        scoped to the caller's verified tenant. Append-only: no UPDATE, no
+        DELETE, ever.
+
+        Denials are here as fully as grants. This is the only place a refused
+        request is visible at all - a denial never becomes a lease.
+      parameters:
+        - $ref: "#/components/parameters/TenantId"
+        - $ref: "#/components/parameters/SourceChannel"
+        - $ref: "#/components/parameters/CorrelationId"
+        - name: principal
+          in: query
+          schema: { type: string }
+          description: Filter on the SUBJECT (`requested_by_principal_id`).
+        - name: secret_path
+          in: query
+          schema: { type: string }
+        - name: event_type
+          in: query
+          schema: { $ref: "#/components/schemas/AuditEventType" }
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Audit entries, newest first. Empty array when none match.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/SecretAuditEntry" }
+        "400":
+          description: "`invalid_from` or `invalid_to`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+
+components:
+  securitySchemes:
+    EnvelopeHeaders:
+      type: apiKey
+      in: header
+      name: X-Principal-Id
+      description: |
+        This service sits behind gateway-auth-svc, which verifies the caller and
+        stamps the canonical §4 headers. The service trusts those headers and
+        re-checks the action against authorization-svc; it does not verify a
+        bearer token itself.
+
+  parameters:
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+      description: |
+        The caller's verified tenant. Mandatory on every route but the health
+        probes. Absent, the request never passed gateway verification, so it is
+        `401` - not `400`: telling the caller to fix its payload would be wrong.
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: The acting human/service principal. Required on administrative writes.
+    WorkloadId:
+      name: X-Workload-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: |
+        The brokering workload. Used in place of `X-Principal-Id` on
+        `/v1/secrets/broker` - a workload authenticates as itself, not as a
+        human subject.
+    SourceChannel:
+      name: X-Source-Channel
+      in: header
+      required: true
+      schema: { type: string, enum: [api, ui, batch, system] }
+    PurposeContext:
+      name: X-Purpose-Context
+      in: header
+      required: true
+      schema: { type: string }
+      description: |
+        Why privileged material is being touched. §4 marks this "required for
+        governed sensitive access"; on this service every write qualifies, so
+        every write is refused without it (`400 envelope_incomplete`).
+
+        The console sends a distinct value per operation -
+        `SECRET_POLICY_ADMINISTRATION`, `SECRET_MATERIAL_PROVISIONING`,
+        `SECRET_ACCESS_BROKERAGE`, `SECRET_LEASE_REVOCATION`, `SECRET_ROTATION`
+        - rather than one blanket string, because provisioning material and
+        brokering it are genuinely different reasons and an auditor should not
+        have to infer which from the route.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+      description: |
+        Required on every write (§4 and INV-08). Distinct from the body's
+        `request_id` on broker and rotate, which is the DOMAIN dedup key and is
+        what those endpoints actually replay against.
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema: { type: string }
+      description: |
+        Echoed into logs, audit rows and emitted events, and returned on the
+        response. Generated if absent.
+    SecretPolicyId:
+      name: secret_policy_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    VersionId:
+      name: version_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    LeaseId:
+      name: lease_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    From:
+      name: from
+      in: query
+      schema: { type: string, format: date-time }
+      description: RFC3339 lower bound, inclusive.
+    To:
+      name: to
+      in: query
+      schema: { type: string, format: date-time }
+      description: RFC3339 upper bound, exclusive.
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      description: Clamped to 200. A request for more is silently capped.
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  responses:
+    BadRequest:
+      description: |
+        `missing_field`, `invalid_field`, `invalid_json`, `invalid_classification`,
+        `request_too_large`, or `envelope_incomplete` (a §4 header missing on a
+        write). `field` names the offending input where one can be identified.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InvalidPathParameter:
+      description: |
+        `invalid_path_parameter` - an id in the path is not a UUID, with `field`
+        naming which one.
+
+        This is a `400`, not a `503`. A malformed id used to reach the driver,
+        whose generic error every handler translated to `store_unavailable`, so
+        a caller's own bad id read as an outage and clients would retry, back
+        off, and eventually page someone.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthenticated:
+      description: |
+        `missing_principal` or `tenant_scope_missing` - no verified identity or
+        tenant on the request, so it never passed the gateway.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    AuthorizationDenied:
+      description: |
+        `authorization_denied` - authorization-svc refused this principal the
+        required `SECRET_*` action.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unavailable:
+      description: |
+        `store_unavailable`, `vault_backend_unavailable`, or `authz_unavailable`.
+        All fail closed - nothing was written and nothing was permitted.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status: { type: string, example: ok }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code. Match on this, not on prose.
+        field:
+          type: string
+          description: The offending input, when one can be identified.
+        secret_path: { type: string }
+        lease_id: { type: string }
+
+    SecretClass:
+      type: string
+      description: |
+        Data-driven in the service - new classes need no code change there, so
+        this enum constrains only generated clients.
+      enum:
+        - DATABASE_CREDENTIAL
+        - INTEGRATION_TOKEN
+        - BANK_CREDENTIAL
+        - ESIGNATURE_CREDENTIAL
+        - PRIVATE_KEY
+        - ENCRYPTION_MATERIAL_REFERENCE
+        - API_SIGNING_SECRET
+        - SERVICE_TO_SERVICE_TRUST_MATERIAL
+
+    VersionStatus:
+      type: string
+      enum: [DRAFT, ACTIVE, SUPERSEDED, RETIRED]
+
+    LeaseStatus:
+      type: string
+      description: |
+        `EXPIRED` is computed on read, never stored - see
+        `GET /v1/secrets/leases/{lease_id}`.
+      enum: [GRANTED, EXPIRED, REVOKED]
+
+    AuditEventType:
+      type: string
+      enum: [REQUESTED, GRANTED, DENIED, REVOKED, ROTATED]
+
+    CreateSecretPolicyRequest:
+      type: object
+      required: [secret_class, secret_path, created_by_principal_id]
+      properties:
+        secret_policy_id:
+          type: string
+          format: uuid
+          description: Caller-supplied id. Omit to let the database generate one.
+        secret_class: { $ref: "#/components/schemas/SecretClass" }
+        secret_path:
+          type: string
+          description: |
+            The opaque address in the vault backend - NEVER the secret value.
+            Unique on its own; a vault path is already a unique address by
+            construction.
+          example: integrations/stripe/webhook-signing-key
+        created_by_principal_id: { type: string }
+        data_classification:
+          type: string
+          enum: [public, internal, confidential, restricted]
+
+    SecretPolicy:
+      type: object
+      properties:
+        secret_policy_id: { type: string, format: uuid }
+        secret_class: { $ref: "#/components/schemas/SecretClass" }
+        secret_path: { type: string }
+        created_at: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+        data_classification: { type: string }
+
+    CreateSecretPolicyVersionRequest:
+      type: object
+      required: [effective_from, created_by_principal_id]
+      properties:
+        secret_policy_version_id: { type: string, format: uuid }
+        tenant_id:
+          type: [string, "null"]
+          format: uuid
+          description: null makes the version global - every tenant.
+        legal_entity_id:
+          type: [string, "null"]
+          format: uuid
+          description: null scopes it to the whole tenant.
+        allowed_workload_ids:
+          type: array
+          items: { type: string }
+          description: |
+            The authorization for brokering, and the only one - see
+            `POST /v1/secrets/broker`. An empty array is a valid, fully closed
+            policy.
+        max_lease_duration_seconds:
+          type: integer
+          minimum: 1
+          description: How long a granted lease lives.
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: [string, "null"], format: date-time }
+        created_by_principal_id: { type: string }
+
+    SecretPolicyVersion:
+      type: object
+      properties:
+        secret_policy_version_id: { type: string, format: uuid }
+        secret_policy_id: { type: string, format: uuid }
+        tenant_id: { type: [string, "null"], format: uuid }
+        legal_entity_id: { type: [string, "null"], format: uuid }
+        allowed_workload_ids:
+          type: array
+          items: { type: string }
+        max_lease_duration_seconds: { type: integer }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: [string, "null"], format: date-time }
+        version_status: { $ref: "#/components/schemas/VersionStatus" }
+        created_at: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+
+    ApplicableSecretPolicyVersion:
+      allOf:
+        - $ref: "#/components/schemas/SecretPolicyVersion"
+        - type: object
+          properties:
+            secret_class: { $ref: "#/components/schemas/SecretClass" }
+            secret_path: { type: string }
+
+    ActivatedVersion:
+      allOf:
+        - $ref: "#/components/schemas/SecretPolicyVersion"
+        - type: object
+          required: [transitioned]
+          properties:
+            transitioned:
+              type: boolean
+              description: |
+                false means the version was already ACTIVE and this call changed
+                nothing.
+
+    PutMaterialResult:
+      type: object
+      properties:
+        secret_path: { type: string }
+        written: { type: boolean }
+
+    BrokerRequest:
+      type: object
+      required: [secret_path, requested_by_principal_id, request_id]
+      properties:
+        secret_path: { type: string }
+        tenant_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            The scope to resolve against. Must match the caller's verified
+            tenant when present; omitting it means the global policy set.
+        legal_entity_id: { type: [string, "null"], format: uuid }
+        requested_by_principal_id:
+          type: string
+          description: |
+            The workload asking. Checked against the resolved version's
+            `allowed_workload_ids`.
+        request_id:
+          type: string
+          description: Domain idempotency key. A replay returns the same `lease_id`.
+        correlation_id:
+          type: string
+          description: |
+            Used only when `X-Correlation-ID` is absent; the header wins when
+            both are present.
+
+    BrokerResult:
+      type: object
+      properties:
+        lease_id: { type: string, format: uuid }
+        secret_path: { type: string }
+        lease_token:
+          type: string
+          description: |
+            **A live credential.** Short-lived, opaque, and the only way to
+            reach the material. Never log it, never store it, never render it in
+            a UI. Re-minted on every call, including an idempotent replay that
+            returns an existing `lease_id`.
+        expires_at: { type: string, format: date-time }
+
+    SecretLease:
+      type: object
+      properties:
+        lease_id: { type: string, format: uuid }
+        request_id: { type: string }
+        secret_policy_version_id: { type: string, format: uuid }
+        secret_class: { $ref: "#/components/schemas/SecretClass" }
+        secret_path: { type: string }
+        requested_by_principal_id: { type: string }
+        tenant_id: { type: [string, "null"], format: uuid }
+        legal_entity_id: { type: [string, "null"], format: uuid }
+        status: { $ref: "#/components/schemas/LeaseStatus" }
+        granted_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        revoked_at: { type: [string, "null"], format: date-time }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+
+    RevokedLease:
+      allOf:
+        - $ref: "#/components/schemas/SecretLease"
+        - type: object
+          required: [transitioned]
+          properties:
+            transitioned:
+              type: boolean
+              description: |
+                false means the lease was already REVOKED. `revoked_at` cannot
+                answer this - it is set either way.
+
+    RotateResult:
+      type: object
+      properties:
+        secret_policy_id: { type: string, format: uuid }
+        secret_path: { type: string }
+        revoked_lease_count:
+          type: integer
+          description: |
+            Leases killed by this rotation. On an idempotent replay this reports
+            the ORIGINAL count, not 0.
+        rotated_at: { type: string, format: date-time }
+
+    SecretAuditEntry:
+      type: object
+      properties:
+        audit_log_id: { type: string, format: uuid }
+        event_type: { $ref: "#/components/schemas/AuditEventType" }
+        secret_class:
+          type: string
+          description: Empty on a DENIED where no policy was resolved to read it from.
+        secret_path: { type: string }
+        requested_by_principal_id:
+          type: string
+          description: The SUBJECT - whose access this entry concerns.
+        acted_by_principal_id:
+          type: [string, "null"]
+          description: |
+            The ACTOR - who performed the act. Equal to the subject for
+            REQUESTED/GRANTED/DENIED; different for REVOKED, where an operator
+            ends somebody else's lease.
+
+            null on rows written before migration 000004, which did not capture
+            it. Deliberately not backfilled: copying the subject across would be
+            right for three event types and wrong for the one the column exists
+            for.
+        tenant_id: { type: [string, "null"], format: uuid }
+        legal_entity_id: { type: [string, "null"], format: uuid }
+        lease_id:
+          type: [string, "null"]
+          format: uuid
+          description: null for REQUESTED and DENIED - nothing was granted to reference.
+        secret_policy_version_id: { type: [string, "null"], format: uuid }
+        request_id:
+          type: [string, "null"]
+          description: Populated only on ROTATED, which is the only event deduped on it.
+        outcome_detail: { type: string }
+        correlation_id: { type: string }
+        recorded_at: { type: string, format: date-time }

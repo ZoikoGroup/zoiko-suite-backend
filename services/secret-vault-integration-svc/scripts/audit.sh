@@ -282,6 +282,37 @@ LEAK=$(get "/v1/secrets/audit?secret_path=$SPATH&event_type=ROTATED&limit=50" "a
   | python -c "import sys,json;print(len(json.load(sys.stdin)))" 2>/dev/null)
 chk "  ... and invisible to an unrelated tenant" "$LEAK" "0"
 
+# WHO did it, not only whose access it was. requested_by_principal_id names the
+# SUBJECT of a row; on REVOKED that is the lease holder, and the operator who
+# ended the lease was authorized against SECRET_LEASE_REVOKE and then discarded.
+# The log could say a lease was revoked and whose it was, and could not say who
+# revoked it -- the first question asked after a credential incident. Migration
+# 000004 added acted_by_principal_id for this row.
+ACTOR_JSON=$(get "/v1/secrets/audit?secret_path=$SPATH&event_type=REVOKED&limit=10" "au-$STAMP-actor" "${H[@]}")
+REV_ACTOR=$(echo "$ACTOR_JSON" | python -c "
+import sys,json
+rows=json.load(sys.stdin)
+print(next((r.get('acted_by_principal_id') or '' for r in rows), ''))" 2>/dev/null)
+REV_SUBJECT=$(echo "$ACTOR_JSON" | python -c "
+import sys,json
+rows=json.load(sys.stdin)
+print(next((r.get('requested_by_principal_id') or '' for r in rows), ''))" 2>/dev/null)
+chk "REVOKED names the acting principal" "$REV_ACTOR" "$PRIN"
+chk "  ... and the subject is still the lease holder" "$REV_SUBJECT" "$WL"
+# The distinction is the entire point. Equal values would mean the column was
+# filled from the wrong source and the check above passes for the wrong reason.
+if [ -n "$REV_ACTOR" ] && [ "$REV_ACTOR" != "$REV_SUBJECT" ]; then
+  ok "  ... actor and subject are genuinely different principals"
+else
+  bad "  ... actor and subject collapsed to one value ($REV_ACTOR)"
+fi
+# Every other event type must fill it too, so "everything principal X did" is
+# one predicate rather than a per-type special case.
+NULLS=$(get "/v1/secrets/audit?secret_path=$SPATH&limit=50" "au-$STAMP-actor2" "${H[@]}" | python -c "
+import sys,json
+print(sum(1 for r in json.load(sys.stdin) if not r.get('acted_by_principal_id')))" 2>/dev/null)
+chk "no audit row written by this run omits its actor" "$NULLS" "0"
+
 echo
 echo "-- 12. Canonical input contract (ZS-ARCH-SVC-001 §4) ----------------"
 # 401, not 400: a missing tenant or actor means the request never passed
@@ -355,6 +386,122 @@ print(sum(1 for g in d['data']['groups'] if 'secret-vault' in g['name'] for r in
   chk "  ... all evaluating (health ok)" "$NH" "6"
 else
   echo "  SKIP  prometheus not reachable on :9090 (rules not asserted)"
+fi
+
+echo
+echo "-- 16. Published contract vs. the code ------------------------------"
+# A contract document that has drifted from the service is worse than none: a
+# client generated from it fails at runtime against a service that is working
+# correctly. Each check below compares the document to the source, not to
+# another document.
+for f in openapi.yaml asyncapi.yaml RUNBOOK.md; do
+  if [ -f "$SVC/$f" ]; then ok "$f present"; else bad "$f missing"; fi
+done
+
+# Routes: every chi route registered in the handler must appear in openapi.yaml,
+# and openapi.yaml must invent none. Compared as sets, both directions.
+ROUTE_DIFF=$(python - "$SVC" <<'PYEOF'
+import re, sys, pathlib
+try:
+    import yaml
+except ImportError:
+    print("SKIP pyyaml not installed"); raise SystemExit
+svc = pathlib.Path(sys.argv[1])
+code = (svc / "internal/handler/handler.go").read_text(encoding="utf-8")
+# chi names path params {like_this}; OpenAPI uses the same syntax, so the two
+# are directly comparable once the method is folded in.
+in_code = set()
+# The leading slash matters: without it this also matches
+# r.Header.Get("X-Correlation-ID") and reports the header name as an
+# undocumented route.
+for m, p in re.findall(r'r\.(Get|Post|Put|Patch|Delete)\("(/[^"]*)"', code):
+    in_code.add(f"{m.upper()} {p}")
+spec = yaml.safe_load((svc / "openapi.yaml").read_text(encoding="utf-8"))
+in_spec = set()
+for path, ops in spec["paths"].items():
+    for method in ops:
+        if method in ("get", "post", "put", "patch", "delete"):
+            in_spec.add(f"{method.upper()} {path}")
+# Health and metrics are served from main.go, not the handler router.
+in_spec -= {"GET /healthz", "GET /readyz", "GET /metrics"}
+missing = in_code - in_spec
+extra = in_spec - in_code
+for r in sorted(missing): print("UNDOCUMENTED " + r)
+for r in sorted(extra): print("PHANTOM " + r)
+print("COUNT %d" % len(in_code))
+PYEOF
+)
+echo "$ROUTE_DIFF" | grep -q "^SKIP" && echo "  SKIP  $(echo "$ROUTE_DIFF" | head -1)" || {
+  chk "routes in handler but not in openapi.yaml" "$(echo "$ROUTE_DIFF" | grep -c '^UNDOCUMENTED')" "0"
+  chk "routes in openapi.yaml the service does not serve" "$(echo "$ROUTE_DIFF" | grep -c '^PHANTOM')" "0"
+  echo "        v1 routes documented: $(echo "$ROUTE_DIFF" | grep '^COUNT' | awk '{print $2}')"
+}
+
+# Events: the same comparison for the event contract.
+EV_DIFF=$(python - "$SVC" <<'PYEOF'
+import re, sys, pathlib
+try:
+    import yaml
+except ImportError:
+    print("SKIP pyyaml not installed"); raise SystemExit
+svc = pathlib.Path(sys.argv[1])
+code = set(re.findall(r'"(secret\.[a-z.]+)"', (svc / "internal/events/publisher.go").read_text(encoding="utf-8")))
+spec = yaml.safe_load((svc / "asyncapi.yaml").read_text(encoding="utf-8"))
+doc = {m["name"] for m in spec["components"]["messages"].values()}
+for e in sorted(code - doc): print("UNDOCUMENTED " + e)
+for e in sorted(doc - code): print("PHANTOM " + e)
+print("COUNT %d" % len(code))
+PYEOF
+)
+echo "$EV_DIFF" | grep -q "^SKIP" && echo "  SKIP  pyyaml not installed" || {
+  chk "events published but not in asyncapi.yaml" "$(echo "$EV_DIFF" | grep -c '^UNDOCUMENTED')" "0"
+  chk "events in asyncapi.yaml that are never published" "$(echo "$EV_DIFF" | grep -c '^PHANTOM')" "0"
+  echo "        events documented: $(echo "$EV_DIFF" | grep '^COUNT' | awk '{print $2}')"
+}
+
+# Runbook: each of the six alert rules points at a section by number in its
+# annotation. A dangling pointer is discovered by an on-call at 3am, which is
+# the worst possible time to find out the page does not exist.
+RULES_FILE="$SVC/../../deployments/prometheus-rules.yml"
+MISSING_SECTIONS=0
+for n in 4.1 4.2 4.3 4.4 4.5 4.6; do
+  grep -q "^### $n " "$SVC/RUNBOOK.md" || MISSING_SECTIONS=$((MISSING_SECTIONS+1))
+done
+chk "runbook sections the alerts reference" "$MISSING_SECTIONS" "0"
+# And the reverse: the alert annotations must name a section that exists.
+if [ -f "$RULES_FILE" ]; then
+  # Scoped to this service's group: prometheus-rules.yml carries every
+  # service's rules and the other groups reference sections of their own
+  # runbooks, so an unscoped grep counts those too.
+  REFS=$(awk '/^  - name: secret-vault-integration$/{f=1;next} /^  - name: /{f=0} f' "$RULES_FILE"     | grep -oE "RUNBOOK section [0-9]+\.[0-9]+" | awk '{print $3}' | sort -u)
+  chk "  ... distinct sections referenced by these rules" "$(echo "$REFS" | grep -c .)" "6"
+  # Every one of them must resolve to a heading that exists. A dangling pointer
+  # is found by an on-call at 3am, which is the worst time to learn the page
+  # is not there.
+  DANGLING=0
+  for ref in $REFS; do
+    grep -q "^### $ref " "$SVC/RUNBOOK.md" || DANGLING=$((DANGLING+1))
+  done
+  chk "  ... references resolving to no runbook heading" "$DANGLING" "0"
+fi
+
+echo
+echo "-- 17. Console (secret-vault surface of the admin UI) ----------------"
+# The Go suite cannot see whether the CONSOLE sends the canonical headers this
+# service refuses writes without, keeps the lease token off the page, or tells
+# an operator apart the 403 and the 404. This is that half of end-to-end.
+# SKIP_FE=1 skips it; the suite takes about a minute and needs node_modules.
+FE="${FE:-$SVC/../../../zoiko-suite-frontend-platform}"
+if [ -n "$SKIP_FE" ]; then
+  echo "  SKIP  SKIP_FE set"
+elif [ ! -d "$FE/node_modules" ]; then
+  echo "  SKIP  console not installed at $FE (run npm ci there)"
+else
+  FEOUT=$(cd "$FE" && npx playwright test e2e/secrets.spec.ts --reporter=list 2>&1)
+  FEPASS=$(echo "$FEOUT" | grep -cE "^\s+ok [0-9]+")
+  FEFAIL=$(echo "$FEOUT" | grep -cE "^\s+x  [0-9]+")
+  chk "console e2e failures" "$FEFAIL" "0"
+  if [ "$FEPASS" -ge 9 ]; then ok "console e2e passing ($FEPASS)"; else bad "console e2e passing ($FEPASS, want >= 9)"; fi
 fi
 
 docker exec "$PG" psql -U postgres -c "DROP DATABASE IF EXISTS svi_audit_scratch;" >/dev/null 2>&1

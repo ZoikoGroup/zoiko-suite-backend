@@ -126,9 +126,20 @@ type SecretAccessAuditLog struct {
 	SecretClass string `json:"secret_class"`
 	SecretPath  string `json:"secret_path"`
 
-	RequestedByPrincipalID string  `json:"requested_by_principal_id"`
-	TenantID               *string `json:"tenant_id"`
-	LegalEntityID          *string `json:"legal_entity_id"`
+	// RequestedByPrincipalID is the SUBJECT of this record: the principal
+	// whose access to the material the entry concerns.
+	RequestedByPrincipalID string `json:"requested_by_principal_id"`
+
+	// ActedByPrincipalID is the ACTOR: the authenticated caller that
+	// performed the act. Equal to RequestedByPrincipalID for
+	// REQUESTED/GRANTED/DENIED, where subject and actor are the same
+	// principal, and genuinely different for REVOKED — an operator ending
+	// somebody else's lease. Nil only on rows written before migration
+	// 000004, which never captured it.
+	ActedByPrincipalID *string `json:"acted_by_principal_id"`
+
+	TenantID      *string `json:"tenant_id"`
+	LegalEntityID *string `json:"legal_entity_id"`
 
 	// LeaseID is nil for REQUESTED/DENIED — nothing was granted to
 	// reference.
@@ -221,7 +232,11 @@ type RecordAuditEntryParams struct {
 	SecretClass            string
 	SecretPath             string
 	RequestedByPrincipalID string
-	TenantID               *string
+	// ActedByPrincipalID is the authenticated caller performing the act.
+	// Leave nil only where there is genuinely no actor to name; every
+	// handler in this service has one.
+	ActedByPrincipalID *string
+	TenantID           *string
 	LegalEntityID          *string
 	LeaseID                *string
 	SecretPolicyVersionID  *string
