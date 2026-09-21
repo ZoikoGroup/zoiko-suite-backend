@@ -16,13 +16,13 @@ import (
 
 const treasuryTransferColumns = `
 	transfer_id, tenant_id, source_bank_account_id, target_bank_account_id, amount, currency_code, correlation_id, is_cross_entity,
-	protected_field_hash, status, maker_principal_id, checker_principal_id, reject_reason, payment_attempt_id, source_journal_id, intercompany_entry_id,
+	protected_field_hash, status, maker_principal_id, checker_principal_id, authorizer_principal_id, reject_reason, payment_attempt_id, source_journal_id, intercompany_entry_id,
 	cancel_reason, return_reason, resolution_note,
 	created_at, updated_at`
 
 func scanTreasuryTransfer(row pgx.Row, t *domain.TreasuryTransfer) error {
 	return row.Scan(&t.TransferID, &t.TenantID, &t.SourceBankAccountID, &t.TargetBankAccountID, &t.Amount, &t.CurrencyCode, &t.CorrelationID, &t.IsCrossEntity,
-		&t.ProtectedFieldHash, &t.Status, &t.MakerPrincipalID, &t.CheckerPrincipalID, &t.RejectReason, &t.PaymentAttemptID, &t.SourceJournalID, &t.IntercompanyEntryID,
+		&t.ProtectedFieldHash, &t.Status, &t.MakerPrincipalID, &t.CheckerPrincipalID, &t.AuthorizerPrincipalID, &t.RejectReason, &t.PaymentAttemptID, &t.SourceJournalID, &t.IntercompanyEntryID,
 		&t.CancelReason, &t.ReturnReason, &t.ResolutionNote,
 		&t.CreatedAt, &t.UpdatedAt)
 }
@@ -128,6 +128,84 @@ func (s *PgStore) ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveT
 		return nil, err
 	}
 	return &t, nil
+}
+
+// AuthorizeTreasuryTransfer is the doc's own additional dual-control step
+// for cross-entity transfers — mirrors ApproveTreasuryTransfer's shape
+// exactly (self-check before the CAS update, DB trigger as the second
+// line of defense). Only valid from APPROVED on a cross-entity transfer;
+// same-entity transfers have no AUTHORIZED state to reach at all.
+func (s *PgStore) AuthorizeTreasuryTransfer(ctx context.Context, p domain.AuthorizeTreasuryTransferParams) (*domain.TreasuryTransfer, error) {
+	existing, err := s.GetTreasuryTransfer(ctx, p.TenantID, p.TransferID)
+	if err != nil {
+		return nil, err
+	}
+	if existing.MakerPrincipalID == p.AuthorizerPrincipalID {
+		return nil, domain.ErrTransferSelfAuthorization
+	}
+	if !domain.CanAuthorizeTransfer(existing.Status, existing.IsCrossEntity) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+
+	var t domain.TreasuryTransfer
+	err = s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE treasury_transfers SET status=$3, authorizer_principal_id=$4, updated_at=now()
+			WHERE transfer_id=$1 AND tenant_id=$2 AND status='APPROVED' AND is_cross_entity=true
+			RETURNING `+treasuryTransferColumns,
+			p.TransferID, p.TenantID, domain.TransferAuthorized, p.AuthorizerPrincipalID)
+		return scanTreasuryTransfer(row, &t)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, s.notFoundOrInvalidTransfer(ctx, p.TenantID, p.TransferID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// ListTransfers is the doc's own ListTransfers query — tenant-scoped,
+// with optional legal_entity_id/status filters. legal_entity_id is
+// resolved via source_bank_account_id's owning account (treasury_transfers
+// itself has no legal_entity_id column — the transfer's legal entity is
+// always the source account's), matching how every other BNK-09 command
+// already derives legal entity from the source account.
+func (s *PgStore) ListTransfers(ctx context.Context, p domain.ListTransfersParams) ([]domain.TreasuryTransfer, error) {
+	limit := p.Limit
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	var results []domain.TreasuryTransfer
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		query := `
+			SELECT ` + treasuryTransferColumns + ` FROM treasury_transfers t
+			WHERE t.tenant_id=$1
+				AND ($2='' OR EXISTS (SELECT 1 FROM bank_accounts ba WHERE ba.bank_account_id=t.source_bank_account_id AND ba.legal_entity_id=$2))
+				AND ($3='' OR t.status=$3)
+			ORDER BY t.created_at DESC
+			LIMIT $4 OFFSET $5`
+		rows, err := tx.Query(ctx, query, p.TenantID, p.LegalEntityID, p.Status, limit, p.Offset)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var t domain.TreasuryTransfer
+			if err := scanTreasuryTransfer(rows, &t); err != nil {
+				return err
+			}
+			results = append(results, t)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	if results == nil {
+		results = []domain.TreasuryTransfer{}
+	}
+	return results, nil
 }
 
 func (s *PgStore) RejectTreasuryTransfer(ctx context.Context, p domain.RejectTreasuryTransferParams) (*domain.TreasuryTransfer, error) {

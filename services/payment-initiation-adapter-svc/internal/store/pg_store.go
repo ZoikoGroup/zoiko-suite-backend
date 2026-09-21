@@ -124,20 +124,27 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 	id := uuid.New().String()
 	var a *domain.PaymentInitiationAttempt
 	err := s.withTenant(ctx, func(tx pgx.Tx) error {
-		// Invariant #16: a source_reference with an attempt still
-		// unresolved (PREPARED/PENDING_UNKNOWN) must not get a second one,
-		// even under a brand-new idempotency_key — that's the scenario the
-		// unique index on idempotency_key alone doesn't catch. SUBMITTED
-		// is deliberately NOT in this set: once submitted, external
-		// execution/finality belongs to BNK-07 (payment-status-svc), not
-		// this service — from BNK-06's own ownership boundary, SUBMITTED
-		// is a durable, resolved outcome, not something still pending
-		// here. Only checked when the caller actually supplied a
-		// source_reference; an empty one has nothing to dedupe against.
+		// Invariant #16: a source_reference with an attempt still unresolved
+		// OR already submitted must not get a second one, even under a
+		// brand-new idempotency_key — that's the scenario the unique index
+		// on idempotency_key alone doesn't catch. SUBMITTED is included
+		// deliberately: this service never transitions an attempt OUT of
+		// SUBMITTED (finality tracking is BNK-07/payment-status-svc's own
+		// concern), so from the money-movement-safety angle this invariant
+		// protects, SUBMITTED means "a payment for this source_reference
+		// was already sent to the provider" — permanently, as far as this
+		// service knows — and a second send for the same instruction must
+		// never happen regardless of whether the first later settles or
+		// fails downstream. A genuine retry after a real failure mints a
+		// NEW source_reference (a new instruction), the same way a
+		// caller-side retry already gets a new idempotency_key; it does
+		// not reuse the exhausted one. Only checked when the caller
+		// actually supplied a source_reference; an empty one has nothing
+		// to dedupe against.
 		if req.SourceReference != "" {
 			existing, err := scanAttempt(tx.QueryRow(ctx, `
 				SELECT `+attemptColumns+` FROM payment_initiation_attempts
-				WHERE source_reference = $1 AND status IN ('PREPARED', 'PENDING_UNKNOWN')
+				WHERE source_reference = $1 AND status IN ('PREPARED', 'PENDING_UNKNOWN', 'SUBMITTED')
 				LIMIT 1
 			`, req.SourceReference))
 			if err == nil {

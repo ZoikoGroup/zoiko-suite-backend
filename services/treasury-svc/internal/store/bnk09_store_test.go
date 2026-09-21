@@ -4,6 +4,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -24,6 +25,139 @@ func seedTransferPair(t *testing.T, ctx context.Context, tenantID string) (src, 
 		t.Fatalf("create target account: %v", err)
 	}
 	return srcAcct.BankAccountID, tgtAcct.BankAccountID
+}
+
+// TestPgStore_AuthorizeTreasuryTransfer_CrossEntityOnly proves
+// CanAuthorizeTransfer's own gate: a same-entity (non-cross-entity)
+// transfer never becomes eligible for AuthorizeTreasuryTransfer, even
+// while sitting APPROVED — same-entity transfers have no AUTHORIZED step
+// at all.
+func TestPgStore_AuthorizeTreasuryTransfer_CrossEntityOnly(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 50, CurrencyCode: "USD", IsCrossEntity: false, CorrelationID: "corr-auth-same-entity", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	if _, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "authorizer-1"}); !errors.Is(err, domain.ErrInvalidTransferTransition) {
+		t.Fatalf("expected ErrInvalidTransferTransition authorizing a same-entity transfer, got %v", err)
+	}
+}
+
+// TestPgStore_AuthorizeTreasuryTransfer_RejectsSelfAuthorization is the
+// negative-controlled proof of the doc's SoD line: "Maker cannot
+// authorize own transfer where policy applies."
+func TestPgStore_AuthorizeTreasuryTransfer_RejectsSelfAuthorization(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 300, CurrencyCode: "USD", IsCrossEntity: true, CorrelationID: "corr-auth-self", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	if _, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "maker-1"}); !errors.Is(err, domain.ErrTransferSelfAuthorization) {
+		t.Fatalf("expected ErrTransferSelfAuthorization, got %v", err)
+	}
+
+	// Positive control: a different principal succeeds.
+	authorized, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "authorizer-1"})
+	if err != nil || authorized.Status != domain.TransferAuthorized {
+		t.Fatalf("authorize: %+v err=%v", authorized, err)
+	}
+	if authorized.AuthorizerPrincipalID != "authorizer-1" {
+		t.Fatalf("expected authorizer_principal_id to be recorded, got %q", authorized.AuthorizerPrincipalID)
+	}
+
+	// Re-authorizing an already-AUTHORIZED transfer must be rejected — not
+	// a silent no-op.
+	if _, err := s.AuthorizeTreasuryTransfer(ctx, domain.AuthorizeTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, AuthorizerPrincipalID: "authorizer-2"}); !errors.Is(err, domain.ErrInvalidTransferTransition) {
+		t.Fatalf("expected ErrInvalidTransferTransition re-authorizing, got %v", err)
+	}
+}
+
+// TestPgStore_ListTransfers_FiltersByLegalEntityAndStatus is the real
+// proof of the doc's own ListTransfers query.
+func TestPgStore_ListTransfers_FiltersByLegalEntityAndStatus(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+
+	srcA, tgtA := seedTransferPair(t, ctx, tenantID)
+	transferA, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: srcA, TargetBankAccountID: tgtA,
+		Amount: 10, CurrencyCode: "USD", CorrelationID: "corr-list-a", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create A: %v", err)
+	}
+	srcAcctA, err := s.GetBankAccount(ctx, srcA)
+	if err != nil {
+		t.Fatalf("get src account A: %v", err)
+	}
+
+	srcB, tgtB := seedTransferPair(t, ctx, tenantID)
+	if _, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: srcB, TargetBankAccountID: tgtB,
+		Amount: 20, CurrencyCode: "USD", CorrelationID: "corr-list-b", MakerPrincipalID: "maker-2",
+	}); err != nil {
+		t.Fatalf("create B: %v", err)
+	}
+
+	all, err := s.ListTransfers(ctx, domain.ListTransfersParams{TenantID: tenantID})
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("expected 2 transfers unfiltered, got %d", len(all))
+	}
+
+	byEntity, err := s.ListTransfers(ctx, domain.ListTransfersParams{TenantID: tenantID, LegalEntityID: srcAcctA.LegalEntityID})
+	if err != nil {
+		t.Fatalf("list by legal entity: %v", err)
+	}
+	if len(byEntity) != 1 || byEntity[0].TransferID != transferA.TransferID {
+		t.Fatalf("expected exactly transfer A filtering by its source legal entity, got %+v", byEntity)
+	}
+
+	byStatus, err := s.ListTransfers(ctx, domain.ListTransfersParams{TenantID: tenantID, Status: domain.TransferPendingApproval})
+	if err != nil {
+		t.Fatalf("list by status: %v", err)
+	}
+	if len(byStatus) != 2 {
+		t.Fatalf("expected 2 PENDING_APPROVAL transfers, got %d", len(byStatus))
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transferA.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve A: %v", err)
+	}
+	byStatus, err = s.ListTransfers(ctx, domain.ListTransfersParams{TenantID: tenantID, Status: domain.TransferApproved})
+	if err != nil {
+		t.Fatalf("list by status after approve: %v", err)
+	}
+	if len(byStatus) != 1 || byStatus[0].TransferID != transferA.TransferID {
+		t.Fatalf("expected exactly transfer A as APPROVED, got %+v", byStatus)
+	}
 }
 
 // TestPgStore_ApproveTreasuryTransfer_RejectsSelfApproval is the real

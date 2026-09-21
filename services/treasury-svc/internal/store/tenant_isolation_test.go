@@ -82,6 +82,7 @@ func TestMain(m *testing.M) {
 		"000007_add_bnk09_lifecycle_extensions.up.sql",
 		"000008_add_bnk08_cash_position_snapshot.up.sql",
 		"000009_add_bnk10_fx_exposure_snapshot.up.sql",
+		"000010_add_bnk09_authorization_and_events.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {

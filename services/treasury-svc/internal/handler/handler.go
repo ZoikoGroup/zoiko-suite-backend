@@ -32,7 +32,9 @@ type Store interface {
 	// maker-checker flow.
 	CreateTreasuryTransfer(ctx context.Context, p domain.CreateTreasuryTransferParams) (*domain.TreasuryTransfer, bool, error)
 	GetTreasuryTransfer(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error)
+	ListTransfers(ctx context.Context, p domain.ListTransfersParams) ([]domain.TreasuryTransfer, error)
 	ApproveTreasuryTransfer(ctx context.Context, p domain.ApproveTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	AuthorizeTreasuryTransfer(ctx context.Context, p domain.AuthorizeTreasuryTransferParams) (*domain.TreasuryTransfer, error)
 	RejectTreasuryTransfer(ctx context.Context, p domain.RejectTreasuryTransferParams) (*domain.TreasuryTransfer, error)
 	MarkTransferSubmitted(ctx context.Context, tenantID, transferID, paymentAttemptID string) (*domain.TreasuryTransfer, error)
 	MarkTransferLedgerPosted(ctx context.Context, tenantID, transferID, sourceJournalID string) (*domain.TreasuryTransfer, error)
@@ -53,6 +55,7 @@ type Store interface {
 	GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error)
 	PublishFXExposureSnapshot(ctx context.Context, p domain.PublishFXExposureParams) (*domain.FXExposureSnapshot, error)
 	SupersedeFXExposureSnapshot(ctx context.Context, p domain.SupersedeFXExposureParams) (*domain.FXExposureSnapshot, error)
+	ListFXCurrencyBreakdown(ctx context.Context, tenantID, legalEntityID string) ([]domain.FXExposureSnapshot, error)
 
 	// BNK-08 — see internal/store/bnk08_store.go's own doc comments.
 	CreateCashPositionSnapshot(ctx context.Context, p domain.CalculateCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
@@ -94,13 +97,28 @@ type Publisher interface {
 	PublishBankAccountClosed(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
 	PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
 
-	// BNK-09 events for the new Wave 12 transitions — see this file's own
-	// package doc: BNK-09 published nothing at all before this. Only the
-	// two new commands' outcomes are wired here; retroactively covering
-	// Create/Approve/Reject/Submitted/Completed is a separate, deferred
-	// gap, not part of this wave.
+	// BNK-09 events — see internal/events/publisher.go's own doc comments.
+	// Every doc-named TreasuryTransfer* event is now covered, plus the
+	// non-doc-listed Cancelled (a documented spec-inconsistency judgment
+	// call, not a silent guess — see PublishTreasuryTransferCancelled).
+	PublishTreasuryTransferCreated(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferApproved(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferAuthorized(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferSubmitted(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferSettled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferRejected(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
 	PublishTreasuryTransferReturned(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
 	PublishTreasuryTransferCancelled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+
+	// BNK-08 events — see internal/events/publisher.go's own doc comments.
+	PublishCashPositionCalculated(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
+	PublishCashPositionPublished(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
+	PublishCashPositionBecameStale(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot)
+
+	// BNK-10 events — see internal/events/publisher.go's own doc comments.
+	PublishFXExposureCalculated(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
+	PublishFXExposurePublished(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
+	PublishFXExposureBecameStale(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot)
 }
 
 // AuthZClient defines authorization plane contract.
@@ -139,6 +157,9 @@ const (
 	actionSetThreshold     = "TREASURY_THRESHOLD_SET"
 	actionInitiateTransfer = "TREASURY_TRANSFER_INITIATE"
 	actionApproveTransfer  = "TREASURY_TRANSFER_APPROVE"
+	// actionAuthorizeTransfer gates AuthorizeTreasuryTransfer — the doc's
+	// "treasury.transfer.authorize" permission, distinct from approve.
+	actionAuthorizeTransfer = "TREASURY_TRANSFER_AUTHORIZE"
 	actionExecuteTransfer  = "TREASURY_TRANSFER_EXECUTE"
 	// actionModifyTransfer gates Amend/SubmitForApproval/CancelBeforeSubmission
 	// — the maker-only commands over a not-yet-approved transfer.
@@ -195,10 +216,19 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		// BNK-09 — see internal/handler/bnk09_handler.go.
 		r.Post("/transfers", h.CreateTreasuryTransfer)
+		r.Get("/transfers", h.ListTransfers)
 		r.Get("/transfers/{transferID}", h.GetTreasuryTransfer)
+		r.Get("/transfers/{transferID}/approval", h.GetTransferApproval)
+		r.Get("/transfers/{transferID}/execution", h.GetTransferExecution)
+		r.Get("/transfers/{transferID}/available-actions", h.GetTransferAvailableActions)
 		r.Post("/transfers/{transferID}/approve", h.ApproveTreasuryTransfer)
+		r.Post("/transfers/{transferID}/authorize", h.AuthorizeTreasuryTransfer)
 		r.Post("/transfers/{transferID}/reject", h.RejectTreasuryTransfer)
 		r.Post("/transfers/{transferID}/execute", h.ExecuteTreasuryTransfer)
+		// InitiateTreasuryTransfer is the doc's own name for this same
+		// step — an additive route alias to the identical handler, not a
+		// second implementation to keep in sync.
+		r.Post("/transfers/{transferID}/initiate", h.ExecuteTreasuryTransfer)
 		r.Post("/transfers/{transferID}/amend", h.AmendTreasuryTransfer)
 		r.Post("/transfers/{transferID}/submit-for-approval", h.SubmitTransferForApproval)
 		r.Post("/transfers/{transferID}/cancel", h.CancelBeforeSubmission)
@@ -219,6 +249,16 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/fx/exposure-snapshot/{snapshotID}/supersede", h.SupersedeFXExposureSnapshot)
 		r.Get("/fx/exposure-snapshot", h.GetFXExposureSnapshotLatest)
 		r.Get("/fx/exposure-snapshot/as-of", h.GetFXExposureSnapshotAsOf)
+		r.Get("/fx/exposure-snapshot/currency-breakdown", h.GetFXCurrencyBreakdown)
+		r.Get("/fx/exposure-snapshot/maturity-profile", h.GetMaturityProfile)
+		r.Get("/fx/exposure-snapshot/{snapshotID}/lineage", h.GetSourceLineage)
+		// GetScenario (doc query): no separate route exists — RunFXScenario
+		// (POST /fx/scenario) already returns the full computed scenario
+		// response synchronously, and scenario outputs are explicitly never
+		// persisted ("scenario outputs remain analytical and separate from
+		// approved treasury actions"). There is nothing stored to GET
+		// later; inventing a persisted-scenario retrieval would contradict
+		// that explicit doc constraint rather than fill a real gap.
 
 		// BNK-01 — see internal/handler/bnk01_handler.go.
 		r.Post("/accounts/{accountID}/verify-ownership", h.VerifyBankAccountOwnership)

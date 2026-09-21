@@ -110,9 +110,14 @@ func (p *PgStore) CompleteConnectionAuthorization(ctx context.Context, params do
 func (p *PgStore) ActivateConnection(ctx context.Context, params domain.ActivateConnectionParams) (*domain.BankConnection, error) {
 	var c domain.BankConnection
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		// token_lease_ref<>'' is defense-in-depth alongside the status
+		// guard: ReconnectProvider clears it when re-entering AUTHORIZING
+		// from RECONSENT_REQUIRED specifically so this can't succeed again
+		// on stale consent until a real CompleteConnectionAuthorization
+		// sets a fresh one.
 		row := tx.QueryRow(ctx, `
 			UPDATE bank_connections SET status=$3, updated_at=now()
-			WHERE connection_id=$1 AND tenant_id=$2 AND status='AUTHORIZING'
+			WHERE connection_id=$1 AND tenant_id=$2 AND status='AUTHORIZING' AND token_lease_ref<>''
 			RETURNING `+bnk02Columns,
 			params.ConnectionID, params.TenantID, domain.ConnStatusActive)
 		if err := scanConnection(row, &c); err != nil {
@@ -207,14 +212,34 @@ func (p *PgStore) RevokeConnection(ctx context.Context, params domain.RevokeConn
 	return &c, err
 }
 
+// ReconnectProvider's target status depends on WHY the connection needs
+// reconnecting. DEGRADED/SUSPENDED are operational states — the provider
+// session itself is still valid, so recovery goes straight back to ACTIVE,
+// unchanged from before. RECONSENT_REQUIRED means the bank/provider is
+// demanding fresh consent — jumping straight to ACTIVE from there would
+// silently reactivate a connection whose authorization is no longer
+// valid, the same class of gap the doc's "revoked consent cannot be
+// silently reactivated" SoD rule targets for RevokeConnection. So
+// RECONSENT_REQUIRED instead re-enters the real authorization step
+// (-> AUTHORIZING), and only CompleteConnectionAuthorization/
+// ActivateConnection — which actually capture a new token lease/granted
+// scope — can bring it back to ACTIVE.
 func (p *PgStore) ReconnectProvider(ctx context.Context, params domain.ReconnectProviderParams) (*domain.BankConnection, error) {
 	var c domain.BankConnection
 	err := p.withTenant(ctx, func(tx pgx.Tx) error {
 		row := tx.QueryRow(ctx, `
-			UPDATE bank_connections SET status=$3, health_status='HEALTHY', updated_at=now()
+			UPDATE bank_connections SET
+				status=CASE WHEN status='RECONSENT_REQUIRED' THEN 'AUTHORIZING' ELSE 'ACTIVE' END,
+				-- Clearing the stale credential here (not just relabeling the
+				-- state) is what actually prevents ActivateConnection from
+				-- reactivating on old consent — see ActivateConnection's own
+				-- token_lease_ref<>'' guard, and this function's doc comment.
+				token_lease_ref=CASE WHEN status='RECONSENT_REQUIRED' THEN '' ELSE token_lease_ref END,
+				token_expires_at=CASE WHEN status='RECONSENT_REQUIRED' THEN NULL ELSE token_expires_at END,
+				health_status='HEALTHY', updated_at=now()
 			WHERE connection_id=$1 AND tenant_id=$2 AND status IN ('DEGRADED','SUSPENDED','RECONSENT_REQUIRED')
 			RETURNING `+bnk02Columns,
-			params.ConnectionID, params.TenantID, domain.ConnStatusActive)
+			params.ConnectionID, params.TenantID)
 		if err := scanConnection(row, &c); err != nil {
 			return err
 		}
@@ -317,4 +342,20 @@ func (p *PgStore) IsRegionAllowed(ctx context.Context, tenantID, legalEntityID, 
 		return true, nil
 	}
 	return matchingPolicies > 0, nil
+}
+
+// HasRegionPolicy reports whether a legal entity has any configured
+// bank_region_policies rows at all — used only to make the fail-open
+// "unrestricted" path in enforceRegionPolicy visible in telemetry (a
+// deliberate product decision, not a bug: see IsRegionAllowed's own doc
+// comment), never to change IsRegionAllowed's own enforcement decision.
+func (p *PgStore) HasRegionPolicy(ctx context.Context, tenantID, legalEntityID string) (bool, error) {
+	var total int
+	err := p.withTenant(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM bank_region_policies WHERE tenant_id=$1 AND legal_entity_id=$2`, tenantID, legalEntityID).Scan(&total)
+	})
+	if err != nil {
+		return false, err
+	}
+	return total > 0, nil
 }

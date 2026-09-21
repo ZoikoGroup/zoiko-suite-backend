@@ -97,6 +97,15 @@ func (h *BNK02Handler) enforceRegionPolicy(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusForbidden, domain.ErrConnectionRegionNotAllowed.Error())
 		return false
 	}
+	// Make the fail-open path visible in telemetry: an allowed result
+	// because the legal entity has zero configured policy rows is a
+	// meaningfully different, weaker guarantee than "explicitly allowed by
+	// policy" — this is the deliberate opt-in-per-entity decision, not a
+	// bug, but it should be discoverable, not silent.
+	if hasPolicy, err := h.bnk02Store.HasRegionPolicy(r.Context(), tenantID, conn.LegalEntityID); err == nil && !hasPolicy {
+		h.logger.Warn("enforceRegionPolicy: legal entity has no configured region policy — connection allowed unrestricted",
+			zap.String("legal_entity_id", conn.LegalEntityID), zap.String("region", conn.Region))
+	}
 	return true
 }
 

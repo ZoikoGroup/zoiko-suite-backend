@@ -253,6 +253,66 @@ func TestResolveStatusConflict_SamePrincipalAsCreator_Forbidden(t *testing.T) {
 	}
 }
 
+// TestPollPaymentStatus_SamePrincipalAsCreator_AssertingSettled_Forbidden
+// is the real proof of the doc's own SoD line ("same actor should not
+// create payment and manually assert final settlement"): PollPaymentStatus
+// is the de facto manual-settlement path (no separate ConfirmSettlement
+// command exists), so it must be gated the same way
+// ResolveStatusConflict/RecordReturn already are.
+func TestPollPaymentStatus_SamePrincipalAsCreator_AssertingSettled_Forbidden(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := recordPayment(t, r) // created as "principal-operator"
+
+	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusSettled}, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when the creator manually asserts their own payment SETTLED, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPollPaymentStatus_SamePrincipalAsCreator_AssertingRejected_Forbidden
+// proves the same guard covers REJECTED, the other governed-final status
+// PollPaymentStatus can assert — not just SETTLED specifically.
+func TestPollPaymentStatus_SamePrincipalAsCreator_AssertingRejected_Forbidden(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := recordPayment(t, r)
+
+	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusRejected}, testTenant)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 when the creator manually asserts their own payment REJECTED, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPollPaymentStatus_SamePrincipalAsCreator_IntermediateStatus_Allowed
+// proves the guard is scoped to finality claims only — reporting
+// intermediate progress (ACCEPTED/PENDING) is not "asserting final
+// settlement" and remains unrestricted, same scoping as the doc's own
+// SoD language.
+func TestPollPaymentStatus_SamePrincipalAsCreator_IntermediateStatus_Allowed(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := recordPayment(t, r)
+
+	w := doRequest(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusAccepted}, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 — an intermediate status report is not a finality assertion, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPollPaymentStatus_DifferentPrincipal_AssertingSettled_Succeeds is
+// the positive control.
+func TestPollPaymentStatus_DifferentPrincipal_AssertingSettled_Succeeds(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
+	p := recordPayment(t, r)
+
+	w := doRequestAs(r, http.MethodPost, "/bnk07/payments/"+p.PaymentID+"/poll",
+		domain.ProviderCallbackPayload{ReportedStatus: domain.StatusSettled}, testTenant, "principal-reviewer")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a different principal asserting SETTLED, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestRecordReturn_FromSettled(t *testing.T) {
 	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{})
 	p := recordPayment(t, r)
