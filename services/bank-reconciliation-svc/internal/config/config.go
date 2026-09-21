@@ -42,6 +42,14 @@ type Config struct {
 	// before persisting the match. Optional: if empty, the GL path is used.
 	BankingConnectorURL string
 
+	// CloseServiceURL is the base URL of financial-close-svc. CertifyRun
+	// checks it before writing a certificate — the same integration
+	// general-ledger-svc already has for journal posting (see
+	// internal/close/client.go's own doc comment) — so certification
+	// against a CLOSED/LOCKED period is refused rather than silently
+	// allowed.
+	CloseServiceURL string
+
 	// OTELExporterEndpoint is where internal/telemetry sends OTLP/HTTP
 	// traces (03-microservices.md §3.8's Observability Baseline).
 	OTELExporterEndpoint string
@@ -109,6 +117,7 @@ func Load() (*Config, error) {
 		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 		LedgerServiceURL:         env("LEDGER_SERVICE_URL", "http://general-ledger-svc:8098"),
 		BankingConnectorURL:      env("BANKING_CONNECTOR_URL", "http://banking-connector-svc:8145"),
+		CloseServiceURL:          env("CLOSE_SERVICE_URL", "http://financial-close-svc:8104"),
 		OTELExporterEndpoint:     env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil
 }

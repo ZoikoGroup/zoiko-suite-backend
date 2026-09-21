@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
+	"zoiko.io/bank-reconciliation-svc/internal/close"
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 	"zoiko.io/bank-reconciliation-svc/internal/handler"
 	"zoiko.io/bank-reconciliation-svc/internal/ledger"
@@ -289,7 +290,7 @@ func (s *stubStore) GetRun(_ context.Context, _, _ string) (*domain.Reconciliati
 	if s.getRunErr != nil {
 		return nil, s.getRunErr
 	}
-	return &domain.ReconciliationRun{RunID: "run-1", Status: domain.RunStatusDraft, LegalEntityID: "e1", PopulationID: s.runPopulationID}, nil
+	return &domain.ReconciliationRun{RunID: "run-1", Status: domain.RunStatusDraft, LegalEntityID: "e1", StatementDate: "2024-08-15", PopulationID: s.runPopulationID}, nil
 }
 func (s *stubStore) FreezePopulation(_ context.Context, _, _, _, _ string) (*domain.ReconciliationPopulation, bool, error) {
 	if s.freezeErr != nil {
@@ -454,16 +455,34 @@ func (b *stubBanking) GetCanonicalTransaction(_ context.Context, _, _ string) (i
 	return nil, nil // never called in existing tests
 }
 
+// stubClose is the Wave 13 test double for internal/close.Client — defaults
+// to "open" (nil error) so every pre-existing CertifyRun test, none of
+// which is about the closed-period check itself, keeps passing unchanged.
+// Tests that specifically exercise the check set err.
+type stubClose struct{ err error }
+
+func (c *stubClose) CheckPeriodOpen(_ context.Context, _, _, _ string) error { return c.err }
+
 // newRouter mirrors cmd/server/main.go's middleware stack. TenantContext was
 // previously absent here, so every test ran with no verified tenant scope at
 // all — which is precisely the condition the routes were getting wrong, and
 // the reason the whole class of tenant-scope defects went unnoticed by a
 // 24-test suite.
 func newRouter(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger) chi.Router {
+	return newRouterWithClose(s, p, a, l, &stubClose{})
+}
+
+// closeClient takes the close.Client INTERFACE, not *stubClose — passing a
+// literal nil here is a true nil interface (the "not configured" case);
+// passing a nil *stubClose through a concrete-typed parameter would
+// instead produce a non-nil interface wrapping a nil pointer, which
+// panics on the first method call rather than exercising the intended
+// not-configured path.
+func newRouterWithClose(s *stubStore, p *stubPublisher, a *stubAuthZ, l *stubLedger, closeClient close.Client) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
 	// Pass nil for banking client — existing tests all use journal_id path.
-	h := handler.New(s, p, a, l, nil, zap.NewNop())
+	h := handler.New(s, p, a, l, nil, closeClient, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -997,6 +1016,55 @@ func TestCertifyRun_PopulationNotFrozen_Returns409(t *testing.T) {
 	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 certifying a run whose population was never frozen, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// ── Wave 13: closed-period enforcement at certification ─────────────────────
+
+// TestCertifyRun_PeriodLocked_Returns409 is the real proof of the doc's
+// own SoD rule ("closed-period/control exceptions need authorized
+// remediation"): a CLOSED/LOCKED period blocks certification before the
+// store is ever called.
+func TestCertifyRun_PeriodLocked_Returns409(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, &stubClose{err: domain.ErrPeriodLocked})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 certifying against a CLOSED/LOCKED period, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCertifyRun_CloseServiceUnavailable_FailsClosed proves an
+// unreachable/ambiguous financial-close-svc blocks certification rather
+// than defaulting to "assume open."
+func TestCertifyRun_CloseServiceUnavailable_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, &stubClose{err: domain.ErrCloseServiceUnavailable})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when financial-close-svc is unreachable, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCertifyRun_NotConfigured_FailsClosed proves a deployment that never
+// wired a close client fails closed rather than skipping the check.
+func TestCertifyRun_NotConfigured_FailsClosed(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, nil)
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no close client is configured, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestCertifyRun_PeriodOpen_Succeeds is the positive control: an OPEN
+// period still lets certification proceed normally.
+func TestCertifyRun_PeriodOpen_Succeeds(t *testing.T) {
+	s := newStubStore()
+	r := newRouterWithClose(s, &stubPublisher{}, &stubAuthZ{}, &stubLedger{}, &stubClose{})
+	rec := doRequest(r, http.MethodPost, "/v1/reconciliation-runs/run-1/certify", nil, "principal-1")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 certifying against an OPEN period, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

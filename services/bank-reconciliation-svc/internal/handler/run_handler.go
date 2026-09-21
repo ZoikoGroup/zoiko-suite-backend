@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -173,6 +175,22 @@ func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Wave 13: the doc's own SoD rule — "closed-period/control exceptions
+	// need authorized remediation" — certification must fail closed on a
+	// CLOSED/LOCKED period or an unreachable/ambiguous financial-close-svc
+	// response, never default to "assume open."
+	if err := h.checkPeriodOpenForCertification(r.Context(), tenantID, run); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrPeriodLocked):
+			writeError(w, http.StatusConflict, "period_locked", err.Error())
+		case errors.Is(err, domain.ErrCloseServiceUnavailable):
+			writeError(w, http.StatusServiceUnavailable, "close_service_unavailable", err.Error())
+		default:
+			h.writeStoreErr(w, "CertifyRun/CheckPeriodOpen", err)
+		}
+		return
+	}
+
 	cert, created, err := h.store.CertifyRun(r.Context(), tenantID, runID, principalID, correlationID)
 	if err != nil {
 		switch {
@@ -201,6 +219,26 @@ func (h *Handler) CertifyRun(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusOK
 	}
 	writeJSON(w, status, cert)
+}
+
+// checkPeriodOpenForCertification derives the doc-standard "YYYY-MM"
+// period_name from the run's own statement_date (not "now" — the period
+// being certified is the one the statement belongs to) and asks
+// financial-close-svc whether it's open. A closeClient that isn't
+// configured (nil) fails closed, same as an unreachable one — there is
+// no honest "skip the check" default for a financial control gate.
+func (h *Handler) checkPeriodOpenForCertification(ctx context.Context, tenantID string, run *domain.ReconciliationRun) error {
+	if h.closeClient == nil {
+		h.log.Error("CertifyRun: financial-close-svc client not configured — failing closed")
+		return domain.ErrCloseServiceUnavailable
+	}
+	statementDate, err := time.Parse("2006-01-02", run.StatementDate)
+	if err != nil {
+		h.log.Error("CertifyRun: run's statement_date did not parse — failing closed", zap.String("statement_date", run.StatementDate), zap.Error(err))
+		return domain.ErrCloseServiceUnavailable
+	}
+	periodName := statementDate.Format("2006-01")
+	return h.closeClient.CheckPeriodOpen(ctx, tenantID, run.LegalEntityID, periodName)
 }
 
 // ── POST /v1/reconciliation-runs/{run_id}/reperform ──────────────────────────
