@@ -48,6 +48,15 @@ type Store interface {
 	RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error)
 	GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error)
 
+	// BNK-08 — see internal/store/bnk08_store.go's own doc comments.
+	CreateCashPositionSnapshot(ctx context.Context, p domain.CalculateCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
+	GetCashPositionSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.CashPositionSnapshot, error)
+	GetLatestCashPosition(ctx context.Context, tenantID, legalEntityID, reportingCurrency string) (*domain.CashPositionSnapshot, error)
+	GetCashPositionAsOf(ctx context.Context, tenantID, legalEntityID, reportingCurrency string, asOf time.Time) (*domain.CashPositionSnapshot, error)
+	ListCurrencyBreakdown(ctx context.Context, tenantID, legalEntityID string) ([]domain.CashPositionSnapshot, error)
+	PublishCashPositionSnapshot(ctx context.Context, p domain.PublishCashPositionParams) (*domain.CashPositionSnapshot, error)
+	SupersedeCashPositionSnapshot(ctx context.Context, p domain.SupersedeCashPositionParams) (*domain.CashPositionSnapshot, error)
+
 	// BNK-01 — see internal/store/bnk01_store.go's own doc comments.
 	VerifyBankAccountOwnership(ctx context.Context, p domain.VerifyOwnershipParams) (*domain.OwnershipEvidence, error)
 	ListOwnershipEvidence(ctx context.Context, tenantID, bankAccountID string) ([]domain.OwnershipEvidence, error)
@@ -132,6 +141,13 @@ const (
 	actionModifyTransfer  = "TREASURY_TRANSFER_MODIFY"
 	actionResolveTransfer = "TREASURY_TRANSFER_RESOLVE"
 	actionViewPositions    = "TREASURY_POSITIONS_VIEW"
+	// actionCalculateCashPosition gates Calculate/RefreshCashPosition —
+	// the doc's own "cash.position.calculate"-equivalent permission.
+	// actionPublishCashPosition gates PublishCashPositionSnapshot only —
+	// the doc lists cash.position.publish as a distinct permission from
+	// calculate/read.
+	actionCalculateCashPosition = "TREASURY_CASH_POSITION_CALCULATE"
+	actionPublishCashPosition   = "TREASURY_CASH_POSITION_PUBLISH"
 )
 
 type Handler struct {
@@ -196,6 +212,17 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/accounts/{accountID}/masked", h.GetBankAccountMasked)
 		r.Get("/accounts/{accountID}/available-actions", h.GetAvailableActions)
 		r.Get("/accounts/{accountID}/connection-options", h.ListConnectionOptions)
+
+		// BNK-08 — see internal/handler/bnk08_handler.go.
+		r.Post("/cash-position/calculate", h.CalculateCashPosition)
+		r.Post("/cash-position/refresh", h.RefreshCashPosition)
+		r.Post("/cash-position/{snapshotID}/publish", h.PublishCashPositionSnapshot)
+		r.Post("/cash-position/{snapshotID}/supersede", h.SupersedeCashPositionSnapshot)
+		r.Get("/cash-position", h.GetCashPosition)
+		r.Get("/cash-position/as-of", h.GetCashPositionAsOf)
+		r.Get("/cash-position/{snapshotID}/freshness", h.GetSourceFreshness)
+		r.Get("/cash-position/{snapshotID}/drilldown", h.GetAccountDrilldown)
+		r.Get("/cash-position/currency-breakdown", h.GetCurrencyBreakdown)
 	})
 }
 
