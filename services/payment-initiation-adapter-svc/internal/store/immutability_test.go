@@ -260,9 +260,13 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 		t.Fatalf("expected exactly 1 attempt row for this source_reference, got %d — this is a duplicate-attempt bug if not 1", count)
 	}
 
-	// Once the first attempt resolves (submitted), a fresh instruction
-	// with the SAME source_reference must still be allowed — Invariant
-	// #16 only blocks concurrent unresolved attempts, not all reuse ever.
+	// Once the first attempt is SUBMITTED, a second attempt for the SAME
+	// source_reference must still be refused — SUBMITTED means a payment
+	// was already sent to the provider for this instruction, and this
+	// service never transitions an attempt OUT of SUBMITTED (finality
+	// tracking is BNK-07/payment-status-svc's concern), so a duplicate
+	// send must never be allowed regardless of how the first one later
+	// resolves downstream.
 	if _, err := testStore.MarkSubmitted(ctx, first.AttemptID, "provider-req-1", "provider-resp-1", "maker-1"); err != nil {
 		t.Fatalf("MarkSubmitted: %v", err)
 	}
@@ -272,11 +276,26 @@ func TestPgStore_PrepareAttempt_RejectsSecondUnresolvedAttempt(t *testing.T) {
 		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
 		IdempotencyKey: "corr-unresolved-3",
 	}, "maker-1")
-	if err != nil {
-		t.Fatalf("expected a new attempt to be allowed once the prior one resolved (SUBMITTED), got %v", err)
+	if !errors.Is(err, domain.ErrUnresolvedAttemptExists) {
+		t.Fatalf("expected ErrUnresolvedAttemptExists once the prior attempt is SUBMITTED, got %v", err)
 	}
-	if third.AttemptID == first.AttemptID {
-		t.Fatal("expected a genuinely new attempt row once the prior one resolved")
+	if third == nil || third.AttemptID != first.AttemptID {
+		t.Fatalf("expected the ORIGINAL (SUBMITTED) attempt id %s to be returned, got %+v", first.AttemptID, third)
+	}
+
+	// A genuinely new instruction — a different source_reference — is
+	// completely unaffected, proving this isn't a global lockout.
+	fourth, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+		LegalEntityID: uuid.New().String(), SourceReference: "instruction-" + uuid.New().String(),
+		PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+		Amount: 75.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		IdempotencyKey: "corr-unresolved-4",
+	}, "maker-1")
+	if err != nil {
+		t.Fatalf("expected a genuinely new source_reference to be unaffected, got %v", err)
+	}
+	if fourth.AttemptID == first.AttemptID {
+		t.Fatal("expected a genuinely new attempt row for a different source_reference")
 	}
 }
 

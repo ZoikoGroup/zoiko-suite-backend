@@ -5,6 +5,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -132,6 +133,7 @@ func (h *Handler) CalculateCashPosition(w http.ResponseWriter, r *http.Request) 
 		h.writeCashPositionErr(w, err)
 		return
 	}
+	h.publishCashPositionCalculated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *snap)
 	writeJSON(w, http.StatusCreated, snap)
 }
 
@@ -178,6 +180,7 @@ func (h *Handler) RefreshCashPosition(w http.ResponseWriter, r *http.Request) {
 		h.writeCashPositionErr(w, err)
 		return
 	}
+	h.publishCashPositionCalculated(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *snap)
 
 	if req.PriorSnapshotID != "" {
 		if _, err := h.store.SupersedeCashPositionSnapshot(r.Context(), domain.SupersedeCashPositionParams{
@@ -217,7 +220,22 @@ func (h *Handler) PublishCashPositionSnapshot(w http.ResponseWriter, r *http.Req
 		h.writeCashPositionErr(w, err)
 		return
 	}
+	h.publisher.PublishCashPositionPublished(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// publishCashPositionCalculated fires the doc's own CashPositionCalculated
+// event for every newly created snapshot, and additionally
+// CashPositionBecameStale when the calculation itself already reveals a
+// stale source component — HasStaleComponent is computed at calculation
+// time from real source freshness (see domain.CashPositionCalculation),
+// so this is the mechanical, already-computed trigger for that event
+// rather than a fabricated new staleness-detection mechanism.
+func (h *Handler) publishCashPositionCalculated(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot) {
+	h.publisher.PublishCashPositionCalculated(ctx, correlationID, actorID, snap)
+	if snap.HasStaleComponent {
+		h.publisher.PublishCashPositionBecameStale(ctx, correlationID, actorID, snap)
+	}
 }
 
 type supersedeCashPositionRequest struct {
@@ -335,7 +353,7 @@ func (h *Handler) GetCashPositionAsOf(w http.ResponseWriter, r *http.Request) {
 }
 
 type sourceFreshnessResponse struct {
-	SnapshotID string                       `json:"snapshot_id"`
+	SnapshotID string                      `json:"snapshot_id"`
 	Components []domain.ComponentFreshness `json:"components"`
 }
 

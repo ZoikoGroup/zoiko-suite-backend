@@ -530,6 +530,18 @@ func (h *Handler) PollPaymentStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// SoD: the same actor who created this payment must not also be the
+	// one manually asserting it into a governed final state (SETTLED/
+	// REJECTED) — PollPaymentStatus is the de facto manual-settlement
+	// path, since there is no separate ConfirmSettlement command (see
+	// this handler's own doc comment). Intermediate progress reports
+	// (ACCEPTED/PENDING) are not a finality claim and remain unrestricted
+	// — same scoping as ResolveStatusConflict/RecordReturn, which only
+	// gate the commands that actually assert/change finality.
+	if domain.IsFinal(payload.ReportedStatus) && p.CreatedByPrincipalID != "" && p.CreatedByPrincipalID == principalID {
+		writeError(w, http.StatusForbidden, domain.ErrSelfResolutionForbidden.Error())
+		return
+	}
 	if !h.authorize(w, r, principalID, p.LegalEntityID, PaymentStatusIngest) {
 		return
 	}

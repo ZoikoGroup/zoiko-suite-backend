@@ -85,6 +85,70 @@ func TestBNK02_ConnectionLifecycle_CAS_Transitions(t *testing.T) {
 	}
 }
 
+// TestBNK02_ReconnectFromReconsentRequired_ForcesNewAuthorization proves
+// the fix: unlike DEGRADED/SUSPENDED (which recover straight to ACTIVE,
+// still proven by TestBNK02_ConnectionLifecycle_CAS_Transitions above),
+// reconnecting from RECONSENT_REQUIRED does NOT silently jump back to
+// ACTIVE — it re-enters AUTHORIZING and requires a real new
+// CompleteConnectionAuthorization + ActivateConnection to get there,
+// mirroring the initial connection flow rather than trusting stale
+// consent.
+func TestBNK02_ReconnectFromReconsentRequired_ForcesNewAuthorization(t *testing.T) {
+	admin := openAdminPool(t)
+	appPool := appRolePool(t, admin)
+	s := store.NewPgStore(appPool)
+
+	ctx := middleware.WithTenant(context.Background(), "tenant-bnk02-reconsent")
+
+	conn, _, err := s.InitiateConnection(ctx, domain.InitiateConnectionParams{
+		TenantID: "tenant-bnk02-reconsent", LegalEntityID: "le-reconsent", BankAccountID: "acct-reconsent", BankName: "Test Bank",
+		CreatedByPrincipalID: "auditor-1", CorrelationID: "corr-reconsent-1",
+	})
+	if err != nil {
+		t.Fatalf("initiate: %v", err)
+	}
+	if _, err := s.CompleteConnectionAuthorization(ctx, domain.CompleteConnectionAuthorizationParams{
+		ConnectionID: conn.ConnectionID, TenantID: "tenant-bnk02-reconsent", TokenLeaseRef: "lease-original",
+		GrantedScope: []string{"balances"}, ActorPrincipalID: "ops-1",
+	}); err != nil {
+		t.Fatalf("complete authorization: %v", err)
+	}
+	if _, err := s.ActivateConnection(ctx, domain.ActivateConnectionParams{ConnectionID: conn.ConnectionID, TenantID: "tenant-bnk02-reconsent", ActorPrincipalID: "ops-1"}); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	reconsent, err := s.TriggerReconsent(ctx, domain.TriggerReconsentParams{ConnectionID: conn.ConnectionID, TenantID: "tenant-bnk02-reconsent", ActorPrincipalID: "provider-webhook"})
+	if err != nil || reconsent.Status != domain.ConnStatusReconsentRequired {
+		t.Fatalf("trigger reconsent: status=%v err=%v", reconsent, err)
+	}
+
+	// The real proof: reconnecting from RECONSENT_REQUIRED lands in
+	// AUTHORIZING, not ACTIVE — old consent is never silently trusted again.
+	reconnected, err := s.ReconnectProvider(ctx, domain.ReconnectProviderParams{ConnectionID: conn.ConnectionID, TenantID: "tenant-bnk02-reconsent", ActorPrincipalID: "ops-1"})
+	if err != nil || reconnected.Status != domain.ConnStatusAuthorizing {
+		t.Fatalf("expected reconnect from RECONSENT_REQUIRED to land in AUTHORIZING, got status=%v err=%v", reconnected, err)
+	}
+
+	// Activating directly from here (without a real new authorization) must
+	// still be rejected — CanActivate only permits AUTHORIZING, and this
+	// proves ReconnectProvider didn't quietly skip the real step.
+	if _, err := s.ActivateConnection(ctx, domain.ActivateConnectionParams{ConnectionID: conn.ConnectionID, TenantID: "tenant-bnk02-reconsent", ActorPrincipalID: "ops-1"}); err == nil {
+		t.Fatal("expected ActivateConnection to require a fresh CompleteConnectionAuthorization first")
+	}
+
+	// The real new authorization completes the recovery.
+	if _, err := s.CompleteConnectionAuthorization(ctx, domain.CompleteConnectionAuthorizationParams{
+		ConnectionID: conn.ConnectionID, TenantID: "tenant-bnk02-reconsent", TokenLeaseRef: "lease-fresh",
+		GrantedScope: []string{"balances"}, ActorPrincipalID: "ops-1",
+	}); err != nil {
+		t.Fatalf("complete fresh authorization: %v", err)
+	}
+	active, err := s.ActivateConnection(ctx, domain.ActivateConnectionParams{ConnectionID: conn.ConnectionID, TenantID: "tenant-bnk02-reconsent", ActorPrincipalID: "ops-1"})
+	if err != nil || active.Status != domain.ConnStatusActive {
+		t.Fatalf("expected activation to succeed after a fresh authorization, got status=%v err=%v", active, err)
+	}
+}
+
 // TestBNK02_RevokedConnection_IsTerminal is the real, negative-controlled
 // proof of the spec's own named negative path "revoked bank consent
 // still used": REVOKED cannot be reversed by any command, and a raw
