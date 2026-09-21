@@ -38,6 +38,11 @@ type Store interface {
 	MarkTransferLedgerPosted(ctx context.Context, tenantID, transferID, sourceJournalID string) (*domain.TreasuryTransfer, error)
 	MarkTransferIntercompanyPaired(ctx context.Context, tenantID, transferID, intercompanyEntryID string) (*domain.TreasuryTransfer, error)
 	MarkTransferCompleted(ctx context.Context, tenantID, transferID string) (*domain.TreasuryTransfer, error)
+	AmendTreasuryTransfer(ctx context.Context, p domain.AmendTreasuryTransferParams) (*domain.TreasuryTransfer, error)
+	SubmitTransferForApproval(ctx context.Context, p domain.SubmitTransferForApprovalParams) (*domain.TreasuryTransfer, error)
+	CancelBeforeSubmission(ctx context.Context, p domain.CancelBeforeSubmissionParams) (*domain.TreasuryTransfer, error)
+	MarkTransferReturned(ctx context.Context, p domain.MarkTransferReturnedParams) (*domain.TreasuryTransfer, error)
+	ResolveTreasuryTransfer(ctx context.Context, p domain.ResolveTreasuryTransferParams) (*domain.TreasuryTransfer, error)
 
 	// BNK-10 — see internal/store/bnk10_store.go's own doc comments.
 	RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error)
@@ -73,6 +78,14 @@ type Publisher interface {
 	PublishBankAccountReactivated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
 	PublishBankAccountClosed(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
 	PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount)
+
+	// BNK-09 events for the new Wave 12 transitions — see this file's own
+	// package doc: BNK-09 published nothing at all before this. Only the
+	// two new commands' outcomes are wired here; retroactively covering
+	// Create/Approve/Reject/Submitted/Completed is a separate, deferred
+	// gap, not part of this wave.
+	PublishTreasuryTransferReturned(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
+	PublishTreasuryTransferCancelled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer)
 }
 
 // AuthZClient defines authorization plane contract.
@@ -112,6 +125,12 @@ const (
 	actionInitiateTransfer = "TREASURY_TRANSFER_INITIATE"
 	actionApproveTransfer  = "TREASURY_TRANSFER_APPROVE"
 	actionExecuteTransfer  = "TREASURY_TRANSFER_EXECUTE"
+	// actionModifyTransfer gates Amend/SubmitForApproval/CancelBeforeSubmission
+	// — the maker-only commands over a not-yet-approved transfer.
+	// actionResolveTransfer gates MarkTransferReturned/ResolveTreasuryTransfer
+	// — operator-facing, post-submission recovery actions.
+	actionModifyTransfer  = "TREASURY_TRANSFER_MODIFY"
+	actionResolveTransfer = "TREASURY_TRANSFER_RESOLVE"
 	actionViewPositions    = "TREASURY_POSITIONS_VIEW"
 )
 
@@ -153,6 +172,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/transfers/{transferID}/approve", h.ApproveTreasuryTransfer)
 		r.Post("/transfers/{transferID}/reject", h.RejectTreasuryTransfer)
 		r.Post("/transfers/{transferID}/execute", h.ExecuteTreasuryTransfer)
+		r.Post("/transfers/{transferID}/amend", h.AmendTreasuryTransfer)
+		r.Post("/transfers/{transferID}/submit-for-approval", h.SubmitTransferForApproval)
+		r.Post("/transfers/{transferID}/cancel", h.CancelBeforeSubmission)
+		r.Post("/transfers/{transferID}/mark-returned", h.MarkTransferReturned)
+		r.Post("/transfers/{transferID}/resolve", h.ResolveTreasuryTransfer)
 
 		// BNK-10 — see internal/handler/bnk10_handler.go.
 		r.Post("/fx/rates", h.RecordFXRate)

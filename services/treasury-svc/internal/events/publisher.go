@@ -153,6 +153,42 @@ func (p *Publisher) PublishBankAccountTokenRotated(ctx context.Context, correlat
 	p.emit(ctx, "bank_account.token_rotated", correlationID, acct.TenantID, acct.LegalEntityID, actorID, payload)
 }
 
+// treasuryTransferPayload is the shared field set for BNK-09's Wave 12
+// events — deliberately excludes protected_field_hash (internal only).
+func treasuryTransferPayload(t domain.TreasuryTransfer) map[string]any {
+	return map[string]any{
+		"transfer_id":            t.TransferID,
+		"source_bank_account_id": t.SourceBankAccountID,
+		"target_bank_account_id": t.TargetBankAccountID,
+		"amount":                 t.Amount,
+		"currency_code":          t.CurrencyCode,
+		"is_cross_entity":        t.IsCrossEntity,
+		"status":                 t.Status,
+		"maker_principal_id":     t.MakerPrincipalID,
+	}
+}
+
+// PublishTreasuryTransferReturned corresponds to the doc's own
+// TreasuryTransferReturned event — a bank return of an already-submitted
+// transfer.
+func (p *Publisher) PublishTreasuryTransferReturned(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	payload := treasuryTransferPayload(t)
+	payload["return_reason"] = t.ReturnReason
+	p.emit(ctx, "treasury_transfer.returned", correlationID, t.TenantID, "", actorID, payload)
+}
+
+// PublishTreasuryTransferCancelled has no literal counterpart in the
+// doc's own canonical event catalogue (Cancelled is a named state and
+// CancelBeforeSubmission a named command, but no TreasuryTransferCancelled
+// event is listed anywhere) — a real inconsistency in the spec, resolved
+// here by following this codebase's own established rule that every
+// state transition publishes something (see Wave 8's BNK-01 events).
+func (p *Publisher) PublishTreasuryTransferCancelled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	payload := treasuryTransferPayload(t)
+	payload["cancel_reason"] = t.CancelReason
+	p.emit(ctx, "treasury_transfer.cancelled", correlationID, t.TenantID, "", actorID, payload)
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

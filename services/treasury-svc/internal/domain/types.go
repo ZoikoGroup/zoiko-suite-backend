@@ -256,6 +256,9 @@ type InitiateTransferRequest struct {
 	Amount              float64 `json:"amount"`
 	CurrencyCode        string  `json:"currency_code"`
 	CorrelationID       string  `json:"correlation_id"`
+	// SaveAsDraft creates the transfer in DRAFT instead of the default
+	// PENDING_APPROVAL — see CreateTreasuryTransferParams.SaveAsDraft.
+	SaveAsDraft bool `json:"save_as_draft,omitempty"`
 }
 
 type errorString string

@@ -257,10 +257,14 @@ func (m *mockStore) CreateTreasuryTransfer(ctx context.Context, p domain.CreateT
 	if id == "transfer-" {
 		id = p.SourceBankAccountID + "->" + p.TargetBankAccountID
 	}
+	initialStatus := domain.TransferPendingApproval
+	if p.SaveAsDraft {
+		initialStatus = domain.TransferDraft
+	}
 	t := &domain.TreasuryTransfer{
 		TransferID: id, TenantID: p.TenantID, SourceBankAccountID: p.SourceBankAccountID, TargetBankAccountID: p.TargetBankAccountID,
 		Amount: p.Amount, CurrencyCode: p.CurrencyCode, CorrelationID: p.CorrelationID, IsCrossEntity: p.IsCrossEntity,
-		Status: domain.TransferPendingApproval, MakerPrincipalID: p.MakerPrincipalID,
+		Status: initialStatus, MakerPrincipalID: p.MakerPrincipalID,
 	}
 	m.transfers[id] = t
 	if p.CorrelationID != "" {
@@ -346,6 +350,92 @@ func (m *mockStore) MarkTransferCompleted(ctx context.Context, tenantID, transfe
 	return t, nil
 }
 
+func (m *mockStore) AmendTreasuryTransfer(ctx context.Context, p domain.AmendTreasuryTransferParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if t.MakerPrincipalID != p.ActorPrincipalID {
+		return nil, domain.ErrOnlyMakerMayModifyTransfer
+	}
+	if !domain.CanAmendTransfer(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.SourceBankAccountID = p.SourceBankAccountID
+	t.TargetBankAccountID = p.TargetBankAccountID
+	t.Amount = p.Amount
+	t.CurrencyCode = p.CurrencyCode
+	return t, nil
+}
+
+func (m *mockStore) SubmitTransferForApproval(ctx context.Context, p domain.SubmitTransferForApprovalParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if t.MakerPrincipalID != p.ActorPrincipalID {
+		return nil, domain.ErrOnlyMakerMayModifyTransfer
+	}
+	if !domain.CanSubmitTransferForApproval(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.Status = domain.TransferPendingApproval
+	return t, nil
+}
+
+func (m *mockStore) CancelBeforeSubmission(ctx context.Context, p domain.CancelBeforeSubmissionParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if t.MakerPrincipalID != p.ActorPrincipalID {
+		return nil, domain.ErrOnlyMakerMayModifyTransfer
+	}
+	if !domain.CanCancelBeforeSubmission(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.Status = domain.TransferCancelled
+	t.CancelReason = p.Reason
+	return t, nil
+}
+
+func (m *mockStore) MarkTransferReturned(ctx context.Context, p domain.MarkTransferReturnedParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if !domain.CanMarkTransferReturned(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	t.Status = domain.TransferReturned
+	t.ReturnReason = p.Reason
+	return t, nil
+}
+
+func (m *mockStore) ResolveTreasuryTransfer(ctx context.Context, p domain.ResolveTreasuryTransferParams) (*domain.TreasuryTransfer, error) {
+	t, ok := m.transfers[p.TransferID]
+	if !ok {
+		return nil, domain.ErrTransferNotFound
+	}
+	if !domain.CanResolveTransfer(t.Status) {
+		return nil, domain.ErrInvalidTransferTransition
+	}
+	switch p.Resolution {
+	case domain.ResolutionResubmit:
+		t.Status = domain.TransferPendingApproval
+		t.CheckerPrincipalID = ""
+		t.PaymentAttemptID = ""
+		t.SourceJournalID = ""
+		t.IntercompanyEntryID = ""
+	case domain.ResolutionCancel:
+		t.Status = domain.TransferCancelled
+	default:
+		return nil, domain.ErrInvalidResolution
+	}
+	t.ResolutionNote = p.Note
+	return t, nil
+}
+
 // ── BNK-10 ───────────────────────────────────────────────────────────────────
 
 func (m *mockStore) RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error) {
@@ -381,6 +471,9 @@ type mockPublisher struct {
 	bankAccountReactivated           []domain.BankAccount
 	bankAccountClosed                []domain.BankAccount
 	bankAccountTokenRotated          []domain.BankAccount
+
+	treasuryTransferReturned  []domain.TreasuryTransfer
+	treasuryTransferCancelled []domain.TreasuryTransfer
 }
 
 func (m *mockPublisher) PublishCashPositionUpdated(ctx context.Context, correlationID, legalEntityID, actorID string, balance domain.CashBalance) {
@@ -425,6 +518,14 @@ func (m *mockPublisher) PublishBankAccountClosed(ctx context.Context, correlatio
 
 func (m *mockPublisher) PublishBankAccountTokenRotated(ctx context.Context, correlationID, actorID string, acct domain.BankAccount) {
 	m.bankAccountTokenRotated = append(m.bankAccountTokenRotated, acct)
+}
+
+func (m *mockPublisher) PublishTreasuryTransferReturned(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	m.treasuryTransferReturned = append(m.treasuryTransferReturned, t)
+}
+
+func (m *mockPublisher) PublishTreasuryTransferCancelled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	m.treasuryTransferCancelled = append(m.treasuryTransferCancelled, t)
 }
 
 type mockAuthz struct {
@@ -944,6 +1045,191 @@ func TestHandler_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecon
 	}
 	if len(s.transfers) != 1 {
 		t.Fatalf("expected exactly 1 transfer to exist after a retried create, got %d", len(s.transfers))
+	}
+}
+
+// ── Wave 12: Amend/SubmitForApproval/Cancel/MarkReturned/Resolve ────────────
+
+func doTransferJSONRequest(t *testing.T, r http.Handler, method, path string, body any, principalID string) *httptest.ResponseRecorder {
+	t.Helper()
+	var buf bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&buf).Encode(body)
+	}
+	req := httptest.NewRequest(method, path, &buf)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", principalID)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	return rr
+}
+
+func newWave12Router(s *mockStore, p *mockPublisher) chi.Router {
+	h := handler.New(s, p, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+	return r
+}
+
+func TestHandler_AmendTreasuryTransfer_DraftOnly_OnlyMaker(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1", Amount: 100, CurrencyCode: "USD"}
+	r := newWave12Router(s, &mockPublisher{})
+
+	// A non-maker cannot amend.
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/amend",
+		domain.InitiateTransferRequest{SourceBankAccountID: "src", TargetBankAccountID: "tgt", Amount: 50, CurrencyCode: "USD"}, "not-the-maker")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 amending as a non-maker, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// The maker can amend while DRAFT.
+	rr = doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/amend",
+		domain.InitiateTransferRequest{SourceBankAccountID: "src", TargetBankAccountID: "tgt", Amount: 50, CurrencyCode: "USD"}, "maker-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 amending as the maker, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var updated domain.TreasuryTransfer
+	_ = json.Unmarshal(rr.Body.Bytes(), &updated)
+	if updated.Amount != 50 {
+		t.Fatalf("expected the amended amount to persist, got %v", updated.Amount)
+	}
+}
+
+func TestHandler_SubmitTransferForApproval_MovesDraftToPendingApproval(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferDraft, MakerPrincipalID: "maker-1"}
+	r := newWave12Router(s, &mockPublisher{})
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/submit-for-approval", nil, "maker-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var updated domain.TreasuryTransfer
+	_ = json.Unmarshal(rr.Body.Bytes(), &updated)
+	if updated.Status != domain.TransferPendingApproval {
+		t.Fatalf("expected PENDING_APPROVAL, got %s", updated.Status)
+	}
+}
+
+func TestHandler_CancelBeforeSubmission_PublishesCancelledEvent(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferPendingApproval, MakerPrincipalID: "maker-1"}
+	p := &mockPublisher{}
+	r := newWave12Router(s, p)
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/cancel", map[string]string{"reason": "no longer needed"}, "maker-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var updated domain.TreasuryTransfer
+	_ = json.Unmarshal(rr.Body.Bytes(), &updated)
+	if updated.Status != domain.TransferCancelled {
+		t.Fatalf("expected CANCELLED, got %s", updated.Status)
+	}
+	if len(p.treasuryTransferCancelled) != 1 {
+		t.Fatalf("expected PublishTreasuryTransferCancelled to be called once, got %d", len(p.treasuryTransferCancelled))
+	}
+}
+
+// TestHandler_CancelBeforeSubmission_AfterSubmission_Rejected is the
+// negative control: once the bank has seen the transfer, cancellation is
+// refused — CancelBeforeSubmission means before.
+func TestHandler_CancelBeforeSubmission_AfterSubmission_Rejected(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
+	r := newWave12Router(s, &mockPublisher{})
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/cancel", map[string]string{"reason": "too late"}, "maker-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 cancelling a SUBMITTED transfer, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandler_MarkTransferReturned_PublishesReturnedEvent(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
+	p := &mockPublisher{}
+	r := newWave12Router(s, p)
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/mark-returned", map[string]string{"reason": "destination account closed"}, "ops-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var updated domain.TreasuryTransfer
+	_ = json.Unmarshal(rr.Body.Bytes(), &updated)
+	if updated.Status != domain.TransferReturned {
+		t.Fatalf("expected RETURNED, got %s", updated.Status)
+	}
+	if len(p.treasuryTransferReturned) != 1 {
+		t.Fatalf("expected PublishTreasuryTransferReturned to be called once, got %d", len(p.treasuryTransferReturned))
+	}
+}
+
+func TestHandler_MarkTransferReturned_MissingReason_Returns400(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferSubmitted, MakerPrincipalID: "maker-1"}
+	r := newWave12Router(s, &mockPublisher{})
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/mark-returned", map[string]string{}, "ops-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with no reason, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestHandler_ResolveTreasuryTransfer_Resubmit(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{
+		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1",
+		CheckerPrincipalID: "checker-1", PaymentAttemptID: "attempt-1",
+	}
+	r := newWave12Router(s, &mockPublisher{})
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
+		map[string]string{"resolution": "RESUBMIT", "note": "corrected, resubmitting"}, "ops-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var updated domain.TreasuryTransfer
+	_ = json.Unmarshal(rr.Body.Bytes(), &updated)
+	if updated.Status != domain.TransferPendingApproval {
+		t.Fatalf("expected PENDING_APPROVAL, got %s", updated.Status)
+	}
+	if updated.CheckerPrincipalID != "" || updated.PaymentAttemptID != "" {
+		t.Fatalf("expected the prior checker/attempt to be cleared on resubmit, got %+v", updated)
+	}
+}
+
+func TestHandler_ResolveTreasuryTransfer_Cancel_PublishesCancelledEvent(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"}
+	p := &mockPublisher{}
+	r := newWave12Router(s, p)
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
+		map[string]string{"resolution": "CANCEL", "note": "abandoned"}, "ops-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var updated domain.TreasuryTransfer
+	_ = json.Unmarshal(rr.Body.Bytes(), &updated)
+	if updated.Status != domain.TransferCancelled {
+		t.Fatalf("expected CANCELLED, got %s", updated.Status)
+	}
+	if len(p.treasuryTransferCancelled) != 1 {
+		t.Fatalf("expected PublishTreasuryTransferCancelled to be called once, got %d", len(p.treasuryTransferCancelled))
+	}
+}
+
+func TestHandler_ResolveTreasuryTransfer_InvalidResolution_Returns400(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferReturned, MakerPrincipalID: "maker-1"}
+	r := newWave12Router(s, &mockPublisher{})
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/resolve",
+		map[string]string{"resolution": "BOGUS", "note": "x"}, "ops-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an invalid resolution, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 
