@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/bank-reconciliation-svc/internal/banking"
+	"zoiko.io/bank-reconciliation-svc/internal/close"
 	"zoiko.io/bank-reconciliation-svc/internal/domain"
 	"zoiko.io/bank-reconciliation-svc/internal/ledger"
 	svcmiddleware "zoiko.io/bank-reconciliation-svc/internal/middleware"
@@ -102,16 +103,17 @@ const (
 const maxBodyBytes = 64 << 10
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	ledger    ledger.Client
-	banking   banking.Client
-	log       *zap.Logger
+	store       Store
+	publisher   Publisher
+	authz       AuthZClient
+	ledger      ledger.Client
+	banking     banking.Client
+	closeClient close.Client
+	log         *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, ledgerClient ledger.Client, bankingClient banking.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, publisher: publisher, authz: authz, ledger: ledgerClient, banking: bankingClient, log: log}
+func New(store Store, publisher Publisher, authz AuthZClient, ledgerClient ledger.Client, bankingClient banking.Client, closeClient close.Client, log *zap.Logger) *Handler {
+	return &Handler{store: store, publisher: publisher, authz: authz, ledger: ledgerClient, banking: bankingClient, closeClient: closeClient, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {

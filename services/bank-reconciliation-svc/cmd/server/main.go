@@ -32,6 +32,7 @@ import (
 
 	"zoiko.io/bank-reconciliation-svc/internal/authz"
 	"zoiko.io/bank-reconciliation-svc/internal/banking"
+	"zoiko.io/bank-reconciliation-svc/internal/close"
 	"zoiko.io/bank-reconciliation-svc/internal/config"
 	svcenvelope "zoiko.io/bank-reconciliation-svc/internal/envelope"
 	"zoiko.io/bank-reconciliation-svc/internal/events"
@@ -177,6 +178,7 @@ func main() {
 	ledgerClient := ledger.NewHTTPClient(cfg.LedgerServiceURL)
 
 	bankingClient := banking.NewHTTPClient(cfg.BankingConnectorURL)
+	closeClient := close.NewHTTPClient(cfg.CloseServiceURL, log)
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -200,7 +202,7 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, ledgerClient, bankingClient, log)
+	h := handler.New(pgStore, publisher, authzClient, ledgerClient, bankingClient, closeClient, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────

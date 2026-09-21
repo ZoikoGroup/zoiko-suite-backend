@@ -71,6 +71,7 @@ func TestMain(m *testing.M) {
 		"000001_initial_schema.up.sql",
 		"000002_immutability.up.sql",
 		"000003_add_rls.up.sql",
+		"000004_add_authorization_verification.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {
@@ -139,6 +140,51 @@ func TestPgStore_PreparedAttempt_AuthorizedFieldsAreImmutable(t *testing.T) {
 		t.Fatalf("re-enable trigger: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE payment_initiation_attempts SET amount = 1 WHERE attempt_id = $1`, attempt.AttemptID); err == nil {
+		t.Fatal("expected re-enabling the trigger to restore the refusal")
+	}
+}
+
+// TestPgStore_PreparedAttempt_AuthorizationFieldsPersistAndAreImmutable
+// proves Wave 11a's new authorization_id/authorization_source columns
+// round-trip through PrepareAttempt correctly and are covered by the same
+// protected-field trigger as amount/payee_ref — a caller cannot swap in a
+// different authorization_id after the fact to make a stale fingerprint
+// verification look current.
+func TestPgStore_PreparedAttempt_AuthorizationFieldsPersistAndAreImmutable(t *testing.T) {
+	tenantID := uuid.New().String()
+	ctx := middleware.WithTenant(context.Background(), tenantID)
+
+	attempt, err := testStore.PrepareAttempt(ctx, tenantID, domain.PrepareAttemptRequest{
+		LegalEntityID: uuid.New().String(), PayerAccountRef: "acct-src", PayeeRef: "acct-dst",
+		Amount: 250.00, Currency: "USD", ExecutionDate: time.Now(), PayerAccountVerified: true,
+		IdempotencyKey: "corr-auth-fields-1",
+		AuthorizationFingerprint: "sha256:real-fingerprint", AuthorizationID: "auth-real-1",
+		AuthorizationSource: domain.AuthorizationSourcePaymentAuthorization,
+	}, "maker-1")
+	if err != nil {
+		t.Fatalf("PrepareAttempt: %v", err)
+	}
+	if attempt.AuthorizationID != "auth-real-1" || attempt.AuthorizationSource != domain.AuthorizationSourcePaymentAuthorization {
+		t.Fatalf("expected authorization_id/authorization_source to round-trip, got %+v", attempt)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE payment_initiation_attempts SET authorization_id = 'auth-swapped' WHERE attempt_id = $1`, attempt.AttemptID); err == nil {
+		t.Fatal("expected the trigger to refuse changing authorization_id on a PREPARED attempt")
+	}
+
+	// Negative control: disable the trigger, confirm the same UPDATE now
+	// succeeds (proving the trigger — not something else — was refusing
+	// it), then re-enable and confirm refusal returns.
+	if _, err := testPool.Exec(ctx, `ALTER TABLE payment_initiation_attempts DISABLE TRIGGER trg_reject_attempt_mutation`); err != nil {
+		t.Fatalf("disable trigger: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE payment_initiation_attempts SET authorization_id = 'auth-swapped' WHERE attempt_id = $1`, attempt.AttemptID); err != nil {
+		t.Fatalf("expected the UPDATE to succeed with the trigger disabled, proving it was the real mechanism: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `ALTER TABLE payment_initiation_attempts ENABLE TRIGGER trg_reject_attempt_mutation`); err != nil {
+		t.Fatalf("re-enable trigger: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE payment_initiation_attempts SET authorization_id = 'auth-real-1' WHERE attempt_id = $1`, attempt.AttemptID); err == nil {
 		t.Fatal("expected re-enabling the trigger to restore the refusal")
 	}
 }

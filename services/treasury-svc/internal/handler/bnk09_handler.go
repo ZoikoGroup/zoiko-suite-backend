@@ -30,6 +30,10 @@ func (h *Handler) writeTransferErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "dependency_unavailable", err.Error())
 	case errors.Is(err, domain.ErrPaymentRejected):
 		writeError(w, http.StatusUnprocessableEntity, "payment_rejected", err.Error())
+	case errors.Is(err, domain.ErrOnlyMakerMayModifyTransfer):
+		writeError(w, http.StatusForbidden, "only_maker_may_modify", err.Error())
+	case errors.Is(err, domain.ErrInvalidResolution):
+		writeError(w, http.StatusBadRequest, "invalid_resolution", err.Error())
 	default:
 		h.log.Error("treasury transfer operation failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, "transfer_operation_failed", err.Error())
@@ -140,7 +144,7 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 	transfer, created, err := h.store.CreateTreasuryTransfer(r.Context(), domain.CreateTreasuryTransferParams{
 		TenantID: srcAcct.TenantID, SourceBankAccountID: req.SourceBankAccountID, TargetBankAccountID: req.TargetBankAccountID,
 		Amount: req.Amount, CurrencyCode: req.CurrencyCode, IsCrossEntity: isCrossEntity,
-		CorrelationID: correlationID, MakerPrincipalID: principalID,
+		CorrelationID: correlationID, MakerPrincipalID: principalID, SaveAsDraft: req.SaveAsDraft,
 	})
 	if err != nil {
 		h.writeTransferErr(w, err)
@@ -162,6 +166,31 @@ func (h *Handler) GetTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, transfer)
+}
+
+// GetTreasuryTransferFingerprint handles
+// GET /v1/treasury/transfers/{transferID}/fingerprint — Wave 11b's
+// service-to-service read payment-initiation-adapter-svc calls to
+// independently re-derive and compare domain.TransferFingerprint,
+// instead of trusting the fingerprint SubmitTreasuryPayment sent it.
+// Same no-extra-authz-gate posture as GetTreasuryTransfer above: tenant
+// isolation is enforced by RLS via the request's tenant context, not a
+// principal-level permission check, since this is a narrow read of
+// exactly what the caller already has (the transfer ID) plus its own
+// live status/fingerprint.
+func (h *Handler) GetTreasuryTransferFingerprint(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"transfer_id": transfer.TransferID,
+		"status":      transfer.Status,
+		"fingerprint": domain.TransferFingerprint(transfer),
+	})
 }
 
 // ApproveTreasuryTransfer handles POST /v1/treasury/transfers/{id}/approve
@@ -263,8 +292,14 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	}
 
 	if transfer.Status == domain.TransferApproved {
+		// Wave 11b: computed from the transfer's live APPROVED state
+		// (still the status at this point — MarkTransferSubmitted hasn't
+		// run yet), so it matches what GetTreasuryTransferFingerprint
+		// will independently re-derive when payment-initiation-adapter-svc
+		// verifies it.
+		fingerprint := domain.TransferFingerprint(transfer)
 		attemptID, err := h.transferClients.SubmitTreasuryPayment(r.Context(), tenantID, principalID, correlationID,
-			srcAcct.LegalEntityID, transfer.TransferID, transfer.SourceBankAccountID, transfer.TargetBankAccountID, transfer.Amount, transfer.CurrencyCode)
+			srcAcct.LegalEntityID, transfer.TransferID, transfer.SourceBankAccountID, transfer.TargetBankAccountID, fingerprint, transfer.Amount, transfer.CurrencyCode)
 		if err != nil {
 			h.writeTransferErr(w, err)
 			return
@@ -328,4 +363,195 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	}
 
 	writeJSON(w, http.StatusOK, transfer)
+}
+
+// AmendTreasuryTransfer handles POST /v1/treasury/transfers/{id}/amend —
+// the maker's own DRAFT-only correction path. Reuses
+// InitiateTransferRequest's shape (source/target account, amount,
+// currency) since it's the same protected-field set CreateTreasuryTransfer
+// itself accepts.
+func (h *Handler) AmendTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	var req domain.InitiateTransferRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if req.Amount <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid_amount", string(domain.ErrInvalidAmount))
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionModifyTransfer); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.AmendTreasuryTransfer(r.Context(), domain.AmendTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transferID, SourceBankAccountID: req.SourceBankAccountID,
+		TargetBankAccountID: req.TargetBankAccountID, Amount: req.Amount, CurrencyCode: req.CurrencyCode,
+		ActorPrincipalID: principalID,
+	})
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// SubmitTransferForApproval handles
+// POST /v1/treasury/transfers/{id}/submit-for-approval — the maker's own
+// DRAFT->PENDING_APPROVAL command. Distinct from ExecuteTreasuryTransfer's
+// internal MarkTransferSubmitted (BNK-06 accepting the payment attempt,
+// much later in the lifecycle) despite the similar name — the doc itself
+// names both SubmitTransfer and the Submitted/Pending state as distinct
+// concepts from CreateTreasuryTransfer/ApproveTreasuryTransfer.
+func (h *Handler) SubmitTransferForApproval(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionModifyTransfer); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.SubmitTransferForApproval(r.Context(), domain.SubmitTransferForApprovalParams{
+		TenantID: tenantID, TransferID: transferID, ActorPrincipalID: principalID,
+	})
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// CancelBeforeSubmission handles POST /v1/treasury/transfers/{id}/cancel —
+// the doc's own command name. Only the maker may cancel their own
+// transfer, and only before the bank has ever seen it.
+func (h *Handler) CancelBeforeSubmission(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionModifyTransfer); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.CancelBeforeSubmission(r.Context(), domain.CancelBeforeSubmissionParams{
+		TenantID: tenantID, TransferID: transferID, Reason: req.Reason, ActorPrincipalID: principalID,
+	})
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	h.publisher.PublishTreasuryTransferCancelled(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// MarkTransferReturned handles
+// POST /v1/treasury/transfers/{id}/mark-returned — an operator action (not
+// maker-restricted) recording that the bank returned an already-submitted
+// transfer unexecuted. This is the real trigger for the doc's
+// TreasuryTransferReturned event; nothing in this codebase polls for
+// returns automatically yet, so this is the explicit, evidenced entry
+// point until such a consumer exists.
+func (h *Handler) MarkTransferReturned(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "reason is required")
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionResolveTransfer); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.MarkTransferReturned(r.Context(), domain.MarkTransferReturnedParams{
+		TenantID: tenantID, TransferID: transferID, Reason: req.Reason, ActorPrincipalID: principalID,
+	})
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	h.publisher.PublishTreasuryTransferReturned(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ResolveTreasuryTransfer handles
+// POST /v1/treasury/transfers/{id}/resolve — the doc's own command name.
+// resolution is "RESUBMIT" (back to PENDING_APPROVAL for a fresh
+// maker-checker cycle) or "CANCEL" (terminal).
+func (h *Handler) ResolveTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	var req struct {
+		Resolution string `json:"resolution"`
+		Note       string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionResolveTransfer); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.ResolveTreasuryTransfer(r.Context(), domain.ResolveTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transferID, Resolution: req.Resolution, Note: req.Note, ActorPrincipalID: principalID,
+	})
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	if updated.Status == domain.TransferCancelled {
+		h.publisher.PublishTreasuryTransferCancelled(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
+	}
+	writeJSON(w, http.StatusOK, updated)
 }

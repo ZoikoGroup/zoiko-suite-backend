@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -91,6 +92,39 @@ func (s *PgStore) ListOwnershipEvidence(ctx context.Context, tenantID, bankAccou
 	return out, nil
 }
 
+// GetBankAccountAsOf returns the account's mutable-field values as they
+// stood at asOf — the history row whose effective_at is the latest one
+// not after asOf. Falls back to the live bank_accounts row when asOf is
+// now-or-later, since the most recent history row and the live row are
+// the same snapshot by construction (recordAccountHistory runs in the
+// same transaction as every mutation). Returns (nil, nil) if the account
+// doesn't exist, or existed but not yet as of asOf (a genuinely later
+// creation), mirroring GetBankAccount's own not-found convention.
+func (s *PgStore) GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountID string, asOf time.Time) (*domain.AccountHistoryEntry, error) {
+	var e domain.AccountHistoryEntry
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		row := tx.QueryRow(ctx, `
+			SELECT history_id, bank_account_id, tenant_id, account_name, masked_account_number, bank_identifier,
+			       account_status, branch_ref, country, account_type, requested_operational_use, token_version,
+			       changed_by_principal_id, effective_at, superseded_by
+			FROM bank_account_history
+			WHERE bank_account_id = $1 AND tenant_id = $2 AND effective_at <= $3
+			ORDER BY effective_at DESC
+			LIMIT 1`,
+			bankAccountID, tenantID, asOf)
+		return row.Scan(&e.HistoryID, &e.BankAccountID, &e.TenantID, &e.AccountName, &e.MaskedAccountNumber, &e.BankIdentifier,
+			&e.AccountStatus, &e.BranchRef, &e.Country, &e.AccountType, &e.RequestedOperationalUse, &e.TokenVersion,
+			&e.ChangedByPrincipalID, &e.EffectiveAt, &e.SupersededBy)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return &e, nil
+}
+
 // IsOwnershipVerified is the derived fact BNK-06/BNK-09 (or any future
 // caller) should check before treating an account as usable for
 // protected outbound use — the doc's own negative path "unverified
@@ -118,7 +152,10 @@ func (s *PgStore) AmendBankAccountMetadata(ctx context.Context, p domain.AmendBa
 			RETURNING `+bankAccountColumns,
 			p.BankAccountID, p.TenantID, p.AccountName, p.BranchRef, p.BankIdentifier, p.Country, p.AccountType,
 		)
-		return scanBankAccount(row, &acct)
+		if err := scanBankAccount(row, &acct); err != nil {
+			return err
+		}
+		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -138,7 +175,10 @@ func (s *PgStore) ChangeOperationalUse(ctx context.Context, p domain.ChangeOpera
 			RETURNING `+bankAccountColumns,
 			p.BankAccountID, p.TenantID, p.RequestedOperationalUse,
 		)
-		return scanBankAccount(row, &acct)
+		if err := scanBankAccount(row, &acct); err != nil {
+			return err
+		}
+		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -158,7 +198,10 @@ func (s *PgStore) SuspendBankAccount(ctx context.Context, p domain.SuspendAccoun
 			RETURNING `+bankAccountColumns,
 			p.BankAccountID, p.TenantID, p.Reason,
 		)
-		return scanBankAccount(row, &acct)
+		if err := scanBankAccount(row, &acct); err != nil {
+			return err
+		}
+		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -178,7 +221,10 @@ func (s *PgStore) ReactivateBankAccount(ctx context.Context, p domain.Reactivate
 			RETURNING `+bankAccountColumns,
 			p.BankAccountID, p.TenantID,
 		)
-		return scanBankAccount(row, &acct)
+		if err := scanBankAccount(row, &acct); err != nil {
+			return err
+		}
+		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -198,7 +244,10 @@ func (s *PgStore) CloseBankAccount(ctx context.Context, p domain.CloseAccountPar
 			RETURNING `+bankAccountColumns,
 			p.BankAccountID, p.TenantID, p.Reason,
 		)
-		return scanBankAccount(row, &acct)
+		if err := scanBankAccount(row, &acct); err != nil {
+			return err
+		}
+		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -224,7 +273,10 @@ func (s *PgStore) RotateAccountIdentifierToken(ctx context.Context, p domain.Rot
 			RETURNING `+bankAccountColumns,
 			p.BankAccountID, p.TenantID, p.NewMaskedAccountNumber, p.NewBankIdentifier,
 		)
-		return scanBankAccount(row, &acct)
+		if err := scanBankAccount(row, &acct); err != nil {
+			return err
+		}
+		return s.recordAccountHistory(ctx, tx, &acct, p.ActorPrincipalID)
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, s.notFoundOrInvalidErr(ctx, p.BankAccountID)
@@ -233,6 +285,34 @@ func (s *PgStore) RotateAccountIdentifierToken(ctx context.Context, p domain.Rot
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return &acct, nil
+}
+
+// recordAccountHistory inserts a new append-only snapshot of acct's
+// current mutable fields and supersedes whatever history row previously
+// stood for this account — the same insert-then-supersede pattern
+// VerifyBankAccountOwnership already uses for ownership evidence. Called
+// in the same transaction as the UPDATE that produced acct, by every
+// BNK-01 command that can change a versioned field.
+func (s *PgStore) recordAccountHistory(ctx context.Context, tx pgx.Tx, acct *domain.BankAccount, actorPrincipalID string) error {
+	var historyID string
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO bank_account_history (
+			history_id, bank_account_id, tenant_id, account_name, masked_account_number, bank_identifier,
+			account_status, branch_ref, country, account_type, requested_operational_use, token_version,
+			changed_by_principal_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		RETURNING history_id`,
+		uuid.New().String(), acct.BankAccountID, acct.TenantID, acct.AccountName, acct.MaskedAccountNumber, acct.BankIdentifier,
+		acct.AccountStatus, acct.BranchRef, acct.Country, acct.AccountType, acct.RequestedOperationalUse, acct.TokenVersion,
+		actorPrincipalID,
+	).Scan(&historyID); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		UPDATE bank_account_history SET superseded_by = $1
+		WHERE bank_account_id = $2 AND history_id <> $1 AND superseded_by IS NULL`,
+		historyID, acct.BankAccountID)
+	return err
 }
 
 // notFoundOrInvalidErr mirrors notFoundOrInvalid but returns the actual

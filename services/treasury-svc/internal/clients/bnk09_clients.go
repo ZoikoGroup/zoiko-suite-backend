@@ -46,6 +46,14 @@ type prepareAttemptRequest struct {
 	LegalEntityID            string
 	SourceReference          string
 	AuthorizationFingerprint string
+	// AuthorizationID/AuthorizationSource (Wave 11b): identify this as a
+	// BNK-09-originated fingerprint so payment-initiation-adapter-svc's
+	// PrepareAttempt re-fetches and compares it against treasury-svc's
+	// own GetTreasuryTransferFingerprint, instead of the AuthorizationSourcePaymentAuthorization
+	// path (which would look for it in payment-authorization-svc) or
+	// leaving it unverified.
+	AuthorizationID          string
+	AuthorizationSource      string
 	PayerAccountRef          string
 	PayeeRef                 string
 	Amount                   float64
@@ -55,6 +63,13 @@ type prepareAttemptRequest struct {
 	PayerAccountVerified     bool
 	IdempotencyKey           string
 }
+
+// authorizationSourceTreasury must match payment-initiation-adapter-svc's
+// domain.AuthorizationSourceTreasury exactly — the two services aren't
+// sharing a Go package, so this is reproduced as a literal rather than an
+// import, same posture as this file's own comment on prepareAttemptRequest's
+// field names having no json tags to keep in sync by hand.
+const authorizationSourceTreasury = "TREASURY_SVC"
 
 type paymentInitiationAttempt struct {
 	AttemptID       string
@@ -69,9 +84,10 @@ type paymentInitiationAttempt struct {
 // AttemptID once the attempt is durably SUBMITTED, or a sentinel error —
 // PENDING_UNKNOWN and REJECTED_BEFORE_SUBMISSION are both surfaced as
 // errors, since neither is a safe state for the caller to treat as done.
-func (c *TransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef string, amount float64, currency string) (string, error) {
+func (c *TransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount float64, currency string) (string, error) {
 	body, err := json.Marshal(prepareAttemptRequest{
 		LegalEntityID: legalEntityID, SourceReference: "treasury-transfer:" + transferID,
+		AuthorizationFingerprint: fingerprint, AuthorizationID: transferID, AuthorizationSource: authorizationSourceTreasury,
 		PayerAccountRef: payerAccountRef, PayeeRef: payeeRef, Amount: amount, Currency: currency,
 		ExecutionDate: time.Now().UTC(), PaymentReference: "Treasury transfer " + transferID,
 		PayerAccountVerified: true, IdempotencyKey: transferID,

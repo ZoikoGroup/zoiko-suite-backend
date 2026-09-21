@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -17,9 +18,10 @@ import (
 )
 
 const (
-	actionVerifyOwnership = "BANK_ACCOUNT_VERIFY"
-	actionAmendAccount    = "BANK_ACCOUNT_MANAGE"
-	actionCloseAccount    = "BANK_ACCOUNT_CLOSE"
+	actionVerifyOwnership   = "BANK_ACCOUNT_VERIFY"
+	actionAmendAccount      = "BANK_ACCOUNT_MANAGE"
+	actionCloseAccount      = "BANK_ACCOUNT_CLOSE"
+	actionViewAccountMasked = "BANK_ACCOUNT_VIEW_MASKED"
 )
 
 func (h *Handler) fetchAccountForAuth(w http.ResponseWriter, r *http.Request, accountID string) (*domain.BankAccount, bool) {
@@ -130,6 +132,179 @@ func (h *Handler) GetBankAccountByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, bankAccountDetailResponse{BankAccount: *acct, IsOwnershipVerified: verified})
+}
+
+// GetBankAccountAsOf handles GET /v1/treasury/accounts/{accountID}/as-of
+// — the historical-reconstruction read Invariant #1 requires ("bank
+// account legal-entity ownership and operational status are ...
+// historically reconstructable"). Query param at is an RFC3339
+// timestamp; defaults to now if omitted (equivalent to the live row).
+func (h *Handler) GetBankAccountAsOf(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	accountID := chi.URLParam(r, "accountID")
+	acct, ok := h.fetchAccountForAuth(w, r, accountID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, acct.LegalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	asOf := time.Now().UTC()
+	if raw := r.URL.Query().Get("at"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_field", "at must be an RFC3339 timestamp")
+			return
+		}
+		asOf = parsed
+	}
+	entry, err := h.store.GetBankAccountAsOf(r.Context(), acct.TenantID, accountID, asOf)
+	if err != nil {
+		h.log.Error("GetBankAccountAsOf: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_error", err.Error())
+		return
+	}
+	if entry == nil {
+		writeError(w, http.StatusNotFound, "no_history_as_of", "the account had no recorded state as of the given time")
+		return
+	}
+	writeJSON(w, http.StatusOK, entry)
+}
+
+// bankAccountMaskedResponse is BNK-01's safe-default read (Invariant #2:
+// "raw values never appear in ordinary logs, list APIs, search indexes or
+// analytics"). Every identifier this service ever stores is already
+// masked/tokenized at write time (RegisterBankAccountRequest only ever
+// accepts MaskedAccountNumber, never a raw one) — there is no further
+// un-masking to strip. What this response DOES omit, deliberately, versus
+// the full GetBankAccountByID read: bank_identifier (routing/institution
+// reference), created_by_principal_id, correlation_id and token_version —
+// fields that identify who/how the account was set up or rotated, not
+// needed by a caller that only wants to know the account exists and is
+// usable.
+type bankAccountMaskedResponse struct {
+	BankAccountID       string `json:"bank_account_id"`
+	LegalEntityID       string `json:"legal_entity_id"`
+	AccountName         string `json:"account_name"`
+	MaskedAccountNumber string `json:"masked_account_number"`
+	CurrencyCode        string `json:"currency_code"`
+	AccountStatus       string `json:"account_status"`
+}
+
+// GetBankAccountMasked handles GET /v1/treasury/accounts/{accountID}/masked
+// — a distinct, lower-privilege read path from GetBankAccountByID
+// (actionViewAccountMasked, not actionViewPositions), so a caller that
+// only needs to confirm an account's identity/status doesn't need the
+// broader positions-view permission. GetBankAccountByID's own
+// authorization requirement is left unchanged here — tightening it to a
+// stricter "sensitive read" permission is a separate policy decision, not
+// made by this additive change.
+func (h *Handler) GetBankAccountMasked(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	accountID := chi.URLParam(r, "accountID")
+	acct, ok := h.fetchAccountForAuth(w, r, accountID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, acct.LegalEntityID, actionViewAccountMasked); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, bankAccountMaskedResponse{
+		BankAccountID: acct.BankAccountID, LegalEntityID: acct.LegalEntityID, AccountName: acct.AccountName,
+		MaskedAccountNumber: acct.MaskedAccountNumber, CurrencyCode: acct.CurrencyCode, AccountStatus: acct.AccountStatus,
+	})
+}
+
+// availableActionsResponse names which of this account's own existing
+// transition guards (CanAmendMetadata etc., domain/types.go) currently
+// evaluate true for its status — a direct, mechanical read of guards that
+// already exist, not new business logic. The doc lists GetAvailableActions
+// as a query with no elaborating prose anywhere; this is the only
+// non-invented interpretation available.
+type availableActionsResponse struct {
+	BankAccountID string   `json:"bank_account_id"`
+	AccountStatus string   `json:"account_status"`
+	Actions       []string `json:"available_actions"`
+}
+
+func (h *Handler) GetAvailableActions(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	accountID := chi.URLParam(r, "accountID")
+	acct, ok := h.fetchAccountForAuth(w, r, accountID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, acct.LegalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	actions := []string{}
+	if domain.CanAmendMetadata(acct.AccountStatus) {
+		actions = append(actions, "amend-metadata")
+	}
+	if domain.CanChangeOperationalUse(acct.AccountStatus) {
+		actions = append(actions, "change-operational-use")
+	}
+	if domain.CanSuspendAccount(acct.AccountStatus) {
+		actions = append(actions, "suspend")
+	}
+	if domain.CanReactivateAccount(acct.AccountStatus) {
+		actions = append(actions, "reactivate")
+	}
+	if domain.CanCloseAccount(acct.AccountStatus) {
+		actions = append(actions, "close")
+	}
+	if domain.CanRotateAccountToken(acct.AccountStatus) {
+		actions = append(actions, "rotate-token")
+	}
+	writeJSON(w, http.StatusOK, availableActionsResponse{BankAccountID: acct.BankAccountID, AccountStatus: acct.AccountStatus, Actions: actions})
+}
+
+// ListConnectionOptions handles GET
+// /v1/treasury/accounts/{accountID}/connection-options — a thin, fail-
+// closed read against banking-connector-svc's real BNK-02 connection
+// records for this account. This service never owns connection data; see
+// internal/clients/banking.go's own doc comment on why the route lives
+// here rather than on banking-connector-svc despite that.
+func (h *Handler) ListConnectionOptions(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	accountID := chi.URLParam(r, "accountID")
+	acct, ok := h.fetchAccountForAuth(w, r, accountID)
+	if !ok {
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, acct.LegalEntityID, actionViewPositions); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	if h.banking == nil {
+		writeError(w, http.StatusServiceUnavailable, "banking_connector_not_configured", "banking-connector-svc integration is not configured")
+		return
+	}
+	options, err := h.banking.ListConnectionOptions(r.Context(), acct.TenantID, acct.LegalEntityID, accountID, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.log.Error("ListConnectionOptions: banking-connector-svc unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "banking_connector_unavailable", err.Error())
+		return
+	}
+	if options == nil {
+		options = []domain.ConnectionOption{}
+	}
+	writeJSON(w, http.StatusOK, options)
 }
 
 func (h *Handler) GetOwnershipEvidence(w http.ResponseWriter, r *http.Request) {

@@ -194,6 +194,272 @@ func TestPgStore_TreasuryTransfer_SameEntitySkipsIntercompanySteps(t *testing.T)
 	}
 }
 
+// TestPgStore_TreasuryTransfer_DraftLifecycle_FullWalk is the real,
+// end-to-end proof of Wave 12: Draft -> amend -> submit-for-approval ->
+// approve -> attempt-to-cancel-after-submission (rejected) -> resolve
+// path never reached because it's not RETURNED. Also proves a DRAFT-stage
+// cancel IS allowed (the positive control for CanCancelBeforeSubmission),
+// and that amending after leaving DRAFT is rejected (the negative
+// control for CanAmendTransfer).
+func TestPgStore_TreasuryTransfer_DraftLifecycle_FullWalk(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+	src2, tgt2 := seedTransferPair(t, ctx, tenantID)
+
+	// 1. Create as DRAFT.
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 50000, CurrencyCode: "USD", CorrelationID: "corr-draft-1", MakerPrincipalID: "maker-1", SaveAsDraft: true,
+	})
+	if err != nil || transfer.Status != domain.TransferDraft {
+		t.Fatalf("create as draft: status=%v err=%v", transfer, err)
+	}
+
+	// 2. Amend while DRAFT — the maker corrects the amount.
+	amended, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 45000, CurrencyCode: "USD", ActorPrincipalID: "maker-1",
+	})
+	if err != nil || amended.Amount != 45000 || amended.Status != domain.TransferDraft {
+		t.Fatalf("amend: %+v err=%v", amended, err)
+	}
+
+	// Negative control: a different principal cannot amend the maker's draft.
+	if _, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 1, CurrencyCode: "USD", ActorPrincipalID: "someone-else",
+	}); err != domain.ErrOnlyMakerMayModifyTransfer {
+		t.Fatalf("expected ErrOnlyMakerMayModifyTransfer amending as a non-maker, got %v", err)
+	}
+
+	// 3. Submit for approval — DRAFT -> PENDING_APPROVAL.
+	submitted, err := s.SubmitTransferForApproval(ctx, domain.SubmitTransferForApprovalParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, ActorPrincipalID: "maker-1",
+	})
+	if err != nil || submitted.Status != domain.TransferPendingApproval {
+		t.Fatalf("submit for approval: %+v err=%v", submitted, err)
+	}
+
+	// Negative control: amending after leaving DRAFT must be refused.
+	if _, err := s.AmendTreasuryTransfer(ctx, domain.AmendTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 1, CurrencyCode: "USD", ActorPrincipalID: "maker-1",
+	}); err != domain.ErrInvalidTransferTransition {
+		t.Fatalf("expected ErrInvalidTransferTransition amending a PENDING_APPROVAL transfer, got %v", err)
+	}
+
+	// 4. Approve, then submit to the bank (MarkTransferSubmitted — a
+	// different, later transition from SubmitTransferForApproval above).
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := s.MarkTransferSubmitted(ctx, tenantID, transfer.TransferID, "attempt-1"); err != nil {
+		t.Fatalf("mark submitted: %v", err)
+	}
+
+	// Negative control: cancelling after the bank has seen the transfer
+	// (SUBMITTED) must be refused — CancelBeforeSubmission means before.
+	if _, err := s.CancelBeforeSubmission(ctx, domain.CancelBeforeSubmissionParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Reason: "changed my mind", ActorPrincipalID: "maker-1",
+	}); err != domain.ErrInvalidTransferTransition {
+		t.Fatalf("expected ErrInvalidTransferTransition cancelling a SUBMITTED transfer, got %v", err)
+	}
+
+	// 5. Positive control on a SEPARATE, still-DRAFT transfer: cancel is
+	// allowed before any submission.
+	draft2, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src2, TargetBankAccountID: tgt2,
+		Amount: 100, CurrencyCode: "USD", CorrelationID: "corr-draft-2", MakerPrincipalID: "maker-2", SaveAsDraft: true,
+	})
+	if err != nil {
+		t.Fatalf("create second draft: %v", err)
+	}
+	cancelled, err := s.CancelBeforeSubmission(ctx, domain.CancelBeforeSubmissionParams{
+		TenantID: tenantID, TransferID: draft2.TransferID, Reason: "no longer needed", ActorPrincipalID: "maker-2",
+	})
+	if err != nil || cancelled.Status != domain.TransferCancelled || cancelled.CancelReason != "no longer needed" {
+		t.Fatalf("cancel a DRAFT transfer: %+v err=%v", cancelled, err)
+	}
+}
+
+// TestPgStore_TreasuryTransfer_CancelBeforeSubmission_OnlyMaker proves
+// only the maker who created the transfer may cancel it — a different
+// principal, even an authorized one, cannot.
+func TestPgStore_TreasuryTransfer_CancelBeforeSubmission_OnlyMaker(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 10, CurrencyCode: "USD", CorrelationID: "corr-only-maker", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.CancelBeforeSubmission(ctx, domain.CancelBeforeSubmissionParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Reason: "x", ActorPrincipalID: "not-the-maker",
+	}); err != domain.ErrOnlyMakerMayModifyTransfer {
+		t.Fatalf("expected ErrOnlyMakerMayModifyTransfer, got %v", err)
+	}
+}
+
+// TestPgStore_TreasuryTransfer_CancelledIsImmutable is the negative-
+// controlled proof that CANCELLED joined COMPLETED/REJECTED as terminal
+// in migration 000007's updated trigger.
+func TestPgStore_TreasuryTransfer_CancelledIsImmutable(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 10, CurrencyCode: "USD", CorrelationID: "corr-cancel-immutable", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.CancelBeforeSubmission(ctx, domain.CancelBeforeSubmissionParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Reason: "x", ActorPrincipalID: "maker-1",
+	}); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE treasury_transfers SET amount = 1 WHERE transfer_id = $1`, transfer.TransferID); err == nil {
+		t.Fatal("expected the trigger to refuse mutating a CANCELLED transfer")
+	}
+	if _, err := testPool.Exec(ctx, `ALTER TABLE treasury_transfers DISABLE TRIGGER trg_reject_terminal_transfer_mutation`); err != nil {
+		t.Fatalf("disable trigger: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE treasury_transfers SET amount = 1 WHERE transfer_id = $1`, transfer.TransferID); err != nil {
+		t.Fatalf("expected the UPDATE to succeed with the trigger disabled, proving it was the real mechanism: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `ALTER TABLE treasury_transfers ENABLE TRIGGER trg_reject_terminal_transfer_mutation`); err != nil {
+		t.Fatalf("re-enable trigger: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE treasury_transfers SET amount = 2 WHERE transfer_id = $1`, transfer.TransferID); err == nil {
+		t.Fatal("expected re-enabling the trigger to restore the refusal")
+	}
+}
+
+// TestPgStore_TreasuryTransfer_ReturnedThenResolved_Resubmit proves the
+// bank-return recovery path: a SUBMITTED transfer marked RETURNED can be
+// resolved back to PENDING_APPROVAL, with the prior checker and the
+// failed attempt's correlation ids cleared — a genuinely fresh
+// maker-checker cycle, not a reuse of the invalidated approval.
+func TestPgStore_TreasuryTransfer_ReturnedThenResolved_Resubmit(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 200, CurrencyCode: "USD", CorrelationID: "corr-returned-1", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := s.MarkTransferSubmitted(ctx, tenantID, transfer.TransferID, "attempt-1"); err != nil {
+		t.Fatalf("mark submitted: %v", err)
+	}
+
+	// Negative control: cannot mark returned before the bank has seen it —
+	// use a fresh PENDING_APPROVAL transfer to prove this without
+	// disturbing the one under test.
+	other, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 1, CurrencyCode: "USD", CorrelationID: "corr-not-yet-submitted", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create other: %v", err)
+	}
+	if _, err := s.MarkTransferReturned(ctx, domain.MarkTransferReturnedParams{
+		TenantID: tenantID, TransferID: other.TransferID, Reason: "too early", ActorPrincipalID: "ops-1",
+	}); err != domain.ErrInvalidTransferTransition {
+		t.Fatalf("expected ErrInvalidTransferTransition marking a PENDING_APPROVAL transfer returned, got %v", err)
+	}
+
+	returned, err := s.MarkTransferReturned(ctx, domain.MarkTransferReturnedParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Reason: "destination account closed", ActorPrincipalID: "ops-1",
+	})
+	if err != nil || returned.Status != domain.TransferReturned || returned.ReturnReason != "destination account closed" {
+		t.Fatalf("mark returned: %+v err=%v", returned, err)
+	}
+
+	resolved, err := s.ResolveTreasuryTransfer(ctx, domain.ResolveTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Resolution: domain.ResolutionResubmit, Note: "corrected destination, resubmitting", ActorPrincipalID: "ops-1",
+	})
+	if err != nil || resolved.Status != domain.TransferPendingApproval {
+		t.Fatalf("resolve (resubmit): %+v err=%v", resolved, err)
+	}
+	if resolved.CheckerPrincipalID != "" || resolved.PaymentAttemptID != "" {
+		t.Fatalf("expected the prior checker and failed attempt id to be cleared on resubmit, got %+v", resolved)
+	}
+
+	// The fresh cycle requires a genuinely different checker — the old
+	// checker-1 approval is gone, so even re-approving with checker-1 is
+	// allowed here (it's now a NEW approval decision), but self-approval
+	// by the maker is still refused.
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "maker-1"}); err != domain.ErrTransferSelfApproval {
+		t.Fatalf("expected ErrTransferSelfApproval on the resubmitted transfer, got %v", err)
+	}
+}
+
+// TestPgStore_TreasuryTransfer_ReturnedThenResolved_Cancel proves the
+// other resolution outcome: abandoning a returned transfer for good.
+func TestPgStore_TreasuryTransfer_ReturnedThenResolved_Cancel(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	src, tgt := seedTransferPair(t, ctx, tenantID)
+
+	transfer, _, err := s.CreateTreasuryTransfer(ctx, domain.CreateTreasuryTransferParams{
+		TenantID: tenantID, SourceBankAccountID: src, TargetBankAccountID: tgt,
+		Amount: 200, CurrencyCode: "USD", CorrelationID: "corr-returned-2", MakerPrincipalID: "maker-1",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := s.ApproveTreasuryTransfer(ctx, domain.ApproveTreasuryTransferParams{TenantID: tenantID, TransferID: transfer.TransferID, CheckerPrincipalID: "checker-1"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if _, err := s.MarkTransferSubmitted(ctx, tenantID, transfer.TransferID, "attempt-1"); err != nil {
+		t.Fatalf("mark submitted: %v", err)
+	}
+	if _, err := s.MarkTransferReturned(ctx, domain.MarkTransferReturnedParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Reason: "bank rejected the payee", ActorPrincipalID: "ops-1",
+	}); err != nil {
+		t.Fatalf("mark returned: %v", err)
+	}
+
+	resolved, err := s.ResolveTreasuryTransfer(ctx, domain.ResolveTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Resolution: domain.ResolutionCancel, Note: "abandoned", ActorPrincipalID: "ops-1",
+	})
+	if err != nil || resolved.Status != domain.TransferCancelled {
+		t.Fatalf("resolve (cancel): %+v err=%v", resolved, err)
+	}
+
+	// Terminal now — resolving again must fail.
+	if _, err := s.ResolveTreasuryTransfer(ctx, domain.ResolveTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transfer.TransferID, Resolution: domain.ResolutionResubmit, Note: "x", ActorPrincipalID: "ops-1",
+	}); err != domain.ErrInvalidTransferTransition {
+		t.Fatalf("expected ErrInvalidTransferTransition resolving an already-CANCELLED transfer, got %v", err)
+	}
+}
+
 // TestPgStore_TreasuryTransfer_CrossEntitySagaIsResumable exercises the
 // full cross-entity saga (SUBMITTED -> LEDGER_POSTED -> INTERCOMPANY_PAIRED
 // -> COMPLETED) and proves each step's CAS predecessor requirement — the
