@@ -59,6 +59,14 @@ const (
 	StatusQuarantined              AttemptStatus = "QUARANTINED"
 )
 
+// AuthorizationSourcePaymentAuthorization is the only AuthorizationSource
+// value PrepareAttempt independently verifies today (Wave 11a, AP-10's
+// payment-authorization-svc). Any other value — including empty, the
+// carve-out for BNK-09-originated attempts pending Wave 11b's product
+// decision on treasury-svc's own fingerprint design — is stored as
+// given, not verified. See migration 000004's own doc comment.
+const AuthorizationSourcePaymentAuthorization = "PAYMENT_AUTHORIZATION_SVC"
+
 func CanSubmit(s AttemptStatus) bool                 { return s == StatusPrepared }
 func CanCancelBeforeSubmission(s AttemptStatus) bool { return s == StatusPrepared }
 func CanRetry(s AttemptStatus) bool                  { return s == StatusPendingUnknown }
@@ -73,6 +81,13 @@ type PaymentInitiationAttempt struct {
 	LegalEntityID            string
 	SourceReference          string // caller's own reference (e.g. AP-11's instruction_id)
 	AuthorizationFingerprint string
+	// AuthorizationID/AuthorizationSource identify which upstream record
+	// and service AuthorizationFingerprint was derived from, so
+	// PrepareAttempt can independently re-fetch and compare it rather than
+	// trusting it as given — see AuthorizationSourcePaymentAuthorization's
+	// own doc comment.
+	AuthorizationID   string
+	AuthorizationSource string
 	PayerAccountRef          string
 	PayeeRef                 string
 	Amount                   float64
@@ -124,6 +139,8 @@ type PrepareAttemptRequest struct {
 	LegalEntityID            string
 	SourceReference          string
 	AuthorizationFingerprint string
+	AuthorizationID          string
+	AuthorizationSource      string
 	PayerAccountRef          string
 	PayeeRef                 string
 	Amount                   float64
@@ -169,4 +186,12 @@ const (
 	ErrInvalidResolution          = sentinel("resolved_status must be SUBMITTED or REJECTED_BEFORE_SUBMISSION")
 	ErrProviderAdapterUnavailable = sentinel("provider adapter unavailable")
 	ErrStoreUnavailable           = sentinel("store unavailable")
+
+	// ErrAuthorizationFingerprintRequired/Mismatch/Unavailable are Wave
+	// 11a's real fingerprint verification outcomes for an
+	// AuthorizationSourcePaymentAuthorization attempt — see
+	// clients/authorization.go.
+	ErrAuthorizationFingerprintRequired  = sentinel("authorization_fingerprint and authorization_id are required for this authorization_source")
+	ErrAuthorizationFingerprintMismatch  = sentinel("authorization_fingerprint does not match the live authorization record")
+	ErrAuthorizationServiceUnavailable   = sentinel("payment-authorization-svc unavailable")
 )

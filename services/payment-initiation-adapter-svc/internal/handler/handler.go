@@ -36,16 +36,17 @@ type AuthzChecker interface {
 }
 
 type Handler struct {
-	store    store.Store
-	pub      events.Publisher
-	authz    AuthzChecker
-	provider provideradapter.Client
-	treasury clients.TreasuryClient
-	log      *zap.Logger
+	store         store.Store
+	pub           events.Publisher
+	authz         AuthzChecker
+	provider      provideradapter.Client
+	treasury      clients.TreasuryClient
+	authorization clients.AuthorizationClient
+	log           *zap.Logger
 }
 
-func New(st store.Store, pub events.Publisher, az AuthzChecker, provider provideradapter.Client, treasury clients.TreasuryClient, log *zap.Logger) *Handler {
-	return &Handler{store: st, pub: pub, authz: az, provider: provider, treasury: treasury, log: log}
+func New(st store.Store, pub events.Publisher, az AuthzChecker, provider provideradapter.Client, treasury clients.TreasuryClient, authorization clients.AuthorizationClient, log *zap.Logger) *Handler {
+	return &Handler{store: st, pub: pub, authz: az, provider: provider, treasury: treasury, authorization: authorization, log: log}
 }
 
 func RegisterRoutes(r chi.Router, h *Handler) {
@@ -143,6 +144,29 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
+
+	// Wave 11a: for an attempt declaring AuthorizationSourcePaymentAuthorization,
+	// AuthorizationFingerprint is no longer trusted as given — it's
+	// independently re-verified against payment-authorization-svc's live
+	// record by AuthorizationID. An attempt declaring any other source
+	// (including empty — BNK-09-originated attempts, pending Wave 11b's
+	// product decision on treasury-svc's own fingerprint design) is
+	// exempted from this check, not silently rejected.
+	if req.AuthorizationSource == domain.AuthorizationSourcePaymentAuthorization {
+		if req.AuthorizationFingerprint == "" || req.AuthorizationID == "" {
+			writeError(w, http.StatusBadRequest, domain.ErrAuthorizationFingerprintRequired.Error())
+			return
+		}
+		if err := h.authorization.VerifyFingerprint(r.Context(), verifiedTenant, req.AuthorizationID, req.AuthorizationFingerprint); err != nil {
+			if errors.Is(err, domain.ErrAuthorizationFingerprintMismatch) {
+				writeError(w, http.StatusUnprocessableEntity, domain.ErrAuthorizationFingerprintMismatch.Error())
+				return
+			}
+			h.log.Error("PrepareAttempt: payment-authorization-svc fingerprint verification failed — failing closed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
+			return
+		}
+	}
 
 	// PayerAccountVerified above is a caller-attested flag, not a real
 	// check — this is the actual one, against treasury-svc's own BNK-01

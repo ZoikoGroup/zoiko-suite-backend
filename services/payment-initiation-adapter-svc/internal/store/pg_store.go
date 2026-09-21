@@ -96,7 +96,7 @@ func (s *PgStore) recordEvent(ctx context.Context, tx pgx.Tx, tenantID *string, 
 }
 
 const attemptColumns = `
-	attempt_id, tenant_id, legal_entity_id, source_reference, authorization_fingerprint, payer_account_ref,
+	attempt_id, tenant_id, legal_entity_id, source_reference, authorization_fingerprint, authorization_id, authorization_source, payer_account_ref,
 	payee_ref, amount, currency, execution_date, payment_reference, payer_account_verified, idempotency_key,
 	status, provider_request_id, provider_response_ref, rejection_reason, quarantine_reason,
 	ambiguous_resolution_note, submitted_at, resolved_at, created_by_principal_id, created_at, updated_at`
@@ -104,6 +104,7 @@ const attemptColumns = `
 func scanAttempt(row pgx.Row) (*domain.PaymentInitiationAttempt, error) {
 	a := &domain.PaymentInitiationAttempt{}
 	err := row.Scan(&a.AttemptID, &a.TenantID, &a.LegalEntityID, &a.SourceReference, &a.AuthorizationFingerprint,
+		&nullString{&a.AuthorizationID}, &nullString{&a.AuthorizationSource},
 		&a.PayerAccountRef, &a.PayeeRef, &a.Amount, &a.Currency, &a.ExecutionDate, &nullString{&a.PaymentReference},
 		&a.PayerAccountVerified, &a.IdempotencyKey, &a.Status, &nullString{&a.ProviderRequestID},
 		&nullString{&a.ProviderResponseRef}, &nullString{&a.RejectionReason}, &nullString{&a.QuarantineReason},
@@ -150,9 +151,10 @@ func (s *PgStore) PrepareAttempt(ctx context.Context, tenantID string, req domai
 
 		inserted, err := scanAttempt(tx.QueryRow(ctx, `
 			INSERT INTO payment_initiation_attempts (`+attemptColumns+`)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'PREPARED', '', '', '', '', '', NULL, NULL, $14, NOW(), NOW())
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'PREPARED', '', '', '', '', '', NULL, NULL, $16, NOW(), NOW())
 			RETURNING `+attemptColumns,
 			id, nullableTenant(tenantID), req.LegalEntityID, req.SourceReference, req.AuthorizationFingerprint,
+			req.AuthorizationID, req.AuthorizationSource,
 			req.PayerAccountRef, req.PayeeRef, req.Amount, req.Currency, req.ExecutionDate, req.PaymentReference,
 			req.PayerAccountVerified, req.IdempotencyKey, principalID,
 		))

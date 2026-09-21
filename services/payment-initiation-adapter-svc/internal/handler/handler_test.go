@@ -55,6 +55,20 @@ func (t *stubTreasury) VerifyPayerAccount(_ context.Context, _, _, _, _ string) 
 	return t.err
 }
 
+// ── stub authorization client ────────────────────────────────────────────────
+//
+// Defaults to "matches" so every pre-existing test (none of which sets
+// AuthorizationSource to AuthorizationSourcePaymentAuthorization) keeps
+// working unchanged — the verification call is skipped entirely for
+// those. Tests that specifically exercise Wave 11a's real verification
+// set err.
+
+type stubAuthorization struct{ err error }
+
+func (a *stubAuthorization) VerifyFingerprint(_ context.Context, _, _, _ string) error {
+	return a.err
+}
+
 // ── test harness ─────────────────────────────────────────────────────────────
 //
 // These tests use the REAL provideradapter.StubProviderAdapter (not a
@@ -70,8 +84,12 @@ func newTestRouter(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *p
 }
 
 func newTestRouterWithTreasury(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury) chi.Router {
+	return newTestRouterFull(st, pub, az, provider, treasury, &stubAuthorization{})
+}
+
+func newTestRouterFull(st *stubStore, pub *stubPublisher, az *stubAuthz, provider *provideradapter.StubProviderAdapter, treasury *stubTreasury, authorization *stubAuthorization) chi.Router {
 	logger := zap.NewNop()
-	h := handler.New(st, pub, az, provider, treasury, logger)
+	h := handler.New(st, pub, az, provider, treasury, authorization, logger)
 	r := chi.NewRouter()
 	r.Use(middleware.TenantContext())
 	handler.RegisterRoutes(r, h)
@@ -174,6 +192,93 @@ func TestPrepareAttempt_TreasuryVerifies_Succeeds(t *testing.T) {
 	a := prepareAttempt(t, r, newPrepareReq("idem-treasury-3", "invoice-payment"))
 	if a.Status != domain.StatusPrepared {
 		t.Fatalf("expected PREPARED, got %s", a.Status)
+	}
+}
+
+// ── Wave 11a: authorization fingerprint verification ─────────────────────────
+
+func newAuthorizationSourceReq(idempotencyKey string) domain.PrepareAttemptRequest {
+	req := newPrepareReq(idempotencyKey, "invoice-payment")
+	req.AuthorizationSource = domain.AuthorizationSourcePaymentAuthorization
+	req.AuthorizationID = "auth-1"
+	req.AuthorizationFingerprint = "sha256:real-fingerprint"
+	return req
+}
+
+// TestPrepareAttempt_AuthorizationSourceRequiresFingerprintAndID proves a
+// caller declaring AuthorizationSourcePaymentAuthorization cannot omit
+// either the fingerprint or the ID it's supposed to verify against — both
+// are required together, not silently accepted as an unverified attempt.
+func TestPrepareAttempt_AuthorizationSourceRequiresFingerprintAndID(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+
+	missingFingerprint := newAuthorizationSourceReq("idem-auth-1")
+	missingFingerprint.AuthorizationFingerprint = ""
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", missingFingerprint, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with a missing fingerprint, got %d: %s", w.Code, w.Body.String())
+	}
+
+	missingID := newAuthorizationSourceReq("idem-auth-2")
+	missingID.AuthorizationID = ""
+	w = doRequest(r, http.MethodPost, "/bnk06/attempts/", missingID, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with a missing authorization_id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_AuthorizationFingerprintMismatch_Returns422 is the
+// real proof of Wave 11a: a caller-supplied fingerprint that doesn't
+// match payment-authorization-svc's live record is rejected, not stored
+// and trusted.
+func TestPrepareAttempt_AuthorizationFingerprintMismatch_Returns422(t *testing.T) {
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{}, &stubAuthorization{err: domain.ErrAuthorizationFingerprintMismatch})
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newAuthorizationSourceReq("idem-auth-3"), testTenant)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 on a fingerprint mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_AuthorizationServiceUnavailable_FailsClosed proves an
+// unreachable payment-authorization-svc blocks the attempt rather than
+// silently trusting the caller-supplied fingerprint.
+func TestPrepareAttempt_AuthorizationServiceUnavailable_FailsClosed(t *testing.T) {
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{}, &stubAuthorization{err: domain.ErrAuthorizationServiceUnavailable})
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newAuthorizationSourceReq("idem-auth-4"), testTenant)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when payment-authorization-svc is unreachable, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_AuthorizationFingerprintVerified_Succeeds is the
+// positive control: a real, matching fingerprint still succeeds.
+func TestPrepareAttempt_AuthorizationFingerprintVerified_Succeeds(t *testing.T) {
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{}, &stubAuthorization{})
+	a := prepareAttempt(t, r, newAuthorizationSourceReq("idem-auth-5"))
+	if a.Status != domain.StatusPrepared {
+		t.Fatalf("expected PREPARED, got %s", a.Status)
+	}
+	if a.AuthorizationID != "auth-1" {
+		t.Fatalf("expected authorization_id to be persisted, got %q", a.AuthorizationID)
+	}
+}
+
+// TestPrepareAttempt_UnverifiedSource_SkipsFingerprintCheck is the
+// documented Wave 11b carve-out: an attempt with no (or an unrecognized)
+// AuthorizationSource — the BNK-09/treasury-svc shape today — is not
+// rejected for lacking a verifiable fingerprint. Verifying that path is
+// explicitly deferred pending its own product decision.
+func TestPrepareAttempt_UnverifiedSource_SkipsFingerprintCheck(t *testing.T) {
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{}, &stubAuthorization{err: domain.ErrAuthorizationFingerprintMismatch})
+	req := newPrepareReq("idem-auth-6", "treasury-transfer-payment")
+	req.AuthorizationFingerprint = "" // treasury-svc sends none today — see bnk09_clients.go
+	a := prepareAttempt(t, r, req)
+	if a.Status != domain.StatusPrepared {
+		t.Fatalf("expected PREPARED (fingerprint check skipped for an unverified source), got %s", a.Status)
 	}
 }
 
