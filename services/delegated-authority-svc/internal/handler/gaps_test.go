@@ -69,10 +69,10 @@ func tenantInjector(tenantID string) func(http.Handler) http.Handler {
 }
 
 // newRouterAuthz mirrors newRouter but takes the scoped authz double.
-func newRouterAuthz(s *stubStore, pub *stubPublisher, authz handler.AuthZClient) chi.Router {
+func newRouterAuthz(s *stubStore, authz handler.AuthZClient) chi.Router {
 	r := chi.NewRouter()
 	r.Use(tenantInjector("tenant-abc"))
-	h := handler.New(s, pub, authz, zap.NewNop())
+	h := handler.New(s, authz, zap.NewNop(), nil)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -81,7 +81,7 @@ func newRouterAuthz(s *stubStore, pub *stubPublisher, authz handler.AuthZClient)
 // reached the service without X-Tenant-Id.
 func newRouterNoTenant(s *stubStore) chi.Router {
 	r := chi.NewRouter()
-	h := handler.New(s, &stubPublisher{}, &stubAuthZ{}, zap.NewNop())
+	h := handler.New(s, &stubAuthZ{}, zap.NewNop(), nil)
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -105,7 +105,7 @@ func body(delegator, delegate, correlationID string) map[string]any {
 // themselves that colleague's authority. Both checks that existed passed.
 func TestCreate_CannotDelegateSomeoneElsesAuthorityToYourself(t *testing.T) {
 	az := newScopedAuthZ("attacker|DELEGATION_ADMINISTER")
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, az)
+	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
 		body("cfo-alice", "attacker", uuid.NewString()), "attacker")
@@ -128,7 +128,7 @@ func TestCreate_CannotDelegateSomeoneElsesAuthorityToYourself(t *testing.T) {
 // yourself is the same escalation by a longer route.
 func TestCreate_AdministratorStillCannotNameThemselvesDelegate(t *testing.T) {
 	az := newScopedAuthZ() // grants everything, including DELEGATION_ADMINISTER
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, az)
+	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
 		body("cfo-alice", "admin-1", uuid.NewString()), "admin-1")
@@ -142,7 +142,7 @@ func TestCreate_AdministratorStillCannotNameThemselvesDelegate(t *testing.T) {
 // even when the delegate is a third party.
 func TestCreate_OnBehalfOfRequiresAdministerGrant(t *testing.T) {
 	az := newScopedAuthZ("clerk|DELEGATION_ADMINISTER")
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, az)
+	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
 		body("cfo-alice", "bob", uuid.NewString()), "clerk")
@@ -159,7 +159,7 @@ func TestCreate_OnBehalfOfRequiresAdministerGrant(t *testing.T) {
 // two other people. Closing the hole must not close this.
 func TestCreate_AdministratorMayDelegateBetweenOtherPrincipals(t *testing.T) {
 	az := newScopedAuthZ()
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, az)
+	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
 		body("cfo-alice", "bob", uuid.NewString()), "admin-1")
@@ -176,7 +176,7 @@ func TestCreate_AdministratorMayDelegateBetweenOtherPrincipals(t *testing.T) {
 // grant at all.
 func TestCreate_DelegatingYourOwnAuthorityNeedsNoAdministerGrant(t *testing.T) {
 	az := newScopedAuthZ("cfo-alice|DELEGATION_ADMINISTER")
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, az)
+	r := newRouterAuthz(newStubStore(), az)
 
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
 		body("cfo-alice", "bob", uuid.NewString()), "cfo-alice")
@@ -190,7 +190,7 @@ func TestCreate_DelegatingYourOwnAuthorityNeedsNoAdministerGrant(t *testing.T) {
 }
 
 func TestCreate_DelegateMayNotBeTheDelegator(t *testing.T) {
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
 	rr := doReq(r, http.MethodPost, "/v1/delegations/",
 		body("same-principal", "same-principal", uuid.NewString()), "same-principal")
 	if rr.Code != http.StatusBadRequest {
@@ -236,7 +236,7 @@ func decodeList(t *testing.T, rr *httptest.ResponseRecorder) []domain.Delegation
 func TestList_UnscopedReadReturnsOnlyYourOwnDelegations(t *testing.T) {
 	s := newStubStore()
 	seedTwo(t, s)
-	r := newRouterAuthz(s, &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(s, newScopedAuthZ())
 
 	rr := doReq(r, http.MethodGet, "/v1/delegations/", nil, "me")
 	if rr.Code != http.StatusOK {
@@ -254,7 +254,7 @@ func TestList_UnscopedReadReturnsOnlyYourOwnDelegations(t *testing.T) {
 func TestList_UnscopedReadOfAnotherPrincipalIsForbidden(t *testing.T) {
 	s := newStubStore()
 	seedTwo(t, s)
-	r := newRouterAuthz(s, &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(s, newScopedAuthZ())
 
 	rr := doReq(r, http.MethodGet, "/v1/delegations/?delegate_principal_id=cto-carol", nil, "me")
 	if rr.Code != http.StatusForbidden {
@@ -267,7 +267,7 @@ func TestList_EntityScopedReadRequiresViewGrant(t *testing.T) {
 	s := newStubStore()
 	seedTwo(t, s)
 	az := newScopedAuthZ("nosy|DELEGATION_VIEW")
-	r := newRouterAuthz(s, &stubPublisher{}, az)
+	r := newRouterAuthz(s, az)
 
 	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us", nil, "nosy")
 	if rr.Code != http.StatusForbidden {
@@ -281,7 +281,7 @@ func TestList_EntityScopedReadRequiresViewGrant(t *testing.T) {
 func TestList_EntityScopedReadWithGrantSeesTheWholeEntity(t *testing.T) {
 	s := newStubStore()
 	seedTwo(t, s)
-	r := newRouterAuthz(s, &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(s, newScopedAuthZ())
 
 	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us", nil, "auditor")
 	if rr.Code != http.StatusOK {
@@ -295,7 +295,7 @@ func TestList_EntityScopedReadWithGrantSeesTheWholeEntity(t *testing.T) {
 // ── GAP 3: a misspelled status filter answered "no delegations" ──────────────
 
 func TestList_UnknownStatusIsRejected(t *testing.T) {
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
 	rr := doReq(r, http.MethodGet, "/v1/delegations/?status=ACTIVEE", nil, "me")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
@@ -308,7 +308,7 @@ func TestList_UnknownStatusIsRejected(t *testing.T) {
 // ── GAP 4: paging ────────────────────────────────────────────────────────────
 
 func TestList_PagingValidation(t *testing.T) {
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
 	for _, q := range []string{"limit=abc", "limit=0", "limit=501", "offset=-1"} {
 		rr := doReq(r, http.MethodGet, "/v1/delegations/?"+q, nil, "me")
 		if rr.Code != http.StatusBadRequest {
@@ -320,7 +320,7 @@ func TestList_PagingValidation(t *testing.T) {
 func TestList_LimitIsApplied(t *testing.T) {
 	s := newStubStore()
 	seedTwo(t, s)
-	r := newRouterAuthz(s, &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(s, newScopedAuthZ())
 
 	rr := doReq(r, http.MethodGet, "/v1/delegations/?legal_entity_id=le-us&limit=1", nil, "auditor")
 	if rr.Code != http.StatusOK {
@@ -355,7 +355,7 @@ func TestRoutes_MissingTenantIs401NotServiceUnavailable(t *testing.T) {
 // ── GAP 6: an unknown field was discarded in silence ─────────────────────────
 
 func TestCreate_UnknownFieldIsRejected(t *testing.T) {
-	r := newRouterAuthz(newStubStore(), &stubPublisher{}, newScopedAuthZ())
+	r := newRouterAuthz(newStubStore(), newScopedAuthZ())
 	b := body("cfo-alice", "bob", uuid.NewString())
 	b["effective_untill"] = time.Now().UTC().Add(72 * time.Hour) // misspelled
 	rr := doReq(r, http.MethodPost, "/v1/delegations/", b, "cfo-alice")

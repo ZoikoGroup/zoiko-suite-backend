@@ -16,6 +16,17 @@ type Config struct {
 
 	AuthZServiceURL string
 
+	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
+	// mutual-TLS rollout. internal/mtls was pushed into this service as a
+	// rollout target and then never referenced by anything: the package sat
+	// here, complete and unreachable, so the service read as mTLS-capable in a
+	// file listing and spoke plain HTTP to authorization-svc in every
+	// deployment. Default off, matching the siblings — the point of this block
+	// is that turning it on is now possible at all.
+	AuthzMTLSEnabled         bool
+	AuthzMTLSURL             string
+	MTLSManagementServiceURL string
+
 	OTELExporterEndpoint string
 }
 
@@ -64,6 +75,10 @@ func Load() (*Config, error) {
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.delegated-authority.events"),
 		},
 		AuthZServiceURL: env("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+
+		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",
+		AuthzMTLSURL:             env("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),
+		MTLSManagementServiceURL: env("MTLS_MANAGEMENT_SERVICE_URL", "http://mtls-management-svc:8140"),
 
 		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 	}, nil

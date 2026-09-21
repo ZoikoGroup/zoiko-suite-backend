@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +31,8 @@ import (
 	"zoiko.io/delegated-authority-svc/internal/handler"
 	"zoiko.io/delegated-authority-svc/internal/health"
 	svcmiddleware "zoiko.io/delegated-authority-svc/internal/middleware"
+	"zoiko.io/delegated-authority-svc/internal/mtls"
+	"zoiko.io/delegated-authority-svc/internal/outbox"
 	"zoiko.io/delegated-authority-svc/internal/store"
 	"zoiko.io/delegated-authority-svc/internal/telemetry"
 )
@@ -51,6 +55,15 @@ import (
 // transient outage into a standing permit-or-deny for every subsequent
 // caller on this instance, which defeats fail-closed.
 const decisionCacheTTL = 5 * time.Second
+
+// platformScopeID mirrors authorization-svc's own constant of the same name.
+//
+// It is one literal shared by the whole estate and by
+// deployments/scripts/seed-demo-rbac.ps1. A service that invents its own gets
+// grants seeded against one id and checks made against another — silently, and
+// fail-closed, so the symptom is a correctly-permissioned operator being
+// refused with no indication why.
+const platformScopeID = "00000000-0000-0000-0000-00000000f001"
 
 type cachedDecision struct {
 	deniedErr error
@@ -199,6 +212,35 @@ func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, leg
 	return nil
 }
 
+// Ping reports whether authorization-svc is reachable, for readiness.
+//
+// It asks /healthz rather than replaying an authorize call: a probe must not
+// write entries into the access decision log, which is an append-only record of
+// real decisions about real principals, and a synthetic check every few seconds
+// would bury the real ones.
+//
+// The path is /healthz, not /health. identity-context-svc shipped a registry
+// probe against /health for a service that serves /healthz — it returned 503
+// permanently and its unit test asserted the wrong path, so the test encoded
+// the defect instead of catching it. Verified against the running container
+// here rather than against a stub.
+func (a *httpAuthzClient) Ping(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.baseURL+"/healthz", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("authorization-svc /healthz returned %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func main() {
 	// ── 1. Config ─────────────────────────────────────────────────────────────
 	cfg, err := config.Load()
@@ -235,6 +277,7 @@ func main() {
 	}()
 
 	metrics := telemetry.NewMetrics("delegated-authority-svc")
+	domainMetrics := telemetry.NewDomain("delegated-authority-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
@@ -285,7 +328,39 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
-	authzClient := &httpAuthzClient{baseURL: cfg.AuthZServiceURL, client: &http.Client{Timeout: 5 * time.Second}, log: log, cache: make(map[string]cachedDecision)}
+	// mTLS to authorization-svc, off by default and identical to the siblings'
+	// wiring. Every call this service makes to authorization-svc decides
+	// whether somebody may hand another principal their authority, which is
+	// exactly the traffic the material-path rollout exists for.
+	var httpClientForAuthz *http.Client
+	authzBaseURL := cfg.AuthZServiceURL
+	if cfg.AuthzMTLSEnabled {
+		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "delegated-authority-svc", platformScopeID)
+		if err != nil {
+			log.Fatal("mtls: failed to provision client identity", zap.Error(err))
+		}
+		log.Info("mTLS enabled for authorization-svc calls", zap.String("authz_mtls_url", cfg.AuthzMTLSURL))
+		httpClientForAuthz = mtlsHTTPClient
+		authzBaseURL = cfg.AuthzMTLSURL
+	} else {
+		httpClientForAuthz = &http.Client{Timeout: 5 * time.Second}
+	}
+	authzClient := &httpAuthzClient{baseURL: authzBaseURL, client: httpClientForAuthz, log: log, cache: make(map[string]cachedDecision)}
+
+	// ── 4b. Outbox relay ──────────────────────────────────────────────────────
+	//
+	// Events are written by the store inside the transaction that changes the
+	// state; this loop is what delivers them. Started before the server so a
+	// backlog left by the previous process is already draining when the first
+	// request arrives.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
+	relayDone := make(chan struct{})
+	go func() {
+		defer close(relayDone)
+		relay.Run(relayCtx)
+	}()
 
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
@@ -305,11 +380,16 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, log)
+	h := handler.New(pgStore, authzClient, log, domainMetrics)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
-	healthH := health.New(pool, log)
+	// authorization-svc is a readiness dependency, not merely a runtime one.
+	// Every endpoint here calls it before doing anything and this service fails
+	// closed, so with it unreachable the pool can be perfectly healthy while
+	// 100% of requests answer 503. Readiness used to report ready throughout
+	// exactly that outage.
+	healthH := health.New(pool, log, health.Dependency{Name: "authorization-svc", Check: authzClient.Ping})
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
 	r.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
@@ -352,6 +432,20 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
+	}
+
+	// Stop the relay AFTER the server, and wait for it.
+	//
+	// The order is the point: in-flight requests are still committing events
+	// while Shutdown drains them, so a relay stopped first would leave that last
+	// handful of authority.revoked rows sitting until the next process starts.
+	// They would not be lost — that is what the outbox is for — but a revocation
+	// should not wait on a deployment.
+	relayCancel()
+	select {
+	case <-relayDone:
+	case <-time.After(10 * time.Second):
+		log.Warn("outbox relay did not stop within 10s; undelivered events remain queued and will be drained at next start")
 	}
 	log.Info("server stopped")
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"zoiko.io/delegated-authority-svc/internal/domain"
+	"zoiko.io/delegated-authority-svc/internal/events"
 	svcmiddleware "zoiko.io/delegated-authority-svc/internal/middleware"
 )
 
@@ -102,7 +103,12 @@ func (s *PgStore) CreateDelegation(ctx context.Context, d *domain.DelegationGran
 		}
 		if tag.RowsAffected() == 1 {
 			created = true
-			return nil
+			// Same transaction as the INSERT. A grant that exists always has
+			// its event; ON CONFLICT DO NOTHING means a replay reaches the
+			// branch below instead and enqueues nothing, so an idempotent
+			// retry cannot emit a second authority.delegated.
+			d.TenantID = tenantID
+			return enqueue(ctx, tx, events.EventDelegated, *d)
 		}
 		row := tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND correlation_id = $2", tenantID, d.CorrelationID)
 		return scanDelegation(row, d)
@@ -135,15 +141,33 @@ func (s *PgStore) ExpireDue(ctx context.Context) ([]domain.DelegationGrant, erro
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
 		for rows.Next() {
 			var d domain.DelegationGrant
 			if err := scanDelegation(rows, &d); err != nil {
+				rows.Close()
 				return err
 			}
 			out = append(out, d)
 		}
-		return rows.Err()
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// Enqueued inside the sweep's own transaction, after the cursor is
+		// closed — pgx allows one statement at a time per connection, so
+		// enqueueing inside the loop would abort the UPDATE mid-read.
+		//
+		// Atomicity matters more here than anywhere else in this file: the
+		// flip to EXPIRED is the only record that the lapse was observed, and
+		// it happens exactly once. Published separately, a broker failure at
+		// this moment would lose authority.expired permanently, because the
+		// next sweep finds no ACTIVE row left to flip.
+		for _, d := range out {
+			if err := enqueue(ctx, tx, events.EventExpired, d); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -271,10 +295,177 @@ func (s *PgStore) RevokeDelegation(ctx context.Context, delegationID, revokedByP
 		}
 
 		row = tx.QueryRow(ctx, "SELECT "+delegationColumns+" FROM delegation_grants WHERE tenant_id = $1 AND delegation_id = $2", tenantID, delegationID)
-		return scanDelegation(row, &out)
+		if err := scanDelegation(row, &out); err != nil {
+			return err
+		}
+		// The event this whole mechanism was built for. identity-context-svc
+		// ends the delegate's session on authority.revoked; losing it leaves a
+		// withdrawn authority live while the register, the operator and every
+		// log agree the revocation succeeded.
+		return enqueue(ctx, tx, events.EventRevoked, out)
 	})
 	if err != nil {
 		return nil, mapPgError(err)
 	}
 	return &out, nil
+}
+
+// ── Transactional outbox ─────────────────────────────────────────────────────
+
+// enqueue writes one lifecycle event into the outbox, inside the caller's
+// transaction.
+//
+// It takes the tx rather than the pool for the only reason the outbox exists:
+// the event and the state change it describes must commit or roll back
+// together. Published from the handler after the commit, as this service used
+// to, a broker failure left a revoked grant whose revocation nobody was ever
+// told about — and told the operator it had succeeded.
+func enqueue(ctx context.Context, tx pgx.Tx, eventType string, d domain.DelegationGrant) error {
+	key, body, err := events.Build(eventType, d)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO delegation_outbox (tenant_id, delegation_id, event_type, payload)
+		VALUES ($1, $2, $3, $4)
+	`, d.TenantID, key, eventType, body)
+	if err != nil {
+		return fmt.Errorf("enqueue %s: %w", eventType, err)
+	}
+	return nil
+}
+
+// OutboxRecord is one claimed, unpublished event.
+type OutboxRecord struct {
+	OutboxID  int64
+	EventType string
+	Key       string
+	Body      []byte
+}
+
+// withRelay runs fn with app.outbox_relay installed instead of a tenant.
+//
+// The relay is the one code path in this service that legitimately crosses
+// tenants: it drains every tenant's backlog from a single loop. Rather than
+// letting it run unscoped — which under FORCE ROW LEVEL SECURITY would simply
+// see nothing — it names itself, so the policy admits it by an explicit,
+// auditable disjunct rather than by the absence of a control.
+func (s *PgStore) withRelay(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin relay transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		return fmt.Errorf("set relay context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit relay transaction: %w", err)
+	}
+	return nil
+}
+
+// ClaimOutbox takes up to limit unpublished events, oldest first, locking them
+// for the duration of the caller's drain.
+//
+// FOR UPDATE SKIP LOCKED is what makes more than one replica safe: a second
+// instance draining concurrently steps over the rows this one holds instead of
+// blocking behind them or, worse, publishing them a second time.
+func (s *PgStore) ClaimOutbox(ctx context.Context, limit int, fn func([]OutboxRecord) error) error {
+	return s.withRelay(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT outbox_id, event_type, delegation_id::text, payload
+			FROM delegation_outbox
+			WHERE published_at IS NULL
+			ORDER BY created_at, outbox_id
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		`, limit)
+		if err != nil {
+			return fmt.Errorf("claim outbox: %w", err)
+		}
+		var claimed []OutboxRecord
+		for rows.Next() {
+			var r OutboxRecord
+			if err := rows.Scan(&r.OutboxID, &r.EventType, &r.Key, &r.Body); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan outbox row: %w", err)
+			}
+			claimed = append(claimed, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("read outbox rows: %w", err)
+		}
+		if len(claimed) == 0 {
+			return nil
+		}
+
+		// fn publishes. It runs while the rows are still locked and BEFORE the
+		// marking commits, so a crash mid-publish rolls the marking back and the
+		// events are re-delivered rather than lost. At-least-once, chosen
+		// deliberately: a duplicate authority.revoked ends a session that is
+		// already ending, a lost one leaves it open.
+		if err := fn(claimed); err != nil {
+			ids := make([]int64, 0, len(claimed))
+			for _, r := range claimed {
+				ids = append(ids, r.OutboxID)
+			}
+			// Recorded on the rows themselves, so a stuck event can be diagnosed
+			// from the table without correlating against logs.
+			if _, uerr := tx.Exec(ctx, `
+				UPDATE delegation_outbox
+				SET attempts = attempts + 1, last_error = $2
+				WHERE outbox_id = ANY($1)
+			`, ids, err.Error()); uerr != nil {
+				return fmt.Errorf("record publish failure: %w (original: %v)", uerr, err)
+			}
+			// Committed: the attempt count and the error are worth keeping even
+			// though the publish failed. published_at is untouched, so the rows
+			// are claimed again on the next tick.
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return fmt.Errorf("commit publish failure: %w (original: %v)", cerr, err)
+			}
+			return err
+		}
+
+		ids := make([]int64, 0, len(claimed))
+		for _, r := range claimed {
+			ids = append(ids, r.OutboxID)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE delegation_outbox SET published_at = now() WHERE outbox_id = ANY($1)
+		`, ids); err != nil {
+			return fmt.Errorf("mark published: %w", err)
+		}
+		return nil
+	})
+}
+
+// OutboxDepth reports the unpublished backlog and the age of its oldest entry.
+//
+// Both, not just the depth. A backlog of ten that is three seconds old is a
+// service under load; a backlog of ten that is an hour old is a relay that has
+// stopped, and on this service that means a revocation has not reached the
+// consumer that ends the delegate's session. Depth alone cannot tell them
+// apart, which is why the alert rule uses the age.
+func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge time.Duration, err error) {
+	err = s.withRelay(ctx, func(tx pgx.Tx) error {
+		var oldest *time.Time
+		row := tx.QueryRow(ctx, `
+			SELECT count(*), min(created_at) FROM delegation_outbox WHERE published_at IS NULL
+		`)
+		if err := row.Scan(&pending, &oldest); err != nil {
+			return fmt.Errorf("outbox depth: %w", err)
+		}
+		if oldest != nil {
+			oldestAge = time.Since(*oldest)
+		}
+		return nil
+	})
+	return pending, oldestAge, err
 }
