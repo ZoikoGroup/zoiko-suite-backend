@@ -65,6 +65,10 @@ func (a *stubAuth) add(id, tenantID, legalEntityID string, netAmount float64) {
 	a.auths[id] = paymentauthorization.Authorization{
 		AuthorizationID: id, TenantID: &tid, LegalEntityID: legalEntityID, NetAmount: netAmount,
 		Currency: "USD", Status: "APPROVED", PayeeRef: "payee-" + id,
+		// Deterministic per-authorization value so a test can assert this
+		// exact fingerprint reached BNK-06's PrepareAndSubmitRequest
+		// unchanged (Wave 11a) — never recomputed along the way.
+		ProposalFingerprint: "fp-" + id,
 	}
 	a.validity[id] = true
 }
@@ -94,14 +98,16 @@ var _ paymentauthorization.Client = (*stubAuth)(nil)
 // ── stub payment-initiation-adapter-svc (BNK-06) client ─────────────────────
 
 type stubProvider struct {
-	fail  bool
-	calls int
+	fail    bool
+	calls   int
+	lastReq provideradapter.PrepareAndSubmitRequest
 }
 
 func newStubProvider() *stubProvider { return &stubProvider{} }
 
 func (p *stubProvider) PrepareAndSubmit(_ context.Context, _, _ string, req provideradapter.PrepareAndSubmitRequest) (*provideradapter.Attempt, error) {
 	p.calls++
+	p.lastReq = req
 	if p.fail {
 		return nil, domain.ErrProviderAdapterUnavailable
 	}
@@ -513,6 +519,36 @@ func TestSubmitPaymentRun_HandsInstructionToBanking(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &listResp)
 	if listResp.Data[0].ProviderAttemptID == "" || listResp.Data[0].Bnk07PaymentID == "" {
 		t.Fatalf("expected instruction to carry real Banking correlation ids, got %+v", listResp.Data[0])
+	}
+}
+
+// TestSubmitPaymentRun_CarriesRealAuthorizationFingerprintToBanking is
+// the real, end-to-end proof of Wave 11a: the exact fingerprint
+// payment-authorization-svc reported at CreateRun time is the one BNK-06
+// receives at submission — not recomputed, not dropped, not a caller
+// placeholder — along with the authorization_id it belongs to and a
+// declared, verifiable source.
+func TestSubmitPaymentRun_CarriesRealAuthorizationFingerprintToBanking(t *testing.T) {
+	auth := newStubAuth()
+	auth.add("auth-fp-1", testTenant, testLegalEntity, 100)
+	provider := newStubProvider()
+	status := newStubStatus()
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, auth, provider, status)
+	run := createRun(t, r, []string{"auth-fp-1"})
+	validateAndLock(t, r, run.RunID)
+
+	w := doRequest(r, http.MethodPost, "/ap11/runs/"+run.RunID+"/submit", domain.SubmitRunRequest{IdempotencyKey: "idem-fp-1"}, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 submitting, got %d: %s", w.Code, w.Body.String())
+	}
+	if provider.lastReq.AuthorizationID != "auth-fp-1" {
+		t.Fatalf("expected authorization_id auth-fp-1 to reach BNK-06, got %q", provider.lastReq.AuthorizationID)
+	}
+	if provider.lastReq.AuthorizationFingerprint != "fp-auth-fp-1" {
+		t.Fatalf("expected the real fingerprint fp-auth-fp-1 to reach BNK-06 unchanged, got %q", provider.lastReq.AuthorizationFingerprint)
+	}
+	if provider.lastReq.AuthorizationSource != "PAYMENT_AUTHORIZATION_SVC" {
+		t.Fatalf("expected AuthorizationSource PAYMENT_AUTHORIZATION_SVC, got %q", provider.lastReq.AuthorizationSource)
 	}
 }
 
