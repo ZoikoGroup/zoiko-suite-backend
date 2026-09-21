@@ -66,8 +66,9 @@ func main() {
 	// internal/provideradapter's package doc.
 	provider := provideradapter.NewStubProviderAdapter()
 	treasuryClient := clients.NewTreasuryHTTPClient(cfg.TreasuryServiceURL)
+	authorizationClient := clients.NewAuthorizationHTTPClient(cfg.AuthorizationServiceURL)
 
-	h := handler.New(pgStore, publisher, authzClient, provider, treasuryClient, logger)
+	h := handler.New(pgStore, publisher, authzClient, provider, treasuryClient, authorizationClient, logger)
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

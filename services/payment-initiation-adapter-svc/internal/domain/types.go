@@ -59,6 +59,32 @@ const (
 	StatusQuarantined              AttemptStatus = "QUARANTINED"
 )
 
+// AuthorizationSourcePaymentAuthorization is the AP-10 source
+// (payment-authorization-svc) PrepareAttempt independently verifies via
+// AuthorizationClient (Wave 11a).
+//
+// AuthorizationSourceTreasury is the BNK-09 source (Wave 11b, closing the
+// carve-out AuthorizationSourcePaymentAuthorization's Wave 11a comment
+// used to document): treasury-svc's own ExecuteTreasuryTransfer now sends
+// a real fingerprint — domain.TransferFingerprint over the approved
+// transfer's identity/amount/account/checker fields — and PrepareAttempt
+// independently re-fetches and compares it against treasury-svc's
+// GetTreasuryTransferFingerprint via TreasuryClient, the same
+// live-refetch-and-compare idiom as the AP-10 path, just against a
+// different upstream.
+//
+// Any AuthorizationSource value outside these two, other than empty, is
+// rejected (ErrUnrecognizedAuthorizationSource) rather than silently
+// trusted — the two documented callers of this endpoint (payment-run-svc
+// for AP-10, treasury-svc for BNK-09) now both declare their source, so a
+// third, unrecognized one is more likely a bug or spoofing attempt than a
+// legitimate new caller. Empty remains exempted from verification for
+// backward compatibility with any caller that predates this field.
+const (
+	AuthorizationSourcePaymentAuthorization = "PAYMENT_AUTHORIZATION_SVC"
+	AuthorizationSourceTreasury             = "TREASURY_SVC"
+)
+
 func CanSubmit(s AttemptStatus) bool                 { return s == StatusPrepared }
 func CanCancelBeforeSubmission(s AttemptStatus) bool { return s == StatusPrepared }
 func CanRetry(s AttemptStatus) bool                  { return s == StatusPendingUnknown }
@@ -73,6 +99,13 @@ type PaymentInitiationAttempt struct {
 	LegalEntityID            string
 	SourceReference          string // caller's own reference (e.g. AP-11's instruction_id)
 	AuthorizationFingerprint string
+	// AuthorizationID/AuthorizationSource identify which upstream record
+	// and service AuthorizationFingerprint was derived from, so
+	// PrepareAttempt can independently re-fetch and compare it rather than
+	// trusting it as given — see AuthorizationSourcePaymentAuthorization's
+	// own doc comment.
+	AuthorizationID   string
+	AuthorizationSource string
 	PayerAccountRef          string
 	PayeeRef                 string
 	Amount                   float64
@@ -124,6 +157,8 @@ type PrepareAttemptRequest struct {
 	LegalEntityID            string
 	SourceReference          string
 	AuthorizationFingerprint string
+	AuthorizationID          string
+	AuthorizationSource      string
 	PayerAccountRef          string
 	PayeeRef                 string
 	Amount                   float64
@@ -169,4 +204,23 @@ const (
 	ErrInvalidResolution          = sentinel("resolved_status must be SUBMITTED or REJECTED_BEFORE_SUBMISSION")
 	ErrProviderAdapterUnavailable = sentinel("provider adapter unavailable")
 	ErrStoreUnavailable           = sentinel("store unavailable")
+
+	// ErrAuthorizationFingerprintRequired/Mismatch/Unavailable are Wave
+	// 11a's real fingerprint verification outcomes for an
+	// AuthorizationSourcePaymentAuthorization attempt — see
+	// clients/authorization.go.
+	ErrAuthorizationFingerprintRequired  = sentinel("authorization_fingerprint and authorization_id are required for this authorization_source")
+	ErrAuthorizationFingerprintMismatch  = sentinel("authorization_fingerprint does not match the live authorization record")
+	ErrAuthorizationServiceUnavailable   = sentinel("payment-authorization-svc unavailable")
+
+	// ErrTreasuryFingerprintMismatch/Unavailable are Wave 11b's fingerprint
+	// verification outcomes for an AuthorizationSourceTreasury attempt —
+	// see clients/treasury.go's VerifyTransferFingerprint.
+	ErrTreasuryFingerprintMismatch = sentinel("authorization_fingerprint does not match the live treasury transfer record")
+
+	// ErrUnrecognizedAuthorizationSource (Wave 11b): a non-empty
+	// authorization_source outside AuthorizationSourcePaymentAuthorization/
+	// AuthorizationSourceTreasury is refused rather than silently trusted
+	// — see this file's doc comment on those two constants.
+	ErrUnrecognizedAuthorizationSource = sentinel("unrecognized authorization_source")
 )

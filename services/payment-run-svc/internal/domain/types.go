@@ -160,9 +160,14 @@ type RunInstruction struct {
 	TenantID        *string
 	RunID           string
 	AuthorizationID string
-	PayeeRef        string
-	NetAmount       float64
-	Currency        string
+	// AuthorizationFingerprint is captured from payment-authorization-svc
+	// at CreateRun time (Wave 11a) and carried through to BNK-06's
+	// PrepareAttempt for independent re-verification there — never
+	// recomputed or trusted blindly by this service in between.
+	AuthorizationFingerprint string
+	PayeeRef                 string
+	NetAmount                float64
+	Currency                 string
 
 	Status           InstructionStatus
 	ConsumedAt       *time.Time

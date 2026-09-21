@@ -47,6 +47,7 @@ func (s *stubStore) PrepareAttempt(_ context.Context, tenantID string, req domai
 	a := &domain.PaymentInitiationAttempt{
 		AttemptID: uuid.New().String(), TenantID: strp(tenantID), LegalEntityID: req.LegalEntityID,
 		SourceReference: req.SourceReference, AuthorizationFingerprint: req.AuthorizationFingerprint,
+		AuthorizationID: req.AuthorizationID, AuthorizationSource: req.AuthorizationSource,
 		PayerAccountRef: req.PayerAccountRef, PayeeRef: req.PayeeRef, Amount: req.Amount, Currency: req.Currency,
 		ExecutionDate: req.ExecutionDate, PaymentReference: req.PaymentReference,
 		PayerAccountVerified: req.PayerAccountVerified, IdempotencyKey: req.IdempotencyKey,

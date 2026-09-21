@@ -191,4 +191,11 @@ var (
 	// line-level ConfirmMatch self-confirmation block, applied at the
 	// run/certification level.
 	ErrRunSelfCertificationForbidden = errorString("the certifying principal matched at least one line in this population and cannot also certify the run")
+
+	// ErrPeriodLocked/ErrCloseServiceUnavailable back CertifyRun's Wave 13
+	// closed-period check (internal/close's client) — certification must
+	// fail closed on either: a CLOSED/LOCKED period, or an unreachable/
+	// ambiguous financial-close-svc response.
+	ErrPeriodLocked          = errorString("the accounting period for this run's statement date is closed or locked")
+	ErrCloseServiceUnavailable = errorString("financial-close-svc unavailable")
 )

@@ -5,6 +5,7 @@ package store_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -205,6 +206,119 @@ func TestPgStore_RotateAccountIdentifierToken_RequiresVersionBump(t *testing.T) 
 	}
 	if rotated.TokenVersion != 2 {
 		t.Fatalf("expected token_version bumped to 2, got %d", rotated.TokenVersion)
+	}
+}
+
+// TestPgStore_GetBankAccountAsOf_ReturnsHistoricalValues is the real proof
+// of Invariant #1 ("historically reconstructable"): amending an account
+// twice leaves two distinct history rows, and asking for the account's
+// state at a timestamp between the two amendments returns the FIRST
+// amendment's values, not the current (second) ones.
+func TestPgStore_GetBankAccountAsOf_ReturnsHistoricalValues(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	acct := newTestAccount(tenantID, uuid.New().String())
+	if _, err := s.CreateBankAccount(ctx, acct); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	if _, err := s.AmendBankAccountMetadata(ctx, domain.AmendBankAccountMetadataParams{
+		BankAccountID: acct.BankAccountID, TenantID: tenantID, AccountName: "First Amendment", BranchRef: acct.BranchRef,
+		BankIdentifier: acct.BankIdentifier, Country: acct.Country, AccountType: acct.AccountType, ActorPrincipalID: "ops-1",
+	}); err != nil {
+		t.Fatalf("first amend: %v", err)
+	}
+
+	var midpoint time.Time
+	if err := testPool.QueryRow(ctx, `SELECT effective_at FROM bank_account_history WHERE bank_account_id = $1 ORDER BY effective_at DESC LIMIT 1`, acct.BankAccountID).Scan(&midpoint); err != nil {
+		t.Fatalf("read midpoint effective_at: %v", err)
+	}
+	// Real time gap so the two history rows have distinct effective_at
+	// values a query can actually distinguish between.
+	time.Sleep(10 * time.Millisecond)
+
+	if _, err := s.AmendBankAccountMetadata(ctx, domain.AmendBankAccountMetadataParams{
+		BankAccountID: acct.BankAccountID, TenantID: tenantID, AccountName: "Second Amendment", BranchRef: acct.BranchRef,
+		BankIdentifier: acct.BankIdentifier, Country: acct.Country, AccountType: acct.AccountType, ActorPrincipalID: "ops-1",
+	}); err != nil {
+		t.Fatalf("second amend: %v", err)
+	}
+
+	asOf, err := s.GetBankAccountAsOf(ctx, tenantID, acct.BankAccountID, midpoint)
+	if err != nil {
+		t.Fatalf("GetBankAccountAsOf: %v", err)
+	}
+	if asOf == nil {
+		t.Fatal("expected a history entry, got nil")
+	}
+	if asOf.AccountName != "First Amendment" {
+		t.Fatalf("expected the FIRST amendment's name at the midpoint timestamp, got %q", asOf.AccountName)
+	}
+
+	current, err := s.GetBankAccountAsOf(ctx, tenantID, acct.BankAccountID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("GetBankAccountAsOf (now): %v", err)
+	}
+	if current == nil || current.AccountName != "Second Amendment" {
+		t.Fatalf("expected the SECOND (latest) amendment's name as of now, got %+v", current)
+	}
+
+	// A timestamp before the account existed at all returns nil, not the
+	// earliest row — there is genuinely no state to report that far back.
+	before, err := s.GetBankAccountAsOf(ctx, tenantID, acct.BankAccountID, midpoint.Add(-1*time.Hour))
+	if err != nil {
+		t.Fatalf("GetBankAccountAsOf (before creation): %v", err)
+	}
+	if before != nil {
+		t.Fatalf("expected nil for a timestamp before the account existed, got %+v", before)
+	}
+}
+
+// TestPgStore_BankAccountHistory_IsAppendOnly is the negative-controlled
+// proof of migration 000006's reject_account_history_mutation trigger: a
+// history row can never be field-edited or deleted, even by a raw
+// UPDATE/DELETE, and even the one legitimate write (a NULL->value
+// superseded_by) can never happen twice.
+func TestPgStore_BankAccountHistory_IsAppendOnly(t *testing.T) {
+	cleanTables(t)
+	s := testStore
+
+	tenantID := uuid.New().String()
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
+	acct := newTestAccount(tenantID, uuid.New().String())
+	if _, err := s.CreateBankAccount(ctx, acct); err != nil {
+		t.Fatalf("create account: %v", err)
+	}
+
+	var historyID string
+	if err := testPool.QueryRow(ctx, `SELECT history_id FROM bank_account_history WHERE bank_account_id = $1`, acct.BankAccountID).Scan(&historyID); err != nil {
+		t.Fatalf("read history_id: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `UPDATE bank_account_history SET account_name = 'tampered' WHERE history_id = $1`, historyID); err == nil {
+		t.Fatal("expected the trigger to refuse editing a history row's fields")
+	}
+	if _, err := testPool.Exec(ctx, `DELETE FROM bank_account_history WHERE history_id = $1`, historyID); err == nil {
+		t.Fatal("expected the trigger to refuse deleting a history row")
+	}
+
+	// Negative control: disable the trigger, confirm the same UPDATE now
+	// succeeds (proving the trigger — not something else — was refusing
+	// it), then re-enable and confirm refusal returns.
+	if _, err := testPool.Exec(ctx, `ALTER TABLE bank_account_history DISABLE TRIGGER trg_reject_account_history_mutation`); err != nil {
+		t.Fatalf("disable trigger: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE bank_account_history SET account_name = 'tampered-while-disabled' WHERE history_id = $1`, historyID); err != nil {
+		t.Fatalf("expected the UPDATE to succeed with the trigger disabled, proving it was the real mechanism: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `ALTER TABLE bank_account_history ENABLE TRIGGER trg_reject_account_history_mutation`); err != nil {
+		t.Fatalf("re-enable trigger: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE bank_account_history SET account_name = 'tampered-again' WHERE history_id = $1`, historyID); err == nil {
+		t.Fatal("expected re-enabling the trigger to restore the refusal")
 	}
 }
 

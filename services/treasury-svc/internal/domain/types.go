@@ -67,6 +67,43 @@ type OwnershipEvidence struct {
 	SupersededBy          *string   `json:"superseded_by,omitempty"`
 }
 
+// AccountHistoryEntry is one append-only snapshot of a bank account's
+// mutable fields at the moment a BNK-01 command changed them — see
+// migration 000006's own doc comment. Mirrors OwnershipEvidence's
+// superseded-by shape: never edited in place, only ever superseded by the
+// next entry.
+type AccountHistoryEntry struct {
+	HistoryID               string    `json:"history_id"`
+	BankAccountID            string    `json:"bank_account_id"`
+	TenantID                 string    `json:"tenant_id"`
+	AccountName              string    `json:"account_name"`
+	MaskedAccountNumber      string    `json:"masked_account_number"`
+	BankIdentifier            string    `json:"bank_identifier"`
+	AccountStatus              string    `json:"account_status"`
+	BranchRef                    string    `json:"branch_ref"`
+	Country                       string    `json:"country"`
+	AccountType                   string    `json:"account_type"`
+	RequestedOperationalUse       string    `json:"requested_operational_use"`
+	TokenVersion                   int       `json:"token_version"`
+	ChangedByPrincipalID       string    `json:"changed_by_principal_id"`
+	EffectiveAt                  time.Time `json:"effective_at"`
+	SupersededBy                  *string   `json:"superseded_by,omitempty"`
+}
+
+// ConnectionOption is one BNK-02 connection reported for a bank account
+// via ListConnectionOptions (Wave 10d) — read-only data this service
+// never owns; sourced live from banking-connector-svc, never persisted
+// here.
+type ConnectionOption struct {
+	ConnectionID string   `json:"connection_id"`
+	ProviderRef  string   `json:"provider_ref"`
+	Status       string   `json:"status"`
+	HealthStatus string   `json:"health_status"`
+	Region       string   `json:"region"`
+	Currency     string   `json:"currency"`
+	ConsentScope []string `json:"consent_scope"`
+}
+
 // ── BNK-01 command params ───────────────────────────────────────────────────
 
 type VerifyOwnershipParams struct {
@@ -219,6 +256,9 @@ type InitiateTransferRequest struct {
 	Amount              float64 `json:"amount"`
 	CurrencyCode        string  `json:"currency_code"`
 	CorrelationID       string  `json:"correlation_id"`
+	// SaveAsDraft creates the transfer in DRAFT instead of the default
+	// PENDING_APPROVAL — see CreateTreasuryTransferParams.SaveAsDraft.
+	SaveAsDraft bool `json:"save_as_draft,omitempty"`
 }
 
 type errorString string
