@@ -120,7 +120,7 @@ type Clients interface {
 // payment-initiation-adapter-svc, general-ledger-svc and
 // intercompany-accounting-svc — see internal/clients/bnk09_clients.go.
 type TransferClients interface {
-	SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef string, amount float64, currency string) (string, error)
+	SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount float64, currency string) (string, error)
 	PostTreasuryTransferJournal(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, fiscalPeriod, transferID string, amount float64) (string, error)
 	PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error)
 }
@@ -204,6 +204,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/transfers/{transferID}/cancel", h.CancelBeforeSubmission)
 		r.Post("/transfers/{transferID}/mark-returned", h.MarkTransferReturned)
 		r.Post("/transfers/{transferID}/resolve", h.ResolveTreasuryTransfer)
+		// Wave 11b — the live fingerprint payment-initiation-adapter-svc
+		// re-fetches to verify a BNK-09-originated PrepareAttempt, same
+		// idiom as payment-authorization-svc's own GET /authorizations/{id}.
+		r.Get("/transfers/{transferID}/fingerprint", h.GetTreasuryTransferFingerprint)
 
 		// BNK-10 — see internal/handler/bnk10_handler.go.
 		r.Post("/fx/rates", h.RecordFXRate)

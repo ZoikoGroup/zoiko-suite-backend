@@ -49,10 +49,21 @@ func (a *stubAuthz) CheckAllowed(_ context.Context, _, _, _ string) error {
 // about BNK-06's treasury-svc verification) keeps working unchanged.
 // Tests that specifically exercise the real verification set err.
 
-type stubTreasury struct{ err error }
+type stubTreasury struct {
+	err            error
+	fingerprintErr error
+}
 
 func (t *stubTreasury) VerifyPayerAccount(_ context.Context, _, _, _, _ string) error {
 	return t.err
+}
+
+// VerifyTransferFingerprint (Wave 11b) uses its own independent
+// fingerprintErr field rather than reusing err — existing tests only set
+// err (for VerifyPayerAccount) and expect the treasury fingerprint check
+// to keep passing unchanged.
+func (t *stubTreasury) VerifyTransferFingerprint(_ context.Context, _, _, _ string) error {
+	return t.fingerprintErr
 }
 
 // ── stub authorization client ────────────────────────────────────────────────
@@ -266,19 +277,105 @@ func TestPrepareAttempt_AuthorizationFingerprintVerified_Succeeds(t *testing.T) 
 	}
 }
 
-// TestPrepareAttempt_UnverifiedSource_SkipsFingerprintCheck is the
-// documented Wave 11b carve-out: an attempt with no (or an unrecognized)
-// AuthorizationSource — the BNK-09/treasury-svc shape today — is not
-// rejected for lacking a verifiable fingerprint. Verifying that path is
-// explicitly deferred pending its own product decision.
-func TestPrepareAttempt_UnverifiedSource_SkipsFingerprintCheck(t *testing.T) {
+// TestPrepareAttempt_EmptySource_SkipsFingerprintCheck proves the one
+// remaining carve-out: an attempt with no AuthorizationSource at all is
+// exempted from fingerprint verification (backward compatibility with any
+// caller that predates this field), not rejected. As of Wave 11b, both of
+// this service's actual integrated callers (payment-run-svc for AP-10,
+// treasury-svc for BNK-09) now declare a real source, so this path is no
+// longer treasury-svc's shape — see the AuthorizationSourceTreasury tests
+// below for that.
+func TestPrepareAttempt_EmptySource_SkipsFingerprintCheck(t *testing.T) {
 	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
 		&stubTreasury{}, &stubAuthorization{err: domain.ErrAuthorizationFingerprintMismatch})
-	req := newPrepareReq("idem-auth-6", "treasury-transfer-payment")
-	req.AuthorizationFingerprint = "" // treasury-svc sends none today — see bnk09_clients.go
+	req := newPrepareReq("idem-auth-6", "invoice-payment")
+	req.AuthorizationFingerprint = ""
 	a := prepareAttempt(t, r, req)
 	if a.Status != domain.StatusPrepared {
-		t.Fatalf("expected PREPARED (fingerprint check skipped for an unverified source), got %s", a.Status)
+		t.Fatalf("expected PREPARED (fingerprint check skipped for an empty source), got %s", a.Status)
+	}
+}
+
+// TestPrepareAttempt_UnrecognizedSource_Rejected proves a non-empty,
+// non-recognized AuthorizationSource is refused (400) rather than
+// silently trusted like the empty case above.
+func TestPrepareAttempt_UnrecognizedSource_Rejected(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+	req := newPrepareReq("idem-auth-7", "invoice-payment")
+	req.AuthorizationSource = "SOME_OTHER_SERVICE"
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", req, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unrecognized authorization_source, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── Wave 11b: BNK-09 treasury transfer fingerprint verification ─────────────
+
+func newTreasurySourceReq(idempotencyKey string) domain.PrepareAttemptRequest {
+	req := newPrepareReq(idempotencyKey, "treasury-transfer-payment")
+	req.AuthorizationSource = domain.AuthorizationSourceTreasury
+	req.AuthorizationID = "transfer-1"
+	req.AuthorizationFingerprint = "sha256:real-transfer-fingerprint"
+	return req
+}
+
+// TestPrepareAttempt_TreasurySourceRequiresFingerprintAndID mirrors
+// TestPrepareAttempt_AuthorizationSourceRequiresFingerprintAndID for the
+// treasury path.
+func TestPrepareAttempt_TreasurySourceRequiresFingerprintAndID(t *testing.T) {
+	r := newTestRouter(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter())
+
+	missingFingerprint := newTreasurySourceReq("idem-treasury-fp-1")
+	missingFingerprint.AuthorizationFingerprint = ""
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", missingFingerprint, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with a missing fingerprint, got %d: %s", w.Code, w.Body.String())
+	}
+
+	missingID := newTreasurySourceReq("idem-treasury-fp-2")
+	missingID.AuthorizationID = ""
+	w = doRequest(r, http.MethodPost, "/bnk06/attempts/", missingID, testTenant)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 with a missing authorization_id, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_TreasuryFingerprintMismatch_Returns422 is the real
+// proof of Wave 11b: a caller-supplied fingerprint that doesn't match
+// treasury-svc's live GetTreasuryTransferFingerprint record is rejected,
+// not stored and trusted — closing the exact carve-out Wave 11a left open.
+func TestPrepareAttempt_TreasuryFingerprintMismatch_Returns422(t *testing.T) {
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{fingerprintErr: domain.ErrTreasuryFingerprintMismatch}, &stubAuthorization{})
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newTreasurySourceReq("idem-treasury-fp-3"), testTenant)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 on a treasury fingerprint mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_TreasuryFingerprintServiceUnavailable_FailsClosed
+// proves an unreachable treasury-svc blocks the attempt rather than
+// silently trusting the caller-supplied fingerprint.
+func TestPrepareAttempt_TreasuryFingerprintServiceUnavailable_FailsClosed(t *testing.T) {
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{fingerprintErr: clients.ErrTransferFingerprintUnavailable}, &stubAuthorization{})
+	w := doRequest(r, http.MethodPost, "/bnk06/attempts/", newTreasurySourceReq("idem-treasury-fp-4"), testTenant)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when treasury-svc is unreachable, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPrepareAttempt_TreasuryFingerprintVerified_Succeeds is the positive
+// control: a real, matching treasury transfer fingerprint still succeeds.
+func TestPrepareAttempt_TreasuryFingerprintVerified_Succeeds(t *testing.T) {
+	r := newTestRouterFull(newStubStore(), &stubPublisher{}, &stubAuthz{}, provideradapter.NewStubProviderAdapter(),
+		&stubTreasury{}, &stubAuthorization{})
+	a := prepareAttempt(t, r, newTreasurySourceReq("idem-treasury-fp-5"))
+	if a.Status != domain.StatusPrepared {
+		t.Fatalf("expected PREPARED, got %s", a.Status)
+	}
+	if a.AuthorizationSource != domain.AuthorizationSourceTreasury {
+		t.Fatalf("expected authorization_source to be persisted as %q, got %q", domain.AuthorizationSourceTreasury, a.AuthorizationSource)
 	}
 }
 

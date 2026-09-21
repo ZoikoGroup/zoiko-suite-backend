@@ -168,6 +168,31 @@ func (h *Handler) GetTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, transfer)
 }
 
+// GetTreasuryTransferFingerprint handles
+// GET /v1/treasury/transfers/{transferID}/fingerprint — Wave 11b's
+// service-to-service read payment-initiation-adapter-svc calls to
+// independently re-derive and compare domain.TransferFingerprint,
+// instead of trusting the fingerprint SubmitTreasuryPayment sent it.
+// Same no-extra-authz-gate posture as GetTreasuryTransfer above: tenant
+// isolation is enforced by RLS via the request's tenant context, not a
+// principal-level permission check, since this is a narrow read of
+// exactly what the caller already has (the transfer ID) plus its own
+// live status/fingerprint.
+func (h *Handler) GetTreasuryTransferFingerprint(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"transfer_id": transfer.TransferID,
+		"status":      transfer.Status,
+		"fingerprint": domain.TransferFingerprint(transfer),
+	})
+}
+
 // ApproveTreasuryTransfer handles POST /v1/treasury/transfers/{id}/approve
 // — the checker step. Self-approval and protected-field-hash mismatch are
 // both real, store-enforced rejections (domain.ErrTransferSelfApproval,
@@ -267,8 +292,14 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 	}
 
 	if transfer.Status == domain.TransferApproved {
+		// Wave 11b: computed from the transfer's live APPROVED state
+		// (still the status at this point — MarkTransferSubmitted hasn't
+		// run yet), so it matches what GetTreasuryTransferFingerprint
+		// will independently re-derive when payment-initiation-adapter-svc
+		// verifies it.
+		fingerprint := domain.TransferFingerprint(transfer)
 		attemptID, err := h.transferClients.SubmitTreasuryPayment(r.Context(), tenantID, principalID, correlationID,
-			srcAcct.LegalEntityID, transfer.TransferID, transfer.SourceBankAccountID, transfer.TargetBankAccountID, transfer.Amount, transfer.CurrencyCode)
+			srcAcct.LegalEntityID, transfer.TransferID, transfer.SourceBankAccountID, transfer.TargetBankAccountID, fingerprint, transfer.Amount, transfer.CurrencyCode)
 		if err != nil {
 			h.writeTransferErr(w, err)
 			return

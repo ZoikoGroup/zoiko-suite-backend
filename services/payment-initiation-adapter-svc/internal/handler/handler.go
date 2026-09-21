@@ -145,14 +145,15 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 
 	verifiedTenant := svcmiddleware.TenantFromContext(r.Context())
 
-	// Wave 11a: for an attempt declaring AuthorizationSourcePaymentAuthorization,
+	// Wave 11a/11b: for an attempt declaring a recognized AuthorizationSource,
 	// AuthorizationFingerprint is no longer trusted as given — it's
-	// independently re-verified against payment-authorization-svc's live
-	// record by AuthorizationID. An attempt declaring any other source
-	// (including empty — BNK-09-originated attempts, pending Wave 11b's
-	// product decision on treasury-svc's own fingerprint design) is
-	// exempted from this check, not silently rejected.
-	if req.AuthorizationSource == domain.AuthorizationSourcePaymentAuthorization {
+	// independently re-verified against that source's own live record.
+	// Empty remains exempted (backward compatibility with any caller that
+	// predates this field); any other, unrecognized value is refused
+	// rather than silently trusted — see the AuthorizationSource* doc
+	// comment in internal/domain/types.go.
+	switch req.AuthorizationSource {
+	case domain.AuthorizationSourcePaymentAuthorization:
 		if req.AuthorizationFingerprint == "" || req.AuthorizationID == "" {
 			writeError(w, http.StatusBadRequest, domain.ErrAuthorizationFingerprintRequired.Error())
 			return
@@ -166,6 +167,25 @@ func (h *Handler) PrepareAttempt(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "authorization service unavailable")
 			return
 		}
+	case domain.AuthorizationSourceTreasury:
+		if req.AuthorizationFingerprint == "" || req.AuthorizationID == "" {
+			writeError(w, http.StatusBadRequest, domain.ErrAuthorizationFingerprintRequired.Error())
+			return
+		}
+		if err := h.treasury.VerifyTransferFingerprint(r.Context(), verifiedTenant, req.AuthorizationID, req.AuthorizationFingerprint); err != nil {
+			if errors.Is(err, domain.ErrTreasuryFingerprintMismatch) {
+				writeError(w, http.StatusUnprocessableEntity, domain.ErrTreasuryFingerprintMismatch.Error())
+				return
+			}
+			h.log.Error("PrepareAttempt: treasury-svc transfer fingerprint verification failed — failing closed", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "treasury service unavailable")
+			return
+		}
+	case "":
+		// Exempted — no currently-integrated caller sends empty.
+	default:
+		writeError(w, http.StatusBadRequest, domain.ErrUnrecognizedAuthorizationSource.Error())
+		return
 	}
 
 	// PayerAccountVerified above is a caller-attested flag, not a real

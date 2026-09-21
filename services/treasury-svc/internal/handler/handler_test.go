@@ -782,7 +782,7 @@ func (m *mockClients) GetLiquidityForecastData(ctx context.Context, tenantID, le
 // HTTP-layer behavior (threshold checks, idempotency, validation).
 type mockTransferClients struct{}
 
-func (m *mockTransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef string, amount float64, currency string) (string, error) {
+func (m *mockTransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount float64, currency string) (string, error) {
 	return "attempt-stub", nil
 }
 
@@ -1615,6 +1615,106 @@ func TestHandler_ResolveTreasuryTransfer_InvalidResolution_Returns400(t *testing
 		map[string]string{"resolution": "BOGUS", "note": "x"}, "ops-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an invalid resolution, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── Wave 11b: BNK-09's own authorization fingerprint ─────────────────────────
+
+func TestHandler_GetTreasuryTransferFingerprint_IsStableAndReDerivable(t *testing.T) {
+	s := newMockStore()
+	s.transfers["t1"] = &domain.TreasuryTransfer{
+		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved,
+		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
+		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
+	}
+	r := newWave12Router(s, &mockPublisher{})
+
+	rr := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/fingerprint", nil, "usr-999")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		TransferID  string `json:"transfer_id"`
+		Status      string `json:"status"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := domain.TransferFingerprint(s.transfers["t1"])
+	if resp.Fingerprint != want || resp.Fingerprint == "" {
+		t.Fatalf("expected fingerprint=%q, got %q", want, resp.Fingerprint)
+	}
+	if resp.Status != domain.TransferApproved {
+		t.Fatalf("expected status=APPROVED, got %q", resp.Status)
+	}
+
+	// Re-fetching gives back the SAME fingerprint (deterministic, not a
+	// random/rotating value) — this is what payment-initiation-adapter-svc's
+	// independent re-derive-and-compare depends on.
+	rr2 := doTransferJSONRequest(t, r, http.MethodGet, "/v1/treasury/transfers/t1/fingerprint", nil, "usr-999")
+	var resp2 struct {
+		Fingerprint string `json:"fingerprint"`
+	}
+	_ = json.Unmarshal(rr2.Body.Bytes(), &resp2)
+	if resp2.Fingerprint != resp.Fingerprint {
+		t.Fatalf("expected the fingerprint to be stable across re-fetches, got %q then %q", resp.Fingerprint, resp2.Fingerprint)
+	}
+}
+
+// capturingTransferClients records the fingerprint ExecuteTreasuryTransfer
+// actually sends to payment-initiation-adapter-svc, so the test below can
+// prove it's exactly what GetTreasuryTransferFingerprint would
+// independently re-derive for the same APPROVED transfer state.
+type capturingTransferClients struct {
+	mockTransferClients
+	lastFingerprint string
+}
+
+func (c *capturingTransferClients) SubmitTreasuryPayment(ctx context.Context, tenantID, principalID, correlationID, legalEntityID, transferID, payerAccountRef, payeeRef, fingerprint string, amount float64, currency string) (string, error) {
+	c.lastFingerprint = fingerprint
+	return "attempt-stub", nil
+}
+
+// TestHandler_ExecuteTreasuryTransfer_SendsMatchingFingerprint is the real
+// end-to-end proof Wave 11b depends on: the fingerprint
+// ExecuteTreasuryTransfer sends to BNK-06 must be exactly what
+// GetTreasuryTransferFingerprint independently re-derives for the same
+// state, since that's what payment-initiation-adapter-svc will compare it
+// against.
+func TestHandler_ExecuteTreasuryTransfer_SendsMatchingFingerprint(t *testing.T) {
+	s := newMockStore()
+	s.bankAccounts["src-1"] = &domain.BankAccount{BankAccountID: "src-1", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+	// The expected fingerprint is computed from the transfer's APPROVED
+	// state as it exists BEFORE the request — the mock store's
+	// MarkTransferSubmitted/MarkTransferCompleted mutate the same pointer
+	// in place, so recomputing from s.transfers["t1"] after the request
+	// would silently hash the wrong (already-advanced) status.
+	approvedSnapshot := &domain.TreasuryTransfer{
+		TransferID: "t1", Status: domain.TransferApproved, Amount: 250.5, CurrencyCode: "USD",
+		SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2", CheckerPrincipalID: "checker-1",
+	}
+	want := domain.TransferFingerprint(approvedSnapshot)
+	s.transfers["t1"] = &domain.TreasuryTransfer{
+		TransferID: "t1", TenantID: "tenant-abc", Status: domain.TransferApproved,
+		Amount: 250.5, CurrencyCode: "USD", SourceBankAccountID: "src-1", TargetBankAccountID: "tgt-2",
+		MakerPrincipalID: "maker-1", CheckerPrincipalID: "checker-1",
+	}
+	tc := &capturingTransferClients{}
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, tc, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	rr := doTransferJSONRequest(t, r, http.MethodPost, "/v1/treasury/transfers/t1/execute", nil, "checker-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if tc.lastFingerprint == "" {
+		t.Fatal("expected a non-empty fingerprint to be sent to SubmitTreasuryPayment")
+	}
+	if tc.lastFingerprint != want {
+		t.Fatalf("expected SubmitTreasuryPayment to receive fingerprint=%q, got %q", want, tc.lastFingerprint)
 	}
 }
 

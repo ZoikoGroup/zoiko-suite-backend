@@ -1,6 +1,11 @@
 package domain
 
-import "time"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"time"
+)
 
 // BNK-09 Treasury Transfer: a real maker-checker flow replacing the old
 // InitiateTransfer, which only moved two internal cash_balances rows and
@@ -188,3 +193,36 @@ var (
 	ErrOnlyMakerMayModifyTransfer = errorString("only the principal who created this treasury transfer may amend, submit for approval, or cancel it")
 	ErrInvalidResolution          = errorString("resolution must be RESUBMIT or CANCEL")
 )
+
+// TransferFingerprint (Wave 11b) is treasury-svc's own analogue of
+// payment-proposal-svc's GetFingerprint (payment-proposal-svc/internal/
+// handler/handler.go:663-684): a live, re-derivable hash of "the approved
+// transfer subject" that payment-initiation-adapter-svc's PrepareAttempt
+// (Wave 11a) independently re-fetches and compares by TransferID, instead
+// of trusting a caller-supplied fingerprint outright — closing the
+// AuthorizationSource carve-out Wave 11a left open for BNK-09-originated
+// attempts.
+//
+// Field set decision: the doc names no concrete field set for BNK-09's
+// own fingerprint. Rather than invent an unrelated design, this reuses
+// exactly the fields ApproveTreasuryTransfer's own existing
+// protected_field_hash already protects (Amount, CurrencyCode,
+// SourceBankAccountID, TargetBankAccountID — see pg_store.go's
+// protectedFieldHash), plus the transfer's identity (TransferID, Status)
+// and the checker's identity (CheckerPrincipalID stands in for the plan's
+// candidate "ApprovedByPrincipalID" — there is no separate
+// approved_by_principal_id/approved_at column on treasury_transfers, and
+// checker_principal_id/status/updated_at together are what the table
+// actually records about approval, so this hashes what is real rather
+// than adding columns to match a hypothetical field list). Algorithm/
+// encoding mirrors payment-proposal-svc's GetFingerprint exactly:
+// sha256 over the pipe-joined fields, hex-encoded, "sha256:" prefixed.
+// Amount is formatted to 4 decimal places (not proposal-svc's 2) to match
+// this table's own NUMERIC(20,4) precision and protected_field_hash's
+// existing %.4f convention.
+func TransferFingerprint(t *TreasuryTransfer) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%s|%.4f|%s|%s|%s|%s",
+		t.TransferID, t.Status, t.Amount, t.CurrencyCode, t.SourceBankAccountID, t.TargetBankAccountID, t.CheckerPrincipalID)
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
