@@ -29,6 +29,7 @@ import (
 	"zoiko.io/accounts-receivable-svc/internal/ledger"
 	svcmiddleware "zoiko.io/accounts-receivable-svc/internal/middleware"
 	"zoiko.io/accounts-receivable-svc/internal/mtls"
+	"zoiko.io/accounts-receivable-svc/internal/outbox"
 	"zoiko.io/accounts-receivable-svc/internal/store"
 	"zoiko.io/accounts-receivable-svc/internal/telemetry"
 )
@@ -125,6 +126,13 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
+	// ── 4b. Transactional Outbox Relay (ZS-STATE-001 Invariant I-13) ──────────
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, log)
+	go relay.Start(relayCtx)
+
 	ledgerClient := ledger.NewHTTPClient(cfg.LedgerServiceURL)
 	entityClient := entity.NewHTTPClient(cfg.TenantRegistryURL)
 
@@ -199,6 +207,7 @@ func main() {
 		log.Fatal("server error", zap.Error(err))
 	case sig := <-quit:
 		log.Info("shutdown signal received", zap.String("signal", sig.String()))
+		cancelRelay()
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)

@@ -97,6 +97,31 @@ func (p *Publisher) PublishPaymentReceived(ctx context.Context, inv domain.Custo
 	})
 }
 
+// PublishOutbox publishes a pre-serialized outbox event envelope to Kafka with X-Event-ID header.
+func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	msg := kafka.Message{
+		Topic: p.topic,
+		Key:   []byte(aggregateID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{
+				Key:   "X-Event-ID",
+				Value: []byte(outboxEventID),
+			},
+		},
+	}
+	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		p.log.Error("failed to publish outbox event",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.String("topic", p.topic),
+			zap.Error(err),
+		)
+		return fmt.Errorf("kafka write: %w", err)
+	}
+	return nil
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {

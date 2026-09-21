@@ -32,6 +32,11 @@ func (p *stubPublisher) Publish(_ context.Context, _ events.PublishParams) error
 	return nil
 }
 
+func (p *stubPublisher) PublishOutbox(_ context.Context, _, _ string, _ []byte) error {
+	p.calls++
+	return nil
+}
+
 var _ events.Publisher = (*stubPublisher)(nil)
 
 // ── stub authz — including the own-object SoD layer ─────────────────────────
@@ -570,4 +575,41 @@ func newStubStoreFind(t *testing.T, r http.Handler, authorizationID, tenantID st
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &resp)
 	return &resp.Authorization, w
+}
+
+func TestNoSynchronousHandlerPublishing(t *testing.T) {
+	st := newStubStore()
+	pub := &stubPublisher{}
+	az := &stubAuthz{}
+	prop := newStubProposal()
+	sup := newStubSupplier()
+	pol := &stubPolicy{}
+
+	updatedAt := time.Now().UTC()
+	setupFrozenProposal(prop, sup, "prop-outbox-1", "vendor-1", updatedAt, 1000)
+	r := newTestRouter(st, pub, az, prop, sup, pol)
+
+	// 1. Request Payment Authorization
+	a := requestAuthorization(t, r, "prop-outbox-1")
+	if a.Status != domain.StatusPending {
+		t.Fatalf("expected PENDING, got %s", a.Status)
+	}
+
+	// 2. Approve Payment
+	w := doRequest(r, http.MethodPost, "/ap10/authorizations/"+a.AuthorizationID+"/approve", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on approve, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Consume Payment
+	w = doRequest(r, http.MethodPost, "/ap10/authorizations/"+a.AuthorizationID+"/consume", nil, testTenant)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on consume, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify that the synchronous publisher was NOT invoked at all from the handler.
+	// Publishing is strictly decoupled and handled asynchronously by the transactional outbox relay.
+	if pub.calls != 0 {
+		t.Fatalf("expected 0 synchronous publisher calls from handler, got %d", pub.calls)
+	}
 }
