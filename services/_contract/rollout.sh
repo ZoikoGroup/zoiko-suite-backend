@@ -69,7 +69,7 @@ key-management-svc secret-vault-integration-svc mtls-management-svc \
 counterparty-management-svc vendor-due-diligence-svc banking-connector-svc \
 treasury-svc corporate-tax-svc vat-gst-svc withholding-tax-svc tax-determination-svc \
 tax-authority-interface-svc evidence-manifest-svc governance-decision-log-svc \
-audit-event-store-svc hris-connector-svc"
+audit-event-store-svc hris-connector-svc search-indexer-svc"
 
 # Services that post to, or report from, an accounting book (INV-03).
 #

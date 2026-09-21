@@ -44,3 +44,9 @@ tools/servicectl/servicectl.exe
 # by explicit request — large (tens of MB total), not yet reviewed for
 # what should be extracted/kept vs. superseded.
 docs/original_doc/*.docx
+
+# Go build scratch used by services/*/scripts/audit.sh.
+# GOTMPDIR is moved off the system temp path because Windows Application
+# Control intermittently blocks a freshly linked test binary there — a scan
+# race, not a test failure.
+.gotmp/

@@ -412,6 +412,39 @@ $BUNDLES = @(
         Code    = "RETENTION_FULL"
         Service = "retention-registry-svc"
         Actions = @("RETENTION_POLICY_CREATE", "LEGAL_HOLD_CREATE", "LEGAL_HOLD_RELEASE")
+    },
+    @{
+        # search-indexer-svc (ZS-SVC-AB-001 ESR-01..ESR-05). Its CONTROL plane
+        # -- registering a source, drafting and publishing a contract, building
+        # and activating an index generation -- authorizes against the PLATFORM
+        # scope, not a legal entity: a search contract describes a shape shared
+        # by every tenant, and a generation is one physical index serving all of
+        # them, so a tenant-scoped grant must not be able to change what every
+        # other tenant can search.
+        #
+        # SEARCH_GENERATION_ACTIVATE is a separate action from
+        # SEARCH_GENERATION_CREATE on purpose. Building a generation is routine
+        # and touches nothing anyone is querying; ACTIVATING one changes what
+        # every caller sees in a single atomic alias swap. They are in the same
+        # bundle here because this seeds a DEVELOPMENT stack, exactly as
+        # RETENTION_FULL pairs create and release -- in a real deployment they
+        # are the pair you would want held by different people.
+        #
+        # SEARCH_EXPORT is in this bundle and is NOT implied by the ability to
+        # search. INV-29: "search exports/downloads require separate export
+        # authorization; search permission does not imply bulk-exfiltration
+        # permission." A principal that can search but holds no SEARCH_EXPORT
+        # gets a correct ESR-016 from /v1/search-exports.
+        #
+        # SEARCH_RESTRICTION_APPLY is the erasure/disposition path PRV and DRC
+        # call to remove search visibility for a specific record.
+        Code    = "SEARCH_FULL"
+        Service = "search-indexer-svc"
+        Actions = @(
+            "SEARCH_SOURCE_REGISTER", "SEARCH_CONTRACT_CREATE", "SEARCH_CONTRACT_TRANSITION",
+            "SEARCH_GENERATION_CREATE", "SEARCH_GENERATION_ACTIVATE",
+            "SEARCH_RESTRICTION_APPLY", "SEARCH_EXPORT"
+        )
     }
 )
 
@@ -435,7 +468,12 @@ $PLATFORM_SCOPED_ACTION_CODES = @(
     # retention-registry-svc falls back to the platform scope when a hold or
     # policy names no tenant -- the console offers that as a "platform-wide"
     # checkbox, so the grant has to exist on that scope too.
-    "RETENTION_FULL")
+    "RETENTION_FULL",
+    # search-indexer-svc's whole control plane authorizes against the platform
+    # scope. A grant made only on the legal entity would be invisible to every
+    # one of its checks -- silently, and fail-closed, so it would read as
+    # "no_grant" rather than as a scope mismatch.
+    "SEARCH_FULL")
 $PLATFORM_SCOPED_ACTIONS = $BUNDLES |
     Where-Object { $PLATFORM_SCOPED_ACTION_CODES -contains $_.Code } |
     ForEach-Object { $_.Actions }

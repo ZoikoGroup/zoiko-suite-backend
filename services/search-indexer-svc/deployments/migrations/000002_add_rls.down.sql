@@ -1,0 +1,10 @@
+DROP POLICY IF EXISTS tenant_isolation_policy ON search_evidence;
+DROP POLICY IF EXISTS tenant_isolation_policy ON restriction_tombstones;
+DROP POLICY IF EXISTS tenant_isolation_policy ON projection_ledger;
+ALTER TABLE search_evidence        NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE restriction_tombstones NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE projection_ledger      NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE search_evidence        DISABLE ROW LEVEL SECURITY;
+ALTER TABLE restriction_tombstones DISABLE ROW LEVEL SECURITY;
+ALTER TABLE projection_ledger      DISABLE ROW LEVEL SECURITY;
+DROP FUNCTION IF EXISTS search_indexer_platform_scope();

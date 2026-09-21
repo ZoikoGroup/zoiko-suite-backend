@@ -54,6 +54,7 @@ services:
       - ../services/workflow-svc/deployments/migrations:/migrations/workflow:ro
       - ../services/configuration-feature-flag-svc/deployments/migrations:/migrations/configuration-feature-flag:ro
       - ../services/secret-vault-integration-svc/deployments/migrations:/migrations/secret-vault-integration:ro
+      - ../services/search-indexer-svc/deployments/migrations:/migrations/search-indexer:ro
       - ../services/obligations-svc/deployments/migrations:/migrations/obligations:ro
       - ../services/schema-registry-svc/deployments/migrations:/migrations/schema-registry:ro
       - ../services/document-vault-svc/deployments/migrations:/migrations/document-vault:ro
@@ -666,13 +667,18 @@ services:
       # Bounded stale window for NON-MATERIAL READS only, while the registry is
       # unreachable. Writes are never served from a stale context.
       TENANT_CONTEXT_STALE_GRACE_SECONDS: "120"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
       identity-svc:
         condition: service_healthy
       tenant-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8092/healthz"]
+      # readyz, not healthz. Liveness here answers 200 whenever the process is
+      # up and checks nothing, so with an unreachable JWKS endpoint the
+      # container reported healthy while refusing every request in the estate.
+      # readyz actually pings identity-context-svc's key set.
+      test: ["CMD", "/healthcheck", "http://localhost:8092/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -1419,40 +1425,82 @@ services:
       start_period: 10s
     restart: on-failure
 
-  # ── Search Indexer (Port: 8096) ────────────────────────────────────────────
-  # Reads obligations via the real obligations-svc HTTP API (never its DB)
-  # and upserts them into OpenSearch. First real search-layer integration.
-  # Adding a second consumer (audit, documents) requires only a new syncer
-  # goroutine — see services/search-indexer-svc/README.md.
+  # ── Search Indexer / ESR control plane (Port: 8096) ────────────────────────
+  # ZS-SVC-AB-001 ESR-01..ESR-05: the source and contract registry, the secure
+  # indexing and restriction-propagation pipeline, the query planner with its
+  # mandatory filters, the re-authorizing retrieval path, and the index
+  # generation lifecycle.
+  #
+  # It CONSUMES DOMAIN EVENTS. It used to poll obligations-svc over HTTP, which
+  # could never work (tracker row 65a: the poll was headerless against an
+  # endpoint that requires a verified tenant, so every cycle 401'd and the index
+  # was never populated) and could not be fixed by adding a header, because the
+  # poll was deliberately cross-tenant. Events carry tenant_id in their envelope,
+  # so no cross-tenant read privilege is needed at all. Onboarding a domain is a
+  # POST to /v1/search-sources, not a redeploy.
   search-indexer-svc:
     build:
       context: ..
       dockerfile: services/search-indexer-svc/Dockerfile
     container_name: search-indexer-svc
-    mem_limit: 256m
+    mem_limit: 512m
     cpus: "0.5"
     ports:
       - "8096:8096"
     environment:
+      ENV: "local"
       PORT: "8096"
-      OBLIGATIONS_SVC_URL: "http://obligations-svc:8088"
-      TENANT_SVC_URL: "http://tenant-svc:8081"
+      DB_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_NAME: "search_indexer"
+      DB_USER: "${POSTGRES_USER:-postgres}"
+      DB_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+      DB_SSLMODE: "disable"
+      # Topics are resolved at runtime from the registered search sources, so
+      # onboarding a domain is a registration rather than a redeploy; this
+      # bootstrap list only seeds the set before any source exists.
+      KAFKA_BROKERS: "kafka:9094"
+      KAFKA_GROUP_ID: "search-indexer-svc"
+      KAFKA_BOOTSTRAP_TOPICS: ""
       OPENSEARCH_ADDRESSES: "http://opensearch:9200"
-      SYNC_INTERVAL: "60s"
+      AUTHZ_SERVICE_URL: "http://authorization-svc:8089"
+      # The one platform-scope id the whole estate shares, and the same id
+      # seed-demo-rbac.ps1 grants SEARCH_FULL against. A service that invented
+      # its own would have its grants seeded against one id and its checks made
+      # against another — silently, and fail-closed, so it reads as "no_grant"
+      # rather than as a scope mismatch (tracker row 67).
+      AUTHZ_PLATFORM_SCOPE_ID: "00000000-0000-0000-0000-00000000f001"
+      # Signs pagination cursors (NP-57). A development value here; outside
+      # local the service refuses to start without one, because a cursor signed
+      # with a key that lives in this repository is not signed.
+      CURSOR_SIGNING_KEY_HEX: "6465762d6f6e6c792d637572736f722d6b65792d6e6f742d666f722d70726f64756374696f6e"
+      # Strict rather than the write-strict default: ESR-001
+      # TENANT_CONTEXT_MISSING has to be a hard refusal on READS too, and every
+      # route here is a governed retrieval.
+      ZS_ENVELOPE_ENFORCEMENT: "strict"
+      RESTRICTION_VERIFY_INTERVAL: "30s"
+      CHECKPOINT_INTERVAL: "60s"
+      MAX_RESULT_WINDOW: "100"
+      FACET_MIN_COUNT: "2"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
     depends_on:
+      postgres:
+        condition: service_healthy
       opensearch:
         condition: service_healthy
-      obligations-svc:
+      kafka:
         condition: service_healthy
-      tenant-svc:
+      authorization-svc:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "/healthcheck", "http://localhost:8096/healthz"]
+      # /readyz, not /healthz. Liveness here says only that the process is
+      # running; a search plane whose engine or database is unreachable answers
+      # every query with an error and must leave rotation.
+      test: ["CMD", "/healthcheck", "http://localhost:8096/readyz"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 15s
+      start_period: 20s
     restart: on-failure
 
   # ── Phase 2: Workflow History Service (Port: 8097) ───────────────────────────

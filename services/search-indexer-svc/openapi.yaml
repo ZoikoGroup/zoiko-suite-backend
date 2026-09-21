@@ -1,0 +1,1050 @@
+openapi: 3.0.3
+
+# ZS-SVC-AB-001 §11.1 canonical APIs, as implemented.
+#
+# Two things about this document are deliberate and worth stating up front,
+# because both look like omissions:
+#
+#   1. NO REQUEST BODY CARRIES tenant_id, actor, purpose OR residency. They
+#      are resolved from the verified envelope headers and never from the
+#      body. NP-01 is "client supplies another tenant_id in body → reject/
+#      ignore client tenant; trusted context wins", and the cheapest way to
+#      honour that is to give the body nowhere to put one — the service's
+#      decoder additionally refuses unknown fields, so a caller that tries is
+#      refused rather than silently ignored.
+#
+#   2. EVERY ERROR CARRIES A §11.3 REASON CODE. A caller branches on
+#      `reason_code`, never on `detail`, and the canonical `reason` travels
+#      alongside so a human reading a response in a terminal does not need the
+#      §11.3 table.
+
+info:
+  title: search-indexer-svc — Enterprise Search, Indexing, Query & Secure Retrieval
+  version: "1.0.0"
+  description: |
+    ESR-01 through ESR-05 of ZS-SVC-AB-001.
+
+    Search is a rebuildable, policy-bound projection over authoritative
+    sources. An index entry never becomes source-of-truth authority and never
+    grants access (INV-01, INV-06). Every material retrieval is tenant-scoped,
+    purpose-aware, re-authorized against current policy, and traceable to its
+    authoritative source.
+
+servers:
+  - url: http://localhost:8096
+    description: Local development (direct port)
+  - url: http://localhost:8000/search-indexer-svc
+    description: Through the Traefik gateway
+
+tags:
+  - name: Search
+    description: Tenant-plane governed retrieval
+  - name: Restrictions
+    description: Priority visibility removal and its verification
+  - name: Registry
+    description: ESR-01 control plane — sources and index contracts
+  - name: Lifecycle
+    description: ESR-05 control plane — index generations and checkpoints
+  - name: Operations
+    description: Health and metrics
+
+paths:
+  /healthz:
+    get:
+      tags: [Operations]
+      summary: Liveness
+      description: |
+        Checks nothing on purpose. A liveness probe that consulted the database
+        would have the orchestrator restart every instance during a failover,
+        turning a recoverable dependency outage into a restart storm.
+      security: []
+      responses:
+        "200":
+          description: The process is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: healthy }
+
+  /readyz:
+    get:
+      tags: [Operations]
+      summary: Readiness, with per-dependency detail
+      description: |
+        Postgres and OpenSearch are CRITICAL — a search plane that cannot reach
+        its engine answers every query with an error. Alias consistency is
+        reported but NOT critical: drift means the alias and the control plane
+        disagree about which generation serves, and taking the instance out of
+        rotation would replace a correctness incident with an availability one.
+      security: []
+      responses:
+        "200":
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+        "503":
+          description: Not ready — see `checks` for which dependency failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Readiness" }
+
+  /metrics:
+    get:
+      tags: [Operations]
+      summary: Prometheus scrape
+      security: []
+      responses:
+        "200": { description: Prometheus exposition format }
+
+  # ── Tenant plane ──────────────────────────────────────────────────────────
+
+  /v1/search:
+    post:
+      tags: [Search]
+      summary: Execute a governed search
+      description: |
+        Runs §1.3's decision ordering: identity, purpose, scope, eligible
+        partitions, mandatory filters, bounded execution, per-result
+        re-authorization, snippet and facet policy.
+
+        Answers **206 Partial Content**, not 200, whenever the result set is
+        not exhaustive — an engine shard failure, a candidate whose
+        authorization could not be obtained, or a result that could not be
+        hydrated. INV-24 requires partial results to be explicit, and a status
+        code is the one part of a response a caller cannot overlook.
+
+        An evidence row is written on EVERY path, including refusals. An
+        evidence table that only recorded successful searches could not answer
+        "what was this actor trying to reach".
+      operationId: search
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: Complete result set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "206":
+          description: |
+            PARTIAL or DEGRADED. `completeness_state` and
+            `completeness_detail` say why; `suppressions` says how many
+            candidates were withheld and under which reason code, without
+            naming them (TC-06).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400":
+          description: ESR-003/004/005/006/015 — the request was refused
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "401":
+          description: ESR-001 TENANT_CONTEXT_MISSING
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "403":
+          description: ESR-007 PARTITION_NOT_AUTHORIZED / ESR-009 PRIVACY_PURPOSE_BLOCKED
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "404":
+          description: ESR-002 SCOPE_NOT_REGISTERED / ESR-011 INDEX_GENERATION_NOT_ACTIVE
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "503":
+          description: ESR-008 AUTHORIZATION_INDETERMINATE — failing closed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+
+  /v1/retrieve:
+    post:
+      tags: [Search]
+      summary: Re-authorize and hydrate specific candidate refs
+      description: |
+        Compiles a plan with the same mandatory tenant, residency and tombstone
+        filters as a search — it is not a short-circuit to a raw engine get.
+        A second code path fetching by id would be a second place for those
+        filters to be forgotten, which is how an insecure direct object
+        reference gets in (§9.1).
+
+        Bounded at 50 refs. A caller that could name 10 000 has
+        bulk-exfiltration capability whatever the route is called (INV-29), so
+        a larger population is refused with ESR-016.
+      operationId: retrieve
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RetrieveRequest" }
+      responses:
+        "200":
+          description: All named refs authorized and returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "206":
+          description: Some refs were suppressed or could not be hydrated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400":
+          description: ESR-016 — too many refs; use an authorized export
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+
+  /v1/scopes:
+    get:
+      tags: [Search]
+      summary: Search surfaces and their field capabilities
+      description: |
+        Contract metadata only. No counts and no per-tenant state: a scope
+        listing that said how many documents a tenant has would be a
+        cardinality disclosure made before any query was authorized (§7.3).
+
+        SECRET_PROHIBITED fields are absent entirely — NP-53's "reject without
+        leaking field existence" applies to the catalogue as much as to a sort
+        refusal.
+      operationId: listScopes
+      responses:
+        "200":
+          description: Published scopes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  scopes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Scope" }
+
+  /v1/restrictions:
+    post:
+      tags: [Restrictions]
+      summary: Apply a priority visibility removal
+      description: |
+        The HTTP twin of the event-driven restriction lane, for callers with no
+        event to emit — PRV's erasure workflow and DRC's disposition both need
+        to remove search visibility for a specific record on request, and
+        waiting for a domain event that may never come is not an answer to an
+        erasure obligation.
+
+        Applied to the index immediately rather than queued: §8.2 says
+        visibility-reducing events outrank normal indexing backlog.
+
+        Answers **APPLIED**, never VERIFIED. §2.2 is explicit that APPLIED is
+        not VERIFIED until search visibility has actually been tested; poll
+        `GET /v1/restrictions` for the verified state.
+      operationId: applyRestriction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RestrictionRequest" }
+      responses:
+        "200":
+          description: |
+            Idempotent replay of the same `source_event_id` — the end state the
+            caller wanted is already in place (NP-47).
+        "202":
+          description: Applied to the index; verification pending
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RestrictionResult" }
+        "409":
+          description: |
+            ESR-013 RESTRICTION_EPOCH_MISMATCH — the restriction is older than
+            one already applied (NP-11/NP-48). A 409 rather than a 200 because
+            a privacy workflow must not record an erasure that was declined.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+        "503":
+          description: Recorded, but the index write failed; the verifier will retry
+    get:
+      tags: [Restrictions]
+      summary: Restriction propagation state for this tenant
+      operationId: listRestrictions
+      parameters:
+        - { name: scope, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 500 } }
+      responses:
+        "200":
+          description: Tombstones and their propagation state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  restrictions:
+                    type: array
+                    items: { $ref: "#/components/schemas/Tombstone" }
+
+  /v1/search-exports:
+    post:
+      tags: [Search]
+      summary: Request a controlled export of an authorized result set
+      description: |
+        Requires the `SEARCH_EXPORT` action and its OWN reason. INV-29: search
+        permission does not imply bulk-exfiltration permission, and NP-29 is
+        the same rule stated as an attack.
+
+        **Records authorization and population; transfers nothing.** Wiring a
+        bulk writer needs the OD-13 decision on export maximums and async
+        thresholds, so this answers 202 with the recorded authorization rather
+        than inventing a limit.
+      operationId: requestExport
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, reason]
+              properties:
+                scope: { type: string }
+                reason:
+                  type: string
+                  description: The export's own reason. Search purpose does not carry over.
+                max_records: { type: integer }
+      responses:
+        "202":
+          description: Export authorized and recorded as evidence
+        "400":
+          description: No reason given
+        "403":
+          description: ESR-016 EXPORT_AUTHORIZATION_REQUIRED
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+
+  /v1/search-evidence:
+    get:
+      tags: [Search]
+      summary: This tenant's search evidence
+      description: |
+        Carries a **digest** of each query, never its text. INV-17 and §9.2:
+        search text is personal data when it can reveal a person, condition,
+        employment matter, legal issue or financial fact, and a table of
+        everyone's queries is one of the most sensitive things a platform can
+        accumulate.
+      operationId: listEvidence
+      parameters:
+        - { name: scope, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, maximum: 500 } }
+      responses:
+        "200":
+          description: Evidence rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  evidence:
+                    type: array
+                    items: { $ref: "#/components/schemas/Evidence" }
+
+  # ── Control plane ─────────────────────────────────────────────────────────
+
+  /v1/search-sources:
+    post:
+      tags: [Registry]
+      summary: Register a searchable source
+      description: |
+        **Platform-scoped.** A source describes a shape shared by every tenant,
+        so authorizing this against the caller's own legal entity would let a
+        tenant-scoped grant change what every other tenant can search.
+
+        `SECRET_PROHIBITED` is not accepted as a sensitivity ceiling: INV-09
+        says such content never enters a search index, so a source with that
+        ceiling could have no legal contract at all.
+      operationId: createSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSourceRequest" }
+      responses:
+        "201":
+          description: Registered; its topic is subscribed within 30 seconds
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Source" }
+        "400": { description: Missing event types, or a prohibited ceiling }
+        "403": { description: Principal lacks SEARCH_SOURCE_REGISTER }
+        "409": { description: That source_type is already registered }
+        "503": { description: Authorization unavailable — failing closed }
+    get:
+      tags: [Registry]
+      summary: List registered sources
+      operationId: listSources
+      responses:
+        "200":
+          description: Sources
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sources:
+                    type: array
+                    items: { $ref: "#/components/schemas/Source" }
+
+  /v1/index-contracts:
+    post:
+      tags: [Registry]
+      summary: Draft an index contract version
+      description: |
+        **Always created DRAFT.** §4.2's publication gates — source owner,
+        Security, Privacy/Records and Search Platform approval — are a human
+        workflow this service cannot perform, so it cannot create a published
+        contract in one call however complete the request is.
+
+        Field rules enforced here AND in the database:
+        * `snippet_allowed` requires `returnable` and `searchable` (INV-13)
+        * `SECRET_PROHIBITED` may be declared but never exposed (INV-09)
+        * no field may exceed its source's sensitivity ceiling (§4.1)
+        * `R0` cannot carry anything above INTERNAL (§7.1)
+        * governance field names are reserved (INV-02)
+      operationId: createContract
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateContractRequest" }
+      responses:
+        "201":
+          description: Draft contract
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Contract" }
+        "400": { description: The field contract is invalid — `detail` says which rule }
+        "403": { description: Principal lacks SEARCH_CONTRACT_CREATE }
+        "404": { description: source_type is not registered }
+    get:
+      tags: [Registry]
+      summary: List contracts
+      operationId: listContracts
+      parameters:
+        - { name: scope, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Contracts with their fields
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contracts:
+                    type: array
+                    items: { $ref: "#/components/schemas/Contract" }
+
+  /v1/index-contracts/{contractID}:
+    get:
+      tags: [Registry]
+      summary: One contract with its field definitions
+      operationId: getContract
+      parameters:
+        - { name: contractID, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Contract
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Contract" }
+        "404": { description: No such contract }
+
+  /v1/index-contracts/{contractID}/state:
+    post:
+      tags: [Registry]
+      summary: Move a contract through its publication states
+      description: |
+        `DRAFT → CERTIFIED → PUBLISHED → RETIRED`. Only one PUBLISHED version
+        per scope may exist at a time, enforced by a partial unique index — two
+        would let a generation build from either, and §4.2's gate would have
+        certified a field set that is not the one being built.
+      operationId: transitionContract
+      parameters:
+        - { name: contractID, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [state]
+              properties:
+                state: { type: string, enum: [DRAFT, CERTIFIED, PUBLISHED, RETIRED] }
+                note: { type: string }
+      responses:
+        "200":
+          description: Transitioned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Contract" }
+        "409": { description: Illegal transition, or another version is already PUBLISHED }
+
+  /v1/index-generations:
+    post:
+      tags: [Lifecycle]
+      summary: Plan and build a new index generation
+      description: |
+        Creates the concrete engine index with a **strict** mapping derived
+        from the PUBLISHED contract, then moves PLANNED → BUILDING. Everything
+        after BUILDING is a separate, separately-authorized transition — above
+        all ACTIVE, which §8.1 requires to be reached only from READY.
+      operationId: createGeneration
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope]
+              properties:
+                scope: { type: string }
+      responses:
+        "201":
+          description: Generation created and BUILDING
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Generation" }
+        "409": { description: The scope has no PUBLISHED contract to build from }
+    get:
+      tags: [Lifecycle]
+      summary: List generations
+      operationId: listGenerations
+      parameters:
+        - { name: scope, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Generations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  generations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Generation" }
+
+  /v1/index-generations/{generationID}/state:
+    post:
+      tags: [Lifecycle]
+      summary: Drive the §8.1 generation lifecycle
+      description: |
+        `PLANNED → BUILDING → VALIDATING → READY → ACTIVE → RETIRED`.
+
+        **VALIDATING → READY runs real validation**, not a state write:
+        * cross-tenant contamination — any document with no `tenant_id` fails
+          the generation outright (NP-41)
+        * completeness against the control-plane ledger, which counted
+          independently of the index (NP-18)
+
+        **→ ACTIVE swaps the alias atomically**, engine first. If the swap
+        succeeds and the state write fails, the alias points at a generation
+        the control plane does not call ACTIVE — detectable drift, caught by
+        `/readyz`. The other order gives a control plane that claims ACTIVE
+        while the alias still serves the old generation: silently wrong, and
+        correct-looking from every API.
+
+        Requires `SEARCH_GENERATION_ACTIVATE` rather than
+        `SEARCH_GENERATION_CREATE` for ACTIVE and RETIRED — building is
+        routine, cutting over is not.
+      operationId: transitionGeneration
+      parameters:
+        - { name: generationID, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [state]
+              properties:
+                state:
+                  type: string
+                  enum: [BUILDING, VALIDATING, READY, ACTIVE, FAILED, RETIRED]
+                note: { type: string }
+      responses:
+        "200":
+          description: Transitioned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Generation" }
+        "409":
+          description: |
+            Illegal transition; ESR-017 REINDEX_VALIDATION_FAILED; another
+            generation is already ACTIVE; or an attempt to retire the serving
+            generation before its replacement is active.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReasonedError" }
+
+  /v1/checkpoints:
+    get:
+      tags: [Lifecycle]
+      summary: Index freshness and population
+      description: |
+        §5.3's completeness certification. `indexed_live` comes from the
+        control-plane ledger, which counted independently of the index — that
+        independence is what makes NP-17 ("checkpoint falsely advances past
+        missing events") detectable at all.
+      operationId: listCheckpoints
+      parameters:
+        - { name: scope, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Checkpoints
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  checkpoints:
+                    type: array
+                    items: { $ref: "#/components/schemas/Checkpoint" }
+
+components:
+  securitySchemes:
+    envelope:
+      type: apiKey
+      in: header
+      name: X-Tenant-Id
+      description: |
+        The ZoikoSuite Canonical Service Input Contract (ZS-ARCH-SVC-001 §4).
+        This service runs the envelope middleware in STRICT mode, so every
+        route requires the full set on reads as well as writes — ESR-001
+        TENANT_CONTEXT_MISSING has to be a hard refusal for a search plane.
+
+        Mandatory: `X-Tenant-Id`, `X-Principal-Id` (or `X-Workload-Id`),
+        `X-Request-Id`, `X-Correlation-ID`, `X-Source-Channel`,
+        `X-Purpose-Context`, and `Idempotency-Key` on POST.
+
+        In production Traefik's ForwardAuth sets these from gateway-auth-svc's
+        verified identity envelope and strips any inbound copies.
+
+  schemas:
+    ReasonedError:
+      type: object
+      description: Every refusal carries its §11.3 reason code and canonical meaning.
+      properties:
+        error: { type: string, example: search_refused }
+        detail: { type: string }
+        reason_code:
+          type: string
+          example: ESR-006
+          enum: [ESR-001, ESR-002, ESR-003, ESR-004, ESR-005, ESR-006, ESR-007,
+                 ESR-008, ESR-009, ESR-010, ESR-011, ESR-012, ESR-013, ESR-014,
+                 ESR-015, ESR-016, ESR-017, ESR-018, ESR-019, ESR-020]
+        reason: { type: string, example: FIELD_NOT_RETURNABLE }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+          example:
+            bootstrap: ok
+            postgres: ok
+            opensearch: ok
+            alias_consistency: ok
+
+    SearchRequest:
+      type: object
+      required: [scope]
+      description: |
+        Note the absence of tenant_id, actor and purpose — they come from the
+        verified envelope. Unknown fields are REFUSED, not ignored: a caller
+        that sent tenant_id would otherwise read an empty result as "that
+        tenant has no data" rather than "my request was not honoured".
+      properties:
+        scope:
+          type: string
+          description: A registered search surface, e.g. `obligation`.
+        query:
+          type: string
+          description: |
+            Free text. Minimum 2 characters after Unicode NFKC normalisation
+            (NP-54). Wildcards, fuzzy operators, regex and engine identifiers
+            are refused with ESR-003 — this service accepts no engine query
+            language, so passing one through as literal text would be a
+            silently wrong answer.
+        filters:
+          type: object
+          additionalProperties: { type: string }
+          description: Exact-match narrowing over registered filterable fields.
+        requested_fields:
+          type: array
+          items: { type: string }
+          description: |
+            Allowlisted projection. Omitted, the caller gets governance lineage
+            plus the contract's returnable fields — never the whole document.
+        facets:
+          type: array
+          items: { type: string }
+          description: Registered facetable fields. Computed inside the mandatory filters only.
+        sort:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              desc: { type: boolean }
+        size: { type: integer, maximum: 100 }
+        cursor:
+          type: string
+          description: |
+            Opaque, HMAC-signed, and bound to the tenant, scope and exact plan
+            that produced it. Editing it fails integrity validation (NP-57);
+            reusing it after changing the query fails plan binding (NP-56).
+        include_snippets: { type: boolean }
+
+    SearchResponse:
+      type: object
+      properties:
+        scope: { type: string }
+        results:
+          type: array
+          items: { $ref: "#/components/schemas/Result" }
+        facets:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              properties:
+                value: { type: string }
+                count: { type: integer }
+        suppressions:
+          type: array
+          description: |
+            Reason codes and counts only. TC-06: a suppressed result can emit a
+            non-sensitive reason code without revealing forbidden existence
+            details, so nothing here names what was withheld.
+          items:
+            type: object
+            properties:
+              reason_code: { type: string }
+              meaning: { type: string }
+              count: { type: integer }
+        completeness_state:
+          type: string
+          enum: [COMPLETE, PARTIAL, DEGRADED, UNKNOWN]
+        completeness_detail: { type: string }
+        total: { type: integer }
+        total_is_exact:
+          type: boolean
+          description: |
+            False once anything was suppressed. The engine's count is reported
+            as-is and flagged rather than adjusted downward — subtracting the
+            suppressions would tell the caller exactly how many results it was
+            not allowed to see (NP-40, §7.3).
+        next_cursor: { type: string }
+        index_generation: { type: string }
+        reason_codes:
+          type: array
+          items: { type: string }
+
+    Result:
+      type: object
+      properties:
+        source_type: { type: string }
+        source_id: { type: string }
+        source_version: { type: integer }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        score: { type: number }
+        index_generation:
+          type: string
+          description: TC-02 — answerable from the result itself.
+        indexed_at: { type: string, format: date-time }
+        retrieval_class: { type: string, enum: [R0, R1, R2, R3] }
+        fields:
+          type: object
+          additionalProperties: true
+        snippets:
+          type: object
+          description: |
+            HTML-escaped, with only this service's own `<mark>` tags as markup.
+            Stored source markup is escaped to visible text first and cannot
+            execute in a client (NP-24, §7.2).
+          additionalProperties:
+            type: array
+            items: { type: string }
+        freshness:
+          type: string
+          enum: [INDEX, SOURCE]
+          description: |
+            `SOURCE` means the content was hydrated from the authoritative
+            record (R2); `INDEX` means it is the projection's view. §7.1 does
+            not let index content be trusted as a current display value for
+            material records, so a caller has to be able to tell which it got.
+
+    RetrieveRequest:
+      type: object
+      required: [scope, refs]
+      properties:
+        scope: { type: string }
+        refs:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            properties:
+              source_type: { type: string }
+              source_id: { type: string }
+
+    RestrictionRequest:
+      type: object
+      required: [scope, source_type, source_id, reason, source_event_id]
+      properties:
+        scope: { type: string }
+        source_type: { type: string }
+        source_id: { type: string }
+        reason: { type: string, example: PRV_ERASURE }
+        source_event_id:
+          type: string
+          description: |
+            The authoritative source event this restriction derives from.
+            Required, not generated: it is the idempotency key that makes a
+            replayed erasure a no-op rather than a second tombstone (NP-47).
+
+    RestrictionResult:
+      type: object
+      properties:
+        applied: { type: boolean }
+        state: { type: string, enum: [PENDING, APPLIED, VERIFIED, FAILED] }
+        epoch: { type: integer }
+        verified: { type: boolean }
+        verified_note: { type: string }
+
+    Tombstone:
+      type: object
+      properties:
+        tenant_id: { type: string }
+        scope_name: { type: string }
+        source_type: { type: string }
+        source_id: { type: string }
+        reason: { type: string }
+        epoch: { type: integer }
+        source_event_id: { type: string }
+        effective_at: { type: string, format: date-time }
+        propagated_at: { type: string, format: date-time, nullable: true }
+        verified_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            When invisibility was PROVEN (TC-08). Distinct from propagated_at:
+            §2.2 says APPLIED is not VERIFIED until search visibility has been
+            tested, and NP-60 forbids relabelling an unproven state as a pass.
+        state: { type: string, enum: [PENDING, APPLIED, VERIFIED, FAILED] }
+        failure_reason: { type: string }
+
+    Evidence:
+      type: object
+      properties:
+        evidence_id: { type: string, format: uuid }
+        request_id: { type: string }
+        correlation_id: { type: string }
+        tenant_id: { type: string }
+        actor_id: { type: string }
+        workload_id: { type: string }
+        purpose_context: { type: string }
+        scope_name: { type: string }
+        query_digest:
+          type: string
+          description: SHA-256 of the normalised query. Never the query itself (INV-17).
+        mandatory_filters_digest: { type: string }
+        plan_digest: { type: string }
+        index_generation: { type: string }
+        partition_set: { type: array, items: { type: string } }
+        complexity_score: { type: integer }
+        result_count: { type: integer }
+        suppressed_count: { type: integer }
+        completeness_state: { type: string }
+        reason_codes: { type: array, items: { type: string } }
+        duration_ms: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    CreateSourceRequest:
+      type: object
+      required: [owner_service, source_type, event_topic, event_types]
+      properties:
+        owner_service: { type: string }
+        source_type:
+          type: string
+          description: |
+            Also the first segment of this source's event names, which is how a
+            topic's events are bound to a projector without a per-event mapping
+            table nobody would keep current.
+        tenant_scope: { type: string, enum: [SINGLE_TENANT, TENANT_SHARDED, SHARED_REFERENCE] }
+        residency_region: { type: string, default: GLOBAL }
+        sensitivity_ceiling:
+          type: string
+          enum: [PUBLIC, INTERNAL, PERSONAL, FINANCIAL, HR, LEGAL_PRIVILEGED, RESTRICTED]
+        event_topic: { type: string }
+        event_types: { type: array, items: { type: string }, minItems: 1 }
+        restriction_event_types:
+          type: array
+          items: { type: string }
+          description: The priority visibility-reduction lane (§8.2).
+        freshness_class: { type: string, enum: [S0, S1, S2, S3] }
+        max_lag_seconds: { type: integer }
+
+    Source:
+      allOf:
+        - $ref: "#/components/schemas/CreateSourceRequest"
+        - type: object
+          properties:
+            source_id: { type: string, format: uuid }
+            created_at: { type: string, format: date-time }
+            created_by_principal_id: { type: string, format: uuid }
+
+    CreateContractRequest:
+      type: object
+      required: [source_type, authz_action, fields]
+      properties:
+        source_type: { type: string }
+        scope_name: { type: string }
+        retrieval_class: { type: string, enum: [R0, R1, R2, R3], default: R1 }
+        freshness_class: { type: string, enum: [S0, S1, S2, S3] }
+        analyzer_profile: { type: string, default: standard }
+        authz_action:
+          type: string
+          description: |
+            The action_type this scope's results are re-authorized against.
+            Required: without one, R1/R2 retrieval has nothing to ask
+            authorization-svc, i.e. silently unauthorized results.
+        fields:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/FieldDefinition" }
+
+    FieldDefinition:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        source_path:
+          type: string
+          description: |
+            Dotted path into the event payload, e.g. `amount.currency_code`.
+            Defaults to `name`. Separate from `name` so a domain can rename a
+            payload field without breaking every saved query.
+        type: { type: string, enum: [KEYWORD, TEXT, DATE, LONG, DOUBLE, BOOLEAN] }
+        searchable: { type: boolean }
+        filterable: { type: boolean }
+        facetable: { type: boolean }
+        sortable: { type: boolean }
+        snippet_allowed:
+          type: boolean
+          description: Requires `returnable` and `searchable` (INV-13).
+        returnable: { type: boolean }
+        exportable: { type: boolean }
+        sensitivity_class:
+          type: string
+          enum: [PUBLIC, INTERNAL, PERSONAL, FINANCIAL, HR, LEGAL_PRIVILEGED, RESTRICTED, SECRET_PROHIBITED]
+          description: |
+            `SECRET_PROHIBITED` may be DECLARED — that is how the projector
+            learns to refuse a payload carrying one (NP-10) — but may not be
+            searchable, filterable, facetable, sortable, snippet-allowed,
+            returnable or exportable (INV-09).
+        analyzer_profile: { type: string }
+
+    Contract:
+      type: object
+      properties:
+        contract_id: { type: string, format: uuid }
+        source_id: { type: string, format: uuid }
+        scope_name: { type: string }
+        version: { type: integer }
+        schema_digest: { type: string }
+        publication_state: { type: string, enum: [DRAFT, CERTIFIED, PUBLISHED, RETIRED] }
+        freshness_class: { type: string }
+        retrieval_class: { type: string }
+        analyzer_profile: { type: string }
+        authz_action: { type: string }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/FieldDefinition" }
+        created_at: { type: string, format: date-time }
+        published_at: { type: string, format: date-time, nullable: true }
+
+    Generation:
+      type: object
+      properties:
+        generation_id: { type: string, format: uuid }
+        contract_id: { type: string, format: uuid }
+        contract_version: { type: integer }
+        scope_name: { type: string }
+        engine_ref:
+          type: string
+          description: |
+            The concrete index name. Server-owned and never nameable by a
+            caller — INV-03 and NP-02.
+        validation_state:
+          type: string
+          enum: [PLANNED, BUILDING, VALIDATING, READY, ACTIVE, FAILED, RETIRED]
+        validation_digest:
+          type: string
+          description: TC-09 — what was actually checked before activation.
+        validation_note: { type: string }
+        activated_at: { type: string, format: date-time, nullable: true }
+        retired_at: { type: string, format: date-time, nullable: true }
+
+    Checkpoint:
+      type: object
+      properties:
+        scope_name: { type: string }
+        source_partition: { type: string }
+        watermark: { type: integer }
+        committed_at: { type: string, format: date-time }
+        observed_at: { type: string, format: date-time }
+        lag_ms: { type: integer }
+        freshness:
+          type: string
+          enum: [UNKNOWN, CURRENT, LAGGING, STALE]
+          description: UNKNOWN is never represented as CURRENT (§2.2).
+        indexed_live: { type: integer }
+        indexed_tombstoned: { type: integer }
+
+    Scope:
+      type: object
+      properties:
+        scope: { type: string }
+        contract_version: { type: integer }
+        retrieval_class: { type: string }
+        freshness_class: { type: string }
+        active:
+          type: boolean
+          description: Whether a generation is currently serving this scope.
+        fields:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              type: { type: string }
+              searchable: { type: boolean }
+              filterable: { type: boolean }
+              facetable: { type: boolean }
+              sortable: { type: boolean }
+              returnable: { type: boolean }
+              snippet_allowed: { type: boolean }
+
+security:
+  - envelope: []

@@ -17,7 +17,7 @@ func ServicePolicy() Policy {
 		LegalEntityID: NotRequired,
 
 		// §4: required for governed sensitive access.
-		PurposeContext: NotRequired,
+		PurposeContext: RequiredOnWrite,
 
 		// This service does not post to an accounting book.
 		BookID: NotRequired,
