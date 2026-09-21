@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -24,6 +25,10 @@ func (h *Handler) writeTransferErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "invalid_transition", err.Error())
 	case errors.Is(err, domain.ErrTransferSelfApproval):
 		writeError(w, http.StatusForbidden, "self_approval_forbidden", err.Error())
+	case errors.Is(err, domain.ErrTransferSelfAuthorization):
+		writeError(w, http.StatusForbidden, "self_authorization_forbidden", err.Error())
+	case errors.Is(err, domain.ErrCrossEntityTransferRequiresAuthorization):
+		writeError(w, http.StatusConflict, "authorization_required", err.Error())
 	case errors.Is(err, domain.ErrTransferHashMismatch):
 		writeError(w, http.StatusConflict, "protected_fields_changed", err.Error())
 	case errors.Is(err, domain.ErrPaymentAdapterUnavailable), errors.Is(err, domain.ErrGLServiceUnavailable), errors.Is(err, domain.ErrIntercompanyServiceUnavailable):
@@ -154,6 +159,9 @@ func (h *Handler) CreateTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 	if !created {
 		status = http.StatusOK
 	}
+	if created {
+		h.publisher.PublishTreasuryTransferCreated(r.Context(), correlationID, principalID, *transfer)
+	}
 	writeJSON(w, status, transfer)
 }
 
@@ -220,6 +228,38 @@ func (h *Handler) ApproveTreasuryTransfer(w http.ResponseWriter, r *http.Request
 		h.writeTransferErr(w, err)
 		return
 	}
+	h.publisher.PublishTreasuryTransferApproved(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// AuthorizeTreasuryTransfer handles POST /v1/treasury/transfers/{id}/authorize
+// — the doc's own additional dual-control step, required only for
+// cross-entity transfers (see domain.CanAuthorizeTransfer). Self-check
+// and CAS enforcement mirror ApproveTreasuryTransfer exactly.
+func (h *Handler) AuthorizeTreasuryTransfer(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, transfer.TenantID, actionAuthorizeTransfer); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	updated, err := h.store.AuthorizeTreasuryTransfer(r.Context(), domain.AuthorizeTreasuryTransferParams{
+		TenantID: tenantID, TransferID: transferID, AuthorizerPrincipalID: principalID,
+	})
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	h.publisher.PublishTreasuryTransferAuthorized(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -241,7 +281,111 @@ func (h *Handler) RejectTreasuryTransfer(w http.ResponseWriter, r *http.Request)
 		h.writeTransferErr(w, err)
 		return
 	}
+	h.publisher.PublishTreasuryTransferRejected(r.Context(), r.Header.Get("X-Correlation-ID"), principalID, *updated)
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// ListTransfers handles GET /v1/treasury/transfers — the doc's own
+// ListTransfers query. legal_entity_id/status are optional filters.
+func (h *Handler) ListTransfers(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	q := r.URL.Query()
+	limit := 0
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			limit = n
+		}
+	}
+	offset := 0
+	if v := q.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			offset = n
+		}
+	}
+	transfers, err := h.store.ListTransfers(r.Context(), domain.ListTransfersParams{
+		TenantID: tenantID, LegalEntityID: q.Get("legal_entity_id"), Status: q.Get("status"),
+		Limit: limit, Offset: offset,
+	})
+	if err != nil {
+		h.log.Error("ListTransfers: store unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "cannot list transfers")
+		return
+	}
+	writeJSON(w, http.StatusOK, transfers)
+}
+
+// GetTransferApproval handles GET /v1/treasury/transfers/{id}/approval —
+// the doc's own GetTransferApproval query. No separate approval entity
+// exists in this schema (maker/checker/status ARE the approval record on
+// TreasuryTransfer itself), so this is an honest projection of the
+// existing fields rather than a fabricated sub-entity.
+func (h *Handler) GetTransferApproval(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"transfer_id":             transfer.TransferID,
+		"status":                  transfer.Status,
+		"maker_principal_id":      transfer.MakerPrincipalID,
+		"checker_principal_id":    transfer.CheckerPrincipalID,
+		"approved":                transfer.CheckerPrincipalID != "",
+		"authorizer_principal_id": transfer.AuthorizerPrincipalID,
+		"authorized":              transfer.AuthorizerPrincipalID != "",
+		"is_cross_entity":         transfer.IsCrossEntity,
+		"reject_reason":           transfer.RejectReason,
+	})
+}
+
+// GetTransferExecution handles GET /v1/treasury/transfers/{id}/execution
+// — the doc's own GetTransferExecution query, projecting the same
+// execution-lineage fields ExecuteTreasuryTransfer's saga already writes.
+func (h *Handler) GetTransferExecution(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"transfer_id":           transfer.TransferID,
+		"status":                transfer.Status,
+		"payment_attempt_id":    transfer.PaymentAttemptID,
+		"source_journal_id":     transfer.SourceJournalID,
+		"intercompany_entry_id": transfer.IntercompanyEntryID,
+		"return_reason":         transfer.ReturnReason,
+		"resolution_note":       transfer.ResolutionNote,
+	})
+}
+
+// GetTransferAvailableActions handles
+// GET /v1/treasury/transfers/{id}/available-actions — the doc's own
+// GetAvailableActions query, mirroring BNK-01's own implementation
+// pattern: a direct, mechanical read of which of this aggregate's own
+// existing transition guards currently pass, not new business logic.
+func (h *Handler) GetTransferAvailableActions(w http.ResponseWriter, r *http.Request) {
+	tenantID := svcmiddleware.TenantFromContext(r.Context())
+	transferID := chi.URLParam(r, "transferID")
+	transfer, err := h.store.GetTreasuryTransfer(r.Context(), tenantID, transferID)
+	if err != nil {
+		h.writeTransferErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"can_amend":               domain.CanAmendTransfer(transfer.Status),
+		"can_submit_for_approval": domain.CanSubmitTransferForApproval(transfer.Status),
+		"can_approve":             domain.CanApproveTransfer(transfer.Status),
+		"can_authorize":           domain.CanAuthorizeTransfer(transfer.Status, transfer.IsCrossEntity),
+		"can_reject":              domain.CanRejectTransfer(transfer.Status),
+		"can_execute":             domain.CanExecuteTransfer(transfer.Status),
+		"can_cancel":              domain.CanCancelBeforeSubmission(transfer.Status),
+		"can_mark_returned":       domain.CanMarkTransferReturned(transfer.Status),
+		"can_resolve":             domain.CanResolveTransfer(transfer.Status),
+	})
 }
 
 // ExecuteTreasuryTransfer handles POST /v1/treasury/transfers/{id}/execute
@@ -291,10 +435,19 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if transfer.Status == domain.TransferApproved {
-		// Wave 11b: computed from the transfer's live APPROVED state
-		// (still the status at this point — MarkTransferSubmitted hasn't
-		// run yet), so it matches what GetTreasuryTransferFingerprint
+	// A cross-entity transfer sitting APPROVED must go through
+	// AuthorizeTreasuryTransfer first — see domain.CanAuthorizeTransfer's
+	// own doc comment. Same-entity transfers are unaffected: they were
+	// never gated by this and still submit straight from APPROVED.
+	if transfer.Status == domain.TransferApproved && transfer.IsCrossEntity {
+		h.writeTransferErr(w, domain.ErrCrossEntityTransferRequiresAuthorization)
+		return
+	}
+
+	if transfer.Status == domain.TransferApproved || transfer.Status == domain.TransferAuthorized {
+		// Wave 11b: computed from the transfer's live APPROVED/AUTHORIZED
+		// state (still the status at this point — MarkTransferSubmitted
+		// hasn't run yet), so it matches what GetTreasuryTransferFingerprint
 		// will independently re-derive when payment-initiation-adapter-svc
 		// verifies it.
 		fingerprint := domain.TransferFingerprint(transfer)
@@ -309,6 +462,7 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 			h.writeTransferErr(w, err)
 			return
 		}
+		h.publisher.PublishTreasuryTransferSubmitted(r.Context(), correlationID, principalID, *transfer)
 	}
 
 	if transfer.Status == domain.TransferSubmitted {
@@ -318,6 +472,7 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 				h.writeTransferErr(w, err)
 				return
 			}
+			h.publisher.PublishTreasuryTransferSettled(r.Context(), correlationID, principalID, *transfer)
 			writeJSON(w, http.StatusOK, transfer)
 			return
 		}
@@ -360,6 +515,7 @@ func (h *Handler) ExecuteTreasuryTransfer(w http.ResponseWriter, r *http.Request
 			h.writeTransferErr(w, err)
 			return
 		}
+		h.publisher.PublishTreasuryTransferSettled(r.Context(), correlationID, principalID, *transfer)
 	}
 
 	writeJSON(w, http.StatusOK, transfer)

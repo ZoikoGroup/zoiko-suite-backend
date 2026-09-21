@@ -168,6 +168,56 @@ func treasuryTransferPayload(t domain.TreasuryTransfer) map[string]any {
 	}
 }
 
+// PublishTreasuryTransferCreated corresponds to the doc's own
+// TreasuryTransferCreated event.
+func (p *Publisher) PublishTreasuryTransferCreated(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	p.emit(ctx, "treasury_transfer.created", correlationID, t.TenantID, "", actorID, treasuryTransferPayload(t))
+}
+
+// PublishTreasuryTransferApproved corresponds to the doc's own
+// TreasuryTransferApproved event — the checker's sign-off.
+func (p *Publisher) PublishTreasuryTransferApproved(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	payload := treasuryTransferPayload(t)
+	payload["checker_principal_id"] = t.CheckerPrincipalID
+	p.emit(ctx, "treasury_transfer.approved", correlationID, t.TenantID, "", actorID, payload)
+}
+
+// PublishTreasuryTransferAuthorized corresponds to the doc's own
+// TreasuryTransferAuthorized event — the additional dual-control step
+// AuthorizeTreasuryTransfer requires for cross-entity transfers.
+func (p *Publisher) PublishTreasuryTransferAuthorized(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	payload := treasuryTransferPayload(t)
+	payload["authorizer_principal_id"] = t.AuthorizerPrincipalID
+	p.emit(ctx, "treasury_transfer.authorized", correlationID, t.TenantID, "", actorID, payload)
+}
+
+// PublishTreasuryTransferSubmitted corresponds to the doc's own
+// TreasuryTransferSubmitted event — BNK-06 has accepted the payment
+// attempt.
+func (p *Publisher) PublishTreasuryTransferSubmitted(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	payload := treasuryTransferPayload(t)
+	payload["payment_attempt_id"] = t.PaymentAttemptID
+	p.emit(ctx, "treasury_transfer.submitted", correlationID, t.TenantID, "", actorID, payload)
+}
+
+// PublishTreasuryTransferSettled corresponds to the doc's own
+// TreasuryTransferSettled event, emitted when the internal COMPLETED
+// state is reached — the doc names the event "Settled" while this
+// service's own state constant is TransferCompleted; this maps the two
+// deliberately rather than renaming the internal state name this session
+// already established.
+func (p *Publisher) PublishTreasuryTransferSettled(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	p.emit(ctx, "treasury_transfer.settled", correlationID, t.TenantID, "", actorID, treasuryTransferPayload(t))
+}
+
+// PublishTreasuryTransferRejected corresponds to the doc's own
+// TreasuryTransferRejected event — the checker's refusal.
+func (p *Publisher) PublishTreasuryTransferRejected(ctx context.Context, correlationID, actorID string, t domain.TreasuryTransfer) {
+	payload := treasuryTransferPayload(t)
+	payload["reject_reason"] = t.RejectReason
+	p.emit(ctx, "treasury_transfer.rejected", correlationID, t.TenantID, "", actorID, payload)
+}
+
 // PublishTreasuryTransferReturned corresponds to the doc's own
 // TreasuryTransferReturned event — a bank return of an already-submitted
 // transfer.
@@ -187,6 +237,76 @@ func (p *Publisher) PublishTreasuryTransferCancelled(ctx context.Context, correl
 	payload := treasuryTransferPayload(t)
 	payload["cancel_reason"] = t.CancelReason
 	p.emit(ctx, "treasury_transfer.cancelled", correlationID, t.TenantID, "", actorID, payload)
+}
+
+// cashPositionPayload is the shared field set for BNK-08's snapshot
+// lifecycle events.
+func cashPositionPayload(snap domain.CashPositionSnapshot) map[string]any {
+	return map[string]any{
+		"snapshot_id":         snap.SnapshotID,
+		"legal_entity_id":     snap.LegalEntityID,
+		"reporting_currency":  snap.ReportingCurrency,
+		"status":              snap.Status,
+		"effective_status":    snap.EffectiveStatus,
+		"has_stale_component": snap.HasStaleComponent,
+		"available_cash":      snap.AvailableCash,
+	}
+}
+
+// PublishCashPositionCalculated corresponds to the doc's own
+// CashPositionCalculated event.
+func (p *Publisher) PublishCashPositionCalculated(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot) {
+	p.emit(ctx, "cash_position.calculated", correlationID, snap.TenantID, snap.LegalEntityID, actorID, cashPositionPayload(snap))
+}
+
+// PublishCashPositionPublished corresponds to the doc's own
+// CashPositionPublished event.
+func (p *Publisher) PublishCashPositionPublished(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot) {
+	p.emit(ctx, "cash_position.published", correlationID, snap.TenantID, snap.LegalEntityID, actorID, cashPositionPayload(snap))
+}
+
+// PublishCashPositionBecameStale corresponds to the doc's own
+// CashPositionBecameStale event — fired when a newly calculated
+// snapshot's own HasStaleComponent is true, the same real, already-computed
+// source-freshness signal GetCashPosition's EffectiveStatus derivation
+// uses (see domain.CashPositionSnapshot's own doc comment on "derived,
+// never stored" staleness).
+func (p *Publisher) PublishCashPositionBecameStale(ctx context.Context, correlationID, actorID string, snap domain.CashPositionSnapshot) {
+	p.emit(ctx, "cash_position.became_stale", correlationID, snap.TenantID, snap.LegalEntityID, actorID, cashPositionPayload(snap))
+}
+
+// fxExposurePayload is the shared field set for BNK-10's snapshot
+// lifecycle events.
+func fxExposurePayload(snap domain.FXExposureSnapshot) map[string]any {
+	return map[string]any{
+		"snapshot_id":         snap.SnapshotID,
+		"legal_entity_id":     snap.LegalEntityID,
+		"exposure_currency":   snap.ExposureCurrency,
+		"functional_currency": snap.FunctionalCurrency,
+		"status":              snap.Status,
+		"effective_status":    snap.EffectiveStatus,
+		"has_stale_component": snap.HasStaleComponent,
+		"net_exposure_amount": snap.NetExposureAmount,
+	}
+}
+
+// PublishFXExposureCalculated corresponds to the doc's own
+// FXExposureCalculated event.
+func (p *Publisher) PublishFXExposureCalculated(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot) {
+	p.emit(ctx, "fx_exposure.calculated", correlationID, snap.TenantID, snap.LegalEntityID, actorID, fxExposurePayload(snap))
+}
+
+// PublishFXExposurePublished corresponds to the doc's own
+// FXExposurePublished event.
+func (p *Publisher) PublishFXExposurePublished(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot) {
+	p.emit(ctx, "fx_exposure.published", correlationID, snap.TenantID, snap.LegalEntityID, actorID, fxExposurePayload(snap))
+}
+
+// PublishFXExposureBecameStale corresponds to the doc's own
+// FXExposureBecameStale event — same "fired at calculation time when
+// HasStaleComponent is already true" mapping as CashPositionBecameStale.
+func (p *Publisher) PublishFXExposureBecameStale(ctx context.Context, correlationID, actorID string, snap domain.FXExposureSnapshot) {
+	p.emit(ctx, "fx_exposure.became_stale", correlationID, snap.TenantID, snap.LegalEntityID, actorID, fxExposurePayload(snap))
 }
 
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID string, payload map[string]any) {

@@ -21,9 +21,15 @@ const (
 	// CreateTreasuryTransferParams.SaveAsDraft — CreateTreasuryTransfer's
 	// default (unset) behavior is UNCHANGED for backward compatibility,
 	// same posture as migration 000003's BNK-01 default.
-	TransferDraft              = "DRAFT"
-	TransferPendingApproval    = "PENDING_APPROVAL"
-	TransferApproved           = "APPROVED"
+	TransferDraft           = "DRAFT"
+	TransferPendingApproval = "PENDING_APPROVAL"
+	TransferApproved        = "APPROVED"
+	// TransferAuthorized is the doc's own additional dual-control step
+	// ("Approved/Authorized" in the doc's state model), required only for
+	// cross-entity transfers — see AuthorizeTreasuryTransfer/
+	// CanAuthorizeTransfer. Same-entity transfers skip straight from
+	// APPROVED to SUBMITTED, unchanged from before this state existed.
+	TransferAuthorized         = "AUTHORIZED"
 	TransferSubmitted          = "SUBMITTED"
 	TransferLedgerPosted       = "LEDGER_POSTED"
 	TransferIntercompanyPaired = "INTERCOMPANY_PAIRED"
@@ -43,6 +49,15 @@ const (
 func CanApproveTransfer(status string) bool { return status == TransferPendingApproval }
 func CanRejectTransfer(status string) bool  { return status == TransferPendingApproval }
 
+// CanAuthorizeTransfer: only APPROVED, and only for cross-entity
+// transfers — same-entity transfers have no "Authorized" step at all
+// (they go straight from APPROVED to submission), matching the doc's own
+// SoD line tying the extra dual-control step specifically to cross-entity
+// movement, not a universal requirement.
+func CanAuthorizeTransfer(status string, isCrossEntity bool) bool {
+	return status == TransferApproved && isCrossEntity
+}
+
 // CanAmendTransfer/CanSubmitTransferForApproval: DRAFT-only. There is no
 // approval yet to invalidate at this stage, which is what keeps the doc's
 // SoD rule ("amount/date change invalidates approval") moot for these —
@@ -51,11 +66,11 @@ func CanAmendTransfer(status string) bool             { return status == Transfe
 func CanSubmitTransferForApproval(status string) bool { return status == TransferDraft }
 
 // CanCancelBeforeSubmission: anything strictly before the bank has seen
-// the transfer — DRAFT, PENDING_APPROVAL, or APPROVED (but not yet
-// SUBMITTED).
+// the transfer — DRAFT, PENDING_APPROVAL, APPROVED, or AUTHORIZED (but
+// not yet SUBMITTED).
 func CanCancelBeforeSubmission(status string) bool {
 	switch status {
-	case TransferDraft, TransferPendingApproval, TransferApproved:
+	case TransferDraft, TransferPendingApproval, TransferApproved, TransferAuthorized:
 		return true
 	default:
 		return false
@@ -80,7 +95,7 @@ func CanResolveTransfer(status string) bool { return status == TransferReturned 
 // is rather than requiring one specific status.
 func CanExecuteTransfer(status string) bool {
 	switch status {
-	case TransferApproved, TransferSubmitted, TransferLedgerPosted, TransferIntercompanyPaired:
+	case TransferApproved, TransferAuthorized, TransferSubmitted, TransferLedgerPosted, TransferIntercompanyPaired:
 		return true
 	default:
 		return false
@@ -88,27 +103,33 @@ func CanExecuteTransfer(status string) bool {
 }
 
 type TreasuryTransfer struct {
-	TransferID          string    `json:"transfer_id"`
-	TenantID            string    `json:"tenant_id"`
-	SourceBankAccountID string    `json:"source_bank_account_id"`
-	TargetBankAccountID string    `json:"target_bank_account_id"`
-	Amount              float64   `json:"amount"`
-	CurrencyCode        string    `json:"currency_code"`
-	CorrelationID       string    `json:"correlation_id,omitempty"`
-	IsCrossEntity       bool      `json:"is_cross_entity"`
-	ProtectedFieldHash  string    `json:"-"`
-	Status              string    `json:"status"`
-	MakerPrincipalID    string    `json:"maker_principal_id"`
-	CheckerPrincipalID  string    `json:"checker_principal_id,omitempty"`
-	RejectReason        string    `json:"reject_reason,omitempty"`
-	PaymentAttemptID    string    `json:"payment_attempt_id,omitempty"`
-	SourceJournalID     string    `json:"source_journal_id,omitempty"`
-	IntercompanyEntryID string    `json:"intercompany_entry_id,omitempty"`
-	CancelReason        string    `json:"cancel_reason,omitempty"`
-	ReturnReason        string    `json:"return_reason,omitempty"`
-	ResolutionNote      string    `json:"resolution_note,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	TransferID          string  `json:"transfer_id"`
+	TenantID            string  `json:"tenant_id"`
+	SourceBankAccountID string  `json:"source_bank_account_id"`
+	TargetBankAccountID string  `json:"target_bank_account_id"`
+	Amount              float64 `json:"amount"`
+	CurrencyCode        string  `json:"currency_code"`
+	CorrelationID       string  `json:"correlation_id,omitempty"`
+	IsCrossEntity       bool    `json:"is_cross_entity"`
+	ProtectedFieldHash  string  `json:"-"`
+	Status              string  `json:"status"`
+	MakerPrincipalID    string  `json:"maker_principal_id"`
+	CheckerPrincipalID  string  `json:"checker_principal_id,omitempty"`
+	// AuthorizerPrincipalID is set by AuthorizeTreasuryTransfer — the
+	// doc's own additional dual-control step, required only for
+	// cross-entity transfers ("cross-entity transfers may require
+	// dual-entity/controller approval"). Empty for same-entity transfers,
+	// which skip this step entirely.
+	AuthorizerPrincipalID string    `json:"authorizer_principal_id,omitempty"`
+	RejectReason          string    `json:"reject_reason,omitempty"`
+	PaymentAttemptID      string    `json:"payment_attempt_id,omitempty"`
+	SourceJournalID       string    `json:"source_journal_id,omitempty"`
+	IntercompanyEntryID   string    `json:"intercompany_entry_id,omitempty"`
+	CancelReason          string    `json:"cancel_reason,omitempty"`
+	ReturnReason          string    `json:"return_reason,omitempty"`
+	ResolutionNote        string    `json:"resolution_note,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 type CreateTreasuryTransferParams struct {
@@ -127,6 +148,17 @@ type ApproveTreasuryTransferParams struct {
 	TenantID, TransferID, CheckerPrincipalID string
 }
 
+type AuthorizeTreasuryTransferParams struct {
+	TenantID, TransferID, AuthorizerPrincipalID string
+}
+
+// ListTransfersParams is ListTransfers' filter/pagination input —
+// legal_entity_id/status are optional filters (empty = unfiltered).
+type ListTransfersParams struct {
+	TenantID, LegalEntityID, Status string
+	Limit, Offset                   int
+}
+
 type RejectTreasuryTransferParams struct {
 	TenantID, TransferID, CheckerPrincipalID, Reason string
 }
@@ -135,11 +167,11 @@ type RejectTreasuryTransferParams struct {
 // still DRAFT. Every protected field is re-suppliable — the store
 // recomputes protected_field_hash from the amended values.
 type AmendTreasuryTransferParams struct {
-	TenantID, TransferID                               string
-	SourceBankAccountID, TargetBankAccountID            string
-	Amount                                              float64
-	CurrencyCode                                        string
-	ActorPrincipalID                                    string
+	TenantID, TransferID                     string
+	SourceBankAccountID, TargetBankAccountID string
+	Amount                                   float64
+	CurrencyCode                             string
+	ActorPrincipalID                         string
 }
 
 type SubmitTransferForApprovalParams struct {
@@ -175,14 +207,23 @@ const (
 )
 
 var (
-	ErrTransferNotFound               = errorString("treasury transfer not found")
-	ErrInvalidTransferTransition      = errorString("treasury transfer is not in a state that permits this action")
-	ErrTransferSelfApproval           = errorString("the principal who created a treasury transfer cannot also approve it")
-	ErrTransferHashMismatch           = errorString("treasury transfer's protected fields do not match their state at creation")
-	ErrPaymentAdapterUnavailable      = errorString("payment-initiation-adapter-svc unavailable")
-	ErrPaymentRejected                = errorString("payment-initiation-adapter-svc rejected the payment attempt")
-	ErrGLServiceUnavailable           = errorString("general-ledger-svc unavailable")
-	ErrIntercompanyServiceUnavailable = errorString("intercompany-accounting-svc unavailable")
+	ErrTransferNotFound          = errorString("treasury transfer not found")
+	ErrInvalidTransferTransition = errorString("treasury transfer is not in a state that permits this action")
+	ErrTransferSelfApproval      = errorString("the principal who created a treasury transfer cannot also approve it")
+	// ErrTransferSelfAuthorization backs AuthorizeTreasuryTransfer's own
+	// SoD check — the doc's literal words: "Maker cannot authorize own
+	// transfer where policy applies."
+	ErrTransferSelfAuthorization = errorString("the principal who created a treasury transfer cannot also authorize it")
+	// ErrCrossEntityTransferRequiresAuthorization backs ExecuteTreasuryTransfer:
+	// a cross-entity transfer sitting APPROVED cannot be submitted directly
+	// — AuthorizeTreasuryTransfer must run first. Same-entity transfers
+	// never hit this; CanAuthorizeTransfer only applies to cross-entity.
+	ErrCrossEntityTransferRequiresAuthorization = errorString("cross-entity treasury transfers require AuthorizeTreasuryTransfer before they can be submitted")
+	ErrTransferHashMismatch                     = errorString("treasury transfer's protected fields do not match their state at creation")
+	ErrPaymentAdapterUnavailable                = errorString("payment-initiation-adapter-svc unavailable")
+	ErrPaymentRejected                          = errorString("payment-initiation-adapter-svc rejected the payment attempt")
+	ErrGLServiceUnavailable                     = errorString("general-ledger-svc unavailable")
+	ErrIntercompanyServiceUnavailable           = errorString("intercompany-accounting-svc unavailable")
 
 	// ErrOnlyMakerMayModifyTransfer backs AmendTreasuryTransfer,
 	// SubmitTransferForApproval and CancelBeforeSubmission — the doc names
