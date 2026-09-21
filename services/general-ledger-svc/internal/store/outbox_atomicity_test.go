@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -26,12 +27,14 @@ func TestPgStore_Outbox_CreateJournal_Atomicity_RealDB(t *testing.T) {
 
 	journalID := uuid.New().String()
 	correlationID := uuid.New().String()
+	transactionDate := domain.NewDate(2026, time.August, 1)
 	h := &domain.JournalHeader{
 		JournalID:            journalID,
 		TenantID:             tenantID,
 		LegalEntityID:        legalEntityID,
 		FiscalPeriod:         "2026-08",
 		Status:               domain.JournalStatusPending,
+		TransactionDate:      transactionDate,
 		CreatedByPrincipalID: "preparer-1",
 		CorrelationID:        correlationID,
 		ApprovalStatus:       domain.ApprovalStatusDraft,
@@ -88,12 +91,14 @@ func TestPgStore_Outbox_TransitionJournal_ValidatedAndPosted_RealDB(t *testing.T
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	journalID := uuid.New().String()
+	transactionDate := domain.NewDate(2026, time.August, 1)
 	h := &domain.JournalHeader{
 		JournalID:            journalID,
 		TenantID:             tenantID,
 		LegalEntityID:        legalEntityID,
 		FiscalPeriod:         "2026-08",
 		Status:               domain.JournalStatusPending,
+		TransactionDate:      transactionDate,
 		CreatedByPrincipalID: "preparer-1",
 		CorrelationID:        uuid.New().String(),
 		ApprovalStatus:       domain.ApprovalStatusDraft,
@@ -149,12 +154,14 @@ func TestPgStore_Outbox_ReverseJournal_Atomicity_RealDB(t *testing.T) {
 	ctx := svcmiddleware.WithTenant(context.Background(), tenantID)
 
 	originalJournalID := uuid.New().String()
+	transactionDate := domain.NewDate(2026, time.August, 1)
 	h := &domain.JournalHeader{
 		JournalID:            originalJournalID,
 		TenantID:             tenantID,
 		LegalEntityID:        legalEntityID,
 		FiscalPeriod:         "2026-08",
 		Status:               domain.JournalStatusPending,
+		TransactionDate:      transactionDate,
 		CreatedByPrincipalID: "preparer-1",
 		CorrelationID:        uuid.New().String(),
 		ApprovalStatus:       domain.ApprovalStatusPosted,
@@ -176,6 +183,7 @@ func TestPgStore_Outbox_ReverseJournal_Atomicity_RealDB(t *testing.T) {
 		LegalEntityID:        legalEntityID,
 		FiscalPeriod:         "2026-08",
 		Status:               domain.JournalStatusFinalized,
+		TransactionDate:      transactionDate,
 		ApprovalStatus:       domain.ApprovalStatusPosted,
 		ReversalOfJournalID:  &originalJournalID,
 		Description:          "Reversal",
