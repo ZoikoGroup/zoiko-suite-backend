@@ -190,15 +190,19 @@ const (
 	ErrIdempotencyKeyRequired     = sentinel("idempotency_key is required")
 	ErrDuplicateIdempotencyKey    = sentinel("an attempt already exists for this idempotency key")
 	// ErrUnresolvedAttemptExists is Invariant #16: a source_reference with
-	// an attempt still in PREPARED/PENDING_UNKNOWN must not get a second
-	// attempt — the existing one has to resolve (submit, get rejected, or
-	// get cancelled) first. SUBMITTED is not "unresolved" for this
-	// purpose: once submitted, finality belongs to BNK-07, not this
-	// service. Unlike ErrDuplicateIdempotencyKey this is checked even
-	// when the caller supplies a brand-new idempotency_key, which is
-	// exactly the gap this closes: a caller retrying with a fresh key for
-	// the same underlying instruction could otherwise create a second,
-	// concurrent live attempt.
+	// an attempt in PREPARED/PENDING_UNKNOWN/SUBMITTED must not get a
+	// second one — the existing one has to resolve (get rejected or get
+	// cancelled) first. SUBMITTED is included: this service never
+	// transitions an attempt OUT of SUBMITTED (finality tracking is
+	// BNK-07/payment-status-svc's own concern), so a second send for the
+	// same source_reference must never happen once the first was already
+	// submitted, regardless of how it later resolves downstream. A
+	// genuine retry after a real failure mints a NEW source_reference.
+	// Unlike ErrDuplicateIdempotencyKey this is checked even when the
+	// caller supplies a brand-new idempotency_key, which is exactly the
+	// gap this closes: a caller retrying with a fresh key for the same
+	// underlying instruction could otherwise create a second, concurrent
+	// live attempt.
 	ErrUnresolvedAttemptExists    = sentinel("an unresolved attempt already exists for this source_reference")
 	ErrPayerAccountNotVerified    = sentinel("payer_account_verified must be true to submit a payment")
 	ErrInvalidResolution          = sentinel("resolved_status must be SUBMITTED or REJECTED_BEFORE_SUBMISSION")
