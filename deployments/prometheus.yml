@@ -43,3 +43,10 @@ scrape_configs:
   - job_name: identity-context-svc
     static_configs:
       - targets: ["identity-svc:8080"]
+  # The ForwardAuth target every gated request passes through. It was not
+  # scraped at all, and until recently had no /metrics to scrape — so the one
+  # service whose failure presents as every OTHER service returning 401 was
+  # the only one with no signal of its own.
+  - job_name: gateway-auth-svc
+    static_configs:
+      - targets: ["gateway-auth-svc:8092"]

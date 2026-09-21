@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -47,6 +48,28 @@ func NewClient(url string, ttl time.Duration) *Client {
 
 // PublicKey returns the RSA public key for kid, refreshing the cached JWKS
 // document if it's stale or the kid is unknown.
+// The two ways PublicKey can fail, as sentinels rather than bare strings.
+//
+// They mean opposite things operationally and need opposite responses, and
+// until these existed a caller could only tell them apart by matching on error
+// text — so nothing did, and both were reported as one undifferentiated
+// "invalid token":
+//
+//	ErrUnavailable  — the JWKS endpoint could not be read and nothing is
+//	                  cached for this kid. identity-context-svc is down, and
+//	                  EVERY request through the gateway is failing.
+//	ErrKeyNotFound  — the endpoint was read and does not contain this kid.
+//	                  Almost always a signing-key rotation this gateway has
+//	                  not caught up with; only tokens signed by the new key
+//	                  fail, and it self-heals on the next refresh.
+//
+// One is a total outage, the other is a partial and transient one. Alerting on
+// them identically means either paging for a rotation or missing an outage.
+var (
+	ErrUnavailable = errors.New("jwks: key set unavailable")
+	ErrKeyNotFound = errors.New("jwks: no key for kid")
+)
+
 func (c *Client) PublicKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	c.mu.Lock()
 	pub, known := c.byKid[kid]
@@ -65,14 +88,14 @@ func (c *Client) PublicKey(ctx context.Context, kid string) (*rsa.PublicKey, err
 		if known {
 			return pub, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	pub, known = c.byKid[kid]
 	if !known {
-		return nil, fmt.Errorf("no key found for kid %q", kid)
+		return nil, fmt.Errorf("%w %q", ErrKeyNotFound, kid)
 	}
 	return pub, nil
 }

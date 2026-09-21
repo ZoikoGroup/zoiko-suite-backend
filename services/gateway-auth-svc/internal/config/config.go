@@ -12,6 +12,12 @@ import (
 // message broker here — this service is a stateless JWT verifier called by
 // Traefik's ForwardAuth middleware on every gated request.
 type Config struct {
+	// OTELExporterEndpoint is the OTLP/HTTP collector traces are shipped to.
+	// Tracing failing to initialise is logged and the service starts anyway —
+	// a collector outage must not take down the gateway every request depends
+	// on.
+	OTELExporterEndpoint string
+
 	Port int
 
 	// JWKSURL is identity-context-svc's public key endpoint. Envelope JWTs
@@ -89,6 +95,7 @@ func Load() (*Config, error) {
 		CartaServiceURL:         strEnv("CARTA_SERVICE_URL", ""),
 		SIEMServiceURL:          strEnv("SIEM_SERVICE_URL", ""),
 		TenantRegistryURL:       strEnv("TENANT_REGISTRY_URL", ""),
+		OTELExporterEndpoint:    strEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
 		TenantContextTTL:        time.Duration(ctxTTL) * time.Second,
 		TenantContextStaleGrace: time.Duration(ctxGrace) * time.Second,
 	}, nil

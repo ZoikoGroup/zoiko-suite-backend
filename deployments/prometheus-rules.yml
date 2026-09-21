@@ -164,6 +164,124 @@ groups:
           summary: "{{ $value }} live support elevations into customer tenants"
 
   # ---------------------------------------------------------------------------
+  # gateway-auth-svc
+  #
+  # Chosen on the same criterion as the blocks below: every rule here fires on
+  # something the two baseline rules cannot see. This service answers 401 and
+  # 403 as its NORMAL output — refusing an unauthenticated request is it
+  # working — so error-rate alerting is blind to it in both directions. It
+  # cannot tell a healthy gateway rejecting scanner traffic from a JWKS outage
+  # locking every user out of the estate, because both are a wall of 401s.
+  #
+  # Runbook: services/gateway-auth-svc/RUNBOOK.md
+  - name: gateway-auth
+    rules:
+      - alert: GatewayAuthJWKSUnavailable
+        # identity-context-svc's JWKS endpoint cannot be read and nothing is
+        # cached. EVERY gated request in the estate fails closed while this is
+        # true, and the symptom reported by users is "the whole platform is
+        # down" rather than anything naming this service. Nothing else in the
+        # estate surfaces this: the gateway answers a correct 401 and the
+        # backends never see the request at all.
+        expr: sum(rate(gateway_auth_jwks_errors_total{operation="fetch"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc cannot reach the JWKS endpoint — every gated request is failing"
+          description: >-
+            identity-context-svc's key set is unreachable and no cached key
+            covers the incoming tokens. This is a total authentication outage.
+            RUNBOOK section 4.1.
+
+      - alert: GatewayAuthTokenSpoofingDetected
+        # A validly-signed token presented against a DIFFERENT tenant's
+        # hostname. Unlike everything else in this group, this is not a
+        # misconfiguration: by construction the token verified, so whoever
+        # sent it holds genuine credentials and is using them against a tenant
+        # that is not theirs. Threshold is any occurrence, deliberately — a
+        # rate threshold on this would mean tolerating some amount of it.
+        expr: sum(increase(gateway_auth_verify_decisions_total{outcome="tenant_hostname_mismatch"}[15m])) > 0
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc rejected {{ $value }} token/hostname tenant mismatches in 15m"
+          description: >-
+            A token minted for one tenant was presented against another
+            tenant's hostname. Treat as credential theft or replay until shown
+            otherwise. RUNBOOK section 4.2.
+
+      - alert: GatewayAuthTenantContextUnresolved
+        # tenant-entity-registry-svc is unreachable, so GOV-01 resolution
+        # cannot complete. The gateway fails closed: writes are refused
+        # outright and reads only survive inside the bounded stale window, so
+        # this degrades into a full outage rather than announcing itself as
+        # one.
+        expr: sum(rate(gateway_auth_tenant_context_total{outcome="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc cannot resolve tenant context — requests failing closed"
+          description: >-
+            The tenant registry is unreachable. Writes are refused with 503 and
+            reads outlive it only for the stale-grace window.
+            RUNBOOK section 4.3.
+
+      - alert: GatewayAuthTenantContextStale
+        # Serving reads from a cache the registry could not confirm. Correct,
+        # bounded behaviour — and the early warning that the alert above is
+        # coming, which is the only reason to page on it at ticket severity
+        # rather than wait.
+        expr: |
+          sum(rate(gateway_auth_tenant_context_total{outcome="stale"}[10m]))
+          /
+          clamp_min(sum(rate(gateway_auth_tenant_context_total[10m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "gateway-auth-svc serving over 10% of reads from stale tenant context"
+          description: >-
+            The registry is intermittently unreachable and reads are being
+            served from an unconfirmed cache. Writes are already being refused.
+            RUNBOOK section 4.4.
+
+      - alert: GatewayAuthRejectionRateHigh
+        # A sustained collapse in the allowed ratio. Deliberately a RATIO and
+        # deliberately not alerting on 401s alone: a public endpoint always
+        # refuses some traffic, and a raw count would either page on ordinary
+        # scanner noise or need a per-deployment threshold nobody maintains.
+        expr: |
+          sum(rate(gateway_auth_verify_decisions_total{outcome!="allowed"}[10m]))
+          /
+          clamp_min(sum(rate(gateway_auth_verify_decisions_total[10m])), 0.001) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "gateway-auth-svc refusing over 50% of requests for 10m"
+          description: >-
+            Check the outcome label to tell these apart: invalid_token points
+            at an expiry or key-rotation problem, no_token at a client that
+            stopped sending credentials, incomplete_claims at
+            identity-context-svc minting bad envelopes. RUNBOOK section 4.5.
+
+      - alert: GatewayAuthReadinessFailing
+        # Duplicated from the baseline ReadinessProbeFailing on purpose, at a
+        # tighter threshold. Nothing gated is reachable while this service is
+        # unready — it is not one service degrading, it is the front door.
+        expr: readiness_up{service="gateway-auth-svc"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "gateway-auth-svc not ready for 1m"
+          description: >-
+            The gateway cannot verify anything. Every gated route in the estate
+            is refusing traffic. RUNBOOK section 4.6.
+
   # secret-vault-integration-svc
   # ---------------------------------------------------------------------------
   #

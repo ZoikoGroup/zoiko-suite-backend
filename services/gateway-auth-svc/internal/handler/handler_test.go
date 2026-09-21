@@ -323,7 +323,13 @@ func TestVerify_ResolvedTenantMismatch_Returns403(t *testing.T) {
 	h.Verify(rec, req)
 
 	assert.Equal(t, http.StatusForbidden, rec.Code)
-	assert.Equal(t, "tenant_hostname_mismatch", rec.Header().Get("X-Carta-Decision"))
+	assert.Equal(t, "tenant_hostname_mismatch", rec.Header().Get("X-Auth-Denial-Reason"))
+	// NOT attributed to CARTA. This refusal used to set X-Carta-Decision,
+	// reporting a token-spoofing rejection as a decision the risk engine had
+	// made — carta-svc was never consulted on this path, and anyone reading
+	// that header went looking through its logs for a decision that does not
+	// exist there.
+	assert.Empty(t, rec.Header().Get("X-Carta-Decision"))
 }
 
 // TestVerify_ResolvedTenantMatches_Returns200 proves the matching case is

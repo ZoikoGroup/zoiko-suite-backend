@@ -21,6 +21,7 @@ import (
 	"zoiko.io/gateway-auth-svc/internal/jwks"
 	"zoiko.io/gateway-auth-svc/internal/router"
 	"zoiko.io/gateway-auth-svc/internal/siem"
+	"zoiko.io/gateway-auth-svc/internal/telemetry"
 	"zoiko.io/gateway-auth-svc/internal/tenantctx"
 )
 
@@ -36,6 +37,23 @@ func main() {
 	if err != nil {
 		log.Fatal("config load failed", zap.Error(err))
 	}
+
+	// Tracing is best-effort: a collector that is down must not stop the
+	// service every gated request in the estate depends on.
+	shutdownTracing, err := telemetry.InitTracing(context.Background(), "gateway-auth-svc", cfg.OTELExporterEndpoint)
+	if err != nil {
+		log.Warn("tracing disabled — OTLP exporter unavailable", zap.Error(err))
+	} else {
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTracing(shutdownCtx); err != nil {
+				log.Warn("tracing shutdown failed", zap.Error(err))
+			}
+		}()
+	}
+
+	metrics := telemetry.NewMetrics("gateway-auth-svc")
 
 	jwksClient := jwks.NewClient(cfg.JWKSURL, cfg.JWKSCacheTTL)
 	cartaClient := carta.New(cfg.CartaServiceURL, log)
@@ -59,8 +77,8 @@ func main() {
 			"resolution; tenant operability and cross-tenant entity ownership are not checked at the gateway")
 	}
 
-	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log)
-	r := router.New(h, jwksClient)
+	h := handler.New(cfg, jwksClient, cartaClient, siemClient, tenantResolver, log).UseMetrics(metrics)
+	r := router.New(h, jwksClient, metrics)
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
