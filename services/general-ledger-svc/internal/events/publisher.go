@@ -67,6 +67,29 @@ func NewPublisher(log *zap.Logger, topic string, producer MessageWriter) *Publis
 	return &Publisher{log: log, topic: topic, producer: producer}
 }
 
+// PublishOutbox emits an already-serialized Variant A event payload to the Kafka topic
+// with partition key = aggregateID and Kafka header X-Event-ID = outboxEventID.
+// Kafka write errors are returned to the caller so the outbox relay can retry.
+func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, aggregateID string, payload []byte) error {
+	msg := kafka.Message{
+		Key:   []byte(aggregateID),
+		Value: payload,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+		},
+	}
+	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		p.log.Error("failed to publish outbox event",
+			zap.String("outbox_event_id", outboxEventID),
+			zap.String("aggregate_id", aggregateID),
+			zap.String("topic", p.topic),
+			zap.Error(err),
+		)
+		return fmt.Errorf("kafka write: %w", err)
+	}
+	return nil
+}
+
 // PublishJournalCreated corresponds to §10.1's journal.created event.
 func (p *Publisher) PublishJournalCreated(ctx context.Context, h domain.JournalHeader) {
 	p.emit(ctx, "journal.created", h.CorrelationID, h.JournalID,

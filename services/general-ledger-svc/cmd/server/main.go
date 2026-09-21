@@ -38,6 +38,7 @@ import (
 	"zoiko.io/general-ledger-svc/internal/health"
 	svcmiddleware "zoiko.io/general-ledger-svc/internal/middleware"
 	"zoiko.io/general-ledger-svc/internal/mtls"
+	"zoiko.io/general-ledger-svc/internal/outbox"
 	"zoiko.io/general-ledger-svc/internal/store"
 	"zoiko.io/general-ledger-svc/internal/telemetry"
 )
@@ -139,6 +140,12 @@ func main() {
 	defer func() { _ = kafkaWriter.Close() }()
 
 	publisher := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+
+	// ── 4b. Transactional Outbox Relay (ZS-STATE-001 Invariant I-13) ──────────
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relay := outbox.NewRelay(pool, publisher, 500*time.Millisecond, 50, log)
+	go relay.Start(relayCtx)
 
 	var authzClient *authz.HTTPClient
 	if cfg.AuthzMTLSEnabled {

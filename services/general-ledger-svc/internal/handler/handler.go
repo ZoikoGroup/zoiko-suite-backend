@@ -408,7 +408,6 @@ func (h *Handler) CreateJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.publisher.PublishJournalCreated(r.Context(), *header)
 	writeJSON(w, http.StatusCreated, domain.JournalWithLines{JournalHeader: *header, Lines: resultLines})
 }
 
@@ -932,7 +931,6 @@ func (h *Handler) ValidateJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	header.Status = domain.JournalStatusValidated
-	h.publisher.PublishJournalValidated(r.Context(), *header)
 	writeJSON(w, http.StatusOK, header)
 }
 
@@ -979,7 +977,6 @@ func (h *Handler) PostJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	header.Status = domain.JournalStatusFinalized
-	h.publisher.PublishJournalPosted(r.Context(), *header)
 	writeJSON(w, http.StatusOK, header)
 }
 
@@ -1137,7 +1134,6 @@ func (h *Handler) ReverseJournal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	header.Status = domain.JournalStatusReversed
-	h.publisher.PublishJournalReversed(r.Context(), *header, reversingHeader.JournalID)
 	writeJSON(w, http.StatusCreated, domain.JournalWithLines{JournalHeader: *reversingHeader, Lines: resultLines})
 }
 
@@ -1869,7 +1865,6 @@ func (h *Handler) PostAccountingEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &header.JournalID, &now
-	h.publisher.PublishJournalPosted(r.Context(), *header)
 	writeJSON(w, http.StatusCreated, exec)
 }
 
@@ -1995,7 +1990,6 @@ func (h *Handler) PostApprovedJournal(w http.ResponseWriter, r *http.Request) {
 	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &req.JournalID, &now
 	header.Status = domain.JournalStatusFinalized
 	header.ApprovalStatus = domain.ApprovalStatusPosted
-	h.publisher.PublishJournalPosted(r.Context(), *header)
 	writeJSON(w, http.StatusOK, exec)
 }
 
@@ -2094,7 +2088,6 @@ func (h *Handler) CreateReversalPosting(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	exec.Status, exec.JournalID, exec.CommittedAt = domain.PostingExecutionStatusCommitted, &reversingHeader.JournalID, &now
-	h.publisher.PublishJournalReversed(r.Context(), *header, reversingHeader.JournalID)
 	writeJSON(w, http.StatusCreated, exec)
 }
 

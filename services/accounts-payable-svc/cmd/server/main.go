@@ -37,8 +37,9 @@ import (
 	"zoiko.io/accounts-payable-svc/internal/health"
 	svcmiddleware "zoiko.io/accounts-payable-svc/internal/middleware"
 	"zoiko.io/accounts-payable-svc/internal/mtls"
-	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
+	"zoiko.io/accounts-payable-svc/internal/outbox"
 	"zoiko.io/accounts-payable-svc/internal/payableopenitem"
+	"zoiko.io/accounts-payable-svc/internal/purchaseorder"
 	"zoiko.io/accounts-payable-svc/internal/store"
 	"zoiko.io/accounts-payable-svc/internal/telemetry"
 )
@@ -130,8 +131,11 @@ func main() {
 	// so a production deployment cannot reach this branch and silently stop
 	// publishing.
 	var publisher handler.Publisher
+	var outboxPub outbox.Publisher
 	if len(cfg.Kafka.Brokers) == 0 {
-		publisher = events.NewLogOnlyPublisher(log)
+		logPub := events.NewLogOnlyPublisher(log)
+		publisher = logPub
+		outboxPub = logPub
 	} else {
 		kafkaWriter := &kafka.Writer{
 			Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
@@ -155,8 +159,16 @@ func main() {
 			BatchTimeout: 10 * time.Millisecond,
 		}
 		defer func() { _ = kafkaWriter.Close() }()
-		publisher = events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+		evPub := events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+		publisher = evPub
+		outboxPub = evPub
 	}
+
+	// ── 4b. Transactional Outbox Relay (ZS-STATE-001 Invariant I-13) ──────────
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relay := outbox.NewRelay(pool, outboxPub, 500*time.Millisecond, 50, log)
+	go relay.Start(relayCtx)
 	var authzClient *authz.HTTPClient
 	if cfg.AuthzMTLSEnabled {
 		mtlsHTTPClient, err := mtls.NewClientHTTPClient(context.Background(), cfg.MTLSManagementServiceURL, "accounts-payable-svc", platformScopeID)
@@ -239,6 +251,7 @@ func main() {
 		log.Fatal("server error", zap.Error(err))
 	case sig := <-quit:
 		log.Info("shutdown signal received", zap.String("signal", sig.String()))
+		cancelRelay()
 	}
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)

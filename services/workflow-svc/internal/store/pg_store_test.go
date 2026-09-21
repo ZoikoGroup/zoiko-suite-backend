@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 	"zoiko.io/workflow-svc/internal/store"
 )
@@ -568,5 +569,404 @@ func TestPgStore_CancelApprovedWorkflow_Illegal(t *testing.T) {
 	_, _, err = s.CancelWorkflow(ctx, instance.WorkflowInstanceID, "admin-1")
 	if !errors.Is(err, domain.ErrInvalidTransition) {
 		t.Fatalf("expected ErrInvalidTransition cancelling an APPROVED workflow, got %v", err)
+	}
+}
+
+func makeTestSubjectFingerprint() string {
+	b := svcenvelope.NewFingerprintBuilder()
+	b.Set("journal_id", "j-101")
+	b.SetAmount("total_debit", 4500.00, "USD")
+	return b.Build()
+}
+
+func TestPgStore_SubjectBinding_Persistence(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	fp := makeTestSubjectFingerprint()
+	subjType := "JOURNAL"
+	subjID := "j-101"
+	subjVer := 2
+
+	p := twoStageParams()
+	p.SubjectType = &subjType
+	p.SubjectID = &subjID
+	p.SubjectVersion = &subjVer
+	p.SubjectFingerprint = &fp
+
+	created, _, wasCreated, err := s.CreateWorkflow(ctx, p)
+	if err != nil || !wasCreated {
+		t.Fatalf("create workflow with subject: wasCreated=%v, err=%v", wasCreated, err)
+	}
+
+	loaded, err := s.FindWorkflowByID(ctx, created.WorkflowInstanceID)
+	if err != nil {
+		t.Fatalf("find workflow: %v", err)
+	}
+
+	if loaded.SubjectType == nil || *loaded.SubjectType != subjType {
+		t.Errorf("expected subject_type=%s, got %v", subjType, loaded.SubjectType)
+	}
+	if loaded.SubjectID == nil || *loaded.SubjectID != subjID {
+		t.Errorf("expected subject_id=%s, got %v", subjID, loaded.SubjectID)
+	}
+	if loaded.SubjectVersion == nil || *loaded.SubjectVersion != subjVer {
+		t.Errorf("expected subject_version=%d, got %v", subjVer, loaded.SubjectVersion)
+	}
+	if loaded.SubjectFingerprint == nil || *loaded.SubjectFingerprint != fp {
+		t.Errorf("expected subject_fingerprint=%s, got %v", fp, loaded.SubjectFingerprint)
+	}
+}
+
+func TestPgStore_InvalidateWorkflow_PendingAndApproved(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	// 1. Invalidate while PENDING
+	fp := makeTestSubjectFingerprint()
+	subjType := "SUPPLIER_INVOICE"
+	subjID := "inv-99"
+	subjVer := 1
+
+	p := twoStageParams()
+	p.SubjectType = &subjType
+	p.SubjectID = &subjID
+	p.SubjectVersion = &subjVer
+	p.SubjectFingerprint = &fp
+
+	instance, _, _, err := s.CreateWorkflow(ctx, p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	narrative := "Vendor destination account modified"
+	invalidated, transitioned, err := s.InvalidateWorkflow(ctx, domain.InvalidateWorkflowParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		TenantID:           testTenantID,
+		ActorPrincipalID:   "fraud-detector-1",
+		ReasonCode:         "CONTROL_FAILURE",
+		Narrative:          &narrative,
+		EvidenceRefs:       []string{"doc-audit-1"},
+	})
+	if err != nil || !transitioned {
+		t.Fatalf("invalidate: transitioned=%v, err=%v", transitioned, err)
+	}
+	if invalidated.WorkflowStatus != domain.WorkflowStatusInvalidated {
+		t.Fatalf("expected status INVALIDATED, got %s", invalidated.WorkflowStatus)
+	}
+	if invalidated.InvalidatedAt == nil {
+		t.Errorf("expected invalidated_at stamped")
+	}
+	if invalidated.InvalidationReasonCode == nil || *invalidated.InvalidationReasonCode != "CONTROL_FAILURE" {
+		t.Errorf("expected reason code CONTROL_FAILURE, got %v", invalidated.InvalidationReasonCode)
+	}
+	if invalidated.CurrentStage != 0 {
+		t.Errorf("expected current_stage=0 for terminal invalidated workflow, got %d", invalidated.CurrentStage)
+	}
+
+	// Idempotent replay of invalidation
+	_, transitioned, err = s.InvalidateWorkflow(ctx, domain.InvalidateWorkflowParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		TenantID:           testTenantID,
+		ActorPrincipalID:   "fraud-detector-1",
+		ReasonCode:         "CONTROL_FAILURE",
+	})
+	if err != nil {
+		t.Fatalf("replay invalidate: %v", err)
+	}
+	if transitioned {
+		t.Errorf("expected idempotent no-op on replay, got transitioned=true")
+	}
+
+	// 2. Invalidate an already-APPROVED workflow (material edit after approval)
+	p2 := twoStageParams()
+	p2.Stages = []domain.CreateWorkflowStageInput{{ApproverPrincipalID: "approver-1"}}
+	p2.SubjectFingerprint = &fp
+	apprInstance, _, _, err := s.CreateWorkflow(ctx, p2)
+	if err != nil {
+		t.Fatalf("create single-stage: %v", err)
+	}
+
+	_, _, _, err = s.SubmitAction(ctx, domain.SubmitActionParams{
+		WorkflowInstanceID: apprInstance.WorkflowInstanceID,
+		ActorPrincipalID:   "approver-1",
+		Action:             "APPROVE",
+	})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	// Now invalidate the approved workflow
+	invAppr, transitioned, err := s.InvalidateWorkflow(ctx, domain.InvalidateWorkflowParams{
+		WorkflowInstanceID: apprInstance.WorkflowInstanceID,
+		TenantID:           testTenantID,
+		ActorPrincipalID:   "system-policy-evaluator",
+		ReasonCode:         "POLICY_NOT_MET",
+	})
+	if err != nil || !transitioned {
+		t.Fatalf("invalidate approved: transitioned=%v, err=%v", transitioned, err)
+	}
+	if invAppr.WorkflowStatus != domain.WorkflowStatusInvalidated {
+		t.Fatalf("expected status INVALIDATED from APPROVED, got %s", invAppr.WorkflowStatus)
+	}
+
+	// 3. Cannot invalidate a CANCELLED workflow
+	cancInstance, _, _, _ := s.CreateWorkflow(ctx, twoStageParams())
+	_, _, _ = s.CancelWorkflow(ctx, cancInstance.WorkflowInstanceID, "admin-1")
+	_, _, err = s.InvalidateWorkflow(ctx, domain.InvalidateWorkflowParams{
+		WorkflowInstanceID: cancInstance.WorkflowInstanceID,
+		TenantID:           testTenantID,
+		ActorPrincipalID:   "admin-1",
+		ReasonCode:         "CONTROL_FAILURE",
+	})
+	if !errors.Is(err, domain.ErrInvalidTransition) {
+		t.Fatalf("expected ErrInvalidTransition invalidating cancelled workflow, got %v", err)
+	}
+}
+
+func TestPgStore_VerifyRelease_Comprehensive(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	fp := makeTestSubjectFingerprint()
+	subjType := "PAYMENT_PROPOSAL"
+	subjID := "prop-42"
+	subjVer := 1
+
+	// Create and fully approve a 1-stage workflow
+	p := twoStageParams()
+	p.Stages = []domain.CreateWorkflowStageInput{{ApproverPrincipalID: "approver-1"}}
+	p.SubjectType = &subjType
+	p.SubjectID = &subjID
+	p.SubjectVersion = &subjVer
+	p.SubjectFingerprint = &fp
+
+	instance, _, _, err := s.CreateWorkflow(ctx, p)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// 1. Not approved yet -> verification fails
+	res, err := s.VerifyRelease(ctx, domain.VerifyReleaseParams{
+		WorkflowInstanceID:        instance.WorkflowInstanceID,
+		TenantID:                  testTenantID,
+		CurrentSubjectFingerprint: fp,
+	})
+	if err != nil {
+		t.Fatalf("verify release: %v", err)
+	}
+	if res.CanRelease || res.Status != "INVALID" {
+		t.Errorf("expected cannot release while PENDING, got %+v", res)
+	}
+
+	// Approve the workflow
+	_, _, _, err = s.SubmitAction(ctx, domain.SubmitActionParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		ActorPrincipalID:   "approver-1",
+		Action:             "APPROVE",
+	})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+
+	// 2. Matching fingerprint and version -> can release!
+	res, err = s.VerifyRelease(ctx, domain.VerifyReleaseParams{
+		WorkflowInstanceID:        instance.WorkflowInstanceID,
+		TenantID:                  testTenantID,
+		ExpectedSubjectVersion:    &subjVer,
+		CurrentSubjectFingerprint: fp,
+	})
+	if err != nil {
+		t.Fatalf("verify release: %v", err)
+	}
+	if !res.CanRelease || res.Status != "VALID" {
+		t.Errorf("expected CanRelease=true, got %+v", res)
+	}
+
+	// 3. Fingerprint mismatch (material change!) -> verification blocked
+	alteredFp := svcenvelope.NewFingerprintBuilder().Set("journal_id", "j-101").SetAmount("total_debit", 9999.00, "USD").Build()
+	res, err = s.VerifyRelease(ctx, domain.VerifyReleaseParams{
+		WorkflowInstanceID:        instance.WorkflowInstanceID,
+		TenantID:                  testTenantID,
+		CurrentSubjectFingerprint: alteredFp,
+	})
+	if err != nil {
+		t.Fatalf("verify release: %v", err)
+	}
+	if res.CanRelease || res.Status != "INVALID" {
+		t.Errorf("expected CanRelease=false on fingerprint mismatch, got %+v", res)
+	}
+
+	// 4. Version mismatch -> verification blocked
+	differentVer := 2
+	res, err = s.VerifyRelease(ctx, domain.VerifyReleaseParams{
+		WorkflowInstanceID:        instance.WorkflowInstanceID,
+		TenantID:                  testTenantID,
+		ExpectedSubjectVersion:    &differentVer,
+		CurrentSubjectFingerprint: fp,
+	})
+	if err != nil {
+		t.Fatalf("verify release: %v", err)
+	}
+	if res.CanRelease || res.Status != "INVALID" {
+		t.Errorf("expected CanRelease=false on version mismatch, got %+v", res)
+	}
+
+	// 5. Invalidate workflow -> verification blocked
+	_, _, err = s.InvalidateWorkflow(ctx, domain.InvalidateWorkflowParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		TenantID:           testTenantID,
+		ActorPrincipalID:   "security-officer",
+		ReasonCode:         "CONTROL_FAILURE",
+	})
+	if err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+
+	res, err = s.VerifyRelease(ctx, domain.VerifyReleaseParams{
+		WorkflowInstanceID:        instance.WorkflowInstanceID,
+		TenantID:                  testTenantID,
+		CurrentSubjectFingerprint: fp,
+	})
+	if err != nil {
+		t.Fatalf("verify release: %v", err)
+	}
+	if res.CanRelease || res.Status != "INVALID" {
+		t.Errorf("expected CanRelease=false on invalidated workflow, got %+v", res)
+	}
+}
+
+func TestPgStore_VerifyRelease_LegacyUnboundWorkflow(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	// Create legacy workflow without subject fingerprint
+	p := twoStageParams()
+	p.Stages = []domain.CreateWorkflowStageInput{{ApproverPrincipalID: "approver-1"}}
+	instance, _, _, err := s.CreateWorkflow(ctx, p)
+	if err != nil {
+		t.Fatalf("create legacy: %v", err)
+	}
+
+	_, _, _, _ = s.SubmitAction(ctx, domain.SubmitActionParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		ActorPrincipalID:   "approver-1",
+		Action:             "APPROVE",
+	})
+
+	// Verify release on unbound workflow must fail safely
+	res, err := s.VerifyRelease(ctx, domain.VerifyReleaseParams{
+		WorkflowInstanceID:        instance.WorkflowInstanceID,
+		TenantID:                  testTenantID,
+		CurrentSubjectFingerprint: makeTestSubjectFingerprint(),
+	})
+	if err != nil {
+		t.Fatalf("verify release on legacy: %v", err)
+	}
+	if res.CanRelease || res.Status != "INVALID" {
+		t.Errorf("expected unbound workflow to fail release verification safely, got %+v", res)
+	}
+}
+
+func TestPgStore_Outbox_PersistenceAndAtomicity(t *testing.T) {
+	pool := getTestPool(t)
+	defer pool.Close()
+	setupTestDB(t, pool)
+
+	s := store.New(pool, zap.NewNop())
+	ctx := tenantCtx(testTenantID)
+
+	// 1. CreateWorkflow inserts outbox event workflow.started in same transaction
+	p := twoStageParams()
+	p.Stages = []domain.CreateWorkflowStageInput{{ApproverPrincipalID: "approver-1"}}
+	instance, _, _, err := s.CreateWorkflow(ctx, p)
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+
+	var startedCount int
+	var outboxEventID string
+	var eventType string
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(outbox_event_id::TEXT), ''), COALESCE(MAX(event_type), '')
+		FROM outbox_events
+		WHERE aggregate_id = $1 AND event_type = 'workflow.started'
+	`, instance.WorkflowInstanceID).Scan(&startedCount, &outboxEventID, &eventType)
+	if err != nil {
+		t.Fatalf("query outbox for workflow.started: %v", err)
+	}
+	if startedCount != 1 {
+		t.Fatalf("expected 1 outbox event for workflow.started, got %d", startedCount)
+	}
+	if outboxEventID == "" {
+		t.Fatalf("expected non-empty outbox_event_id")
+	}
+
+	// 2. SubmitAction inserts approval.granted and workflow.completed (since 1-stage final)
+	_, _, _, err = s.SubmitAction(ctx, domain.SubmitActionParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		ActorPrincipalID:   "approver-1",
+		Action:             "APPROVE",
+	})
+	if err != nil {
+		t.Fatalf("submit action: %v", err)
+	}
+
+	var grantedCount, completedCount int
+	err = pool.QueryRow(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE event_type = 'approval.granted'),
+			COUNT(*) FILTER (WHERE event_type = 'workflow.completed')
+		FROM outbox_events
+		WHERE aggregate_id = $1
+	`, instance.WorkflowInstanceID).Scan(&grantedCount, &completedCount)
+	if err != nil {
+		t.Fatalf("query outbox for approval actions: %v", err)
+	}
+	if grantedCount != 1 {
+		t.Errorf("expected 1 outbox approval.granted, got %d", grantedCount)
+	}
+	if completedCount != 1 {
+		t.Errorf("expected 1 outbox workflow.completed, got %d", completedCount)
+	}
+
+	// 3. InvalidateWorkflow inserts workflow.approval.invalidated
+	_, transitioned, err := s.InvalidateWorkflow(ctx, domain.InvalidateWorkflowParams{
+		WorkflowInstanceID: instance.WorkflowInstanceID,
+		TenantID:           testTenantID,
+		ActorPrincipalID:   "admin-1",
+		ReasonCode:         "CONTROL_FAILURE",
+	})
+	if err != nil || !transitioned {
+		t.Fatalf("invalidate workflow: err=%v transitioned=%v", err, transitioned)
+	}
+
+	var invalidatedCount int
+	err = pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM outbox_events
+		WHERE aggregate_id = $1 AND event_type = 'workflow.approval.invalidated'
+	`, instance.WorkflowInstanceID).Scan(&invalidatedCount)
+	if err != nil {
+		t.Fatalf("query outbox for invalidation: %v", err)
+	}
+	if invalidatedCount != 1 {
+		t.Errorf("expected 1 outbox workflow.approval.invalidated, got %d", invalidatedCount)
 	}
 }

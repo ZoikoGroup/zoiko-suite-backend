@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/workflow-svc/internal/domain"
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/handler"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
@@ -43,6 +45,13 @@ type stubStore struct {
 	cancelInstance     *domain.WorkflowInstance
 	cancelTransitioned bool
 	cancelErr          error
+
+	invalidateInstance     *domain.WorkflowInstance
+	invalidateTransitioned bool
+	invalidateErr          error
+
+	verifyReleaseResult *domain.ReleaseVerificationResult
+	verifyReleaseErr    error
 
 	auditEngagement        *domain.AuditEngagement
 	auditCreateCreated     bool
@@ -147,6 +156,12 @@ func (s *stubStore) EscalateWorkflow(_ context.Context, _, _ string) (*domain.Wo
 }
 func (s *stubStore) CancelWorkflow(_ context.Context, _, _ string) (*domain.WorkflowInstance, bool, error) {
 	return s.cancelInstance, s.cancelTransitioned, s.cancelErr
+}
+func (s *stubStore) InvalidateWorkflow(_ context.Context, _ domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error) {
+	return s.invalidateInstance, s.invalidateTransitioned, s.invalidateErr
+}
+func (s *stubStore) VerifyRelease(_ context.Context, _ domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error) {
+	return s.verifyReleaseResult, s.verifyReleaseErr
 }
 func (s *stubStore) CreateAuditEngagement(_ context.Context, _ domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error) {
 	return s.auditEngagement, s.auditCreateCreated, s.auditCreateErr
@@ -278,12 +293,13 @@ func (s *stubStore) GetAuditEngagementReportGates(_ context.Context, _, _ string
 // ── stub publisher ───────────────────────────────────────────────────────────
 
 type stubPublisher struct {
-	startedCalls   int
-	grantedCalls   int
-	rejectedCalls  int
-	escalatedCalls int
-	completedCalls int
-	auditEvents    []string
+	startedCalls     int
+	grantedCalls     int
+	rejectedCalls    int
+	escalatedCalls   int
+	completedCalls   int
+	invalidatedCalls int
+	auditEvents      []string
 }
 
 func (p *stubPublisher) PublishWorkflowStarted(_ context.Context, _ domain.WorkflowInstance) error {
@@ -304,6 +320,10 @@ func (p *stubPublisher) PublishWorkflowEscalated(_ context.Context, _ domain.Wor
 }
 func (p *stubPublisher) PublishWorkflowCompleted(_ context.Context, _ domain.WorkflowInstance, _ string) error {
 	p.completedCalls++
+	return nil
+}
+func (p *stubPublisher) PublishWorkflowInvalidated(_ context.Context, _ domain.WorkflowInstance, _ string) error {
+	p.invalidatedCalls++
 	return nil
 }
 func (p *stubPublisher) PublishAuditEngagementEvent(_ context.Context, eventType string, _ domain.AuditEngagement, _, _ string) error {
@@ -379,8 +399,10 @@ func TestCreateWorkflow_Created(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
 	}
-	if pub.startedCalls != 1 {
-		t.Errorf("expected workflow.started published once, got %d", pub.startedCalls)
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.startedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got %d", pub.startedCalls)
 	}
 }
 
@@ -486,11 +508,10 @@ func TestSubmitAction_Approved_PublishesGrantedOnly_WhenNotFinalStage(t *testing
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if pub.grantedCalls != 1 {
-		t.Errorf("expected approval.granted published once, got %d", pub.grantedCalls)
-	}
-	if pub.completedCalls != 0 {
-		t.Errorf("expected workflow.completed NOT published (not final stage), got %d", pub.completedCalls)
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.grantedCalls != 0 || pub.completedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got granted=%d completed=%d", pub.grantedCalls, pub.completedCalls)
 	}
 }
 
@@ -512,8 +533,10 @@ func TestSubmitAction_FinalApprove_PublishesCompleted(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if pub.grantedCalls != 1 || pub.completedCalls != 1 {
-		t.Errorf("expected granted+completed published once each, got granted=%d completed=%d", pub.grantedCalls, pub.completedCalls)
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.grantedCalls != 0 || pub.completedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got granted=%d completed=%d", pub.grantedCalls, pub.completedCalls)
 	}
 }
 
@@ -728,5 +751,345 @@ func TestGetWorkflow_NoTenantScope_Refused(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 with no X-Tenant-Id, got %d", w.Code)
+	}
+}
+
+// ── Subject Binding Tests ───────────────────────────────────────────────────
+
+func validSubjectFingerprint() string {
+	b := svcenvelope.NewFingerprintBuilder()
+	b.Set("invoice_id", "inv-100")
+	b.SetAmount("total", 1250.50, "USD")
+	return b.Build()
+}
+
+func TestCreateWorkflow_WithSubjectBinding_Success(t *testing.T) {
+	fp := validSubjectFingerprint()
+	subjType := "SUPPLIER_INVOICE"
+	subjID := "inv-100"
+	subjVer := 1
+
+	store := &stubStore{
+		instance: &domain.WorkflowInstance{
+			WorkflowInstanceID: "w-subj-1",
+			WorkflowStatus:     domain.WorkflowStatusPending,
+			SubjectType:        &subjType,
+			SubjectID:          &subjID,
+			SubjectVersion:     &subjVer,
+			SubjectFingerprint: &fp,
+		},
+		stages: []*domain.WorkflowStage{{WorkflowStageID: "s-1", StageOrder: 1}},
+	}
+	r := newTestRouter(store)
+
+	body := fmt.Sprintf(`{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_type":"%s",
+		"subject_id":"%s",
+		"subject_version":1,
+		"subject_fingerprint":"%s",
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`, subjType, subjID, fp)
+
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 created, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateWorkflow_InvalidFingerprint_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_type":"SUPPLIER_INVOICE",
+		"subject_id":"inv-100",
+		"subject_fingerprint":"md5:invalid-format",
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid fingerprint, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateWorkflow_NegativeSubjectVersion_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_version":-1,
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for negative subject version, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestCreateWorkflow_MissingSubjectField_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	// Has subject_type but missing subject_id
+	body := `{
+		"tenant_id":"t-1",
+		"legal_entity_id":"le-1",
+		"workflow_type":"INVOICE_APPROVAL",
+		"subject_type":"SUPPLIER_INVOICE",
+		"stages":[{"approver_principal_id":"approver-1"}]
+	}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows", bytes.NewBufferString(body)), "requester-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for partial subject identity, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── InvalidateWorkflow Tests ────────────────────────────────────────────────
+
+func TestInvalidateWorkflow_Pending_Success(t *testing.T) {
+	fp := validSubjectFingerprint()
+	subjType := "SUPPLIER_INVOICE"
+	subjID := "inv-1"
+	code := "CONTROL_FAILURE"
+
+	store := &stubStore{
+		invalidateInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID:     "w-1",
+			WorkflowStatus:         domain.WorkflowStatusInvalidated,
+			SubjectType:            &subjType,
+			SubjectID:              &subjID,
+			SubjectFingerprint:     &fp,
+			InvalidationReasonCode: &code,
+		},
+		invalidateTransitioned: true,
+	}
+	pub := &stubPublisher{}
+	r := newTestRouterFull(store, pub, &stubAuthz{})
+
+	body := `{"reason_code":"CONTROL_FAILURE","narrative":"material vendor bank account changed"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.invalidatedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got %d", pub.invalidatedCalls)
+	}
+}
+
+func TestInvalidateWorkflow_Approved_Success(t *testing.T) {
+	code := "CANCEL_CUSTOMER_REQUEST"
+	store := &stubStore{
+		invalidateInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID:     "w-approved-1",
+			WorkflowStatus:         domain.WorkflowStatusInvalidated,
+			InvalidationReasonCode: &code,
+		},
+		invalidateTransitioned: true,
+	}
+	pub := &stubPublisher{}
+	r := newTestRouterFull(store, pub, &stubAuthz{})
+
+	body := `{"reason_code":"CANCEL_CUSTOMER_REQUEST"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-approved-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// Direct synchronous publishing has been eliminated per Requirement 6:
+	// events are durably queued by the transactional outbox inside the store transaction.
+	if pub.invalidatedCalls != 0 {
+		t.Errorf("expected no direct synchronous publishing from handler, got %d", pub.invalidatedCalls)
+	}
+}
+
+func TestInvalidateWorkflow_IdempotentReplay_DoesNotRepublish(t *testing.T) {
+	code := "CONTROL_FAILURE"
+	store := &stubStore{
+		invalidateInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID:     "w-1",
+			WorkflowStatus:         domain.WorkflowStatusInvalidated,
+			InvalidationReasonCode: &code,
+		},
+		invalidateTransitioned: false, // already invalidated
+	}
+	pub := &stubPublisher{}
+	r := newTestRouterFull(store, pub, &stubAuthz{})
+
+	body := `{"reason_code":"CONTROL_FAILURE"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if pub.invalidatedCalls != 0 {
+		t.Errorf("expected no publish on idempotent replay, got %d", pub.invalidatedCalls)
+	}
+}
+
+func TestInvalidateWorkflow_InvalidReasonCode_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"reason_code":"NON_GOVERNED_CUSTOM_REASON"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for ungoverned reason code, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvalidateWorkflow_MissingReasonCode_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"narrative":"missing reason code"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing reason code, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
+	store := &stubStore{invalidateErr: domain.ErrInvalidTransition}
+	r := newTestRouter(store)
+
+	body := `{"reason_code":"CONTROL_FAILURE"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/invalidate", bytes.NewBufferString(body)), "admin-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 conflict, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── VerifyRelease Tests ─────────────────────────────────────────────────────
+
+func TestVerifyRelease_ApprovedMatching_CanRelease(t *testing.T) {
+	fp := validSubjectFingerprint()
+	store := &stubStore{
+		verifyReleaseResult: &domain.ReleaseVerificationResult{
+			WorkflowInstanceID: "w-appr-1",
+			CanRelease:         true,
+			Status:             "VALID",
+			WorkflowStatus:     domain.WorkflowStatusApproved,
+			SubjectFingerprint: &fp,
+		},
+	}
+	r := newTestRouter(store)
+
+	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s","expected_subject_version":1}`, fp)
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-appr-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+	var res domain.ReleaseVerificationResult
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if !res.CanRelease || res.Status != "VALID" {
+		t.Errorf("expected can_release=true, got %+v", res)
+	}
+}
+
+func TestVerifyRelease_FingerprintMismatch_Conflict(t *testing.T) {
+	reason := domain.ErrSubjectFingerprintMismatch.Error()
+	store := &stubStore{
+		verifyReleaseResult: &domain.ReleaseVerificationResult{
+			WorkflowInstanceID: "w-appr-1",
+			CanRelease:         false,
+			Status:             "INVALID",
+			Reason:             &reason,
+			WorkflowStatus:     domain.WorkflowStatusApproved,
+		},
+	}
+	r := newTestRouter(store)
+
+	// Caller presents modified fingerprint
+	liveFp := validSubjectFingerprint()
+	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, liveFp)
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-appr-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on mismatch, got %d: %s", w.Code, w.Body.String())
+	}
+	var res domain.ReleaseVerificationResult
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if res.CanRelease || res.Status != "INVALID" {
+		t.Errorf("expected can_release=false and status=INVALID, got %+v", res)
+	}
+}
+
+func TestVerifyRelease_UnboundSubject_FailsSafely(t *testing.T) {
+	reason := domain.ErrWorkflowUnboundSubject.Error()
+	store := &stubStore{
+		verifyReleaseResult: &domain.ReleaseVerificationResult{
+			WorkflowInstanceID: "w-legacy-1",
+			CanRelease:         false,
+			Status:             "INVALID",
+			Reason:             &reason,
+			WorkflowStatus:     domain.WorkflowStatusApproved,
+		},
+	}
+	r := newTestRouter(store)
+
+	body := fmt.Sprintf(`{"current_subject_fingerprint":"%s"}`, validSubjectFingerprint())
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-legacy-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for unbound subject, got %d", w.Code)
+	}
+	var res domain.ReleaseVerificationResult
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	if res.CanRelease {
+		t.Errorf("expected can_release=false for unbound subject, got %+v", res)
+	}
+}
+
+func TestVerifyRelease_InvalidFingerprintFormat_BadRequest(t *testing.T) {
+	r := newTestRouter(&stubStore{})
+
+	body := `{"current_subject_fingerprint":"bad-fingerprint"}`
+	req := scoped(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-1/verify-release", bytes.NewBufferString(body)))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for bad fingerprint, got %d", w.Code)
 	}
 }
