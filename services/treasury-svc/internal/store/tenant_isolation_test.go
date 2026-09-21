@@ -78,6 +78,7 @@ func TestMain(m *testing.M) {
 		"000003_add_bnk01_identity.up.sql",
 		"000004_add_bnk09_treasury_transfer.up.sql",
 		"000005_add_bnk10_fx_rates.up.sql",
+		"000006_add_bnk01_account_history.up.sql",
 	} {
 		sql, err := os.ReadFile("../../deployments/migrations/" + migration)
 		if err != nil {
@@ -115,10 +116,12 @@ func cleanTables(t *testing.T) {
 	for _, stmt := range []string{
 		"ALTER TABLE bank_accounts DISABLE TRIGGER trg_reject_bank_account_mutation",
 		"ALTER TABLE bank_account_ownership_evidence DISABLE TRIGGER trg_reject_ownership_evidence_mutation",
+		"ALTER TABLE bank_account_history DISABLE TRIGGER trg_reject_account_history_mutation",
 		"ALTER TABLE treasury_transfers DISABLE TRIGGER trg_reject_terminal_transfer_mutation",
-		"DELETE FROM treasury_transfers; DELETE FROM cash_balances; DELETE FROM bank_account_ownership_evidence; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;",
+		"DELETE FROM treasury_transfers; DELETE FROM cash_balances; DELETE FROM bank_account_ownership_evidence; DELETE FROM bank_account_history; DELETE FROM bank_accounts; DELETE FROM liquidity_thresholds;",
 		"ALTER TABLE bank_accounts ENABLE TRIGGER trg_reject_bank_account_mutation",
 		"ALTER TABLE bank_account_ownership_evidence ENABLE TRIGGER trg_reject_ownership_evidence_mutation",
+		"ALTER TABLE bank_account_history ENABLE TRIGGER trg_reject_account_history_mutation",
 		"ALTER TABLE treasury_transfers ENABLE TRIGGER trg_reject_terminal_transfer_mutation",
 	} {
 		if _, err := testPool.Exec(ctx, stmt); err != nil {

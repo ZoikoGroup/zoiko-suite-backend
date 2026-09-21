@@ -53,6 +53,7 @@ type Store interface {
 	ReactivateBankAccount(ctx context.Context, p domain.ReactivateAccountParams) (*domain.BankAccount, error)
 	CloseBankAccount(ctx context.Context, p domain.CloseAccountParams) (*domain.BankAccount, error)
 	RotateAccountIdentifierToken(ctx context.Context, p domain.RotateAccountTokenParams) (*domain.BankAccount, error)
+	GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountID string, asOf time.Time) (*domain.AccountHistoryEntry, error)
 }
 
 // Publisher defines Kafka event publication contract.
@@ -96,6 +97,15 @@ type TransferClients interface {
 	PairTreasuryTransferIntercompany(ctx context.Context, tenantID, principalID, correlationID, sourceLegalEntityID, targetLegalEntityID, sourceJournalID string, amount float64, currencyCode string) (string, error)
 }
 
+// BankingConnector is BNK-01's read-only dependency on banking-connector-svc
+// for ListConnectionOptions (Wave 10d) — optional (nil is a valid value,
+// same convention as bank-reconciliation-svc's own optional banking
+// client): a deployment that hasn't wired banking-connector-svc's URL yet
+// simply can't serve this one query, not a startup failure.
+type BankingConnector interface {
+	ListConnectionOptions(ctx context.Context, tenantID, legalEntityID, bankAccountID, correlationID string) ([]domain.ConnectionOption, error)
+}
+
 const (
 	actionRegisterAccount  = "TREASURY_ACCOUNT_REGISTER"
 	actionSetThreshold     = "TREASURY_THRESHOLD_SET"
@@ -111,16 +121,18 @@ type Handler struct {
 	authz           AuthZClient
 	clients         Clients
 	transferClients TransferClients
+	banking         BankingConnector
 	log             *zap.Logger
 }
 
-func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, transferClients TransferClients, log *zap.Logger) *Handler {
+func New(store Store, publisher Publisher, authz AuthZClient, clients Clients, transferClients TransferClients, banking BankingConnector, log *zap.Logger) *Handler {
 	return &Handler{
 		store:           store,
 		publisher:       publisher,
 		authz:           authz,
 		clients:         clients,
 		transferClients: transferClients,
+		banking:         banking,
 		log:             log,
 	}
 }
@@ -156,6 +168,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/accounts/{accountID}/reactivate", h.ReactivateBankAccount)
 		r.Post("/accounts/{accountID}/close", h.CloseBankAccount)
 		r.Post("/accounts/{accountID}/rotate-token", h.RotateAccountIdentifierToken)
+		r.Get("/accounts/{accountID}/as-of", h.GetBankAccountAsOf)
+		r.Get("/accounts/{accountID}/masked", h.GetBankAccountMasked)
+		r.Get("/accounts/{accountID}/available-actions", h.GetAvailableActions)
+		r.Get("/accounts/{accountID}/connection-options", h.ListConnectionOptions)
 	})
 }
 

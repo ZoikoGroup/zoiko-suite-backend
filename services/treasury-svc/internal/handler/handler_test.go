@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -166,6 +167,23 @@ func (m *mockStore) GetBankAccount(ctx context.Context, bankAccountID string) (*
 		return nil, m.getErr
 	}
 	return m.bankAccounts[bankAccountID], nil
+}
+
+func (m *mockStore) GetBankAccountAsOf(ctx context.Context, tenantID, bankAccountID string, asOf time.Time) (*domain.AccountHistoryEntry, error) {
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	a := m.bankAccounts[bankAccountID]
+	if a == nil {
+		return nil, nil
+	}
+	return &domain.AccountHistoryEntry{
+		HistoryID: "hist-" + a.BankAccountID, BankAccountID: a.BankAccountID, TenantID: a.TenantID,
+		AccountName: a.AccountName, MaskedAccountNumber: a.MaskedAccountNumber, BankIdentifier: a.BankIdentifier,
+		AccountStatus: a.AccountStatus, BranchRef: a.BranchRef, Country: a.Country, AccountType: a.AccountType,
+		RequestedOperationalUse: a.RequestedOperationalUse, TokenVersion: a.TokenVersion,
+		ChangedByPrincipalID: a.CreatedByPrincipalID, EffectiveAt: asOf,
+	}, nil
 }
 
 func (m *mockStore) ListBankAccounts(ctx context.Context, legalEntityID string) ([]domain.BankAccount, error) {
@@ -412,9 +430,15 @@ func (m *mockPublisher) PublishBankAccountTokenRotated(ctx context.Context, corr
 type mockAuthz struct {
 	allowed bool
 	err     error
+	// lastAction records the actionType of the most recent CheckAllowed
+	// call, so a test can assert a route requested the specific
+	// permission it's supposed to (e.g. the masked read using a distinct,
+	// lower-privilege action from the full detail read).
+	lastAction string
 }
 
 func (m *mockAuthz) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	m.lastAction = actionType
 	if m.err != nil {
 		return m.err
 	}
@@ -473,6 +497,18 @@ func (m *mockTransferClients) PairTreasuryTransferIntercompany(ctx context.Conte
 	return "intercompany-stub", nil
 }
 
+type mockBankingConnector struct {
+	options []domain.ConnectionOption
+	err     error
+}
+
+func (m *mockBankingConnector) ListConnectionOptions(ctx context.Context, tenantID, legalEntityID, bankAccountID, correlationID string) ([]domain.ConnectionOption, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.options, nil
+}
+
 func TestHandler_RegisterBankAccount(t *testing.T) {
 	s := newMockStore()
 	p := &mockPublisher{}
@@ -480,7 +516,7 @@ func TestHandler_RegisterBankAccount(t *testing.T) {
 	c := &mockClients{}
 	log := zap.NewNop()
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -524,7 +560,7 @@ func TestHandler_BankAccountLifecycle_PublishesEveryEvent(t *testing.T) {
 	p := &mockPublisher{}
 	az := &mockAuthz{allowed: true}
 	c := &mockClients{}
-	h := handler.New(s, p, az, c, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -598,7 +634,7 @@ func TestHandler_VerifyBankAccountOwnership_CreatorCannotSelfVerify(t *testing.T
 		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
 		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -623,7 +659,7 @@ func TestHandler_VerifyBankAccountOwnership_DifferentPrincipal_Succeeds(t *testi
 		BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD",
 		AccountStatus: domain.BankAccountPendingVerification, CreatedByPrincipalID: "usr-creator",
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -663,7 +699,7 @@ func TestHandler_GetEffectiveCash(t *testing.T) {
 		AvailableBalance: 1000.0,
 	}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -710,7 +746,7 @@ func TestHandler_GetEffectiveCash_FreshBankBalance_NotFlaggedStale(t *testing.T)
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances[acctID] = &domain.CashBalance{BankAccountID: acctID, AvailableBalance: 1000.0, AsOfTimestamp: time.Now().UTC()}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -770,7 +806,7 @@ func TestHandler_CreateTreasuryTransfer_SuccessAndThreshold(t *testing.T) {
 		MinimumRequiredBalance: 200.0,
 	}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -831,7 +867,7 @@ func TestHandler_CreateTreasuryTransfer_MissingCorrelationID_Rejected(t *testing
 	s.bankAccounts["tgt-2"] = &domain.BankAccount{BankAccountID: "tgt-2", LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -865,7 +901,7 @@ func TestHandler_CreateTreasuryTransfer_RetriedCorrelationID_DoesNotCreateASecon
 	s.cashBalances["src-1"] = &domain.CashBalance{BankAccountID: "src-1", AvailableBalance: 500.0}
 	s.cashBalances["tgt-2"] = &domain.CashBalance{BankAccountID: "tgt-2", AvailableBalance: 100.0}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -944,7 +980,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 		AvailableBalance: 100.0,
 	}
 
-	h := handler.New(s, p, az, c, &mockTransferClients{}, log)
+	h := handler.New(s, p, az, c, &mockTransferClients{}, nil, log)
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1005,7 +1041,7 @@ func TestHandler_GetForecasts_Endpoint(t *testing.T) {
 
 func TestHandler_GetFXExposure_RequiresRecordedRate(t *testing.T) {
 	s := newMockStore()
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1027,7 +1063,7 @@ func TestHandler_GetFXExposure_ConvertsAtRecordedRate(t *testing.T) {
 		inflowsData:  []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
 		outflowsData: []domain.ExpectedCashFlow{{Amount: 400.0, DueDate: now.AddDate(0, 0, 10), Category: "PAYABLE"}},
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1079,7 +1115,7 @@ func TestHandler_RunFXScenario_UsesHypotheticalRate(t *testing.T) {
 	c := &mockClients{
 		inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
 	}
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, c, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1130,7 +1166,7 @@ func TestHandler_GetBankAccountByID_IncludesOwnershipVerified(t *testing.T) {
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1159,7 +1195,7 @@ func TestHandler_GetBankAccountByID_UnverifiedAccount_ReturnsFalse(t *testing.T)
 	acctID := "acct-1"
 	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
 
-	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, zap.NewNop())
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
 	r := chi.NewRouter()
 	handler.RegisterRoutes(r, h)
 
@@ -1179,5 +1215,226 @@ func TestHandler_GetBankAccountByID_UnverifiedAccount_ReturnsFalse(t *testing.T)
 	}
 	if resp.IsOwnershipVerified {
 		t.Error("expected is_ownership_verified=false for an account with no non-superseded evidence")
+	}
+}
+
+// ── Wave 10: history, masked reads, available actions ───────────────────────
+
+func TestHandler_GetBankAccountAsOf_ReturnsHistoricalEntry(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountName: "Corporate Checking", CurrencyCode: "USD", AccountStatus: "ACTIVE"}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/as-of?at=2026-01-01T00:00:00Z", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var entry domain.AccountHistoryEntry
+	if err := json.NewDecoder(rr.Body).Decode(&entry); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if entry.AccountName != "Corporate Checking" {
+		t.Fatalf("expected the account's name in the history entry, got %q", entry.AccountName)
+	}
+}
+
+func TestHandler_GetBankAccountAsOf_InvalidTimestamp_Returns400(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/as-of?at=not-a-timestamp", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a malformed at param, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandler_GetBankAccountMasked_UsesDistinctPermission proves the
+// masked read is gated on its own lower-privilege action — not silently
+// reusing the same permission as the full detail read (GetBankAccountByID).
+func TestHandler_GetBankAccountMasked_UsesDistinctPermission(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{
+		BankAccountID: acctID, LegalEntityID: "ent-123", AccountName: "Corporate Checking",
+		MaskedAccountNumber: "****1234", BankIdentifier: "SWIFT-TEST", CurrencyCode: "USD", AccountStatus: "ACTIVE",
+	}
+	az := &mockAuthz{allowed: true}
+
+	h := handler.New(s, &mockPublisher{}, az, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/masked", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if az.lastAction != "BANK_ACCOUNT_VIEW_MASKED" {
+		t.Fatalf("expected the masked route to check BANK_ACCOUNT_VIEW_MASKED, got %q", az.lastAction)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, hasBankIdentifier := resp["bank_identifier"]; hasBankIdentifier {
+		t.Error("expected the masked response to omit bank_identifier")
+	}
+	if resp["masked_account_number"] != "****1234" {
+		t.Fatalf("expected masked_account_number to be present, got %+v", resp)
+	}
+}
+
+func TestHandler_GetAvailableActions_ActiveAccount_ExcludesReactivate(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/available-actions", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Actions []string `json:"available_actions"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := map[string]bool{"amend-metadata": true, "change-operational-use": true, "suspend": true, "close": true, "rotate-token": true}
+	for _, a := range resp.Actions {
+		if a == "reactivate" {
+			t.Fatal("expected an ACTIVE account to NOT report reactivate as available")
+		}
+		delete(want, a)
+	}
+	if len(want) != 0 {
+		t.Fatalf("expected all of %v to be reported available for an ACTIVE account, missing some: got %v", want, resp.Actions)
+	}
+}
+
+func TestHandler_GetAvailableActions_ClosedAccount_ReportsNone(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, LegalEntityID: "ent-123", AccountStatus: "CLOSED"}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/available-actions", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Actions []string `json:"available_actions"`
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Actions) != 0 {
+		t.Fatalf("expected a CLOSED account to report zero available actions, got %v", resp.Actions)
+	}
+}
+
+func TestHandler_ListConnectionOptions_Success(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
+	banking := &mockBankingConnector{options: []domain.ConnectionOption{{ConnectionID: "conn-1", Status: "ACTIVE", ProviderRef: "plaid"}}}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/connection-options", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var options []domain.ConnectionOption
+	if err := json.NewDecoder(rr.Body).Decode(&options); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(options) != 1 || options[0].ConnectionID != "conn-1" {
+		t.Fatalf("expected the one connection option to be returned, got %+v", options)
+	}
+}
+
+// TestHandler_ListConnectionOptions_ConnectorUnavailable_FailsClosed proves
+// a banking-connector-svc failure is reported as 503, never as an empty
+// (and misleadingly reassuring) connection list.
+func TestHandler_ListConnectionOptions_ConnectorUnavailable_FailsClosed(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
+	banking := &mockBankingConnector{err: errors.New("connector down")}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, banking, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/connection-options", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when banking-connector-svc is unreachable, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestHandler_ListConnectionOptions_NotConfigured_Returns503 proves a
+// deployment that hasn't wired banking-connector-svc's URL fails closed
+// rather than panicking on the nil client.
+func TestHandler_ListConnectionOptions_NotConfigured_Returns503(t *testing.T) {
+	s := newMockStore()
+	acctID := "acct-1"
+	s.bankAccounts[acctID] = &domain.BankAccount{BankAccountID: acctID, TenantID: "tenant-abc", LegalEntityID: "ent-123", AccountStatus: "ACTIVE"}
+
+	h := handler.New(s, &mockPublisher{}, &mockAuthz{allowed: true}, &mockClients{}, &mockTransferClients{}, nil, zap.NewNop())
+	r := chi.NewRouter()
+	handler.RegisterRoutes(r, h)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/accounts/"+acctID+"/connection-options", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when banking-connector integration is not configured, got %d: %s", rr.Code, rr.Body.String())
 	}
 }

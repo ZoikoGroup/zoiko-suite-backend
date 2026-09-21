@@ -86,7 +86,10 @@ func (s *PgStore) CreateBankAccount(ctx context.Context, acct *domain.BankAccoun
 			now, now)
 		if err := scanBankAccount(row, acct); err == nil {
 			created = true
-			return nil
+			// The initial history entry — without this, GetBankAccountAsOf
+			// has no row to return for any timestamp before the first
+			// amendment, even though the account genuinely existed then.
+			return s.recordAccountHistory(ctx, tx, acct, acct.CreatedByPrincipalID)
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
