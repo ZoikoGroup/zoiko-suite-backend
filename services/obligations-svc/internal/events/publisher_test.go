@@ -19,6 +19,7 @@ import (
 
 	"zoiko.io/obligations-svc/internal/domain"
 	"zoiko.io/obligations-svc/internal/events"
+	"zoiko.io/obligations-svc/internal/middleware"
 )
 
 type fakeWriter struct {
@@ -84,4 +85,53 @@ func TestPublishObligationUpdated_RepeatEventsOnSameObligation_GetDistinctEventI
 	first := decode(t, w.msgs[0])
 	second := decode(t, w.msgs[1])
 	assert.NotEqual(t, first.EventID, second.EventID)
+}
+
+// Doc 03 §19 lists tenant ID as a mandatory envelope field, and
+// search-indexer-svc refuses to project an event without one (INV-02: "every
+// projection document carries trusted tenant identity").
+//
+// The value comes from the REQUEST CONTEXT, which is where the middleware put
+// the gateway-set X-Tenant-Id after requireTenant refused everything that
+// lacked it — not from the payload, and not from a second lookup.
+func TestPublish_EnvelopeCarriesTheVerifiedTenant(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w)
+
+	const tenant = "11111111-1111-1111-1111-111111111111"
+	ctx := middleware.WithTenant(context.Background(), tenant)
+
+	require.NoError(t, p.PublishObligationCreated(ctx, domain.Obligation{
+		ObligationID:   "ob-1",
+		LegalEntityID:  "22222222-2222-2222-2222-222222222222",
+		ObligationCode: "GST-Q4",
+	}, "corr-1"))
+
+	require.Len(t, w.msgs, 1)
+	var env struct {
+		TenantID      string `json:"tenant_id"`
+		LegalEntityID string `json:"legal_entity_id"`
+	}
+	require.NoError(t, json.Unmarshal(w.msgs[0].Value, &env))
+	assert.Equal(t, tenant, env.TenantID)
+	assert.Equal(t, "22222222-2222-2222-2222-222222222222", env.LegalEntityID)
+}
+
+// An unscoped context omits the field rather than emitting an empty string.
+//
+// omitempty, deliberately: a downstream consumer must be able to tell "no
+// tenant" from "the empty tenant", and search-indexer-svc quarantines the
+// event either way. Emitting "" would make a missing tenant look like a
+// present one to anything doing a bare presence check.
+func TestPublish_OmitsTenantWhenTheContextCarriesNone(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.obligations.events", w)
+
+	require.NoError(t, p.PublishObligationCreated(context.Background(),
+		domain.Obligation{ObligationID: "ob-1", LegalEntityID: "le-1"}, "corr-1"))
+
+	require.Len(t, w.msgs, 1)
+	var raw map[string]any
+	require.NoError(t, json.Unmarshal(w.msgs[0].Value, &raw))
+	assert.NotContains(t, raw, "tenant_id")
 }
