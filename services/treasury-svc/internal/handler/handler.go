@@ -47,6 +47,12 @@ type Store interface {
 	// BNK-10 — see internal/store/bnk10_store.go's own doc comments.
 	RecordFXRate(ctx context.Context, p domain.RecordFXRateParams) (*domain.FXRate, error)
 	GetLatestFXRate(ctx context.Context, tenantID, currencyPair string) (*domain.FXRate, error)
+	CreateFXExposureSnapshot(ctx context.Context, p domain.CalculateFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error)
+	GetFXExposureSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.FXExposureSnapshot, error)
+	GetLatestFXExposure(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string) (*domain.FXExposureSnapshot, error)
+	GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error)
+	PublishFXExposureSnapshot(ctx context.Context, p domain.PublishFXExposureParams) (*domain.FXExposureSnapshot, error)
+	SupersedeFXExposureSnapshot(ctx context.Context, p domain.SupersedeFXExposureParams) (*domain.FXExposureSnapshot, error)
 
 	// BNK-08 — see internal/store/bnk08_store.go's own doc comments.
 	CreateCashPositionSnapshot(ctx context.Context, p domain.CalculateCashPositionParams, calc domain.CashPositionCalculation) (*domain.CashPositionSnapshot, error)
@@ -148,6 +154,11 @@ const (
 	// calculate/read.
 	actionCalculateCashPosition = "TREASURY_CASH_POSITION_CALCULATE"
 	actionPublishCashPosition   = "TREASURY_CASH_POSITION_PUBLISH"
+	// actionCalculateFXExposure/actionPublishFXExposure mirror the
+	// cash-position pair above — the doc lists fx.exposure.calculate and
+	// fx.exposure.publish as distinct permissions.
+	actionCalculateFXExposure = "TREASURY_FX_EXPOSURE_CALCULATE"
+	actionPublishFXExposure   = "TREASURY_FX_EXPOSURE_PUBLISH"
 )
 
 type Handler struct {
@@ -198,6 +209,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/fx/rates", h.RecordFXRate)
 		r.Get("/fx/exposure", h.GetFXExposure)
 		r.Post("/fx/scenario", h.RunFXScenario)
+		r.Post("/fx/exposure-snapshot/calculate", h.CalculateFXExposure)
+		r.Post("/fx/exposure-snapshot/refresh", h.RefreshFXExposure)
+		r.Post("/fx/exposure-snapshot/{snapshotID}/publish", h.PublishFXExposureSnapshot)
+		r.Post("/fx/exposure-snapshot/{snapshotID}/supersede", h.SupersedeFXExposureSnapshot)
+		r.Get("/fx/exposure-snapshot", h.GetFXExposureSnapshotLatest)
+		r.Get("/fx/exposure-snapshot/as-of", h.GetFXExposureSnapshotAsOf)
 
 		// BNK-01 — see internal/handler/bnk01_handler.go.
 		r.Post("/accounts/{accountID}/verify-ownership", h.VerifyBankAccountOwnership)

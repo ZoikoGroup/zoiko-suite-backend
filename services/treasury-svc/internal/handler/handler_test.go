@@ -39,6 +39,7 @@ type mockStore struct {
 	fxRates map[string]*domain.FXRate
 
 	cashPositions map[string]*domain.CashPositionSnapshot
+	fxExposures   map[string]*domain.FXExposureSnapshot
 }
 
 func newMockStore() *mockStore {
@@ -561,6 +562,93 @@ func (m *mockStore) SupersedeCashPositionSnapshot(ctx context.Context, p domain.
 		return nil, domain.ErrInvalidCashPositionTransition
 	}
 	snap.Status = domain.CashPositionSuperseded
+	newID := p.NewSnapshotID
+	snap.SupersededBy = &newID
+	return snap, nil
+}
+
+// ── BNK-10 FXExposureSnapshot ────────────────────────────────────────────────
+
+var mockFXExposureSeq int
+
+func (m *mockStore) CreateFXExposureSnapshot(ctx context.Context, p domain.CalculateFXExposureParams, calc domain.FXExposureCalculation) (*domain.FXExposureSnapshot, error) {
+	if m.fxExposures == nil {
+		m.fxExposures = map[string]*domain.FXExposureSnapshot{}
+	}
+	mockFXExposureSeq++
+	snap := &domain.FXExposureSnapshot{
+		SnapshotID: fmt.Sprintf("fxsnap-%s-%s-%s-%d", p.LegalEntityID, p.ExposureCurrency, p.FunctionalCurrency, mockFXExposureSeq),
+		TenantID: p.TenantID, LegalEntityID: p.LegalEntityID, ExposureCurrency: p.ExposureCurrency, FunctionalCurrency: p.FunctionalCurrency,
+		AsOfTimestamp: calc.AsOfTimestamp, RateUsed: calc.RateUsed, RateAsOf: calc.RateAsOf, RateVersion: calc.RateVersion,
+		NettingScope: p.NettingScope, Buckets: calc.Buckets, GrossExposureAmount: calc.GrossExposureAmount, NetExposureAmount: calc.NetExposureAmount,
+		Status: domain.FXExposureCalculated, EffectiveStatus: domain.FXExposureCalculated, HasStaleComponent: calc.HasStaleComponent,
+		CalculatedByPrincipalID: p.ActorPrincipalID, CorrelationID: p.CorrelationID, CreatedAt: time.Now().UTC(),
+	}
+	m.fxExposures[snap.SnapshotID] = snap
+	return snap, nil
+}
+
+func (m *mockStore) GetFXExposureSnapshot(ctx context.Context, tenantID, snapshotID string) (*domain.FXExposureSnapshot, error) {
+	snap, ok := m.fxExposures[snapshotID]
+	if !ok {
+		return nil, domain.ErrFXExposureSnapshotNotFound
+	}
+	return snap, nil
+}
+
+func (m *mockStore) GetLatestFXExposure(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string) (*domain.FXExposureSnapshot, error) {
+	var latest *domain.FXExposureSnapshot
+	for _, snap := range m.fxExposures {
+		if snap.LegalEntityID != legalEntityID || snap.ExposureCurrency != exposureCurrency || snap.FunctionalCurrency != functionalCurrency {
+			continue
+		}
+		if latest == nil || snap.CreatedAt.After(latest.CreatedAt) {
+			latest = snap
+		}
+	}
+	return latest, nil
+}
+
+func (m *mockStore) GetFXExposureAsOf(ctx context.Context, tenantID, legalEntityID, exposureCurrency, functionalCurrency string, asOf time.Time) (*domain.FXExposureSnapshot, error) {
+	var latest *domain.FXExposureSnapshot
+	for _, snap := range m.fxExposures {
+		if snap.LegalEntityID != legalEntityID || snap.ExposureCurrency != exposureCurrency || snap.FunctionalCurrency != functionalCurrency || snap.CreatedAt.After(asOf) {
+			continue
+		}
+		if latest == nil || snap.CreatedAt.After(latest.CreatedAt) {
+			latest = snap
+		}
+	}
+	return latest, nil
+}
+
+func (m *mockStore) PublishFXExposureSnapshot(ctx context.Context, p domain.PublishFXExposureParams) (*domain.FXExposureSnapshot, error) {
+	snap, ok := m.fxExposures[p.SnapshotID]
+	if !ok {
+		return nil, domain.ErrFXExposureSnapshotNotFound
+	}
+	if !domain.CanPublishFXExposure(snap.Status) {
+		return nil, domain.ErrInvalidFXExposureTransition
+	}
+	if snap.HasStaleComponent {
+		return nil, domain.ErrFXExposureStaleCannotPublish
+	}
+	snap.Status = domain.FXExposurePublished
+	snap.PublishedByPrincipalID = p.ActorPrincipalID
+	now := time.Now().UTC()
+	snap.PublishedAt = &now
+	return snap, nil
+}
+
+func (m *mockStore) SupersedeFXExposureSnapshot(ctx context.Context, p domain.SupersedeFXExposureParams) (*domain.FXExposureSnapshot, error) {
+	snap, ok := m.fxExposures[p.SnapshotID]
+	if !ok {
+		return nil, domain.ErrFXExposureSnapshotNotFound
+	}
+	if !domain.CanSupersedeFXExposure(snap.Status) {
+		return nil, domain.ErrInvalidFXExposureTransition
+	}
+	snap.Status = domain.FXExposureSuperseded
 	newID := p.NewSnapshotID
 	snap.SupersededBy = &newID
 	return snap, nil
@@ -1734,6 +1822,138 @@ func TestHandler_RunFXScenario_UsesHypotheticalRate(t *testing.T) {
 	// current = 1000*1.10 = 1100, scenario = 1000*1.20 = 1200, delta = 100.
 	if resp.FunctionalAmountDelta != 100.0 {
 		t.Errorf("expected functional_amount_delta=100, got %f", resp.FunctionalAmountDelta)
+	}
+}
+
+// ── Wave 15: BNK-10 FXExposureSnapshot ───────────────────────────────────────
+
+func TestHandler_CalculateFXExposure_PersistsSnapshot(t *testing.T) {
+	s := newMockStore()
+	now := time.Now().UTC()
+	c := &mockClients{
+		inflowsData:  []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: now.AddDate(0, 0, 10), Category: "RECEIVABLE"}},
+		outflowsData: []domain.ExpectedCashFlow{{Amount: 400.0, DueDate: now.AddDate(0, 0, 10), Category: "PAYABLE"}},
+	}
+	r := newCashPositionRouter(s, c)
+
+	recordBody := []byte(`{"currency_pair":"EUR/USD","rate":1.10}`)
+	recordReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/rates", bytes.NewReader(recordBody))
+	recordReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	recordReq.Header.Set("X-Principal-Id", "usr-999")
+	recordRR := httptest.NewRecorder()
+	r.ServeHTTP(recordRR, recordReq.WithContext(svcmiddleware.WithTenant(recordReq.Context(), "tenant-abc")))
+	if recordRR.Code != http.StatusCreated {
+		t.Fatalf("RecordFXRate: expected 201, got %d: %s", recordRR.Code, recordRR.Body.String())
+	}
+
+	body := []byte(`{"legal_entity_id":"ent-123","exposure_currency":"EUR","functional_currency":"USD","correlation_id":"corr-1"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/exposure-snapshot/calculate", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var snap domain.FXExposureSnapshot
+	if err := json.Unmarshal(rr.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if snap.Status != domain.FXExposureCalculated {
+		t.Fatalf("expected CALCULATED, got %s", snap.Status)
+	}
+	if snap.NettingScope != "SINGLE_ENTITY:ent-123" {
+		t.Fatalf("expected netting_scope to be recorded as single-entity, got %q", snap.NettingScope)
+	}
+	// net exposure = 1000 - 400 = 600 EUR -> 660 USD at 1.10.
+	if snap.NetExposureAmount != 660 {
+		t.Fatalf("expected net_exposure_amount=660, got %v", snap.NetExposureAmount)
+	}
+}
+
+func TestHandler_PublishFXExposureSnapshot_RefusesStale(t *testing.T) {
+	s := newMockStore()
+	// A rate recorded further back than FXRateStalenessThreshold flags the
+	// snapshot stale, same as GetFXExposure's own staleness behavior.
+	s.fxRates = map[string]*domain.FXRate{"EUR/USD": {CurrencyPair: "EUR/USD", Rate: 1.10, RateID: "rate-1", EffectiveAt: time.Now().UTC().Add(-48 * time.Hour)}}
+	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
+	r := newCashPositionRouter(s, c)
+
+	calcBody := []byte(`{"legal_entity_id":"ent-123","exposure_currency":"EUR","functional_currency":"USD"}`)
+	calcReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/exposure-snapshot/calculate", bytes.NewReader(calcBody))
+	calcReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	calcReq.Header.Set("X-Principal-Id", "usr-999")
+	calcRR := httptest.NewRecorder()
+	r.ServeHTTP(calcRR, calcReq.WithContext(svcmiddleware.WithTenant(calcReq.Context(), "tenant-abc")))
+	if calcRR.Code != http.StatusCreated {
+		t.Fatalf("calculate: expected 201, got %d: %s", calcRR.Code, calcRR.Body.String())
+	}
+	var snap domain.FXExposureSnapshot
+	_ = json.Unmarshal(calcRR.Body.Bytes(), &snap)
+	if !snap.HasStaleComponent {
+		t.Fatal("expected the snapshot to be flagged stale (rate older than FXRateStalenessThreshold)")
+	}
+
+	pubReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/exposure-snapshot/"+snap.SnapshotID+"/publish", nil)
+	pubReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	pubReq.Header.Set("X-Principal-Id", "usr-999")
+	pubRR := httptest.NewRecorder()
+	r.ServeHTTP(pubRR, pubReq.WithContext(svcmiddleware.WithTenant(pubReq.Context(), "tenant-abc")))
+	if pubRR.Code != http.StatusConflict {
+		t.Fatalf("expected 409 publishing a stale snapshot, got %d: %s", pubRR.Code, pubRR.Body.String())
+	}
+}
+
+func TestHandler_RefreshFXExposure_SupersedesPrior(t *testing.T) {
+	s := newMockStore()
+	s.fxRates = map[string]*domain.FXRate{"EUR/USD": {CurrencyPair: "EUR/USD", Rate: 1.10, RateID: "rate-1", EffectiveAt: time.Now().UTC()}}
+	c := &mockClients{inflowsData: []domain.ExpectedCashFlow{{Amount: 1000.0, DueDate: time.Now().UTC().AddDate(0, 0, 10), Category: "RECEIVABLE"}}}
+	r := newCashPositionRouter(s, c)
+
+	calcBody := []byte(`{"legal_entity_id":"ent-123","exposure_currency":"EUR","functional_currency":"USD"}`)
+	calcReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/exposure-snapshot/calculate", bytes.NewReader(calcBody))
+	calcReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	calcReq.Header.Set("X-Principal-Id", "usr-999")
+	calcRR := httptest.NewRecorder()
+	r.ServeHTTP(calcRR, calcReq.WithContext(svcmiddleware.WithTenant(calcReq.Context(), "tenant-abc")))
+	var first domain.FXExposureSnapshot
+	_ = json.Unmarshal(calcRR.Body.Bytes(), &first)
+
+	refreshBody := []byte(`{"legal_entity_id":"ent-123","exposure_currency":"EUR","functional_currency":"USD","prior_snapshot_id":"` + first.SnapshotID + `"}`)
+	refreshReq := httptest.NewRequest(http.MethodPost, "/v1/treasury/fx/exposure-snapshot/refresh", bytes.NewReader(refreshBody))
+	refreshReq.Header.Set("X-Tenant-Id", "tenant-abc")
+	refreshReq.Header.Set("X-Principal-Id", "usr-999")
+	refreshRR := httptest.NewRecorder()
+	r.ServeHTTP(refreshRR, refreshReq.WithContext(svcmiddleware.WithTenant(refreshReq.Context(), "tenant-abc")))
+	if refreshRR.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", refreshRR.Code, refreshRR.Body.String())
+	}
+	var second domain.FXExposureSnapshot
+	_ = json.Unmarshal(refreshRR.Body.Bytes(), &second)
+	if second.SnapshotID == first.SnapshotID {
+		t.Fatal("expected refresh to create a NEW snapshot, not reuse the prior one")
+	}
+
+	if s.fxExposures[first.SnapshotID].Status != domain.FXExposureSuperseded {
+		t.Fatalf("expected the prior snapshot to be SUPERSEDED after refresh, got %s", s.fxExposures[first.SnapshotID].Status)
+	}
+	if s.fxExposures[first.SnapshotID].SupersededBy == nil || *s.fxExposures[first.SnapshotID].SupersededBy != second.SnapshotID {
+		t.Fatalf("expected superseded_by to point at the new snapshot, got %+v", s.fxExposures[first.SnapshotID].SupersededBy)
+	}
+}
+
+func TestHandler_GetFXExposureSnapshotLatest_NotFound_Returns404(t *testing.T) {
+	s := newMockStore()
+	r := newCashPositionRouter(s, &mockClients{})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/treasury/fx/exposure-snapshot?legal_entity_id=ent-123&exposure_currency=EUR&functional_currency=USD", nil)
+	req.Header.Set("X-Tenant-Id", "tenant-abc")
+	req.Header.Set("X-Principal-Id", "usr-999")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req.WithContext(svcmiddleware.WithTenant(req.Context(), "tenant-abc")))
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 when no fx exposure snapshot was ever calculated, got %d: %s", rr.Code, rr.Body.String())
 	}
 }
 

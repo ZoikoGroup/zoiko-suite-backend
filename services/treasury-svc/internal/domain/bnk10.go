@@ -94,3 +94,102 @@ var (
 	ErrFXRateNotFound = errorString("no FX rate has been recorded for this currency pair")
 	ErrInvalidFXRate  = errorString("fx rate must be a positive number")
 )
+
+// ── FXExposureSnapshot (Wave 15) ────────────────────────────────────────────
+//
+// GetFXExposure/RunFXScenario above remain exactly what they were: live,
+// never-persisted composition reads. FXExposureSnapshot is the doc's
+// separate, real entity — CalculateFXExposure persists what
+// buildExposure (internal/handler/bnk10_handler.go) already computes,
+// with the same Calculated->Published->Superseded lifecycle Wave 14 gave
+// BNK-08's CashPositionSnapshot. RunFXScenario is UNCHANGED — its
+// hypothetical-rate output is never written here, keeping the doc's own
+// "scenario outputs remain analytical and separate from approved
+// treasury actions" rule structurally true, not just documented.
+const (
+	FXExposureCalculated = "CALCULATED"
+	FXExposurePublished  = "PUBLISHED"
+	FXExposureSuperseded = "SUPERSEDED"
+)
+
+func CanPublishFXExposure(status string) bool { return status == FXExposureCalculated }
+func CanSupersedeFXExposure(status string) bool {
+	return status == FXExposureCalculated || status == FXExposurePublished
+}
+
+// FXExposureSnapshot is BNK-10's real persisted entity.
+type FXExposureSnapshot struct {
+	SnapshotID         string    `json:"snapshot_id"`
+	TenantID           string    `json:"tenant_id"`
+	LegalEntityID      string    `json:"legal_entity_id"`
+	ExposureCurrency   string    `json:"exposure_currency"`
+	FunctionalCurrency string    `json:"functional_currency"`
+	AsOfTimestamp      time.Time `json:"as_of_timestamp"`
+
+	RateUsed  float64   `json:"rate_used"`
+	RateAsOf  time.Time `json:"rate_as_of"`
+	RateVersion string  `json:"rate_version,omitempty"`
+	// NettingScope records what this calculation's scope actually was —
+	// see this file's own doc comment: always single-entity today, never
+	// silently implying a netting algorithm that doesn't exist.
+	NettingScope string `json:"netting_scope"`
+
+	Buckets             []FXExposureBucket `json:"buckets"`
+	GrossExposureAmount float64            `json:"gross_exposure_amount"`
+	NetExposureAmount   float64            `json:"net_exposure_amount"`
+
+	Status                 string     `json:"status"`
+	// EffectiveStatus mirrors BNK-08's own derived-staleness pattern:
+	// PUBLISHED becomes "STALE" (never stored) when HasStaleComponent.
+	EffectiveStatus        string     `json:"effective_status"`
+	HasStaleComponent      bool       `json:"has_stale_component"`
+	PublishedByPrincipalID string     `json:"published_by_principal_id,omitempty"`
+	PublishedAt            *time.Time `json:"published_at,omitempty"`
+	SupersededBy           *string    `json:"superseded_by,omitempty"`
+
+	CalculatedByPrincipalID string    `json:"calculated_by_principal_id"`
+	CorrelationID           string    `json:"correlation_id,omitempty"`
+	CreatedAt               time.Time `json:"created_at"`
+}
+
+// FXExposureCalculation is buildExposure's result, handed to the store to
+// persist — same "handler composes, store persists" split Wave 14 uses.
+type FXExposureCalculation struct {
+	RateUsed      float64
+	RateAsOf      time.Time
+	RateVersion   string
+	HasStaleComponent bool
+	Buckets       []FXExposureBucket
+	GrossExposureAmount float64
+	NetExposureAmount   float64
+	AsOfTimestamp time.Time
+}
+
+type CalculateFXExposureParams struct {
+	TenantID, LegalEntityID, ExposureCurrency, FunctionalCurrency string
+	NettingScope                                                  string
+	CorrelationID                                                 string
+	ActorPrincipalID                                              string
+}
+
+type RefreshFXExposureParams struct {
+	CalculateFXExposureParams
+	PriorSnapshotID string
+}
+
+type PublishFXExposureParams struct {
+	TenantID, SnapshotID, ActorPrincipalID string
+}
+
+type SupersedeFXExposureParams struct {
+	TenantID, SnapshotID, NewSnapshotID string
+}
+
+var (
+	ErrFXExposureSnapshotNotFound  = errorString("fx exposure snapshot not found")
+	ErrInvalidFXExposureTransition = errorString("fx exposure snapshot is not in a state that permits this action")
+	// ErrFXExposureStaleCannotPublish mirrors
+	// ErrCashPositionStaleCannotPublish — a snapshot calculated from a
+	// stale FX rate cannot be marked authoritative.
+	ErrFXExposureStaleCannotPublish = errorString("fx exposure snapshot was calculated from a stale rate and cannot be published as current")
+)
