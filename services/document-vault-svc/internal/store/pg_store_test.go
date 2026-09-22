@@ -105,7 +105,7 @@ func TestPgStore_CreateDocument_And_FindByID(t *testing.T) {
 	v := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("abc123"), StorageKey: "key-1", SizeBytes: 100,
 		ContentType: "application/pdf", CreatedByPrincipalID: "principal-1"}
 
-	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v))
+	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "corr-108"))
 	require.NotEmpty(t, doc.DocumentID)
 	require.Equal(t, 1, doc.CurrentVersion)
 	require.NotEmpty(t, v.DocumentVersionID)
@@ -128,11 +128,11 @@ func TestPgStore_AddVersion_BumpsCurrentVersion_PreservesLineage(t *testing.T) {
 	}
 	v1 := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("v1sum"), StorageKey: "key-1", SizeBytes: 10,
 		ContentType: "text/plain", CreatedByPrincipalID: "principal-1"}
-	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v1))
+	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v1, "corr-131"))
 
 	v2 := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("v2sum"), StorageKey: "key-2", SizeBytes: 20,
 		ContentType: "text/plain", CreatedByPrincipalID: "principal-2"}
-	updated, err := s.AddVersion(tenantCtx(), doc.DocumentID, v2)
+	updated, err := s.AddVersion(tenantCtx(), doc.DocumentID, v2, "corr-addversion")
 	require.NoError(t, err)
 	require.Equal(t, 2, updated.CurrentVersion)
 
@@ -148,8 +148,67 @@ func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	s := store.New(pool, zap.NewNop())
 
 	_, err := s.AddVersion(tenantCtx(), "00000000-0000-0000-0000-000000000000",
-		&domain.DocumentVersion{ChecksumSHA256: sha256Hex("x"), StorageKey: "k", ContentType: "text/plain", CreatedByPrincipalID: "p"})
+		&domain.DocumentVersion{ChecksumSHA256: sha256Hex("x"), StorageKey: "k", ContentType: "text/plain", CreatedByPrincipalID: "p"}, "corr-notfound")
 	require.ErrorIs(t, err, domain.ErrDocumentNotFound)
+}
+
+// TestPgStore_CreateDocument_InsertsOutboxEventAtomically is the real
+// proof of Wave 1 (BIZ-01 events): CreateDocument must leave a
+// document.uploaded row in outbox_events, written in the SAME transaction
+// as the document/version insert — see internal/outbox's own package doc.
+func TestPgStore_CreateDocument_InsertsOutboxEventAtomically(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+
+	doc := &domain.Document{
+		TenantID:      "11111111-1111-1111-1111-111111111111",
+		LegalEntityID: "22222222-2222-2222-2222-222222222222",
+		Title:         "Outbox Test Doc", Classification: domain.ClassificationInternal,
+		CreatedByPrincipalID: "principal-1",
+	}
+	v := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("outbox-1"), StorageKey: "key-outbox-1", SizeBytes: 5,
+		ContentType: "text/plain", CreatedByPrincipalID: "principal-1"}
+	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "corr-outbox-1"))
+
+	var eventType, aggregateID, correlationID string
+	var publishedAt *string
+	err := pool.QueryRow(context.Background(),
+		`SELECT event_type, aggregate_id, correlation_id, published_at::text FROM outbox_events WHERE aggregate_id = $1`,
+		doc.DocumentID).Scan(&eventType, &aggregateID, &correlationID, &publishedAt)
+	require.NoError(t, err, "expected exactly one outbox_events row for this document")
+	require.Equal(t, "document.uploaded", eventType)
+	require.Equal(t, doc.DocumentID, aggregateID)
+	require.Equal(t, "corr-outbox-1", correlationID)
+	require.Nil(t, publishedAt, "a freshly-inserted event must be unpublished until the relay picks it up")
+}
+
+// TestPgStore_AddVersion_InsertsOutboxEventAtomically mirrors the create
+// test for the version_created event.
+func TestPgStore_AddVersion_InsertsOutboxEventAtomically(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+
+	doc := &domain.Document{
+		TenantID:      "11111111-1111-1111-1111-111111111111",
+		LegalEntityID: "22222222-2222-2222-2222-222222222222",
+		Title:         "Outbox Version Test", Classification: domain.ClassificationInternal,
+		CreatedByPrincipalID: "principal-1",
+	}
+	v1 := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("outbox-v1"), StorageKey: "key-outbox-v1", SizeBytes: 5,
+		ContentType: "text/plain", CreatedByPrincipalID: "principal-1"}
+	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v1, "corr-outbox-v1"))
+
+	v2 := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("outbox-v2"), StorageKey: "key-outbox-v2", SizeBytes: 6,
+		ContentType: "text/plain", CreatedByPrincipalID: "principal-1"}
+	_, err := s.AddVersion(tenantCtx(), doc.DocumentID, v2, "corr-outbox-v2")
+	require.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.version_created'`,
+		doc.DocumentID).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 1, count, "expected exactly one document.version_created event")
 }
 
 func TestPgStore_RecordAccess_IsAppendOnly(t *testing.T) {
@@ -163,7 +222,7 @@ func TestPgStore_RecordAccess_IsAppendOnly(t *testing.T) {
 	}
 	v := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("sum"), StorageKey: "key", SizeBytes: 1,
 		ContentType: "text/plain", CreatedByPrincipalID: "principal-1"}
-	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v))
+	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "corr-166"))
 
 	for i := 0; i < 3; i++ {
 		require.NoError(t, s.RecordAccess(tenantCtx(), &domain.DocumentAccessLog{

@@ -22,8 +22,8 @@ import (
 )
 
 type Store interface {
-	CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion) error
-	AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion) (*domain.Document, error)
+	CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) error
+	AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
@@ -174,7 +174,7 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: actor,
 	}
 
-	if err := h.store.CreateDocument(r.Context(), doc, firstVersion); err != nil {
+	if err := h.store.CreateDocument(r.Context(), doc, firstVersion, r.Header.Get("X-Correlation-ID")); err != nil {
 		h.log.Error("CreateDocument: store unavailable", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 		return
@@ -366,7 +366,7 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 		CreatedByPrincipalID: actor,
 	}
 
-	doc, err := h.store.AddVersion(r.Context(), documentID, v)
+	doc, err := h.store.AddVersion(r.Context(), documentID, v, r.Header.Get("X-Correlation-ID"))
 	if err != nil {
 		h.handleStoreError(w, err)
 		return

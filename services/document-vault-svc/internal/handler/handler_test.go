@@ -39,7 +39,7 @@ func newStubStore() *stubStore {
 	return &stubStore{docs: map[string]*domain.Document{}, versions: map[string][]domain.DocumentVersion{}}
 }
 
-func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *domain.DocumentVersion) error {
+func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *domain.DocumentVersion, _ string) error {
 	if s.createErr != nil {
 		return s.createErr
 	}
@@ -59,7 +59,7 @@ func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *d
 	return nil
 }
 
-func (s *stubStore) AddVersion(_ context.Context, documentID string, v *domain.DocumentVersion) (*domain.Document, error) {
+func (s *stubStore) AddVersion(_ context.Context, documentID string, v *domain.DocumentVersion, _ string) (*domain.Document, error) {
 	doc, ok := s.docs[documentID]
 	if !ok {
 		return nil, domain.ErrDocumentNotFound

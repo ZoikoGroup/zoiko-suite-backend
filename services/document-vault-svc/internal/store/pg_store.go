@@ -29,6 +29,7 @@ import (
 
 	"zoiko.io/document-vault-svc/internal/domain"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
+	"zoiko.io/document-vault-svc/internal/outbox"
 )
 
 type PgStore struct {
@@ -129,7 +130,7 @@ func scanVersion(row pgx.Row, v *domain.DocumentVersion) error {
 // The tenant is taken from the caller's context, not from doc.TenantID. A
 // document may only be written into the tenant the request is scoped to, and
 // the WITH CHECK half of the policy enforces the same thing at the database.
-func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion) error {
+func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) error {
 	return s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
 		doc.TenantID = tenantID
 		err := tx.QueryRow(ctx, `
@@ -159,14 +160,55 @@ func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firs
 		if err != nil {
 			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
 		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.uploaded", doc.DocumentID, tenantID,
+			doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
+				"document_id":     doc.DocumentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": doc.LegalEntityID,
+				"title":           doc.Title,
+				"classification":  string(doc.Classification),
+				"version":         firstVersion.Version,
+				"checksum_sha256": firstVersion.ChecksumSHA256,
+			}); err != nil {
+			return err
+		}
 		return nil
 	})
+}
+
+// insertDocumentOutboxEvent is the shared outbox-insert call site for
+// every document-vault-svc event — see internal/outbox's own package doc
+// for why the insert happens here, inside the same transaction as the
+// business mutation, rather than as a separate publish call.
+func (s *PgStore) insertDocumentOutboxEvent(ctx context.Context, tx pgx.Tx, eventType, documentID, tenantID, legalEntityID, actorID, correlationID string, payload map[string]any) error {
+	if correlationID == "" {
+		correlationID = documentID
+	}
+	env, err := outbox.NewVariantAEnvelope(eventType, correlationID, tenantID, legalEntityID, actorID, payload)
+	if err != nil {
+		return fmt.Errorf("build outbox envelope: %w", err)
+	}
+	actor := actorID
+	if err := outbox.Insert(ctx, tx, outbox.Event{
+		AggregateType: "DOCUMENT",
+		AggregateID:   documentID,
+		EventType:     eventType,
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		ActorID:       &actor,
+		CorrelationID: correlationID,
+		Payload:       env,
+	}); err != nil {
+		return fmt.Errorf("outbox insert: %w", err)
+	}
+	return nil
 }
 
 // AddVersion appends a new immutable version row and bumps
 // documents.current_version — the ONLY mutation ever applied to the documents
 // row post-creation.
-func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion) (*domain.Document, error) {
+func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error) {
 	var out domain.Document
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
 		var nextVersion int
@@ -207,6 +249,17 @@ func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.D
 			FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
 		if err := scanDocument(row, &out); err != nil {
 			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.version_created", documentID, tenantID,
+			out.LegalEntityID, v.CreatedByPrincipalID, correlationID, map[string]any{
+				"document_id":     documentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": out.LegalEntityID,
+				"version":         v.Version,
+				"checksum_sha256": v.ChecksumSHA256,
+			}); err != nil {
+			return err
 		}
 		return nil
 	})

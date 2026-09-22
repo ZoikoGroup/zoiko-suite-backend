@@ -18,7 +18,7 @@ func newDocumentForEvidenceTest(t *testing.T, s *store.PgStore, label string) (*
 		Classification: domain.ClassificationConfidential, RetentionPolicy: "7_YEARS", CreatedByPrincipalID: "preparer-1",
 	}
 	v := &domain.DocumentVersion{ChecksumSHA256: sha256Hex(label), StorageKey: "key-" + label, SizeBytes: 100, ContentType: "application/pdf", CreatedByPrincipalID: "preparer-1"}
-	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v))
+	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "corr-"+label))
 	return doc, v
 }
 
@@ -102,7 +102,7 @@ func TestPgStore_SupersedeEvidence_LinksForwardNeverOverwrites(t *testing.T) {
 	require.NoError(t, err)
 
 	v2 := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("supersede-v2"), StorageKey: "key-supersede-v2", SizeBytes: 200, ContentType: "application/pdf", CreatedByPrincipalID: "auditor-1"}
-	_, err = s.AddVersion(tenantCtx(), doc.DocumentID, v2)
+	_, err = s.AddVersion(tenantCtx(), doc.DocumentID, v2, "corr-addversion")
 	require.NoError(t, err)
 
 	newVersion, err := s.SupersedeEvidence(tenantCtx(), domain.SupersedeEvidenceParams{EvidenceID: evidence.EvidenceID, NewDocumentVersionID: v2.DocumentVersionID, ActorPrincipalID: "auditor-1"})
