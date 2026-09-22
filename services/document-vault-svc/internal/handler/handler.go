@@ -20,6 +20,7 @@ import (
 	"zoiko.io/document-vault-svc/internal/domain"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/residency"
+	"zoiko.io/document-vault-svc/internal/scan"
 	"zoiko.io/document-vault-svc/internal/storage"
 )
 
@@ -39,6 +40,7 @@ type Store interface {
 	ListDocuments(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.Document, error)
 	RecordAccess(ctx context.Context, log *domain.DocumentAccessLog) error
 	ListAccessLog(ctx context.Context, documentID string, limit, offset int) ([]domain.DocumentAccessLog, error)
+	RecordQuarantinedVersionUpload(ctx context.Context, documentID, attemptedByPrincipalID, reason, correlationID string) error
 }
 
 type Handler struct {
@@ -46,11 +48,12 @@ type Handler struct {
 	storage   storage.Backend
 	residency residency.Validator
 	authz     authz.Client
+	scanner   scan.Scanner
 	log       *zap.Logger
 }
 
-func New(store Store, storageBackend storage.Backend, residencyValidator residency.Validator, authzClient authz.Client, log *zap.Logger) *Handler {
-	return &Handler{store: store, storage: storageBackend, residency: residencyValidator, authz: authzClient, log: log}
+func New(store Store, storageBackend storage.Backend, residencyValidator residency.Validator, authzClient authz.Client, scanner scan.Scanner, log *zap.Logger) *Handler {
+	return &Handler{store: store, storage: storageBackend, residency: residencyValidator, authz: authzClient, scanner: scanner, log: log}
 }
 
 // maxBodyBytes caps a request body.
@@ -135,6 +138,21 @@ func (h *Handler) CreateDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(content) == 0 {
 		writeError(w, http.StatusBadRequest, "empty_content", domain.ErrEmptyContent.Error())
+		return
+	}
+
+	// Malware/type scan gate (BIZ-01's own "Malware/type/hash failure
+	// quarantines upload" failure semantics) — before anything is
+	// persisted. No document exists yet at this point, so a quarantine
+	// here is reject-only: there is no aggregate to tie a recorded event
+	// to (see internal/scan's own package doc on the current NoOpScanner).
+	if result, err := h.scanner.Scan(r.Context(), content, req.ContentType); err != nil {
+		h.log.Error("CreateDocument: scan unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "scan_unavailable", "")
+		return
+	} else if !result.Clean {
+		h.log.Warn("CreateDocument: upload quarantined", zap.String("reason", result.Reason))
+		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", result.Reason)
 		return
 	}
 
@@ -706,6 +724,23 @@ func (h *Handler) AddVersion(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(content) == 0 {
 		writeError(w, http.StatusBadRequest, "empty_content", domain.ErrEmptyContent.Error())
+		return
+	}
+
+	// Malware/type scan gate — same as CreateDocument's, but this time
+	// the document already exists, so a quarantine is recorded as a real
+	// event (document.version_upload_quarantined) rather than only
+	// rejected. Still nothing is persisted to storage or document_versions.
+	if result, err := h.scanner.Scan(r.Context(), content, req.ContentType); err != nil {
+		h.log.Error("AddVersion: scan unavailable — failing closed", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "scan_unavailable", "")
+		return
+	} else if !result.Clean {
+		h.log.Warn("AddVersion: upload quarantined", zap.String("document_id", documentID), zap.String("reason", result.Reason))
+		if err := h.store.RecordQuarantinedVersionUpload(r.Context(), documentID, actor, result.Reason, r.Header.Get("X-Correlation-ID")); err != nil {
+			h.log.Error("AddVersion: failed to record quarantine event", zap.Error(err))
+		}
+		writeError(w, http.StatusUnprocessableEntity, "upload_quarantined", result.Reason)
 		return
 	}
 

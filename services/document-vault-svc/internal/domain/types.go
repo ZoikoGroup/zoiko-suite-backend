@@ -302,6 +302,10 @@ var (
 	// ErrDuplicateLink backs LinkDocument — the same document already
 	// linked to the same object is a caller bug, not a new fact.
 	ErrDuplicateLink = errors.New("this document is already linked to that object")
+	// ErrUploadQuarantined backs CreateDocument/AddVersion's scan gate
+	// (internal/scan) — the doc's own "Malware/type/hash failure
+	// quarantines upload" failure semantics.
+	ErrUploadQuarantined = errors.New("upload quarantined: failed content scan")
 
 	// ErrInvalidPaging is returned for an out-of-range limit or offset.
 	ErrInvalidPaging = errors.New("limit must be between 1 and 500 and offset must not be negative")

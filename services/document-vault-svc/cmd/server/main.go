@@ -25,6 +25,7 @@ import (
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/outbox"
 	"zoiko.io/document-vault-svc/internal/residency"
+	"zoiko.io/document-vault-svc/internal/scan"
 	"zoiko.io/document-vault-svc/internal/storage"
 	"zoiko.io/document-vault-svc/internal/store"
 )
@@ -72,7 +73,12 @@ func main() {
 	pgStore := store.New(pool, log)
 	residencyValidator := residency.NewHTTPValidator(cfg.TenantRegistryURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
-	h := handler.New(pgStore, storageBackend, residencyValidator, authzClient, log)
+	// scan.NoOpScanner: no real malware/type scanning engine is
+	// integrated anywhere in this repo — see internal/scan's own package
+	// doc. The gate itself is real and wired; swapping in a real scanner
+	// is a one-line change here.
+	scanner := scan.NoOpScanner{}
+	h := handler.New(pgStore, storageBackend, residencyValidator, authzClient, scanner, log)
 	healthH := health.New(pool)
 
 	// ── Transactional outbox relay (ZS-STATE-001 Invariant I-13) ─────────────

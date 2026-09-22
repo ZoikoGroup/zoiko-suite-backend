@@ -446,6 +446,38 @@ func TestPgStore_LinkDocument_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrDocumentNotFound)
 }
 
+// TestPgStore_RecordQuarantinedVersionUpload_InsertsOutboxEventNoMutation
+// proves Wave 4's quarantine event: a real outbox row lands with no
+// accompanying document/version mutation — the event itself is the
+// record that an upload was rejected before ever reaching storage.
+func TestPgStore_RecordQuarantinedVersionUpload_InsertsOutboxEventNoMutation(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "quarantine")
+
+	err := s.RecordQuarantinedVersionUpload(tenantCtx(), doc.DocumentID, "uploader-1", "malware signature match", "corr-quarantine-1")
+	require.NoError(t, err)
+
+	var eventType, reason string
+	err = pool.QueryRow(context.Background(),
+		`SELECT event_type, payload->'payload'->>'reason' FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.version_upload_quarantined'`,
+		doc.DocumentID).Scan(&eventType, &reason)
+	require.NoError(t, err)
+	require.Equal(t, "document.version_upload_quarantined", eventType)
+	require.Equal(t, "malware signature match", reason)
+
+	current, err := s.FindDocumentByID(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	require.Equal(t, 1, current.CurrentVersion, "expected the quarantined upload to never bump current_version")
+}
+
+func TestPgStore_RecordQuarantinedVersionUpload_UnknownDocument_ReturnsNotFound(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	err := s.RecordQuarantinedVersionUpload(tenantCtx(), "00000000-0000-0000-0000-000000000000", "uploader-1", "reason", "corr")
+	require.ErrorIs(t, err, domain.ErrDocumentNotFound)
+}
+
 func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.New(pool, zap.NewNop())

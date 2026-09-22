@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -21,21 +22,23 @@ import (
 	"zoiko.io/document-vault-svc/internal/handler"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
 	"zoiko.io/document-vault-svc/internal/residency"
+	"zoiko.io/document-vault-svc/internal/scan"
 	"zoiko.io/document-vault-svc/internal/storage"
 )
 
 // ── stub store ───────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	docs      map[string]*domain.Document
-	versions  map[string][]domain.DocumentVersion
-	accessLog []domain.DocumentAccessLog
-	links     map[string][]domain.DocumentLink
-	seq       int
-	linkSeq   int
-	createErr error
-	findErr   error
-	recordErr error
+	docs             map[string]*domain.Document
+	versions         map[string][]domain.DocumentVersion
+	accessLog        []domain.DocumentAccessLog
+	links            map[string][]domain.DocumentLink
+	quarantineEvents []string
+	seq              int
+	linkSeq          int
+	createErr        error
+	findErr          error
+	recordErr        error
 }
 
 func newStubStore() *stubStore {
@@ -223,6 +226,14 @@ func (s *stubStore) ListVersions(_ context.Context, documentID string) ([]domain
 	return s.versions[documentID], nil
 }
 
+func (s *stubStore) RecordQuarantinedVersionUpload(_ context.Context, documentID, _, _, _ string) error {
+	if _, ok := s.docs[documentID]; !ok {
+		return domain.ErrDocumentNotFound
+	}
+	s.quarantineEvents = append(s.quarantineEvents, documentID)
+	return nil
+}
+
 func (s *stubStore) RecordAccess(_ context.Context, log *domain.DocumentAccessLog) error {
 	if s.recordErr != nil {
 		return s.recordErr
@@ -291,6 +302,25 @@ func (a *stubAuthz) called(principal, action string) bool {
 	return false
 }
 
+// ── stub scanner ─────────────────────────────────────────────────────────────
+
+// stubScanner defaults to clean, same posture as the real NoOpScanner —
+// tests that want a quarantine set clean=false explicitly.
+type stubScanner struct {
+	clean  bool
+	reason string
+	err    error
+}
+
+func newStubScanner() *stubScanner { return &stubScanner{clean: true} }
+
+func (s *stubScanner) Scan(_ context.Context, _ []byte, _ string) (scan.Result, error) {
+	if s.err != nil {
+		return scan.Result{}, s.err
+	}
+	return scan.Result{Clean: s.clean, Reason: s.reason}, nil
+}
+
 // ── stub residency validator ─────────────────────────────────────────────────
 
 type stubResidency struct {
@@ -340,7 +370,28 @@ func newRouterAuthz(s *stubStore, res residency.Validator, st storage.Backend, a
 		})
 	})
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, st, res, az, zap.NewNop())
+	h := handler.New(s, st, res, az, newStubScanner(), zap.NewNop())
+	handler.RegisterRoutes(r, h)
+	return r
+}
+
+// newRouterScanner is newRouterAuthz with a caller-supplied scanner — for
+// tests that need to control the quarantine gate specifically.
+func newRouterScanner(s *stubStore, res residency.Validator, st storage.Backend, sc scan.Scanner) chi.Router {
+	r := chi.NewRouter()
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.Header.Get("X-Principal-Id") == "" {
+				req.Header.Set("X-Principal-Id", testPrincipal)
+			}
+			if req.Header.Get("X-Tenant-Id") == "" {
+				req.Header.Set("X-Tenant-Id", testTenant)
+			}
+			next.ServeHTTP(w, req)
+		})
+	})
+	r.Use(svcmiddleware.TenantContext())
+	h := handler.New(s, st, res, &stubAuthz{}, sc, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -350,7 +401,7 @@ func newRouterAuthz(s *stubStore, res residency.Validator, st storage.Backend, a
 func newRouterRaw(s *stubStore, res residency.Validator, st storage.Backend) chi.Router {
 	r := chi.NewRouter()
 	r.Use(svcmiddleware.TenantContext())
-	h := handler.New(s, st, res, &stubAuthz{}, zap.NewNop())
+	h := handler.New(s, st, res, &stubAuthz{}, newStubScanner(), zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -429,6 +480,55 @@ func TestCreateDocument_ResidencyServiceUnavailable_FailsClosed503(t *testing.T)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+// ── Scan gate (BIZ-01 Wave 4) ────────────────────────────────────────────────
+
+func TestCreateDocument_Quarantined_Returns422_NeverPersists(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouterScanner(s, &stubResidency{}, st, &stubScanner{clean: false, reason: "malware signature match"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content")))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+	assert.Contains(t, rec.Body.String(), "malware signature match")
+	assert.Empty(t, s.docs, "expected the quarantined upload to never create a document row")
+}
+
+func TestCreateDocument_ScanUnavailable_FailsClosed503(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouterScanner(s, &stubResidency{}, st, &stubScanner{err: errors.New("scanner down")})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content")))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Empty(t, s.docs, "expected an unavailable scanner to fail closed, never persisting the document")
+}
+
+func TestAddVersion_Quarantined_Returns422_RecordsEventNeverPersistsVersion(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "v1 content"))))
+
+	quarantineRouter := newRouterScanner(s, &stubResidency{}, st, &stubScanner{clean: false, reason: "type mismatch"})
+	body, _ := json.Marshal(domain.CreateDocumentVersionRequest{
+		ContentType: "text/plain", ContentBase64: base64.StdEncoding.EncodeToString([]byte("v2 content")),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/versions", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	quarantineRouter.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+	assert.Contains(t, rec.Body.String(), "type mismatch")
+	assert.Equal(t, 1, s.docs["doc-1"].CurrentVersion, "expected the quarantined version to never bump current_version")
+	assert.Equal(t, []string{"doc-1"}, s.quarantineEvents, "expected the quarantine event to be recorded against the existing document")
 }
 
 // ── GetDocument / GetContent — real round-trip through real crypto storage ──

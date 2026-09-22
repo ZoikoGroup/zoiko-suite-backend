@@ -726,6 +726,33 @@ func (s *PgStore) ListAccessLog(ctx context.Context, documentID string, limit, o
 // document_document_links_document_id_linked_object_type_linked_object_id_key
 // unique constraint (checked via 23505 here rather than a SELECT-then-INSERT
 // race) makes a duplicate link a real error, not a silent second row.
+// RecordQuarantinedVersionUpload publishes document.version_upload_quarantined
+// for an upload AddVersion rejected before it ever reached storage or a
+// document_versions row — see internal/scan's own package doc. There is
+// no business mutation here (the point is that nothing was persisted);
+// the event itself is the record that this happened, still written
+// through the same outbox mechanism as every other event so it is not
+// silently lost.
+func (s *PgStore) RecordQuarantinedVersionUpload(ctx context.Context, documentID, attemptedByPrincipalID, reason, correlationID string) error {
+	return s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, documentID, tenantID); err != nil {
+			return err
+		}
+		var legalEntityID string
+		if err := tx.QueryRow(ctx, `SELECT legal_entity_id::text FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`,
+			documentID, tenantID).Scan(&legalEntityID); err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		return s.insertDocumentOutboxEvent(ctx, tx, "document.version_upload_quarantined", documentID, tenantID,
+			legalEntityID, attemptedByPrincipalID, correlationID, map[string]any{
+				"document_id":     documentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": legalEntityID,
+				"reason":          reason,
+			})
+	})
+}
+
 func (s *PgStore) LinkDocument(ctx context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error) {
 	var out domain.DocumentLink
 	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
