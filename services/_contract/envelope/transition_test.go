@@ -230,3 +230,107 @@ func TestTransitionHistoryRecordStructure(t *testing.T) {
 		t.Errorf("TransitionHistoryRecord fields corrupted during serialization: %+v", parsed)
 	}
 }
+
+func TestValidateTransitionEdge_WorkflowInstance(t *testing.T) {
+	// 1. Legal transitions
+	legalCases := []struct {
+		from string
+		to   string
+	}{
+		{"PENDING", "APPROVED"},
+		{"PENDING", "REJECTED"},
+		{"PENDING", "ESCALATED"},
+		{"PENDING", "CANCELLED"},
+		{"PENDING", "INVALIDATED"},
+		{"ESCALATED", "APPROVED"},
+		{"ESCALATED", "REJECTED"},
+		{"ESCALATED", "CANCELLED"},
+		{"ESCALATED", "INVALIDATED"},
+		{"APPROVED", "INVALIDATED"},
+	}
+
+	for _, tc := range legalCases {
+		if err := ValidateTransitionEdge("workflow_instance", tc.from, tc.to); err != nil {
+			t.Errorf("expected legal transition %s -> %s for workflow_instance, got error: %v", tc.from, tc.to, err)
+		}
+		// Also works with alias "workflow"
+		if err := ValidateTransitionEdge("workflow", tc.from, tc.to); err != nil {
+			t.Errorf("expected legal transition %s -> %s for workflow alias, got error: %v", tc.from, tc.to, err)
+		}
+	}
+
+	// 2. Negative Control: Illegal edges
+	illegalCases := []struct {
+		from string
+		to   string
+	}{
+		{"CANCELLED", "APPROVED"},
+		{"REJECTED", "INVALIDATED"},
+		{"INVALIDATED", "PENDING"},
+		{"APPROVED", "PENDING"},
+		{"APPROVED", "CANCELLED"},
+		{"APPROVED", "APPROVED"},
+		{"REJECTED", "APPROVED"},
+		{"CANCELLED", "PENDING"},
+	}
+
+	for _, tc := range illegalCases {
+		err := ValidateTransitionEdge("workflow_instance", tc.from, tc.to)
+		if err == nil {
+			t.Fatalf("expected illegal transition %s -> %s to fail, but got nil", tc.from, tc.to)
+		}
+
+		// Verify sentinel error matching
+		if !errors.Is(err, ErrIllegalTransitionEdge) {
+			t.Errorf("expected errors.Is(err, ErrIllegalTransitionEdge), got %v", err)
+		}
+
+		// Verify mapped governed reason code per ZS-STATE-001 §16 and Appendix B
+		var edgeErr *IllegalEdgeError
+		if !errors.As(err, &edgeErr) {
+			t.Fatalf("expected error to be *IllegalEdgeError, got %T", err)
+		}
+
+		if edgeErr.ReasonCode != ReasonRejectPolicyNotMet {
+			t.Errorf("expected ReasonCode = %q, got %q", ReasonRejectPolicyNotMet, edgeErr.ReasonCode)
+		}
+		if edgeErr.ReasonFamily != ReasonFamilyReject {
+			t.Errorf("expected ReasonFamily = %q, got %q", ReasonFamilyReject, edgeErr.ReasonFamily)
+		}
+		if edgeErr.ExceptionClass != ExceptionClassBusinessRule {
+			t.Errorf("expected ExceptionClass = %q, got %q", ExceptionClassBusinessRule, edgeErr.ExceptionClass)
+		}
+	}
+
+	// 3. Unknown object type is rejected
+	err := ValidateTransitionEdge("unknown_type", "DRAFT", "ISSUED")
+	if err == nil || !errors.Is(err, ErrIllegalTransitionEdge) {
+		t.Errorf("expected unknown object type to be rejected with ErrIllegalTransitionEdge, got %v", err)
+	}
+}
+
+func TestWorkflowTransitionTarget(t *testing.T) {
+	cases := map[string]string{
+		"invalidate":          "INVALIDATED",
+		"invalidate_workflow": "INVALIDATED",
+		"cancel":              "CANCELLED",
+		"cancel_workflow":     "CANCELLED",
+		"escalate":            "ESCALATED",
+		"escalate_workflow":   "ESCALATED",
+		"approve":             "APPROVED",
+		"approve_workflow":    "APPROVED",
+		"reject":              "REJECTED",
+		"reject_workflow":     "REJECTED",
+	}
+
+	for input, want := range cases {
+		got, ok := WorkflowTransitionTarget(input)
+		if !ok || got != want {
+			t.Errorf("WorkflowTransitionTarget(%q) = (%q, %v), want (%q, true)", input, got, ok, want)
+		}
+	}
+
+	if _, ok := WorkflowTransitionTarget("unknown"); ok {
+		t.Errorf("expected unknown transition to return false")
+	}
+}

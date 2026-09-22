@@ -649,6 +649,48 @@ func TestSubmitAction_InvalidAction(t *testing.T) {
 	}
 }
 
+func TestSubmitAction_IllegalTransitionEdge_NegativeControl(t *testing.T) {
+	// Negative Control per ZS-STATE-001 §4 step 4 & §18 T-01:
+	// Attempt an illegal transition edge: CANCELLED -> APPROVE (target APPROVED).
+	// Terminal state cannot be transitioned forward.
+	store := &stubStore{
+		findInstance: &domain.WorkflowInstance{
+			WorkflowInstanceID: "w-cancelled",
+			LegalEntityID:      "le-1",
+			WorkflowStatus:     "CANCELLED",
+		},
+	}
+	r := newTestRouterFull(store, &stubPublisher{}, &stubAuthz{})
+
+	body := `{"action":"APPROVE"}`
+	req := scopedAs(httptest.NewRequest(http.MethodPost, "/v1/workflows/w-cancelled/actions", bytes.NewBufferString(body)), "approver-1")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for illegal edge CANCELLED -> APPROVED, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+
+	if resp["error"] != "invalid_transition" {
+		t.Errorf("expected error = 'invalid_transition', got %v", resp["error"])
+	}
+	// Assert mapped to canonical governed reason code from envelope/reason.go
+	if resp["reason_code"] != string(svcenvelope.ReasonRejectPolicyNotMet) {
+		t.Errorf("expected reason_code = %q, got %v", svcenvelope.ReasonRejectPolicyNotMet, resp["reason_code"])
+	}
+	if resp["reason_family"] != string(svcenvelope.ReasonFamilyReject) {
+		t.Errorf("expected reason_family = %q, got %v", svcenvelope.ReasonFamilyReject, resp["reason_family"])
+	}
+	if resp["exception_class"] != string(svcenvelope.ExceptionClassBusinessRule) {
+		t.Errorf("expected exception_class = %q, got %v", svcenvelope.ExceptionClassBusinessRule, resp["exception_class"])
+	}
+}
+
 // ── Escalate / Cancel ────────────────────────────────────────────────────────
 
 func TestEscalateWorkflow_InvalidTransition(t *testing.T) {
@@ -990,6 +1032,17 @@ func TestInvalidateWorkflow_TerminalState_Conflict(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 conflict, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response JSON: %v", err)
+	}
+	if resp["reason_code"] != string(svcenvelope.ReasonRejectPolicyNotMet) {
+		t.Errorf("expected reason_code = %q, got %v", svcenvelope.ReasonRejectPolicyNotMet, resp["reason_code"])
+	}
+	if resp["reason_family"] != string(svcenvelope.ReasonFamilyReject) {
+		t.Errorf("expected reason_family = %q, got %v", svcenvelope.ReasonFamilyReject, resp["reason_family"])
 	}
 }
 

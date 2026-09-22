@@ -388,7 +388,7 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, WorkflowType: req.WorkflowType,
 		SubjectType: req.SubjectType, SubjectID: req.SubjectID, SubjectVersion: req.SubjectVersion,
 		SubjectFingerprint: req.SubjectFingerprint,
-		InitiatedBy: principalID, CorrelationID: correlationID, Stages: req.Stages,
+		InitiatedBy:        principalID, CorrelationID: correlationID, Stages: req.Stages,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
@@ -552,6 +552,27 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4)
+	targetState := "APPROVED"
+	if req.Action == "REJECT" {
+		targetState = "REJECTED"
+	}
+	if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", instanceForAuthzCheck.WorkflowStatus, targetState); edgeErr != nil {
+		var illegalErr *svcenvelope.IllegalEdgeError
+		if errors.As(edgeErr, &illegalErr) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"message":         illegalErr.Error(),
+				"from_state":      illegalErr.FromState,
+				"to_state":        illegalErr.ToState,
+				"reason_family":   string(illegalErr.ReasonFamily),
+				"reason_code":     string(illegalErr.ReasonCode),
+				"exception_class": string(illegalErr.ExceptionClass),
+			})
+			return
+		}
+	}
+
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
 		Rationale: req.Rationale, CausationID: req.CausationID,
@@ -563,7 +584,12 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrWrongApprover):
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"reason_family":   string(svcenvelope.ReasonFamilyReject),
+				"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
+				"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
+			})
 		default:
 			h.log.Error("SubmitAction: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -695,6 +721,72 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 	}
 	canonicalReason := string(validatedCode)
 
+	// Build and validate canonical transition command (ZS-STATE-001 §4)
+	env := svcenvelope.Parse(r)
+	if env.TenantID == "" {
+		env.TenantID = tenantScope
+	}
+	if env.ActorSubjectID == "" {
+		env.ActorSubjectID = principalID
+	}
+	if env.CorrelationID == "" {
+		env.CorrelationID = correlationID
+	}
+	if env.IdempotencyKey == "" {
+		env.IdempotencyKey = r.Header.Get("Idempotency-Key")
+		if env.IdempotencyKey == "" {
+			env.IdempotencyKey = "inv-" + workflowInstanceID
+		}
+	}
+	if env.SourceChannel == "" {
+		env.SourceChannel = svcenvelope.ChannelWeb
+	}
+	if env.ExpectedVersion == "" {
+		env.ExpectedVersion = r.Header.Get("X-Expected-Version")
+		if env.ExpectedVersion == "" {
+			env.ExpectedVersion = "1"
+		}
+	}
+
+	payload := &svcenvelope.TransitionPayload{
+		ReasonCode:   canonicalReason,
+		EvidenceRefs: req.EvidenceRefs,
+	}
+	if req.Narrative != nil {
+		payload.Narrative = *req.Narrative
+	}
+	_, cmdErr := svcenvelope.NewTransitionCommand(
+		env,
+		"workflow_instance",
+		workflowInstanceID,
+		"invalidate",
+		payload,
+	)
+	if cmdErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_transition_command", "message": cmdErr.Error()})
+		return
+	}
+
+	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4)
+	existing, findErr := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if findErr == nil && existing != nil {
+		if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", existing.WorkflowStatus, "INVALIDATED"); edgeErr != nil {
+			var illegalErr *svcenvelope.IllegalEdgeError
+			if errors.As(edgeErr, &illegalErr) {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error":           "invalid_transition",
+					"message":         illegalErr.Error(),
+					"from_state":      illegalErr.FromState,
+					"to_state":        illegalErr.ToState,
+					"reason_family":   string(illegalErr.ReasonFamily),
+					"reason_code":     string(illegalErr.ReasonCode),
+					"exception_class": string(illegalErr.ExceptionClass),
+				})
+				return
+			}
+		}
+	}
+
 	instance, transitioned, err := h.store.InvalidateWorkflow(r.Context(), domain.InvalidateWorkflowParams{
 		WorkflowInstanceID: workflowInstanceID,
 		TenantID:           tenantScope,
@@ -710,7 +802,13 @@ func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrWorkflowNotFound):
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition", "message": "cannot invalidate a workflow in terminal rejected or cancelled state"})
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"message":         "cannot invalidate a workflow in terminal rejected or cancelled state",
+				"reason_family":   string(svcenvelope.ReasonFamilyReject),
+				"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
+				"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
+			})
 		default:
 			h.log.Error("InvalidateWorkflow: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -809,7 +907,12 @@ func writeStoreErr(w http.ResponseWriter, log *zap.Logger, err error, correlatio
 	case errors.Is(err, domain.ErrWorkflowNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":           "invalid_transition",
+			"reason_family":   string(svcenvelope.ReasonFamilyReject),
+			"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
+			"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
+		})
 	default:
 		log.Error(op+": store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})

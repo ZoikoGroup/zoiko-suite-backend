@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -223,3 +224,77 @@ func TestPgStore_Outbox_FailedTransition_NoOutboxRow_RealDB(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, outboxCount, "expected 0 outbox events on failed transition")
 }
+
+func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	invoiceID := uuid.New().String()
+	correlationID := uuid.New().String()
+	outboxEventID := uuid.New().String()
+
+	// 1. Begin raw transaction
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// Set tenant context for RLS in this tx
+	_, err = tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
+	require.NoError(t, err)
+
+	// 2. Write the domain business row into customer_invoices
+	const insertInvoiceSQL = `
+		INSERT INTO customer_invoices (
+			invoice_id, tenant_id, legal_entity_id, customer_id, invoice_number,
+			amount, currency_code, due_date, status, created_by_principal_id,
+			correlation_id, created_at
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9, $10,
+			$11, now()
+		)
+	`
+	_, err = tx.Exec(ctx, insertInvoiceSQL,
+		invoiceID, tenantID, legalEntityID, "cust-fail-001", "INV-FAIL-AR",
+		10000.0, "USD", time.Now().UTC().Add(30*24*time.Hour), "ISSUED", "preparer-1",
+		correlationID,
+	)
+	require.NoError(t, err)
+
+	// 3. Write the outbox row
+	err = outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: outboxEventID,
+		AggregateType: "CUSTOMER_INVOICE",
+		AggregateID:   invoiceID,
+		EventType:     "invoice.issued",
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		CorrelationID: correlationID,
+		Payload:       map[string]any{"invoice_id": invoiceID},
+	})
+	require.NoError(t, err)
+
+	// 4. Deliberately fail the transaction before commit
+	// (Trigger duplicate primary key on outbox_events)
+	_, err = tx.Exec(ctx, "INSERT INTO outbox_events (outbox_event_id) VALUES ($1)", outboxEventID)
+	require.Error(t, err, "expected duplicate primary key constraint collision")
+
+	err = tx.Rollback(ctx)
+	require.NoError(t, err)
+
+	// 5. Query fresh connection (pool) and assert NEITHER row exists
+	var invoiceCount, outboxCount int
+	scoped(t, pool, tenantID, func(verifyTx pgx.Tx) {
+		err := verifyTx.QueryRow(ctx, "SELECT count(*) FROM customer_invoices WHERE invoice_id = $1", invoiceID).Scan(&invoiceCount)
+		require.NoError(t, err)
+
+		err = verifyTx.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1", invoiceID).Scan(&outboxCount)
+		require.NoError(t, err)
+	})
+
+	assert.Equal(t, 0, invoiceCount, "domain customer_invoice row must not exist after rollback")
+	assert.Equal(t, 0, outboxCount, "outbox row must not exist after rollback")
+}
+
