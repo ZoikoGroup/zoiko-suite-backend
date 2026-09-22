@@ -208,9 +208,27 @@ $BUNDLES = @(
         # configuration-feature-flag-svc authorizes config and flag writes
         # against authzPlatformScopeID -- a config value or flag shapes
         # platform behaviour, so it is a platform action, not an entity one.
+        #
+        # FOUR actions, not two. A config entry or flag written with no
+        # tenant_id is the environment-wide DEFAULT: it applies to every tenant
+        # that has not set its own value. Writing one and writing your own
+        # organisation's value are not the same act, and used to be the same
+        # grant -- so a principal provisioned to manage one organisation could
+        # change what every other organisation reads. RLS cannot catch it
+        # either: a global row genuinely belongs to no tenant, so the policy's
+        # WITH CHECK admits a NULL tenant_id unconditionally.
+        #
+        # Both are in this bundle because this seeds a DEVELOPMENT stack,
+        # exactly as RETENTION_FULL pairs create and release -- in a real
+        # deployment "change my organisation's settings" and "change the
+        # default for everyone" are the pair you would want held by different
+        # people.
         Code    = "CONFIG_FULL"
         Service = "configuration-feature-flag-svc"
-        Actions = @("CONFIGURATION_WRITE", "FEATURE_FLAG_WRITE")
+        Actions = @(
+            "CONFIGURATION_WRITE", "CONFIGURATION_GLOBAL_WRITE",
+            "FEATURE_FLAG_WRITE", "FEATURE_FLAG_GLOBAL_WRITE"
+        )
     },
     @{
         # notification-svc authorizes sends against the target legal entity

@@ -50,3 +50,20 @@ scrape_configs:
   - job_name: gateway-auth-svc
     static_configs:
       - targets: ["gateway-auth-svc:8092"]
+
+  # The register of who may act for whom. Scraped for the expiry signals as much
+  # as the refusals: a delegation that outlives its window is authority nobody
+  # granted, and nothing else in the estate can see that this service has
+  # stopped ending them on time.
+  - job_name: delegated-authority-svc
+    static_configs:
+      - targets: ["delegated-authority-svc:8136"]
+
+  # The governed authoring layer in front of authorization-svc's admin API.
+  # Scraped for the propagation signals above all: every write here provisions
+  # into authorization-svc before it records, and fails closed, so a sustained
+  # admin-API failure means nobody can author or retire a role at all — and
+  # every symptom of it is an ordinary-looking 503.
+  - job_name: access-control-svc
+    static_configs:
+      - targets: ["access-control-svc:8137"]
