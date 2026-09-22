@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -69,6 +70,44 @@ func (s *stubStore) AddVersion(_ context.Context, documentID string, v *domain.D
 	v.Version = doc.CurrentVersion
 	v.DocumentVersionID = "ver-new"
 	s.versions[documentID] = append(s.versions[documentID], *v)
+	return doc, nil
+}
+
+func (s *stubStore) DeclareRecord(_ context.Context, p domain.DeclareRecordParams, _ string) (*domain.Document, error) {
+	doc, ok := s.docs[p.DocumentID]
+	if !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	if doc.Status != domain.StatusActive {
+		return nil, domain.ErrDocumentNotActive
+	}
+	if doc.DeclaredAt != nil {
+		return nil, domain.ErrDocumentAlreadyDeclared
+	}
+	v := doc.CurrentVersion
+	now := time.Now().UTC()
+	doc.DeclaredVersion = &v
+	doc.DeclaredAt = &now
+	doc.DeclaredByPrincipalID = &p.DeclaredByPrincipalID
+	return doc, nil
+}
+
+func (s *stubStore) SupersedeDocument(_ context.Context, p domain.SupersedeDocumentParams, _ string) (*domain.Document, error) {
+	if p.DocumentID == p.SupersededByDocumentID {
+		return nil, domain.ErrCannotSupersedeSelf
+	}
+	doc, ok := s.docs[p.DocumentID]
+	if !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	if _, ok := s.docs[p.SupersededByDocumentID]; !ok {
+		return nil, domain.ErrSupersedingDocumentNotFound
+	}
+	if doc.SupersededByDocumentID != nil {
+		return nil, domain.ErrDocumentAlreadySuperseded
+	}
+	doc.Status = domain.StatusSuperseded
+	doc.SupersededByDocumentID = &p.SupersededByDocumentID
 	return doc, nil
 }
 
@@ -389,3 +428,117 @@ func TestAddVersion_DocumentNotFound_Returns404(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// ── DeclareRecord ────────────────────────────────────────────────────────────
+
+func TestDeclareRecord_Valid_Returns200(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content")))
+	r.ServeHTTP(httptest.NewRecorder(), createReq)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/declare-record", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.Document
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.NotNil(t, got.DeclaredAt)
+	require.NotNil(t, got.DeclaredVersion)
+	assert.Equal(t, 1, *got.DeclaredVersion)
+	require.NotNil(t, got.DeclaredByPrincipalID)
+	assert.Equal(t, testPrincipal, *got.DeclaredByPrincipalID)
+}
+
+func TestDeclareRecord_AlreadyDeclared_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content")))
+	r.ServeHTTP(httptest.NewRecorder(), createReq)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/declare-record", nil))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/declare-record", nil))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+func TestDeclareRecord_DocumentNotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/nope/declare-record", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestDeclareRecord_AuthorizationDenied_Returns403(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	az := &stubAuthz{denied: map[string]bool{testPrincipal + "|" + authz.ActionDocumentDeclareRecord: true}}
+	r := newRouterAuthz(s, &stubResidency{}, st, az)
+
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/declare-record", nil))
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+// ── SupersedeDocument ────────────────────────────────────────────────────────
+
+func supersedeBody(t *testing.T, supersededByID string) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"superseded_by_document_id": supersededByID})
+	require.NoError(t, err)
+	return body
+}
+
+func TestSupersedeDocument_Valid_Returns200(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "original"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "replacement"))))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/supersede", bytes.NewReader(supersedeBody(t, "doc-2")))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.Document
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, domain.StatusSuperseded, got.Status)
+	require.NotNil(t, got.SupersededByDocumentID)
+	assert.Equal(t, "doc-2", *got.SupersededByDocumentID)
+}
+
+func TestSupersedeDocument_MissingField_Returns400(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/supersede", bytes.NewReader(supersedeBody(t, ""))))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestSupersedeDocument_AlreadySuperseded_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "original"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "replacement-1"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "replacement-2"))))
+
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/supersede", bytes.NewReader(supersedeBody(t, "doc-2"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/supersede", bytes.NewReader(supersedeBody(t, "doc-3"))))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}

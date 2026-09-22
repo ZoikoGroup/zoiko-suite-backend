@@ -50,6 +50,12 @@ const (
 	ActionDocumentDownload      = "DOCUMENT_DOWNLOAD"
 	ActionDocumentVersionCreate = "DOCUMENT_VERSION_CREATE"
 	ActionDocumentAccessLogRead = "DOCUMENT_ACCESS_LOG_READ"
+	// ActionDocumentDeclareRecord/ActionDocumentSupersede gate BIZ-01 Wave
+	// 2's DeclareRecord/SupersedeDocument — distinct from ordinary version
+	// creation, since declaring or superseding a record is a heavier-weight
+	// action than uploading a new version.
+	ActionDocumentDeclareRecord = "DOCUMENT_DECLARE_RECORD"
+	ActionDocumentSupersede     = "DOCUMENT_SUPERSEDE"
 )
 
 // Client is the interface the handler depends on, so tests can substitute a

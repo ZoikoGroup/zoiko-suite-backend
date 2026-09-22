@@ -143,6 +143,139 @@ func TestPgStore_AddVersion_BumpsCurrentVersion_PreservesLineage(t *testing.T) {
 	require.Equal(t, sha256Hex("v2sum"), versions[1].ChecksumSHA256)
 }
 
+func newDocForDeclareTest(t *testing.T, s *store.PgStore, label string) *domain.Document {
+	t.Helper()
+	doc := &domain.Document{
+		TenantID:      "11111111-1111-1111-1111-111111111111",
+		LegalEntityID: "22222222-2222-2222-2222-222222222222",
+		Title:         "Declare Test " + label, Classification: domain.ClassificationInternal,
+		CreatedByPrincipalID: "principal-1",
+	}
+	v := &domain.DocumentVersion{ChecksumSHA256: sha256Hex("declare-" + label), StorageKey: "key-declare-" + label,
+		SizeBytes: 5, ContentType: "text/plain", CreatedByPrincipalID: "principal-1"}
+	require.NoError(t, s.CreateDocument(tenantCtx(), doc, v, "corr-declare-"+label))
+	return doc
+}
+
+// TestPgStore_DeclareRecord_Succeeds_ThenRejectsRedeclaration is the real
+// proof of BIZ-01's central concept: DeclareRecord succeeds once, records
+// the CURRENT version, and — the negative control — a second
+// DeclareRecord call on the same document is rejected, not silently
+// re-applied.
+func TestPgStore_DeclareRecord_Succeeds_ThenRejectsRedeclaration(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "redeclare")
+
+	declared, err := s.DeclareRecord(tenantCtx(), domain.DeclareRecordParams{
+		DocumentID: doc.DocumentID, DeclaredByPrincipalID: "declarer-1",
+	}, "corr-declare-1")
+	require.NoError(t, err)
+	require.NotNil(t, declared.DeclaredAt)
+	require.NotNil(t, declared.DeclaredVersion)
+	require.Equal(t, 1, *declared.DeclaredVersion)
+	require.Equal(t, "declarer-1", *declared.DeclaredByPrincipalID)
+
+	_, err = s.DeclareRecord(tenantCtx(), domain.DeclareRecordParams{
+		DocumentID: doc.DocumentID, DeclaredByPrincipalID: "declarer-2",
+	}, "corr-declare-2")
+	require.ErrorIs(t, err, domain.ErrDocumentAlreadyDeclared)
+
+	// Negative control at the DB layer: a raw UPDATE attempting to change
+	// the declaration must be refused by migration 000005's own trigger,
+	// not just the application-layer CAS.
+	_, err = pool.Exec(tenantCtx(), `UPDATE documents SET declared_by_principal_id = 'tampered' WHERE document_id = $1`, doc.DocumentID)
+	require.Error(t, err, "expected the trigger to refuse mutating an existing declaration")
+}
+
+// TestPgStore_SupersedeDocument_LinksForwardThenRejectsSecondSupersede
+// mirrors the evidence-supersede proof this same service already has for
+// AUD-06: forward-link once, never twice, never an in-place rewrite.
+func TestPgStore_SupersedeDocument_LinksForwardThenRejectsSecondSupersede(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	original := newDocForDeclareTest(t, s, "supersede-orig")
+	replacement := newDocForDeclareTest(t, s, "supersede-new")
+
+	updated, err := s.SupersedeDocument(tenantCtx(), domain.SupersedeDocumentParams{
+		DocumentID: original.DocumentID, SupersededByDocumentID: replacement.DocumentID, ActorPrincipalID: "actor-1",
+	}, "corr-supersede-1")
+	require.NoError(t, err)
+	require.Equal(t, domain.StatusSuperseded, updated.Status)
+	require.NotNil(t, updated.SupersededByDocumentID)
+	require.Equal(t, replacement.DocumentID, *updated.SupersededByDocumentID)
+
+	// A second, different replacement must be rejected — supersession is
+	// exactly-once.
+	third := newDocForDeclareTest(t, s, "supersede-third")
+	_, err = s.SupersedeDocument(tenantCtx(), domain.SupersedeDocumentParams{
+		DocumentID: original.DocumentID, SupersededByDocumentID: third.DocumentID, ActorPrincipalID: "actor-1",
+	}, "corr-supersede-2")
+	require.ErrorIs(t, err, domain.ErrDocumentAlreadySuperseded)
+
+	// Negative control at the DB layer.
+	_, err = pool.Exec(tenantCtx(), `UPDATE documents SET superseded_by_document_id = $1 WHERE document_id = $2`, third.DocumentID, original.DocumentID)
+	require.Error(t, err, "expected the trigger to refuse re-pointing an existing supersede link")
+}
+
+// TestPgStore_SupersedeDocument_RejectsSelfAndUnknownTarget covers the two
+// input-validation paths: self-supersede and a nonexistent replacement.
+func TestPgStore_SupersedeDocument_RejectsSelfAndUnknownTarget(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "self")
+
+	_, err := s.SupersedeDocument(tenantCtx(), domain.SupersedeDocumentParams{
+		DocumentID: doc.DocumentID, SupersededByDocumentID: doc.DocumentID, ActorPrincipalID: "actor-1",
+	}, "corr-self")
+	require.ErrorIs(t, err, domain.ErrCannotSupersedeSelf)
+
+	_, err = s.SupersedeDocument(tenantCtx(), domain.SupersedeDocumentParams{
+		DocumentID: doc.DocumentID, SupersededByDocumentID: "00000000-0000-0000-0000-000000000000", ActorPrincipalID: "actor-1",
+	}, "corr-unknown")
+	require.ErrorIs(t, err, domain.ErrSupersedingDocumentNotFound)
+}
+
+// TestPgStore_DeclareRecord_InsertsOutboxEventAtomically and
+// TestPgStore_SupersedeDocument_InsertsOutboxEventAtomically prove the two
+// new events actually land, same discipline as Wave 1's tests.
+func TestPgStore_DeclareRecord_InsertsOutboxEventAtomically(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "outbox-declare")
+
+	_, err := s.DeclareRecord(tenantCtx(), domain.DeclareRecordParams{
+		DocumentID: doc.DocumentID, DeclaredByPrincipalID: "declarer-1",
+	}, "corr-outbox-declare")
+	require.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.record_declared'`,
+		doc.DocumentID).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
+func TestPgStore_SupersedeDocument_InsertsOutboxEventAtomically(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	original := newDocForDeclareTest(t, s, "outbox-supersede-orig")
+	replacement := newDocForDeclareTest(t, s, "outbox-supersede-new")
+
+	_, err := s.SupersedeDocument(tenantCtx(), domain.SupersedeDocumentParams{
+		DocumentID: original.DocumentID, SupersededByDocumentID: replacement.DocumentID, ActorPrincipalID: "actor-1",
+	}, "corr-outbox-supersede")
+	require.NoError(t, err)
+
+	var count int
+	err = pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'document.superseded'`,
+		original.DocumentID).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
 func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.New(pool, zap.NewNop())

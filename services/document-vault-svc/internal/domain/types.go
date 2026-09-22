@@ -32,7 +32,28 @@ const (
 	StatusActive       DocumentStatus = "ACTIVE"
 	StatusRetained     DocumentStatus = "RETAINED"
 	StatusPurgePending DocumentStatus = "PURGE_PENDING"
+	// StatusSuperseded is reached only via SupersedeDocument — mirrors
+	// AUD-06's evidence_versions.superseded_by_evidence_version_id
+	// forward-link pattern (migration 000003), now reused for documents
+	// themselves (migration 000005).
+	StatusSuperseded DocumentStatus = "SUPERSEDED"
 )
+
+// CanDeclareRecord: only an ACTIVE document with no prior declaration.
+// Once declared, migration 000005's own trigger blocks any further
+// change to the declaration fields — this is DeclareRecord's one and
+// only opportunity, not a repeatable action.
+func CanDeclareRecord(d *Document) bool {
+	return d.Status == StatusActive && d.DeclaredAt == nil
+}
+
+// CanSupersede: any document not already superseded. A declared record
+// MAY be superseded (that is the whole point of the command — replacing
+// an authoritative record with a corrected one); an undeclared document
+// may be too.
+func CanSupersede(d *Document) bool {
+	return d.SupersededByDocumentID == nil
+}
 
 type AccessType string
 
@@ -57,6 +78,17 @@ type Document struct {
 	CreatedByPrincipalID string         `json:"created_by_principal_id"`
 	CreatedAt            time.Time      `json:"created_at"`
 	UpdatedAt            time.Time      `json:"updated_at"`
+
+	// DeclaredVersion/DeclaredAt/DeclaredByPrincipalID (Wave 2): set together,
+	// exactly once, by DeclareRecord — "record declaration tracked
+	// separately" per the doc's own words, i.e. orthogonal to Status, not a
+	// value of it. migration 000005's trigger blocks any further change.
+	DeclaredVersion       *int       `json:"declared_version,omitempty"`
+	DeclaredAt            *time.Time `json:"declared_at,omitempty"`
+	DeclaredByPrincipalID *string    `json:"declared_by_principal_id,omitempty"`
+	// SupersededByDocumentID (Wave 2): set exactly once by SupersedeDocument.
+	// Forward link only — the new document's own row never points back.
+	SupersededByDocumentID *string `json:"superseded_by_document_id,omitempty"`
 }
 
 // DocumentVersion is one immutable entry in a document's lineage. Rows are
@@ -110,6 +142,26 @@ type DocumentResponse struct {
 	Document Document `json:"document"`
 }
 
+// DeclareRecordParams is DeclareRecord's input — declares the document's
+// CURRENT version (as of the call) the authoritative record. There is no
+// "declare a specific past version" mode: only the live version can
+// become the declared record, matching how AddVersion is the only way
+// current_version ever advances.
+type DeclareRecordParams struct {
+	DocumentID            string
+	DeclaredByPrincipalID string
+}
+
+// SupersedeDocumentParams is SupersedeDocument's input — marks DocumentID
+// as superseded by SupersededByDocumentID, an already-existing document.
+// This never creates the new document; the caller creates it first via
+// the normal CreateDocument path, then links the two.
+type SupersedeDocumentParams struct {
+	DocumentID             string
+	SupersededByDocumentID string
+	ActorPrincipalID       string
+}
+
 // ---------------------------------------------------------------------------
 // Sentinel errors
 // ---------------------------------------------------------------------------
@@ -150,6 +202,19 @@ var (
 	// ErrAuthzServiceUnavailable covers every non-decision from
 	// authorization-svc. Callers must treat it as a refusal.
 	ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
+
+	// ErrDocumentAlreadyDeclared backs DeclareRecord — see CanDeclareRecord.
+	ErrDocumentAlreadyDeclared = errors.New("document is already a declared record")
+	// ErrDocumentNotActive backs DeclareRecord — only an ACTIVE document
+	// may be declared.
+	ErrDocumentNotActive = errors.New("document is not ACTIVE")
+	// ErrDocumentAlreadySuperseded backs SupersedeDocument — see CanSupersede.
+	ErrDocumentAlreadySuperseded = errors.New("document has already been superseded")
+	// ErrSupersedingDocumentNotFound backs SupersedeDocument — the
+	// replacement document must already exist.
+	ErrSupersedingDocumentNotFound = errors.New("superseding document not found")
+	// ErrCannotSupersedeSelf backs SupersedeDocument.
+	ErrCannotSupersedeSelf = errors.New("a document cannot supersede itself")
 
 	// ErrInvalidPaging is returned for an out-of-range limit or offset.
 	ErrInvalidPaging = errors.New("limit must be between 1 and 500 and offset must not be negative")

@@ -104,13 +104,15 @@ func (s *PgStore) withTenant(ctx context.Context, fn func(tx pgx.Tx, tenantID st
 
 const documentColumns = `
 	document_id, tenant_id, legal_entity_id, title, classification, retention_policy,
-	residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at
+	residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at,
+	declared_version, declared_at, declared_by_principal_id, superseded_by_document_id
 `
 
 func scanDocument(row pgx.Row, d *domain.Document) error {
 	return row.Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification,
 		&d.RetentionPolicy, &d.ResidencyRegionCode, &d.CurrentVersion, &d.Status,
-		&d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt)
+		&d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt,
+		&d.DeclaredVersion, &d.DeclaredAt, &d.DeclaredByPrincipalID, &d.SupersededByDocumentID)
 }
 
 const versionColumns = `
@@ -267,6 +269,131 @@ func (s *PgStore) AddVersion(ctx context.Context, documentID string, v *domain.D
 		return nil, err
 	}
 	return &out, nil
+}
+
+// DeclareRecord marks the document's CURRENT version (as of this call) the
+// authoritative declared record — BIZ-01's own central concept ("record
+// declaration tracked separately"). The CAS predicate
+// (status='ACTIVE' AND declared_at IS NULL) is the real guard; migration
+// 000005's trigger is the second line of defense against a raw UPDATE
+// bypassing it.
+func (s *PgStore) DeclareRecord(ctx context.Context, p domain.DeclareRecordParams, correlationID string) (*domain.Document, error) {
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET declared_version = current_version, declared_at = now(), declared_by_principal_id = $3, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND status = 'ACTIVE' AND declared_at IS NULL
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.DeclaredByPrincipalID,
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifyDeclareRecordFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		declaredVersion := 0
+		if out.DeclaredVersion != nil {
+			declaredVersion = *out.DeclaredVersion
+		}
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.record_declared", p.DocumentID, tenantID,
+			out.LegalEntityID, p.DeclaredByPrincipalID, correlationID, map[string]any{
+				"document_id":      p.DocumentID,
+				"tenant_id":        tenantID,
+				"legal_entity_id":  out.LegalEntityID,
+				"declared_version": declaredVersion,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// classifyDeclareRecordFailure runs when DeclareRecord's CAS UPDATE
+// touched zero rows, to tell "document not found" apart from "found but
+// not eligible" (already declared, or not ACTIVE) — same not-found-vs-
+// invalid-transition split used throughout this codebase (e.g. BNK-09's
+// notFoundOrInvalidTransfer).
+func (s *PgStore) classifyDeclareRecordFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	if d.DeclaredAt != nil {
+		return domain.ErrDocumentAlreadyDeclared
+	}
+	return domain.ErrDocumentNotActive
+}
+
+// SupersedeDocument marks documentID as superseded by an already-existing
+// document — mirrors AUD-06's SupersedeEvidence exactly: a forward link
+// set once, never an in-place content change.
+func (s *PgStore) SupersedeDocument(ctx context.Context, p domain.SupersedeDocumentParams, correlationID string) (*domain.Document, error) {
+	if p.DocumentID == p.SupersededByDocumentID {
+		return nil, domain.ErrCannotSupersedeSelf
+	}
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid)`,
+			p.SupersededByDocumentID, tenantID).Scan(&exists); err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		if !exists {
+			return domain.ErrSupersedingDocumentNotFound
+		}
+
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET status = 'SUPERSEDED', superseded_by_document_id = $3, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND superseded_by_document_id IS NULL
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.SupersededByDocumentID,
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifySupersedeFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.superseded", p.DocumentID, tenantID,
+			out.LegalEntityID, p.ActorPrincipalID, correlationID, map[string]any{
+				"document_id":               p.DocumentID,
+				"tenant_id":                 tenantID,
+				"legal_entity_id":           out.LegalEntityID,
+				"superseded_by_document_id": p.SupersededByDocumentID,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *PgStore) classifySupersedeFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	return domain.ErrDocumentAlreadySuperseded
 }
 
 // FindDocumentByID looks up a document, scoped to the caller's tenant. A

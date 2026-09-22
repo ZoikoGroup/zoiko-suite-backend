@@ -24,6 +24,8 @@ import (
 type Store interface {
 	CreateDocument(ctx context.Context, doc *domain.Document, firstVersion *domain.DocumentVersion, correlationID string) error
 	AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error)
+	DeclareRecord(ctx context.Context, p domain.DeclareRecordParams, correlationID string) (*domain.Document, error)
+	SupersedeDocument(ctx context.Context, p domain.SupersedeDocumentParams, correlationID string) (*domain.Document, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
@@ -68,6 +70,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{documentID}/versions", h.AddVersion)
 		r.Get("/{documentID}/versions", h.ListVersions)
 		r.Get("/{documentID}/access-log", h.ListAccessLog)
+		r.Post("/{documentID}/declare-record", h.DeclareRecord)
+		r.Post("/{documentID}/supersede", h.SupersedeDocument)
 	})
 }
 
@@ -208,6 +212,86 @@ func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
 
 	h.recordAccess(r, actor, documentID, nil, domain.AccessMetadata)
 	writeJSON(w, http.StatusOK, doc)
+}
+
+// ── POST /v1/documents/{documentID}/declare-record ──────────────────────────
+
+// DeclareRecord marks the document's current version the authoritative
+// declared record — BIZ-01's own central concept, distinct from ordinary
+// versioning. See domain.CanDeclareRecord's own doc comment: this is a
+// one-time action, not a repeatable one.
+func (h *Handler) DeclareRecord(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentDeclareRecord) {
+		return
+	}
+
+	updated, err := h.store.DeclareRecord(r.Context(), domain.DeclareRecordParams{
+		DocumentID: documentID, DeclaredByPrincipalID: actor,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/{documentID}/supersede ────────────────────────────────
+
+type supersedeDocumentRequest struct {
+	SupersededByDocumentID string `json:"superseded_by_document_id"`
+}
+
+// SupersedeDocument marks documentID as superseded by an already-existing
+// document — the replacement is created first via the normal
+// CreateDocument path, then linked here. Forward link only, set exactly
+// once (migration 000005's own trigger).
+func (h *Handler) SupersedeDocument(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req supersedeDocumentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.SupersededByDocumentID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "superseded_by_document_id")
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentSupersede) {
+		return
+	}
+
+	updated, err := h.store.SupersedeDocument(r.Context(), domain.SupersedeDocumentParams{
+		DocumentID: documentID, SupersededByDocumentID: req.SupersededByDocumentID, ActorPrincipalID: actor,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 // ── GET /v1/documents ────────────────────────────────────────────────────────
@@ -480,6 +564,16 @@ func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "document_not_found", "")
 	case errors.Is(err, domain.ErrDocumentVersionNotFound):
 		writeError(w, http.StatusNotFound, "version_not_found", "")
+	case errors.Is(err, domain.ErrDocumentAlreadyDeclared):
+		writeError(w, http.StatusConflict, "already_declared", err.Error())
+	case errors.Is(err, domain.ErrDocumentNotActive):
+		writeError(w, http.StatusConflict, "document_not_active", err.Error())
+	case errors.Is(err, domain.ErrDocumentAlreadySuperseded):
+		writeError(w, http.StatusConflict, "already_superseded", err.Error())
+	case errors.Is(err, domain.ErrSupersedingDocumentNotFound):
+		writeError(w, http.StatusBadRequest, "superseding_document_not_found", err.Error())
+	case errors.Is(err, domain.ErrCannotSupersedeSelf):
+		writeError(w, http.StatusBadRequest, "cannot_supersede_self", err.Error())
 	default:
 		h.log.Error("store error", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
