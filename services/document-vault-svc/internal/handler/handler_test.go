@@ -1351,3 +1351,106 @@ func TestClassifyRecord_AlreadyConfirmed_Returns409(t *testing.T) {
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/classify", bytes.NewReader(classifyBody(t, "PUBLIC", "HUMAN", nil))))
 	assert.Equal(t, http.StatusConflict, rec.Code)
 }
+
+// ── BulkClassify (BIZ-02 Wave 3) ─────────────────────────────────────────────
+
+func bulkClassifyBody(t *testing.T, documentIDs []string, value string) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"document_ids": documentIDs, "classification_value": value, "source": "HUMAN",
+	})
+	require.NoError(t, err)
+	return body
+}
+
+type bulkClassifyResultDTO struct {
+	DocumentID     string                        `json:"document_id"`
+	Classification *domain.RecordClassification `json:"classification,omitempty"`
+	Error          string                        `json:"error,omitempty"`
+}
+
+func TestBulkClassify_Success_PerDocumentResults(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "one"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "two"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, []string{"doc-1", "doc-2"}, "RESTRICTED"))))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var results []bulkClassifyResultDTO
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &results))
+	require.Len(t, results, 2)
+	for _, res := range results {
+		assert.Empty(t, res.Error)
+		require.NotNil(t, res.Classification)
+		assert.Equal(t, domain.ClassificationStatusCandidate, res.Classification.Status)
+		assert.Equal(t, domain.Classification("RESTRICTED"), res.Classification.ClassificationValue)
+	}
+}
+
+func TestBulkClassify_UnknownDocumentDoesNotBlockOthers(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "one"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, []string{"doc-1", "nope"}, "RESTRICTED"))))
+	require.Equal(t, http.StatusOK, rec.Code, "one bad document ID must not fail the whole batch")
+
+	var results []bulkClassifyResultDTO
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &results))
+	require.Len(t, results, 2)
+	assert.Equal(t, "doc-1", results[0].DocumentID)
+	assert.Empty(t, results[0].Error)
+	require.NotNil(t, results[0].Classification)
+	assert.Equal(t, "nope", results[1].DocumentID)
+	assert.Equal(t, "document_not_found", results[1].Error)
+	assert.Nil(t, results[1].Classification)
+}
+
+func TestBulkClassify_EmptyDocumentIDs_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, []string{}, "RESTRICTED"))))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestBulkClassify_TooManyDocuments_Returns400(t *testing.T) {
+	ids := make([]string, 501)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("doc-%d", i)
+	}
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, ids, "RESTRICTED"))))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestBulkClassify_InvalidClassificationValue_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, []string{"doc-1"}, "TOP_SECRET"))))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestBulkClassify_AuthorizationDenied_ResultsCarryForbidden(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	az := &stubAuthz{denied: map[string]bool{testPrincipal + "|" + authz.ActionClassifyRecord: true}}
+	r := newRouterAuthz(s, &stubResidency{}, st, az)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "one"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/bulk-classify", bytes.NewReader(bulkClassifyBody(t, []string{"doc-1"}, "RESTRICTED"))))
+	require.Equal(t, http.StatusOK, rec.Code, "a per-document denial is carried in the result, not the HTTP status")
+
+	var results []bulkClassifyResultDTO
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &results))
+	require.Len(t, results, 1)
+	assert.Equal(t, "forbidden", results[0].Error)
+	assert.Nil(t, results[0].Classification)
+}

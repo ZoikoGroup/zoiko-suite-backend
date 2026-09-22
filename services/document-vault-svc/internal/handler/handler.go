@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -99,6 +100,7 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{documentID}/classification", h.GetClassification)
 		r.Post("/{documentID}/reclassify", h.Reclassify)
 		r.Post("/classifications/{classificationID}/supersede", h.SupersedeClassification)
+		r.Post("/bulk-classify", h.BulkClassify)
 	})
 }
 
@@ -807,6 +809,128 @@ func (h *Handler) SupersedeClassification(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/bulk-classify ─────────────────────────────────────────
+
+// maxBulkClassifyDocuments bounds a single BulkClassify call — each
+// listed document is its own sequential authorization round-trip and its
+// own database transaction, so an unbounded list turns one HTTP request
+// into an unbounded amount of work. Matches maxPageLimit's existing cap
+// on this service's other unbounded-list surface.
+const maxBulkClassifyDocuments = maxPageLimit
+
+type bulkClassifyRequest struct {
+	DocumentIDs         []string                    `json:"document_ids"`
+	ClassificationValue domain.Classification       `json:"classification_value"`
+	Source              domain.ClassificationSource `json:"source"`
+	Confidence          *float64                    `json:"confidence,omitempty"`
+	RuleModelVersion    string                      `json:"rule_model_version,omitempty"`
+	SourceEvidence      string                      `json:"source_evidence,omitempty"`
+}
+
+type bulkClassifyResult struct {
+	DocumentID     string                       `json:"document_id"`
+	Classification *domain.RecordClassification `json:"classification,omitempty"`
+	Error          string                       `json:"error,omitempty"`
+}
+
+// BulkClassify applies ClassifyRecord independently to each listed
+// document — BIZ-02's own BulkClassify command. Each document gets its
+// own authorization decision and its own transaction (via the existing
+// FindDocumentByID + ClassifyRecord path); one document's failure —
+// not found, already confirmed, denied — never blocks the others in the
+// same call. The response is always 200 with a per-document result
+// list, never a single pass/fail for the whole batch, so a caller must
+// inspect each entry rather than infer success from the status code.
+func (h *Handler) BulkClassify(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req bulkClassifyRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.DocumentIDs) == 0 {
+		writeError(w, http.StatusBadRequest, "empty_document_ids", "")
+		return
+	}
+	if len(req.DocumentIDs) > maxBulkClassifyDocuments {
+		writeError(w, http.StatusBadRequest, "too_many_documents",
+			fmt.Sprintf("at most %d documents per call", maxBulkClassifyDocuments))
+		return
+	}
+	if !req.ClassificationValue.Valid() {
+		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.ClassificationValue))
+		return
+	}
+
+	results := make([]bulkClassifyResult, 0, len(req.DocumentIDs))
+	for _, documentID := range req.DocumentIDs {
+		results = append(results, h.classifyOneForBulk(r, actor, documentID, req))
+	}
+	writeJSON(w, http.StatusOK, results)
+}
+
+// classifyOneForBulk runs ClassifyRecord for one document within a
+// BulkClassify call. It deliberately never writes to the response
+// itself — h.authorize can't be reused here, because it writes the
+// denial straight to the (shared, single) ResponseWriter, which is only
+// correct for a handler with one outcome. Each document's outcome is
+// captured as data instead, and only the final aggregate response is
+// written once, after every document has been attempted.
+func (h *Handler) classifyOneForBulk(r *http.Request, actor, documentID string, req bulkClassifyRequest) bulkClassifyResult {
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		return bulkClassifyResult{DocumentID: documentID, Error: h.classificationErrorCode(err)}
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, doc.LegalEntityID, authz.ActionClassifyRecord); err != nil {
+		return bulkClassifyResult{DocumentID: documentID, Error: h.authzErrorCode(err)}
+	}
+	classification, err := h.store.ClassifyRecord(r.Context(), domain.ClassifyRecordParams{
+		DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
+		Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
+		ProposedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		return bulkClassifyResult{DocumentID: documentID, Error: h.classificationErrorCode(err)}
+	}
+	return bulkClassifyResult{DocumentID: documentID, Classification: classification}
+}
+
+// classificationErrorCode maps a classification store error to the same
+// short code handleStoreError would write for it, for the per-document
+// results BulkClassify returns instead of a single HTTP status.
+func (h *Handler) classificationErrorCode(err error) string {
+	switch {
+	case errors.Is(err, domain.ErrDocumentNotFound):
+		return "document_not_found"
+	case errors.Is(err, domain.ErrInvalidClassificationSource):
+		return "invalid_source"
+	case errors.Is(err, domain.ErrAIConfidenceRequired):
+		return "confidence_required"
+	case errors.Is(err, domain.ErrHumanConfidenceNotAllowed):
+		return "confidence_not_allowed"
+	case errors.Is(err, domain.ErrClassificationNotCandidate):
+		return "not_candidate"
+	default:
+		h.log.Error("store error (bulk classify)", zap.Error(err))
+		return "store_unavailable"
+	}
+}
+
+// authzErrorCode mirrors h.authorize's own decision mapping without
+// writing to the response — see classifyOneForBulk's own comment on why.
+func (h *Handler) authzErrorCode(err error) string {
+	if errors.Is(err, domain.ErrAuthorizationDenied) {
+		return "forbidden"
+	}
+	h.log.Error("authorization check failed — failing closed (bulk classify)", zap.Error(err))
+	return "authz_unavailable"
 }
 
 // ── GET /v1/documents ────────────────────────────────────────────────────────
