@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"zoiko.io/access-control-svc/internal/health"
 	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
 	"zoiko.io/access-control-svc/internal/mtls"
+	"zoiko.io/access-control-svc/internal/outbox"
 	"zoiko.io/access-control-svc/internal/store"
 	"zoiko.io/access-control-svc/internal/telemetry"
 )
@@ -287,6 +289,7 @@ func main() {
 	}()
 
 	metrics := telemetry.NewMetrics("access-control-svc")
+	domainMetrics := telemetry.NewDomain("access-control-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
@@ -367,14 +370,34 @@ func main() {
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
-	h := handler.New(pgStore, publisher, authzClient, authzAdminClient, log)
+	h := handler.New(pgStore, authzClient, authzAdminClient, domainMetrics, log)
 	handler.RegisterRoutes(r, h)
 
 	// ── 6. Health probes + metrics ────────────────────────────────────────────
-	healthH := health.New(pool, log)
+	//
+	// authorization-svc is a READINESS dependency, not merely a runtime one.
+	// Every write on this service calls it twice — once to authorize the
+	// caller, once to provision the definition through its admin API — and
+	// fails closed on both. Readiness that only pinged the database reported
+	// green while 100% of writes answered 503, so the load balancer kept
+	// sending traffic to an instance that could not author anything.
+	healthH := health.New(pool, log, health.Dependency{
+		Name:  "authorization-svc",
+		Check: authzReachable(cfg.AuthZServiceURL),
+	})
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
 	r.Handle("/metrics", metrics.MetricsHandler(healthH.Readiness, promhttp.Handler()))
+
+	// ── 6b. Outbox relay ──────────────────────────────────────────────────────
+	//
+	// The store enqueues every catalogue event in the transaction that caused
+	// it; this drains the backlog to Kafka. See internal/outbox for why the two
+	// are separate acts.
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
+	go relay.Run(relayCtx)
 
 	// ── 7. HTTP server with graceful shutdown ─────────────────────────────────
 	addr := ":" + strconv.Itoa(cfg.Port)
@@ -408,7 +431,46 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("graceful shutdown failed", zap.Error(err))
 	}
+	// After the server, not before: a request still in flight may yet enqueue
+	// an event, and the relay is what delivers it. One last drain then runs
+	// with the listener already closed, so the backlog left behind is only what
+	// Kafka genuinely would not take.
+	stopRelay()
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer drainCancel()
+	if n, err := relay.DrainOnce(drainCtx); err != nil {
+		log.Error("final outbox drain failed — events remain queued for the next instance", zap.Error(err))
+	} else if n > 0 {
+		log.Info("final outbox drain", zap.Int("events", n))
+	}
 	log.Info("server stopped")
+}
+
+// authzReachable builds the readiness check for authorization-svc.
+//
+// It probes /healthz, not /v1/authorize. Readiness asks whether the dependency
+// is REACHABLE; an authorize call would additionally need a principal, an
+// entity and an action, would append a row to the append-only access decision
+// log on every scrape, and would report NOT READY for a caller who is merely
+// unauthorized. Reachability is the question, so reachability is what is asked.
+func authzReachable(baseURL string) func(context.Context) error {
+	client := &http.Client{Timeout: 2 * time.Second}
+	return func(ctx context.Context) error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/healthz", nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("authorization-svc /healthz returned %d", resp.StatusCode)
+		}
+		return nil
+	}
 }
 
 func correlationIDMiddleware(next http.Handler) http.Handler {

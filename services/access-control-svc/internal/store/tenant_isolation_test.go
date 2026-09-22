@@ -27,6 +27,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -170,6 +171,13 @@ func createAppRole(ctx context.Context, pool *pgxpool.Pool, dbName string) error
 		fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", dbName, appRole),
 		fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", appRole),
 		fmt.Sprintf("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %s", appRole),
+		// event_outbox.outbox_id is BIGSERIAL. Without USAGE on its sequence
+		// every enqueue fails as the app role with "permission denied for
+		// sequence" — and because the enqueue shares the write's transaction,
+		// the write fails with it. A grant list that covers tables but not
+		// sequences is a grant list that breaks the moment a table gets an
+		// identity column.
+		fmt.Sprintf("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %s", appRole),
 	}
 	for _, s := range stmts {
 		if _, err := pool.Exec(ctx, s); err != nil {
@@ -290,8 +298,8 @@ func TestPolicyRefusesCrossTenantWrite(t *testing.T) {
 }
 
 // TestPolicyFailsClosedWithNoTenantInstalled -- an unscoped connection must see
-// nothing, not everything. NULLIF makes the predicate NULL rather than '',
-// and NULL is not true.
+// nothing, not everything. NULLIF makes the predicate NULL rather than an empty
+// string, and NULL is not true.
 func TestPolicyFailsClosedWithNoTenantInstalled(t *testing.T) {
 	seedRole(t, tenantA, "FAILCLOSED_"+uuid.NewString()[:8])
 
@@ -350,4 +358,284 @@ func TestStoreUpdateCannotCrossTenants(t *testing.T) {
 		"SELECT status, role_name FROM role_definitions WHERE role_definition_id = $1", idB).Scan(&status, &name))
 	require.Equal(t, "ACTIVE", status)
 	require.NotEqual(t, "Renamed By Other Tenant", name)
+}
+
+// ── 4. The outbox ────────────────────────────────────────────────────────────
+
+// TestOutboxPolicyAdmitsTheRelayAndNobodyElse pins the one deliberate
+// cross-tenant escape hatch in this schema.
+//
+// The relay drains every tenant's backlog from a single loop, so it cannot run
+// under a tenant scope. Running it UNSCOPED would be worse than wrong: under
+// FORCE ROW LEVEL SECURITY it would simply select nothing, with no error, and
+// present as a relay that publishes nothing while reporting perfect health.
+// migration 000004 admits it by a named capability instead, and this asserts
+// both halves — that app.outbox_relay opens the table, and that nothing else
+// does.
+func TestOutboxPolicyAdmitsTheRelayAndNobodyElse(t *testing.T) {
+	ctx := context.Background()
+	seedOutbox(t, tenantA, "role.updated")
+	seedOutbox(t, tenantB, "role.updated")
+
+	// Scoped to tenant A: only tenant A's row is visible.
+	scoped := countOutbox(t, "SELECT set_config('app.tenant_id', '"+tenantA+"', true)")
+	require.Equal(t, 1, scoped, "a tenant-scoped reader saw another tenant's outbox rows")
+
+	// Unscoped: nothing at all. Fail-closed by SQL semantics.
+	require.Equal(t, 0, countOutbox(t, "SELECT 1"),
+		"an unscoped reader saw outbox rows — the policy is not fail-closed")
+
+	// As the relay: everything.
+	require.GreaterOrEqual(t, countOutbox(t, "SELECT set_config('app.outbox_relay', 'true', true)"), 2,
+		"the relay could not see every tenant's backlog — it would publish nothing and report no error")
+
+	// And the store's own relay path agrees.
+	pending, _, err := testStore.OutboxDepth(ctx)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, pending, int64(2))
+}
+
+// TestCreateRoleEnqueuesInTheSameTransaction is the property the outbox exists
+// for. The event and the state change are one commit: neither can exist without
+// the other.
+func TestCreateRoleEnqueuesInTheSameTransaction(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantA)
+	code := "OUTBOX_" + uuid.NewString()[:8]
+	role := &domain.RoleDefinition{
+		RoleDefinitionID: uuid.NewString(), TenantID: tenantA, RoleCode: code,
+		RoleName: "outbox probe", RoleScopeType: "TENANT", Status: domain.RoleStatusActive,
+		CreatedByPrincipalID: "admin-seed", CorrelationID: uuid.NewString(),
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	created, err := testStore.CreateRole(ctx, role, "admin-seed")
+	require.NoError(t, err)
+	require.True(t, created)
+
+	var payload []byte
+	require.NoError(t, ownerPool.QueryRow(ctx, `
+		SELECT payload FROM event_outbox
+		WHERE tenant_id = $1 AND event_type = 'role.created' AND aggregate_key = $2`,
+		tenantA, role.RoleDefinitionID).Scan(&payload),
+		"role.created was not enqueued in the transaction that created the role")
+
+	var env struct {
+		EventType string `json:"event_type"`
+		Payload   struct {
+			RoleID string `json:"role_id"`
+		} `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(payload, &env))
+	require.Equal(t, "role.created", env.EventType)
+	require.Equal(t, role.RoleDefinitionID, env.Payload.RoleID)
+}
+
+// TestUpdateRoleEnqueuesRoleUpdatedWithRoleID is the defect this service
+// shipped with, pinned at the layer that writes it.
+//
+// identity-context-svc revokes the sessions of everyone holding a role when it
+// sees role.updated, and it reads payload.role_id. The event carried only
+// role_definition_id, so the field it reads was always empty and it dropped
+// every one. Retiring a role therefore left every session that already held it
+// carrying the bundles it used to grant.
+func TestUpdateRoleEnqueuesRoleUpdatedWithRoleID(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantA)
+	id := seedRole(t, tenantA, "RETIRE_"+uuid.NewString()[:8])
+
+	_, err := testStore.UpdateRole(ctx, id, "", "RETIRED", "admin-seed")
+	require.NoError(t, err)
+
+	var payload []byte
+	require.NoError(t, ownerPool.QueryRow(ctx, `
+		SELECT payload FROM event_outbox
+		WHERE tenant_id = $1 AND event_type = 'role.updated' AND aggregate_key = $2`,
+		tenantA, id).Scan(&payload))
+
+	var env struct {
+		Payload struct {
+			RoleID string `json:"role_id"`
+			Status string `json:"status"`
+		} `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal(payload, &env))
+	require.Equal(t, id, env.Payload.RoleID,
+		"role.updated with an empty role_id is dropped by identity-context-svc — no session is ever revoked")
+	require.Equal(t, "RETIRED", env.Payload.Status)
+}
+
+// TestClaimOutboxLeavesRowsOnPublishFailure -- delivery may fail; the fact may
+// not be lost. A failed publish must leave published_at NULL so the next tick
+// retries, and must record why on the row itself.
+func TestClaimOutboxLeavesRowsOnPublishFailure(t *testing.T) {
+	ctx := context.Background()
+	seedOutbox(t, tenantA, "role.created")
+
+	before := pendingCount(t)
+	require.Greater(t, before, int64(0))
+
+	err := testStore.ClaimOutbox(ctx, 100, func([]store.OutboxRecord) error {
+		return fmt.Errorf("broker unavailable")
+	})
+	require.Error(t, err)
+	require.Equal(t, before, pendingCount(t),
+		"a failed publish marked rows delivered — those events are gone")
+
+	var attempts int
+	var lastErr *string
+	require.NoError(t, ownerPool.QueryRow(ctx,
+		"SELECT max(attempts), max(last_error) FROM event_outbox WHERE published_at IS NULL").Scan(&attempts, &lastErr))
+	require.GreaterOrEqual(t, attempts, 1, "the failed attempt was not recorded on the row")
+	require.NotNil(t, lastErr)
+
+	// And a successful drain clears the backlog.
+	require.NoError(t, testStore.ClaimOutbox(ctx, 100, func(recs []store.OutboxRecord) error {
+		require.NotEmpty(t, recs)
+		return nil
+	}))
+	require.Equal(t, int64(0), pendingCount(t))
+}
+
+// TestMalformedIDsAreNotFoundNotOutages -- role_definition_id is a UUID column,
+// so a non-UUID string raises 22P02 from Postgres rather than returning no
+// rows. That used to leave as 503 store_unavailable with the raw SQLSTATE in
+// the body: a database outage reported for a request that simply named nothing.
+func TestMalformedIDsAreNotFoundNotOutages(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantA)
+
+	_, err := testStore.GetRole(ctx, "not-a-uuid")
+	require.ErrorIs(t, err, domain.ErrRoleNotFound)
+
+	_, err = testStore.GetBundle(ctx, "not-a-uuid", "also-not-a-uuid")
+	require.ErrorIs(t, err, domain.ErrBundleNotFound)
+
+	_, err = testStore.UpdateRole(ctx, "not-a-uuid", "x", "RETIRED", "admin-seed")
+	require.ErrorIs(t, err, domain.ErrRoleNotFound)
+
+	// Collection reads narrow to nothing rather than refusing.
+	list, err := testStore.ListBundles(ctx, "not-a-uuid")
+	require.NoError(t, err)
+	require.Empty(t, list)
+
+	list, err = testStore.ListAllBundles(ctx, domain.BundleListFilter{RoleID: "not-a-uuid"})
+	require.NoError(t, err)
+	require.Empty(t, list)
+}
+
+// TestDuplicateRoleCodeIsAConflictNotAnOutage -- and a replay of the same
+// correlation id is neither.
+func TestDuplicateRoleCodeIsAConflictNotAnOutage(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantA)
+	code := "DUPE_" + uuid.NewString()[:8]
+	correlationID := uuid.NewString()
+
+	first := &domain.RoleDefinition{
+		RoleDefinitionID: uuid.NewString(), TenantID: tenantA, RoleCode: code,
+		RoleName: "first", RoleScopeType: "TENANT", Status: domain.RoleStatusActive,
+		CreatedByPrincipalID: "admin-seed", CorrelationID: correlationID,
+		CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	created, err := testStore.CreateRole(ctx, first, "admin-seed")
+	require.NoError(t, err)
+	require.True(t, created)
+
+	// A different intent, same code: a conflict the caller can act on.
+	taken, err := testStore.RoleCodeTaken(ctx, code, uuid.NewString())
+	require.NoError(t, err)
+	require.True(t, taken)
+
+	second := *first
+	second.RoleDefinitionID = uuid.NewString()
+	second.CorrelationID = uuid.NewString()
+	_, err = testStore.CreateRole(ctx, &second, "admin-seed")
+	require.ErrorIs(t, err, domain.ErrRoleCodeExists,
+		"a duplicate role_code surfaced as something other than a conflict")
+
+	// The SAME intent replayed is not a conflict — that is the whole point of
+	// an idempotency key, and an existence check without this exclusion turns
+	// every retry into a 409.
+	taken, err = testStore.RoleCodeTaken(ctx, code, correlationID)
+	require.NoError(t, err)
+	require.False(t, taken, "a replay of the original create was reported as a duplicate")
+
+	replay := *first
+	replay.RoleDefinitionID = uuid.NewString()
+	created, err = testStore.CreateRole(ctx, &replay, "admin-seed")
+	require.NoError(t, err)
+	require.False(t, created, "a replay should resolve to the original, not create")
+	require.Equal(t, first.RoleDefinitionID, replay.RoleDefinitionID)
+}
+
+// TestOneBundleCodePerRole -- authorization-svc identifies a bundle by
+// (role_id, bundle_code) and its attach endpoint is an upsert-REPLACE on that
+// pair. Two local rows sharing a code therefore pointed at ONE remote grant:
+// creating the second silently replaced the first's actions, and detaching
+// either retired the bundle both of them described.
+func TestOneBundleCodePerRole(t *testing.T) {
+	ctx := svcmiddleware.WithTenant(context.Background(), tenantA)
+	roleID := seedRole(t, tenantA, "BUNDLEDUPE_"+uuid.NewString()[:8])
+	code := "PO_FULL"
+
+	first := &domain.PermissionBundleDef{
+		BundleID: uuid.NewString(), TenantID: tenantA, RoleDefinitionID: roleID,
+		BundleCode: code, PermittedActions: []string{"PO_ISSUE"}, ActiveFlag: true,
+		CorrelationID: uuid.NewString(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}
+	created, err := testStore.CreateBundle(ctx, first, "admin-seed")
+	require.NoError(t, err)
+	require.True(t, created)
+
+	second := *first
+	second.BundleID = uuid.NewString()
+	second.CorrelationID = uuid.NewString()
+	second.PermittedActions = []string{"PO_CLOSE"}
+	_, err = testStore.CreateBundle(ctx, &second, "admin-seed")
+	require.ErrorIs(t, err, domain.ErrBundleCodeExists,
+		"two bundles with one code on one role: both display ACTIVE here, one grant exists there")
+
+	// A bundle write enqueues BOTH its own event and a role.updated, because
+	// what the role grants has changed and role.updated is the only name the
+	// session-revoking consumer dispatches on.
+	var roleEvents int
+	require.NoError(t, ownerPool.QueryRow(ctx, `
+		SELECT count(*) FROM event_outbox
+		WHERE tenant_id = $1 AND event_type = 'role.updated' AND aggregate_key = $2`,
+		tenantA, roleID).Scan(&roleEvents))
+	require.Equal(t, 1, roleEvents,
+		"a bundle change that emits no role.updated revokes no session — the old grant stays live")
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+func seedOutbox(t *testing.T, tenantID, eventType string) {
+	t.Helper()
+	_, err := ownerPool.Exec(context.Background(), `
+		INSERT INTO event_outbox (tenant_id, event_type, aggregate_key, payload)
+		VALUES ($1, $2, $3, $4)`,
+		tenantID, eventType, uuid.NewString(), []byte(`{"event_type":"`+eventType+`"}`))
+	require.NoError(t, err)
+}
+
+// countOutbox counts what a reader sees after running setup, through the
+// NOBYPASSRLS app pool — the only connection on which the policy actually
+// binds.
+func countOutbox(t *testing.T, setup string) int {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := appPool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	_, err = tx.Exec(ctx, setup)
+	require.NoError(t, err)
+
+	var n int
+	require.NoError(t, tx.QueryRow(ctx, "SELECT count(*) FROM event_outbox").Scan(&n))
+	return n
+}
+
+func pendingCount(t *testing.T) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, ownerPool.QueryRow(context.Background(),
+		"SELECT count(*) FROM event_outbox WHERE published_at IS NULL").Scan(&n))
+	return n
 }

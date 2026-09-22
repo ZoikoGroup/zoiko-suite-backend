@@ -19,6 +19,7 @@ import (
 	"zoiko.io/access-control-svc/internal/domain"
 	"zoiko.io/access-control-svc/internal/handler"
 	"zoiko.io/access-control-svc/internal/middleware"
+	"zoiko.io/access-control-svc/internal/telemetry"
 )
 
 // ── stubs ─────────────────────────────────────────────────────────────────────
@@ -29,6 +30,15 @@ type stubStore struct {
 	bundlesByRole        map[string][]domain.PermissionBundleDef
 	bundlesByCorrelation map[string]*domain.PermissionBundleDef
 	bundlesByID          map[string]*domain.PermissionBundleDef
+
+	// events is where the enqueued events land.
+	//
+	// They are recorded by the STORE, not by a publisher the handler calls,
+	// because that is where they are now written: in the same transaction as
+	// the state change. A stub that let the handler publish separately would be
+	// modelling the fire-and-forget path the outbox replaced, and would keep
+	// passing if that path ever came back.
+	events *stubPublisher
 }
 
 func newStubStore() *stubStore {
@@ -38,18 +48,44 @@ func newStubStore() *stubStore {
 		bundlesByRole:        make(map[string][]domain.PermissionBundleDef),
 		bundlesByCorrelation: make(map[string]*domain.PermissionBundleDef),
 		bundlesByID:          make(map[string]*domain.PermissionBundleDef),
+		events:               &stubPublisher{},
 	}
 }
 
-func (s *stubStore) CreateRole(_ context.Context, r *domain.RoleDefinition) (bool, error) {
+func (s *stubStore) CreateRole(_ context.Context, r *domain.RoleDefinition, _ string) (bool, error) {
 	if existing, ok := s.rolesByCorrelation[r.CorrelationID]; ok {
 		*r = *existing
+		// No event on a replay: nothing was created by this call.
 		return false, nil
+	}
+	for _, existing := range s.rolesByID {
+		if existing.RoleCode == r.RoleCode {
+			return false, domain.ErrRoleCodeExists
+		}
 	}
 	cp := *r
 	s.rolesByID[r.RoleDefinitionID] = &cp
 	s.rolesByCorrelation[r.CorrelationID] = &cp
+	s.events.roleCreated++
 	return true, nil
+}
+
+func (s *stubStore) RoleCodeTaken(_ context.Context, roleCode, exceptCorrelationID string) (bool, error) {
+	for _, r := range s.rolesByID {
+		if r.RoleCode == roleCode && r.CorrelationID != exceptCorrelationID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *stubStore) BundleCodeTaken(_ context.Context, roleDefinitionID, bundleCode, exceptCorrelationID string) (bool, error) {
+	for _, b := range s.bundlesByID {
+		if b.RoleDefinitionID == roleDefinitionID && b.BundleCode == bundleCode && b.CorrelationID != exceptCorrelationID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *stubStore) GetRole(_ context.Context, roleDefinitionID string) (*domain.RoleDefinition, error) {
@@ -91,19 +127,26 @@ func (s *stubStore) UpdateRole(_ context.Context, roleDefinitionID, roleName, st
 	}
 	r.UpdatedByPrincipalID = updatedByPrincipalID
 	r.UpdatedAt = time.Now().UTC()
+	s.events.roleUpdated++
 	cp := *r
 	return &cp, nil
 }
 
-func (s *stubStore) CreateBundle(_ context.Context, b *domain.PermissionBundleDef) (bool, error) {
+func (s *stubStore) CreateBundle(_ context.Context, b *domain.PermissionBundleDef, _ string) (bool, error) {
 	if existing, ok := s.bundlesByCorrelation[b.CorrelationID]; ok {
 		*b = *existing
 		return false, nil
+	}
+	for _, existing := range s.bundlesByID {
+		if existing.RoleDefinitionID == b.RoleDefinitionID && existing.BundleCode == b.BundleCode {
+			return false, domain.ErrBundleCodeExists
+		}
 	}
 	cp := *b
 	s.bundlesByRole[b.RoleDefinitionID] = append(s.bundlesByRole[b.RoleDefinitionID], cp)
 	s.bundlesByCorrelation[b.CorrelationID] = &cp
 	s.bundlesByID[b.BundleID] = &cp
+	s.events.bundleUpdated++
 	return true, nil
 }
 
@@ -133,6 +176,7 @@ func (s *stubStore) UpdateBundle(_ context.Context, roleDefinitionID, bundleID s
 	}
 	b.UpdatedByPrincipalID = updatedByPrincipalID
 	b.UpdatedAt = time.Now().UTC()
+	s.events.bundleUpdated++
 	cp := *b
 	return &cp, nil
 }
@@ -151,18 +195,14 @@ func (s *stubStore) ListAllBundles(_ context.Context, filter domain.BundleListFi
 	return out, nil
 }
 
+// stubPublisher counts the events the store enqueued.
+//
+// It is no longer a handler collaborator — the handler has no publisher any
+// more. It is the store's record of what went into the outbox, which is what
+// these tests have always meant by "an event was published" and is now
+// literally where it happens.
 type stubPublisher struct {
 	roleCreated, roleUpdated, bundleUpdated int
-}
-
-func (p *stubPublisher) PublishRoleCreated(_ context.Context, _ domain.RoleDefinition, _ string) {
-	p.roleCreated++
-}
-func (p *stubPublisher) PublishRoleUpdated(_ context.Context, _ domain.RoleDefinition, _ string) {
-	p.roleUpdated++
-}
-func (p *stubPublisher) PublishBundleUpdated(_ context.Context, _ domain.PermissionBundleDef, _ string) {
-	p.bundleUpdated++
 }
 
 type stubAuthZ struct{ err error }
@@ -219,7 +259,21 @@ func (a *stubAuthzAdmin) SetPermissionBundleActive(_ context.Context, roleID, bu
 
 // ── router factory ─────────────────────────────────────────────────────────────
 
+// newRouter wires a handler over the stubs.
+//
+// pub is attached to the STORE rather than handed to the handler: events are
+// enqueued by the store now, in the transaction that changed the state.
+// Threading it here keeps every existing call site and assertion reading the
+// same way.
+//
+// The metrics registry is a fresh one per router. prometheus.MustRegister
+// panics on a duplicate collector name, so routers sharing the default registry
+// would panic on the second one built in a package run — and a test that shared
+// one would be asserting on whatever ran before it.
 func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, admin *stubAuthzAdmin) chi.Router {
+	if pub != nil {
+		s.events = pub
+	}
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -227,7 +281,8 @@ func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ, admin *stubAu
 			next.ServeHTTP(w, req)
 		})
 	})
-	h := handler.New(s, pub, authz, admin, zap.NewNop())
+	metrics := telemetry.NewDomainWith(telemetry.NewRegistry(), "access-control-svc")
+	h := handler.New(s, authz, admin, metrics, zap.NewNop())
 	handler.RegisterRoutes(r, h)
 	return r
 }
@@ -247,10 +302,18 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 	return rr
 }
 
+// roleBody derives the role_code from the correlation id.
+//
+// Two definitions may not share a role_code in one tenant — so a fixture that
+// hard-coded one could only ever seed a single role, and every test needing two
+// of them was seeding a duplicate that the store now (correctly) refuses. Tying
+// the code to the key keeps a REPLAY identical, which is what
+// TestCreateRole_IdempotentReplay depends on, while two separate fixtures get
+// two separate codes.
 func roleBody(correlationID string) map[string]any {
 	return map[string]any{
 		"legal_entity_id": "le-us",
-		"role_code":       "PROCUREMENT_OFFICER",
+		"role_code":       "PROCUREMENT_OFFICER_" + strings.ToUpper(strings.ReplaceAll(correlationID, "-", ""))[:12],
 		"role_name":       "Procurement Officer",
 		"role_scope_type": "LEGAL_ENTITY",
 		"correlation_id":  correlationID,
@@ -321,10 +384,12 @@ func createRole(t *testing.T, r chi.Router) domain.RoleDefinition {
 	return role
 }
 
+// bundleBody derives bundle_code from the correlation id for the same reason
+// roleBody derives role_code: one code per role, replays excepted.
 func bundleBody(correlationID string) map[string]any {
 	return map[string]any{
 		"legal_entity_id":   "le-us",
-		"bundle_code":       "PO_FULL",
+		"bundle_code":       "PO_FULL_" + strings.ToUpper(strings.ReplaceAll(correlationID, "-", ""))[:12],
 		"permitted_actions": []string{"PO_ISSUE", "PO_AMEND", "PO_CLOSE"},
 		"correlation_id":    correlationID,
 	}
@@ -881,4 +946,170 @@ func TestListRoles_SearchNarrowsResults(t *testing.T) {
 	if roles[0].RoleCode != "AP_VENDOR_MANAGER" {
 		t.Errorf("search returned %q, want AP_VENDOR_MANAGER", roles[0].RoleCode)
 	}
+}
+
+// ── regressions this service shipped with ─────────────────────────────────────
+
+// TestWritesAuthorizeAgainstROLE_MANAGE is the headline defect.
+//
+// The handler asked authorization-svc for "ACCESS_ROLE_MANAGE", a name that
+// appears nowhere else in this estate: the seed that provisions the demo grants
+// attaches ACCESS_CONTROL_FULL with permitted_actions ["ROLE_MANAGE"], the
+// console tells the operator a 403 means "you hold no ROLE_MANAGE grant", and
+// the live bundle in authorization-svc grants ROLE_MANAGE. Every write on this
+// service was therefore refused 403 while every read worked — which reads as an
+// under-granted operator, not as a service asking for an action nobody defines.
+func TestWritesAuthorizeAgainstROLE_MANAGE(t *testing.T) {
+	authz := &recordingAuthZ{}
+	rr := newRouterWithAuthz(newStubStore(), authz)
+	resp := doReq(rr, http.MethodPost, "/v1/role-definitions/", roleBody(uuid.NewString()), "admin-1")
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("expected 201 got %d: %s", resp.Code, resp.Body.String())
+	}
+	if len(authz.actions) == 0 {
+		t.Fatal("no authorization check was made on a write")
+	}
+	for _, a := range authz.actions {
+		if a != "ROLE_MANAGE" {
+			t.Fatalf("write authorized against %q; the estate grants ROLE_MANAGE and nothing grants anything else", a)
+		}
+	}
+}
+
+// TestDuplicateRoleCodeIs409NotAnOutage — a UNIQUE violation used to leave as
+// 503 store_unavailable with the raw SQLSTATE in the body, sending on-call to
+// look at a healthy database.
+func TestDuplicateRoleCodeIs409NotAnOutage(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+
+	first := roleBody(uuid.NewString())
+	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", first, "admin-1"); rr.Code != http.StatusCreated {
+		t.Fatalf("seed: expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Same code, different intent.
+	second := roleBody(uuid.NewString())
+	second["role_code"] = first["role_code"]
+	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", second, "admin-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for a duplicate role_code, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "role_code_exists") {
+		t.Errorf("expected error_code role_code_exists, got %s", rr.Body.String())
+	}
+}
+
+// TestDuplicateRoleCodeDoesNotProvisionAnOrphan — the conflict is detected
+// BEFORE the role is created in authorization-svc. Reaching the UNIQUE index
+// only afterwards left a provisioned role there that this register refused to
+// record: a grant nobody here can see, retire or explain.
+func TestDuplicateRoleCodeDoesNotProvisionAnOrphan(t *testing.T) {
+	s := newStubStore()
+	admin := &stubAuthzAdmin{}
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, admin)
+
+	first := roleBody(uuid.NewString())
+	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", first, "admin-1"); rr.Code != http.StatusCreated {
+		t.Fatalf("seed: expected 201 got %d", rr.Code)
+	}
+	admin.gotScopes = nil
+
+	second := roleBody(uuid.NewString())
+	second["role_code"] = first["role_code"]
+	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", second, "admin-1"); rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d", rr.Code)
+	}
+	if len(admin.gotScopes) != 0 {
+		t.Fatalf("the refused create still provisioned %d role(s) in authorization-svc", len(admin.gotScopes))
+	}
+}
+
+// TestDuplicateBundleCodeIs409 — two bundles with one code on one role point at
+// a single grant in authorization-svc, because its attach endpoint is an
+// upsert-replace on (role_id, bundle_code).
+func TestDuplicateBundleCodeIs409(t *testing.T) {
+	s := newStubStore()
+	r := newRouter(s, &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	role := createRole(t, r)
+
+	first := bundleBody(uuid.NewString())
+	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/"+role.RoleDefinitionID+"/permission-bundles", first, "admin-1"); rr.Code != http.StatusCreated {
+		t.Fatalf("seed: expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	second := bundleBody(uuid.NewString())
+	second["bundle_code"] = first["bundle_code"]
+	rr := doReq(r, http.MethodPost, "/v1/role-definitions/"+role.RoleDefinitionID+"/permission-bundles", second, "admin-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for a duplicate bundle_code, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "bundle_code_exists") {
+		t.Errorf("expected error_code bundle_code_exists, got %s", rr.Body.String())
+	}
+}
+
+// TestCreateRole_ReplayAnswers200NotCreated — the client documents "201 is a
+// new role; 200 is a replay of one this correlation_id already created", and
+// the handler answered 201 to both. A caller retrying a write could not tell
+// whether it had just created something, which is the entire value of an
+// idempotency key.
+func TestCreateRole_ReplayAnswers200NotCreated(t *testing.T) {
+	correlationID := uuid.NewString()
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+
+	if rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1"); rr.Code != http.StatusCreated {
+		t.Fatalf("first create: expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("replay: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestCreateRole_ReplayEnqueuesNoSecondEvent — a consumer that saw role.created
+// twice for one role would act on a creation that did not happen.
+func TestCreateRole_ReplayEnqueuesNoSecondEvent(t *testing.T) {
+	correlationID := uuid.NewString()
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{}, &stubAuthzAdmin{})
+
+	doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1")
+	doReq(r, http.MethodPost, "/v1/role-definitions/", roleBody(correlationID), "admin-1")
+
+	if pub.roleCreated != 1 {
+		t.Fatalf("a replayed create enqueued %d role.created events", pub.roleCreated)
+	}
+}
+
+func TestCreateRole_UnknownScopeTypeRejected(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{}, &stubAuthzAdmin{})
+	body := roleBody(uuid.NewString())
+	body["role_scope_type"] = "GALAXY"
+	rr := doReq(r, http.MethodPost, "/v1/role-definitions/", body, "admin-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown role_scope_type, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── a recording authz client, for the action-name assertion ───────────────────
+
+type recordingAuthZ struct{ actions []string }
+
+func (a *recordingAuthZ) CheckAllowed(_ context.Context, _, _, actionType string) error {
+	a.actions = append(a.actions, actionType)
+	return nil
+}
+
+func newRouterWithAuthz(s *stubStore, authz *recordingAuthZ) chi.Router {
+	r := chi.NewRouter()
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			req = req.WithContext(middleware.WithTenant(req.Context(), "tenant-abc"))
+			next.ServeHTTP(w, req)
+		})
+	})
+	metrics := telemetry.NewDomainWith(telemetry.NewRegistry(), "access-control-svc")
+	handler.RegisterRoutes(r, handler.New(s, authz, &stubAuthzAdmin{}, metrics, zap.NewNop()))
+	return r
 }

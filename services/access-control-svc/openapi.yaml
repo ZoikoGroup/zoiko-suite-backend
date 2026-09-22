@@ -1,0 +1,874 @@
+openapi: 3.0.3
+
+# access-control-svc — the governed authoring layer for RBAC role and
+# permission-bundle DEFINITIONS.
+#
+# SCOPE, STATED UP FRONT because it is the thing most easily got wrong about
+# this service. authorization-svc owns live RBAC and every other service's
+# authz checks resolve against it. This service does not shadow that data. It
+# is the front door: creating a role or bundle here makes a synchronous call
+# into authorization-svc's admin API, so a definition recorded here has
+# actually been provisioned for enforcement. Per-principal role ASSIGNMENTS
+# are out of scope and are not reachable on this API at all.
+#
+# Written from the running service (handler.RegisterRoutes and the store), not
+# from the design note. Where the two disagreed the code won and the note was
+# corrected.
+
+info:
+  title: access-control-svc
+  version: "1.1.0"
+  description: |
+    Role catalogues, permission bundles, and the provisioning of both into
+    authorization-svc (Doc 03 §9.4).
+
+    ## Ordering, and why every write can answer 503
+
+    Every write PROVISIONS BEFORE IT RECORDS, and fails closed. A role is never
+    listed here as created unless authorization-svc accepted it; a retirement is
+    never recorded unless authorization-svc's `active_flag` was actually
+    cleared. So `503 authz_admin_unavailable` means **nothing was written**, and
+    on a retirement it means the role is still granting everything it grants
+    today. That is the one outcome a reader must not read as a transient blip.
+
+    The alternative — record locally, reconcile later — was rejected: a
+    governance register that claims a state the platform is not enforcing is
+    worse than no register.
+
+    ## Authorization
+
+    Every write is authorized against `ROLE_MANAGE` on the `legal_entity_id` in
+    the request body, not platform-wide. A `403` means the caller holds no such
+    grant on that entity specifically.
+
+    Reads are authenticated and tenant-scoped, and are NOT gated on a grant.
+    Two reasons: no bundle in this estate grants a view action on this service,
+    so enforcing one would close a working page against every existing
+    operator; and identity-context-svc reads the bundle collection as a
+    **workload** (`X-Workload-Id`) on its session-resolution hot path, where
+    there is no principal to evaluate a grant for.
+
+    ## Idempotency
+
+    `correlation_id` in the body is the idempotency key. Creates are unique on
+    `(tenant_id, correlation_id)`: a first write answers **201**, a replay
+    answers **200** with the original record and writes nothing. A client that
+    cannot tell those apart has no use for the key.
+
+    ## Errors
+
+    Business refusals use `{"error_code","error_message"}`. Envelope violations
+    come from the shared middleware and use `{"error","detail","violations"}`.
+    Both dialects are in this document because both reach callers.
+
+servers:
+  - url: http://localhost:8137
+    description: Local (published port)
+  - url: http://access-control-svc:8137
+    description: In-cluster
+  - url: http://localhost:8000/access-control-svc
+    description: Through the Traefik gateway
+
+tags:
+  - name: role-definitions
+    description: The role catalogue.
+  - name: permission-bundles
+    description: The action sets a role definition permits.
+  - name: operations
+    description: Health, readiness and metrics.
+
+paths:
+  /v1/role-definitions/:
+    get:
+      tags: [role-definitions]
+      summary: List the tenant's role catalogue
+      description: |
+        Scoped by the verified `X-Tenant-Id` alone — there is no tenant
+        parameter, and every store query carries an explicit predicate over the
+        header in addition to the row-level-security policy.
+
+        `limit` of 0 (the default) means NO CAP. Paging is something a caller
+        asks for: silently truncating a catalogue read would make its totals
+        wrong, and a register whose totals are wrong is not a register.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/RoleStatus' }
+          description: Narrow to ACTIVE or RETIRED. Anything else is `400 invalid_status` rather than an empty list — a typo must not read as "nothing is defined".
+        - name: scope_type
+          in: query
+          schema: { $ref: '#/components/schemas/RoleScopeType' }
+        - name: search
+          in: query
+          schema: { type: string }
+          description: Case-insensitive substring over role_code OR role_name.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: The catalogue, newest first. An empty catalogue is `[]`, never null.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RoleDefinition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+    post:
+      tags: [role-definitions]
+      summary: Define a role, and provision it into authorization-svc
+      description: |
+        The remote call happens FIRST. If authorization-svc refuses or cannot be
+        reached, nothing is persisted and the answer is `503`.
+
+        A `role_code` this tenant already uses is `409 role_code_exists`, and
+        the check runs BEFORE provisioning — so a refused create never leaves a
+        role in authorization-svc that this register does not record.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRoleRequest' }
+      responses:
+        '201':
+          description: Defined and provisioned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleDefinition' }
+        '200':
+          description: |
+            A replay. This `correlation_id` already defined a role in this
+            tenant; the original is returned and nothing was written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleDefinition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: A role definition with that `role_code` already exists in this tenant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceError' }
+              example:
+                error_code: role_code_exists
+                error_message: a role definition with that role_code already exists in this tenant
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/role-definitions/{role_definition_id}:
+    parameters:
+      - $ref: '#/components/parameters/RoleDefinitionId'
+    get:
+      tags: [role-definitions]
+      summary: Read one role definition
+      description: |
+        A malformed id answers `404`, not `503`. `role_definition_id` is a UUID
+        column, so a non-UUID raised `22P02` from Postgres and used to leave as
+        `store_unavailable` with the raw SQLSTATE in the body — a database
+        outage reported for a request that simply named nothing.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleDefinition' }
+          description: The definition.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+    patch:
+      tags: [role-definitions]
+      summary: Rename a role, retire it, or bring it back
+      description: |
+        A partial update: an omitted field is left alone.
+
+        **A status change is propagated to authorization-svc before it is
+        recorded, and fails closed.** Retiring clears `roles.active_flag` there,
+        and its authorize path joins through that flag, so a RETIRED role grants
+        nothing to anyone from that moment. Assignments are left intact, so
+        reactivating restores exactly the access the retirement suspended.
+
+        A rename makes no remote call. Setting the status a role already has is
+        a no-op rather than a redundant round trip.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateRoleRequest' }
+      responses:
+        '200':
+          description: The updated definition.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RoleDefinition' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/role-definitions/{role_definition_id}/permission-bundles:
+    parameters:
+      - $ref: '#/components/parameters/RoleDefinitionId'
+    get:
+      tags: [permission-bundles]
+      summary: The bundles attached to one role
+      description: |
+        This is the read identity-context-svc makes on its session-resolution
+        hot path, as a **workload**. It therefore accepts `X-Workload-Id` in
+        place of `X-Principal-Id`, per the canonical contract's definition of
+        `actor_subject_id`. It did not, once, and the resulting 401 was reported
+        by that service's resolver as "upstream dependency unavailable" — so
+        every context resolution in the stack answered 503 and the cause looked
+        like an outage rather than a contract mismatch.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      responses:
+        '200':
+          description: The role's bundles, newest first. A malformed role id reads as `[]`.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PermissionBundleDef' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+    post:
+      tags: [permission-bundles]
+      summary: Attach a permission bundle to a role
+      description: |
+        Provisioned into authorization-svc against the role, then recorded.
+        Same fail-closed ordering and same idempotency as role creation.
+
+        A `bundle_code` this role already carries is `409 bundle_code_exists`,
+        checked before provisioning. This is not a cosmetic uniqueness rule:
+        authorization-svc identifies a bundle by `(role_id, bundle_code)` and
+        its attach endpoint is an upsert-REPLACE on that pair, so a second
+        bundle sharing a code would silently overwrite the first one's permitted
+        actions there while both kept showing as ACTIVE here — and detaching
+        either would retire the single grant they both described.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBundleRequest' }
+      responses:
+        '201':
+          description: Attached and provisioned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PermissionBundleDef' }
+        '200':
+          description: A replay of a bundle this `correlation_id` already attached.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PermissionBundleDef' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: That `bundle_code` is already attached to this role.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceError' }
+              example:
+                error_code: bundle_code_exists
+                error_message: a permission bundle with that bundle_code is already attached to this role
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/role-definitions/{role_definition_id}/permission-bundles/{bundle_id}:
+    parameters:
+      - $ref: '#/components/parameters/RoleDefinitionId'
+      - $ref: '#/components/parameters/BundleId'
+    get:
+      tags: [permission-bundles]
+      summary: Read one bundle, resolved under its role
+      description: |
+        Addressed by BOTH ids. A bundle that exists but belongs to a different
+        role reads exactly like one that does not exist — deliberately, so a
+        probe cannot confirm a foreign bundle id.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PermissionBundleDef' }
+          description: The bundle.
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+    patch:
+      tags: [permission-bundles]
+      summary: Edit one bundle's permitted actions and/or its active state
+      description: |
+        A partial update. Both changes are propagated to authorization-svc
+        BEFORE they are recorded and fail closed, like every other write here.
+
+        An action edit is propagated as an upsert-replace (idempotent on
+        `(role_id, bundle_code)`). An active-state change goes through the
+        retire/reactivate endpoints. A submission that changes nothing returns
+        the current record and makes no remote call.
+
+        `bundle_code` is deliberately NOT editable: authorization-svc has no
+        rename, so a rename here could only be a local label on a
+        differently-enforced reality. Detach and re-attach under a new code.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateBundleRequest' }
+      responses:
+        '200':
+          description: The bundle, edited — or unchanged, if the submission changed nothing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PermissionBundleDef' }
+        '400':
+          description: |
+            `nothing_to_update` (neither field supplied) or `empty_actions` (an
+            explicitly empty action list — a bundle that grants nothing is a
+            control in name only; detach it instead).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServiceError' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+    delete:
+      tags: [permission-bundles]
+      summary: Detach one bundle from its role
+      description: |
+        A withdrawal, not a deletion: `active_flag` goes false here and the
+        bundle is retired in authorization-svc by resolving its code to the
+        remote id. Nothing is hard-deleted, matching authorization-svc's own
+        retire posture — a decision recorded as `rbac:role=<code>` is only
+        explainable while the actions that role once held remain readable.
+
+        Idempotent: an already-detached bundle answers 200 with the current
+        record. Fail-closed: a retirement that cannot be propagated refuses, so
+        a detached row here always means a withdrawn bundle there.
+
+        This route carries its context in the QUERY STRING
+        (`legal_entity_id`, `correlation_id`) because DELETE carries no body
+        over this API surface. A JSON body is still honoured if present.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalIdRequired'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: legal_entity_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+          description: The entity this write is authorized against.
+        - name: correlation_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: The detached bundle.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PermissionBundleDef' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ProvisioningUnavailable' }
+
+  /v1/permission-bundles/:
+    get:
+      tags: [permission-bundles]
+      summary: The tenant's whole bundle catalogue, across every role
+      description: |
+        The flat read the role-scoped collection cannot give. A console showing
+        bundles across roles previously fanned out one request per role; this is
+        the endpoint that read was added to avoid.
+
+        Still scoped by the verified `X-Tenant-Id` — a slice of one tenant's
+        catalogue, not a platform-wide dump.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/WorkloadId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - name: role_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: Narrow to one role. A malformed value narrows to nothing rather than erroring.
+        - name: active_flag
+          in: query
+          schema: { type: boolean }
+        - name: search
+          in: query
+          schema: { type: string }
+          description: Case-insensitive substring over bundle_code.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 0 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0 }
+      responses:
+        '200':
+          description: Every bundle in the tenant, newest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PermissionBundleDef' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '503': { $ref: '#/components/responses/StoreUnavailable' }
+
+  /healthz:
+    get:
+      tags: [operations]
+      summary: Liveness
+      description: |
+        Answers whenever the process is up, and deliberately checks nothing. A
+        liveness probe that fails on a dependency outage gets the container
+        killed and restarted, which fixes nothing and removes the one instance
+        that could have reported what was wrong.
+      responses:
+        '200': { description: OK }
+
+  /readyz:
+    get:
+      tags: [operations]
+      summary: Readiness — database AND authorization-svc
+      description: |
+        authorization-svc is a readiness dependency, not merely a runtime one.
+        Every write calls it twice (authorize the caller, provision the
+        definition) and fails closed on both, so a probe that only pinged the
+        database reported green while 100% of writes answered 503 and the load
+        balancer kept sending traffic to an instance that could author nothing.
+
+        The body names which component failed, because the two have opposite
+        remedies: a dead pool is this service's problem; an unreachable
+        authorization-svc is somebody else's and restarting this one will not
+        help.
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              example:
+                status: READY
+                components: { database: ok, authorization-svc: ok }
+        '503':
+          description: Not ready. `components` names the failure.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              example:
+                status: NOT_READY
+                components:
+                  database: ok
+                  authorization-svc: "unreachable: dial tcp: connection refused"
+
+  /metrics:
+    get:
+      tags: [operations]
+      summary: Prometheus exposition
+      description: |
+        Beyond the standard HTTP series, this service exports the decision
+        counters in `internal/telemetry/domain.go`:
+        `access_control_role_writes_total`,
+        `access_control_bundle_writes_total`,
+        `access_control_authz_decisions_total`,
+        `access_control_authz_admin_calls_total`, and the outbox gauges
+        `access_control_outbox_pending` / `_oldest_age_seconds`.
+
+        Every label combination is pre-created at zero. A series that has never
+        been observed and one reading zero are indistinguishable to an alert
+        expression, so a rule written to catch the FIRST refusal would otherwise
+        stay silent through exactly the event it exists for.
+      responses:
+        '200': { description: Prometheus text exposition. }
+
+components:
+  parameters:
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+      description: The verified tenant. Absent is 401 — never an unscoped read.
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      schema: { type: string }
+      description: The human subject. On a READ, either this or X-Workload-Id satisfies `actor_subject_id`.
+    WorkloadId:
+      name: X-Workload-Id
+      in: header
+      schema: { type: string }
+      description: |
+        A workload subject. Accepted on reads only. A workload may read the
+        catalogue; only a named human changes it, because the principal is what
+        the evidence records.
+    PrincipalIdRequired:
+      name: X-Principal-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Writes require a human principal. X-Workload-Id does not satisfy a write.
+    LegalEntityId:
+      name: X-Legal-Entity-Id
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+      description: Required on writes (INV-02).
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      schema: { type: string }
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: true
+      schema: { type: string }
+    SourceChannel:
+      name: X-Source-Channel
+      in: header
+      required: true
+      schema: { type: string, enum: [ui, api, system, batch] }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+      description: Required on material state changes (INV-08).
+    RoleDefinitionId:
+      name: role_definition_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BundleId:
+      name: bundle_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    RoleStatus:
+      type: string
+      enum: [ACTIVE, RETIRED]
+      description: |
+        Constrained by a CHECK in migration 000002 and validated in the handler.
+        It used to be an unconstrained VARCHAR with the vocabulary in a comment,
+        so `{"status":"BANANA"}` persisted and the role then matched neither
+        status filter — invisible without being retired.
+
+    RoleScopeType:
+      type: string
+      enum: [LEGAL_ENTITY, TENANT]
+      description: |
+        Which kind of assignment the role is for. Scoping happens at ASSIGNMENT
+        time, not definition time — this mirrors authorization-svc's own model.
+
+    RoleDefinition:
+      type: object
+      required:
+        [role_definition_id, tenant_id, role_code, role_name, role_scope_type,
+         status, created_by_principal_id, correlation_id, created_at, updated_at]
+      properties:
+        role_definition_id:
+          type: string
+          format: uuid
+          description: |
+            The SAME id authorization-svc knows the role by — this service
+            generates it and provisions the role under it. Events carry it as
+            `role_id` for that reason.
+        tenant_id: { type: string, format: uuid }
+        role_code:
+          type: string
+          description: Unique per tenant. The string every service's authz check names.
+        role_name: { type: string }
+        role_scope_type: { $ref: '#/components/schemas/RoleScopeType' }
+        status: { $ref: '#/components/schemas/RoleStatus' }
+        created_by_principal_id: { type: string }
+        updated_by_principal_id:
+          type: string
+          description: Who made the last change. Absent on rows never updated.
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PermissionBundleDef:
+      type: object
+      required:
+        [bundle_id, tenant_id, role_definition_id, bundle_code,
+         permitted_actions, active_flag, correlation_id, created_at, updated_at]
+      properties:
+        bundle_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        role_definition_id: { type: string, format: uuid }
+        bundle_code:
+          type: string
+          description: Unique per (tenant, role) — see the 409 on the attach route for why.
+        permitted_actions:
+          type: array
+          items: { type: string }
+          minItems: 1
+        active_flag:
+          type: boolean
+          description: False means detached — withdrawn, with its contents kept.
+        updated_by_principal_id: { type: string }
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    CreateRoleRequest:
+      type: object
+      required: [legal_entity_id, role_code, role_name, role_scope_type, correlation_id]
+      properties:
+        legal_entity_id:
+          type: string
+          format: uuid
+          description: The entity the ROLE_MANAGE check is made against.
+        role_code: { type: string }
+        role_name: { type: string }
+        role_scope_type: { $ref: '#/components/schemas/RoleScopeType' }
+        correlation_id:
+          type: string
+          description: The idempotency key. Generate once per intent and reuse on retry.
+
+    UpdateRoleRequest:
+      type: object
+      required: [legal_entity_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        role_name:
+          type: string
+          description: Omit (or send empty) to leave the name alone.
+        status:
+          allOf: [{ $ref: '#/components/schemas/RoleStatus' }]
+          description: Omit to leave the status alone.
+        correlation_id: { type: string }
+
+    CreateBundleRequest:
+      type: object
+      required: [legal_entity_id, bundle_code, permitted_actions, correlation_id]
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        bundle_code: { type: string }
+        permitted_actions:
+          type: array
+          items: { type: string }
+          minItems: 1
+        correlation_id: { type: string }
+
+    UpdateBundleRequest:
+      type: object
+      required: [legal_entity_id]
+      description: At least one of `permitted_actions` or `active_flag` must be present.
+      properties:
+        legal_entity_id: { type: string, format: uuid }
+        permitted_actions:
+          type: array
+          items: { type: string }
+          minItems: 1
+        active_flag: { type: boolean }
+        correlation_id: { type: string }
+
+    ServiceErrorCode:
+      type: string
+      description: |
+        Every `error_code` this service emits, exhaustively.
+
+        Exhaustive on purpose. A client branching on the code needs the whole
+        list or it will one day meet one this contract never mentioned and fall
+        through to a generic failure message — and the codes that matter most
+        here (`authz_admin_unavailable`, `role_code_exists`) are precisely the
+        ones a generic message renders wrongly. `scripts/audit.sh` §5 diffs this
+        enum against the handler and fails if either side gains a code the other
+        does not have.
+      enum:
+        # Authorization and identity.
+        - forbidden                 # no ROLE_MANAGE grant on this legal entity
+        - identity_missing          # no verified actor
+        - tenant_missing            # no verified tenant
+        - authz_unavailable         # the authorize call could not be made; nothing written
+        - authz_admin_unavailable   # provisioning could not be made; NOTHING WAS WRITTEN
+        # Conflicts.
+        - role_code_exists
+        - bundle_code_exists
+        # Request validation.
+        - invalid_json
+        - missing_fields
+        - invalid_status
+        - invalid_scope_type
+        - invalid_active_flag
+        - invalid_limit
+        - invalid_offset
+        - nothing_to_update         # a partial update supplying neither field
+        - empty_actions             # an explicitly empty permitted_actions list
+        # Resolution and storage.
+        - not_found                 # unknown, malformed, or another tenant's id
+        - store_unavailable
+
+    ServiceError:
+      type: object
+      required: [error_code, error_message]
+      properties:
+        error_code: { $ref: '#/components/schemas/ServiceErrorCode' }
+        error_message: { type: string }
+
+    EnvelopeError:
+      type: object
+      description: |
+        The shared canonical-input-contract refusal. `violations` is kept
+        STRUCTURED rather than folded into `detail`: a caller cannot tell which
+        of seven headers it is missing from one concatenated sentence.
+      required: [error, detail, violations]
+      properties:
+        error: { type: string, example: envelope_incomplete }
+        detail: { type: string }
+        service: { type: string }
+        violations:
+          type: array
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              reason: { type: string }
+
+    Readiness:
+      type: object
+      properties:
+        status: { type: string, enum: [READY, NOT_READY] }
+        components:
+          type: object
+          additionalProperties: { type: string }
+
+  responses:
+    BadRequest:
+      description: Malformed request, or a violated envelope.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/ServiceError'
+              - $ref: '#/components/schemas/EnvelopeError'
+    Unauthenticated:
+      description: |
+        No verified tenant (`tenant_missing`) or no verified actor
+        (`identity_missing`), or an incomplete envelope on a write.
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/ServiceError'
+              - $ref: '#/components/schemas/EnvelopeError'
+    Forbidden:
+      description: |
+        The caller holds no `ROLE_MANAGE` grant on this legal entity. Entity-
+        scoped, not platform-wide.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ServiceError' }
+          example:
+            error_code: forbidden
+            error_message: authorization denied for this access control action
+    NotFound:
+      description: |
+        No such definition or bundle in this tenant. A malformed id, a foreign
+        tenant's id and an id that never existed are all answered the same way,
+        deliberately.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ServiceError' }
+          example:
+            error_code: not_found
+            error_message: role definition not found
+    StoreUnavailable:
+      description: The catalogue's database could not be reached. Nothing was changed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ServiceError' }
+    ProvisioningUnavailable:
+      description: |
+        `authz_admin_unavailable` or `authz_unavailable` — **nothing was
+        written**. On a retirement this means the role is still being enforced;
+        it is not a transient blip and must not be rendered as one.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ServiceError' }
+          example:
+            error_code: authz_admin_unavailable
+            error_message: authorization-svc admin API unavailable

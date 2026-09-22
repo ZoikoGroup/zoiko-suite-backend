@@ -1,0 +1,244 @@
+asyncapi: 2.6.0
+
+# access-control-svc — published events.
+#
+# Written from internal/events/publisher.go and the outbox's own CHECK
+# constraint, which is the only list a deployment can actually violate. The
+# three names here, the constraint in migration 000004 and the Go constants are
+# checked against each other by scripts/audit.sh §6 — a document that has
+# drifted from its producer is worse than no document, because it is the thing
+# a consumer team builds against.
+
+info:
+  title: access-control-svc events
+  version: "1.1.0"
+  description: |
+    Role and permission-bundle lifecycle events, published to
+    `zoiko.access-control.events` through a **transactional outbox**.
+
+    ## The outbox, and why it is not optional here
+
+    The event is written into `event_outbox` in the SAME Postgres transaction
+    as the state change it describes, and a background relay drains that table
+    to Kafka. So a definition that changed always has its event, and an event
+    that exists always has its change; delivery is a separate, retryable
+    problem.
+
+    Before that, these were written straight to Kafka from the handler after the
+    commit, with the error logged and discarded. On a service whose events are
+    advisory that is a tolerable trade. It is not one here: `role.updated` is
+    what tells the rest of the estate that what a role grants has changed, so a
+    broker hiccup during a retirement discarded the only notice — while the
+    register showed RETIRED, authorization-svc correctly refused new authorize
+    calls, and the operator was told it had worked.
+
+    **At-least-once.** The relay marks rows published only after the broker
+    accepts them, inside the same transaction, so a crash mid-publish re-delivers
+    rather than loses. Consumers must be idempotent on `event_id`.
+
+    ## Ordering
+
+    The Kafka key is the aggregate id — `role_definition_id` for role events,
+    `bundle_id` for bundle events — so changes to one aggregate stay ordered
+    relative to each other.
+
+    ## A bundle change emits TWO events
+
+    Editing, attaching or detaching a bundle publishes
+    `permission.bundle.updated` **and** `role.updated` for its role. That is not
+    redundancy. A bundle change IS a change to what the role grants, and the
+    consumer that ends sessions carrying the old grant dispatches on
+    `role.updated` and has no case for the bundle name at all — so the bundle
+    event alone could never revoke anything.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: localhost:9092
+    protocol: kafka
+  cluster:
+    url: kafka:9094
+    protocol: kafka
+
+channels:
+  zoiko.access-control.events:
+    description: |
+      Every event this service publishes. One topic, keyed by aggregate id.
+    publish:
+      operationId: consumeAccessControlEvents
+      message:
+        oneOf:
+          - $ref: '#/components/messages/RoleCreated'
+          - $ref: '#/components/messages/RoleUpdated'
+          - $ref: '#/components/messages/PermissionBundleUpdated'
+
+components:
+  messages:
+    RoleCreated:
+      name: role.created
+      title: A role definition was created and provisioned
+      summary: |
+        Published once, in the transaction that recorded the definition. A
+        REPLAY of the same correlation id publishes nothing — a consumer seeing
+        role.created twice for one role would act on a creation that did not
+        happen.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: role.created }
+              payload: { $ref: '#/components/schemas/RoleCreatedPayload' }
+
+    RoleUpdated:
+      name: role.updated
+      title: A role definition was renamed, retired, reactivated, or its grants changed
+      summary: |
+        The event the rest of the estate acts on.
+
+        **Consumers today**
+
+        * `authorization-svc` (lifecycle consumer, group
+          `authorization-svc-lifecycle`, topics `zoiko.identity.events`,
+          `zoiko.access-control.events`, `zoiko.entity.events`) invalidates its
+          cached grant sources for `tenant_id`. Verified live.
+        * `identity-context-svc` (`handleRoleUpdated`) revokes the sessions of
+          every principal holding the role, because a role's permission bundles
+          are frozen into the session envelope at resolve time. It reads
+          `payload.role_id`.
+
+        **`role_id` is the field that matters.** This service published only
+        `role_definition_id`, so `role_id` was always absent and
+        identity-context-svc answered every one of these with "role.updated
+        names no role_id — cannot revoke" and dropped it. Both names are now
+        sent and are always the same value.
+
+        Note for anyone wiring that consumer: its reader is currently
+        configured with a single topic (`zoiko.identity.events`) and so does not
+        receive this topic at all. The payload is correct; the subscription is
+        the remaining step, and it belongs to that service.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: role.updated }
+              payload: { $ref: '#/components/schemas/RoleUpdatedPayload' }
+
+    PermissionBundleUpdated:
+      name: permission.bundle.updated
+      title: A permission bundle was attached, edited or detached
+      summary: |
+        Says WHAT changed about a role's grants. Always accompanied by a
+        `role.updated` for the same role — see the note on the info block.
+
+        `permitted_actions` changing changes what every holder of that role may
+        do, which is why authorization-svc treats this as a grant-graph event
+        and invalidates on it.
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: permission.bundle.updated }
+              payload: { $ref: '#/components/schemas/BundleUpdatedPayload' }
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The platform event contract (Doc 03 §19).
+
+        `legal_entity_id` and `jurisdiction_context` are deliberately ABSENT
+        rather than empty: a role or bundle definition is tenant-wide
+        configuration and is not scoped to one legal entity, so emitting either
+        would be fabricating provenance. The entity in the REQUEST that caused
+        the change is the entity the caller was authorized against, which is a
+        different fact and belongs in the access decision log, not here.
+      required: [event_id, event_type, event_version, emitted_at, schema_version, source_service, correlation_id, payload]
+      properties:
+        event_id:
+          type: string
+          example: evt-7ba38c68-e274-4315-b8ef-b8c6cff96fcf
+          description: |
+            Fresh per publish, never derived from the aggregate. Deduplicate on
+            this — delivery is at-least-once.
+        event_type:
+          type: string
+          enum: [role.created, role.updated, permission.bundle.updated]
+        event_version: { type: string, const: "1.0" }
+        emitted_at:
+          type: string
+          format: date-time
+          description: |
+            When the envelope was BUILT — inside the transaction that made the
+            change — not when the relay delivered it.
+        schema_version: { type: string, const: "1.0" }
+        source_service: { type: string, const: access-control-svc }
+        tenant_id: { type: string, format: uuid }
+        actor_id:
+          type: string
+          description: The verified principal who made the change.
+        correlation_id:
+          type: string
+          description: |
+            The correlation id of the REQUEST that caused this change — not the
+            one the row has carried since it was created. An update stamped with
+            the create's correlation id cannot be joined to the change it
+            describes, which is the single most useful thing a correlation id
+            is for.
+        payload: { type: object }
+
+    RoleCreatedPayload:
+      type: object
+      required: [role_id, role_definition_id, role_code, role_scope_type, status]
+      properties:
+        role_id:
+          type: string
+          format: uuid
+          description: The role's id in authorization-svc — the same value as role_definition_id.
+        role_definition_id: { type: string, format: uuid }
+        role_code: { type: string }
+        role_name: { type: string }
+        role_scope_type: { type: string, enum: [LEGAL_ENTITY, TENANT] }
+        status: { type: string, enum: [ACTIVE] }
+
+    RoleUpdatedPayload:
+      type: object
+      required: [role_id, role_definition_id, status]
+      properties:
+        role_id:
+          type: string
+          format: uuid
+          description: |
+            READ THIS ONE. identity-context-svc unmarshals exactly this field and
+            drops the event when it is empty.
+        role_definition_id:
+          type: string
+          format: uuid
+          description: The same value, under this service's own name for it. Kept so consumers built against the shipped shape keep working.
+        role_code: { type: string }
+        status:
+          type: string
+          enum: [ACTIVE, RETIRED]
+          description: |
+            The state AFTER the change. RETIRED means authorization-svc has
+            cleared the role's active_flag, so it grants nothing from that
+            moment; assignments are kept, so ACTIVE restores exactly what was
+            suspended.
+
+    BundleUpdatedPayload:
+      type: object
+      required: [bundle_id, role_id, role_definition_id, bundle_code, permitted_actions, active_flag]
+      properties:
+        bundle_id: { type: string, format: uuid }
+        role_id: { type: string, format: uuid }
+        role_definition_id: { type: string, format: uuid }
+        bundle_code: { type: string }
+        permitted_actions:
+          type: array
+          items: { type: string }
+        active_flag:
+          type: boolean
+          description: False means detached — withdrawn, contents kept.

@@ -161,4 +161,27 @@ var (
 
 	// ErrTenantMissing is returned when a request carries no X-Tenant-Id header.
 	ErrTenantMissing = errorString("caller tenant scope missing")
+
+	// ErrRoleCodeExists is returned when a create names a role_code another
+	// definition in this tenant already holds.
+	//
+	// It used to surface as ErrStoreUnavailable -- the UNIQUE (tenant_id,
+	// role_code) violation reached the caller as 503 "store unavailable",
+	// pointing on-call at a database that was working correctly and refusing a
+	// request that was simply a duplicate. Worse, the refusal happened AFTER
+	// the role had been provisioned into authorization-svc, so a rejected
+	// create left a role there that this register did not record.
+	ErrRoleCodeExists = errorString("a role definition with that role_code already exists in this tenant")
+
+	// ErrBundleCodeExists is returned when a create names a bundle_code the
+	// same role already carries.
+	//
+	// This is not a cosmetic uniqueness rule. authorization-svc identifies a
+	// bundle by (role_id, bundle_code) and its attach endpoint is an
+	// upsert-replace on that pair, so a second local bundle sharing a code
+	// silently REPLACED the first one's permitted actions there while both
+	// rows stayed ACTIVE here -- and detaching either one retired the single
+	// remote bundle both of them pointed at. The register then showed an
+	// ACTIVE bundle granting nothing.
+	ErrBundleCodeExists = errorString("a permission bundle with that bundle_code is already attached to this role")
 )
