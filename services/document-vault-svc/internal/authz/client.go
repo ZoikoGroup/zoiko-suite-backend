@@ -56,6 +56,10 @@ const (
 	// action than uploading a new version.
 	ActionDocumentDeclareRecord = "DOCUMENT_DECLARE_RECORD"
 	ActionDocumentSupersede     = "DOCUMENT_SUPERSEDE"
+	// ActionDocumentArchive/ActionDocumentRequestDisposition gate BIZ-01
+	// Wave 3's MoveToArchive/RequestDisposition.
+	ActionDocumentArchive            = "DOCUMENT_ARCHIVE"
+	ActionDocumentRequestDisposition = "DOCUMENT_REQUEST_DISPOSITION"
 )
 
 // Client is the interface the handler depends on, so tests can substitute a

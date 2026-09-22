@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -26,6 +28,9 @@ type Store interface {
 	AddVersion(ctx context.Context, documentID string, v *domain.DocumentVersion, correlationID string) (*domain.Document, error)
 	DeclareRecord(ctx context.Context, p domain.DeclareRecordParams, correlationID string) (*domain.Document, error)
 	SupersedeDocument(ctx context.Context, p domain.SupersedeDocumentParams, correlationID string) (*domain.Document, error)
+	MoveToArchive(ctx context.Context, p domain.MoveToArchiveParams, correlationID string) (*domain.Document, error)
+	RequestDisposition(ctx context.Context, p domain.RequestDispositionParams, correlationID string) (*domain.Document, error)
+	GetAsOfDocument(ctx context.Context, documentID string, asOf time.Time) (*domain.Document, *domain.DocumentVersion, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
@@ -72,6 +77,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{documentID}/access-log", h.ListAccessLog)
 		r.Post("/{documentID}/declare-record", h.DeclareRecord)
 		r.Post("/{documentID}/supersede", h.SupersedeDocument)
+		r.Post("/{documentID}/archive", h.MoveToArchive)
+		r.Post("/{documentID}/request-disposition", h.RequestDisposition)
+		r.Get("/{documentID}/verify-digest", h.VerifyDigest)
+		r.Get("/{documentID}/as-of", h.GetAsOfDocument)
 	})
 }
 
@@ -292,6 +301,187 @@ func (h *Handler) SupersedeDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/{documentID}/archive ──────────────────────────────────
+
+type moveToArchiveRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// MoveToArchive marks the document ARCHIVED — see domain.CanArchive.
+func (h *Handler) MoveToArchive(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req moveToArchiveRequest
+	_ = decodeJSONOptional(r, &req)
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentArchive) {
+		return
+	}
+
+	updated, err := h.store.MoveToArchive(r.Context(), domain.MoveToArchiveParams{
+		DocumentID: documentID, ArchivedByPrincipalID: actor, Reason: req.Reason,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── POST /v1/documents/{documentID}/request-disposition ─────────────────────
+
+type requestDispositionRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// RequestDisposition records a disposition request only — see
+// domain.Document.DispositionRequestedAt's own doc comment. It never
+// purges anything; DATA-GOV owns that decision.
+func (h *Handler) RequestDisposition(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req requestDispositionRequest
+	_ = decodeJSONOptional(r, &req)
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRequestDisposition) {
+		return
+	}
+
+	updated, err := h.store.RequestDisposition(r.Context(), domain.RequestDispositionParams{
+		DocumentID: documentID, RequestedByPrincipalID: actor, Reason: req.Reason,
+	}, r.Header.Get("X-Correlation-ID"))
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── GET /v1/documents/{documentID}/verify-digest ─────────────────────────────
+
+// VerifyDigest re-verifies a version's stored checksum against the actual
+// bytes on disk — a pass/fail integrity check, never the content itself
+// (that stays GetContent's own DOWNLOAD-gated disclosure). Defaults to
+// the document's current version; ?version=N checks a specific one.
+func (h *Handler) VerifyDigest(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	version := doc.CurrentVersion
+	if q := r.URL.Query().Get("version"); q != "" {
+		v, err := strconv.Atoi(q)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_version", q)
+			return
+		}
+		version = v
+	}
+
+	v, err := h.store.FindVersion(r.Context(), documentID, version)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+
+	_, err = h.storage.Get(r.Context(), v.StorageKey, v.ChecksumSHA256)
+	result := domain.DigestVerification{DocumentID: documentID, Version: version, ChecksumSHA256: v.ChecksumSHA256, Verified: true}
+	if errors.Is(err, storage.ErrIntegrityFailure) {
+		h.log.Error("VerifyDigest: INTEGRITY FAILURE", zap.String("document_id", documentID), zap.Int("version", version))
+		result.Verified = false
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if err != nil {
+		h.log.Error("VerifyDigest: storage unavailable", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "storage_unavailable", "")
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ── GET /v1/documents/{documentID}/as-of ─────────────────────────────────────
+
+type asOfDocumentResponse struct {
+	Document domain.Document        `json:"document"`
+	Version  domain.DocumentVersion `json:"version_as_of"`
+}
+
+// GetAsOfDocument reconstructs which version was current as of a given
+// time — see store.PgStore.GetAsOfDocument's own doc comment on the real
+// limit: only the version lineage is reconstructable, not historical
+// status/declaration/supersession (no history table backs those fields
+// yet).
+func (h *Handler) GetAsOfDocument(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	asOfRaw := r.URL.Query().Get("as_of")
+	if asOfRaw == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "as_of")
+		return
+	}
+	asOf, err := time.Parse(time.RFC3339, asOfRaw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_as_of", "as_of must be an RFC3339 timestamp")
+		return
+	}
+
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	asOfDoc, asOfVersion, err := h.store.GetAsOfDocument(r.Context(), documentID, asOf)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, asOfDocumentResponse{Document: *asOfDoc, Version: *asOfVersion})
 }
 
 // ── GET /v1/documents ────────────────────────────────────────────────────────
@@ -574,6 +764,10 @@ func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "superseding_document_not_found", err.Error())
 	case errors.Is(err, domain.ErrCannotSupersedeSelf):
 		writeError(w, http.StatusBadRequest, "cannot_supersede_self", err.Error())
+	case errors.Is(err, domain.ErrDocumentNotArchivable):
+		writeError(w, http.StatusConflict, "not_archivable", err.Error())
+	case errors.Is(err, domain.ErrDispositionAlreadyRequested):
+		writeError(w, http.StatusConflict, "disposition_already_requested", err.Error())
 	default:
 		h.log.Error("store error", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
@@ -667,6 +861,21 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// decodeJSONOptional is decodeJSON for a command whose body is entirely
+// optional (e.g. an archive/disposition reason) — an empty body is not an
+// error, malformed JSON still is.
+func decodeJSONOptional(r *http.Request, dst any) error {
+	if r.ContentLength == 0 {
+		return nil
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }
 
 func parsePaging(w http.ResponseWriter, r *http.Request) (limit, offset int, ok bool) {

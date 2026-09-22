@@ -111,6 +111,63 @@ func (s *stubStore) SupersedeDocument(_ context.Context, p domain.SupersedeDocum
 	return doc, nil
 }
 
+func (s *stubStore) MoveToArchive(_ context.Context, p domain.MoveToArchiveParams, _ string) (*domain.Document, error) {
+	doc, ok := s.docs[p.DocumentID]
+	if !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	if doc.Status != domain.StatusActive && doc.Status != domain.StatusSuperseded {
+		return nil, domain.ErrDocumentNotArchivable
+	}
+	now := time.Now().UTC()
+	doc.Status = domain.StatusArchived
+	doc.ArchivedAt = &now
+	doc.ArchivedByPrincipalID = &p.ArchivedByPrincipalID
+	if p.Reason != "" {
+		doc.ArchiveReason = &p.Reason
+	}
+	return doc, nil
+}
+
+func (s *stubStore) RequestDisposition(_ context.Context, p domain.RequestDispositionParams, _ string) (*domain.Document, error) {
+	doc, ok := s.docs[p.DocumentID]
+	if !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	if doc.DispositionRequestedAt != nil {
+		return nil, domain.ErrDispositionAlreadyRequested
+	}
+	now := time.Now().UTC()
+	doc.Status = domain.StatusPurgePending
+	doc.DispositionRequestedAt = &now
+	doc.DispositionRequestedByPrincipalID = &p.RequestedByPrincipalID
+	if p.Reason != "" {
+		doc.DispositionReason = &p.Reason
+	}
+	return doc, nil
+}
+
+func (s *stubStore) GetAsOfDocument(_ context.Context, documentID string, asOf time.Time) (*domain.Document, *domain.DocumentVersion, error) {
+	doc, ok := s.docs[documentID]
+	if !ok {
+		return nil, nil, domain.ErrDocumentNotFound
+	}
+	versions := s.versions[documentID]
+	var found *domain.DocumentVersion
+	for i := range versions {
+		if versions[i].CreatedAt.After(asOf) {
+			continue
+		}
+		if found == nil || versions[i].Version > found.Version {
+			found = &versions[i]
+		}
+	}
+	if found == nil {
+		return nil, nil, domain.ErrDocumentVersionNotFound
+	}
+	return doc, found, nil
+}
+
 func (s *stubStore) FindDocumentByID(_ context.Context, documentID string) (*domain.Document, error) {
 	if s.findErr != nil {
 		return nil, s.findErr
@@ -541,4 +598,142 @@ func TestSupersedeDocument_AlreadySuperseded_Returns409(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/supersede", bytes.NewReader(supersedeBody(t, "doc-3"))))
 	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+// ── MoveToArchive ────────────────────────────────────────────────────────────
+
+func TestMoveToArchive_Valid_Returns200(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	body, _ := json.Marshal(map[string]string{"reason": "no longer needed"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/archive", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.Document
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, domain.StatusArchived, got.Status)
+	require.NotNil(t, got.ArchivedAt)
+}
+
+func TestMoveToArchive_NoBody_Returns200(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/archive", nil))
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestMoveToArchive_AlreadyArchived_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/archive", nil))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/archive", nil))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+// ── RequestDisposition ───────────────────────────────────────────────────────
+
+func TestRequestDisposition_Valid_Returns200(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/request-disposition", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.Document
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, domain.StatusPurgePending, got.Status)
+	require.NotNil(t, got.DispositionRequestedAt)
+}
+
+func TestRequestDisposition_AlreadyRequested_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/request-disposition", nil))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/request-disposition", nil))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+// ── VerifyDigest ─────────────────────────────────────────────────────────────
+
+func TestVerifyDigest_Valid_ReturnsVerifiedTrue(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/verify-digest", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.DigestVerification
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.True(t, got.Verified)
+	assert.Equal(t, 1, got.Version)
+}
+
+func TestVerifyDigest_DocumentNotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/nope/verify-digest", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// ── GetAsOfDocument ──────────────────────────────────────────────────────────
+
+func TestGetAsOfDocument_MissingParam_Returns400(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/as-of", nil))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestGetAsOfDocument_InvalidTimestamp_Returns400(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/as-of?as_of=not-a-timestamp", nil))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestGetAsOfDocument_Valid_Returns200(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/as-of?as_of="+time.Now().UTC().Format(time.RFC3339), nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got struct {
+		Document domain.Document        `json:"document"`
+		Version  domain.DocumentVersion `json:"version_as_of"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "doc-1", got.Document.DocumentID)
+	assert.Equal(t, 1, got.Version.Version)
 }

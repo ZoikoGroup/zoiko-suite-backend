@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -105,14 +106,18 @@ func (s *PgStore) withTenant(ctx context.Context, fn func(tx pgx.Tx, tenantID st
 const documentColumns = `
 	document_id, tenant_id, legal_entity_id, title, classification, retention_policy,
 	residency_region_code, current_version, status, created_by_principal_id, created_at, updated_at,
-	declared_version, declared_at, declared_by_principal_id, superseded_by_document_id
+	declared_version, declared_at, declared_by_principal_id, superseded_by_document_id,
+	archived_at, archived_by_principal_id, archive_reason,
+	disposition_requested_at, disposition_requested_by_principal_id, disposition_reason
 `
 
 func scanDocument(row pgx.Row, d *domain.Document) error {
 	return row.Scan(&d.DocumentID, &d.TenantID, &d.LegalEntityID, &d.Title, &d.Classification,
 		&d.RetentionPolicy, &d.ResidencyRegionCode, &d.CurrentVersion, &d.Status,
 		&d.CreatedByPrincipalID, &d.CreatedAt, &d.UpdatedAt,
-		&d.DeclaredVersion, &d.DeclaredAt, &d.DeclaredByPrincipalID, &d.SupersededByDocumentID)
+		&d.DeclaredVersion, &d.DeclaredAt, &d.DeclaredByPrincipalID, &d.SupersededByDocumentID,
+		&d.ArchivedAt, &d.ArchivedByPrincipalID, &d.ArchiveReason,
+		&d.DispositionRequestedAt, &d.DispositionRequestedByPrincipalID, &d.DispositionReason)
 }
 
 const versionColumns = `
@@ -394,6 +399,142 @@ func (s *PgStore) classifySupersedeFailure(ctx context.Context, tx pgx.Tx, tenan
 		return fmt.Errorf("document store unavailable: %w", err)
 	}
 	return domain.ErrDocumentAlreadySuperseded
+}
+
+// MoveToArchive marks the document ARCHIVED — ends its active life the
+// same way SupersedeDocument does, just without a replacement document.
+func (s *PgStore) MoveToArchive(ctx context.Context, p domain.MoveToArchiveParams, correlationID string) (*domain.Document, error) {
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET status = 'ARCHIVED', archived_at = now(), archived_by_principal_id = $3, archive_reason = $4, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND status IN ('ACTIVE', 'SUPERSEDED')
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.ArchivedByPrincipalID, nullableString(p.Reason),
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifyArchiveFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.archived", p.DocumentID, tenantID,
+			out.LegalEntityID, p.ArchivedByPrincipalID, correlationID, map[string]any{
+				"document_id":     p.DocumentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": out.LegalEntityID,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *PgStore) classifyArchiveFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	return domain.ErrDocumentNotArchivable
+}
+
+// RequestDisposition records a disposition request (-> PURGE_PENDING) and
+// nothing more — see domain.Document.DispositionRequestedAt's own doc
+// comment on why this service does not itself purge anything.
+func (s *PgStore) RequestDisposition(ctx context.Context, p domain.RequestDispositionParams, correlationID string) (*domain.Document, error) {
+	var out domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			UPDATE documents
+			SET status = 'PURGE_PENDING', disposition_requested_at = now(), disposition_requested_by_principal_id = $3, disposition_reason = $4, updated_at = now()
+			WHERE document_id = $1 AND tenant_id = $2::uuid AND disposition_requested_at IS NULL
+			RETURNING `+documentColumns,
+			p.DocumentID, tenantID, p.RequestedByPrincipalID, nullableString(p.Reason),
+		)
+		if err := scanDocument(row, &out); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return s.classifyDispositionFailure(ctx, tx, tenantID, p.DocumentID)
+			}
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+
+		if err := s.insertDocumentOutboxEvent(ctx, tx, "document.disposition_requested", p.DocumentID, tenantID,
+			out.LegalEntityID, p.RequestedByPrincipalID, correlationID, map[string]any{
+				"document_id":     p.DocumentID,
+				"tenant_id":       tenantID,
+				"legal_entity_id": out.LegalEntityID,
+			}); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (s *PgStore) classifyDispositionFailure(ctx context.Context, tx pgx.Tx, tenantID, documentID string) error {
+	var d domain.Document
+	row := tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents WHERE document_id = $1 AND tenant_id = $2::uuid`, documentID, tenantID)
+	if err := scanDocument(row, &d); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrDocumentNotFound
+		}
+		return fmt.Errorf("document store unavailable: %w", err)
+	}
+	return domain.ErrDispositionAlreadyRequested
+}
+
+// nullableString turns an empty caller-supplied string into a real SQL
+// NULL rather than an empty string — archive_reason/disposition_reason
+// are optional free text, and "" and "not given" should not be
+// indistinguishable in the column.
+func nullableString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// GetAsOfDocument reconstructs which version was CURRENT as of asOf, from
+// document_versions' own immutable, timestamped lineage — real data, a
+// real answer. It does NOT reconstruct historical status/declaration/
+// supersession state: there is no history table backing those mutable
+// fields on the documents row (unlike BNK-01/BNK-08's own AsOf queries,
+// which are backed by a dedicated history table) — see this service's
+// own Wave 3 commit message for why that's a real, separate build, not
+// silently faked here.
+func (s *PgStore) GetAsOfDocument(ctx context.Context, documentID string, asOf time.Time) (*domain.Document, *domain.DocumentVersion, error) {
+	doc, err := s.FindDocumentByID(ctx, documentID)
+	if err != nil {
+		return nil, nil, err
+	}
+	var v domain.DocumentVersion
+	err = s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		row := tx.QueryRow(ctx, `
+			SELECT `+versionColumns+` FROM document_versions
+			WHERE document_id = $1 AND created_at <= $2
+			ORDER BY version DESC LIMIT 1`, documentID, asOf)
+		return scanVersion(row, &v)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, domain.ErrDocumentVersionNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("document store unavailable: %w", err)
+	}
+	return doc, &v, nil
 }
 
 // FindDocumentByID looks up a document, scoped to the caller's tenant. A

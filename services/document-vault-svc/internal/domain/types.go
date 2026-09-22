@@ -37,6 +37,8 @@ const (
 	// forward-link pattern (migration 000003), now reused for documents
 	// themselves (migration 000005).
 	StatusSuperseded DocumentStatus = "SUPERSEDED"
+	// StatusArchived is reached only via MoveToArchive (migration 000006).
+	StatusArchived DocumentStatus = "ARCHIVED"
 )
 
 // CanDeclareRecord: only an ACTIVE document with no prior declaration.
@@ -53,6 +55,21 @@ func CanDeclareRecord(d *Document) bool {
 // may be too.
 func CanSupersede(d *Document) bool {
 	return d.SupersededByDocumentID == nil
+}
+
+// CanArchive: ACTIVE or SUPERSEDED documents only — not already ARCHIVED
+// or PURGE_PENDING. A document ends its active life in one of two ways
+// (superseded by a replacement, or archived outright), and either may
+// still be archived afterward.
+func CanArchive(d *Document) bool {
+	return d.Status == StatusActive || d.Status == StatusSuperseded
+}
+
+// CanRequestDisposition: any status except PURGE_PENDING itself — once a
+// disposition request exists, migration 000006's trigger blocks a second
+// one from silently replacing it.
+func CanRequestDisposition(d *Document) bool {
+	return d.DispositionRequestedAt == nil
 }
 
 type AccessType string
@@ -89,6 +106,19 @@ type Document struct {
 	// SupersededByDocumentID (Wave 2): set exactly once by SupersedeDocument.
 	// Forward link only — the new document's own row never points back.
 	SupersededByDocumentID *string `json:"superseded_by_document_id,omitempty"`
+
+	// ArchivedAt/ArchivedByPrincipalID/ArchiveReason (Wave 3): set together
+	// by MoveToArchive.
+	ArchivedAt            *time.Time `json:"archived_at,omitempty"`
+	ArchivedByPrincipalID *string    `json:"archived_by_principal_id,omitempty"`
+	ArchiveReason         *string    `json:"archive_reason,omitempty"`
+	// DispositionRequestedAt/DispositionRequestedByPrincipalID/DispositionReason
+	// (Wave 3): set together by RequestDisposition. This service records
+	// the request only — DATA-GOV owns the actual disposition/purge
+	// decision, per BIZ-01's own dependency line.
+	DispositionRequestedAt            *time.Time `json:"disposition_requested_at,omitempty"`
+	DispositionRequestedByPrincipalID *string    `json:"disposition_requested_by_principal_id,omitempty"`
+	DispositionReason                 *string    `json:"disposition_reason,omitempty"`
 }
 
 // DocumentVersion is one immutable entry in a document's lineage. Rows are
@@ -162,6 +192,31 @@ type SupersedeDocumentParams struct {
 	ActorPrincipalID       string
 }
 
+// MoveToArchiveParams is MoveToArchive's input.
+type MoveToArchiveParams struct {
+	DocumentID            string
+	ArchivedByPrincipalID string
+	Reason                string
+}
+
+// RequestDispositionParams is RequestDisposition's input — see
+// Document.DispositionRequestedAt's own doc comment: this only records
+// the request, it never performs a purge.
+type RequestDispositionParams struct {
+	DocumentID             string
+	RequestedByPrincipalID string
+	Reason                 string
+}
+
+// DigestVerification is VerifyDigest's result — a pass/fail integrity
+// check, never the content itself (that disclosure stays GetContent's).
+type DigestVerification struct {
+	DocumentID     string `json:"document_id"`
+	Version        int    `json:"version"`
+	ChecksumSHA256 string `json:"checksum_sha256"`
+	Verified       bool   `json:"verified"`
+}
+
 // ---------------------------------------------------------------------------
 // Sentinel errors
 // ---------------------------------------------------------------------------
@@ -215,6 +270,11 @@ var (
 	ErrSupersedingDocumentNotFound = errors.New("superseding document not found")
 	// ErrCannotSupersedeSelf backs SupersedeDocument.
 	ErrCannotSupersedeSelf = errors.New("a document cannot supersede itself")
+	// ErrDocumentNotArchivable backs MoveToArchive — see CanArchive.
+	ErrDocumentNotArchivable = errors.New("document is not in a state that can be archived")
+	// ErrDispositionAlreadyRequested backs RequestDisposition — see
+	// CanRequestDisposition.
+	ErrDispositionAlreadyRequested = errors.New("a disposition request already exists for this document")
 
 	// ErrInvalidPaging is returned for an out-of-range limit or offset.
 	ErrInvalidPaging = errors.New("limit must be between 1 and 500 and offset must not be negative")
