@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -235,3 +236,76 @@ func TestPgStore_Outbox_ReverseJournal_Atomicity_RealDB(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, reversingPostedCount, "reversing journal must NOT emit a separate journal.posted event")
 }
+
+func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
+	pool := openTestPool(t)
+	ctx := context.Background()
+
+	tenantID := uuid.New().String()
+	legalEntityID := uuid.New().String()
+	journalID := uuid.New().String()
+	correlationID := uuid.New().String()
+	outboxEventID := uuid.New().String()
+
+	// 1. Begin raw transaction
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+
+	// Set tenant context for RLS in this tx
+	_, err = tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID)
+	require.NoError(t, err)
+
+	// 2. Write the domain business row into journal_headers
+	const insertJournalSQL = `
+		INSERT INTO journal_headers (
+			journal_id, tenant_id, legal_entity_id, fiscal_period, status,
+			transaction_date, posting_date, created_by_principal_id, correlation_id, approval_status,
+			created_at, updated_at
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7, $8, $9, $10,
+			now(), now()
+		)
+	`
+	transactionDate := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+	_, err = tx.Exec(ctx, insertJournalSQL,
+		journalID, tenantID, legalEntityID, "2026-08", "PENDING",
+		transactionDate, transactionDate, "preparer-1", correlationID, "DRAFT",
+	)
+	require.NoError(t, err)
+
+	// 3. Write the outbox row
+	err = outbox.Insert(ctx, tx, outbox.Event{
+		OutboxEventID: outboxEventID,
+		AggregateType: "JOURNAL",
+		AggregateID:   journalID,
+		EventType:     "journal.proposed",
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		CorrelationID: correlationID,
+		Payload:       map[string]any{"journal_id": journalID},
+	})
+	require.NoError(t, err)
+
+	// 4. Deliberately fail the transaction before commit
+	// (Trigger duplicate primary key on outbox_events)
+	_, err = tx.Exec(ctx, "INSERT INTO outbox_events (outbox_event_id) VALUES ($1)", outboxEventID)
+	require.Error(t, err, "expected duplicate primary key constraint collision")
+
+	err = tx.Rollback(ctx)
+	require.NoError(t, err)
+
+	// 5. Query fresh connection (pool) and assert NEITHER row exists
+	var journalCount, outboxCount int
+	scoped(t, pool, tenantID, func(verifyTx pgx.Tx) {
+		err := verifyTx.QueryRow(ctx, "SELECT count(*) FROM journal_headers WHERE journal_id = $1", journalID).Scan(&journalCount)
+		require.NoError(t, err)
+
+		err = verifyTx.QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id = $1", journalID).Scan(&outboxCount)
+		require.NoError(t, err)
+	})
+
+	assert.Equal(t, 0, journalCount, "domain journal_headers row must not exist after rollback")
+	assert.Equal(t, 0, outboxCount, "outbox row must not exist after rollback")
+}
+
