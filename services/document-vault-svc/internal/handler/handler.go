@@ -41,6 +41,10 @@ type Store interface {
 	GetClassification(ctx context.Context, documentID string) (*domain.RecordClassification, error)
 	Reclassify(ctx context.Context, p domain.ReclassifyParams) (*domain.RecordClassification, error)
 	SupersedeClassification(ctx context.Context, p domain.SupersedeClassificationParams) (*domain.RecordClassification, error)
+	GetAsOfClassification(ctx context.Context, documentID string, asOf time.Time) (*domain.RecordClassification, error)
+	ListClassificationHistory(ctx context.Context, documentID string) ([]domain.RecordClassification, error)
+	ListUnclassified(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.Document, error)
+	ExplainPolicyMapping(ctx context.Context, classificationID string) (*domain.PolicyMappingExplanation, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
@@ -101,6 +105,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{documentID}/reclassify", h.Reclassify)
 		r.Post("/classifications/{classificationID}/supersede", h.SupersedeClassification)
 		r.Post("/bulk-classify", h.BulkClassify)
+		r.Get("/{documentID}/classification/as-of", h.GetAsOfClassification)
+		r.Get("/{documentID}/classification/history", h.ListClassificationHistory)
+		r.Get("/unclassified", h.ListUnclassified)
+		r.Get("/classifications/{classificationID}/policy-mapping", h.ExplainPolicyMapping)
 	})
 }
 
@@ -931,6 +939,154 @@ func (h *Handler) authzErrorCode(err error) string {
 	}
 	h.log.Error("authorization check failed — failing closed (bulk classify)", zap.Error(err))
 	return "authz_unavailable"
+}
+
+// ── GET /v1/documents/{documentID}/classification/as-of ──────────────────────
+
+// GetAsOfClassification returns whichever classification governed the
+// document at a given point in time — BIZ-02's own GetAsOfClassification
+// query. Same as_of/RFC3339 query-param contract as GetAsOfDocument.
+func (h *Handler) GetAsOfClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	asOfRaw := r.URL.Query().Get("as_of")
+	if asOfRaw == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "as_of")
+		return
+	}
+	asOf, err := time.Parse(time.RFC3339, asOfRaw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_as_of", "as_of must be an RFC3339 timestamp")
+		return
+	}
+
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	classification, err := h.store.GetAsOfClassification(r.Context(), documentID, asOf)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, classification)
+}
+
+// ── GET /v1/documents/{documentID}/classification/history ────────────────────
+
+// ListClassificationHistory returns every classification decision ever
+// proposed for a document — BIZ-02's own ListClassificationHistory
+// query, the full audit trail behind the current classification.
+func (h *Handler) ListClassificationHistory(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	history, err := h.store.ListClassificationHistory(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if history == nil {
+		history = []domain.RecordClassification{}
+	}
+	writeJSON(w, http.StatusOK, history)
+}
+
+// ── GET /v1/documents/unclassified ────────────────────────────────────────────
+
+// ListUnclassified returns the legal entity's classification governance
+// backlog — documents that have never had a classification CONFIRMED —
+// BIZ-02's own ListUnclassified query. Same legal_entity_id-required and
+// pagination contract as ListDocuments.
+func (h *Handler) ListUnclassified(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field",
+			"legal_entity_id is required — documents are authorized per legal entity")
+		return
+	}
+	limit, offset, ok := parsePaging(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, actor, legalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	docs, err := h.store.ListUnclassified(r.Context(), legalEntityID, limit, offset)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if docs == nil {
+		docs = []domain.Document{}
+	}
+	writeJSON(w, http.StatusOK, docs)
+}
+
+// ── GET /v1/documents/classifications/{classificationID}/policy-mapping ──────
+
+// ExplainPolicyMapping returns what decided a classification — BIZ-02's
+// own ExplainPolicyMapping query. See store.PgStore.ExplainPolicyMapping's
+// own doc comment: this is an honest report of the classification's
+// recorded inputs, not a fabricated policy engine — no
+// confidence-threshold/policy-mapping owner exists in this codebase yet.
+func (h *Handler) ExplainPolicyMapping(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	classificationID := chi.URLParam(r, "classificationID")
+	existing, err := h.store.FindClassificationByID(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	explanation, err := h.store.ExplainPolicyMapping(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, explanation)
 }
 
 // ── GET /v1/documents ────────────────────────────────────────────────────────

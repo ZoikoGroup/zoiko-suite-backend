@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -356,6 +357,141 @@ func (s *PgStore) SupersedeClassification(ctx context.Context, p domain.Supersed
 		return nil, err
 	}
 	return &out, nil
+}
+
+// GetAsOfClassification returns whichever classification was CONFIRMED
+// and in effect at a given point in time — the row with the latest
+// confirmed_at at or before asOf, regardless of its current status.
+// A row this returns may since have been SUPERSEDED; that is expected —
+// this answers "what governed the document at time asOf", the same
+// historical-reconstruction contract GetAsOfDocument already gives for
+// document versions, not "what governs it now" (that's GetClassification).
+func (s *PgStore) GetAsOfClassification(ctx context.Context, documentID string, asOf time.Time) (*domain.RecordClassification, error) {
+	var out domain.RecordClassification
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, documentID, tenantID); err != nil {
+			return err
+		}
+		row := tx.QueryRow(ctx, `
+			SELECT `+classificationColumns+` FROM record_classifications
+			WHERE document_id = $1 AND confirmed_at IS NOT NULL AND confirmed_at <= $2
+			ORDER BY confirmed_at DESC LIMIT 1
+		`, documentID, asOf)
+		return scanClassification(row, &out)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrClassificationNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListClassificationHistory returns every classification decision ever
+// proposed for a document, oldest first — CANDIDATE, CONFIRMED,
+// SUPERSEDED and RESTRICTED rows alike. GetClassification and
+// GetAsOfClassification each answer "what governs/governed this
+// document"; this answers "everything that was ever proposed for it",
+// the full audit trail the doc's own event catalogue implies.
+func (s *PgStore) ListClassificationHistory(ctx context.Context, documentID string) ([]domain.RecordClassification, error) {
+	var out []domain.RecordClassification
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, documentID, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT `+classificationColumns+` FROM record_classifications
+			WHERE document_id = $1
+			ORDER BY proposed_at ASC
+		`, documentID)
+		if err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var c domain.RecordClassification
+			if err := scanClassification(rows, &c); err != nil {
+				return fmt.Errorf("document store unavailable: %w", err)
+			}
+			out = append(out, c)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListUnclassified returns the documents in one legal entity that have
+// never had a classification CONFIRMED — every document lands with a
+// seeded CANDIDATE at upload (Wave 1), so "unclassified" here means
+// "still nothing but candidate proposals", the governance backlog a
+// steward works through.
+func (s *PgStore) ListUnclassified(ctx context.Context, legalEntityID string, limit, offset int) ([]domain.Document, error) {
+	var out []domain.Document
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+documentColumns+` FROM documents d
+			WHERE d.tenant_id = $1::uuid AND d.legal_entity_id = $2::uuid
+			AND NOT EXISTS (
+				SELECT 1 FROM record_classifications rc
+				WHERE rc.document_id = d.document_id AND rc.status IN ('CONFIRMED', 'RESTRICTED')
+			)
+			ORDER BY d.created_at DESC, d.document_id DESC
+			LIMIT $3 OFFSET $4
+		`, tenantID, legalEntityID, limit, offset)
+		if err != nil {
+			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d domain.Document
+			if err := scanDocument(rows, &d); err != nil {
+				return fmt.Errorf("document store unavailable: %w", err)
+			}
+			out = append(out, d)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ExplainPolicyMapping is deliberately honest rather than fabricated: no
+// classification->confirmation policy engine exists in this codebase
+// (see domain.AIConfidenceAutoConfirmThreshold's own doc comment —
+// AI-02/DATA-GOV are the real owners of that policy and neither exists
+// yet). This returns the classification's own recorded decision inputs
+// (source, confidence, rule/model version, evidence) and states plainly
+// that no automatic policy mapping was applied — never a confidence
+// threshold or rule name this service was never given.
+func (s *PgStore) ExplainPolicyMapping(ctx context.Context, classificationID string) (*domain.PolicyMappingExplanation, error) {
+	c, err := s.FindClassificationByID(ctx, classificationID)
+	if err != nil {
+		return nil, err
+	}
+	explanation := "This classification requires human confirmation via ConfirmClassification/SupersedeClassification. " +
+		"No automatic confidence-threshold or rule-based policy mapping is configured in this service yet."
+	if c.Source == domain.ClassificationSourceHuman {
+		explanation = "This classification was proposed by a human and carries no confidence score or policy mapping — " +
+			"it requires confirmation by a different principal (maker-checker), not a policy threshold."
+	}
+	return &domain.PolicyMappingExplanation{
+		ClassificationID:       c.ClassificationID,
+		ClassificationValue:    c.ClassificationValue,
+		Source:                 c.Source,
+		Confidence:             c.Confidence,
+		RuleModelVersion:       c.RuleModelVersion,
+		SourceEvidence:         c.SourceEvidence,
+		AutoConfirmThreshold:   domain.AIConfidenceAutoConfirmThreshold,
+		AutoConfirmPolicyOwner: "AI-02 / DATA-GOV (not yet implemented)",
+		AutoConfirmApplied:     false,
+		Explanation:            explanation,
+	}, nil
 }
 
 // GetClassification returns the current classification for a document —

@@ -136,6 +136,24 @@ type SupersedeClassificationParams struct {
 	ActorPrincipalID         string
 }
 
+// PolicyMappingExplanation is ExplainPolicyMapping's result — an honest
+// report of what decided a classification, not a fabricated policy
+// engine. See AIConfidenceAutoConfirmThreshold's own doc comment: this
+// service has no confidence-threshold/policy-mapping owner yet, so
+// AutoConfirmApplied is always false and Explanation says so plainly.
+type PolicyMappingExplanation struct {
+	ClassificationID       string               `json:"classification_id"`
+	ClassificationValue    Classification       `json:"classification_value"`
+	Source                 ClassificationSource `json:"source"`
+	Confidence             *float64             `json:"confidence,omitempty"`
+	RuleModelVersion       *string              `json:"rule_model_version,omitempty"`
+	SourceEvidence         *string              `json:"source_evidence,omitempty"`
+	AutoConfirmThreshold   float64              `json:"auto_confirm_threshold"`
+	AutoConfirmPolicyOwner string               `json:"auto_confirm_policy_owner"`
+	AutoConfirmApplied     bool                 `json:"auto_confirm_applied"`
+	Explanation            string               `json:"explanation"`
+}
+
 var (
 	// ErrClassificationNotFound backs GetClassification et al.
 	ErrClassificationNotFound = errors.New("record classification not found")

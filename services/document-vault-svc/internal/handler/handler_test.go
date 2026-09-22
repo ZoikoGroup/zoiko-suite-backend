@@ -350,6 +350,69 @@ func (s *stubStore) SupersedeClassification(_ context.Context, p domain.Supersed
 	return next, nil
 }
 
+func (s *stubStore) GetAsOfClassification(_ context.Context, documentID string, asOf time.Time) (*domain.RecordClassification, error) {
+	if _, ok := s.docs[documentID]; !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	var best *domain.RecordClassification
+	for _, c := range s.classifications {
+		if c.DocumentID != documentID || c.ConfirmedAt == nil || c.ConfirmedAt.After(asOf) {
+			continue
+		}
+		if best == nil || c.ConfirmedAt.After(*best.ConfirmedAt) {
+			best = c
+		}
+	}
+	if best == nil {
+		return nil, domain.ErrClassificationNotFound
+	}
+	return best, nil
+}
+
+func (s *stubStore) ListClassificationHistory(_ context.Context, documentID string) ([]domain.RecordClassification, error) {
+	if _, ok := s.docs[documentID]; !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	var out []domain.RecordClassification
+	for _, c := range s.classifications {
+		if c.DocumentID == documentID {
+			out = append(out, *c)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) ListUnclassified(_ context.Context, legalEntityID string, _, _ int) ([]domain.Document, error) {
+	confirmed := map[string]bool{}
+	for _, c := range s.classifications {
+		if c.Status == domain.ClassificationStatusConfirmed || c.Status == domain.ClassificationStatusRestricted {
+			confirmed[c.DocumentID] = true
+		}
+	}
+	var out []domain.Document
+	for _, d := range s.docs {
+		if d.LegalEntityID == legalEntityID && !confirmed[d.DocumentID] {
+			out = append(out, *d)
+		}
+	}
+	return out, nil
+}
+
+func (s *stubStore) ExplainPolicyMapping(_ context.Context, classificationID string) (*domain.PolicyMappingExplanation, error) {
+	for _, c := range s.classifications {
+		if c.ClassificationID == classificationID {
+			return &domain.PolicyMappingExplanation{
+				ClassificationID: c.ClassificationID, ClassificationValue: c.ClassificationValue,
+				Source: c.Source, Confidence: c.Confidence, RuleModelVersion: c.RuleModelVersion,
+				SourceEvidence: c.SourceEvidence, AutoConfirmThreshold: domain.AIConfidenceAutoConfirmThreshold,
+				AutoConfirmPolicyOwner: "AI-02 / DATA-GOV (not yet implemented)", AutoConfirmApplied: false,
+				Explanation: "stub explanation",
+			}, nil
+		}
+	}
+	return nil, domain.ErrClassificationNotFound
+}
+
 func (s *stubStore) GetClassification(_ context.Context, documentID string) (*domain.RecordClassification, error) {
 	if _, ok := s.docs[documentID]; !ok {
 		return nil, domain.ErrDocumentNotFound
@@ -1453,4 +1516,119 @@ func TestBulkClassify_AuthorizationDenied_ResultsCarryForbidden(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.Equal(t, "forbidden", results[0].Error)
 	assert.Nil(t, results[0].Classification)
+}
+
+// ── GetAsOfClassification / ListClassificationHistory / ListUnclassified /
+// ── ExplainPolicyMapping (BIZ-02 Wave 4) ──────────────────────────────────────
+
+func TestGetAsOfClassification_ReturnsWhatGovernedAtThatTime(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	original := confirmFirstClassification(t, r, s)
+	beforeReclassify := time.Now().UTC()
+
+	reclassifyReq := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "RESTRICTED", "HUMAN", nil)))
+	reclassifyRec := httptest.NewRecorder()
+	r.ServeHTTP(reclassifyRec, reclassifyReq)
+	var proposed domain.RecordClassification
+	require.NoError(t, json.Unmarshal(reclassifyRec.Body.Bytes(), &proposed))
+	supersedeBody, err := json.Marshal(map[string]string{"new_classification_id": proposed.ClassificationID})
+	require.NoError(t, err)
+	supersedeReq := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+original.ClassificationID+"/supersede", bytes.NewReader(supersedeBody))
+	supersedeReq.Header.Set("X-Principal-Id", "steward-2")
+	r.ServeHTTP(httptest.NewRecorder(), supersedeReq)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/classification/as-of?as_of="+beforeReclassify.Format(time.RFC3339Nano), nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var asOf domain.RecordClassification
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &asOf))
+	assert.Equal(t, original.ClassificationID, asOf.ClassificationID, "expected the classification that governed BEFORE the reclassification, not the current one")
+	assert.Equal(t, domain.Classification("CONFIDENTIAL"), asOf.ClassificationValue)
+}
+
+func TestGetAsOfClassification_MissingAsOf_Returns400(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/classification/as-of", nil))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestListClassificationHistory_ReturnsFullTrail(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	confirmFirstClassification(t, r, s)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "RESTRICTED", "HUMAN", nil))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/classification/history", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var history []domain.RecordClassification
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &history))
+	assert.Len(t, history, 2, "expected both the original confirmed proposal and the reclassify candidate")
+}
+
+func TestListClassificationHistory_DocumentNotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/nope/classification/history", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestListUnclassified_ExcludesConfirmedDocuments(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "unconfirmed"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "confirmed"))))
+	proposal := s.classifications[1]
+	confirmReq := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+proposal.ClassificationID+"/confirm", nil)
+	confirmReq.Header.Set("X-Principal-Id", "steward-1")
+	r.ServeHTTP(httptest.NewRecorder(), confirmReq)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/unclassified?legal_entity_id=entity-1", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var docs []domain.Document
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &docs))
+	require.Len(t, docs, 1)
+	assert.Equal(t, "doc-1", docs[0].DocumentID)
+}
+
+func TestListUnclassified_MissingLegalEntityID_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/unclassified", nil))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestExplainPolicyMapping_HumanSource_NeverAutoConfirms(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	proposal := s.classifications[0]
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/classifications/"+proposal.ClassificationID+"/policy-mapping", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var explanation domain.PolicyMappingExplanation
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &explanation))
+	assert.False(t, explanation.AutoConfirmApplied)
+	assert.NotEmpty(t, explanation.Explanation)
+}
+
+func TestExplainPolicyMapping_NotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/classifications/nope/policy-mapping", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 }

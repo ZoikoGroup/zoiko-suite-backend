@@ -705,6 +705,112 @@ func TestPgStore_SupersedeClassification_RejectsAlreadySuperseded(t *testing.T) 
 	require.ErrorIs(t, err, domain.ErrClassificationAlreadySuperseded)
 }
 
+// TestPgStore_GetAsOfClassification_ReturnsWhatGovernedAtThatTime proves
+// the historical-reconstruction contract: querying a point in time
+// before a reclassification returns the classification that governed
+// then, not the document's current one.
+func TestPgStore_GetAsOfClassification_ReturnsWhatGovernedAtThatTime(t *testing.T) {
+	s := store.New(requireTestDB(t), zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "as-of-classification")
+	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	original, err := s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-1",
+	})
+	require.NoError(t, err)
+	beforeReclassify := time.Now().UTC()
+
+	replacement, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: "steward-2",
+	})
+	require.NoError(t, err)
+	_, err = s.SupersedeClassification(tenantCtx(), domain.SupersedeClassificationParams{
+		PreviousClassificationID: original.ClassificationID, NewClassificationID: replacement.ClassificationID, ActorPrincipalID: "steward-3",
+	})
+	require.NoError(t, err)
+
+	asOf, err := s.GetAsOfClassification(tenantCtx(), doc.DocumentID, beforeReclassify)
+	require.NoError(t, err)
+	require.Equal(t, original.ClassificationID, asOf.ClassificationID, "expected the classification that governed BEFORE the reclassification")
+	require.Equal(t, original.ClassificationValue, asOf.ClassificationValue)
+
+	current, err := s.GetAsOfClassification(tenantCtx(), doc.DocumentID, time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, replacement.ClassificationID, current.ClassificationID, "expected the current classification when asOf is now")
+}
+
+// TestPgStore_ListClassificationHistory_ReturnsFullTrail proves the
+// audit-trail query returns every proposal, including ones this
+// document's current classification no longer reflects.
+func TestPgStore_ListClassificationHistory_ReturnsFullTrail(t *testing.T) {
+	s := store.New(requireTestDB(t), zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "history")
+	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	original, err := s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-1",
+	})
+	require.NoError(t, err)
+	replacement, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: "steward-2",
+	})
+	require.NoError(t, err)
+
+	history, err := s.ListClassificationHistory(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	require.Len(t, history, 2)
+	require.Equal(t, original.ClassificationID, history[0].ClassificationID, "expected oldest-first ordering")
+	require.Equal(t, replacement.ClassificationID, history[1].ClassificationID)
+}
+
+// TestPgStore_ListUnclassified_ExcludesConfirmedDocuments proves the
+// governance-backlog query only surfaces documents with no
+// CONFIRMED/RESTRICTED classification yet.
+func TestPgStore_ListUnclassified_ExcludesConfirmedDocuments(t *testing.T) {
+	s := store.New(requireTestDB(t), zap.NewNop())
+	unconfirmed := newDocForDeclareTest(t, s, "unclassified")
+	confirmedDoc := newDocForDeclareTest(t, s, "will-be-confirmed")
+	proposal, err := s.GetClassification(tenantCtx(), confirmedDoc.DocumentID)
+	require.NoError(t, err)
+	_, err = s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-1",
+	})
+	require.NoError(t, err)
+
+	docs, err := s.ListUnclassified(tenantCtx(), unconfirmed.LegalEntityID, 100, 0)
+	require.NoError(t, err)
+	ids := make([]string, len(docs))
+	for i, d := range docs {
+		ids[i] = d.DocumentID
+	}
+	require.Contains(t, ids, unconfirmed.DocumentID)
+	require.NotContains(t, ids, confirmedDoc.DocumentID)
+}
+
+// TestPgStore_ExplainPolicyMapping_NeverFabricatesAutoConfirm proves
+// ExplainPolicyMapping reports honestly — AutoConfirmApplied is always
+// false, regardless of source or confidence, because no policy engine
+// exists in this codebase yet (see AIConfidenceAutoConfirmThreshold's
+// own doc comment).
+func TestPgStore_ExplainPolicyMapping_NeverFabricatesAutoConfirm(t *testing.T) {
+	s := store.New(requireTestDB(t), zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "policy-mapping")
+	confidence := 0.99
+	aiProposal, err := s.ClassifyRecord(tenantCtx(), domain.ClassifyRecordParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceAI,
+		Confidence: &confidence, ProposedByPrincipalID: "ai-classifier-1",
+	})
+	require.NoError(t, err)
+
+	explanation, err := s.ExplainPolicyMapping(tenantCtx(), aiProposal.ClassificationID)
+	require.NoError(t, err)
+	require.False(t, explanation.AutoConfirmApplied, "expected no auto-confirm even at 0.99 confidence — no policy engine exists yet")
+	require.NotEmpty(t, explanation.Explanation)
+	require.Equal(t, *aiProposal.Confidence, *explanation.Confidence)
+}
+
 func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.New(pool, zap.NewNop())
