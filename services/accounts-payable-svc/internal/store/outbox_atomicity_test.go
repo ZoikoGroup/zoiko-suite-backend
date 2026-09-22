@@ -26,9 +26,10 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 	// 1. Begin a real transaction
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
+	defer tx.Rollback(ctx) //nolint:errcheck
 
 	// Set tenant context for RLS in this tx
-	_, err = tx.Exec(ctx, "SET LOCAL app.tenant_id = $1", tenantID)
+	_, err = tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	require.NoError(t, err)
 
 	// 2. Write the domain business row into vendor_invoices
