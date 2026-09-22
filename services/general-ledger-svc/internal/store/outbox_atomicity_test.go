@@ -260,18 +260,21 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 	const insertJournalSQL = `
 		INSERT INTO journal_headers (
 			journal_id, tenant_id, legal_entity_id, fiscal_period, status,
-			transaction_date, posting_date, created_by_principal_id, correlation_id, approval_status,
+			description, created_by_principal_id, correlation_id,
+			journal_type, transaction_date, posting_date, currency_code, approval_status,
 			created_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
-			$6, $7, $8, $9, $10,
+			$6, $7, $8,
+			$9, $10, $11, $12, $13,
 			now()
 		)
 	`
 	transactionDate := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
 	_, err = tx.Exec(ctx, insertJournalSQL,
 		journalID, tenantID, legalEntityID, "2026-08", "PENDING",
-		transactionDate, transactionDate, "preparer-1", correlationID, "DRAFT",
+		"Rollback atomicity test", "preparer-1", correlationID,
+		"STANDARD", transactionDate, transactionDate, "USD", "DRAFT",
 	)
 	require.NoError(t, err)
 

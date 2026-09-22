@@ -32,22 +32,26 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 	_, err = tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID)
 	require.NoError(t, err)
 
+	invoiceDate := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
+
 	// 2. Write the domain business row into vendor_invoices
 	const insertInvoiceSQL = `
 		INSERT INTO vendor_invoices (
 			invoice_id, tenant_id, legal_entity_id, vendor_id, invoice_number,
 			amount, currency_code, due_date, status, created_by_principal_id,
-			correlation_id, created_at
+			correlation_id, invoice_date, supply_date, net_amount, tax_amount,
+			created_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
-			$11, now()
+			$11, $12, $13, $14, $15,
+			now()
 		)
 	`
 	_, err = tx.Exec(ctx, insertInvoiceSQL,
 		invoiceID, tenantID, legalEntityID, "vendor-1", "INV-FAIL-001",
 		5000.0, "USD", time.Now().UTC().Add(30*24*time.Hour), "DRAFT", "preparer-1",
-		correlationID,
+		correlationID, invoiceDate, invoiceDate, 5000.0, 0.0,
 	)
 	require.NoError(t, err)
 
