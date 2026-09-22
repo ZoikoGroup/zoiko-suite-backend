@@ -249,3 +249,114 @@ type TransitionHistoryRecord struct {
 	OccurredAt          time.Time  `json:"occurred_at"`
 	EffectiveAt         *time.Time `json:"effective_at,omitempty"`
 }
+
+// PinnedStateMachineEdges maps object_type -> from_state -> set of allowed to_states.
+// Per ZS-STATE-001 §4 (Evaluation-order step 4) and Invariant I-03 ("Allowed edge only:
+// A transition must exist in the active state-machine definition and originate from the current state").
+//
+// Pinned state machine for workflow_instance (§6):
+// - PENDING: may transition to APPROVED, REJECTED, ESCALATED, CANCELLED, INVALIDATED
+// - ESCALATED: may transition to APPROVED, REJECTED, CANCELLED, INVALIDATED
+// - APPROVED: may transition to INVALIDATED (per §6.1/§7 material edit after approval)
+// - REJECTED, CANCELLED, INVALIDATED: terminal states (no allowed outbound transitions)
+var PinnedStateMachineEdges = map[string]map[string][]string{
+	"workflow_instance": {
+		"PENDING":   {"APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "INVALIDATED"},
+		"ESCALATED": {"APPROVED", "REJECTED", "CANCELLED", "INVALIDATED"},
+		"APPROVED":  {"INVALIDATED"},
+	},
+	"workflow": {
+		"PENDING":   {"APPROVED", "REJECTED", "ESCALATED", "CANCELLED", "INVALIDATED"},
+		"ESCALATED": {"APPROVED", "REJECTED", "CANCELLED", "INVALIDATED"},
+		"APPROVED":  {"INVALIDATED"},
+	},
+}
+
+// ErrIllegalTransitionEdge is the sentinel error when a transition edge does not exist
+// in the pinned state-machine definition (ZS-STATE-001 §4 step 4, Invariant I-03).
+var ErrIllegalTransitionEdge = errors.New("illegal state machine transition edge")
+
+// IllegalEdgeError represents a rejection under ZS-STATE-001 §4 step 4 and §16.
+type IllegalEdgeError struct {
+	ObjectType     string         `json:"object_type"`
+	FromState      string         `json:"from_state"`
+	ToState        string         `json:"to_state"`
+	ReasonFamily   ReasonFamily   `json:"reason_family"`
+	ReasonCode     ReasonCode     `json:"reason_code"`
+	ExceptionClass ExceptionClass `json:"exception_class"`
+}
+
+func (e *IllegalEdgeError) Error() string {
+	return fmt.Sprintf("illegal state transition edge for %q: %s -> %s (exception_class: %s, reason: %s/%s)",
+		e.ObjectType, e.FromState, e.ToState, e.ExceptionClass, e.ReasonFamily, e.ReasonCode)
+}
+
+func (e *IllegalEdgeError) Is(target error) bool {
+	return target == ErrIllegalTransitionEdge
+}
+
+// ValidateTransitionEdge checks whether transitioning objectType from fromState to toState
+// is permitted by the pinned state-machine definition (ZS-STATE-001 §4 evaluation order step 4).
+func ValidateTransitionEdge(objectType, fromState, toState string) error {
+	normType := strings.ToLower(strings.TrimSpace(objectType))
+	edgesForType, ok := PinnedStateMachineEdges[normType]
+	if !ok {
+		return &IllegalEdgeError{
+			ObjectType:     objectType,
+			FromState:      fromState,
+			ToState:        toState,
+			ReasonFamily:   ReasonFamilyReject,
+			ReasonCode:     ReasonRejectPolicyNotMet,
+			ExceptionClass: ExceptionClassBusinessRule,
+		}
+	}
+
+	normFrom := strings.ToUpper(strings.TrimSpace(fromState))
+	normTo := strings.ToUpper(strings.TrimSpace(toState))
+
+	allowedTargets, ok := edgesForType[normFrom]
+	if !ok {
+		// State has no outbound edges (e.g. terminal state)
+		return &IllegalEdgeError{
+			ObjectType:     objectType,
+			FromState:      normFrom,
+			ToState:        normTo,
+			ReasonFamily:   ReasonFamilyReject,
+			ReasonCode:     ReasonRejectPolicyNotMet,
+			ExceptionClass: ExceptionClassBusinessRule,
+		}
+	}
+
+	for _, target := range allowedTargets {
+		if target == normTo {
+			return nil
+		}
+	}
+
+	return &IllegalEdgeError{
+		ObjectType:     objectType,
+		FromState:      normFrom,
+		ToState:        normTo,
+		ReasonFamily:   ReasonFamilyReject,
+		ReasonCode:     ReasonRejectPolicyNotMet,
+		ExceptionClass: ExceptionClassBusinessRule,
+	}
+}
+
+// WorkflowTransitionTarget resolves a transition name to its target state for workflow_instance.
+func WorkflowTransitionTarget(transition string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(transition)) {
+	case "invalidate", "invalidate_workflow":
+		return "INVALIDATED", true
+	case "cancel", "cancel_workflow":
+		return "CANCELLED", true
+	case "escalate", "escalate_workflow":
+		return "ESCALATED", true
+	case "approve", "approve_workflow":
+		return "APPROVED", true
+	case "reject", "reject_workflow":
+		return "REJECTED", true
+	default:
+		return "", false
+	}
+}
