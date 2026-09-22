@@ -261,11 +261,11 @@ func TestPgStore_Outbox_ForcedFailure_RollbackAtomicity_RealDB(t *testing.T) {
 		INSERT INTO journal_headers (
 			journal_id, tenant_id, legal_entity_id, fiscal_period, status,
 			transaction_date, posting_date, created_by_principal_id, correlation_id, approval_status,
-			created_at, updated_at
+			created_at
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8, $9, $10,
-			now(), now()
+			now()
 		)
 	`
 	transactionDate := time.Date(2026, time.August, 1, 0, 0, 0, 0, time.UTC)
