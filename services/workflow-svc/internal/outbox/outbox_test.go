@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ type mockTx struct {
 	execCalls   []string
 	execArgs    [][]any
 	queryCalls  []string
+	queryArgs   [][]any
 	committed   bool
 	rolledBack  bool
 	execErr     error
@@ -46,6 +48,7 @@ func (m *mockTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.Comm
 
 func (m *mockTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	m.queryCalls = append(m.queryCalls, sql)
+	m.queryArgs = append(m.queryArgs, args)
 	if m.queryErr != nil {
 		return nil, m.queryErr
 	}
@@ -498,4 +501,164 @@ func stringSearch(h, n string) bool {
 		}
 	}
 	return false
+}
+
+type mockConditionalPublisher struct {
+	mu        sync.Mutex
+	publishes []recordedPublish
+	failIDs   map[string]error
+}
+
+func (m *mockConditionalPublisher) PublishOutbox(ctx context.Context, outboxEventID, eventType, correlationID, tenantID, legalEntityID, actorID string, payload []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publishes = append(m.publishes, recordedPublish{
+		outboxEventID: outboxEventID,
+		eventType:     eventType,
+		correlationID: correlationID,
+		tenantID:      tenantID,
+		legalEntityID: legalEntityID,
+		actorID:       actorID,
+		payload:       payload,
+	})
+	if err, ok := m.failIDs[outboxEventID]; ok {
+		return err
+	}
+	return nil
+}
+
+func TestRelay_MaxAttemptsCeiling_QueryFilterAndDeadLetterLogging(t *testing.T) {
+	eventID := uuid.NewString()
+	envBytes := []byte(`{"event_type":"workflow.created"}`)
+	aID := "a-1"
+	cID := "corr-1"
+
+	// Event is on its 9th attempt (Attempts = 9)
+	rows := &mockRows{
+		rows: []mockEventRow{
+			{
+				id:          eventID,
+				aggType:     "WORKFLOW_INSTANCE",
+				aggID:       "w-deadletter-1",
+				eventType:   "workflow.created",
+				tenantID:    "t-1",
+				entityID:    "e-1",
+				actorID:     &aID,
+				corrID:      &cID,
+				headersJSON: []byte("{}"),
+				payloadJSON: envBytes,
+				attempts:    9,
+			},
+		},
+	}
+	tx := &mockTx{queryRows: rows}
+	pool := &mockPool{tx: tx}
+	pub := &mockPublisher{failErr: errors.New("kafka permanent failure")}
+
+	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 10, zap.NewNop())
+	relay.RelayOnce(context.Background())
+
+	// 1. Assert polling query filtered by publish_attempts < $2
+	if len(tx.queryCalls) == 0 {
+		t.Fatal("expected query to be executed")
+	}
+	query := tx.queryCalls[0]
+	if !strings.Contains(query, "publish_attempts < $2") {
+		t.Fatalf("expected query to filter by publish_attempts < $2, got:\n%s", query)
+	}
+	if len(tx.queryArgs) == 0 || len(tx.queryArgs[0]) < 2 || tx.queryArgs[0][1] != outbox.MaxPublishAttempts {
+		t.Fatalf("expected query arg $2 to be MaxPublishAttempts (%d), got: %v", outbox.MaxPublishAttempts, tx.queryArgs)
+	}
+
+	// 2. Assert update incremented attempt to 10
+	var foundErrorUpdate bool
+	for _, call := range tx.execCalls {
+		if strings.Contains(call, "publish_attempts = publish_attempts + 1") {
+			foundErrorUpdate = true
+			break
+		}
+	}
+	if !foundErrorUpdate {
+		t.Fatal("expected update recording publish failure and reaching dead-letter ceiling")
+	}
+}
+
+func TestRelay_DeadLetter_DoesNotBlockSubsequentEvents(t *testing.T) {
+	poisonedID := uuid.NewString()
+	healthyID := uuid.NewString()
+	envBytes := []byte(`{"event_type":"workflow.created"}`)
+	aID := "a-1"
+	cID1 := "corr-1"
+	cID2 := "corr-2"
+
+	// Batch has 2 events: first will fail (poisoned), second will succeed
+	rows := &mockRows{
+		rows: []mockEventRow{
+			{
+				id:          poisonedID,
+				aggType:     "WORKFLOW_INSTANCE",
+				aggID:       "w-poison-1",
+				eventType:   "workflow.created",
+				tenantID:    "t-1",
+				entityID:    "e-1",
+				actorID:     &aID,
+				corrID:      &cID1,
+				headersJSON: []byte("{}"),
+				payloadJSON: envBytes,
+				attempts:    0,
+			},
+			{
+				id:          healthyID,
+				aggType:     "WORKFLOW_INSTANCE",
+				aggID:       "w-healthy-2",
+				eventType:   "workflow.created",
+				tenantID:    "t-1",
+				entityID:    "e-1",
+				actorID:     &aID,
+				corrID:      &cID2,
+				headersJSON: []byte("{}"),
+				payloadJSON: envBytes,
+				attempts:    0,
+			},
+		},
+	}
+	tx := &mockTx{queryRows: rows}
+	pool := &mockPool{tx: tx}
+
+	// Publisher fails ONLY for poisonedID
+	pub := &mockConditionalPublisher{
+		failIDs: map[string]error{
+			poisonedID: errors.New("poisoned event failure"),
+		},
+	}
+
+	relay := outbox.NewRelay(pool, pub, 100*time.Millisecond, 10, zap.NewNop())
+	relay.RelayOnce(context.Background())
+
+	// Healthy event must be published
+	var publishedHealthy bool
+	for _, p := range pub.publishes {
+		if p.outboxEventID == healthyID {
+			publishedHealthy = true
+		}
+	}
+	if !publishedHealthy {
+		t.Fatal("expected healthy event to be published despite poisoned event failing")
+	}
+
+	// Verify both updates took place in the tx: 1 error update, 1 published update
+	var publishedCount, errorCount int
+	for _, call := range tx.execCalls {
+		if strings.Contains(call, "published_at = NOW()") {
+			publishedCount++
+		} else if strings.Contains(call, "publish_attempts = publish_attempts + 1") {
+			errorCount++
+		}
+	}
+	if errorCount != 1 {
+		t.Fatalf("expected 1 error update for poisoned event, got %d", errorCount)
+	}
+	if publishedCount != 1 {
+		t.Fatalf("expected 1 published update for healthy event, got %d", publishedCount)
+	}
 }

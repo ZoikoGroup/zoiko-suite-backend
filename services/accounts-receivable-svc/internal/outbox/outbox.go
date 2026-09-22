@@ -22,6 +22,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// MaxPublishAttempts defines the maximum number of publish attempts before an event
+// is considered dead-lettered and excluded from active polling cycles.
+const MaxPublishAttempts = 10
+
 // Event is one row to be written to outbox_events inside a domain transaction.
 type Event struct {
 	OutboxEventID string
@@ -208,11 +212,12 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 		       payload, publish_attempts
 		FROM outbox_events
 		WHERE published_at IS NULL
+		  AND publish_attempts < $2
 		ORDER BY created_at ASC
 		LIMIT $1
 		FOR UPDATE SKIP LOCKED
 	`
-	rows, err := tx.Query(ctx, pollSQL, r.batchSize)
+	rows, err := tx.Query(ctx, pollSQL, r.batchSize, MaxPublishAttempts)
 	if err != nil {
 		r.log.Error("outbox relay: poll failed", zap.Error(err))
 		return
@@ -246,16 +251,28 @@ func (r *Relay) RelayOnce(ctx context.Context) {
 
 	for _, e := range pending {
 		if pubErr := r.publisher.PublishOutbox(ctx, e.OutboxEventID, e.AggregateID, e.Payload); pubErr != nil {
+			newAttempts := e.Attempts + 1
 			_, _ = tx.Exec(ctx, `
 				UPDATE outbox_events
 				SET publish_attempts = publish_attempts + 1, last_error = $2
 				WHERE outbox_event_id = $1
 			`, e.OutboxEventID, pubErr.Error())
-			r.log.Warn("outbox relay: publish failed, will retry",
-				zap.String("outbox_event_id", e.OutboxEventID),
-				zap.String("event_type", e.EventType),
-				zap.Error(pubErr),
-			)
+			if newAttempts >= MaxPublishAttempts {
+				r.log.Error("outbox relay: event reached dead-letter ceiling, moving to dead-letter",
+					zap.String("outbox_event_id", e.OutboxEventID),
+					zap.String("event_type", e.EventType),
+					zap.Int("publish_attempts", newAttempts),
+					zap.Int("max_publish_attempts", MaxPublishAttempts),
+					zap.Error(pubErr),
+				)
+			} else {
+				r.log.Warn("outbox relay: publish failed, will retry",
+					zap.String("outbox_event_id", e.OutboxEventID),
+					zap.String("event_type", e.EventType),
+					zap.Int("publish_attempts", newAttempts),
+					zap.Error(pubErr),
+				)
+			}
 		} else {
 			_, _ = tx.Exec(ctx, `
 				UPDATE outbox_events
