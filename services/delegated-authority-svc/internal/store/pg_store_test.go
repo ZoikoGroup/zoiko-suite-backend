@@ -17,6 +17,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,17 +33,29 @@ import (
 	"zoiko.io/delegated-authority-svc/internal/store"
 )
 
-// requireTestDB skips the test unless TEST_DATABASE_URL is set (CI or a local
-// Postgres instance) — the same gate every other service's store suite uses.
+// requireTestDB yields a pool against TEST_DATABASE_URL, or skips — except
+// where skipping would be a lie.
+//
+// A skip reports ok. That is the right answer on a developer laptop with no
+// Postgres and the wrong one in CI, where a suite that silently ran nothing is
+// indistinguishable from one that passed. Under CI or REQUIRE_DB_TESTS this
+// fails instead. Same fix, same reasoning, as the sweep across the seven GOV
+// services.
 func requireTestDB(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	dsn := os.Getenv("TEST_DATABASE_URL")
 	if dsn == "" {
+		if os.Getenv("CI") != "" || os.Getenv("REQUIRE_DB_TESTS") != "" {
+			t.Fatal("TEST_DATABASE_URL is not set, but CI or REQUIRE_DB_TESTS demands these run. " +
+				"A skipped integration suite reports ok having verified nothing.")
+		}
 		t.Skip("TEST_DATABASE_URL not set — skipping real-Postgres integration test")
 	}
 	pool, err := pgxpool.New(context.Background(), dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
+
+	requireNotSuperuser(t, pool)
 
 	// Fresh schema per test run. The outbox depends on nothing; the grants
 	// table must be dropped last only because the outbox references no tables.
@@ -90,7 +103,7 @@ const (
 // principal who is delegator in one row, delegate in another, and absent in a
 // third.
 const (
-	principalSelf = "33333333-3333-3333-3333-333333333333"
+	principalSelf  = "33333333-3333-3333-3333-333333333333"
 	principalOther = "44444444-4444-4444-4444-444444444444"
 	principalThird = "55555555-5555-5555-5555-555555555555"
 )
@@ -146,6 +159,33 @@ func outboxEvents(t *testing.T, pool *pgxpool.Pool, tenantID, delegationID strin
 	}
 	require.NoError(t, rows.Err())
 	return out
+}
+
+// requireNotSuperuser refuses to run the isolation assertions as a superuser.
+//
+// This suite claims to prove tenant isolation, and under a superuser connection
+// it proves nothing at all: Postgres exempts a superuser from row-level
+// security unconditionally, and FORCE ROW LEVEL SECURITY forces it for the
+// table OWNER — not for a superuser. So TestCrossTenantIsolation would pass
+// against a database that was not enforcing the thing under test, and would go
+// on passing if every policy were dropped.
+//
+// It passes for the right reason either way here, because pg_store.go carries
+// an explicit tenant_id predicate on every statement. That is exactly what
+// makes the hole dangerous: the belt holds, so nobody notices the braces are
+// not fastened, and the day someone writes a query that leans on the policy is
+// the day it is found in production.
+func requireNotSuperuser(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var isSuper bool
+	err := pool.QueryRow(context.Background(),
+		"SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&isSuper)
+	require.NoError(t, err, "checking whether the test role is a superuser")
+	require.False(t, isSuper,
+		"TEST_DATABASE_URL connects as a SUPERUSER, which bypasses row-level security "+
+			"unconditionally. The isolation tests in this file would pass with every RLS "+
+			"policy dropped. Point TEST_DATABASE_URL at a NOSUPERUSER NOBYPASSRLS role — "+
+			"zoiko_app is the production runtime role and the one to reproduce.")
 }
 
 func TestCreateDelegationWritesAndEnqueuesDelegated(t *testing.T) {
@@ -475,4 +515,137 @@ func TestRelayDrainsEachEventExactlyOnce(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
+}
+
+// expired_at must name the moment the AUTHORITY ended, not the moment this
+// service got around to noticing. They used to be the same column, so a grant
+// that lapsed on a Friday and was next swept on Monday asserted in evidence
+// that its authority ran all weekend.
+func TestExpireDueRecordsWhenAuthorityEndedNotWhenObserved(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool)
+	ctx := tenantCtx(testTenantA)
+
+	now := time.Now().UTC()
+	endedAt := now.Add(-72 * time.Hour)
+	g := grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa0201", "corr-0201", testEntityA, principalSelf, principalOther,
+		now.Add(-96*time.Hour), endedAt)
+	_, err := s.CreateDelegation(ctx, g)
+	require.NoError(t, err)
+
+	expired, err := s.ExpireDue(ctx)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	require.NotNil(t, expired[0].ExpiredAt)
+
+	require.WithinDuration(t, endedAt, *expired[0].ExpiredAt, time.Second,
+		"expired_at must equal effective_to — the authority ended when its window closed")
+	require.WithinDuration(t, now, expired[0].UpdatedAt, time.Minute,
+		"updated_at is the observation time, and keeps it")
+	require.True(t, expired[0].UpdatedAt.Sub(*expired[0].ExpiredAt) > 48*time.Hour,
+		"the two timestamps must be able to differ; conflating them is the defect")
+}
+
+// The background sweep crosses tenants. A tenant whose register nobody reads
+// previously expired nothing at all, so its delegates kept authority
+// indefinitely and authority.expired was never published for them.
+func TestExpireDueAllTenantsCrossesTenantBoundaries(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool)
+
+	now := time.Now().UTC()
+	from, to := now.Add(-48*time.Hour), now.Add(-24*time.Hour)
+
+	a := grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa0301", "corr-0301", testEntityA, principalSelf, principalOther, from, to)
+	_, err := s.CreateDelegation(tenantCtx(testTenantA), a)
+	require.NoError(t, err)
+
+	b := grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa0302", "corr-0302", testEntityB, principalSelf, principalOther, from, to)
+	_, err = s.CreateDelegation(tenantCtx(testTenantB), b)
+	require.NoError(t, err)
+
+	// No tenant installed: this is the background loop, which belongs to none.
+	expired, err := s.ExpireDueAllTenants(context.Background(), 100)
+	require.NoError(t, err)
+
+	ids := map[string]bool{}
+	for _, e := range expired {
+		ids[e.DelegationID] = true
+		require.Equal(t, domain.DelegationStatusExpired, e.Status)
+		require.NotNil(t, e.ExpiredAt)
+		require.WithinDuration(t, to, *e.ExpiredAt, time.Second)
+	}
+	require.True(t, ids[a.DelegationID], "tenant A's due grant must be expired by the background sweep")
+	require.True(t, ids[b.DelegationID], "tenant B's due grant must be expired without anyone reading tenant B")
+
+	// Each tenant's event lands under its OWN tenant_id: the sweep crosses
+	// tenants to find the rows, and must not blur them on the way out.
+	require.Equal(t, []string{"authority.delegated", "authority.expired"},
+		outboxEvents(t, pool, testTenantA, a.DelegationID))
+	require.Equal(t, []string{"authority.delegated", "authority.expired"},
+		outboxEvents(t, pool, testTenantB, b.DelegationID))
+}
+
+// The batch bound exists so a long-unswept register does not take one lock
+// across the whole table. The caller loops while a pass comes back full.
+func TestExpireDueAllTenantsRespectsBatchLimit(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool)
+	ctx := tenantCtx(testTenantA)
+
+	now := time.Now().UTC()
+	from, to := now.Add(-48*time.Hour), now.Add(-24*time.Hour)
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa04%02d", i)
+		g := grant(id, fmt.Sprintf("corr-04%02d", i), testEntityA, principalSelf, principalOther, from, to)
+		_, err := s.CreateDelegation(ctx, g)
+		require.NoError(t, err)
+	}
+
+	first, err := s.ExpireDueAllTenants(context.Background(), 2)
+	require.NoError(t, err)
+	require.Len(t, first, 2, "a pass must not exceed its batch limit")
+
+	rest, err := s.ExpireDueAllTenants(context.Background(), 100)
+	require.NoError(t, err)
+	require.Len(t, rest, 3, "the remainder is taken by the next pass")
+
+	empty, err := s.ExpireDueAllTenants(context.Background(), 100)
+	require.NoError(t, err)
+	require.Empty(t, empty, "expiry is observed once per grant, not once per pass")
+}
+
+// DueCount is what the backlog gauges read. It has to see across tenants for
+// the same reason the sweep does, and it must not count what it already swept.
+func TestDueCountSeesEveryTenantAndClearsAfterSweep(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool)
+
+	now := time.Now().UTC()
+	overdueBy := 36 * time.Hour
+	from, to := now.Add(-96*time.Hour), now.Add(-overdueBy)
+
+	_, err := s.CreateDelegation(tenantCtx(testTenantA),
+		grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa0501", "corr-0501", testEntityA, principalSelf, principalOther, from, to))
+	require.NoError(t, err)
+	_, err = s.CreateDelegation(tenantCtx(testTenantB),
+		grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa0502", "corr-0502", testEntityB, principalSelf, principalOther, from, to))
+	require.NoError(t, err)
+	// In window: must not be counted as due.
+	_, err = s.CreateDelegation(tenantCtx(testTenantA),
+		grant("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaa0503", "corr-0503", testEntityA, principalSelf, principalOther, now, now.Add(24*time.Hour)))
+	require.NoError(t, err)
+
+	due, oldest, err := s.DueCount(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, int64(2), due, "both tenants' overdue grants are counted; the in-window one is not")
+	require.InDelta(t, overdueBy.Seconds(), oldest.Seconds(), 120,
+		"oldest overdue is measured from effective_to")
+
+	_, err = s.ExpireDueAllTenants(context.Background(), 100)
+	require.NoError(t, err)
+
+	due, _, err = s.DueCount(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, due, "a swept register has no backlog")
 }

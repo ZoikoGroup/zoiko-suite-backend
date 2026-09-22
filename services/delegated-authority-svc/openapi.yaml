@@ -1,0 +1,535 @@
+openapi: 3.0.3
+
+# delegated-authority-svc — the register of who may act for whom.
+#
+# Doc 03 §9.3: "maintains time-bound, scope-bound, approval-bound delegated
+# authority chains", under one hard constraint — "delegated authority must
+# never exceed the delegator's own authority."
+#
+# Three things about this contract are not obvious from the paths alone, and
+# each of them is a refusal a client has to be able to tell apart:
+#
+#   1. THE CALLER IS THE DELEGATOR. Naming somebody else in
+#      delegator_principal_id needs DELEGATION_ADMINISTER on the entity. Without
+#      that separation, DELEGATION_CREATE alone is a privilege-escalation
+#      primitive: name a colleague as delegator, name yourself as delegate, and
+#      you have minted yourself their authority. Both of the checks that existed
+#      before still passed, because the invariant they enforce — a delegation
+#      must not exceed the delegator's authority — was never the one being
+#      violated.
+#
+#   2. AN ADMINISTRATOR MAY NOT BE THE BENEFICIARY. Even holding the administer
+#      grant, a delegation created for someone else may not name its creator as
+#      delegate. That is the same escalation by a longer route.
+#
+#   3. A READ IS SCOPED ONE OF TWO WAYS, never three. With legal_entity_id the
+#      caller needs DELEGATION_VIEW and sees that entity's register; without
+#      one, the answer is the delegations the caller is personally party to.
+#      Asking after another principal with no entity scope is 403, not an empty
+#      list — "you may not ask" and "there are none" are different answers and
+#      only one of them is reassuring.
+#
+# Expiry is NOT lazy. A background sweeper ends due delegations in every tenant
+# within EXPIRY_SWEEP_INTERVAL (30s by default) and publishes authority.expired
+# then; the read paths also sweep their own tenant so a register read never
+# shows a lapsed grant as ACTIVE. expired_at records when the authority ENDED
+# (its effective_to), not when the sweep noticed — see asyncapi.yaml.
+
+info:
+  title: delegated-authority-svc
+  version: "1.1.0"
+  description: |
+    Time-bound, scope-bound delegated authority chains.
+
+    Every route requires the canonical Service Input Contract headers
+    (ZS-ARCH-SVC-001 v2.0 §4). Enforcement is **write-strict** by default
+    (`ZS_ENVELOPE_ENFORCEMENT`): reads need a verified tenant and actor, writes
+    additionally need `X-Legal-Entity-Id` and `Idempotency-Key`.
+
+    Nothing in this register is ever deleted. `ACTIVE` goes to `REVOKED`
+    (explicitly) or `EXPIRED` (by time); both are terminal. The history is the
+    evidence of what authority was held and when, which is the point of the
+    register — Doc 04 §6.3, "access decisions are evidence and must not be
+    ephemeral".
+
+servers:
+  - url: http://delegated-authority-svc:8136
+    description: In-cluster
+  - url: http://localhost:8136
+    description: Local compose
+
+tags:
+  - name: delegations
+    description: The delegation register.
+  - name: operational
+    description: Probes and metrics. Not part of the tenant-facing contract.
+
+paths:
+  /v1/delegations/:
+    post:
+      tags: [delegations]
+      summary: Grant a delegation
+      description: |
+        Creates one delegated-authority chain.
+
+        Idempotent on `(tenant_id, correlation_id)`: a retried submission
+        resolves to the original grant and answers **200** rather than creating
+        a second one. A first creation answers **201**. Generate the correlation
+        id once per submission, never per attempt.
+
+        Before anything is written, authorization-svc is asked whether the
+        **delegator** holds the `action_type` being delegated on this entity.
+        That is a live call, never trusted from the request body, and this
+        service fails closed if authorization-svc cannot be reached.
+      operationId: createDelegation
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/SourceChannel'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDelegationRequest'
+      responses:
+        '201':
+          description: Delegation created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '200':
+          description: |
+            Replay. A grant with this `(tenant_id, correlation_id)` already
+            exists and is returned unchanged.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: |
+            `missing_fields`, `invalid_json`, `delegate_is_delegator` or
+            `invalid_time_window`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                delegate_is_delegator:
+                  value:
+                    error_code: delegate_is_delegator
+                    error_message: delegate_principal_id must differ from delegator_principal_id
+                invalid_time_window:
+                  value:
+                    error_code: invalid_time_window
+                    error_message: effective_to must be after effective_from
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            Three distinct refusals, and they need different remedies:
+
+            - `delegator_mismatch` — the caller named somebody else as delegator
+              without holding `DELEGATION_ADMINISTER` on this entity.
+            - `self_dealing` — an administrator routed another principal's
+              authority to themselves.
+            - `delegator_lacks_authority` — the delegator does not hold what is
+              being delegated. This is the §9.3 invariant.
+            - `forbidden` — the caller lacks `DELEGATION_CREATE`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                delegator_mismatch:
+                  value:
+                    error_code: delegator_mismatch
+                    error_message: caller may only delegate their own authority
+                self_dealing:
+                  value:
+                    error_code: self_dealing
+                    error_message: a delegation administered for another principal may not name the caller as delegate
+                delegator_lacks_authority:
+                  value:
+                    error_code: delegator_lacks_authority
+                    error_message: delegator does not hold the authority being delegated
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+    get:
+      tags: [delegations]
+      summary: Read the delegation register
+      description: |
+        Two scopes, and which one you get is decided by `legal_entity_id`:
+
+        - **with it** — every delegation on that entity. Requires
+          `DELEGATION_VIEW` on the entity.
+        - **without it** — only the delegations the caller is delegator or
+          delegate of. No authorization call; this is the caller's own
+          involvement and needs no grant.
+
+        There is no third mode. An unscoped read used to skip authorization
+        entirely and return the tenant's complete map of who may act for whom.
+      operationId: listDelegations
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - name: legal_entity_id
+          in: query
+          schema: { type: string }
+          description: Switches the read to entity scope. Requires `DELEGATION_VIEW`.
+        - name: delegator_principal_id
+          in: query
+          schema: { type: string }
+        - name: delegate_principal_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/DelegationStatus' }
+          description: |
+            An unrecognised value is **400 `unknown_status`**, never an empty
+            list. On a governance register "nobody holds any delegated
+            authority" and "you misspelled the filter" must not look identical.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: The register, in the scope described above.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DelegationGrant' }
+        '400':
+          description: '`unknown_status` or `invalid_paging`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: |
+            `forbidden` — either the caller lacks `DELEGATION_VIEW` on the named
+            entity, or the read named another principal with no entity scope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/delegations/{delegation_id}:
+    get:
+      tags: [delegations]
+      summary: Read one delegation
+      operationId: getDelegation
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/DelegationId'
+      responses:
+        '200':
+          description: The grant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '404':
+          description: |
+            `not_found`. A **malformed** id answers 404 too, not 503: the value
+            reaches Postgres as `22P02 invalid_text_representation`, and a
+            string that cannot name a row is exactly what 404 means. Reporting
+            it as an outage sent whoever was on call to look at a healthy
+            database.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/delegations/{delegation_id}/revoke:
+    post:
+      tags: [delegations]
+      summary: Revoke an ACTIVE delegation
+      description: |
+        Terminal. A revoked grant cannot be reinstated; issue a new one.
+
+        Requires `DELEGATION_REVOKE`. `authority.revoked` is written in the same
+        transaction as the status change and delivered by the outbox relay —
+        identity-context-svc ends the delegate's session on that event, so it is
+        the one event here that may not be best-effort.
+      operationId: revokeDelegation
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/LegalEntityId'
+        - $ref: '#/components/parameters/DelegationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Revoked. `revoked_by_principal_id` and `revoked_at` are set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationGrant' }
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          description: '`forbidden` — the caller lacks `DELEGATION_REVOKE`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `invalid_transition` — already `REVOKED` or `EXPIRED`. Not a fault
+            and not a refusal: a correct answer that the caller is late. A
+            rising rate of it means two operators are chasing the same
+            delegation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /healthz:
+    get:
+      tags: [operational]
+      summary: Liveness
+      description: Answers 200 whenever the process is up. Checks nothing, by design.
+      responses:
+        '200': { description: Process is up. }
+
+  /readyz:
+    get:
+      tags: [operational]
+      summary: Readiness
+      description: |
+        Pings Postgres **and** authorization-svc.
+
+        authorization-svc is a readiness dependency, not merely a runtime one:
+        every route here calls it before doing anything and this service fails
+        closed, so with it unreachable the pool can be perfectly healthy while
+        100% of requests answer 503. Readiness used to report ready throughout
+        exactly that outage.
+      responses:
+        '200': { description: Every dependency reachable. }
+        '503': { description: A named dependency is not. }
+
+  /metrics:
+    get:
+      tags: [operational]
+      summary: Prometheus exposition
+      responses:
+        '200': { description: Metrics in text exposition format. }
+
+components:
+  parameters:
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Verified tenant, from gateway-auth-svc. Absent is 401 `tenant_missing`.
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: |
+        Verified actor. Absent is 401 `identity_missing` — the request never
+        passed ForwardAuth verification.
+    LegalEntityId:
+      name: X-Legal-Entity-Id
+      in: header
+      required: true
+      schema: { type: string }
+      description: Required on writes (§4, INV-02).
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+      description: Required on writes by the envelope contract.
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      schema: { type: string }
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      schema: { type: string }
+    SourceChannel:
+      name: X-Source-Channel
+      in: header
+      required: false
+      schema: { type: string }
+    DelegationId:
+      name: delegation_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthenticated:
+      description: |
+        `tenant_missing` or `identity_missing`. Deliberately distinct: a
+        forgotten tenant header must not be reported as a missing principal,
+        because the two are fixed in different places.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: |
+        `authz_unavailable` or `store_unavailable`. Nothing was written — this
+        service fails closed rather than guessing a decision.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    DelegationStatus:
+      type: string
+      enum: [ACTIVE, REVOKED, EXPIRED]
+      description: |
+        A linear chain. `ACTIVE` → `REVOKED` (explicit) or `ACTIVE` → `EXPIRED`
+        (by time). Both terminal; nothing returns to `ACTIVE`.
+
+    CreateDelegationRequest:
+      type: object
+      required:
+        - legal_entity_id
+        - delegator_principal_id
+        - delegate_principal_id
+        - action_type
+        - effective_from
+        - effective_to
+        - correlation_id
+      properties:
+        legal_entity_id:
+          type: string
+          description: The entity this delegation is scoped to.
+        delegator_principal_id:
+          type: string
+          description: |
+            Whose authority is being delegated. Must be the caller unless the
+            caller holds `DELEGATION_ADMINISTER` on this entity.
+        delegate_principal_id:
+          type: string
+          description: Who receives it. Must differ from the delegator.
+        action_type:
+          type: string
+          description: |
+            The single action being delegated. Checked against the delegator's
+            own grants at creation time.
+          example: INVOICE_APPROVE
+        effective_from: { type: string, format: date-time }
+        effective_to:
+          type: string
+          format: date-time
+          description: |
+            Must be strictly after `effective_from`. Also the moment the
+            authority ends, which is what `expired_at` is set to when the grant
+            lapses.
+        correlation_id:
+          type: string
+          description: Idempotency key for `(tenant_id, correlation_id)`.
+
+    DelegationGrant:
+      type: object
+      required:
+        - delegation_id
+        - tenant_id
+        - legal_entity_id
+        - delegator_principal_id
+        - delegate_principal_id
+        - action_type
+        - effective_from
+        - effective_to
+        - status
+        - created_by_principal_id
+        - correlation_id
+        - created_at
+        - updated_at
+      properties:
+        delegation_id: { type: string, format: uuid }
+        tenant_id: { type: string }
+        legal_entity_id: { type: string }
+        delegator_principal_id: { type: string }
+        delegate_principal_id: { type: string }
+        action_type: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+        status: { $ref: '#/components/schemas/DelegationStatus' }
+        created_by_principal_id:
+          type: string
+          description: |
+            The caller that created the grant. Differs from
+            `delegator_principal_id` exactly when an administrator created it
+            for somebody else.
+        correlation_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at:
+          type: string
+          format: date-time
+          description: |
+            When this row last changed — which for an expiry is when the sweep
+            observed it, not when the authority ended. See `expired_at`.
+        revoked_by_principal_id:
+          type: string
+          nullable: true
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        expired_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            When the authority ENDED. Equal to `effective_to`, not to the moment
+            the sweep ran — those are different facts and this column holds the
+            first. It previously held the second, so a grant that lapsed on a
+            Friday and was next swept on Monday asserted in evidence that its
+            authority ran all weekend.
+
+    Error:
+      type: object
+      required: [error_code, error_message]
+      properties:
+        error_code:
+          type: string
+          description: |
+            Stable, machine-readable. Clients branch on this, never on the
+            message.
+          enum:
+            - missing_fields
+            - invalid_json
+            - delegate_is_delegator
+            - invalid_time_window
+            - unknown_status
+            - invalid_paging
+            - tenant_missing
+            - identity_missing
+            - forbidden
+            - delegator_mismatch
+            - self_dealing
+            - delegator_lacks_authority
+            - not_found
+            - invalid_transition
+            - authz_unavailable
+            - store_unavailable
+        error_message:
+          type: string
+          description: Human-readable. Wording may change; the code may not.

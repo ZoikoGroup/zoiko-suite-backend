@@ -155,10 +155,30 @@ type Domain struct {
 	// "unavailable" is kept apart from "denied" because the two need opposite
 	// responses: one is a permissions problem, the other a dependency outage.
 	AuthZDecisions *prometheus.CounterVec
-	// Expiries counts grants the lazy sweep flipped to EXPIRED. Expiry is
-	// observed on read here, so this is also the only signal that reads are
-	// happening often enough for the register to be current.
+	// Expiries counts grants flipped to EXPIRED, by either sweep path.
 	Expiries prometheus.Counter
+	// ExpiryLatenessSeconds is how long each expired grant outlived its own
+	// effective_to before the sweep ended it.
+	//
+	// This is the one number that says whether expiry is working, and none of
+	// the others can substitute. A service expiring plenty of grants, every one
+	// of them hours late, is busy by every other measure and healthy by none:
+	// each of those hours is a delegate still holding authority the register
+	// says has lapsed. On a healthy service this is bounded by the sweeper's
+	// poll interval.
+	ExpiryLatenessSeconds prometheus.Histogram
+	// ExpiryDuePending is how many ACTIVE grants are currently past their
+	// window across every tenant — the sweep's backlog.
+	ExpiryDuePending prometheus.Gauge
+	// ExpiryOldestOverdueSeconds is how overdue the oldest unexpired grant is.
+	// Depth alone cannot tell a tick that caught a burst from a sweeper that
+	// has stopped making progress.
+	ExpiryOldestOverdueSeconds prometheus.Gauge
+	// ExpirySweepFailures counts background sweep passes that failed. Distinct
+	// from the read-path sweep, whose errors are logged and swallowed so they
+	// cannot fail the read they piggyback on — which means this counter is the
+	// only place a persistently failing sweep becomes visible.
+	ExpirySweepFailures prometheus.Counter
 	// OutboxPending is the depth of the unpublished event backlog.
 	OutboxPending prometheus.Gauge
 	// OutboxPublished counts events the relay handed to Kafka.
@@ -260,7 +280,34 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 		}, []string{"action", "outcome"}),
 		Expiries: prometheus.NewCounter(prometheus.CounterOpts{
 			Name:        "delegated_authority_expiries_total",
-			Help:        "Delegations flipped to EXPIRED by the lazy sweep.",
+			Help:        "Delegations flipped to EXPIRED, by either sweep path.",
+			ConstLabels: labels,
+		}),
+		ExpiryLatenessSeconds: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "delegated_authority_expiry_lateness_seconds",
+			Help: "How long a delegation outlived its effective_to before being expired.",
+			// Buckets chosen around the failure this metric exists to catch.
+			// The sweeper polls every 30s, so anything up to ~60s is the
+			// mechanism working. The interesting resolution is above that, and
+			// it runs to a day because the defect being fixed here -- expiry
+			// waiting for somebody to read the register -- produced lateness
+			// measured in weekends, not seconds.
+			Buckets:     []float64{1, 5, 15, 30, 60, 300, 900, 3600, 21600, 86400},
+			ConstLabels: labels,
+		}),
+		ExpiryDuePending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "delegated_authority_expiry_due_pending",
+			Help:        "ACTIVE delegations currently past their effective_to, across all tenants.",
+			ConstLabels: labels,
+		}),
+		ExpiryOldestOverdueSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name:        "delegated_authority_expiry_oldest_overdue_seconds",
+			Help:        "Age of the most overdue unexpired delegation.",
+			ConstLabels: labels,
+		}),
+		ExpirySweepFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name:        "delegated_authority_expiry_sweep_failures_total",
+			Help:        "Background expiry sweep passes that failed.",
 			ConstLabels: labels,
 		}),
 		OutboxPending: prometheus.NewGauge(prometheus.GaugeOpts{
@@ -286,6 +333,8 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 	}
 	reg.MustRegister(
 		d.Grants, d.Revocations, d.RegisterReads, d.AuthZDecisions, d.Expiries,
+		d.ExpiryLatenessSeconds, d.ExpiryDuePending, d.ExpiryOldestOverdueSeconds,
+		d.ExpirySweepFailures,
 		d.OutboxPending, d.OutboxPublished, d.OutboxFailures, d.OutboxOldestAgeSeconds,
 	)
 

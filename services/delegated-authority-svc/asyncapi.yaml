@@ -1,0 +1,238 @@
+asyncapi: 2.6.0
+
+# The three lifecycle events of Doc 03 §9.3, all on one topic.
+#
+# WHAT A CONSUMER MUST KNOW, AND WOULD NOT GUESS
+#
+# 1. EVERY EVENT GOES THROUGH THE TRANSACTIONAL OUTBOX. It is written in the
+#    same transaction as the state change and delivered afterwards by a relay.
+#    A grant that exists always has its event; an event that exists always has
+#    its grant. Delivery is retried, so a consumer must be idempotent —
+#    at-least-once, not exactly-once.
+#
+# 2. THE ENVELOPE IS BUILT AT STATE-CHANGE TIME, NOT AT PUBLISH TIME. actor_id
+#    and correlation_id describe the request that caused the change, and by the
+#    time the relay runs that request is gone. This is why emitted_at can
+#    precede the moment the message appears on the topic.
+#
+# 3. authority.expired HAS NO actor_id, deliberately. Nobody expires a
+#    delegation — its window closes. Naming a principal would attribute an act
+#    to someone who did not perform one, on a register whose whole purpose is
+#    recording who did what. A consumer must not treat the empty actor as a
+#    defect or a missing field.
+#
+# 4. MESSAGES ARE KEYED BY delegation_id. Every event about one grant lands on
+#    one partition, so a consumer always sees delegated before revoked for the
+#    same delegation. There is NO such ordering guarantee between delegations,
+#    and none across tenants.
+
+info:
+  title: delegated-authority-svc events
+  version: "1.1.0"
+  description: |
+    Lifecycle events for the delegated-authority register.
+
+    `authority.revoked` is the one that carries operational weight:
+    identity-context-svc ends the delegate's session on it. That is why it goes
+    through the outbox rather than a post-commit publish — a broker hiccup
+    during a revocation used to leave the register correctly showing REVOKED,
+    the operator correctly told it succeeded, and the delegate still holding a
+    live session, with nothing anywhere reporting a fault.
+
+defaultContentType: application/json
+
+servers:
+  kafka:
+    url: kafka:9092
+    protocol: kafka
+    description: Estate event backbone.
+
+channels:
+  zoiko.delegated-authority.events:
+    description: |
+      All three lifecycle events. Configured by `KAFKA_EVENTS_TOPIC`; consumers
+      that read delegation state (notably identity-context-svc) bind to it via
+      `KAFKA_DELEGATION_TOPIC`.
+    subscribe:
+      summary: Delegation lifecycle
+      operationId: consumeDelegationEvents
+      message:
+        oneOf:
+          - $ref: '#/components/messages/AuthorityDelegated'
+          - $ref: '#/components/messages/AuthorityRevoked'
+          - $ref: '#/components/messages/AuthorityExpired'
+
+components:
+  messages:
+    AuthorityDelegated:
+      name: authority.delegated
+      title: A delegation was granted
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: authority.delegated }
+              actor_id:
+                type: string
+                description: The principal that created the grant.
+              payload: { $ref: '#/components/schemas/DelegatedPayload' }
+
+    AuthorityRevoked:
+      name: authority.revoked
+      title: A delegation was revoked
+      description: |
+        **Session-invalidation signal.** identity-context-svc ends the
+        delegate's session on this event. Treat a gap in delivery as a security
+        issue, not a data-freshness one: until it arrives, a delegate whose
+        authority has been withdrawn is still holding it.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: authority.revoked }
+              actor_id:
+                type: string
+                description: The principal that performed the revocation.
+              payload: { $ref: '#/components/schemas/RevokedPayload' }
+
+    AuthorityExpired:
+      name: authority.expired
+      title: A delegation reached the end of its window
+      description: |
+        Published by the background expiry sweeper, which runs across every
+        tenant every `EXPIRY_SWEEP_INTERVAL` (30s by default), and by the
+        read-path sweep when a register read observes a lapse first. Either way
+        it is published exactly once per grant, inside the transaction that
+        flips the row.
+
+        The publication may therefore be later than `payload.effective_to` by up
+        to one sweep interval — the event says the authority HAS ended, not that
+        it ended at `emitted_at`. A consumer computing how long an authority
+        lasted must read `effective_to`, never the envelope timestamp.
+
+        **No `actor_id`.** See the note at the top of this file.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type: { const: authority.expired }
+              actor_id:
+                type: string
+                description: |
+                  Always absent. A lapse has no actor; the field is omitted
+                  rather than filled with whoever observed it.
+              payload: { $ref: '#/components/schemas/ExpiredPayload' }
+
+  schemas:
+    Envelope:
+      type: object
+      required:
+        - event_id
+        - event_type
+        - event_version
+        - emitted_at
+        - schema_version
+        - source_service
+        - correlation_id
+        - payload
+      properties:
+        event_id:
+          type: string
+          description: |
+            A fresh UUID per publish, prefixed `evt-`. Deliberately not derived
+            from the delegation, so a redelivery is distinguishable from a
+            second event about the same grant.
+          example: evt-2f8c1f22-0b1e-4a43-9a2f-3d4c6e7a8b90
+        event_type:
+          type: string
+          enum: [authority.delegated, authority.revoked, authority.expired]
+        event_version: { type: string, example: "1.0" }
+        emitted_at:
+          type: string
+          format: date-time
+          description: |
+            When the envelope was BUILT — inside the state-change transaction —
+            not when the relay put it on the topic.
+        schema_version: { type: string, example: "1.0" }
+        source_service: { type: string, const: delegated-authority-svc }
+        tenant_id:
+          type: string
+          description: |
+            The owning tenant. Always present on events from this service; the
+            transition that produces them cannot occur without a tenant-scoped
+            row.
+        legal_entity_id: { type: string }
+        actor_id:
+          type: string
+          description: |
+            Who performed the act. Omitted on `authority.expired`, where there
+            is none.
+        correlation_id:
+          type: string
+          description: From the request that caused the change.
+        payload:
+          type: object
+          description: Per-event; see below.
+
+    DelegatedPayload:
+      type: object
+      required:
+        - delegation_id
+        - legal_entity_id
+        - delegator_principal_id
+        - delegate_principal_id
+        - action_type
+        - effective_from
+        - effective_to
+      properties:
+        delegation_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        delegator_principal_id: { type: string }
+        delegate_principal_id: { type: string }
+        action_type: { type: string }
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time }
+
+    RevokedPayload:
+      type: object
+      required:
+        - delegation_id
+        - legal_entity_id
+        - delegator_principal_id
+        - delegate_principal_id
+        - action_type
+      properties:
+        delegation_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        delegator_principal_id: { type: string }
+        delegate_principal_id: { type: string }
+        action_type: { type: string }
+
+    ExpiredPayload:
+      type: object
+      required:
+        - delegation_id
+        - legal_entity_id
+        - delegator_principal_id
+        - delegate_principal_id
+        - action_type
+        - effective_to
+      properties:
+        delegation_id: { type: string, format: uuid }
+        legal_entity_id: { type: string }
+        delegator_principal_id: { type: string }
+        delegate_principal_id: { type: string }
+        action_type: { type: string }
+        effective_to:
+          type: string
+          format: date-time
+          description: |
+            When the authority ended — the authoritative timestamp for this
+            event. The row's `expired_at` is set to this same value, not to the
+            moment the sweep ran.

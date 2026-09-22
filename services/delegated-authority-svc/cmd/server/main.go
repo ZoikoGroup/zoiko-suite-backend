@@ -28,6 +28,7 @@ import (
 	"zoiko.io/delegated-authority-svc/internal/domain"
 	svcenvelope "zoiko.io/delegated-authority-svc/internal/envelope"
 	"zoiko.io/delegated-authority-svc/internal/events"
+	"zoiko.io/delegated-authority-svc/internal/expiry"
 	"zoiko.io/delegated-authority-svc/internal/handler"
 	"zoiko.io/delegated-authority-svc/internal/health"
 	svcmiddleware "zoiko.io/delegated-authority-svc/internal/middleware"
@@ -362,6 +363,23 @@ func main() {
 		relay.Run(relayCtx)
 	}()
 
+	// ── 4c. Expiry sweeper ────────────────────────────────────────────────────
+	//
+	// Ends delegations whose window has closed, in every tenant, without
+	// waiting for somebody to read the register. The read paths still sweep
+	// their own tenant so a register read never shows a lapsed grant as ACTIVE;
+	// this loop is what makes authority.expired timely and its coverage
+	// complete. Started alongside the relay so the events it enqueues are
+	// drained by a relay that is already running.
+	sweeperCtx, sweeperCancel := context.WithCancel(context.Background())
+	defer sweeperCancel()
+	sweeper := expiry.New(pgStore, domainMetrics, log).WithInterval(cfg.ExpirySweepInterval)
+	sweeperDone := make(chan struct{})
+	go func() {
+		defer close(sweeperDone)
+		sweeper.Run(sweeperCtx)
+	}()
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -441,6 +459,20 @@ func main() {
 	// handful of authority.revoked rows sitting until the next process starts.
 	// They would not be lost — that is what the outbox is for — but a revocation
 	// should not wait on a deployment.
+	// Stop the sweeper BEFORE the relay, and wait for it.
+	//
+	// Same ordering argument one link further down the chain: a sweep pass that
+	// is mid-flight is committing authority.expired rows, and stopping the
+	// relay first would leave exactly those sitting until the next process
+	// starts. Stopping the producer before its consumer means the relay's own
+	// shutdown below drains whatever the last pass produced.
+	sweeperCancel()
+	select {
+	case <-sweeperDone:
+	case <-time.After(10 * time.Second):
+		log.Warn("expiry sweeper did not stop within 10s; due delegations remain ACTIVE and will be expired at next start")
+	}
+
 	relayCancel()
 	select {
 	case <-relayDone:

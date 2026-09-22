@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -65,6 +66,24 @@ const delegationColumns = `
 	action_type, effective_from, effective_to, status, created_by_principal_id, correlation_id,
 	created_at, updated_at, revoked_by_principal_id, revoked_at, expired_at
 `
+
+// prefixedDelegationColumns qualifies every column with a table alias.
+//
+// Needed by the cross-tenant sweep, whose UPDATE ... FROM puts two relations in
+// scope: the target table and the CTE naming the batch. delegation_id exists in
+// both, so the bare list is ambiguous and Postgres refuses the statement. Built
+// from the same constant rather than written out a second time, so a column
+// added to one list cannot go missing from the other -- scanDelegation reads
+// positionally and a divergence would be a silent field-shift, not an error.
+func prefixedDelegationColumns(alias string) string {
+	cols := strings.FieldsFunc(delegationColumns, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\t' || r == ' '
+	})
+	for i, c := range cols {
+		cols[i] = alias + "." + c
+	}
+	return strings.Join(cols, ", ")
+}
 
 func scanDelegation(row pgx.Row, d *domain.DelegationGrant) error {
 	var status string
@@ -133,9 +152,20 @@ func (s *PgStore) ExpireDue(ctx context.Context) ([]domain.DelegationGrant, erro
 	var out []domain.DelegationGrant
 	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
 		now := time.Now().UTC()
+		// expired_at = effective_to, not now().
+		//
+		// They are different facts. effective_to is when the authority ended,
+		// which is a property of the grant and was knowable the moment it was
+		// written. now() is when this service got around to looking. Writing
+		// the second into a column named for the first misdates the end of an
+		// authority by however long the gap was -- a weekend, for a grant that
+		// lapsed on Friday and was next read on Monday -- and Doc 04 §6.3
+		// requires these records to stand as evidence. updated_at keeps now(),
+		// so "when did it end" and "when did we notice" are both recorded and
+		// are no longer the same column.
 		rows, err := tx.Query(ctx, `
 			UPDATE delegation_grants
-			SET status = 'EXPIRED', expired_at = $1, updated_at = $1
+			SET status = 'EXPIRED', expired_at = effective_to, updated_at = $1
 			WHERE tenant_id = $2 AND status = 'ACTIVE' AND effective_to < $1
 			RETURNING `+delegationColumns, now, tenantID)
 		if err != nil {
@@ -350,6 +380,131 @@ type OutboxRecord struct {
 // letting it run unscoped — which under FORCE ROW LEVEL SECURITY would simply
 // see nothing — it names itself, so the policy admits it by an explicit,
 // auditable disjunct rather than by the absence of a control.
+// withSweeper runs fn with the cross-tenant expiry exemption installed.
+//
+// The same shape as withRelay and for the same reason: expiry is not a request
+// and belongs to no one tenant. A grant lapses because its window closed, which
+// happens whether or not anybody is looking, so the loop that records it cannot
+// be scoped to the tenant that happens to be making a request. Admitted by
+// migration 000004's named capability rather than by connecting as a role that
+// bypasses RLS -- one documented exemption instead of unlimited reach.
+func (s *PgStore) withSweeper(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin sweeper transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.expiry_sweeper', 'true', true)"); err != nil {
+		return fmt.Errorf("set sweeper context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit sweeper transaction: %w", err)
+	}
+	return nil
+}
+
+// ExpireDueAllTenants flips every due delegation in every tenant and enqueues
+// authority.expired for each, in one transaction.
+//
+// This is the authoritative expiry path. ExpireDue still runs on the read paths
+// so a register read never shows a grant as ACTIVE past its window, but it can
+// only see the tenant making the request -- a tenant whose register nobody
+// opens would otherwise never expire anything, and its delegates would keep
+// authority indefinitely with no authority.expired ever published.
+//
+// limit bounds one pass. A register that has been unswept for a long time, or
+// one restored from backup, can have a large due backlog, and taking it in one
+// statement would hold a write lock across the whole table. The caller loops
+// while the count comes back full.
+func (s *PgStore) ExpireDueAllTenants(ctx context.Context, limit int) ([]domain.DelegationGrant, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	var out []domain.DelegationGrant
+	err := s.withSweeper(ctx, func(tx pgx.Tx) error {
+		now := time.Now().UTC()
+		// The CTE picks the batch with FOR UPDATE SKIP LOCKED so a second
+		// replica sweeping concurrently steps over these rows rather than
+		// blocking behind them. Without it, two instances would serialise on
+		// the same batch and one would do no work while holding a transaction
+		// open for the other's duration.
+		rows, err := tx.Query(ctx, `
+			WITH due AS (
+				SELECT delegation_id
+				  FROM delegation_grants
+				 WHERE status = 'ACTIVE' AND effective_to < $1
+				 ORDER BY effective_to
+				 LIMIT $2
+				 FOR UPDATE SKIP LOCKED
+			)
+			UPDATE delegation_grants g
+			   SET status = 'EXPIRED', expired_at = g.effective_to, updated_at = $1
+			  FROM due
+			 WHERE g.delegation_id = due.delegation_id
+			RETURNING `+prefixedDelegationColumns("g"), now, limit)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var d domain.DelegationGrant
+			if err := scanDelegation(rows, &d); err != nil {
+				rows.Close()
+				return err
+			}
+			out = append(out, d)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		// Same transaction as the flip, same reasoning as ExpireDue: the flip
+		// happens exactly once, so an event published separately and lost could
+		// never be regenerated -- the next pass finds no ACTIVE row left.
+		for _, d := range out {
+			if err := enqueue(ctx, tx, events.EventExpired, d); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// DueCount reports how many ACTIVE grants are past their window across every
+// tenant, and how overdue the oldest of them is.
+//
+// Separate from the sweep so the numbers are reported even on a pass where the
+// sweep itself failed -- which is exactly the pass where a growing backlog is
+// the thing worth seeing. Same split, and the same reason, as the relay's
+// observeDepth.
+func (s *PgStore) DueCount(ctx context.Context) (due int64, oldestOverdue time.Duration, err error) {
+	err = s.withSweeper(ctx, func(tx pgx.Tx) error {
+		var oldest *time.Time
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*), min(effective_to)
+			  FROM delegation_grants
+			 WHERE status = 'ACTIVE' AND effective_to < now()
+		`).Scan(&due, &oldest); err != nil {
+			return err
+		}
+		if oldest != nil {
+			oldestOverdue = time.Since(*oldest)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return due, oldestOverdue, nil
+}
+
 func (s *PgStore) withRelay(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
