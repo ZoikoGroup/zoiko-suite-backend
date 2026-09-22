@@ -40,6 +40,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS evidence_reliability_assessments;
 		DROP TABLE IF EXISTS evidence_versions;
 		DROP TABLE IF EXISTS audit_evidence;
+		DROP TABLE IF EXISTS document_links;
 		DROP TABLE IF EXISTS document_access_log;
 		DROP TABLE IF EXISTS document_versions;
 		DROP TABLE IF EXISTS documents;
@@ -390,6 +391,59 @@ func TestPgStore_GetAsOfDocument_ReconstructsVersionLineage(t *testing.T) {
 
 	_, _, err = s.GetAsOfDocument(tenantCtx(), doc.DocumentID, midpoint.Add(-1*time.Hour))
 	require.ErrorIs(t, err, domain.ErrDocumentVersionNotFound, "expected no version to exist before the document was even created")
+}
+
+// TestPgStore_LinkDocument_Succeeds_ThenRejectsDuplicate is the real
+// proof of GetLinkedObjects' data source: a link is recorded, retrievable,
+// and — the negative control — the DB's own unique constraint refuses a
+// duplicate link for the same (document, object) pair.
+func TestPgStore_LinkDocument_Succeeds_ThenRejectsDuplicate(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "link")
+
+	link, err := s.LinkDocument(tenantCtx(), domain.LinkDocumentParams{
+		DocumentID: doc.DocumentID, LinkedObjectType: "EXPENSE_CLAIM", LinkedObjectID: "claim-123",
+		LinkedByPrincipalID: "linker-1", CorrelationID: "corr-link-1",
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, link.LinkID)
+	require.Equal(t, "EXPENSE_CLAIM", link.LinkedObjectType)
+	require.Equal(t, "claim-123", link.LinkedObjectID)
+
+	_, err = s.LinkDocument(tenantCtx(), domain.LinkDocumentParams{
+		DocumentID: doc.DocumentID, LinkedObjectType: "EXPENSE_CLAIM", LinkedObjectID: "claim-123",
+		LinkedByPrincipalID: "linker-2",
+	})
+	require.ErrorIs(t, err, domain.ErrDuplicateLink)
+
+	// A different object type/ID for the SAME document is a genuinely
+	// different link and must succeed.
+	second, err := s.LinkDocument(tenantCtx(), domain.LinkDocumentParams{
+		DocumentID: doc.DocumentID, LinkedObjectType: "WORKFLOW_INSTANCE", LinkedObjectID: "wf-456",
+		LinkedByPrincipalID: "linker-1",
+	})
+	require.NoError(t, err)
+
+	links, err := s.ListDocumentLinks(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	require.Len(t, links, 2)
+
+	// Negative control at the DB layer: links are append-only.
+	_, err = pool.Exec(tenantCtx(), `UPDATE document_links SET linked_object_id = 'tampered' WHERE link_id = $1`, second.LinkID)
+	require.Error(t, err, "expected the trigger to refuse updating an existing link")
+	_, err = pool.Exec(tenantCtx(), `DELETE FROM document_links WHERE link_id = $1`, second.LinkID)
+	require.Error(t, err, "expected the trigger to refuse deleting an existing link")
+}
+
+func TestPgStore_LinkDocument_UnknownDocument_ReturnsNotFound(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	_, err := s.LinkDocument(tenantCtx(), domain.LinkDocumentParams{
+		DocumentID: "00000000-0000-0000-0000-000000000000", LinkedObjectType: "EXPENSE_CLAIM", LinkedObjectID: "claim-1",
+		LinkedByPrincipalID: "linker-1",
+	})
+	require.ErrorIs(t, err, domain.ErrDocumentNotFound)
 }
 
 func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {

@@ -31,6 +31,8 @@ type Store interface {
 	MoveToArchive(ctx context.Context, p domain.MoveToArchiveParams, correlationID string) (*domain.Document, error)
 	RequestDisposition(ctx context.Context, p domain.RequestDispositionParams, correlationID string) (*domain.Document, error)
 	GetAsOfDocument(ctx context.Context, documentID string, asOf time.Time) (*domain.Document, *domain.DocumentVersion, error)
+	LinkDocument(ctx context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error)
+	ListDocumentLinks(ctx context.Context, documentID string) ([]domain.DocumentLink, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
@@ -81,6 +83,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{documentID}/request-disposition", h.RequestDisposition)
 		r.Get("/{documentID}/verify-digest", h.VerifyDigest)
 		r.Get("/{documentID}/as-of", h.GetAsOfDocument)
+		r.Post("/{documentID}/links", h.LinkDocument)
+		r.Get("/{documentID}/links", h.GetLinkedObjects)
 	})
 }
 
@@ -484,6 +488,87 @@ func (h *Handler) GetAsOfDocument(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, asOfDocumentResponse{Document: *asOfDoc, Version: *asOfVersion})
 }
 
+// ── POST /v1/documents/{documentID}/links ────────────────────────────────────
+
+type linkDocumentRequest struct {
+	LinkedObjectType string `json:"linked_object_type"`
+	LinkedObjectID   string `json:"linked_object_id"`
+}
+
+// LinkDocument records a link to another business object — see
+// domain.DocumentLink's own doc comment. The caller (whatever service
+// attached this document to something) invokes this explicitly; nothing
+// here infers a link on its own.
+func (h *Handler) LinkDocument(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req linkDocumentRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LinkedObjectType == "" || req.LinkedObjectID == "" {
+		writeError(w, http.StatusBadRequest, "missing_field", "linked_object_type and linked_object_id are required")
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentLink) {
+		return
+	}
+
+	link, err := h.store.LinkDocument(r.Context(), domain.LinkDocumentParams{
+		DocumentID: documentID, LinkedObjectType: req.LinkedObjectType, LinkedObjectID: req.LinkedObjectID,
+		LinkedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, link)
+}
+
+// ── GET /v1/documents/{documentID}/links ─────────────────────────────────────
+
+// GetLinkedObjects handles the doc's own GetLinkedObjects query — every
+// business object this document has ever been linked to.
+func (h *Handler) GetLinkedObjects(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	links, err := h.store.ListDocumentLinks(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if links == nil {
+		links = []domain.DocumentLink{}
+	}
+	writeJSON(w, http.StatusOK, links)
+}
+
 // ── GET /v1/documents ────────────────────────────────────────────────────────
 
 // ListDocuments is the tenant's register for one legal entity.
@@ -768,6 +853,8 @@ func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "not_archivable", err.Error())
 	case errors.Is(err, domain.ErrDispositionAlreadyRequested):
 		writeError(w, http.StatusConflict, "disposition_already_requested", err.Error())
+	case errors.Is(err, domain.ErrDuplicateLink):
+		writeError(w, http.StatusConflict, "duplicate_link", err.Error())
 	default:
 		h.log.Error("store error", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")

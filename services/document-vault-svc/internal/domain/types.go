@@ -217,6 +217,30 @@ type DigestVerification struct {
 	Verified       bool   `json:"verified"`
 }
 
+// DocumentLink is one append-only row answering BIZ-01's GetLinkedObjects
+// query — see migration 000007's own doc comment. LinkedObjectType/
+// LinkedObjectID are opaque, caller-supplied identifiers for a business
+// object this service has no schema access to (e.g. "EXPENSE_CLAIM" /
+// the expense claim's own ID in expense-claim-svc).
+type DocumentLink struct {
+	LinkID              string    `json:"link_id"`
+	DocumentID          string    `json:"document_id"`
+	LinkedObjectType    string    `json:"linked_object_type"`
+	LinkedObjectID      string    `json:"linked_object_id"`
+	LinkedByPrincipalID string    `json:"linked_by_principal_id"`
+	CorrelationID       *string   `json:"correlation_id,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+// LinkDocumentParams is LinkDocument's input.
+type LinkDocumentParams struct {
+	DocumentID          string
+	LinkedObjectType    string
+	LinkedObjectID      string
+	LinkedByPrincipalID string
+	CorrelationID       string
+}
+
 // ---------------------------------------------------------------------------
 // Sentinel errors
 // ---------------------------------------------------------------------------
@@ -275,6 +299,9 @@ var (
 	// ErrDispositionAlreadyRequested backs RequestDisposition — see
 	// CanRequestDisposition.
 	ErrDispositionAlreadyRequested = errors.New("a disposition request already exists for this document")
+	// ErrDuplicateLink backs LinkDocument — the same document already
+	// linked to the same object is a caller bug, not a new fact.
+	ErrDuplicateLink = errors.New("this document is already linked to that object")
 
 	// ErrInvalidPaging is returned for an out-of-range limit or offset.
 	ErrInvalidPaging = errors.New("limit must be between 1 and 500 and offset must not be negative")

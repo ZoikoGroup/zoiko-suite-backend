@@ -60,6 +60,10 @@ const (
 	// Wave 3's MoveToArchive/RequestDisposition.
 	ActionDocumentArchive            = "DOCUMENT_ARCHIVE"
 	ActionDocumentRequestDisposition = "DOCUMENT_REQUEST_DISPOSITION"
+	// ActionDocumentLink gates LinkDocument — reading links back is
+	// covered by the existing ActionDocumentRead, same as any other
+	// metadata about a document.
+	ActionDocumentLink = "DOCUMENT_LINK"
 )
 
 // Client is the interface the handler depends on, so tests can substitute a

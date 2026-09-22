@@ -30,7 +30,9 @@ type stubStore struct {
 	docs      map[string]*domain.Document
 	versions  map[string][]domain.DocumentVersion
 	accessLog []domain.DocumentAccessLog
+	links     map[string][]domain.DocumentLink
 	seq       int
+	linkSeq   int
 	createErr error
 	findErr   error
 	recordErr error
@@ -166,6 +168,35 @@ func (s *stubStore) GetAsOfDocument(_ context.Context, documentID string, asOf t
 		return nil, nil, domain.ErrDocumentVersionNotFound
 	}
 	return doc, found, nil
+}
+
+func (s *stubStore) LinkDocument(_ context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error) {
+	if _, ok := s.docs[p.DocumentID]; !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	for _, l := range s.links[p.DocumentID] {
+		if l.LinkedObjectType == p.LinkedObjectType && l.LinkedObjectID == p.LinkedObjectID {
+			return nil, domain.ErrDuplicateLink
+		}
+	}
+	s.linkSeq++
+	link := domain.DocumentLink{
+		LinkID: fmt.Sprintf("link-%d", s.linkSeq), DocumentID: p.DocumentID,
+		LinkedObjectType: p.LinkedObjectType, LinkedObjectID: p.LinkedObjectID,
+		LinkedByPrincipalID: p.LinkedByPrincipalID, CreatedAt: time.Now().UTC(),
+	}
+	if s.links == nil {
+		s.links = map[string][]domain.DocumentLink{}
+	}
+	s.links[p.DocumentID] = append(s.links[p.DocumentID], link)
+	return &link, nil
+}
+
+func (s *stubStore) ListDocumentLinks(_ context.Context, documentID string) ([]domain.DocumentLink, error) {
+	if _, ok := s.docs[documentID]; !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	return s.links[documentID], nil
 }
 
 func (s *stubStore) FindDocumentByID(_ context.Context, documentID string) (*domain.Document, error) {
@@ -736,4 +767,88 @@ func TestGetAsOfDocument_Valid_Returns200(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	assert.Equal(t, "doc-1", got.Document.DocumentID)
 	assert.Equal(t, 1, got.Version.Version)
+}
+
+// ── LinkDocument / GetLinkedObjects ──────────────────────────────────────────
+
+func linkBody(t *testing.T, objectType, objectID string) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]string{"linked_object_type": objectType, "linked_object_id": objectID})
+	require.NoError(t, err)
+	return body
+}
+
+func TestLinkDocument_Valid_Returns201(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/links", bytes.NewReader(linkBody(t, "EXPENSE_CLAIM", "claim-1")))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var got domain.DocumentLink
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "EXPENSE_CLAIM", got.LinkedObjectType)
+	assert.Equal(t, "claim-1", got.LinkedObjectID)
+}
+
+func TestLinkDocument_MissingField_Returns400(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/links", bytes.NewReader(linkBody(t, "EXPENSE_CLAIM", ""))))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestLinkDocument_Duplicate_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/links", bytes.NewReader(linkBody(t, "EXPENSE_CLAIM", "claim-1"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/links", bytes.NewReader(linkBody(t, "EXPENSE_CLAIM", "claim-1"))))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+func TestGetLinkedObjects_ReturnsAllLinks(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/links", bytes.NewReader(linkBody(t, "EXPENSE_CLAIM", "claim-1"))))
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/links", bytes.NewReader(linkBody(t, "WORKFLOW_INSTANCE", "wf-1"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/links", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got []domain.DocumentLink
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Len(t, got, 2)
+}
+
+func TestGetLinkedObjects_NoLinks_ReturnsEmptyArray(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "INTERNAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/links", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, "[]", rec.Body.String())
+}
+
+func TestGetLinkedObjects_DocumentNotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/nope/links", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 }

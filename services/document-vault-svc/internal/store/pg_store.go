@@ -721,6 +721,71 @@ func (s *PgStore) ListAccessLog(ctx context.Context, documentID string, limit, o
 	return out, nil
 }
 
+// LinkDocument records a link to another business object — BIZ-01's
+// GetLinkedObjects data source (migration 000007). Append-only; the
+// document_document_links_document_id_linked_object_type_linked_object_id_key
+// unique constraint (checked via 23505 here rather than a SELECT-then-INSERT
+// race) makes a duplicate link a real error, not a silent second row.
+func (s *PgStore) LinkDocument(ctx context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error) {
+	var out domain.DocumentLink
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, p.DocumentID, tenantID); err != nil {
+			return err
+		}
+		row := tx.QueryRow(ctx, `
+			INSERT INTO document_links (document_id, linked_object_type, linked_object_id, linked_by_principal_id, correlation_id)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING link_id, document_id, linked_object_type, linked_object_id, linked_by_principal_id, correlation_id, created_at
+		`, p.DocumentID, p.LinkedObjectType, p.LinkedObjectID, p.LinkedByPrincipalID, nullableString(p.CorrelationID))
+		if err := row.Scan(&out.LinkID, &out.DocumentID, &out.LinkedObjectType, &out.LinkedObjectID,
+			&out.LinkedByPrincipalID, &out.CorrelationID, &out.CreatedAt); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.ErrDuplicateLink
+			}
+			return fmt.Errorf("document store unavailable: %w", mapPgError(err))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListDocumentLinks is GetLinkedObjects' real query — every object this
+// document has ever been linked to, newest first.
+func (s *PgStore) ListDocumentLinks(ctx context.Context, documentID string) ([]domain.DocumentLink, error) {
+	var out []domain.DocumentLink
+	err := s.withTenant(ctx, func(tx pgx.Tx, tenantID string) error {
+		if err := ensureDocument(ctx, tx, documentID, tenantID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT link_id, document_id, linked_object_type, linked_object_id, linked_by_principal_id, correlation_id, created_at
+			FROM document_links WHERE document_id = $1
+			ORDER BY created_at DESC, link_id DESC
+		`, documentID)
+		if err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var l domain.DocumentLink
+			if err := rows.Scan(&l.LinkID, &l.DocumentID, &l.LinkedObjectType, &l.LinkedObjectID,
+				&l.LinkedByPrincipalID, &l.CorrelationID, &l.CreatedAt); err != nil {
+				return fmt.Errorf("document store unavailable: %w", err)
+			}
+			out = append(out, l)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ensureDocument confirms the document exists in this tenant, inside the
 // caller's transaction. Used by every child-table read so a version, an
 // access-log entry, or a download can never be served for a document the
