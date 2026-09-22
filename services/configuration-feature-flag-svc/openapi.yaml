@@ -1,0 +1,568 @@
+openapi: 3.0.3
+
+info:
+  title: Configuration & Feature Flag Service
+  version: "1.0.0"
+  description: |
+    Runtime configuration values and environment-aware feature flags for the
+    ZoikoSuite platform (`docs/architecture/03-microservices.md` §9.6).
+
+    ## The two things a caller must understand before using this API
+
+    **1. Nothing is ever overwritten.** Both resources are versioned and
+    effective-dated. A "change" is always a new row plus an end-dated
+    predecessor, in one transaction. There is no PUT, PATCH or DELETE, and
+    there never will be — the history of what a value was, when, and who set
+    it is the point.
+
+    That is why `POST` answers two different success codes:
+
+    | Code | Meaning |
+    | --- | --- |
+    | `201` | A real transition was recorded — a first value for this scope, or a genuinely different one. |
+    | `200` | The submitted value already equalled the effective one. Nothing was written, no version was created, and no event was emitted. |
+
+    A client that collapses these into "saved" loses the only signal
+    distinguishing a change from a no-op.
+
+    **2. Scope is a tuple, and a lookup is exact.** Every record is keyed on
+    `(key, environment, tenant_id)`. A `tenant_id` of `null` is not a missing
+    value — it is *the environment-wide default*, which applies to every tenant
+    that has not set its own.
+
+    The single-key `GET`s match that tuple **exactly** and do **not** fall back
+    from a tenant-specific miss to the global default. So a `404` from
+    `GET /v1/config/{key}?environment=prod` does not mean the value is unset; it
+    means it is unset *at that exact scope*, and a global default may well
+    exist. The list endpoints behave differently: they return the caller's own
+    tenant plus the globals that apply to it.
+
+    ## Authorization
+
+    Writes are authorized against `authorization-svc` on the platform scope and
+    **fail closed** — an unobtainable decision is a `503`, never an implicit
+    permit. There are four actions, not two, because writing the
+    environment-wide default is a different act from writing one organisation's
+    value:
+
+    | Scope written | Config | Flags |
+    | --- | --- | --- |
+    | `tenant_id` present | `CONFIGURATION_WRITE` | `FEATURE_FLAG_WRITE` |
+    | `tenant_id` absent (global) | `CONFIGURATION_GLOBAL_WRITE` | `FEATURE_FLAG_GLOBAL_WRITE` |
+
+    Reads are tenant-scoped by the gateway-verified `X-Tenant-Id` header and
+    require no action grant.
+
+servers:
+  - url: http://localhost:8086
+    description: Local
+  - url: http://configuration-feature-flag-svc:8086
+    description: In-cluster
+
+tags:
+  - name: config
+    description: Runtime configuration values.
+  - name: flags
+    description: Environment-aware feature flags.
+  - name: operations
+    description: Health, readiness and metrics.
+
+paths:
+  /v1/config:
+    post:
+      tags: [config]
+      operationId: upsertConfigEntry
+      summary: Record a configuration value
+      description: |
+        Records a value for `(key, environment, tenant_id)`.
+
+        Idempotent by value equality rather than by a caller-supplied key: the
+        comparison is semantic JSON equality, so a reserialised but equivalent
+        value is a no-op. Setting something to the value it already holds is
+        safe to repeat.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpsertConfigRequest' }
+      responses:
+        '201':
+          description: A new version was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigEntry' }
+        '200':
+          description: |
+            The value already equalled what was submitted. Nothing was written
+            and no `config.updated` event was emitted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/ScopeRaceConflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    get:
+      tags: [config]
+      operationId: listConfigEntries
+      summary: List the configuration that applies to the caller
+      description: |
+        Every currently-effective entry for the caller's own tenant, plus the
+        environment-wide defaults that apply to it.
+
+        An omitted `tenant_id` used to mean "no filter" on this route, which
+        returned every tenant's configuration to any caller. It is now scoped to
+        the verified header; naming a different tenant is refused.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - name: environment
+          in: query
+          required: false
+          schema: { type: string, example: prod }
+        - name: tenant_id
+          in: query
+          required: false
+          description: Must equal the caller's verified tenant if given.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: A JSON array, possibly empty. Never `null`.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ConfigEntry' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/config/{key}:
+    get:
+      tags: [config]
+      operationId: getConfigEntry
+      summary: Read the value effective for one exact scope
+      description: |
+        Matches `(key, environment, tenant_id)` **exactly**. There is no
+        fallback from a tenant-specific miss to the global default, so a `404`
+        says nothing about whether a global value exists.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, example: payroll.release.batch_size }
+        - name: environment
+          in: query
+          required: true
+          description: Required. A lookup naming no environment has no answer.
+          schema: { type: string, example: prod }
+        - name: tenant_id
+          in: query
+          required: false
+          description: Omit for the environment-wide default, which is a real scope.
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      responses:
+        '200':
+          description: The currently-effective entry for that exact tuple.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConfigEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/flags:
+    post:
+      tags: [flags]
+      operationId: upsertFeatureFlag
+      summary: Record a feature flag state
+      description: |
+        Same append-only versioning and same 201/200 distinction as
+        `POST /v1/config`, comparing `(enabled, rollout_percentage)` for
+        equality instead of a JSON value.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/PrincipalId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpsertFlagRequest' }
+      responses:
+        '201':
+          description: A new version was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FeatureFlag' }
+        '200':
+          description: The state already matched. Nothing was written.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FeatureFlag' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/ScopeRaceConflict' }
+        '413': { $ref: '#/components/responses/TooLarge' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    get:
+      tags: [flags]
+      operationId: listFeatureFlags
+      summary: List the flags that apply to the caller
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+        - name: environment
+          in: query
+          required: false
+          schema: { type: string }
+        - name: tenant_id
+          in: query
+          required: false
+          description: Must equal the caller's verified tenant if given.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: A JSON array, possibly empty. Never `null`.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FeatureFlag' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /v1/flags/{key}:
+    get:
+      tags: [flags]
+      operationId: getFeatureFlag
+      summary: Read the flag state effective for one exact scope
+      description: |
+        Exact-tuple match, with no fallback — see `GET /v1/config/{key}`.
+
+        A consumer treating a `404` as "enabled" is a safety bug on the
+        consumer's side: this service does not guess a default, and a missing
+        record means the feature's state at that scope is unknown, not on.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string, example: payroll.new_ui }
+        - name: environment
+          in: query
+          required: true
+          schema: { type: string }
+        - name: tenant_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/RequestId'
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/SourceChannel'
+      responses:
+        '200':
+          description: The currently-effective flag for that exact tuple.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FeatureFlag' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: liveness
+      summary: Liveness
+      description: |
+        Answers whenever the process is up and deliberately checks nothing. A
+        liveness probe that failed on a dependency outage would get the
+        container killed and restarted, which fixes nothing and removes the one
+        instance that could report what was wrong.
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [operations]
+      operationId: readiness
+      summary: Readiness
+      description: |
+        Reports whether this instance can actually serve, naming each component.
+
+        `authorization-svc` is a readiness dependency, not merely a runtime one:
+        every write calls it and fails closed, so with it unreachable the pool
+        can be healthy while 100% of writes answer `503` — and every read keeps
+        working, which is what makes that outage look like a broken console.
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+        '503':
+          description: Not ready. `components` names what failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+
+  /metrics:
+    get:
+      tags: [operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: |
+        Prometheus exposition. Re-evaluates readiness on each scrape so
+        `readiness_up` reflects current state rather than the last `/readyz`
+        call — nothing in this platform calls `/readyz` on a schedule.
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      description: |
+        The caller's tenant, set by the gateway from a verified identity
+        envelope. Mandatory on every route — this service read no tenant header
+        at all until that gap was closed, so a `tenant_id` in a body chose whose
+        configuration was overwritten.
+      schema: { type: string, format: uuid }
+    PrincipalId:
+      name: X-Principal-Id
+      in: header
+      required: true
+      description: The acting principal, set by the gateway.
+      schema: { type: string }
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      schema: { type: string }
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Echoed on the response and carried into the emitted event.
+      schema: { type: string }
+    SourceChannel:
+      name: X-Source-Channel
+      in: header
+      required: true
+      description: ZS-ARCH-SVC-001 §4. Mandatory on every request.
+      schema: { type: string, example: system }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: ZS-ARCH-SVC-001 §4. Mandatory on material state changes.
+      schema: { type: string }
+
+  schemas:
+    ConfigEntry:
+      type: object
+      required:
+        [config_id, key, value, environment, tenant_id, effective_from,
+         effective_to, created_by_principal_id, created_at]
+      properties:
+        config_id: { type: string, format: uuid }
+        key: { type: string, example: payroll.release.batch_size }
+        value:
+          description: Any JSON value — object, array, number, string or boolean.
+          example: 250
+        environment: { type: string, example: prod }
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: '`null` means the environment-wide default.'
+        effective_from: { type: string, format: date-time }
+        effective_to:
+          type: string
+          format: date-time
+          nullable: true
+          description: '`null` on the currently-effective row.'
+        created_by_principal_id: { type: string }
+        created_at: { type: string, format: date-time }
+
+    FeatureFlag:
+      type: object
+      required:
+        [flag_id, key, enabled, environment, tenant_id, rollout_percentage,
+         effective_from, effective_to, created_by_principal_id, created_at]
+      properties:
+        flag_id: { type: string, format: uuid }
+        key: { type: string, example: payroll.new_ui }
+        enabled: { type: boolean }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        rollout_percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: |
+            Dormant while `enabled` is false. A flag that is disabled at 20% is
+            off for everyone — the share is what *would* apply if it were
+            switched on.
+        effective_from: { type: string, format: date-time }
+        effective_to: { type: string, format: date-time, nullable: true }
+        created_by_principal_id: { type: string }
+        created_at: { type: string, format: date-time }
+
+    UpsertConfigRequest:
+      type: object
+      required: [key, value, environment, created_by_principal_id]
+      properties:
+        key: { type: string }
+        value:
+          description: Any JSON value. Stored as `jsonb`, so a bare token is not valid.
+        environment: { type: string }
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Omit for the environment-wide default. If present it must equal the
+            caller's verified tenant; naming another is `403`.
+        created_by_principal_id: { type: string }
+
+    UpsertFlagRequest:
+      type: object
+      required: [key, enabled, environment, created_by_principal_id]
+      properties:
+        key: { type: string }
+        enabled:
+          type: boolean
+          description: |
+            Required, and deliberately not defaulted. On an append-only record
+            "left blank" and "off" are two different statements.
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        rollout_percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+          default: 100
+        created_by_principal_id: { type: string }
+
+    Readiness:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [READY, NOT_READY]
+        components:
+          type: object
+          additionalProperties: { type: string }
+          example:
+            database: ok
+            authorization-svc: ok
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Stable machine-readable code. Clients branch on this.
+        field: { type: string }
+        key: { type: string }
+        action: { type: string }
+        message: { type: string }
+
+  responses:
+    BadRequest:
+      description: |
+        `missing_field` — a required field was absent.
+        `invalid_field` — `rollout_percentage` outside 0–100.
+        `invalid_json` — the body could not be parsed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: |
+        `tenant_scope_missing` — no `X-Tenant-Id`.
+        `missing_principal` — no `X-Principal-Id`.
+        `envelope_incomplete` — a §4 mandatory field was absent.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: |
+        `authorization_denied` — the caller holds no grant for the named action.
+        `tenant_scope_mismatch` — the request named a tenant other than the
+        caller's verified one.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: |
+        `config_entry_not_found` / `feature_flag_not_found` — nothing is
+        effective for that **exact** tuple. A global default may still exist;
+        this lookup does not go looking for one.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ScopeRaceConflict:
+      description: |
+        `scope_race_conflict` — a concurrent writer created this scope first.
+        Nothing is wrong with the request or the database; retrying now takes
+        the ordinary compare-and-update path. This used to answer `503`, which
+        said the opposite.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    TooLarge:
+      description: '`request_too_large` — the body exceeded 256 KiB.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: |
+        `store_unavailable` — the database could not be reached. Fails closed:
+        a stale or default value is never returned in its place.
+        `authz_unavailable` — no authorization decision could be obtained, so
+        the write was refused rather than allowed unchecked.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }

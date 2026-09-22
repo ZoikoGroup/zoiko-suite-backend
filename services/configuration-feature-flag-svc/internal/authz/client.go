@@ -10,8 +10,6 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/configuration-feature-flag-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -25,7 +23,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"go.uber.org/zap"
+
+	svcenvelope "zoiko.io/configuration-feature-flag-svc/internal/envelope"
 )
 
 // Sentinel errors, mapped to HTTP status codes by the handler.

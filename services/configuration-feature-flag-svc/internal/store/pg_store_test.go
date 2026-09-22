@@ -41,31 +41,19 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS feature_flags, config_entries CASCADE;`)
+	// Every table the migrations create, not just the two the service started
+	// with. Omitting event_outbox left its policy in place, so re-applying
+	// 000003 failed at "policy already exists" — and because openTestPool runs
+	// per test, that broke every test after the first.
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS event_outbox, feature_flags, config_entries CASCADE;`)
 
 	// Every *.up.sql in filename order, not one hardcoded filename. This
 	// used to name 000001_initial_schema.up.sql alone, which meant a
 	// migration added later was invisible to this suite — the drift trap
 	// known-gaps.md records for jurisdiction-rules-svc, and the reason
 	// 000002's RLS policy would otherwise have gone completely untested.
-	_, filename, _, _ := runtime.Caller(0)
-	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
-	entries, err := os.ReadDir(migDir)
-	if err != nil {
-		t.Fatalf("failed to read migrations dir %s: %v", migDir, err)
-	}
-	var ups []string
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".up.sql") {
-			ups = append(ups, e.Name())
-		}
-	}
-	if len(ups) == 0 {
-		t.Fatalf("no .up.sql migrations found in %s", migDir)
-	}
-	sort.Strings(ups)
-	for _, name := range ups {
-		migSQL, err := os.ReadFile(filepath.Join(migDir, name))
+	for _, name := range migrationFiles(t) {
+		migSQL, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatalf("failed to read migration %s: %v", name, err)
 		}
@@ -75,6 +63,34 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	}
 
 	return pool
+}
+
+// migrationFiles lists every *.up.sql in filename order.
+//
+// Every one, not one hardcoded filename. It used to name
+// 000001_initial_schema.up.sql alone, which meant a migration added later was
+// invisible to this suite — the drift trap known-gaps.md records for
+// jurisdiction-rules-svc, and the reason 000002's RLS policy would otherwise
+// have gone completely untested, as 000003's outbox would now.
+func migrationFiles(t *testing.T) []string {
+	t.Helper()
+	_, filename, _, _ := runtime.Caller(0)
+	migDir := filepath.Join(filepath.Dir(filename), "../../deployments/migrations")
+	entries, err := os.ReadDir(migDir)
+	if err != nil {
+		t.Fatalf("failed to read migrations dir %s: %v", migDir, err)
+	}
+	var ups []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".up.sql") {
+			ups = append(ups, filepath.Join(migDir, e.Name()))
+		}
+	}
+	if len(ups) == 0 {
+		t.Fatalf("no .up.sql migrations found in %s", migDir)
+	}
+	sort.Strings(ups)
+	return ups
 }
 
 // appRolePool returns a pool connected as a genuine NOSUPERUSER
@@ -136,7 +152,47 @@ func appRolePool(t *testing.T, admin *pgxpool.Pool) *pgxpool.Pool {
 	return pool
 }
 
+// restoreSchema re-applies every migration after a test has deliberately
+// dropped a table.
+//
+// Without it the suite leaves the schema broken behind it. That is harmless
+// against an isolated test database and destructive against anything else, and
+// it is not hypothetical: this service's progress.md records a live demo losing
+// feature_flags to exactly this, because the run shared one Postgres with it.
+// The lesson was written down and the teardown was not written, so the next run
+// would have done it again.
+func restoreSchema(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	// Drop everything first, then re-apply. Re-applying over the tables the
+	// test did NOT drop fails at "relation already exists" — 000001 creates
+	// both config_entries and feature_flags, and each of these tests drops only
+	// one of them.
+	if _, err := pool.Exec(context.Background(),
+		`DROP TABLE IF EXISTS event_outbox, feature_flags, config_entries CASCADE;`); err != nil {
+		t.Fatalf("restore: drop: %v", err)
+	}
+	for _, name := range migrationFiles(t) {
+		migSQL, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("restore: read migration %s: %v", name, err)
+		}
+		if _, err := pool.Exec(context.Background(), string(migSQL)); err != nil {
+			t.Fatalf("restore: execute migration %s: %v", name, err)
+		}
+	}
+}
+
 func strPtr(s string) *string { return &s }
+
+// testCallerTenant stands in for the gateway-verified X-Tenant-Id the handler
+// resolves before it reaches the store.
+//
+// It is a separate value from the SCOPE being written, and the distinction is
+// the one these tests exist to keep honest: a global write has no scope tenant,
+// but it is still made BY someone, and the RLS session and the outbox row both
+// hang off that someone. A write that names no caller is refused rather than
+// defaulted — see domain.ErrCallerTenantMissing.
+const testCallerTenant = "11111111-1111-1111-1111-111111111111"
 
 // ── config_entries ───────────────────────────────────────────────────────────
 
@@ -150,6 +206,7 @@ func TestPgStore_UpsertConfigEntry_FirstWriteAndIdempotentSameValue(t *testing.T
 		Value:                []byte(`100`),
 		Environment:          "staging",
 		CreatedByPrincipalID: "admin-1",
+		CallerTenantID:       testCallerTenant,
 	}
 
 	// 1. First write.
@@ -194,6 +251,7 @@ func TestPgStore_UpsertConfigEntry_NewValueEndDatesOldRowNotDeletesIt(t *testing
 		Key:                  "payroll.batch_size",
 		Environment:          "staging",
 		CreatedByPrincipalID: "admin-1",
+		CallerTenantID:       testCallerTenant,
 	}
 
 	v1Params := base
@@ -266,9 +324,14 @@ func TestPgStore_ConfigEntry_TenantScopeIsolation(t *testing.T) {
 
 	global := domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Value: []byte(`100`), Environment: "staging", CreatedByPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	}
 	tenantSpecific := domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Value: []byte(`999`), Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1",
+		// The caller IS that tenant. A caller writing another tenant's scope is
+		// refused by RLS before it reaches the unique index, which is the same
+		// rule the handler enforces with refuseForeignTenant.
+		CallerTenantID: *tenantA,
 	}
 
 	if _, created, err := s.UpsertConfigEntry(ctx, global); err != nil || !created {
@@ -305,9 +368,9 @@ func TestPgStore_ListCurrentConfigEntries_FiltersByEnvironmentAndTenant(t *testi
 	tenantA := strPtr("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
 	writes := []domain.UpsertConfigEntryParams{
-		{Key: "a", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1"},
-		{Key: "b", Value: []byte(`2`), Environment: "production", CreatedByPrincipalID: "admin-1"},
-		{Key: "c", Value: []byte(`3`), Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1"},
+		{Key: "a", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "b", Value: []byte(`2`), Environment: "production", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "c", Value: []byte(`3`), Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1", CallerTenantID: *tenantA},
 	}
 	for _, p := range writes {
 		if _, _, err := s.UpsertConfigEntry(ctx, p); err != nil {
@@ -348,8 +411,9 @@ func TestPgStore_ConfigEntry_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DROP TABLE config_entries CASCADE;`); err != nil {
 		t.Fatalf("failed to drop table for test setup: %v", err)
 	}
+	t.Cleanup(func() { restoreSchema(t, pool) })
 
-	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{Key: "k", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1"}); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{Key: "k", Value: []byte(`1`), Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant}); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("UpsertConfigEntry: expected ErrStoreUnavailable, got %v", err)
 	}
 	if _, err := s.FindCurrentConfigEntry(ctx, "k", "staging", nil); !errors.Is(err, domain.ErrStoreUnavailable) {
@@ -369,6 +433,7 @@ func TestPgStore_UpsertFeatureFlag_FirstWriteAndIdempotentSameValue(t *testing.T
 
 	params := domain.UpsertFeatureFlagParams{
 		Key: "new_ui", Enabled: true, Environment: "staging", RolloutPercentage: 50, CreatedByPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	}
 
 	flag1, created, err := s.UpsertFeatureFlag(ctx, params)
@@ -404,7 +469,7 @@ func TestPgStore_UpsertFeatureFlag_RolloutPercentageChangeEndDatesOldRow(t *test
 	pool := openTestPool(t)
 	s := store.New(pool, zap.NewNop())
 
-	base := domain.UpsertFeatureFlagParams{Key: "new_ui", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1"}
+	base := domain.UpsertFeatureFlagParams{Key: "new_ui", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant}
 
 	v1Params := base
 	v1Params.RolloutPercentage = 10
@@ -459,6 +524,7 @@ func TestPgStore_UpsertFeatureFlag_RolloutPercentageOutOfRangeRejectedByCheckCon
 	// caller of the store package.
 	_, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{
 		Key: "bad_flag", Enabled: true, Environment: "staging", RolloutPercentage: 150, CreatedByPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	})
 	if !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Fatalf("expected the CHECK constraint violation to surface as ErrStoreUnavailable, got %v", err)
@@ -484,9 +550,9 @@ func TestPgStore_ListCurrentFeatureFlags_FiltersByEnvironmentAndTenant(t *testin
 	tenantA := strPtr("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 
 	writes := []domain.UpsertFeatureFlagParams{
-		{Key: "a", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1"},
-		{Key: "b", Enabled: false, Environment: "production", CreatedByPrincipalID: "admin-1"},
-		{Key: "c", Enabled: true, Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1"},
+		{Key: "a", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "b", Enabled: false, Environment: "production", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant},
+		{Key: "c", Enabled: true, Environment: "staging", TenantID: tenantA, CreatedByPrincipalID: "admin-1", CallerTenantID: *tenantA},
 	}
 	for _, p := range writes {
 		if _, _, err := s.UpsertFeatureFlag(ctx, p); err != nil {
@@ -519,8 +585,9 @@ func TestPgStore_FeatureFlag_ErrorsWrapErrStoreUnavailable(t *testing.T) {
 	if _, err := pool.Exec(ctx, `DROP TABLE feature_flags CASCADE;`); err != nil {
 		t.Fatalf("failed to drop table for test setup: %v", err)
 	}
+	t.Cleanup(func() { restoreSchema(t, pool) })
 
-	if _, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{Key: "k", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1"}); !errors.Is(err, domain.ErrStoreUnavailable) {
+	if _, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{Key: "k", Enabled: true, Environment: "staging", CreatedByPrincipalID: "admin-1", CallerTenantID: testCallerTenant}); !errors.Is(err, domain.ErrStoreUnavailable) {
 		t.Errorf("UpsertFeatureFlag: expected ErrStoreUnavailable, got %v", err)
 	}
 	if _, err := s.FindCurrentFeatureFlag(ctx, "k", "staging", nil); !errors.Is(err, domain.ErrStoreUnavailable) {

@@ -70,6 +70,25 @@ type UpsertConfigEntryParams struct {
 	Environment          string
 	TenantID             *string
 	CreatedByPrincipalID string
+
+	// CallerTenantID is the tenant the REQUEST came from, which is a different
+	// thing from TenantID above — that one is the SCOPE being written, and is
+	// nil for the environment-wide default.
+	//
+	// Both are needed. The scope decides which row is superseded; the caller
+	// decides which RLS session the write runs under and which tenant owns the
+	// outbox row the write enqueues. Collapsing them breaks a global write:
+	// its scope is nil, so an RLS session derived from the scope is unscoped,
+	// and the outbox row it enqueues belongs to no tenant and is refused by
+	// event_outbox tenant policy — which would make every global write fail
+	// at commit, after the version row had already been built.
+	//
+	// Required. An empty value is refused rather than defaulted: a write that
+	// cannot say who made it must not reach an append-only record.
+	CallerTenantID string
+
+	// CorrelationID ties the enqueued event back to the request that caused it.
+	CorrelationID string
 }
 
 // UpsertFeatureFlagParams holds input parameters for writing a new
@@ -81,6 +100,12 @@ type UpsertFeatureFlagParams struct {
 	TenantID             *string
 	RolloutPercentage    int
 	CreatedByPrincipalID string
+
+	// CallerTenantID and CorrelationID carry the same meaning as on
+	// UpsertConfigEntryParams — see that struct for why the caller tenant is
+	// separate from the scope being written.
+	CallerTenantID string
+	CorrelationID  string
 }
 
 // ErrConfigEntryNotFound is returned when no currently-effective config
@@ -106,6 +131,13 @@ var ErrStoreUnavailable = errorString("configuration store unavailable")
 // store error, and answered 503 store_unavailable — a lost race reported as a
 // dead database, with no hint that retrying would now succeed.
 var ErrScopeRaceConflict = errorString("another writer created this scope concurrently")
+
+// ErrCallerTenantMissing is returned when a write reaches the store with no
+// caller tenant. It is a programming error rather than a caller mistake — the
+// handler resolves the tenant from the gateway-verified header before it gets
+// here — but it is refused explicitly rather than defaulted, because the
+// alternative is an append-only row and an event that name no owner.
+var ErrCallerTenantMissing = errorString("caller tenant is required for a write")
 
 type errorString string
 

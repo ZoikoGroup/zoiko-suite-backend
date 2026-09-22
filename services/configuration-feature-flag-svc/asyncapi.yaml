@@ -1,0 +1,209 @@
+asyncapi: 2.6.0
+
+info:
+  title: Configuration & Feature Flag Service — Events
+  version: "1.0.0"
+  description: |
+    The two events this service publishes, and the one rule that governs both.
+
+    ## Events are emitted on a real transition only
+
+    Neither event is emitted when a write was an idempotent no-op — when the
+    submitted value already equalled the effective one. Re-asserting a value
+    that is already in force is not a new fact, and a consumer invalidating its
+    cache on one would be doing it for a change that did not happen.
+
+    Concretely: `201` from the API means the event was enqueued, `200` means it
+    was not.
+
+    ## Delivery is transactional, not best-effort
+
+    Both events are written to `event_outbox` **in the same transaction as the
+    version row**, and drained to Kafka by a background relay
+    (`internal/outbox`). A change that was recorded therefore always has its
+    event, and an event that exists always has its change.
+
+    This is not decoration. They used to be published from the handler *after*
+    the store had committed, with the error logged and discarded — so a broker
+    hiccup left the new value recorded, the operator told it was saved, and
+    every consumer still reading the value it superseded. That stale value is
+    perfectly valid data, just old, so nothing downstream could detect the
+    problem either.
+
+    Delivery is **at-least-once**, chosen deliberately: a duplicate makes a
+    consumer re-read a value it already has; a lost one leaves it acting on a
+    value this service has already replaced.
+
+    ## Ordering
+
+    The partition key is the **aggregate id** (`config_id` / `flag_id`), not the
+    correlation id. Keying on the correlation id put two changes to the same
+    entry on different partitions whenever they arrived on different requests,
+    so a consumer replaying them could apply an older value after a newer one
+    and serve the superseded value permanently.
+
+    Note that a new version gets a **new** `config_id`, so strict per-key
+    ordering across versions is not guaranteed by the key alone. Consumers that
+    need it should order on `effective_from`, which is server-set.
+
+defaultContentType: application/json
+
+servers:
+  kafka:
+    url: kafka:9094
+    protocol: kafka
+    description: ZoikoSuite event backbone.
+
+channels:
+  zoiko.configuration.events:
+    description: |
+      Every event this service publishes. One topic, discriminated by
+      `event_type` — matching the platform convention.
+
+      The topic name is `KAFKA_EVENTS_TOPIC` and defaults to this value.
+    publish:
+      operationId: publishConfigurationEvents
+      summary: Configuration and feature-flag transitions.
+      message:
+        oneOf:
+          - $ref: '#/components/messages/ConfigUpdated'
+          - $ref: '#/components/messages/FeatureFlagUpdated'
+
+components:
+  messages:
+    ConfigUpdated:
+      name: config.updated
+      title: A configuration value changed
+      summary: |
+        Emitted when `POST /v1/config` records a new version — a first value for
+        the scope, or a genuinely different one. Never on the idempotent path.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: config.updated
+              payload: { $ref: '#/components/schemas/ConfigUpdatedPayload' }
+
+    FeatureFlagUpdated:
+      name: feature_flag.updated
+      title: A feature flag changed
+      summary: |
+        Emitted when `POST /v1/flags` records a new version. Same
+        transition-only rule as `config.updated`.
+      contentType: application/json
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/Envelope'
+          - type: object
+            properties:
+              event_type:
+                type: string
+                const: feature_flag.updated
+              payload: { $ref: '#/components/schemas/FeatureFlagUpdatedPayload' }
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The platform event contract (`docs/architecture/03-microservices.md`
+        §19).
+
+        `legal_entity_id` and `jurisdiction` are absent on purpose rather than
+        sent empty: configuration and flags are environment- and tenant-scoped,
+        not legal-entity-scoped, and a fabricated field is worse than a missing
+        one.
+      required:
+        [event_id, event_type, event_version, emitted_at, schema_version,
+         source_service, correlation_id, payload]
+      properties:
+        event_id:
+          type: string
+          description: |
+            A fresh UUID per publish, prefixed `evt-`. Not derived from the
+            aggregate — see `known-gaps.md` on event_id collisions.
+          example: evt-2b6d1f0a-2c1e-4f9a-9a31-0d9d1b2f4c77
+        event_type:
+          type: string
+          enum: [config.updated, feature_flag.updated]
+        event_version: { type: string, const: "1.0" }
+        emitted_at: { type: string, format: date-time }
+        schema_version: { type: string, const: "1.0" }
+        source_service:
+          type: string
+          const: configuration-feature-flag-svc
+        tenant_id:
+          type: string
+          description: |
+            The tenant the changed record belongs to. **Omitted entirely** when
+            the record is the environment-wide default, rather than sent as an
+            empty string or a fabricated id. Read `scope_is_global` in the
+            payload rather than inferring scope from this field's absence.
+        actor_id:
+          type: string
+          description: The principal that made the change.
+        correlation_id:
+          type: string
+          description: The correlation id of the request that caused the change.
+        payload: { type: object }
+
+    ConfigUpdatedPayload:
+      type: object
+      required:
+        [config_id, key, value, environment, tenant_id, scope_is_global,
+         effective_from, created_by_principal_id]
+      properties:
+        config_id:
+          type: string
+          format: uuid
+          description: The id of the NEW version. Also the partition key.
+        key: { type: string, example: payroll.release.batch_size }
+        value:
+          description: The new value. Any JSON value.
+        environment: { type: string, example: prod }
+        tenant_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: '`null` for the environment-wide default.'
+        scope_is_global:
+          type: boolean
+          description: |
+            Stated rather than left to be inferred from a null `tenant_id`.
+
+            The two facts read very differently — "this changed for one
+            organisation" versus "the default every organisation without its own
+            value reads has changed" — and a consumer that treats a missing
+            tenant as "unknown" rather than "all" silently ignores the wider of
+            the two.
+        effective_from: { type: string, format: date-time }
+        created_by_principal_id: { type: string }
+
+    FeatureFlagUpdatedPayload:
+      type: object
+      required:
+        [flag_id, key, enabled, environment, tenant_id, scope_is_global,
+         rollout_percentage, effective_from, created_by_principal_id]
+      properties:
+        flag_id:
+          type: string
+          format: uuid
+          description: The id of the NEW version. Also the partition key.
+        key: { type: string, example: payroll.new_ui }
+        enabled: { type: boolean }
+        environment: { type: string }
+        tenant_id: { type: string, format: uuid, nullable: true }
+        scope_is_global: { type: boolean }
+        rollout_percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: |
+            Dormant while `enabled` is false. A consumer must read both: a flag
+            disabled at 20% is off for everyone, and one enabled at 0% is on but
+            reaching nobody.
+        effective_from: { type: string, format: date-time }
+        created_by_principal_id: { type: string }

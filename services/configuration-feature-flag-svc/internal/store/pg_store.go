@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -30,6 +31,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
+	"zoiko.io/configuration-feature-flag-svc/internal/events"
 )
 
 // nilScopeUUID is the sentinel used in COALESCE() to make the
@@ -140,6 +142,14 @@ type Store interface {
 
 	// ListCurrentFeatureFlags is ListCurrentConfigEntries's counterpart.
 	ListCurrentFeatureFlags(ctx context.Context, filter ListFilter) ([]*domain.FeatureFlag, error)
+
+	// ClaimOutbox takes up to limit unpublished events and hands them to fn,
+	// marking them published only if fn succeeds.
+	ClaimOutbox(ctx context.Context, limit int, fn func([]OutboxRecord) error) error
+
+	// OutboxDepth reports the unpublished backlog and the age of its oldest
+	// entry.
+	OutboxDepth(ctx context.Context) (pending int64, oldestAge time.Duration, err error)
 }
 
 // PgStore implements Store against a PostgreSQL cluster via pgxpool.
@@ -185,6 +195,10 @@ func scanConfigEntry(row pgx.Row) (*domain.ConfigEntry, error) {
 // UpsertConfigEntry implements the upsert-with-value-equality design in
 // context.md §7.3.
 func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertConfigEntryParams) (*domain.ConfigEntry, bool, error) {
+	if params.CallerTenantID == "" {
+		return nil, false, domain.ErrCallerTenantMissing
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.log.Error("pg UpsertConfigEntry: begin tx failed", zap.Error(err))
@@ -192,7 +206,12 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
 
-	if err := setTenantScope(ctx, tx, derefOrEmpty(params.TenantID)); err != nil {
+	// The CALLER's tenant, not the scope being written. A global write has no
+	// scope tenant, and deriving the RLS session from it would leave the write
+	// unscoped — which under FORCE ROW LEVEL SECURITY makes the outbox row this
+	// transaction enqueues invisible to its own policy and refuses it at
+	// INSERT, failing the whole write after the version row was built.
+	if err := setTenantScope(ctx, tx, params.CallerTenantID); err != nil {
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
@@ -212,6 +231,10 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 		entry, insertErr := insertConfigEntry(ctx, tx, params)
 		if insertErr != nil {
 			return nil, false, insertErr
+		}
+		if err := enqueueConfigUpdated(ctx, tx, params.CallerTenantID, *entry, params.CorrelationID); err != nil {
+			s.log.Error("pg UpsertConfigEntry: enqueue failed", zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			s.log.Error("pg UpsertConfigEntry: commit failed", zap.Error(err))
@@ -245,6 +268,10 @@ func (s *PgStore) UpsertConfigEntry(ctx context.Context, params domain.UpsertCon
 	entry, err := insertConfigEntry(ctx, tx, params)
 	if err != nil {
 		return nil, false, err
+	}
+	if err := enqueueConfigUpdated(ctx, tx, params.CallerTenantID, *entry, params.CorrelationID); err != nil {
+		s.log.Error("pg UpsertConfigEntry: enqueue failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg UpsertConfigEntry: commit failed", zap.Error(err))
@@ -413,6 +440,10 @@ func scanFeatureFlag(row pgx.Row) (*domain.FeatureFlag, error) {
 // same transactional shape, comparing (enabled, rollout_percentage) for
 // equality instead of a JSON value.
 func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFeatureFlagParams) (*domain.FeatureFlag, bool, error) {
+	if params.CallerTenantID == "" {
+		return nil, false, domain.ErrCallerTenantMissing
+	}
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.log.Error("pg UpsertFeatureFlag: begin tx failed", zap.Error(err))
@@ -420,7 +451,9 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := setTenantScope(ctx, tx, derefOrEmpty(params.TenantID)); err != nil {
+	// The CALLER's tenant — see UpsertConfigEntry for why this is not the scope
+	// being written.
+	if err := setTenantScope(ctx, tx, params.CallerTenantID); err != nil {
 		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 
@@ -439,6 +472,10 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 		flag, insertErr := insertFeatureFlag(ctx, tx, params)
 		if insertErr != nil {
 			return nil, false, insertErr
+		}
+		if err := enqueueFlagUpdated(ctx, tx, params.CallerTenantID, *flag, params.CorrelationID); err != nil {
+			s.log.Error("pg UpsertFeatureFlag: enqueue failed", zap.Error(err))
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			s.log.Error("pg UpsertFeatureFlag: commit failed", zap.Error(err))
@@ -464,6 +501,10 @@ func (s *PgStore) UpsertFeatureFlag(ctx context.Context, params domain.UpsertFea
 	flag, err := insertFeatureFlag(ctx, tx, params)
 	if err != nil {
 		return nil, false, err
+	}
+	if err := enqueueFlagUpdated(ctx, tx, params.CallerTenantID, *flag, params.CorrelationID); err != nil {
+		s.log.Error("pg UpsertFeatureFlag: enqueue failed", zap.Error(err))
+		return nil, false, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		s.log.Error("pg UpsertFeatureFlag: commit failed", zap.Error(err))
@@ -560,6 +601,185 @@ func (s *PgStore) ListCurrentFeatureFlags(ctx context.Context, filter ListFilter
 		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
 	}
 	return results, nil
+}
+
+// ── transactional outbox ─────────────────────────────────────────────────────
+
+// enqueue writes one sealed envelope into event_outbox on the caller's open
+// transaction.
+//
+// Sharing the transaction is the whole point. Before this existed, the handler
+// wrote to Kafka after the store had already committed and logged the error if
+// it failed, so a broker hiccup during a config write left the new version
+// recorded, the operator told it was saved, and every consumer still reading
+// the value it had superseded — with nothing anywhere reporting a fault.
+//
+// Because it shares the transaction, a failure here FAILS THE WRITE. That is
+// deliberate: refusing a change nobody can be told about is better than
+// recording one silently, and the caller can retry.
+func enqueue(ctx context.Context, tx pgx.Tx, tenantID string, out events.Outbound) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO event_outbox (tenant_id, event_type, aggregate_key, payload)
+		VALUES ($1, $2, $3, $4)
+	`, tenantID, out.EventType, out.Key, out.Body)
+	if err != nil {
+		return fmt.Errorf("enqueue %s: %w", out.EventType, err)
+	}
+	return nil
+}
+
+func enqueueConfigUpdated(ctx context.Context, tx pgx.Tx, callerTenantID string, entry domain.ConfigEntry, correlationID string) error {
+	out, err := events.ConfigUpdated(entry, correlationID)
+	if err != nil {
+		return err
+	}
+	return enqueue(ctx, tx, callerTenantID, out)
+}
+
+func enqueueFlagUpdated(ctx context.Context, tx pgx.Tx, callerTenantID string, flag domain.FeatureFlag, correlationID string) error {
+	out, err := events.FeatureFlagUpdated(flag, correlationID)
+	if err != nil {
+		return err
+	}
+	return enqueue(ctx, tx, callerTenantID, out)
+}
+
+// OutboxRecord is one claimed, unpublished event.
+type OutboxRecord struct {
+	OutboxID  int64
+	EventType string
+	Key       string
+	Body      []byte
+}
+
+// withRelay runs fn with app.outbox_relay installed instead of a tenant.
+//
+// The relay is the one code path in this service that legitimately crosses
+// tenants: it drains every tenant's backlog from a single loop. Rather than
+// letting it run unscoped — which under FORCE ROW LEVEL SECURITY would simply
+// see nothing, and would present as a relay that publishes nothing while
+// reporting no error at all — it names itself, so migration 000003's policy
+// admits it by an explicit, auditable disjunct rather than by the absence of a
+// control.
+func (s *PgStore) withRelay(ctx context.Context, fn func(tx pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin relay transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.outbox_relay', 'true', true)"); err != nil {
+		return fmt.Errorf("set relay context: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit relay transaction: %w", err)
+	}
+	return nil
+}
+
+// ClaimOutbox takes up to limit unpublished events, oldest first, locking them
+// for the duration of the caller's drain.
+//
+// FOR UPDATE SKIP LOCKED is what makes more than one replica safe: a second
+// relay claims the next batch instead of blocking on, or duplicating, this one.
+func (s *PgStore) ClaimOutbox(ctx context.Context, limit int, fn func([]OutboxRecord) error) error {
+	return s.withRelay(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT outbox_id, event_type, aggregate_key, payload
+			FROM event_outbox
+			WHERE published_at IS NULL
+			ORDER BY created_at, outbox_id
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		`, limit)
+		if err != nil {
+			return fmt.Errorf("claim outbox: %w", err)
+		}
+		var claimed []OutboxRecord
+		for rows.Next() {
+			var r OutboxRecord
+			if err := rows.Scan(&r.OutboxID, &r.EventType, &r.Key, &r.Body); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan outbox row: %w", err)
+			}
+			claimed = append(claimed, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("read outbox rows: %w", err)
+		}
+		if len(claimed) == 0 {
+			return nil
+		}
+
+		// fn publishes. It runs while the rows are still locked and BEFORE the
+		// marking commits, so a crash mid-publish rolls the marking back and
+		// the events are re-delivered rather than lost. At-least-once, chosen
+		// deliberately: a duplicate config.updated makes a consumer re-read a
+		// value it already has, a lost one leaves it serving a value this
+		// service has already superseded, permanently and undetectably.
+		if err := fn(claimed); err != nil {
+			ids := make([]int64, 0, len(claimed))
+			for _, r := range claimed {
+				ids = append(ids, r.OutboxID)
+			}
+			// Recorded on the rows themselves, so a stuck event can be
+			// diagnosed from the table without correlating against logs.
+			if _, uerr := tx.Exec(ctx, `
+				UPDATE event_outbox
+				SET attempts = attempts + 1, last_error = $2
+				WHERE outbox_id = ANY($1)
+			`, ids, err.Error()); uerr != nil {
+				return fmt.Errorf("record publish failure: %w (original: %v)", uerr, err)
+			}
+			// Committed: the attempt count and the error are worth keeping even
+			// though the publish failed. published_at is untouched, so the rows
+			// are claimed again on the next tick.
+			if cerr := tx.Commit(ctx); cerr != nil {
+				return fmt.Errorf("commit publish failure: %w (original: %v)", cerr, err)
+			}
+			return err
+		}
+
+		ids := make([]int64, 0, len(claimed))
+		for _, r := range claimed {
+			ids = append(ids, r.OutboxID)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE event_outbox SET published_at = now() WHERE outbox_id = ANY($1)
+		`, ids); err != nil {
+			return fmt.Errorf("mark published: %w", err)
+		}
+		return nil
+	})
+}
+
+// OutboxDepth reports the unpublished backlog and the age of its oldest entry.
+//
+// Both, not just the depth. A backlog of ten that is three seconds old is a
+// service under load; a backlog of ten that is an hour old is a relay that has
+// stopped, and on this service that means consumers have been acting on a
+// superseded configuration value for an hour while the console displays the new
+// one. Depth alone cannot tell them apart, which is why the alert rule uses the
+// age.
+func (s *PgStore) OutboxDepth(ctx context.Context) (pending int64, oldestAge time.Duration, err error) {
+	err = s.withRelay(ctx, func(tx pgx.Tx) error {
+		var oldest *time.Time
+		row := tx.QueryRow(ctx, `
+			SELECT count(*), min(created_at) FROM event_outbox WHERE published_at IS NULL
+		`)
+		if err := row.Scan(&pending, &oldest); err != nil {
+			return fmt.Errorf("outbox depth: %w", err)
+		}
+		if oldest != nil {
+			oldestAge = time.Since(*oldest)
+		}
+		return nil
+	})
+	return pending, oldestAge, err
 }
 
 // ─── compile-time interface check ──────────────────────────────────────────

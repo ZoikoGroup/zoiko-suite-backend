@@ -59,6 +59,7 @@ func TestRLS_ConfigEntry_TenantIsolatedAtDatabaseLayer(t *testing.T) {
 	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Environment: "prod", TenantID: strPtr(tenantA),
 		Value: []byte(`100`), CreatedByPrincipalID: "admin-1",
+		CallerTenantID: tenantA,
 	}); err != nil {
 		t.Fatalf("write tenant A's entry: %v", err)
 	}
@@ -66,6 +67,7 @@ func TestRLS_ConfigEntry_TenantIsolatedAtDatabaseLayer(t *testing.T) {
 	if _, _, err := s.UpsertConfigEntry(ctx, domain.UpsertConfigEntryParams{
 		Key: "payroll.batch_size", Environment: "prod", TenantID: nil,
 		Value: []byte(`50`), CreatedByPrincipalID: "admin-1",
+		CallerTenantID: testCallerTenant,
 	}); err != nil {
 		t.Fatalf("write global default: %v", err)
 	}
@@ -130,6 +132,7 @@ func TestRLS_FeatureFlag_TenantIsolatedAtDatabaseLayer(t *testing.T) {
 	if _, _, err := s.UpsertFeatureFlag(ctx, domain.UpsertFeatureFlagParams{
 		Key: "new-payroll-ui", Environment: "prod", TenantID: strPtr(tenantA),
 		Enabled: true, CreatedByPrincipalID: "admin-1",
+		CallerTenantID: tenantA,
 	}); err != nil {
 		t.Fatalf("write tenant A's flag: %v", err)
 	}

@@ -8,12 +8,14 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
 	"zoiko.io/configuration-feature-flag-svc/internal/authz"
 	"zoiko.io/configuration-feature-flag-svc/internal/domain"
 	svcmiddleware "zoiko.io/configuration-feature-flag-svc/internal/middleware"
 	"zoiko.io/configuration-feature-flag-svc/internal/store"
+	"zoiko.io/configuration-feature-flag-svc/internal/telemetry"
 )
 
 // ConfigStore is the narrow interface the handler depends on.
@@ -28,21 +30,18 @@ type ConfigStore interface {
 	ListCurrentFeatureFlags(ctx context.Context, filter store.ListFilter) ([]*domain.FeatureFlag, error)
 }
 
-// EventPublisher is the narrow interface the handler depends on for
-// publishing domain events. Allows the handler to be tested without a
-// real event backbone. Mirrors policy-svc's/governance-decision-log-svc's
-// pattern.
-type EventPublisher interface {
-	PublishConfigUpdated(ctx context.Context, entry domain.ConfigEntry, correlationID string) error
-	PublishFeatureFlagUpdated(ctx context.Context, flag domain.FeatureFlag, correlationID string) error
-}
-
 // Handler holds all HTTP handler methods.
+//
+// There is deliberately no event publisher here any more. Events are enqueued
+// by the store, in the transaction that records the change, and drained to
+// Kafka by internal/outbox. The handler used to publish directly after the
+// store returned — so a broker hiccup lost the event, logged it, and answered
+// 201 as though nothing were wrong. See internal/outbox for the full account.
 type Handler struct {
-	store     ConfigStore
-	publisher EventPublisher
-	authz     authz.Client
-	log       *zap.Logger
+	store   ConfigStore
+	authz   authz.Client
+	metrics *telemetry.Domain
+	log     *zap.Logger
 
 	// authzPlatformScopeID is the legal_entity_id used for configuration and
 	// flags, which are platform-scoped rather than entity-scoped.
@@ -51,11 +50,11 @@ type Handler struct {
 }
 
 // New constructs a Handler.
-func New(store ConfigStore, publisher EventPublisher, authzClient authz.Client, authzPlatformScopeID string, log *zap.Logger) *Handler {
+func New(store ConfigStore, authzClient authz.Client, authzPlatformScopeID string, metrics *telemetry.Domain, log *zap.Logger) *Handler {
 	return &Handler{
 		store:                store,
-		publisher:            publisher,
 		authz:                authzClient,
+		metrics:              metrics,
 		authzPlatformScopeID: authzPlatformScopeID,
 		log:                  log,
 	}
@@ -131,32 +130,52 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteIdentityMissing).Inc()
 		return
 	}
-	if !h.authorize(w, r, principalID, "", ActionConfigWrite) {
+	// tenant_id in the body used to be written straight through, so a caller
+	// could overwrite another tenant's configuration value — and configuration
+	// is what other services read to decide how to behave.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteIdentityMissing).Inc()
 		return
 	}
 
 	var req upsertConfigEntryRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.decodeJSON(w, r, &req, h.metrics.ConfigWrites) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": missing,
 		})
 		return
 	}
-
-	// tenant_id in the body used to be written straight through, so a caller
-	// could overwrite another tenant's configuration value — and configuration is
-	// what other services read to decide how to behave.
-	tenantScope, ok := h.requireTenant(w, r)
-	if !ok {
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+
+	// The SCOPE decides the action, and it has to be resolved before the
+	// authorization check rather than after it. A write with no tenant_id is
+	// the environment-wide DEFAULT: it takes effect for every tenant that has
+	// not set its own value. Authorizing it as an ordinary CONFIGURATION_WRITE
+	// meant a principal provisioned to manage one organisation could change
+	// what every other organisation reads, and no refusal ever ran — RLS cannot
+	// catch it either, because migration 000002's WITH CHECK admits a NULL
+	// tenant_id unconditionally, a global row genuinely belonging to no tenant.
+	global := req.TenantID == nil || *req.TenantID == ""
+	action := telemetry.ActionConfigWrite
+	if global {
+		action = telemetry.ActionConfigGlobalWrite
+	}
+	if !h.authorize(w, r, principalID, "", action, h.metrics.ConfigWrites) {
+		if global {
+			h.metrics.GlobalScopeWrites.WithLabelValues("config", telemetry.WriteForbidden).Inc()
+		}
 		return
 	}
 
@@ -166,14 +185,17 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		Environment:          req.Environment,
 		TenantID:             req.TenantID,
 		CreatedByPrincipalID: req.CreatedByPrincipalID,
+		CallerTenantID:       tenantScope,
+		CorrelationID:        correlationID,
 	}
 
 	entry, created, err := h.store.UpsertConfigEntry(r.Context(), params)
 	if errors.Is(err, domain.ErrScopeRaceConflict) {
-		// A concurrent writer created this scope first. Nothing is wrong with the
-		// request and nothing is wrong with the database — retrying now takes the
-		// ordinary compare-and-update path. This used to answer 503, which said
-		// the opposite.
+		// A concurrent writer created this scope first. Nothing is wrong with
+		// the request and nothing is wrong with the database — retrying now
+		// takes the ordinary compare-and-update path. This used to answer 503,
+		// which said the opposite.
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteConflict).Inc()
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error":   "scope_race_conflict",
 			"key":     req.Key,
@@ -182,6 +204,7 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		h.metrics.ConfigWrites.WithLabelValues(telemetry.WriteStoreUnavailable).Inc()
 		h.log.Error("UpsertConfigEntry: store unavailable",
 			zap.String("key", req.Key),
 			zap.String("correlation_id", correlationID),
@@ -191,23 +214,25 @@ func (h *Handler) UpsertConfigEntry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// config.updated was enqueued by the store inside the same transaction, and
+	// only on a real transition — an idempotent retry writes no row and so
+	// emits no event. Nothing is published from here.
 	status := http.StatusOK
+	outcome := telemetry.WriteNoChange
 	if created {
 		status = http.StatusCreated
-		// Only a real transition is a new fact — an idempotent retry
-		// (same value already effective) must not re-emit config.updated.
-		if pubErr := h.publisher.PublishConfigUpdated(r.Context(), *entry, correlationID); pubErr != nil {
-			h.log.Error("UpsertConfigEntry: failed to publish config.updated",
-				zap.String("config_id", entry.ConfigID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(pubErr),
-			)
-		}
+		outcome = telemetry.WriteCreated
 	}
+	h.metrics.ConfigWrites.WithLabelValues(outcome).Inc()
+	if global {
+		h.metrics.GlobalScopeWrites.WithLabelValues("config", outcome).Inc()
+	}
+
 	h.log.Info("config entry upserted",
 		zap.String("config_id", entry.ConfigID),
 		zap.String("key", entry.Key),
 		zap.Bool("created", created),
+		zap.Bool("global_scope", global),
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, status, entry)
@@ -370,17 +395,24 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 
 	principalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteIdentityMissing).Inc()
 		return
 	}
-	if !h.authorize(w, r, principalID, "", ActionFeatureFlagWrite) {
+	// Same as the config path: tenant_id in the body used to decide whose flag
+	// was flipped, so a caller could turn a feature on or off for another
+	// tenant.
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteIdentityMissing).Inc()
 		return
 	}
 
 	var req upsertFeatureFlagRequest
-	if !decodeJSON(w, r, &req) {
+	if !h.decodeJSON(w, r, &req, h.metrics.FlagWrites) {
 		return
 	}
 	if missing := req.missingField(); missing != "" {
+		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": "missing_field",
 			"field": missing,
@@ -393,6 +425,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		rollout = *req.RolloutPercentage
 	}
 	if rollout < 0 || rollout > 100 {
+		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error":   "invalid_field",
 			"field":   "rollout_percentage",
@@ -401,13 +434,23 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Same as the config path: tenant_id in the body used to decide whose flag
-	// was flipped, so a caller could turn a feature on or off for another tenant.
-	tenantScope, ok := h.requireTenant(w, r)
-	if !ok {
+	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteTenantMismatch).Inc()
 		return
 	}
-	if h.refuseForeignTenant(w, req.TenantID, tenantScope) {
+
+	// See UpsertConfigEntry for why the scope decides the action. It matters
+	// more here, if anything: a global flag write is how a feature is switched
+	// on or off for every organisation in an environment at once.
+	global := req.TenantID == nil || *req.TenantID == ""
+	action := telemetry.ActionFlagWrite
+	if global {
+		action = telemetry.ActionFlagGlobalWrite
+	}
+	if !h.authorize(w, r, principalID, "", action, h.metrics.FlagWrites) {
+		if global {
+			h.metrics.GlobalScopeWrites.WithLabelValues("flag", telemetry.WriteForbidden).Inc()
+		}
 		return
 	}
 
@@ -418,14 +461,13 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		TenantID:             req.TenantID,
 		RolloutPercentage:    rollout,
 		CreatedByPrincipalID: req.CreatedByPrincipalID,
+		CallerTenantID:       tenantScope,
+		CorrelationID:        correlationID,
 	}
 
 	flag, created, err := h.store.UpsertFeatureFlag(r.Context(), params)
 	if errors.Is(err, domain.ErrScopeRaceConflict) {
-		// A concurrent writer created this scope first. Nothing is wrong with the
-		// request and nothing is wrong with the database — retrying now takes the
-		// ordinary compare-and-update path. This used to answer 503, which said
-		// the opposite.
+		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteConflict).Inc()
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error":   "scope_race_conflict",
 			"key":     req.Key,
@@ -434,6 +476,7 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		h.metrics.FlagWrites.WithLabelValues(telemetry.WriteStoreUnavailable).Inc()
 		h.log.Error("UpsertFeatureFlag: store unavailable",
 			zap.String("key", req.Key),
 			zap.String("correlation_id", correlationID),
@@ -443,21 +486,24 @@ func (h *Handler) UpsertFeatureFlag(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// feature_flag.updated was enqueued by the store in the same transaction,
+	// and only on a real transition. Nothing is published from here.
 	status := http.StatusOK
+	outcome := telemetry.WriteNoChange
 	if created {
 		status = http.StatusCreated
-		if pubErr := h.publisher.PublishFeatureFlagUpdated(r.Context(), *flag, correlationID); pubErr != nil {
-			h.log.Error("UpsertFeatureFlag: failed to publish feature_flag.updated",
-				zap.String("flag_id", flag.FlagID),
-				zap.String("correlation_id", correlationID),
-				zap.Error(pubErr),
-			)
-		}
+		outcome = telemetry.WriteCreated
 	}
+	h.metrics.FlagWrites.WithLabelValues(outcome).Inc()
+	if global {
+		h.metrics.GlobalScopeWrites.WithLabelValues("flag", outcome).Inc()
+	}
+
 	h.log.Info("feature flag upserted",
 		zap.String("flag_id", flag.FlagID),
 		zap.String("key", flag.Key),
 		zap.Bool("created", created),
+		zap.Bool("global_scope", global),
 		zap.String("correlation_id", correlationID),
 	)
 	writeJSON(w, status, flag)
@@ -580,9 +626,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // Action types this service asks authorization-svc about. Changing a config
 // value or flipping a feature flag alters platform behaviour at runtime, so
 // both are material actions under 03-microservices.md §17.1.
+//
+// Defined in internal/telemetry and re-exported here rather than declared
+// twice. The metric series for each action are pre-created from the same
+// constants, so an action the handler checks and the metrics do not know about
+// cannot exist — which is how an action name nobody grants stays invisible.
+//
+// There are FOUR, not two: writing the environment-wide default is a different
+// act from writing one organisation's value, and must be a different grant. See
+// telemetry.ActionConfigGlobalWrite for the full reasoning.
 const (
-	ActionConfigWrite      = "CONFIGURATION_WRITE"
-	ActionFeatureFlagWrite = "FEATURE_FLAG_WRITE"
+	ActionConfigWrite            = telemetry.ActionConfigWrite
+	ActionConfigGlobalWrite      = telemetry.ActionConfigGlobalWrite
+	ActionFeatureFlagWrite       = telemetry.ActionFlagWrite
+	ActionFeatureFlagGlobalWrite = telemetry.ActionFlagGlobalWrite
 )
 
 // requirePrincipal resolves the acting principal from the gateway-verified
@@ -632,7 +689,13 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 }
 
 // authorize fails closed on both a denial and an unobtainable decision.
-func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string) bool {
+//
+// The two outcomes are counted separately, and that separation is the point: a
+// denial is a permissions problem and an unobtainable decision is an outage,
+// they need opposite responses, and on the wire they are a 403 and a 503 that
+// http_requests_total cannot distinguish from any other refusal this service
+// makes.
+func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID, legalEntityID, actionType string, writes *prometheus.CounterVec) bool {
 	scope := h.authzPlatformScopeID
 	if legalEntityID != "" {
 		scope = legalEntityID
@@ -640,10 +703,19 @@ func (h *Handler) authorize(w http.ResponseWriter, r *http.Request, principalID,
 	err := h.authz.CheckAllowed(r.Context(), principalID, scope, actionType)
 	switch {
 	case err == nil:
+		h.metrics.AuthZDecisions.WithLabelValues(actionType, telemetry.AuthZGranted).Inc()
 		return true
 	case errors.Is(err, authz.ErrDenied):
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "authorization_denied"})
+		h.metrics.AuthZDecisions.WithLabelValues(actionType, telemetry.AuthZDenied).Inc()
+		writes.WithLabelValues(telemetry.WriteForbidden).Inc()
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":   "authorization_denied",
+			"action":  actionType,
+			"message": "the caller holds no grant for " + actionType,
+		})
 	default:
+		h.metrics.AuthZDecisions.WithLabelValues(actionType, telemetry.AuthZUnavailable).Inc()
+		writes.WithLabelValues(telemetry.WriteAuthzUnavailable).Inc()
 		h.log.Error("authorization check failed — refusing the mutation",
 			zap.String("principal_id", principalID),
 			zap.String("action_type", actionType),
@@ -663,14 +735,16 @@ const maxRequestBytes = 256 << 10 // 256 KiB
 // decodeJSON reads a size-capped JSON body, answering 413 rather than 400 when
 // the cap is what stopped it: "too large" and "malformed" are different faults
 // and a caller can only act on the difference.
-func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+func (h *Handler) decodeJSON(w http.ResponseWriter, r *http.Request, dst any, writes *prometheus.CounterVec) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
+			writes.WithLabelValues(telemetry.WriteTooLarge).Inc()
 			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request_too_large"})
 			return false
 		}
+		writes.WithLabelValues(telemetry.WriteInvalidRequest).Inc()
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
 		return false
 	}
