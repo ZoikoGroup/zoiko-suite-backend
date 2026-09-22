@@ -176,12 +176,12 @@ const (
 // Channels this service accepts. IN_APP is terminal inside the platform; the
 // other three hand off to a provider outside it.
 const (
-	ChannelEmail   = "EMAIL"
+	ChannelEmail = "EMAIL"
 	// ChannelSMS is NOT accepted for new notifications — the handler's
 	// supportedChannels omits it, so a send naming it is refused at the
 	// request boundary. The constant remains because historical rows carry the
 	// value and the delivery router still has to answer for them truthfully.
-	ChannelSMS = "SMS"
+	ChannelSMS     = "SMS"
 	ChannelInApp   = "IN_APP"
 	ChannelWebhook = "WEBHOOK"
 )

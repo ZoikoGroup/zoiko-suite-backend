@@ -1,0 +1,522 @@
+{
+  "info": {
+    "name": "notification-svc",
+    "description": "Manual verification for notification-svc (:8133).\n\n=== READ THIS BEFORE RUNNING ANYTHING ===\n\nThe canonical Service Input Contract (ZS-ARCH-SVC-001 v2.0 §4) is ENFORCED here in write-strict mode. Every request needs X-Tenant-Id, X-Principal-Id, X-Request-Id and X-Source-Channel; every write additionally needs Idempotency-Key AND X-Legal-Entity-Id. A request missing one is refused with 400 envelope_incomplete BEFORE any handler runs.\n\nThat is why this collection mints those headers in a COLLECTION-LEVEL pre-request script rather than listing them per request. Collections on this estate that spelled the headers out per request were all written before enforcement, and every write in them now fails — for a reason that reads like an authorization problem and is not. A script cannot be left off one request the way a header list can.\n\nThe script also mints a fresh correlation_id per run, so re-running the collection does not replay the previous run's idempotent sends and report 200s that look like failures.\n\n=== WHAT SUCCESS LOOKS LIKE ===\n\nA FAILED delivery comes back 201, deliberately: 03-microservices.md §9.7 requires that notification failure must not collapse the source workflow. Read `status` in the body, never the HTTP code, to learn whether a notice went out.\n\n=== THE HEADER PEOPLE MISS ===\n\nX-Legal-Entity-Id is mandatory on WRITES, separately from the body's legal_entity_id. This service sets LegalEntityID: RequiredOnWrite because a notification is an entity-scoped record (INV-02), so a send or a mark-read without the header is 400 envelope_incomplete before any handler runs. The script below sends it on every request.\n\n=== PREREQUISITES ===\n\n- notification-svc, postgres, authorization-svc and mailpit up (deployments/docker-compose.yml).\n- The acting principal holds NOTIFICATION_SEND and NOTIFICATION_VIEW on {{legal_entity_id}} in authorization-svc, or every write answers 403. RUNBOOK.md §'Seeding a grant' has the SQL.\n- Mail lands in mailpit at http://localhost:8025 — nothing leaves the machine.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8133" },
+    { "key": "tenant_id", "value": "11111111-1111-1111-1111-111111111111" },
+    { "key": "principal_id", "value": "33333333-3333-3333-3333-333333333333" },
+    { "key": "legal_entity_id", "value": "22222222-2222-2222-2222-222222222222" },
+    { "key": "recipient_principal_id", "value": "33333333-3333-3333-3333-333333333333" },
+    { "key": "other_tenant_id", "value": "99999999-9999-9999-9999-999999999999" },
+    {
+      "key": "run_id",
+      "value": "",
+      "description": "Set per run by the collection pre-request script. Do not edit."
+    },
+    {
+      "key": "notification_id",
+      "value": "",
+      "description": "Captured from the first send, used by the read/mark-read requests."
+    },
+    {
+      "key": "inapp_notification_id",
+      "value": "",
+      "description": "Captured from the IN_APP send — the only channel with read state."
+    }
+  ],
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// The canonical §4 envelope, minted for EVERY request in this",
+          "// collection.",
+          "//",
+          "// Not spelled out per request on purpose. Enforcement arrived after",
+          "// the collections on this estate were written, and every one that",
+          "// listed headers by hand now has at least one request missing one —",
+          "// which fails with 400 envelope_incomplete and reads like an auth",
+          "// problem. A script cannot be left off a request.",
+          "",
+          "// One run id per collection run, so a re-run does not replay the",
+          "// previous run's idempotent sends and report 200s that look like",
+          "// failures. Seeded once: pm.variables.replaceIn is per-request, so",
+          "// the guard has to be on the collection variable.",
+          "if (!pm.collectionVariables.get('run_id') || pm.info.iteration === 0 && !pm.collectionVariables.get('run_seeded')) {",
+          "  pm.collectionVariables.set('run_id', Date.now().toString(36));",
+          "  pm.collectionVariables.set('run_seeded', '1');",
+          "}",
+          "",
+          "const requestId = 'req-' + Math.random().toString(36).slice(2, 12);",
+          "",
+          "pm.request.headers.upsert({ key: 'X-Tenant-Id', value: pm.collectionVariables.get('tenant_id') });",
+          "// X-Legal-Entity-Id is NOT optional on a write here: this service sets",
+          "// LegalEntityID: RequiredOnWrite (a notification is an entity-scoped",
+          "// record, INV-02), so a send or a mark-read without it is 400",
+          "// envelope_incomplete before any handler runs. Sent on reads too, which",
+          "// is harmless and keeps the script from deciding twice over which",
+          "// requests are writes.",
+          "pm.request.headers.upsert({ key: 'X-Legal-Entity-Id', value: pm.collectionVariables.get('legal_entity_id') });",
+          "pm.request.headers.upsert({ key: 'X-Principal-Id', value: pm.collectionVariables.get('principal_id') });",
+          "pm.request.headers.upsert({ key: 'X-Request-Id', value: requestId });",
+          "pm.request.headers.upsert({ key: 'X-Source-Channel', value: 'system' });",
+          "pm.request.headers.upsert({ key: 'X-Correlation-ID', value: requestId });",
+          "",
+          "// Mandatory for material state changes only (§4, INV-08). Sending it",
+          "// on reads is harmless; omitting it on a write is a 400.",
+          "if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(pm.request.method)) {",
+          "  pm.request.headers.upsert({ key: 'Idempotency-Key', value: requestId });",
+          "}"
+        ]
+      }
+    }
+  ],
+  "item": [
+    {
+      "name": "0. Health",
+      "item": [
+        {
+          "name": "GET /healthz — liveness",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/healthz",
+            "description": "200 whenever the process is up. Says nothing about the database."
+          }
+        },
+        {
+          "name": "GET /readyz — readiness",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/readyz",
+            "description": "Pings the database pool. This is what the container healthcheck uses: liveness answers 200 with a dead pool, so a service returning 500 on every read would read as healthy."
+          }
+        },
+        {
+          "name": "GET /metrics — including the outbox gauges",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/metrics",
+            "description": "Look for notification_outbox_pending and notification_outbox_oldest_age_seconds. A pending count that is not falling means the relay is not reaching Kafka, and every governed notice concluded since then has been recorded with no consumer told."
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. Catalogue",
+      "item": [
+        {
+          "name": "GET /v1/notifications/templates",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/templates",
+            "description": "The six compiled-in templates and the variables each refuses to render without. No authorization check and no tenant SCOPE — the catalogue is compiled into the binary, is identical for every tenant and holds no tenant data. It does require a caller identity, checked in the handler: the route previously relied on the envelope middleware for that and the middleware admits reads in write-strict mode, so a bare curl with no headers returned the whole catalogue."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/templates — no identity (401 expected)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Strip what the collection script just added, to prove the",
+                  "// service fails CLOSED rather than serving an unattributed",
+                  "// request.",
+                  "pm.request.headers.remove('X-Principal-Id');",
+                  "pm.request.headers.remove('X-Tenant-Id');"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/templates"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Send",
+      "item": [
+        {
+          "name": "1. POST — IN_APP, free text (201, status SENT)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('notification_id', body.notification_id);",
+                  "pm.collectionVariables.set('inapp_notification_id', body.notification_id);",
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "// IN_APP is the one channel that can honestly claim receipt:",
+                  "// the register row IS the delivery.",
+                  "pm.test('status is SENT', () => pm.expect(body.status).to.eql('SENT'));",
+                  "pm.test('no external address', () => pm.expect(body.recipient_address).to.be.undefined);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"IN_APP\",\n  \"subject\": \"Payroll cutoff approaching\",\n  \"body\": \"Cutoff for the next payroll run is Friday.\",\n  \"source_event_type\": \"PAYROLL_RUN\",\n  \"source_reference\": \"pr-2026-09\",\n  \"correlation_id\": \"pm-{{run_id}}-inapp\"\n}"
+            },
+            "description": "IN_APP is delivered by being recorded. It carries read state, and it is the only channel on which SENT means the recipient can actually see it."
+          }
+        },
+        {
+          "name": "2. POST — same correlation_id (200 replay, NOT a second notice)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 replay, not 201', () => pm.response.to.have.status(200));",
+                  "pm.test('same notification id', () =>",
+                  "  pm.expect(pm.response.json().notification_id).to.eql(pm.collectionVariables.get('notification_id')));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"IN_APP\",\n  \"subject\": \"Payroll cutoff approaching\",\n  \"body\": \"Cutoff for the next payroll run is Friday.\",\n  \"correlation_id\": \"pm-{{run_id}}-inapp\"\n}"
+            },
+            "description": "Idempotent on (tenant_id, correlation_id). A retried send resolves to the ORIGINAL notification rather than delivering a second copy. Note the body differs from request 1 in nothing that matters — the correlation id is what decides."
+          }
+        },
+        {
+          "name": "3. POST — EMAIL with a caller-supplied address (201, provenance REQUEST)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "// The override is recorded as such. An address the identity",
+                  "// authority vouched for and one handed over in the request",
+                  "// must stay distinguishable after the fact (§0.4).",
+                  "pm.test('provenance is REQUEST', () => pm.expect(body.recipient_address_source).to.eql('REQUEST'));",
+                  "// SENT here means a provider ACCEPTED it. Not that it arrived.",
+                  "pm.test('acceptance evidence recorded', () => {",
+                  "  if (body.status === 'SENT') pm.expect(body.provider_response).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"EMAIL\",\n  \"subject\": \"Invoice approval required\",\n  \"body\": \"Invoice INV-100 needs your approval.\",\n  \"recipient_address\": \"someone@example.com\",\n  \"correlation_id\": \"pm-{{run_id}}-email\"\n}"
+            },
+            "description": "Check mailpit at http://localhost:8025 — the message is there, and nothing left the machine. The override exists for recipients who are not established principals yet; normally leave recipient_address out and let identity-context-svc answer."
+          }
+        },
+        {
+          "name": "4. POST — template render (201)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"EMAIL\",\n  \"template\": \"registration_received\",\n  \"variables\": {\n    \"organization_name\": \"Northwind Trading Ltd\"\n  },\n  \"recipient_address\": \"founder@northwind.example\",\n  \"correlation_id\": \"pm-{{run_id}}-template\"\n}"
+            },
+            "description": "The template supplies its own subject and body. Values are escaped by the service for the context each lands in, so an organization name containing markup arrives as text."
+          }
+        },
+        {
+          "name": "5. POST — template AND subject (400 conflicting_content)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('conflicting_content', () => pm.expect(pm.response.json().error).to.eql('conflicting_content'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"EMAIL\",\n  \"template\": \"registration_received\",\n  \"subject\": \"My own subject\",\n  \"correlation_id\": \"pm-{{run_id}}-conflict\"\n}"
+            },
+            "description": "Mutually exclusive. Accepting both would leave it ambiguous which one the recipient actually received."
+          }
+        },
+        {
+          "name": "6. POST — template missing a variable (400 missing_template_variables)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"EMAIL\",\n  \"template\": \"registration_received\",\n  \"variables\": {},\n  \"recipient_address\": \"founder@northwind.example\",\n  \"correlation_id\": \"pm-{{run_id}}-novars\"\n}"
+            },
+            "description": "Refusing beats sending a message with a blank organization name or an empty login link."
+          }
+        },
+        {
+          "name": "7. POST — SMS (400 unsupported_channel, NOT a stored FAILED row)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('unsupported_channel', () => pm.expect(pm.response.json().error).to.eql('unsupported_channel'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"SMS\",\n  \"subject\": \"Withdrawn channel\",\n  \"correlation_id\": \"pm-{{run_id}}-sms\"\n}"
+            },
+            "description": "SMS was accepted, resolved a recipient, and then failed every send — a channel advertising a capability the platform does not have. It is now refused at the boundary like any unrecognised channel. Nothing is recorded: a caller's typo used to leave a permanent FAILED row and a notification.failed event describing an attempt no provider ever saw."
+          }
+        },
+        {
+          "name": "8. POST — no Idempotency-Key (400 envelope_incomplete)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.request.headers.remove('Idempotency-Key');"]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('refused by the envelope, before any handler', () =>",
+                  "  pm.expect(pm.response.json().error).to.eql('envelope_incomplete'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": "{{base_url}}/v1/notifications/",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"recipient_principal_id\": \"{{recipient_principal_id}}\",\n  \"legal_entity_id\": \"{{legal_entity_id}}\",\n  \"channel\": \"IN_APP\",\n  \"subject\": \"Should never be recorded\",\n  \"correlation_id\": \"pm-{{run_id}}-noidem\"\n}"
+            },
+            "description": "This is the request that every pre-enforcement collection on the estate accidentally makes on EVERY write. It is refused before a handler runs, so nothing is recorded."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Register reads",
+      "item": [
+        {
+          "name": "GET /v1/notifications/?legal_entity_id=… — the ENTITY's register",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/?legal_entity_id={{legal_entity_id}}&limit=20",
+            "description": "Authorized against the entity (NOTIFICATION_VIEW), not merely filtered by tenant. Newest first."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/ — the CALLER's own inbox",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/",
+            "description": "Omitting legal_entity_id is a DIFFERENT read: the recipient filter is forced to the calling principal. Authorization used to be conditional on the filter being present, so omitting it — the easier request — returned every notification in the tenant to a principal holding no grant at all."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/?recipient_principal_id=someone-else (403)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": ["pm.test('403', () => pm.response.to.have.status(403));"]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/?recipient_principal_id=44444444-4444-4444-4444-444444444444",
+            "description": "Refused rather than silently rewritten to the caller. Reading someone else's notices requires legal_entity_id and a grant on it."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/?unread_only=true",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/?unread_only=true",
+            "description": "Implies IN_APP. read_at is NULL for every email and always will be, so an unfiltered unread read would report every email ever sent as unread."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/{id}",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/{{notification_id}}",
+            "description": "Authorized against the notification's OWN legal entity, read from the record rather than from the request."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/{id} — other tenant (404, not 403)",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.request.headers.upsert({ key: 'X-Tenant-Id', value: pm.collectionVariables.get('other_tenant_id') });"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404, not 403', () => pm.response.to.have.status(404));",
+                  "pm.test('notification_not_found', () =>",
+                  "  pm.expect(pm.response.json().error).to.eql('notification_not_found'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/{{notification_id}}",
+            "description": "Row-level security hides another tenant's notification. Telling a caller that an id exists elsewhere is itself a disclosure, so the answer is the same one an unknown id gets."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/not-a-uuid (404, not 503)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/not-a-uuid",
+            "description": "An id that cannot be a UUID names no notification, which is what not found means. The driver's cast failure used to surface as 503 store_unavailable — an outage status for a typo in a URL."
+          }
+        },
+        {
+          "name": "GET /v1/notifications/?limit=9999 (400 invalid_limit)",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/?limit=9999",
+            "description": "1–500."
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Inbox",
+      "item": [
+        {
+          "name": "GET /v1/notifications/unread-count",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/v1/notifications/unread-count",
+            "description": "The number on the bell. There is no principal parameter, deliberately: a per-principal unread total anyone could query would report on colleagues' attention."
+          }
+        },
+        {
+          "name": "POST /v1/notifications/{id}/read — the IN_APP notice (200)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('read_at set', () => pm.expect(pm.response.json().read_at).to.be.a('string'));",
+                  "pm.collectionVariables.set('first_read_at', pm.response.json().read_at);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/v1/notifications/{{inapp_notification_id}}/read",
+            "description": "Only the RECIPIENT may do this. A NOTIFICATION_VIEW grant lets an administrator read the register, and reading the register is not the recipient reading their notice — it must not clear their badge."
+          }
+        },
+        {
+          "name": "POST /v1/notifications/{id}/read — again (200, ORIGINAL read_at)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('keeps the FIRST read', () =>",
+                  "  pm.expect(pm.response.json().read_at).to.eql(pm.collectionVariables.get('first_read_at')));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/v1/notifications/{{inapp_notification_id}}/read",
+            "description": "Idempotent, and it keeps the first read. Inboxes re-issue this on every render; without the COALESCE, 'when did they first see this' would decay into 'when did they last look'."
+          }
+        },
+        {
+          "name": "POST /v1/notifications/{id}/read — an EMAIL (400 channel_has_no_read_state)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/v1/notifications/{{notification_id}}/read",
+            "description": "Run this against an EMAIL notification's id. This service cannot observe whether a message delivered by an external provider was opened, and does not pretend to. (If {{notification_id}} is the IN_APP one, this returns 200 instead — set it to the EMAIL send's id first.)"
+          }
+        }
+      ]
+    }
+  ]
+}

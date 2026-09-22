@@ -1,9 +1,10 @@
-﻿package handler_test
+package handler_test
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/retry"
@@ -25,6 +27,9 @@ type stubStore struct {
 	byCorr     map[string]string // correlation_id -> notification_id
 	lastFilter domain.ListFilter
 	scheduled  []scheduledRetry
+	// events records what CompleteDelivery was asked to enqueue, in order.
+	// The store IS the event log now — see CompleteDelivery below.
+	events []events.Outbound
 }
 
 func newStubStore() *stubStore {
@@ -73,11 +78,20 @@ func (s *stubStore) ListNotifications(_ context.Context, f domain.ListFilter) ([
 	return out, nil
 }
 
-func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error {
+func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, ev events.Outbound) error {
 	n, ok := s.byID[id]
 	if !ok {
 		return domain.ErrNotificationNotFound
 	}
+	// The event is recorded HERE rather than by a separate publisher stub,
+	// because that is now the contract: a delivery concludes and its event is
+	// enqueued in one transaction. A stub that accepted the conclusion and
+	// discarded the event would let the very defect migration 000005 closed
+	// pass every test in this file.
+	if ev.EventType == "" {
+		return errors.New("CompleteDelivery called with no event")
+	}
+	s.events = append(s.events, ev)
 	n.Status = newStatus
 	n.FailureReason = failureReason
 	n.ProviderResponse = providerResponse
@@ -134,13 +148,26 @@ func (s *stubStore) CountUnread(_ context.Context, recipientPrincipalID string) 
 	return count, nil
 }
 
-type stubPublisher struct {
-	sent, failed int
-}
+// eventCounts summarises what the store was asked to enqueue.
+//
+// It replaces a stubPublisher that counted PublishSent/PublishFailed calls.
+// Those methods no longer exist: publishing after the commit was the defect,
+// and the events are now sealed into the same transaction as the conclusion.
+// Counting them off the store is what keeps these assertions honest — they
+// measure the event the database would hold, not a call the handler made.
+type eventCounts struct{ sent, failed int }
 
-func (p *stubPublisher) PublishSent(_ context.Context, _ string, _ domain.Notification) { p.sent++ }
-func (p *stubPublisher) PublishFailed(_ context.Context, _ string, _ domain.Notification, _ string) {
-	p.failed++
+func (s *stubStore) eventCounts() eventCounts {
+	var c eventCounts
+	for _, ev := range s.events {
+		switch ev.EventType {
+		case events.TypeSent:
+			c.sent++
+		case events.TypeFailed:
+			c.failed++
+		}
+	}
+	return c
 }
 
 type stubAuthZ struct {
@@ -193,18 +220,18 @@ func (s *stubResolver) ResolveEmail(_ context.Context, _, _, _ string) (string, 
 
 // â”€â”€ router factory â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-func newRouter(s *stubStore, pub *stubPublisher, authz *stubAuthZ) chi.Router {
-	return newRouterWith(s, pub, authz, &stubDeliverer{delivered: true, reason: "delivered via stub"}, "tenant-abc")
+func newRouter(s *stubStore, authz *stubAuthZ) chi.Router {
+	return newRouterWith(s, authz, &stubDeliverer{delivered: true, reason: "delivered via stub"}, "tenant-abc")
 }
 
 // newRouterWith supplies a resolver that always succeeds, so the tests that
 // predate recipient resolution keep testing what they were written to test.
 // The resolution paths have their own tests below, which pass an explicit one.
-func newRouterWith(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handler.Deliverer, tenantID string) chi.Router {
-	return newRouterFull(s, pub, authz, del, &stubResolver{email: "recipient@example.com"}, tenantID)
+func newRouterWith(s *stubStore, authz *stubAuthZ, del handler.Deliverer, tenantID string) chi.Router {
+	return newRouterFull(s, authz, del, &stubResolver{email: "recipient@example.com"}, tenantID)
 }
 
-func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handler.Deliverer,
+func newRouterFull(s *stubStore, authz *stubAuthZ, del handler.Deliverer,
 	res handler.RecipientResolver, tenantID string) chi.Router {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
@@ -216,8 +243,10 @@ func newRouterFull(s *stubStore, pub *stubPublisher, authz *stubAuthZ, del handl
 		})
 	})
 	h := handler.New(handler.Deps{
-		Store:     s,
-		Publisher: pub,
+		Store: s,
+		// Metrics deliberately left nil. The handler must work without them —
+		// they are observability, not behaviour — and a nil here is what proves
+		// the guards around every metric call are real.
 		AuthZ:     authz,
 		Deliverer: del,
 		Recipient: res,
@@ -249,7 +278,7 @@ func doReq(r chi.Router, method, path string, body any, principalID string) *htt
 // â”€â”€ SendNotification tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestSendNotification_MissingPrincipal(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
 		"legal_entity_id":        "le-us",
@@ -263,7 +292,7 @@ func TestSendNotification_MissingPrincipal(t *testing.T) {
 }
 
 func TestSendNotification_AuthzDenied(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{err: domain.ErrAuthorizationDenied})
+	r := newRouter(newStubStore(), &stubAuthZ{err: domain.ErrAuthorizationDenied})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
 		"legal_entity_id":        "le-us",
@@ -277,8 +306,8 @@ func TestSendNotification_AuthzDenied(t *testing.T) {
 }
 
 func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
-	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	store := newStubStore()
+	r := newRouter(store, &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -302,8 +331,8 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 	if n.SentAt == nil {
 		t.Error("expected sent_at to be set")
 	}
-	if pub.sent != 1 || pub.failed != 0 {
-		t.Errorf("expected 1 sent event, 0 failed, got sent=%d failed=%d", pub.sent, pub.failed)
+	if store.eventCounts().sent != 1 || store.eventCounts().failed != 0 {
+		t.Errorf("expected 1 sent event, 0 failed, got sent=%d failed=%d", store.eventCounts().sent, store.eventCounts().failed)
 	}
 }
 
@@ -312,9 +341,8 @@ func TestSendNotification_SupportedChannel_Sent(t *testing.T) {
 // a typo produced a stored FAILED record and a notification.failed event,
 // evidence of an attempt no provider ever saw.
 func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelivery(t *testing.T) {
-	pub := &stubPublisher{}
 	store := newStubStore()
-	r := newRouter(store, pub, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -330,8 +358,8 @@ func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelive
 	if len(store.byID) != 0 {
 		t.Errorf("a rejected channel must not leave a notification record, found %d", len(store.byID))
 	}
-	if pub.failed != 0 {
-		t.Errorf("a rejected channel must not publish notification.failed, got %d", pub.failed)
+	if store.eventCounts().failed != 0 {
+		t.Errorf("a rejected channel must not publish notification.failed, got %d", store.eventCounts().failed)
 	}
 }
 
@@ -339,8 +367,8 @@ func TestSendNotification_UnsupportedChannel_IsRejectedNotRecordedAsFailedDelive
 // constraint (03-microservices.md Â§9.7) is that a notification failure must
 // not collapse the workflow that raised it.
 func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T) {
-	pub := &stubPublisher{}
-	r := newRouterWith(newStubStore(), pub, &stubAuthZ{},
+	store := newStubStore()
+	r := newRouterWith(store, &stubAuthZ{},
 		&stubDeliverer{delivered: false, reason: "provider rejected the recipient address"}, "tenant-abc")
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
@@ -362,8 +390,8 @@ func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T)
 	if n.FailureReason == "" {
 		t.Error("expected a failure_reason to be recorded")
 	}
-	if pub.failed != 1 || pub.sent != 0 {
-		t.Errorf("expected 1 failed event, 0 sent, got sent=%d failed=%d", pub.sent, pub.failed)
+	if store.eventCounts().failed != 1 || store.eventCounts().sent != 0 {
+		t.Errorf("expected 1 failed event, 0 sent, got sent=%d failed=%d", store.eventCounts().sent, store.eventCounts().failed)
 	}
 }
 
@@ -377,8 +405,7 @@ func TestSendNotification_DeliveryRefused_RecordsFailedButStill201(t *testing.T)
 // handler concluded every one of them FAILED regardless.
 func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T) {
 	store := newStubStore()
-	pub := &stubPublisher{}
-	r := newRouterWith(store, pub, &stubAuthZ{},
+	r := newRouterWith(store, &stubAuthZ{},
 		&stubDeliverer{delivered: false, retryable: true, reason: "dial tcp: connection refused"},
 		"tenant-abc")
 
@@ -415,9 +442,9 @@ func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T)
 	if len(store.scheduled) != 1 {
 		t.Fatalf("store.scheduled = %v, want exactly one scheduled retry", store.scheduled)
 	}
-	if pub.sent != 0 || pub.failed != 0 {
+	if store.eventCounts().sent != 0 || store.eventCounts().failed != 0 {
 		t.Errorf("published sent=%d failed=%d, want nothing published while a retry is pending",
-			pub.sent, pub.failed)
+			store.eventCounts().sent, store.eventCounts().failed)
 	}
 }
 
@@ -426,8 +453,7 @@ func TestSendNotification_TransientFailure_IsScheduledNotConcluded(t *testing.T)
 // change.
 func TestSendNotification_SettledFailure_ConcludesImmediately(t *testing.T) {
 	store := newStubStore()
-	pub := &stubPublisher{}
-	r := newRouterWith(store, pub, &stubAuthZ{},
+	r := newRouterWith(store, &stubAuthZ{},
 		&stubDeliverer{delivered: false, retryable: false, reason: "550 no such mailbox"},
 		"tenant-abc")
 
@@ -451,14 +477,14 @@ func TestSendNotification_SettledFailure_ConcludesImmediately(t *testing.T) {
 	if len(store.scheduled) != 0 {
 		t.Errorf("store.scheduled = %v, want nothing scheduled", store.scheduled)
 	}
-	if pub.failed != 1 {
-		t.Errorf("published failed=%d, want 1 for a concluded failure", pub.failed)
+	if store.eventCounts().failed != 1 {
+		t.Errorf("published failed=%d, want 1 for a concluded failure", store.eventCounts().failed)
 	}
 }
 
 func TestSendNotification_IdempotentReplay(t *testing.T) {
-	pub := &stubPublisher{}
-	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	store := newStubStore()
+	r := newRouter(store, &stubAuthZ{})
 
 	body := map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -483,15 +509,15 @@ func TestSendNotification_IdempotentReplay(t *testing.T) {
 		t.Fatalf("retried send resolved to a different notification_id (%s) than the original (%s)", n2.NotificationID, n1.NotificationID)
 	}
 	// A retry must not re-send â€” exactly one sent event across both requests.
-	if pub.sent != 1 {
-		t.Errorf("expected exactly 1 sent event across both requests, got %d", pub.sent)
+	if store.eventCounts().sent != 1 {
+		t.Errorf("expected exactly 1 sent event across both requests, got %d", store.eventCounts().sent)
 	}
 }
 
 // â”€â”€ GetNotification / ListNotifications tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 func TestGetNotification_NotFound(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/does-not-exist", nil, "principal-1")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 got %d", rr.Code)
@@ -499,7 +525,7 @@ func TestGetNotification_NotFound(t *testing.T) {
 }
 
 func TestListNotifications_EmptyIsEmptyArrayNotNull(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/", nil, "principal-1")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d", rr.Code)
@@ -517,7 +543,7 @@ func TestListNotifications_EmptyIsEmptyArrayNotNull(t *testing.T) {
 func TestListNotifications_WithoutLegalEntity_IsScopedToCallersOwnInbox(t *testing.T) {
 	store := newStubStore()
 	authz := &stubAuthZ{}
-	r := newRouter(store, &stubPublisher{}, authz)
+	r := newRouter(store, authz)
 
 	rr := doReq(r, http.MethodGet, "/v1/notifications/", nil, "principal-1")
 	if rr.Code != http.StatusOK {
@@ -530,7 +556,7 @@ func TestListNotifications_WithoutLegalEntity_IsScopedToCallersOwnInbox(t *testi
 }
 
 func TestListNotifications_OtherRecipientWithoutLegalEntity_IsRefused(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/?recipient_principal_id=someone-else", nil, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 reading another principal's inbox unscoped, got %d: %s", rr.Code, rr.Body.String())
@@ -539,7 +565,7 @@ func TestListNotifications_OtherRecipientWithoutLegalEntity_IsRefused(t *testing
 
 func TestListNotifications_WithLegalEntity_IsAuthorized(t *testing.T) {
 	authz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
-	r := newRouter(newStubStore(), &stubPublisher{}, authz)
+	r := newRouter(newStubStore(), authz)
 	rr := doReq(r, http.MethodGet, "/v1/notifications/?legal_entity_id=le-us", nil, "principal-1")
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 got %d", rr.Code)
@@ -552,7 +578,7 @@ func TestListNotifications_WithLegalEntity_IsAuthorized(t *testing.T) {
 // A missing tenant scope used to be noticed first by the store, which reported
 // it as 503 store_unavailable â€” an outage status for a forgotten header.
 func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
-	r := newRouterWith(newStubStore(), &stubPublisher{}, &stubAuthZ{},
+	r := newRouterWith(newStubStore(), &stubAuthZ{},
 		&stubDeliverer{delivered: true}, "")
 
 	for _, tc := range []struct{ name, method, path string }{
@@ -582,7 +608,7 @@ func TestRequests_WithoutTenantScope_Are401NotServiceUnavailable(t *testing.T) {
 // A misspelled field used to be discarded silently, so the caller got a 201
 // for a notification that did not say what they wrote.
 func TestSendNotification_UnknownField_IsRejected(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
 		"legal_entity_id":        "le-us",
@@ -598,7 +624,7 @@ func TestSendNotification_UnknownField_IsRejected(t *testing.T) {
 
 func TestListNotifications_PagingIsValidated(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{})
 
 	for _, q := range []string{"?limit=abc", "?limit=0", "?limit=100000", "?offset=-1"} {
 		rr := doReq(r, http.MethodGet, "/v1/notifications/"+q, nil, "principal-1")

@@ -29,6 +29,7 @@ import (
 	"zoiko.io/notification-svc/internal/identity"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
+	"zoiko.io/notification-svc/internal/outbox"
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/telemetry"
@@ -75,6 +76,11 @@ func main() {
 	}()
 
 	metrics := telemetry.NewMetrics("notification-svc")
+	// Domain metrics, separate from the HTTP ones above because every
+	// interesting failure in this service answers 2xx — a FAILED delivery is a
+	// 201 by design, and so is one rescheduled after a transient failure. See
+	// internal/telemetry/domain.go.
+	domainMetrics := telemetry.NewDomain("notification-svc")
 
 	// ── 3. Database pool ──────────────────────────────────────────────────────
 	poolCfg, err := pgxpool.ParseConfig(cfg.DB.DSN())
@@ -257,7 +263,7 @@ func main() {
 
 	h := handler.New(handler.Deps{
 		Store:       pgStore,
-		Publisher:   publisher,
+		Metrics:     domainMetrics,
 		AuthZ:       authzClient,
 		Deliverer:   deliverer,
 		Recipient:   identityClient,
@@ -278,14 +284,39 @@ func main() {
 	defer stopWorker()
 
 	retryWorker := retry.NewWorker(
-		pgStore, deliverer, publisher, identityClient, identity.IsSettled,
+		pgStore, deliverer, domainMetrics, identityClient, identity.IsSettled,
 		retry.Options{
-			Interval:      cfg.Retry.Interval,
-			BatchSize:     cfg.Retry.BatchSize,
-			Policy:        retryPolicy,
-			StrandedAfter: cfg.Retry.StrandedAfter,
+			Interval:          cfg.Retry.Interval,
+			BatchSize:         cfg.Retry.BatchSize,
+			Policy:            retryPolicy,
+			StrandedAfter:     cfg.Retry.StrandedAfter,
+			StrandedReclaimed: domainMetrics.StrandedReclaimedTotal,
+			RetriesExhausted:  domainMetrics.RetriesExhaustedTotal,
 		}, log)
 	go retryWorker.Start(workerCtx)
+
+	// ── 6b. Outbox relay ─────────────────────────────────────────────────────
+	//
+	// The two notification events are now committed into event_outbox by the
+	// same transaction that concludes a delivery, and this loop is what carries
+	// them to Kafka. Before it existed the handler and the worker each wrote to
+	// the broker directly after committing and logged the error if that failed,
+	// so a broker hiccup at the moment a notice concluded lost the only record
+	// that it had gone out — silently, with a 201 and a healthy-looking
+	// register. See migration 000005.
+	//
+	// Started unconditionally, including when KAFKA_BROKERS is empty. A
+	// deployment with no broker still enqueues (the enqueue is part of the
+	// delivery transaction and cannot be conditional), so without a relay
+	// draining it the outbox would grow without bound behind a service that
+	// looks entirely healthy. Publisher.Publish treats a nil producer as a
+	// successful dry-run write, which is what makes that drain correct rather
+	// than merely quiet.
+	//
+	// It shares workerCtx with the retry worker, so both stop on the same
+	// cancel during shutdown.
+	relay := outbox.NewRelay(pgStore, publisher, domainMetrics, log)
+	go relay.Run(workerCtx)
 
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)

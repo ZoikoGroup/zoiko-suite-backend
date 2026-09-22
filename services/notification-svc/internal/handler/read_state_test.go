@@ -39,7 +39,7 @@ func inAppTo(recipient, correlationID string) map[string]any {
 
 func TestMarkRead_RecipientMarksTheirOwnNotice(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{})
 
 	created := send(t, r, "sender-1", inAppTo("employee-9", "corr-1"))
 	if created.ReadAt != nil {
@@ -67,7 +67,7 @@ func TestMarkRead_OnlyTheRecipientMayMark(t *testing.T) {
 	store := newStubStore()
 	// An authz stub that grants everything, so the refusal below cannot be
 	// mistaken for a missing permission.
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{})
 
 	created := send(t, r, "sender-1", inAppTo("employee-9", "corr-1"))
 
@@ -85,7 +85,7 @@ func TestMarkRead_OnlyTheRecipientMayMark(t *testing.T) {
 // one would move read_at forward, and "when did they first see this" would
 // decay into "when did they last look".
 func TestMarkRead_KeepsTheFirstRead(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	created := send(t, r, "sender-1", inAppTo("employee-9", "corr-1"))
 
 	first := doReq(r, http.MethodPost, "/v1/notifications/"+created.NotificationID+"/read", nil, "employee-9")
@@ -106,7 +106,7 @@ func TestMarkRead_KeepsTheFirstRead(t *testing.T) {
 // This service cannot know whether an email was opened. Accepting a read mark
 // on one would record an assertion it has no way to make.
 func TestMarkRead_RefusedForChannelsWithNoReadState(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 
 	created := send(t, r, "sender-1", map[string]any{
 		"recipient_principal_id": "employee-9",
@@ -123,7 +123,7 @@ func TestMarkRead_RefusedForChannelsWithNoReadState(t *testing.T) {
 }
 
 func TestMarkRead_UnknownNotification(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/00000000-0000-0000-0000-000000000000/read", nil, "employee-9")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", rr.Code)
@@ -131,7 +131,7 @@ func TestMarkRead_UnknownNotification(t *testing.T) {
 }
 
 func TestMarkRead_RequiresIdentity(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodPost, "/v1/notifications/some-id/read", nil, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
@@ -142,7 +142,7 @@ func TestMarkRead_RequiresIdentity(t *testing.T) {
 
 func TestUnreadCount_CountsOnlyTheCallersUnreadInAppNotices(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{})
 
 	mine1 := send(t, r, "sender-1", inAppTo("employee-9", "corr-1"))
 	send(t, r, "sender-1", inAppTo("employee-9", "corr-2"))
@@ -172,7 +172,7 @@ func TestUnreadCount_CountsOnlyTheCallersUnreadInAppNotices(t *testing.T) {
 }
 
 func TestUnreadCount_RequiresIdentity(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/unread-count", nil, "")
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d", rr.Code)
@@ -181,7 +181,7 @@ func TestUnreadCount_RequiresIdentity(t *testing.T) {
 
 // chi must not capture "unread-count" as a notification id.
 func TestUnreadCount_IsNotRoutedAsANotificationID(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 	rr := doReq(r, http.MethodGet, "/v1/notifications/unread-count", nil, "employee-9")
 	if rr.Code == http.StatusNotFound {
 		t.Fatal("unread-count was routed to GetNotification and answered 404")
@@ -211,7 +211,7 @@ func unreadCount(t *testing.T, r chi.Router, principalID string) int {
 
 func TestListNotifications_UnreadOnlyReachesTheStore(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{})
 
 	doReq(r, http.MethodGet, "/v1/notifications/?unread_only=true", nil, "employee-9")
 	if !store.lastFilter.UnreadOnly {

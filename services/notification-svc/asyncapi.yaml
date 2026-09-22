@@ -1,0 +1,271 @@
+asyncapi: 2.6.0
+
+# notification-svc events — Doc 03 §9.7 and §19.
+#
+# ── Exactly one event per notification ───────────────────────────────────────
+#
+# A notification emits ONE event, at the moment its delivery concludes. Nothing
+# is emitted when it is created, and nothing is emitted when a transient failure
+# is rescheduled. Both omissions are deliberate and load-bearing:
+#
+#   - A notification awaiting another attempt has NOT failed. Emitting
+#     notification.failed there and notification.sent two minutes later would
+#     have consumers act on an outcome that did not happen — an escalation
+#     raised against a payslip notice that was delivered on the next try.
+#   - Creation is not an outcome. A consumer learning that a notice was accepted
+#     for delivery learns nothing it can act on.
+#
+# So: one event, at the SENT or FAILED transition, and `delivery_attempts` on
+# the payload says how much work that took.
+#
+# ── The events are outbox-backed ─────────────────────────────────────────────
+#
+# Every event below is written to `event_outbox` by the SAME transaction that
+# records the delivery conclusion (migration 000005), and internal/outbox drains
+# it to Kafka in a background loop that retries until the write lands.
+#
+# Before that, both producers wrote to Kafka directly after committing, with the
+# error logged and discarded. A broker hiccup at the moment a notice concluded
+# left the delivery correctly recorded, the caller correctly told 201, and no
+# consumer anywhere ever learning the notice went out or that it did not —
+# silently, because the one thing that would have reported the loss was the
+# event that was lost. Delivery is now at-least-once rather than at-most-once:
+# a duplicate makes a consumer re-handle an event it can detect by `event_id`,
+# where a lost one leaves a governed notice whose issue nobody was ever told
+# about.
+#
+# ── No message content on the wire ───────────────────────────────────────────
+#
+# Neither payload carries `subject`, `body` or `recipient_address`. The content
+# of a notice is the most sensitive thing this service holds and the topic is
+# readable by every consumer on the bus; a consumer that needs the content reads
+# the register under its own authorization. Asserted by a test, not just stated.
+
+info:
+  title: notification-svc events
+  version: "1.0.0"
+  description: |
+    Governed delivery outcomes for workflows, deadlines, escalations, approvals
+    and status changes.
+
+    Consumers that page a human on a failed notice should subscribe to
+    `notification.failed`. Consumers building a delivery audit should subscribe
+    to both and treat `notification_id` as the aggregate.
+
+defaultContentType: application/json
+
+servers:
+  local:
+    url: kafka:9094
+    protocol: kafka
+    description: Compose broker. KAFKA_BROKERS empty means "this deployment has no bus" — the relay then dry-runs rather than growing a backlog nothing will drain.
+
+channels:
+  zoiko.notification.events:
+    description: |
+      Every event this service produces. One topic, keyed by `notification_id`
+      so that events about one notification stay ordered on one partition.
+
+      The topic name is `KAFKA_EVENTS_TOPIC` and defaults to
+      `zoiko.notification.events`.
+    subscribe:
+      operationId: consumeNotificationEvents
+      message:
+        oneOf:
+          - $ref: '#/components/messages/NotificationSent'
+          - $ref: '#/components/messages/NotificationFailed'
+
+components:
+  messages:
+    NotificationSent:
+      name: notification.sent
+      title: A notification's delivery concluded successfully
+      summary: |
+        A provider accepted the message. For IN_APP this genuinely means
+        delivered — the register row IS the delivery. For EMAIL it means a mail
+        provider took it, and NOTHING MORE: ZS-SVC-Y-001 §0.4 forbids treating
+        provider acceptance as proof that a person received, read or was legally
+        served with a notice. `provider_response` is the acceptance evidence.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Envelope'
+      examples:
+        - name: emailAccepted
+          payload:
+            event_id: evt-7b0f5a2c-2f5e-4c31-9b2a-1d0a3f4e5b6c
+            event_type: notification.sent
+            event_version: "1.0"
+            emitted_at: "2026-09-22T10:14:02.431Z"
+            schema_version: "1.0"
+            source_service: notification-svc
+            tenant_id: 11111111-1111-1111-1111-111111111111
+            legal_entity_id: 22222222-2222-2222-2222-222222222222
+            actor_id: 33333333-3333-3333-3333-333333333333
+            correlation_id: corr-payroll-2026-09-cutoff
+            payload:
+              notification_id: 9c2f0a11-5d3b-4a77-9f01-6b2c8e4d0a15
+              tenant_id: 11111111-1111-1111-1111-111111111111
+              legal_entity_id: 22222222-2222-2222-2222-222222222222
+              recipient_principal_id: 44444444-4444-4444-4444-444444444444
+              channel: EMAIL
+              source_event_type: PAYROLL_RUN
+              source_reference: pr-2026-09
+              sent_at: "2026-09-22T10:14:02.402Z"
+              provider_response: "250 2.0.0 Ok: queued as 4X9kT2"
+              delivery_attempts: 1
+
+    NotificationFailed:
+      name: notification.failed
+      title: A notification's delivery failed terminally
+      summary: |
+        TERMINAL. Not emitted for a transient failure that has been rescheduled
+        — that notification is still PENDING and may yet be delivered.
+
+        `delivery_attempts` distinguishes a first-attempt refusal (a mailbox
+        that does not exist) from an exhausted budget (a relay that never came
+        back); `failure_reason` names which, and says so in words when the
+        budget ran out.
+      contentType: application/json
+      payload:
+        $ref: '#/components/schemas/Envelope'
+      examples:
+        - name: mailboxRejected
+          payload:
+            event_id: evt-2a1c9f84-7e33-4b5a-8c10-9de2f4a7b331
+            event_type: notification.failed
+            event_version: "1.0"
+            emitted_at: "2026-09-22T10:15:44.118Z"
+            schema_version: "1.0"
+            source_service: notification-svc
+            tenant_id: 11111111-1111-1111-1111-111111111111
+            legal_entity_id: 22222222-2222-2222-2222-222222222222
+            actor_id: 33333333-3333-3333-3333-333333333333
+            correlation_id: corr-reg-northwind
+            payload:
+              notification_id: 1f7d4b62-0c8e-49a1-b3d5-77ac2e9f0b48
+              tenant_id: 11111111-1111-1111-1111-111111111111
+              legal_entity_id: 22222222-2222-2222-2222-222222222222
+              recipient_principal_id: 44444444-4444-4444-4444-444444444444
+              channel: EMAIL
+              source_event_type: ORGANIZATION_REGISTRATION
+              source_reference: org-northwind
+              failure_reason: "550 5.1.1 no such mailbox"
+              delivery_attempts: 1
+              failed_at: "2026-09-22T10:15:44.090Z"
+
+  schemas:
+    Envelope:
+      type: object
+      description: |
+        The platform event contract, Doc 03 §19. Built at ENQUEUE time, inside
+        the delivery transaction, and stored byte for byte — the relay runs long
+        after the request that caused the send is gone, so the actor and the
+        correlation id could not be recovered at publish time.
+      required:
+        - event_id
+        - event_type
+        - event_version
+        - emitted_at
+        - schema_version
+        - source_service
+        - correlation_id
+        - payload
+      properties:
+        event_id:
+          type: string
+          description: |
+            A fresh UUID per publish, prefixed `evt-`. Deliberately NOT derived
+            from the notification id: delivery is at-least-once, and a
+            deterministic id would make a genuine redelivery indistinguishable
+            from a second event about the same aggregate.
+        event_type:
+          type: string
+          enum: [notification.sent, notification.failed]
+          description: |
+            The same two values the `event_outbox_event_known` CHECK constraint
+            allows. An event type this list omits fails the INSERT, and because
+            the enqueue shares the delivery write's transaction, it fails the
+            WRITE — loudly, at the first send after the mistake.
+        event_version: { type: string, enum: ["1.0"] }
+        emitted_at:
+          type: string
+          format: date-time
+          description: When the envelope was SEALED, not when it was published.
+        schema_version: { type: string, enum: ["1.0"] }
+        source_service: { type: string, enum: [notification-svc] }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        actor_id:
+          type: string
+          format: uuid
+          description: |
+            The principal who INITIATED the send — `created_by_principal_id` —
+            not the recipient, who is carried separately in the payload. A
+            consumer treating this as the recipient would attribute every notice
+            to whoever sent it.
+        correlation_id:
+          type: string
+          description: The request's correlation id, carried from the send that caused this.
+        payload:
+          oneOf:
+            - $ref: '#/components/schemas/SentPayload'
+            - $ref: '#/components/schemas/FailedPayload'
+
+    SentPayload:
+      type: object
+      required: [notification_id, tenant_id, recipient_principal_id, channel, delivery_attempts]
+      properties:
+        notification_id:
+          type: string
+          format: uuid
+          description: The aggregate, and the Kafka partition key.
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        recipient_principal_id: { type: string, format: uuid }
+        channel:
+          type: string
+          description: |
+            EMAIL, IN_APP, or a historical SMS/WEBHOOK value. What SENT is worth
+            depends on which — see this message's summary.
+        source_event_type:
+          type: string
+          description: What the sending workflow called the thing that happened. The field most consumers route on.
+        source_reference: { type: string }
+        sent_at: { type: string, format: date-time }
+        provider_response:
+          type: string
+          description: Acceptance evidence. Not a delivery receipt, and must not be rendered as one.
+        delivery_attempts:
+          type: integer
+          description: |
+            How much work the delivery took. One versus four is the difference
+            between a healthy relay and a limping one, and a consumer measuring
+            notification health cannot get it from the fact alone.
+
+    FailedPayload:
+      type: object
+      required: [notification_id, tenant_id, recipient_principal_id, channel, failure_reason, delivery_attempts]
+      properties:
+        notification_id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        legal_entity_id: { type: string, format: uuid }
+        recipient_principal_id: { type: string, format: uuid }
+        channel: { type: string }
+        source_event_type: { type: string }
+        source_reference: { type: string }
+        failure_reason:
+          type: string
+          description: |
+            Exactly what was written to the register. When the retry budget ran
+            out it says so in words — "(no further attempts: exhausted after 5
+            of 5)" — so the record does not read as though a mailbox was
+            rejected when in fact the platform gave up.
+        delivery_attempts: { type: integer }
+        failed_at:
+          type: string
+          format: date-time
+          description: |
+            The row's own `sent_at`: when the delivery CONCLUDED. Taken from the
+            record rather than from the clock at seal time, so a consumer
+            correlating the event against the register does not find two
+            different answers to when the notice failed.

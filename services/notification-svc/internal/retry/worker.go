@@ -7,7 +7,9 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/telemetry"
 )
 
 // Store is the slice of the register the worker touches.
@@ -26,7 +28,12 @@ type Store interface {
 	FindStrandedDeliveries(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
 	ReviveStranded(ctx context.Context, id, tenantID string, staleBefore, nextAttemptAt time.Time) (bool, error)
 	GetNotification(ctx context.Context, id string) (*domain.Notification, error)
-	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error
+	// CompleteDelivery concludes a delivery AND enqueues the event describing
+	// that conclusion, in one transaction. The worker used to publish to Kafka
+	// after this returned, with the error logged and discarded — so a broker
+	// outage during a successful re-attempt delivered the notice and told
+	// nobody. See migration 000005.
+	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, ev events.Outbound) error
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
 	SetRecipientAddress(ctx context.Context, id, tenantID, address, source string) error
 }
@@ -35,9 +42,17 @@ type Deliverer interface {
 	Deliver(ctx context.Context, n domain.Notification) domain.DeliveryOutcome
 }
 
-type Publisher interface {
-	PublishSent(ctx context.Context, correlationID string, n domain.Notification)
-	PublishFailed(ctx context.Context, correlationID string, n domain.Notification, reason string)
+// Metrics is the domain-metric surface the worker records against.
+//
+// It matters more here than on the request path, because nothing the worker
+// does produces an HTTP response at all: a notification delivered on its fourth
+// attempt, one that exhausted its budget, and one reclaimed from being stranded
+// are all invisible to every request metric this service has. A nil Metrics is
+// safe and means "do not record".
+type Metrics interface {
+	ObserveAttempt(channel, outcome, origin string, seconds float64)
+	ObserveConclusion(channel, status string)
+	ObserveRetryScheduled(channel string)
 }
 
 // RecipientResolver re-resolves an address the first attempt could not get.
@@ -61,7 +76,9 @@ type Settled func(error) bool
 type Worker struct {
 	store     Store
 	deliverer Deliverer
-	publisher Publisher
+	metrics   Metrics
+	stranded  Counter
+	exhausted Counter
 	recipient RecipientResolver
 	settled   Settled
 	policy    Policy
@@ -82,9 +99,24 @@ type Options struct {
 	// zero to disable the sweep — see Worker.SweepStranded for why the
 	// default is far larger than the longest possible attempt.
 	StrandedAfter time.Duration
+
+	// StrandedReclaimed and RetriesExhausted are optional counters. Nil means
+	// "do not record", so a test need not build a metrics registry to drive
+	// the worker.
+	StrandedReclaimed Counter
+	RetriesExhausted  Counter
 }
 
-func NewWorker(store Store, deliverer Deliverer, publisher Publisher, recipient RecipientResolver, settled Settled, opts Options, log *zap.Logger) *Worker {
+// Counter is one unlabelled counter. Satisfied by prometheus.Counter.
+//
+// Kept out of Metrics because these two have no labels, and because they are
+// the numbers that should normally be ZERO rather than merely low: every
+// stranded reclaim is a notice the platform accepted and then lost track of,
+// and every exhaustion is a notice it gave up on after using its whole budget.
+// A dashboard treats "should be zero" differently from "watch the ratio".
+type Counter interface{ Inc() }
+
+func NewWorker(store Store, deliverer Deliverer, metrics Metrics, recipient RecipientResolver, settled Settled, opts Options, log *zap.Logger) *Worker {
 	if opts.Interval <= 0 {
 		opts.Interval = 10 * time.Second
 	}
@@ -100,7 +132,9 @@ func NewWorker(store Store, deliverer Deliverer, publisher Publisher, recipient 
 	return &Worker{
 		store:         store,
 		deliverer:     deliverer,
-		publisher:     publisher,
+		metrics:       metrics,
+		stranded:      opts.StrandedReclaimed,
+		exhausted:     opts.RetriesExhausted,
 		recipient:     recipient,
 		settled:       settled,
 		policy:        opts.Policy.Normalize(),
@@ -250,6 +284,9 @@ func (w *Worker) SweepStranded(ctx context.Context) int {
 			continue
 		}
 		revived++
+		if w.stranded != nil {
+			w.stranded.Inc()
+		}
 
 		// WARN, not Info. Every row here is a notification the platform
 		// accepted and then lost track of, so each one is a delivery that
@@ -326,9 +363,29 @@ func (w *Worker) attempt(ctx context.Context, d domain.DueRetry) bool {
 		}
 	}
 
+	attemptStarted := time.Now()
 	outcome := w.deliverer.Deliver(tctx, *n)
+	w.observeAttempt(n.Channel, outcome.Delivered, attemptStarted)
 	w.conclude(tctx, n, outcome)
 	return true
+}
+
+// observeAttempt records one re-attempt against the provider.
+//
+// Called only where a provider was actually reached. conclude's other entry
+// points — a missing resolver, a resolution failure, an address that could not
+// be recorded — never touch a provider, and counting them here would inflate
+// the attempt histogram with durations that measure identity-context-svc or
+// the local database instead of delivery.
+func (w *Worker) observeAttempt(channel string, delivered bool, started time.Time) {
+	if w.metrics == nil {
+		return
+	}
+	outcome := telemetry.OutcomeFailed
+	if delivered {
+		outcome = telemetry.OutcomeDelivered
+	}
+	w.metrics.ObserveAttempt(channel, outcome, telemetry.OriginRetry, time.Since(started).Seconds())
 }
 
 // reresolve fills in a recipient address the first attempt could not obtain.
@@ -371,17 +428,40 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 	now := time.Now().UTC()
 
 	if outcome.Delivered {
-		if err := w.store.CompleteDelivery(ctx, n.NotificationID, "SENT", "", outcome.ProviderResponse, &now); err != nil {
+		// The record is brought up to date BEFORE the event is sealed, because
+		// the event is built from it. Sealing first would announce a
+		// notification.sent carrying status PENDING and no sent_at — describing
+		// the row as it was before the transition the event exists to report.
+		//
+		// DeliveryAttempts is incremented here too, and only here in memory:
+		// the column is incremented by CompleteDelivery itself, so the struct
+		// would otherwise carry a count one behind the row it describes and the
+		// event would understate how much work the delivery took.
+		n.Status, n.SentAt, n.ProviderResponse = "SENT", &now, outcome.ProviderResponse
+		n.FailureReason = ""
+		n.DeliveryAttempts++
+
+		ev, err := events.Sent(n.CorrelationID, *n)
+		if err != nil {
+			w.log.Error("retry worker: delivered but could not seal the event",
+				zap.String("notification_id", n.NotificationID), zap.Error(err))
+			return
+		}
+		// One transaction. The worker used to call CompleteDelivery and then
+		// PublishSent, so a broker outage during a successful re-attempt sent
+		// the notice, recorded it, and told no consumer — permanently, with
+		// nothing but a log line to show for it.
+		if err := w.store.CompleteDelivery(ctx, n.NotificationID, "SENT", "", outcome.ProviderResponse, &now, ev); err != nil {
 			w.log.Error("retry worker: delivered but could not record it",
 				zap.String("notification_id", n.NotificationID), zap.Error(err))
 			return
 		}
-		n.Status, n.SentAt, n.ProviderResponse = "SENT", &now, outcome.ProviderResponse
-		n.FailureReason = ""
 		w.log.Info("retry worker: delivery succeeded on re-attempt",
 			zap.String("notification_id", n.NotificationID),
-			zap.Int("attempt", n.DeliveryAttempts+1))
-		w.publisher.PublishSent(ctx, n.CorrelationID, *n)
+			zap.Int("attempt", n.DeliveryAttempts))
+		if w.metrics != nil {
+			w.metrics.ObserveConclusion(n.Channel, "SENT")
+		}
 		return
 	}
 
@@ -389,6 +469,11 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 	// incremented yet — ScheduleRetry and CompleteDelivery both do that — so
 	// the value the policy needs is the stored count plus this one.
 	attemptsMade := n.DeliveryAttempts + 1
+
+	// Recorded before the reason string is appended to, because the appended
+	// text is how the register explains the difference and the metric should
+	// not be parsed out of prose.
+	exhausted := false
 
 	if outcome.Retryable {
 		if next, ok := w.policy.NextAttempt(now, attemptsMade); ok {
@@ -401,28 +486,47 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 				zap.Int("attempt", attemptsMade),
 				zap.Time("next_attempt_at", next),
 				zap.String("reason", outcome.Reason))
-			// No notification.failed event. The delivery has not concluded,
-			// and publishing a failure that a later attempt reverses would
-			// have consumers reacting to an outcome that did not happen.
+			if w.metrics != nil {
+				w.metrics.ObserveRetryScheduled(n.Channel)
+			}
+			// No notification.failed event, and nothing enqueued. The delivery
+			// has not concluded, and emitting a failure that a later attempt
+			// reverses would have consumers reacting to an outcome that did not
+			// happen. This is why ScheduleRetry takes no event while
+			// CompleteDelivery requires one.
 			return
 		}
 		// Exhausted. The reason records that, so the register does not read as
 		// though a mailbox was rejected when in fact the platform gave up.
+		exhausted = true
 		outcome.Reason = outcome.Reason + " (no further attempts: exhausted after " +
 			itoa(attemptsMade) + " of " + itoa(w.policy.MaxAttempts) + ")"
 	}
 
-	if err := w.store.CompleteDelivery(ctx, n.NotificationID, "FAILED", outcome.Reason, "", &now); err != nil {
+	n.Status, n.SentAt, n.FailureReason = "FAILED", &now, outcome.Reason
+	n.DeliveryAttempts = attemptsMade
+
+	ev, err := events.Failed(n.CorrelationID, *n, outcome.Reason)
+	if err != nil {
+		w.log.Error("retry worker: could not seal the terminal-failure event",
+			zap.String("notification_id", n.NotificationID), zap.Error(err))
+		return
+	}
+	if err := w.store.CompleteDelivery(ctx, n.NotificationID, "FAILED", outcome.Reason, "", &now, ev); err != nil {
 		w.log.Error("retry worker: could not record terminal failure",
 			zap.String("notification_id", n.NotificationID), zap.Error(err))
 		return
 	}
-	n.Status, n.SentAt, n.FailureReason = "FAILED", &now, outcome.Reason
 	w.log.Warn("retry worker: delivery failed terminally",
 		zap.String("notification_id", n.NotificationID),
 		zap.Int("attempts", attemptsMade),
 		zap.String("reason", outcome.Reason))
-	w.publisher.PublishFailed(ctx, n.CorrelationID, *n, outcome.Reason)
+	if w.metrics != nil {
+		w.metrics.ObserveConclusion(n.Channel, "FAILED")
+	}
+	if exhausted && w.exhausted != nil {
+		w.exhausted.Inc()
+	}
 }
 
 // itoa avoids pulling strconv in for two call sites in a log-adjacent string.

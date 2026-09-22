@@ -1813,11 +1813,30 @@ services:
 
   # Notification Service — 03-microservices.md §9.7. Handles governed
   # notifications for workflows, deadlines, escalations, approvals, and status
-  # changes; previously unbuilt. Delivery is a documented stub (see
-  # internal/handler/handler.go) — no real email/SMS/webhook provider is
-  # wired up on the platform yet. Delivery failure is deliberately never a
-  # 5xx to the caller, per the service's own critical constraint: "notification
-  # failure must not collapse source operational workflows."
+  # changes.
+  #
+  # Delivery is NO LONGER a stub — this comment said it was long after a real
+  # SMTP provider was wired in, which is the kind of stale note that has
+  # somebody debugging the wrong thing. What is true now:
+  #
+  #   EMAIL   — a real SMTP provider (mailpit locally, below). SENT means a
+  #             provider ACCEPTED the message, never that it arrived
+  #             (ZS-SVC-Y-001 §0.4).
+  #   IN_APP  — delivered by being recorded; the register row IS the delivery,
+  #             and it carries read state.
+  #   WEBHOOK — no provider, by design (§1.3 — XIC owns machine-to-machine
+  #             exchange). Recorded FAILED naming what is missing.
+  #   SMS     — withdrawn; refused at the request boundary with a 400.
+  #
+  # Delivery failure is deliberately never a 5xx to the caller, per the
+  # service's own critical constraint: "notification failure must not collapse
+  # source operational workflows." A FAILED delivery comes back 201 with the
+  # truth in `status`.
+  #
+  # PORT NOTE: 8133 is also bound by exception-escalation-svc in
+  # docker-compose.phase5.yml. The two cannot run at once, and a console
+  # pointed at localhost:8133 reaches whichever came up. See
+  # services/notification-svc/RUNBOOK.md §8.
   # ── Mailpit — local mail catcher for notification-svc ────────────────────────
   #
   # Accepts SMTP on 1025 and serves everything it receives at
@@ -1859,6 +1878,14 @@ services:
       DB_USER: "${DB_USER_NOTIFICATION:-app_notification}"
       DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
+      # Events are outbox-backed (migration 000005): notification.sent and
+      # notification.failed are committed to event_outbox by the same
+      # transaction that concludes a delivery, and an in-process relay drains
+      # them here, retrying until the write lands. An EMPTY value means "this
+      # deployment has no bus" — the relay then dry-runs and marks batches
+      # published rather than growing a backlog nothing will ever drain. It
+      # does NOT mean "drop the events", which is what the pre-outbox
+      # fire-and-forget publish did on every broker hiccup.
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_EVENTS_TOPIC: "zoiko.notification.events"
       AUTHZ_SERVICE_URL: "http://authorization-svc:8089"

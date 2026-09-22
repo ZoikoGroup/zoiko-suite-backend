@@ -14,9 +14,11 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/events"
 	"zoiko.io/notification-svc/internal/identity"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/retry"
+	"zoiko.io/notification-svc/internal/telemetry"
 	"zoiko.io/notification-svc/internal/templates"
 )
 
@@ -24,7 +26,12 @@ type Store interface {
 	CreateNotification(ctx context.Context, n *domain.Notification) (created bool, err error)
 	GetNotification(ctx context.Context, id string) (*domain.Notification, error)
 	ListNotifications(ctx context.Context, f domain.ListFilter) ([]domain.Notification, error)
-	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error
+	// CompleteDelivery concludes a delivery AND enqueues the event describing
+	// that conclusion, in one transaction. The event is a required argument
+	// rather than something this handler publishes afterwards, which is what it
+	// used to do — see the store method and migration 000005 for what that
+	// cost.
+	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time, ev events.Outbound) error
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
 	MarkRead(ctx context.Context, id, recipientPrincipalID string, readAt time.Time) error
 	CountUnread(ctx context.Context, recipientPrincipalID string) (int, error)
@@ -36,9 +43,20 @@ type RecipientResolver interface {
 	ResolveEmail(ctx context.Context, tenantID, callerPrincipalID, recipientPrincipalID string) (string, error)
 }
 
-type Publisher interface {
-	PublishSent(ctx context.Context, correlationID string, n domain.Notification)
-	PublishFailed(ctx context.Context, correlationID string, n domain.Notification, reason string)
+// Metrics is the domain-metric surface this handler records against.
+//
+// It exists because every interesting failure in this service answers 2xx: a
+// FAILED delivery is a 201 by design (§9.7 — notification failure must not
+// collapse the source workflow), and so is one rescheduled after a transient
+// failure. http_requests_total is therefore flat and healthy across both, and
+// without these counters no number anywhere moves when the platform stops
+// delivering.
+//
+// A nil Metrics is safe and means "do not record", so tests need not build one.
+type Metrics interface {
+	ObserveAttempt(channel, outcome, origin string, seconds float64)
+	ObserveConclusion(channel, status string)
+	ObserveRetryScheduled(channel string)
 }
 
 type AuthZClient interface {
@@ -90,7 +108,7 @@ type Deliverer interface {
 
 type Handler struct {
 	store     Store
-	publisher Publisher
+	metrics   Metrics
 	authz     AuthZClient
 	deliverer Deliverer
 	recipient RecipientResolver
@@ -111,7 +129,7 @@ type Handler struct {
 // which is the same reason domain.ListFilter exists.
 type Deps struct {
 	Store       Store
-	Publisher   Publisher
+	Metrics     Metrics
 	AuthZ       AuthZClient
 	Deliverer   Deliverer
 	Recipient   RecipientResolver
@@ -122,7 +140,7 @@ type Deps struct {
 func New(d Deps) *Handler {
 	return &Handler{
 		store:       d.Store,
-		publisher:   d.Publisher,
+		metrics:     d.Metrics,
 		authz:       d.AuthZ,
 		deliverer:   d.Deliverer,
 		recipient:   d.Recipient,
@@ -160,9 +178,32 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 // gating discovery of what CAN be sent behind an entity grant would only mean
 // a console cannot draw a form until the user picks a legal entity.
 //
-// It still requires a caller identity, so this is not an anonymous endpoint —
-// the envelope middleware ahead of it refuses an unattributed request.
-func (h *Handler) ListTemplates(w http.ResponseWriter, _ *http.Request) {
+// It still requires a caller identity, so this is not an anonymous endpoint.
+//
+// That identity is checked HERE, not left to the envelope middleware. This
+// comment used to say the middleware refused an unattributed request, and it
+// did not: enforcement runs in write-strict mode (ZS_ENVELOPE_ENFORCEMENT's
+// default), where a read's envelope is parsed and REPORTED but the request is
+// admitted. Measured against the running service on 2026-09-22 — a bare
+//
+//	curl http://localhost:8133/v1/notifications/templates
+//
+// with no tenant, no principal and no headers at all returned 200 and the whole
+// catalogue. The one route on this service that documented itself as
+// authenticated was the one route that was not.
+//
+// The disclosure is small — the catalogue is compiled into the binary, is
+// identical for every tenant and holds no tenant data — which is precisely why
+// it survived: nothing downstream of it could go wrong in a way anyone would
+// notice. A control that reads as present and does nothing is worse than no
+// control, and every other handler here fails closed the same way.
+func (h *Handler) ListTemplates(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requirePrincipal(w, r); !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"templates": templates.Catalogue(),
 	})
@@ -315,6 +356,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// from the transport ("empty To") on top of the real one, and the record
 	// would name the mail server rather than the missing address.
 	outcome := domain.DeliveryOutcome{}
+	attemptStarted := time.Now()
 	if resolveErr != nil {
 		outcome.Reason = "recipient resolution failed: " + resolveErr.Error()
 		outcome.Retryable = !identity.IsSettled(resolveErr)
@@ -323,6 +365,19 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	attemptedAt := time.Now().UTC()
+	// Recorded for every attempt, delivered or not — including the resolution
+	// failures above, which never reach a provider. Excluding those would make
+	// the attempt count disagree with delivery_attempts on the row, and an
+	// unresolvable recipient is a delivery attempt that failed, not one that
+	// did not happen.
+	if h.metrics != nil {
+		outcomeLabel := telemetry.OutcomeFailed
+		if outcome.Delivered {
+			outcomeLabel = telemetry.OutcomeDelivered
+		}
+		h.metrics.ObserveAttempt(notification.Channel, outcomeLabel,
+			telemetry.OriginRequest, time.Since(attemptStarted).Seconds())
+	}
 
 	// The OUTCOME of an attempt already made is recorded on a context that
 	// outlives the request, not on r.Context().
@@ -373,9 +428,16 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 				zap.Time("next_attempt_at", next),
 				zap.String("reason", outcome.Reason))
 
-			// No notification.failed event: nothing has failed yet. Publishing
-			// one here and a notification.sent two minutes later would have
-			// consumers act on an outcome that did not happen.
+			if h.metrics != nil {
+				h.metrics.ObserveRetryScheduled(notification.Channel)
+			}
+
+			// No notification.failed event, and nothing enqueued: nothing has
+			// failed yet. Emitting one here and a notification.sent two minutes
+			// later would have consumers act on an outcome that did not happen.
+			// This is also why ScheduleRetry takes no event while
+			// CompleteDelivery requires one — exactly one event per
+			// notification, at the conclusion.
 			writeJSON(w, http.StatusCreated, notification)
 			return
 		}
@@ -389,12 +451,11 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		newStatus = "FAILED"
 	}
 
-	if err := h.store.CompleteDelivery(outcomeCtx, notification.NotificationID,
-		newStatus, outcome.Reason, outcome.ProviderResponse, &attemptedAt); err != nil {
-		h.log.Error("failed to record delivery outcome", zap.Error(err))
-		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
-		return
-	}
+	// The in-memory record is brought up to date BEFORE the event is sealed,
+	// because the event is built from it. Sealing first would publish a
+	// notification.sent carrying status PENDING, no sent_at and no provider
+	// response — describing the row as it was before the transition the event
+	// exists to announce.
 	notification.Status = newStatus
 	notification.FailureReason = outcome.Reason
 	notification.ProviderResponse = outcome.ProviderResponse
@@ -402,13 +463,49 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	notification.DeliveryAttempts = 1
 	notification.LastAttemptAt = &attemptedAt
 
-	if outcome.Delivered {
-		h.publisher.PublishSent(outcomeCtx, correlationID, *notification)
-	} else {
-		h.publisher.PublishFailed(outcomeCtx, correlationID, *notification, outcome.Reason)
+	ev, err := sealConclusion(correlationID, *notification, outcome)
+	if err != nil {
+		// Unreachable short of a marshalling bug, and refused rather than
+		// logged anyway. The old code path logged a marshal failure inside the
+		// publisher and returned, so the notification concluded and the event
+		// vanished — the same silent loss as a broker outage, from a different
+		// cause. Refusing here leaves the row PENDING in flight, which the
+		// stranded sweep reclaims and re-attempts.
+		h.log.Error("failed to seal the delivery event", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "event_seal_failed", err.Error())
+		return
+	}
+
+	// One transaction: the conclusion and the event announcing it. A broker
+	// outage can no longer lose the announcement, because the broker is not
+	// involved — internal/outbox delivers it later and retries until it lands.
+	if err := h.store.CompleteDelivery(outcomeCtx, notification.NotificationID,
+		newStatus, outcome.Reason, outcome.ProviderResponse, &attemptedAt, ev); err != nil {
+		h.log.Error("failed to record delivery outcome", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if h.metrics != nil {
+		h.metrics.ObserveConclusion(notification.Channel, newStatus)
 	}
 
 	writeJSON(w, http.StatusCreated, notification)
+}
+
+// sealConclusion builds the one event a concluded notification emits.
+//
+// One function rather than an if/else at the call site, and shared in spirit
+// with internal/retry's identical choice, because the mapping from outcome to
+// event type is the thing that must not drift: a delivered notification that
+// emitted notification.failed, or the reverse, would be a consumer acting on
+// the opposite of what happened. The status written to the row and the event
+// type are derived from the same domain.DeliveryOutcome.Delivered here.
+func sealConclusion(correlationID string, n domain.Notification, outcome domain.DeliveryOutcome) (events.Outbound, error) {
+	if outcome.Delivered {
+		return events.Sent(correlationID, n)
+	}
+	return events.Failed(correlationID, n, outcome.Reason)
 }
 
 // resolveRecipient determines the endpoint a notification is delivered to, and

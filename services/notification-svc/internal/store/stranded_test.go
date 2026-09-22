@@ -131,7 +131,7 @@ func TestPgStore_FindStranded_IgnoresConcludedRows(t *testing.T) {
 			t.Fatalf("create %s: %v", tc.corr, err)
 		}
 		concluded := time.Now().UTC().Add(-90 * time.Minute)
-		if err := s.CompleteDelivery(ctx, n.NotificationID, tc.status, tc.reason, "", &concluded); err != nil {
+		if err := s.CompleteDelivery(ctx, n.NotificationID, tc.status, tc.reason, "", &concluded, sentEvent(n)); err != nil {
 			t.Fatalf("complete %s: %v", tc.corr, err)
 		}
 

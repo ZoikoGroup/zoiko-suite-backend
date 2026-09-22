@@ -6,9 +6,9 @@ import (
 	"errors"
 	"net/url"
 	"os"
-	"sort"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,7 +43,11 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
+	// Both tables. event_outbox arrived in 000005 and its CREATE is IF NOT
+	// EXISTS, so leaving it behind would carry one run's enqueued events into
+	// the next — and the outbox assertions below count rows.
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS notifications CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS event_outbox CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.
 	//
@@ -310,11 +314,11 @@ func TestPgStore_CompleteDelivery_IsTenantScoped(t *testing.T) {
 	}
 
 	sentAt := time.Now().UTC()
-	if err := s.CompleteDelivery(tenantCtx("tenant-b"), n.NotificationID, "SENT", "", "stub receipt", &sentAt); !errors.Is(err, domain.ErrNotificationNotFound) {
+	if err := s.CompleteDelivery(tenantCtx("tenant-b"), n.NotificationID, "SENT", "", "stub receipt", &sentAt, sentEvent(n)); !errors.Is(err, domain.ErrNotificationNotFound) {
 		t.Fatalf("cross-tenant complete returned %v, want ErrNotificationNotFound", err)
 	}
 
-	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "stub receipt", &sentAt); err != nil {
+	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "stub receipt", &sentAt, sentEvent(n)); err != nil {
 		t.Fatalf("own-tenant complete: %v", err)
 	}
 	got, err := s.GetNotification(tenantCtx("tenant-a"), n.NotificationID)

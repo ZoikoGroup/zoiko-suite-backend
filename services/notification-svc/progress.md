@@ -1,6 +1,76 @@
 # notification-svc — Progress
 
-## Status: complete and working, with no callers (2026-09-08)
+## Status: ESR complete — 163/163 audit checks, front to back (2026-09-22)
+
+`scripts/audit.sh` re-proves it against the running stack. 165 Go tests, 21
+Playwright tests over the console and the bell, `openapi.yaml`, `asyncapi.yaml`,
+`postman_collection.json`, `RUNBOOK.md`, `context.md` and
+`RELEASE_CERTIFICATE.md`.
+
+### Second pass — 2026-09-22
+
+Four defects found and fixed, three of them silent by construction.
+
+**1. Every domain event was lost on a broker hiccup.** Both producers wrote to
+Kafka AFTER the delivery transaction committed, with the error logged and
+discarded — `Publisher.emit`'s whole answer to a refusal was one `log.Error` and
+a `return`. So a broker blip at the moment a notice concluded left the delivery
+recorded, the caller told 201, the register showing SENT, and no consumer
+anywhere learning the notice went out or that it did not. The loss was
+undetectable by design: the one thing that would have reported it was the event
+that was lost, and an escalation chain waiting on `notification.failed` simply
+never fires.
+
+Fixed with migration 000005 (`event_outbox`) and `internal/outbox`.
+`CompleteDelivery` now takes the sealed event as a REQUIRED argument and
+enqueues it in the same transaction as the status transition — "conclude a
+delivery and tell nobody" is no longer a state a caller can reach by forgetting
+an argument, which is exactly how the old shape failed. `PublishSent` and
+`PublishFailed` are removed rather than left unused, and the audit greps for
+their absence. Same defect class as configuration-feature-flag-svc's 000003,
+and worse here: a lost `config.updated` leaves a consumer serving a stale but
+valid value, a lost `notification.failed` leaves a person who was never told
+something they were entitled to be told.
+
+**2. The one route documented as authenticated was the only one that was not.**
+`ListTemplates`'s comment said the envelope middleware refused an unattributed
+request. In write-strict mode — the default — a read's envelope is parsed and
+REPORTED and the request is admitted, so a bare curl with no headers at all
+returned 200 and the whole catalogue. Measured live. The disclosure is small,
+which is precisely why it survived. The handler checks identity itself now.
+
+**3. The console shipped mojibake in text users read.**
+`SendNotificationForm.tsx` had been saved once as cp1252 over UTF-8: the
+template picker's default option rendered `â€" none, write the subject...` and
+the submit button read `Sendingâ€¦` mid-send. Nine sequences plus a BOM.
+Repaired, and the audit greps for the byte sequence.
+
+**4. No visibility into a service whose every failure answers 2xx.** Ten domain
+metrics added, including the `outbox_pending` / `outbox_oldest_age_seconds` pair
+that makes a stalled relay visible — depth alone cannot tell a busy service from
+a stopped one.
+
+**Also: the contract artefacts' own first draft reproduced this estate's
+recurring defect.** `openapi.yaml`, `postman_collection.json` and `audit.sh` all
+documented five mandatory write headers where the service demands six —
+`X-Legal-Entity-Id` is `RequiredOnWrite` here (INV-02) — so a client built
+strictly from them would have had every write refused with 400
+`envelope_incomplete`. The audit caught it by driving the live service, which is
+the whole point of driving the live service. All three corrected; the collection
+mints the envelope in a collection-level script, which cannot be left off one
+request the way a header list can.
+
+**Frontend:** `e2e/mock/notification-service.mjs` and 21 tests in
+`e2e/notifications.spec.ts`, wired into `playwright.config.ts`. The console is
+the only place this service's 2xx distinctions become visible to a person, so
+the spec asserts a rescheduled delivery reads as RETRYING rather than FAILED,
+that an EMAIL send reports acceptance and not receipt, that a WEBHOOK send is
+surfaced as FAILED despite its 201, and that an unreadable inbox shows unknown
+rather than zero.
+
+---
+
+## First status: complete and working, with no callers (2026-09-08)
 
 Six routes, all wired to the Next.js console. Templates, retry with
 exponential backoff and jitter, the stranded-delivery sweep added this pass,

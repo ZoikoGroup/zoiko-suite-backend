@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"zoiko.io/notification-svc/internal/domain"
+	"zoiko.io/notification-svc/internal/events"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/retry"
 )
@@ -103,6 +104,9 @@ type stubStore struct {
 	claimed   map[string]bool
 	completed []string // "id:STATUS"
 	scheduled []string // "id:reason"
+	// events records what CompleteDelivery was asked to enqueue, in order. The
+	// store IS the event log now — see CompleteDelivery below.
+	events    []events.Outbound
 	addresses map[string]string
 
 	claimFails  bool
@@ -179,12 +183,43 @@ func (s *stubStore) GetNotification(_ context.Context, id string) (*domain.Notif
 	return n, nil
 }
 
-func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, _, _ string, _ *time.Time) error {
+// CompleteDelivery records the event it was handed as well as the transition.
+//
+// The event is not optional and the stub refuses a call without one, because
+// that is the contract migration 000005 introduced: a delivery concludes and
+// its event is enqueued in one transaction. The worker previously called
+// CompleteDelivery and then published to Kafka, logging and discarding any
+// failure — so a broker outage during a successful re-attempt delivered the
+// notice and told nobody. A stub that accepted a conclusion with no event would
+// let that shape pass every test in this file.
+func (s *stubStore) CompleteDelivery(_ context.Context, id, newStatus, _, _ string, _ *time.Time, ev events.Outbound) error {
+	if ev.EventType == "" {
+		return errors.New("CompleteDelivery called with no event")
+	}
+	s.events = append(s.events, ev)
 	s.completed = append(s.completed, id+":"+newStatus)
 	if n, ok := s.byID[id]; ok {
 		n.Status = newStatus
 	}
 	return nil
+}
+
+// eventCounts summarises what the store was asked to enqueue. It replaces the
+// stubPublisher that counted PublishSent/PublishFailed calls — those methods no
+// longer exist, because publishing after the commit WAS the defect.
+type eventCounts struct{ sent, failed int }
+
+func (s *stubStore) eventCounts() eventCounts {
+	var c eventCounts
+	for _, ev := range s.events {
+		switch ev.EventType {
+		case events.TypeSent:
+			c.sent++
+		case events.TypeFailed:
+			c.failed++
+		}
+	}
+	return c
 }
 
 func (s *stubStore) ScheduleRetry(_ context.Context, id, _, failureReason string, _, next time.Time) error {
@@ -216,13 +251,6 @@ func (d *stubDeliverer) Deliver(_ context.Context, n domain.Notification) domain
 	return d.outcome
 }
 
-type stubPublisher struct{ sent, failed int }
-
-func (p *stubPublisher) PublishSent(context.Context, string, domain.Notification) { p.sent++ }
-func (p *stubPublisher) PublishFailed(context.Context, string, domain.Notification, string) {
-	p.failed++
-}
-
 type stubResolver struct {
 	email string
 	err   error
@@ -232,11 +260,13 @@ func (r *stubResolver) ResolveEmail(context.Context, string, string, string) (st
 	return r.email, r.err
 }
 
-func newWorker(s *stubStore, d *stubDeliverer, p *stubPublisher, res retry.RecipientResolver, pol retry.Policy) *retry.Worker {
+func newWorker(s *stubStore, d *stubDeliverer, res retry.RecipientResolver, pol retry.Policy) *retry.Worker {
 	settled := func(err error) bool {
 		return errors.Is(err, domain.ErrPrincipalNotFound) || errors.Is(err, domain.ErrPrincipalHasNoAddress)
 	}
-	return retry.NewWorker(s, d, p, res, settled, retry.Options{Policy: pol}, zap.NewNop())
+	// Metrics left nil on purpose: they are observability, not behaviour, and a
+	// nil here is what proves every guard around a metric call is real.
+	return retry.NewWorker(s, d, nil, res, settled, retry.Options{Policy: pol}, zap.NewNop())
 }
 
 func seed(s *stubStore, id, tenant string, attempts int) {
@@ -258,15 +288,14 @@ func TestWorkerConcludesSentOnSuccess(t *testing.T) {
 	s := newStubStore()
 	seed(s, "n1", "tenant-a", 1)
 	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Delivered: true, ProviderResponse: "smtp; queued"}}
-	p := &stubPublisher{}
 
-	newWorker(s, d, p, nil, retry.DefaultPolicy).RunOnce(context.Background())
+	newWorker(s, d, nil, retry.DefaultPolicy).RunOnce(context.Background())
 
 	if len(s.completed) != 1 || s.completed[0] != "n1:SENT" {
 		t.Fatalf("completed = %v, want [n1:SENT]", s.completed)
 	}
-	if p.sent != 1 || p.failed != 0 {
-		t.Fatalf("published sent=%d failed=%d, want 1/0", p.sent, p.failed)
+	if s.eventCounts().sent != 1 || s.eventCounts().failed != 0 {
+		t.Fatalf("published sent=%d failed=%d, want 1/0", s.eventCounts().sent, s.eventCounts().failed)
 	}
 }
 
@@ -278,9 +307,8 @@ func TestWorkerReschedulesTransientFailureWithoutPublishing(t *testing.T) {
 	s := newStubStore()
 	seed(s, "n1", "tenant-a", 1)
 	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Reason: "connection refused", Retryable: true}}
-	p := &stubPublisher{}
 
-	newWorker(s, d, p, nil, retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute}).
+	newWorker(s, d, nil, retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute}).
 		RunOnce(context.Background())
 
 	if len(s.scheduled) != 1 {
@@ -289,8 +317,8 @@ func TestWorkerReschedulesTransientFailureWithoutPublishing(t *testing.T) {
 	if len(s.completed) != 0 {
 		t.Fatalf("completed = %v, want nothing concluded", s.completed)
 	}
-	if p.sent != 0 || p.failed != 0 {
-		t.Fatalf("published sent=%d failed=%d, want nothing published for a pending retry", p.sent, p.failed)
+	if s.eventCounts().sent != 0 || s.eventCounts().failed != 0 {
+		t.Fatalf("published sent=%d failed=%d, want nothing published for a pending retry", s.eventCounts().sent, s.eventCounts().failed)
 	}
 }
 
@@ -300,9 +328,8 @@ func TestWorkerConcludesFailedWhenAttemptsExhausted(t *testing.T) {
 	// fifth and last.
 	seed(s, "n1", "tenant-a", 4)
 	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Reason: "connection refused", Retryable: true}}
-	p := &stubPublisher{}
 
-	newWorker(s, d, p, nil, retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute}).
+	newWorker(s, d, nil, retry.Policy{MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute}).
 		RunOnce(context.Background())
 
 	if len(s.scheduled) != 0 {
@@ -311,8 +338,8 @@ func TestWorkerConcludesFailedWhenAttemptsExhausted(t *testing.T) {
 	if len(s.completed) != 1 || s.completed[0] != "n1:FAILED" {
 		t.Fatalf("completed = %v, want [n1:FAILED]", s.completed)
 	}
-	if p.failed != 1 {
-		t.Fatalf("published failed=%d, want 1 once it terminally failed", p.failed)
+	if s.eventCounts().failed != 1 {
+		t.Fatalf("published failed=%d, want 1 once it terminally failed", s.eventCounts().failed)
 	}
 }
 
@@ -321,9 +348,8 @@ func TestWorkerConcludesSettledFailureImmediately(t *testing.T) {
 	s := newStubStore()
 	seed(s, "n1", "tenant-a", 1)
 	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Reason: "550 no such mailbox", Retryable: false}}
-	p := &stubPublisher{}
 
-	newWorker(s, d, p, nil, retry.DefaultPolicy).RunOnce(context.Background())
+	newWorker(s, d, nil, retry.DefaultPolicy).RunOnce(context.Background())
 
 	if len(s.scheduled) != 0 {
 		t.Fatalf("scheduled = %v, want a permanent refusal not to be retried", s.scheduled)
@@ -342,9 +368,8 @@ func TestWorkerReresolvesAMissingAddressBeforeDelivering(t *testing.T) {
 	seed(s, "n1", "tenant-a", 1)
 	s.byID["n1"].RecipientAddress = ""
 	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Delivered: true, ProviderResponse: "smtp; queued"}}
-	p := &stubPublisher{}
 
-	newWorker(s, d, p, &stubResolver{email: "resolved@example.com"}, retry.DefaultPolicy).
+	newWorker(s, d, &stubResolver{email: "resolved@example.com"}, retry.DefaultPolicy).
 		RunOnce(context.Background())
 
 	if got := s.addresses["n1"]; got != "resolved@example.com" {
@@ -365,9 +390,8 @@ func TestWorkerConcludesWhenRecipientHasNoAddress(t *testing.T) {
 	seed(s, "n1", "tenant-a", 1)
 	s.byID["n1"].RecipientAddress = ""
 	d := &stubDeliverer{}
-	p := &stubPublisher{}
 
-	newWorker(s, d, p, &stubResolver{err: domain.ErrPrincipalHasNoAddress}, retry.DefaultPolicy).
+	newWorker(s, d, &stubResolver{err: domain.ErrPrincipalHasNoAddress}, retry.DefaultPolicy).
 		RunOnce(context.Background())
 
 	if d.calls != 0 {
@@ -390,7 +414,7 @@ func TestWorkerInstallsTheNotificationsTenantOnEveryWrite(t *testing.T) {
 	seed(s, "n2", "tenant-b", 1)
 	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Delivered: true}}
 
-	newWorker(s, d, &stubPublisher{}, nil, retry.DefaultPolicy).RunOnce(context.Background())
+	newWorker(s, d, nil, retry.DefaultPolicy).RunOnce(context.Background())
 
 	if len(s.tenantsSeen) != 2 {
 		t.Fatalf("tenants seen = %v, want one per notification", s.tenantsSeen)
@@ -407,7 +431,7 @@ func TestWorkerSkipsWhatItCannotClaim(t *testing.T) {
 	s.claimed["n1"] = true // already taken
 	d := &stubDeliverer{outcome: domain.DeliveryOutcome{Delivered: true}}
 
-	newWorker(s, d, &stubPublisher{}, nil, retry.DefaultPolicy).RunOnce(context.Background())
+	newWorker(s, d, nil, retry.DefaultPolicy).RunOnce(context.Background())
 
 	if d.calls != 0 {
 		t.Fatalf("deliverer called %d times for an unclaimed notification, want 0", d.calls)

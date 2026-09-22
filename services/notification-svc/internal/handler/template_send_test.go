@@ -3,6 +3,7 @@ package handler_test
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -10,7 +11,7 @@ import (
 )
 
 func TestSendNotification_RendersTemplate(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -44,7 +45,7 @@ func TestSendNotification_RendersTemplate(t *testing.T) {
 }
 
 func TestSendNotification_TemplateAndBodyConflict(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -61,7 +62,7 @@ func TestSendNotification_TemplateAndBodyConflict(t *testing.T) {
 }
 
 func TestSendNotification_UnknownTemplate(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -80,7 +81,7 @@ func TestSendNotification_UnknownTemplate(t *testing.T) {
 // it is refused rather than sent blank.
 func TestSendNotification_MissingTemplateVariables(t *testing.T) {
 	store := newStubStore()
-	r := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(store, &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -104,7 +105,7 @@ func TestSendNotification_MissingTemplateVariables(t *testing.T) {
 
 // Supplying subject and body directly still works — the template form is additive.
 func TestSendNotification_RawSubjectAndBodyStillWork(t *testing.T) {
-	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	r := newRouter(newStubStore(), &stubAuthZ{})
 
 	rr := doReq(r, http.MethodPost, "/v1/notifications/", map[string]any{
 		"recipient_principal_id": "principal-2",
@@ -123,5 +124,40 @@ func TestSendNotification_RawSubjectAndBodyStillWork(t *testing.T) {
 	_ = json.NewDecoder(rr.Body).Decode(&n)
 	if n.Subject != "Handwritten subject" {
 		t.Errorf("expected the supplied subject, got %q", n.Subject)
+	}
+}
+
+// The catalogue endpoint fails closed.
+//
+// It used to not. The handler's own comment said "the envelope middleware ahead
+// of it refuses an unattributed request", and in write-strict mode — the
+// default — the middleware parses and REPORTS a read's envelope and then admits
+// it. A bare curl with no headers at all returned 200 and the whole catalogue
+// against the running service. The one route documented as authenticated was
+// the one route that was not.
+func TestListTemplates_RequiresIdentity(t *testing.T) {
+	r := newRouter(newStubStore(), &stubAuthZ{})
+
+	// No principal: the router factory installs a tenant, so this isolates the
+	// principal check.
+	req := httptest.NewRequest(http.MethodGet, "/v1/notifications/templates", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated catalogue read = %d, want 401 (body: %s)", rr.Code, rr.Body.String())
+	}
+}
+
+func TestListTemplates_RequiresTenant(t *testing.T) {
+	// tenantID "" means the factory installs none.
+	r := newRouterWith(newStubStore(), &stubAuthZ{},
+		&stubDeliverer{delivered: true}, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/notifications/templates", nil)
+	req.Header.Set("X-Principal-Id", "principal-1")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("catalogue read with no tenant = %d, want 401 (body: %s)", rr.Code, rr.Body.String())
 	}
 }

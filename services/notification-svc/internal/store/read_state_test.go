@@ -71,7 +71,7 @@ func TestPgStore_CompleteDelivery_RecordsProviderEvidence(t *testing.T) {
 
 	sentAt := time.Now().UTC()
 	receipt := "smtp mail.example.com:587 accepted; message-id=<abc@zoiko.test>"
-	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", receipt, &sentAt); err != nil {
+	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", receipt, &sentAt, sentEvent(n)); err != nil {
 		t.Fatalf("complete: %v", err)
 	}
 
@@ -99,12 +99,12 @@ func TestPgStore_CompleteDelivery_DoesNotReopenAConcludedNotification(t *testing
 
 	first := time.Now().UTC().Add(-time.Hour)
 	if err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID,
-		"FAILED", "550 no such user", "", &first); err != nil {
+		"FAILED", "550 no such user", "", &first, failedEvent(n, "550 no such user")); err != nil {
 		t.Fatalf("first conclusion: %v", err)
 	}
 
 	second := time.Now().UTC()
-	err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "accepted", &second)
+	err := s.CompleteDelivery(tenantCtx("tenant-a"), n.NotificationID, "SENT", "", "accepted", &second, sentEvent(n))
 	if !errors.Is(err, domain.ErrNotificationNotFound) {
 		t.Fatalf("a concluded notification was re-opened: %v", err)
 	}
