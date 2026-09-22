@@ -13,15 +13,19 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
 
 	"zoiko.io/document-vault-svc/internal/authz"
 	"zoiko.io/document-vault-svc/internal/config"
 	svcenvelope "zoiko.io/document-vault-svc/internal/envelope"
+	"zoiko.io/document-vault-svc/internal/events"
 	"zoiko.io/document-vault-svc/internal/handler"
 	"zoiko.io/document-vault-svc/internal/health"
 	svcmiddleware "zoiko.io/document-vault-svc/internal/middleware"
+	"zoiko.io/document-vault-svc/internal/outbox"
 	"zoiko.io/document-vault-svc/internal/residency"
+	"zoiko.io/document-vault-svc/internal/scan"
 	"zoiko.io/document-vault-svc/internal/storage"
 	"zoiko.io/document-vault-svc/internal/store"
 )
@@ -69,8 +73,38 @@ func main() {
 	pgStore := store.New(pool, log)
 	residencyValidator := residency.NewHTTPValidator(cfg.TenantRegistryURL, log)
 	authzClient := authz.NewHTTPClient(cfg.AuthZServiceURL, log)
-	h := handler.New(pgStore, storageBackend, residencyValidator, authzClient, log)
+	// scan.NoOpScanner: no real malware/type scanning engine is
+	// integrated anywhere in this repo — see internal/scan's own package
+	// doc. The gate itself is real and wired; swapping in a real scanner
+	// is a one-line change here.
+	scanner := scan.NoOpScanner{}
+	h := handler.New(pgStore, storageBackend, residencyValidator, authzClient, scanner, log)
 	healthH := health.New(pool)
+
+	// ── Transactional outbox relay (ZS-STATE-001 Invariant I-13) ─────────────
+	// An empty KAFKA_BROKERS selects the log-only publisher instead — same
+	// posture as accounts-payable-svc/general-ledger-svc/etc: a local run
+	// needs Postgres and this service and nothing else.
+	var outboxPub outbox.Publisher
+	if len(cfg.Kafka.Brokers) == 0 {
+		outboxPub = events.NewLogOnlyPublisher(log)
+	} else {
+		kafkaWriter := &kafka.Writer{
+			Addr:                   kafka.TCP(cfg.Kafka.Brokers...),
+			Topic:                  cfg.Kafka.Topic,
+			Balancer:               &kafka.LeastBytes{},
+			AllowAutoTopicCreation: true,
+			// See accounts-payable-svc/cmd/server's own comment on this field:
+			// without it every publish pays kafka-go's ~1s batch timer.
+			BatchTimeout: 10 * time.Millisecond,
+		}
+		defer func() { _ = kafkaWriter.Close() }()
+		outboxPub = events.NewPublisher(log, cfg.Kafka.Topic, kafkaWriter)
+	}
+	relayCtx, cancelRelay := context.WithCancel(context.Background())
+	defer cancelRelay()
+	relay := outbox.NewRelay(pool, outboxPub, 500*time.Millisecond, 50, log)
+	go relay.Start(relayCtx)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
