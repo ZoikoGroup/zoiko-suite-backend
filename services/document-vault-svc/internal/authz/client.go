@@ -69,6 +69,10 @@ const (
 	// is covered by the existing ActionDocumentRead.
 	ActionClassifyRecord        = "CLASSIFY_RECORD"
 	ActionConfirmClassification = "CONFIRM_CLASSIFICATION"
+	// ActionReclassifyRecord/ActionSupersedeClassification gate BIZ-02
+	// Wave 2's Reclassify/SupersedeClassification.
+	ActionReclassifyRecord        = "RECLASSIFY_RECORD"
+	ActionSupersedeClassification = "SUPERSEDE_CLASSIFICATION"
 )
 
 // Client is the interface the handler depends on, so tests can substitute a

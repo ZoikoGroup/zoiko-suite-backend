@@ -276,6 +276,80 @@ func (s *stubStore) ConfirmClassification(_ context.Context, p domain.ConfirmCla
 	return nil, domain.ErrClassificationNotFound
 }
 
+func (s *stubStore) Reclassify(_ context.Context, p domain.ReclassifyParams) (*domain.RecordClassification, error) {
+	doc, ok := s.docs[p.DocumentID]
+	if !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	if p.Source != domain.ClassificationSourceHuman && p.Source != domain.ClassificationSourceAI {
+		return nil, domain.ErrInvalidClassificationSource
+	}
+	if p.Source == domain.ClassificationSourceAI && p.Confidence == nil {
+		return nil, domain.ErrAIConfidenceRequired
+	}
+	if p.Source == domain.ClassificationSourceHuman && p.Confidence != nil {
+		return nil, domain.ErrHumanConfidenceNotAllowed
+	}
+	var current *domain.RecordClassification
+	for _, c := range s.classifications {
+		if c.DocumentID == p.DocumentID && c.Status != domain.ClassificationStatusSuperseded {
+			current = c
+		}
+	}
+	if current == nil || !domain.CanReclassify(current) {
+		return nil, domain.ErrClassificationNotConfirmed
+	}
+	s.classificationSeq++
+	c := &domain.RecordClassification{
+		ClassificationID: fmt.Sprintf("classification-%d", s.classificationSeq), DocumentID: p.DocumentID,
+		LegalEntityID: doc.LegalEntityID, ClassificationValue: p.ClassificationValue,
+		Status: domain.ClassificationStatusCandidate, Source: p.Source, Confidence: p.Confidence,
+		ProposedByPrincipalID: p.ProposedByPrincipalID, ProposedAt: time.Now().UTC(), EffectiveAt: time.Now().UTC(),
+	}
+	s.classifications = append(s.classifications, c)
+	return c, nil
+}
+
+func (s *stubStore) SupersedeClassification(_ context.Context, p domain.SupersedeClassificationParams) (*domain.RecordClassification, error) {
+	var previous, next *domain.RecordClassification
+	for _, c := range s.classifications {
+		if c.ClassificationID == p.PreviousClassificationID {
+			previous = c
+		}
+		if c.ClassificationID == p.NewClassificationID {
+			next = c
+		}
+	}
+	if previous == nil || next == nil {
+		return nil, domain.ErrClassificationNotFound
+	}
+	if previous.SupersededByClassificationID != nil {
+		return nil, domain.ErrClassificationAlreadySuperseded
+	}
+	if previous.Status != domain.ClassificationStatusConfirmed && previous.Status != domain.ClassificationStatusRestricted {
+		return nil, domain.ErrClassificationNotConfirmed
+	}
+	if next.DocumentID != previous.DocumentID {
+		return nil, domain.ErrClassificationDocumentMismatch
+	}
+	if next.Source == domain.ClassificationSourceHuman && next.ProposedByPrincipalID == p.ActorPrincipalID {
+		return nil, domain.ErrClassificationSelfConfirmation
+	}
+	if next.Status != domain.ClassificationStatusCandidate {
+		return nil, domain.ErrClassificationNotCandidate
+	}
+	now := time.Now().UTC()
+	next.Status = domain.ClassificationStatusConfirmed
+	next.ConfirmedByPrincipalID = &p.ActorPrincipalID
+	next.ConfirmedAt = &now
+	previous.Status = domain.ClassificationStatusSuperseded
+	previous.SupersededByClassificationID = &next.ClassificationID
+	if doc, ok := s.docs[next.DocumentID]; ok {
+		doc.Classification = next.ClassificationValue
+	}
+	return next, nil
+}
+
 func (s *stubStore) GetClassification(_ context.Context, documentID string) (*domain.RecordClassification, error) {
 	if _, ok := s.docs[documentID]; !ok {
 		return nil, domain.ErrDocumentNotFound
@@ -1139,6 +1213,126 @@ func TestClassifyRecord_AIWithConfidence_Returns201_StaysCandidate(t *testing.T)
 	var got domain.RecordClassification
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	assert.Equal(t, domain.ClassificationStatusCandidate, got.Status, "expected no auto-confirm even at high confidence")
+}
+
+// ── Reclassify / SupersedeClassification (BIZ-02 Wave 2) ────────────────────
+
+func confirmFirstClassification(t *testing.T, r chi.Router, s *stubStore) *domain.RecordClassification {
+	t.Helper()
+	proposal := s.classifications[0]
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+proposal.ClassificationID+"/confirm", nil)
+	req.Header.Set("X-Principal-Id", "steward-1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.RecordClassification
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	return &got
+}
+
+func TestReclassify_WithoutConfirmedClassification_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "PUBLIC", "HUMAN", nil))))
+	assert.Equal(t, http.StatusConflict, rec.Code)
+}
+
+func TestReclassify_ThenSupersede_ConfirmsNewAndSupersedesOld(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	original := confirmFirstClassification(t, r, s)
+
+	reclassifyRec := httptest.NewRecorder()
+	r.ServeHTTP(reclassifyRec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "RESTRICTED", "HUMAN", nil))))
+	require.Equal(t, http.StatusCreated, reclassifyRec.Code)
+	var proposed domain.RecordClassification
+	require.NoError(t, json.Unmarshal(reclassifyRec.Body.Bytes(), &proposed))
+	assert.Equal(t, domain.ClassificationStatusCandidate, proposed.Status)
+
+	supersedeBody, err := json.Marshal(map[string]string{"new_classification_id": proposed.ClassificationID})
+	require.NoError(t, err)
+	supersedeReq := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+original.ClassificationID+"/supersede", bytes.NewReader(supersedeBody))
+	supersedeReq.Header.Set("X-Principal-Id", "steward-2")
+	supersedeRec := httptest.NewRecorder()
+	r.ServeHTTP(supersedeRec, supersedeReq)
+
+	require.Equal(t, http.StatusOK, supersedeRec.Code)
+	var confirmed domain.RecordClassification
+	require.NoError(t, json.Unmarshal(supersedeRec.Body.Bytes(), &confirmed))
+	assert.Equal(t, domain.ClassificationStatusConfirmed, confirmed.Status)
+	assert.Equal(t, domain.Classification("RESTRICTED"), confirmed.ClassificationValue)
+	assert.Equal(t, domain.ClassificationStatusSuperseded, s.classifications[0].Status)
+	require.NotNil(t, s.classifications[0].SupersededByClassificationID)
+	assert.Equal(t, proposed.ClassificationID, *s.classifications[0].SupersededByClassificationID)
+	assert.Equal(t, domain.Classification("RESTRICTED"), s.docs["doc-1"].Classification)
+}
+
+func TestSupersedeClassification_SelfConfirmation_Returns403(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	original := confirmFirstClassification(t, r, s)
+
+	reclassifyReq := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "RESTRICTED", "HUMAN", nil)))
+	reclassifyReq.Header.Set("X-Principal-Id", "steward-3")
+	reclassifyRec := httptest.NewRecorder()
+	r.ServeHTTP(reclassifyRec, reclassifyReq)
+	require.Equal(t, http.StatusCreated, reclassifyRec.Code)
+	var proposed domain.RecordClassification
+	require.NoError(t, json.Unmarshal(reclassifyRec.Body.Bytes(), &proposed))
+
+	supersedeBody, err := json.Marshal(map[string]string{"new_classification_id": proposed.ClassificationID})
+	require.NoError(t, err)
+	supersedeReq := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+original.ClassificationID+"/supersede", bytes.NewReader(supersedeBody))
+	supersedeReq.Header.Set("X-Principal-Id", "steward-3")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, supersedeReq)
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestSupersedeClassification_AlreadySuperseded_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	original := confirmFirstClassification(t, r, s)
+
+	firstReclassify := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "RESTRICTED", "HUMAN", nil)))
+	firstReclassifyRec := httptest.NewRecorder()
+	r.ServeHTTP(firstReclassifyRec, firstReclassify)
+	var firstProposed domain.RecordClassification
+	require.NoError(t, json.Unmarshal(firstReclassifyRec.Body.Bytes(), &firstProposed))
+
+	firstSupersedeBody, err := json.Marshal(map[string]string{"new_classification_id": firstProposed.ClassificationID})
+	require.NoError(t, err)
+	firstSupersedeReq := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+original.ClassificationID+"/supersede", bytes.NewReader(firstSupersedeBody))
+	firstSupersedeReq.Header.Set("X-Principal-Id", "steward-2")
+	firstSupersedeRec := httptest.NewRecorder()
+	r.ServeHTTP(firstSupersedeRec, firstSupersedeReq)
+	require.Equal(t, http.StatusOK, firstSupersedeRec.Code)
+
+	// Reclassify again so there's a fresh CANDIDATE to attempt a second
+	// supersede of the now-already-superseded original with.
+	secondReclassify := httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/reclassify", bytes.NewReader(classifyBody(t, "PUBLIC", "HUMAN", nil)))
+	secondReclassifyRec := httptest.NewRecorder()
+	r.ServeHTTP(secondReclassifyRec, secondReclassify)
+	var secondProposed domain.RecordClassification
+	require.NoError(t, json.Unmarshal(secondReclassifyRec.Body.Bytes(), &secondProposed))
+
+	secondSupersedeBody, err := json.Marshal(map[string]string{"new_classification_id": secondProposed.ClassificationID})
+	require.NoError(t, err)
+	secondSupersedeReq := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+original.ClassificationID+"/supersede", bytes.NewReader(secondSupersedeBody))
+	secondSupersedeReq.Header.Set("X-Principal-Id", "steward-4")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, secondSupersedeReq)
+	assert.Equal(t, http.StatusConflict, rec.Code)
 }
 
 func TestClassifyRecord_AlreadyConfirmed_Returns409(t *testing.T) {

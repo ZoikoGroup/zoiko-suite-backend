@@ -38,6 +38,8 @@ type Store interface {
 	FindClassificationByID(ctx context.Context, classificationID string) (*domain.RecordClassification, error)
 	ConfirmClassification(ctx context.Context, p domain.ConfirmClassificationParams) (*domain.RecordClassification, error)
 	GetClassification(ctx context.Context, documentID string) (*domain.RecordClassification, error)
+	Reclassify(ctx context.Context, p domain.ReclassifyParams) (*domain.RecordClassification, error)
+	SupersedeClassification(ctx context.Context, p domain.SupersedeClassificationParams) (*domain.RecordClassification, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
@@ -95,6 +97,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{documentID}/classify", h.ClassifyRecord)
 		r.Post("/classifications/{classificationID}/confirm", h.ConfirmClassification)
 		r.Get("/{documentID}/classification", h.GetClassification)
+		r.Post("/{documentID}/reclassify", h.Reclassify)
+		r.Post("/classifications/{classificationID}/supersede", h.SupersedeClassification)
 	})
 }
 
@@ -714,6 +718,97 @@ func (h *Handler) GetClassification(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, classification)
 }
 
+// ── POST /v1/documents/{documentID}/reclassify ───────────────────────────────
+
+// Reclassify proposes a replacement classification value for a document
+// that already has a CONFIRMED/RESTRICTED classification — BIZ-02's own
+// Reclassify command. Lands CANDIDATE, same as ClassifyRecord's initial
+// proposal; requires SupersedeClassification (by a different principal,
+// for a human proposal) before it governs anything.
+func (h *Handler) Reclassify(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req classifyRecordRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !req.ClassificationValue.Valid() {
+		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.ClassificationValue))
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionReclassifyRecord) {
+		return
+	}
+
+	classification, err := h.store.Reclassify(r.Context(), domain.ReclassifyParams{
+		DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
+		Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
+		ProposedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, classification)
+}
+
+// ── POST /v1/documents/classifications/{classificationID}/supersede ─────────
+
+type supersedeClassificationRequest struct {
+	NewClassificationID string `json:"new_classification_id"`
+}
+
+// SupersedeClassification confirms a Reclassify proposal and marks the
+// classification it replaces as SUPERSEDED — BIZ-02's own
+// SupersedeClassification command. The classificationID in the URL is
+// the PREVIOUS (currently governing) classification; the replacement is
+// named in the body. Fetched (read-only) BEFORE authorization and BEFORE
+// the mutation, same fetch-then-authorize order as every other handler
+// in this service.
+func (h *Handler) SupersedeClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req supersedeClassificationRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	classificationID := chi.URLParam(r, "classificationID")
+
+	existing, err := h.store.FindClassificationByID(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionSupersedeClassification) {
+		return
+	}
+
+	updated, err := h.store.SupersedeClassification(r.Context(), domain.SupersedeClassificationParams{
+		PreviousClassificationID: classificationID, NewClassificationID: req.NewClassificationID, ActorPrincipalID: actor,
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
 // ── GET /v1/documents ────────────────────────────────────────────────────────
 
 // ListDocuments is the tenant's register for one legal entity.
@@ -1029,6 +1124,12 @@ func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusForbidden, "self_confirmation_forbidden", err.Error())
 	case errors.Is(err, domain.ErrClassificationNotCandidate):
 		writeError(w, http.StatusConflict, "not_candidate", err.Error())
+	case errors.Is(err, domain.ErrClassificationNotConfirmed):
+		writeError(w, http.StatusConflict, "not_confirmed", err.Error())
+	case errors.Is(err, domain.ErrClassificationAlreadySuperseded):
+		writeError(w, http.StatusConflict, "already_superseded", err.Error())
+	case errors.Is(err, domain.ErrClassificationDocumentMismatch):
+		writeError(w, http.StatusBadRequest, "document_mismatch", err.Error())
 	default:
 		h.log.Error("store error", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")

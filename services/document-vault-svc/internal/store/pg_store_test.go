@@ -579,6 +579,132 @@ func TestPgStore_ClassifyRecord_AISourceRequiresConfidence(t *testing.T) {
 	require.Equal(t, domain.ClassificationStatusCandidate, proposed.Status, "expected NO auto-confirm regardless of confidence — see AIConfidenceAutoConfirmThreshold's doc comment")
 }
 
+// TestPgStore_Reclassify_RequiresExistingConfirmedClassification proves
+// Reclassify's precondition — it refuses to run against a document that
+// has never had a classification confirmed (ClassifyRecord is the
+// command for a first-ever proposal, not Reclassify).
+func TestPgStore_Reclassify_RequiresExistingConfirmedClassification(t *testing.T) {
+	s := store.New(requireTestDB(t), zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "reclassify-precondition")
+
+	_, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: "steward-1",
+	})
+	require.ErrorIs(t, err, domain.ErrClassificationNotConfirmed)
+}
+
+// TestPgStore_Reclassify_ThenSupersede_ConfirmsNewAndSupersedesOld is the
+// real proof of the reclassification lifecycle: Reclassify proposes a
+// CANDIDATE, SupersedeClassification confirms it AND forward-links the
+// classification it replaces to SUPERSEDED in the same transaction, and
+// the negative control proves the DB trigger refuses any attempt to
+// re-point or clear that forward link afterward.
+func TestPgStore_Reclassify_ThenSupersede_ConfirmsNewAndSupersedesOld(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "reclassify-supersede")
+	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	original, err := s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-1",
+	})
+	require.NoError(t, err)
+
+	proposed, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: "steward-2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.ClassificationStatusCandidate, proposed.Status)
+
+	confirmed, err := s.SupersedeClassification(tenantCtx(), domain.SupersedeClassificationParams{
+		PreviousClassificationID: original.ClassificationID, NewClassificationID: proposed.ClassificationID, ActorPrincipalID: "steward-3",
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.ClassificationStatusConfirmed, confirmed.Status)
+	require.Equal(t, domain.ClassificationRestricted, confirmed.ClassificationValue)
+
+	updatedDoc, err := s.FindDocumentByID(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	require.Equal(t, domain.ClassificationRestricted, updatedDoc.Classification, "expected documents.classification to reflect the superseding classification")
+
+	current, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	require.Equal(t, confirmed.ClassificationID, current.ClassificationID, "expected GetClassification to skip the superseded row and return the new one")
+
+	// Negative control: the DB trigger refuses to re-point or clear an
+	// already-set superseded_by_classification_id.
+	_, err = pool.Exec(tenantCtx(), `UPDATE record_classifications SET superseded_by_classification_id = NULL WHERE classification_id = $1`, original.ClassificationID)
+	require.Error(t, err, "expected the trigger to refuse clearing an existing supersession link")
+
+	var supersededCount int
+	err = pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'classification.superseded'`, doc.DocumentID).Scan(&supersededCount)
+	require.NoError(t, err)
+	require.Equal(t, 1, supersededCount)
+}
+
+// TestPgStore_SupersedeClassification_RejectsSelfConfirmation is the
+// negative-controlled proof that SupersedeClassification enforces the
+// same maker-checker rule as ConfirmClassification for the new proposal.
+func TestPgStore_SupersedeClassification_RejectsSelfConfirmation(t *testing.T) {
+	s := store.New(requireTestDB(t), zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "reclassify-self-confirm")
+	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	original, err := s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-1",
+	})
+	require.NoError(t, err)
+
+	proposed, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: "steward-2",
+	})
+	require.NoError(t, err)
+
+	_, err = s.SupersedeClassification(tenantCtx(), domain.SupersedeClassificationParams{
+		PreviousClassificationID: original.ClassificationID, NewClassificationID: proposed.ClassificationID, ActorPrincipalID: "steward-2",
+	})
+	require.ErrorIs(t, err, domain.ErrClassificationSelfConfirmation)
+}
+
+// TestPgStore_SupersedeClassification_RejectsAlreadySuperseded is the
+// negative-controlled proof that a classification can only ever be
+// superseded once.
+func TestPgStore_SupersedeClassification_RejectsAlreadySuperseded(t *testing.T) {
+	s := store.New(requireTestDB(t), zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "reclassify-double-supersede")
+	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	original, err := s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-1",
+	})
+	require.NoError(t, err)
+
+	firstReplacement, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: "steward-2",
+	})
+	require.NoError(t, err)
+	_, err = s.SupersedeClassification(tenantCtx(), domain.SupersedeClassificationParams{
+		PreviousClassificationID: original.ClassificationID, NewClassificationID: firstReplacement.ClassificationID, ActorPrincipalID: "steward-3",
+	})
+	require.NoError(t, err)
+
+	secondReplacement, err := s.Reclassify(tenantCtx(), domain.ReclassifyParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationPublic, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: "steward-4",
+	})
+	require.NoError(t, err)
+
+	_, err = s.SupersedeClassification(tenantCtx(), domain.SupersedeClassificationParams{
+		PreviousClassificationID: original.ClassificationID, NewClassificationID: secondReplacement.ClassificationID, ActorPrincipalID: "steward-5",
+	})
+	require.ErrorIs(t, err, domain.ErrClassificationAlreadySuperseded)
+}
+
 func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {
 	pool := requireTestDB(t)
 	s := store.New(pool, zap.NewNop())

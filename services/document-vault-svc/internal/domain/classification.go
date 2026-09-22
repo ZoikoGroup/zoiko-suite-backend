@@ -107,6 +107,35 @@ type ConfirmClassificationParams struct {
 	ConfirmedByPrincipalID string
 }
 
+// ReclassifyParams is Reclassify's input — proposes a replacement value
+// for a document that already has a CONFIRMED/RESTRICTED classification.
+// Structurally identical to ClassifyRecordParams; kept as its own type
+// because the two commands have opposite preconditions (ClassifyRecord
+// requires no existing confirmed classification, Reclassify requires
+// one) and must not be interchangeable at the call site.
+type ReclassifyParams struct {
+	DocumentID            string
+	ClassificationValue   Classification
+	Source                ClassificationSource
+	Confidence            *float64
+	RuleModelVersion      string
+	SourceEvidence        string
+	ProposedByPrincipalID string
+	CorrelationID         string
+}
+
+// SupersedeClassificationParams is SupersedeClassification's input — the
+// governance act that confirms a Reclassify proposal and, in the same
+// transaction, marks the classification it replaces as SUPERSEDED. This
+// is the one place a CONFIRMED/RESTRICTED classification's
+// superseded_by_classification_id is ever set (NULL -> value exactly
+// once, enforced by migration 000008's trigger).
+type SupersedeClassificationParams struct {
+	PreviousClassificationID string
+	NewClassificationID      string
+	ActorPrincipalID         string
+}
+
 var (
 	// ErrClassificationNotFound backs GetClassification et al.
 	ErrClassificationNotFound = errors.New("record classification not found")
@@ -125,9 +154,27 @@ var (
 	// ErrClassificationNotCandidate backs ConfirmClassification — only a
 	// CANDIDATE classification may be confirmed.
 	ErrClassificationNotCandidate = errors.New("classification is not in CANDIDATE status")
+	// ErrClassificationNotConfirmed backs Reclassify — there must already
+	// be a CONFIRMED/RESTRICTED classification to replace. ClassifyRecord,
+	// not Reclassify, is the command for a document's first-ever proposal.
+	ErrClassificationNotConfirmed = errors.New("document has no confirmed classification to reclassify")
+	// ErrClassificationAlreadySuperseded backs SupersedeClassification —
+	// the classification being replaced must not already have been
+	// superseded by an earlier reclassification.
+	ErrClassificationAlreadySuperseded = errors.New("classification has already been superseded")
+	// ErrClassificationDocumentMismatch backs SupersedeClassification —
+	// the previous and new classification must belong to the same
+	// document.
+	ErrClassificationDocumentMismatch = errors.New("classification and its replacement belong to different documents")
 )
 
 // CanConfirmClassification: only a CANDIDATE classification.
 func CanConfirmClassification(c *RecordClassification) bool {
 	return c.Status == ClassificationStatusCandidate
+}
+
+// CanReclassify: only a CONFIRMED/RESTRICTED classification has
+// something for Reclassify to replace.
+func CanReclassify(c *RecordClassification) bool {
+	return c.Status == ClassificationStatusConfirmed || c.Status == ClassificationStatusRestricted
 }
