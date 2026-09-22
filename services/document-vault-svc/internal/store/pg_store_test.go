@@ -41,6 +41,7 @@ func requireTestDB(t *testing.T) *pgxpool.Pool {
 		DROP TABLE IF EXISTS evidence_versions;
 		DROP TABLE IF EXISTS audit_evidence;
 		DROP TABLE IF EXISTS document_links;
+		DROP TABLE IF EXISTS record_classifications;
 		DROP TABLE IF EXISTS document_access_log;
 		DROP TABLE IF EXISTS document_versions;
 		DROP TABLE IF EXISTS documents;
@@ -476,6 +477,106 @@ func TestPgStore_RecordQuarantinedVersionUpload_UnknownDocument_ReturnsNotFound(
 	s := store.New(pool, zap.NewNop())
 	err := s.RecordQuarantinedVersionUpload(tenantCtx(), "00000000-0000-0000-0000-000000000000", "uploader-1", "reason", "corr")
 	require.ErrorIs(t, err, domain.ErrDocumentNotFound)
+}
+
+// TestPgStore_CreateDocument_SeedsCandidateClassification proves the
+// upload-time seeding: the uploader's classification choice lands as a
+// CANDIDATE proposal, not a trusted-final value.
+func TestPgStore_CreateDocument_SeedsCandidateClassification(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "seed-classification")
+
+	current, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	require.Equal(t, domain.ClassificationStatusCandidate, current.Status)
+	require.Equal(t, domain.ClassificationSourceHuman, current.Source)
+	require.Nil(t, current.Confidence, "expected a human-sourced proposal to carry no confidence value")
+	require.Nil(t, current.ConfirmedAt)
+}
+
+// TestPgStore_ConfirmClassification_Succeeds_UpdatesDocumentSnapshot is
+// the real proof of BIZ-02's core mechanism: confirming a candidate
+// updates both the classification row AND documents.classification (the
+// cached snapshot), and — the negative control — a second confirm of the
+// same classification is refused.
+func TestPgStore_ConfirmClassification_Succeeds_UpdatesDocumentSnapshot(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "confirm")
+	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+
+	confirmed, err := s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.ClassificationStatusConfirmed, confirmed.Status)
+	require.NotNil(t, confirmed.ConfirmedAt)
+	require.Equal(t, "steward-1", *confirmed.ConfirmedByPrincipalID)
+
+	updatedDoc, err := s.FindDocumentByID(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+	require.Equal(t, confirmed.ClassificationValue, updatedDoc.Classification, "expected documents.classification to be refreshed on confirm")
+
+	_, err = s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: "steward-2",
+	})
+	require.ErrorIs(t, err, domain.ErrClassificationNotCandidate)
+
+	// Negative control at the DB layer.
+	_, err = pool.Exec(tenantCtx(), `UPDATE record_classifications SET confirmed_by_principal_id = 'tampered' WHERE classification_id = $1`, proposal.ClassificationID)
+	require.Error(t, err, "expected the trigger to refuse mutating an existing confirmation")
+
+	var count int
+	err = pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM outbox_events WHERE aggregate_id = $1 AND event_type = 'classification.confirmed'`, doc.DocumentID).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 1, count)
+}
+
+// TestPgStore_ConfirmClassification_RejectsSelfConfirmation is the
+// negative-controlled proof of the maker-checker requirement for
+// human-sourced proposals.
+func TestPgStore_ConfirmClassification_RejectsSelfConfirmation(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "self-confirm")
+	proposal, err := s.GetClassification(tenantCtx(), doc.DocumentID)
+	require.NoError(t, err)
+
+	_, err = s.ConfirmClassification(tenantCtx(), domain.ConfirmClassificationParams{
+		ClassificationID: proposal.ClassificationID, ConfirmedByPrincipalID: proposal.ProposedByPrincipalID,
+	})
+	require.ErrorIs(t, err, domain.ErrClassificationSelfConfirmation)
+}
+
+// TestPgStore_ClassifyRecord_AISourceRequiresConfidence proves the
+// source/confidence validation and that AI-sourced proposals ALSO
+// require ConfirmClassification (no auto-confirm — see
+// domain.AIConfidenceAutoConfirmThreshold's own doc comment).
+func TestPgStore_ClassifyRecord_AISourceRequiresConfidence(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.New(pool, zap.NewNop())
+	doc := newDocForDeclareTest(t, s, "ai-source")
+	// The seeded CANDIDATE proposal from creation does NOT block a second
+	// proposal — only an existing CONFIRMED/RESTRICTED classification
+	// does (that's Reclassify's job). Two independent CANDIDATE proposals
+	// (the human upload choice, and now an AI proposal) may coexist.
+
+	_, err := s.ClassifyRecord(tenantCtx(), domain.ClassifyRecordParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceAI,
+		ProposedByPrincipalID: "ai-classifier-1",
+	})
+	require.ErrorIs(t, err, domain.ErrAIConfidenceRequired)
+
+	confidence := 0.42
+	proposed, err := s.ClassifyRecord(tenantCtx(), domain.ClassifyRecordParams{
+		DocumentID: doc.DocumentID, ClassificationValue: domain.ClassificationRestricted, Source: domain.ClassificationSourceAI,
+		Confidence: &confidence, ProposedByPrincipalID: "ai-classifier-1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, domain.ClassificationStatusCandidate, proposed.Status, "expected NO auto-confirm regardless of confidence — see AIConfidenceAutoConfirmThreshold's doc comment")
 }
 
 func TestPgStore_AddVersion_UnknownDocument_ReturnsNotFound(t *testing.T) {

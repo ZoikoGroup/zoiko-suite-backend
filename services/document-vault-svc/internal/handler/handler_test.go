@@ -29,16 +29,18 @@ import (
 // ── stub store ───────────────────────────────────────────────────────────────
 
 type stubStore struct {
-	docs             map[string]*domain.Document
-	versions         map[string][]domain.DocumentVersion
-	accessLog        []domain.DocumentAccessLog
-	links            map[string][]domain.DocumentLink
-	quarantineEvents []string
-	seq              int
-	linkSeq          int
-	createErr        error
-	findErr          error
-	recordErr        error
+	docs              map[string]*domain.Document
+	versions          map[string][]domain.DocumentVersion
+	accessLog         []domain.DocumentAccessLog
+	links             map[string][]domain.DocumentLink
+	quarantineEvents  []string
+	classifications   []*domain.RecordClassification
+	seq               int
+	linkSeq           int
+	classificationSeq int
+	createErr         error
+	findErr           error
+	recordErr         error
 }
 
 func newStubStore() *stubStore {
@@ -62,6 +64,16 @@ func (s *stubStore) CreateDocument(_ context.Context, doc *domain.Document, v *d
 	v.Version = 1
 	s.docs[doc.DocumentID] = doc
 	s.versions[doc.DocumentID] = []domain.DocumentVersion{*v}
+
+	// Mirrors the real store: the uploader's classification choice is
+	// seeded as a CANDIDATE proposal, not trusted as final.
+	s.classificationSeq++
+	s.classifications = append(s.classifications, &domain.RecordClassification{
+		ClassificationID: fmt.Sprintf("classification-%d", s.classificationSeq), DocumentID: doc.DocumentID,
+		LegalEntityID: doc.LegalEntityID, ClassificationValue: doc.Classification,
+		Status: domain.ClassificationStatusCandidate, Source: domain.ClassificationSourceHuman,
+		ProposedByPrincipalID: doc.CreatedByPrincipalID, ProposedAt: time.Now().UTC(), EffectiveAt: time.Now().UTC(),
+	})
 	return nil
 }
 
@@ -200,6 +212,87 @@ func (s *stubStore) ListDocumentLinks(_ context.Context, documentID string) ([]d
 		return nil, domain.ErrDocumentNotFound
 	}
 	return s.links[documentID], nil
+}
+
+func (s *stubStore) ClassifyRecord(_ context.Context, p domain.ClassifyRecordParams) (*domain.RecordClassification, error) {
+	doc, ok := s.docs[p.DocumentID]
+	if !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	if p.Source != domain.ClassificationSourceHuman && p.Source != domain.ClassificationSourceAI {
+		return nil, domain.ErrInvalidClassificationSource
+	}
+	if p.Source == domain.ClassificationSourceAI && p.Confidence == nil {
+		return nil, domain.ErrAIConfidenceRequired
+	}
+	if p.Source == domain.ClassificationSourceHuman && p.Confidence != nil {
+		return nil, domain.ErrHumanConfidenceNotAllowed
+	}
+	for _, c := range s.classifications {
+		if c.DocumentID == p.DocumentID && (c.Status == domain.ClassificationStatusConfirmed || c.Status == domain.ClassificationStatusRestricted) {
+			return nil, domain.ErrClassificationNotCandidate
+		}
+	}
+	s.classificationSeq++
+	c := &domain.RecordClassification{
+		ClassificationID: fmt.Sprintf("classification-%d", s.classificationSeq), DocumentID: p.DocumentID,
+		LegalEntityID: doc.LegalEntityID, ClassificationValue: p.ClassificationValue,
+		Status: domain.ClassificationStatusCandidate, Source: p.Source, Confidence: p.Confidence,
+		ProposedByPrincipalID: p.ProposedByPrincipalID, ProposedAt: time.Now().UTC(), EffectiveAt: time.Now().UTC(),
+	}
+	s.classifications = append(s.classifications, c)
+	return c, nil
+}
+
+func (s *stubStore) FindClassificationByID(_ context.Context, classificationID string) (*domain.RecordClassification, error) {
+	for _, c := range s.classifications {
+		if c.ClassificationID == classificationID {
+			return c, nil
+		}
+	}
+	return nil, domain.ErrClassificationNotFound
+}
+
+func (s *stubStore) ConfirmClassification(_ context.Context, p domain.ConfirmClassificationParams) (*domain.RecordClassification, error) {
+	for _, c := range s.classifications {
+		if c.ClassificationID != p.ClassificationID {
+			continue
+		}
+		if c.Source == domain.ClassificationSourceHuman && c.ProposedByPrincipalID == p.ConfirmedByPrincipalID {
+			return nil, domain.ErrClassificationSelfConfirmation
+		}
+		if c.Status != domain.ClassificationStatusCandidate {
+			return nil, domain.ErrClassificationNotCandidate
+		}
+		now := time.Now().UTC()
+		c.Status = domain.ClassificationStatusConfirmed
+		c.ConfirmedByPrincipalID = &p.ConfirmedByPrincipalID
+		c.ConfirmedAt = &now
+		if doc, ok := s.docs[c.DocumentID]; ok {
+			doc.Classification = c.ClassificationValue
+		}
+		return c, nil
+	}
+	return nil, domain.ErrClassificationNotFound
+}
+
+func (s *stubStore) GetClassification(_ context.Context, documentID string) (*domain.RecordClassification, error) {
+	if _, ok := s.docs[documentID]; !ok {
+		return nil, domain.ErrDocumentNotFound
+	}
+	var latest *domain.RecordClassification
+	for _, c := range s.classifications {
+		if c.DocumentID != documentID || c.Status == domain.ClassificationStatusSuperseded {
+			continue
+		}
+		if latest == nil || c.ProposedAt.After(latest.ProposedAt) {
+			latest = c
+		}
+	}
+	if latest == nil {
+		return nil, domain.ErrClassificationNotFound
+	}
+	return latest, nil
 }
 
 func (s *stubStore) FindDocumentByID(_ context.Context, documentID string) (*domain.Document, error) {
@@ -951,4 +1044,116 @@ func TestGetLinkedObjects_DocumentNotFound_Returns404(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/nope/links", nil))
 	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// ── ClassifyRecord / ConfirmClassification / GetClassification (BIZ-02) ─────
+
+func TestCreateDocument_SeedsCandidateClassification(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/documents/doc-1/classification", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.RecordClassification
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, domain.ClassificationStatusCandidate, got.Status)
+	assert.Equal(t, domain.Classification("CONFIDENTIAL"), got.ClassificationValue)
+	assert.Nil(t, got.ConfirmedAt)
+}
+
+func classifyBody(t *testing.T, value, source string, confidence *float64) []byte {
+	t.Helper()
+	req := map[string]any{"classification_value": value, "source": source}
+	if confidence != nil {
+		req["confidence"] = *confidence
+	}
+	body, err := json.Marshal(req)
+	require.NoError(t, err)
+	return body
+}
+
+func TestConfirmClassification_Valid_Returns200_UpdatesDocument(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	proposal := s.classifications[0]
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+proposal.ClassificationID+"/confirm", nil)
+	req.Header.Set("X-Principal-Id", "steward-1")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got domain.RecordClassification
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, domain.ClassificationStatusConfirmed, got.Status)
+	assert.Equal(t, domain.Classification("CONFIDENTIAL"), s.docs["doc-1"].Classification)
+}
+
+func TestConfirmClassification_SelfConfirmation_Returns403(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	proposal := s.classifications[0]
+
+	// createBody's default uploader is testPrincipal — confirming as the
+	// same principal must be refused.
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+proposal.ClassificationID+"/confirm", nil))
+	assert.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestConfirmClassification_NotFound_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubResidency{}, newTestStorage(t))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/nope/confirm", nil))
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestClassifyRecord_AIWithoutConfidence_Returns400(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/classify", bytes.NewReader(classifyBody(t, "RESTRICTED", "AI", nil))))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestClassifyRecord_AIWithConfidence_Returns201_StaysCandidate(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+
+	confidence := 0.95
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/classify", bytes.NewReader(classifyBody(t, "RESTRICTED", "AI", &confidence))))
+	require.Equal(t, http.StatusCreated, rec.Code)
+	var got domain.RecordClassification
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, domain.ClassificationStatusCandidate, got.Status, "expected no auto-confirm even at high confidence")
+}
+
+func TestClassifyRecord_AlreadyConfirmed_Returns409(t *testing.T) {
+	st := newTestStorage(t)
+	s := newStubStore()
+	r := newRouter(s, &stubResidency{}, st)
+	r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/documents", bytes.NewReader(createBody(t, "CONFIDENTIAL", "content"))))
+	proposal := s.classifications[0]
+	confirmReq := httptest.NewRequest(http.MethodPost, "/v1/documents/classifications/"+proposal.ClassificationID+"/confirm", nil)
+	confirmReq.Header.Set("X-Principal-Id", "steward-1")
+	confirmRec := httptest.NewRecorder()
+	r.ServeHTTP(confirmRec, confirmReq)
+	require.Equal(t, http.StatusOK, confirmRec.Code)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/documents/doc-1/classify", bytes.NewReader(classifyBody(t, "PUBLIC", "HUMAN", nil))))
+	assert.Equal(t, http.StatusConflict, rec.Code)
 }

@@ -16,17 +16,17 @@
 package authz
 
 import (
-	svcenvelope "zoiko.io/document-vault-svc/internal/envelope"
-	"github.com/go-chi/chi/v5/middleware"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-chi/chi/v5/middleware"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+	svcenvelope "zoiko.io/document-vault-svc/internal/envelope"
 
 	"go.uber.org/zap"
 
@@ -64,6 +64,11 @@ const (
 	// covered by the existing ActionDocumentRead, same as any other
 	// metadata about a document.
 	ActionDocumentLink = "DOCUMENT_LINK"
+	// ActionClassifyRecord/ActionConfirmClassification gate BIZ-02's
+	// ClassifyRecord/ConfirmClassification — reading classification back
+	// is covered by the existing ActionDocumentRead.
+	ActionClassifyRecord        = "CLASSIFY_RECORD"
+	ActionConfirmClassification = "CONFIRM_CLASSIFICATION"
 )
 
 // Client is the interface the handler depends on, so tests can substitute a

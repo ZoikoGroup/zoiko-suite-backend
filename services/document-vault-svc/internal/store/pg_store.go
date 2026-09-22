@@ -180,7 +180,32 @@ func (s *PgStore) CreateDocument(ctx context.Context, doc *domain.Document, firs
 			}); err != nil {
 			return err
 		}
-		return nil
+
+		// BIZ-02: the uploader's classification choice is seeded as the
+		// document's first CANDIDATE proposal, not trusted as final —
+		// see internal/domain/classification.go's own doc comment. It
+		// still requires ConfirmClassification (by a DIFFERENT
+		// principal) before it's a governed fact; documents.classification
+		// above is populated immediately for backward-compatible reads,
+		// but record_classifications is the real source of truth.
+		var classificationID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO record_classifications (document_id, tenant_id, legal_entity_id, classification_value, source, proposed_by_principal_id, correlation_id)
+			VALUES ($1, $2, $3, $4, 'HUMAN', $5, $6)
+			RETURNING classification_id
+		`, doc.DocumentID, tenantID, doc.LegalEntityID, string(doc.Classification), doc.CreatedByPrincipalID, nullableString(correlationID),
+		).Scan(&classificationID); err != nil {
+			return fmt.Errorf("document store unavailable: %w", err)
+		}
+		return s.insertDocumentOutboxEvent(ctx, tx, "classification.proposed", doc.DocumentID, tenantID,
+			doc.LegalEntityID, doc.CreatedByPrincipalID, correlationID, map[string]any{
+				"classification_id":    classificationID,
+				"document_id":          doc.DocumentID,
+				"tenant_id":            tenantID,
+				"legal_entity_id":      doc.LegalEntityID,
+				"classification_value": string(doc.Classification),
+				"source":               "HUMAN",
+			})
 	})
 }
 

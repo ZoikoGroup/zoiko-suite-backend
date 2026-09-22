@@ -34,6 +34,10 @@ type Store interface {
 	GetAsOfDocument(ctx context.Context, documentID string, asOf time.Time) (*domain.Document, *domain.DocumentVersion, error)
 	LinkDocument(ctx context.Context, p domain.LinkDocumentParams) (*domain.DocumentLink, error)
 	ListDocumentLinks(ctx context.Context, documentID string) ([]domain.DocumentLink, error)
+	ClassifyRecord(ctx context.Context, p domain.ClassifyRecordParams) (*domain.RecordClassification, error)
+	FindClassificationByID(ctx context.Context, classificationID string) (*domain.RecordClassification, error)
+	ConfirmClassification(ctx context.Context, p domain.ConfirmClassificationParams) (*domain.RecordClassification, error)
+	GetClassification(ctx context.Context, documentID string) (*domain.RecordClassification, error)
 	FindDocumentByID(ctx context.Context, documentID string) (*domain.Document, error)
 	FindVersion(ctx context.Context, documentID string, version int) (*domain.DocumentVersion, error)
 	ListVersions(ctx context.Context, documentID string) ([]domain.DocumentVersion, error)
@@ -88,6 +92,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Get("/{documentID}/as-of", h.GetAsOfDocument)
 		r.Post("/{documentID}/links", h.LinkDocument)
 		r.Get("/{documentID}/links", h.GetLinkedObjects)
+		r.Post("/{documentID}/classify", h.ClassifyRecord)
+		r.Post("/classifications/{classificationID}/confirm", h.ConfirmClassification)
+		r.Get("/{documentID}/classification", h.GetClassification)
 	})
 }
 
@@ -587,6 +594,126 @@ func (h *Handler) GetLinkedObjects(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, links)
 }
 
+// ── POST /v1/documents/{documentID}/classify ─────────────────────────────────
+
+type classifyRecordRequest struct {
+	ClassificationValue domain.Classification       `json:"classification_value"`
+	Source              domain.ClassificationSource `json:"source"`
+	Confidence          *float64                    `json:"confidence,omitempty"`
+	RuleModelVersion    string                      `json:"rule_model_version,omitempty"`
+	SourceEvidence      string                      `json:"source_evidence,omitempty"`
+}
+
+// ClassifyRecord proposes a classification for a document — BIZ-02's own
+// ClassifyRecord command. Lands CANDIDATE; requires ConfirmClassification
+// (by a different principal, for a human proposal) before it governs
+// anything.
+func (h *Handler) ClassifyRecord(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req classifyRecordRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !req.ClassificationValue.Valid() {
+		writeError(w, http.StatusBadRequest, "invalid_classification", string(req.ClassificationValue))
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionClassifyRecord) {
+		return
+	}
+
+	classification, err := h.store.ClassifyRecord(r.Context(), domain.ClassifyRecordParams{
+		DocumentID: documentID, ClassificationValue: req.ClassificationValue, Source: req.Source,
+		Confidence: req.Confidence, RuleModelVersion: req.RuleModelVersion, SourceEvidence: req.SourceEvidence,
+		ProposedByPrincipalID: actor, CorrelationID: r.Header.Get("X-Correlation-ID"),
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, classification)
+}
+
+// ── POST /v1/documents/classifications/{classificationID}/confirm ───────────
+
+// ConfirmClassification moves a CANDIDATE classification to CONFIRMED —
+// BIZ-02's own ConfirmClassification command. Fetched (read-only) BEFORE
+// authorization and BEFORE the mutation — the same fetch-then-authorize
+// order every other handler in this service uses — so an unauthorized
+// caller can never cause the confirm to actually run before being
+// refused. The self-confirmation (maker-checker) check itself happens
+// in the store layer, where the proposal's own principal is compared.
+func (h *Handler) ConfirmClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	classificationID := chi.URLParam(r, "classificationID")
+
+	existing, err := h.store.FindClassificationByID(r.Context(), classificationID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, existing.LegalEntityID, authz.ActionConfirmClassification) {
+		return
+	}
+
+	updated, err := h.store.ConfirmClassification(r.Context(), domain.ConfirmClassificationParams{
+		ClassificationID: classificationID, ConfirmedByPrincipalID: actor,
+	})
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// ── GET /v1/documents/{documentID}/classification ────────────────────────────
+
+// GetClassification returns the document's current (non-superseded)
+// classification — BIZ-02's own GetClassification query.
+func (h *Handler) GetClassification(w http.ResponseWriter, r *http.Request) {
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	documentID := chi.URLParam(r, "documentID")
+	doc, err := h.store.FindDocumentByID(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	if !h.authorize(w, r, actor, doc.LegalEntityID, authz.ActionDocumentRead) {
+		return
+	}
+
+	classification, err := h.store.GetClassification(r.Context(), documentID)
+	if err != nil {
+		h.handleStoreError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, classification)
+}
+
 // ── GET /v1/documents ────────────────────────────────────────────────────────
 
 // ListDocuments is the tenant's register for one legal entity.
@@ -890,6 +1017,18 @@ func (h *Handler) handleStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "disposition_already_requested", err.Error())
 	case errors.Is(err, domain.ErrDuplicateLink):
 		writeError(w, http.StatusConflict, "duplicate_link", err.Error())
+	case errors.Is(err, domain.ErrClassificationNotFound):
+		writeError(w, http.StatusNotFound, "classification_not_found", "")
+	case errors.Is(err, domain.ErrInvalidClassificationSource):
+		writeError(w, http.StatusBadRequest, "invalid_source", err.Error())
+	case errors.Is(err, domain.ErrAIConfidenceRequired):
+		writeError(w, http.StatusBadRequest, "confidence_required", err.Error())
+	case errors.Is(err, domain.ErrHumanConfidenceNotAllowed):
+		writeError(w, http.StatusBadRequest, "confidence_not_allowed", err.Error())
+	case errors.Is(err, domain.ErrClassificationSelfConfirmation):
+		writeError(w, http.StatusForbidden, "self_confirmation_forbidden", err.Error())
+	case errors.Is(err, domain.ErrClassificationNotCandidate):
+		writeError(w, http.StatusConflict, "not_candidate", err.Error())
 	default:
 		h.log.Error("store error", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
