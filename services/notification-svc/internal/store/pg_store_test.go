@@ -83,6 +83,18 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		}
 	}
 
+	const appRole = "zoiko_app_test"
+	if _, err := pool.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+appRole+`') THEN
+			CREATE ROLE `+appRole+` NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $do$;
+	GRANT USAGE ON SCHEMA public TO `+appRole+`;
+	GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO `+appRole+`;
+	`); err != nil {
+		t.Fatalf("setup test role %s: %v", appRole, err)
+	}
+
 	return pool
 }
 

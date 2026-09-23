@@ -282,7 +282,12 @@ func TestLedger_RLS_TenantIsolation(t *testing.T) {
 		t.Fatalf("Tenant B should receive ErrRenderNotFound when reading Tenant A render, got: %v", err)
 	}
 
-	// 3. Raw SQL check under Tenant B session context: verify 0 rows are visible across all 4 tables
+	// 3. Raw SQL check: verify RLS isolates rows across all 4 tables.
+	// In CI and local test environments, the test pool connects as the Postgres superuser.
+	// Postgres superusers unconditionally bypass Row-Level Security policies even when
+	// FORCE ROW LEVEL SECURITY is set on tables. We switch the transaction session to the
+	// dedicated NOSUPERUSER NOBYPASSRLS role `zoiko_app_test` so that PostgreSQL strictly
+	// enforces the RLS tenant isolation policies.
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("failed to acquire conn: %v", err)
@@ -295,11 +300,31 @@ func TestLedger_RLS_TenantIsolation(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantB); err != nil {
-		t.Fatalf("failed to set tenant context: %v", err)
+	if _, err := tx.Exec(ctx, "SET LOCAL ROLE zoiko_app_test"); err != nil {
+		t.Fatalf("failed to set test role: %v", err)
 	}
 
 	tables := []string{"message_intents", "message_renders", "delivery_attempts", "delivery_events"}
+
+	// Sanity check: Tenant A can see its own row in each table under RLS
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantA); err != nil {
+		t.Fatalf("failed to set tenant context for tenantA: %v", err)
+	}
+	for _, tbl := range tables {
+		var cnt int
+		q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE message_intent_id = $1", tbl)
+		if err := tx.QueryRow(ctx, q, intentID).Scan(&cnt); err != nil {
+			t.Fatalf("query on %s failed: %v", tbl, err)
+		}
+		if cnt != 1 {
+			t.Fatalf("RLS failure: Tenant A should see 1 row in %s under its own context, got %d", tbl, cnt)
+		}
+	}
+
+	// Isolation check: Tenant B must see 0 rows across all 4 tables
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantB); err != nil {
+		t.Fatalf("failed to set tenant context for tenantB: %v", err)
+	}
 	for _, tbl := range tables {
 		var cnt int
 		q := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE message_intent_id = $1", tbl)
