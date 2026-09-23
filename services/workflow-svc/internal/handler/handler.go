@@ -76,6 +76,18 @@ type WorkflowStore interface {
 	StartQualityReview(ctx context.Context, params domain.StartQualityReviewParams) (*domain.QualityReviewRecord, bool, error)
 	CompleteQualityReview(ctx context.Context, params domain.CompleteQualityReviewParams) (*domain.QualityReviewRecord, bool, error)
 	GetAuditEngagementReportGates(ctx context.Context, tenantID, engagementID string) (allSignOffsValid bool, noUnresolvedMandatoryNotes bool, err error)
+
+	// BIZ-04 Form Definition & Submission — see
+	// internal/store/form_store.go's own doc comments for the enforcement
+	// mechanisms.
+	CreateForm(ctx context.Context, params domain.CreateFormParams) (*domain.FormDefinition, bool, error)
+	GetForm(ctx context.Context, tenantID, formID string) (*domain.FormDefinition, error)
+	PublishForm(ctx context.Context, params domain.PublishFormParams) (*domain.FormDefinition, error)
+	RetireForm(ctx context.Context, params domain.RetireFormParams) (*domain.FormDefinition, error)
+	SaveDraft(ctx context.Context, params domain.SaveDraftParams) (*domain.FormSubmission, error)
+	SubmitForm(ctx context.Context, params domain.SubmitFormParams) (*domain.FormSubmission, error)
+	ValidateSubmission(ctx context.Context, params domain.ValidateSubmissionParams) (*domain.FormSubmission, error)
+	GetSubmission(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmission, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -92,6 +104,10 @@ type EventPublisher interface {
 	PublishWorkflowEscalated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishWorkflowCompleted(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishAuditEngagementEvent(ctx context.Context, eventType string, engagement domain.AuditEngagement, actorID, correlationID string) error
+
+	// BIZ-04 Form — see internal/events/publisher.go's own doc comments.
+	PublishFormPublished(ctx context.Context, f domain.FormDefinition, actorID, correlationID string) error
+	PublishFormEvent(ctx context.Context, eventType string, s domain.FormSubmission, actorID, correlationID string) error
 }
 
 // DocumentVaultClient verifies evidence references without making workflow-svc
@@ -198,6 +214,20 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	})
 	r.Post("/v1/audit/sign-offs/{sign_off_id}/withdraw", h.WithdrawSignOff)
 	r.Post("/v1/audit/quality-reviews/{quality_review_id}/complete", h.CompleteQualityReview)
+
+	r.Route("/v1/forms", func(r chi.Router) {
+		r.Post("/", h.CreateForm)
+		r.Get("/{form_id}", h.GetForm)
+		r.Post("/{form_id}/publish", h.PublishForm)
+		r.Post("/{form_id}/retire", h.RetireForm)
+		r.Post("/{form_id}/drafts", h.SaveDraft)
+	})
+	r.Route("/v1/form-submissions", func(r chi.Router) {
+		r.Get("/{submission_id}", h.GetSubmission)
+		r.Post("/{submission_id}/drafts", h.SaveDraft)
+		r.Post("/{submission_id}/submit", h.SubmitForm)
+		r.Post("/{submission_id}/validate", h.ValidateSubmission)
+	})
 }
 
 // requireTenant reads the caller's verified tenant scope, set into
