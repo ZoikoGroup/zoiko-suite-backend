@@ -223,11 +223,15 @@ func TestLedger_RLS_TenantIsolation(t *testing.T) {
 		t.Fatalf("Tenant A RecordMessageRender failed: %v", err)
 	}
 
+	attemptID := uuid.NewString()
 	attempt := &ledger.DeliveryAttempt{
-		ProviderAttemptID: "prov-att-alpha",
+		ProviderAttemptID: attemptID,
 		MessageIntentID:   intentID,
 		TenantID:          tenantA,
 		RenderID:          renderID,
+		SenderStream:      ledger.StreamCritical,
+		FromAddress:       "security@security.zoikosuite.com",
+		ToAddress:         "alpha@example.com",
 		ProviderName:      "smtp",
 		AttemptNumber:     1,
 		Status:            ledger.AttemptStatusAccepted,
@@ -241,7 +245,7 @@ func TestLedger_RLS_TenantIsolation(t *testing.T) {
 		DeliveryEventID:   eventID,
 		MessageIntentID:   intentID,
 		TenantID:          tenantA,
-		ProviderAttemptID: "prov-att-alpha",
+		ProviderAttemptID: attemptID,
 		EventType:         ledger.DeliveryEventDelivered,
 		RawPayload:        json.RawMessage(`{"status":"250 OK"}`),
 		OccurredAt:        time.Now().UTC(),
@@ -291,7 +295,7 @@ func TestLedger_RLS_TenantIsolation(t *testing.T) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1;", tenantB); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantB); err != nil {
 		t.Fatalf("failed to set tenant context: %v", err)
 	}
 
@@ -319,7 +323,7 @@ func TestLedger_Traceability_IntentToRenderToAttemptToEvent(t *testing.T) {
 	intentID := uuid.NewString()
 	renderID := uuid.NewString()
 	eventID := uuid.NewString()
-	providerAttemptID := "prov-tx-" + uuid.NewString()
+	providerAttemptID := uuid.NewString()
 	causationID := "causation-" + uuid.NewString()
 
 	// 1. Create intent
@@ -369,6 +373,9 @@ func TestLedger_Traceability_IntentToRenderToAttemptToEvent(t *testing.T) {
 		MessageIntentID:   intentID,
 		TenantID:          tenantID,
 		RenderID:          renderID,
+		SenderStream:      ledger.StreamCritical,
+		FromAddress:       "security@security.zoikosuite.com",
+		ToAddress:         "trace@example.com",
 		ProviderName:      "smtp",
 		AttemptNumber:     1,
 		Status:            ledger.AttemptStatusAccepted,
@@ -430,7 +437,7 @@ func TestLedger_TransactionRollback(t *testing.T) {
 		t.Fatalf("begin failed: %v", err)
 	}
 
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1;", tenantID); err != nil {
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		t.Fatalf("set tenant failed: %v", err)
 	}
 
@@ -526,22 +533,6 @@ func TestLedger_Constraints_Validation(t *testing.T) {
 	ctx := context.Background()
 	tenantID := "tenant-" + uuid.NewString()
 
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatalf("acquire failed: %v", err)
-	}
-	defer conn.Release()
-
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin failed: %v", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	if _, err := tx.Exec(ctx, "SET LOCAL app.tenant_id = $1;", tenantID); err != nil {
-		t.Fatalf("set tenant failed: %v", err)
-	}
-
 	const insertSQL = `
 		INSERT INTO message_intents (
 			message_intent_id, tenant_id, legal_entity_id, recipient_principal_id,
@@ -552,7 +543,17 @@ func TestLedger_Constraints_Validation(t *testing.T) {
 	`
 
 	// 1. Invalid communication_class
-	_, err = tx.Exec(ctx, insertSQL,
+	tx1, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx1 failed: %v", err)
+	}
+	defer func() { _ = tx1.Rollback(ctx) }()
+
+	if _, err := tx1.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
+		t.Fatalf("set tenant tx1 failed: %v", err)
+	}
+
+	_, err = tx1.Exec(ctx, insertSQL,
 		uuid.NewString(), tenantID, "entity-1", "usr-1", "bad@example.com",
 		"EMAIL", "INVALID_CLASS", "ZS-IA-001", "evt-1", "event.test",
 		"dedup-bad-class", "corr-1", "PENDING",
@@ -560,15 +561,18 @@ func TestLedger_Constraints_Validation(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected error inserting invalid communication_class, got nil")
 	}
+	if rollbackErr := tx1.Rollback(ctx); rollbackErr != nil {
+		t.Fatalf("rollback tx1 failed: %v", rollbackErr)
+	}
 
 	// 2. Invalid status
-	tx2, err := conn.Begin(ctx)
+	tx2, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("begin tx2 failed: %v", err)
 	}
 	defer func() { _ = tx2.Rollback(ctx) }()
 
-	if _, err := tx2.Exec(ctx, "SET LOCAL app.tenant_id = $1;", tenantID); err != nil {
+	if _, err := tx2.Exec(ctx, "SELECT set_config('app.tenant_id', $1, true)", tenantID); err != nil {
 		t.Fatalf("set tenant tx2 failed: %v", err)
 	}
 
@@ -579,6 +583,9 @@ func TestLedger_Constraints_Validation(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatalf("expected error inserting invalid status, got nil")
+	}
+	if rollbackErr := tx2.Rollback(ctx); rollbackErr != nil {
+		t.Fatalf("rollback tx2 failed: %v", rollbackErr)
 	}
 }
 
