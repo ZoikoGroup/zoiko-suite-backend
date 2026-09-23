@@ -280,6 +280,57 @@ func (s *stubStore) RetireTemplate(_ context.Context, p domain.RetireTemplatePar
 	return d, nil
 }
 
+func (s *stubStore) RenderPreview(_ context.Context, p domain.RenderPreviewParams) (*domain.RenderPreviewResult, error) {
+	v, ok := s.versions[p.VersionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	var missing []string
+	for _, key := range v.VariableSchema {
+		if p.Variables[key] == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
+	}
+	return &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: v.Content}, nil
+}
+
+func (s *stubStore) CompareVersions(_ context.Context, versionIDA, versionIDB string) (*domain.CompareVersionsResult, error) {
+	a, ok := s.versions[versionIDA]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	b, ok := s.versions[versionIDB]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if a.TemplateID != b.TemplateID {
+		return nil, domain.ErrTemplateVersionsBelongToDifferentTemplates
+	}
+	return &domain.CompareVersionsResult{VersionA: *a, VersionB: *b, ContentChanged: a.Content != b.Content}, nil
+}
+
+func (s *stubStore) ListLocales(_ context.Context, templateID string) ([]domain.LocaleSummary, error) {
+	if _, ok := s.templates[templateID]; !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	var out []domain.LocaleSummary
+	for _, v := range s.versions {
+		if v.TemplateID != templateID {
+			continue
+		}
+		ls := domain.LocaleSummary{Locale: v.Locale, LatestVersionID: v.VersionID, LatestVersionNumber: v.VersionNumber, LatestStatus: v.Status}
+		if v.Status == domain.TemplateVersionPublished {
+			id := v.VersionID
+			ls.PublishedVersionID = &id
+		}
+		out = append(out, ls)
+	}
+	return out, nil
+}
+
 type stubPublisher struct {
 	sent, failed                                                          int
 	templateCreated, templateApproved, templatePublished, templateRetired int
@@ -969,6 +1020,111 @@ func TestApproveTemplate_AuthzDenied_Returns403(t *testing.T) {
 	}
 	if len(denyingAuthz.calls) != 1 || denyingAuthz.calls[0] != "TEMPLATE_APPROVE" {
 		t.Errorf("expected one TEMPLATE_APPROVE check, got %v", denyingAuthz.calls)
+	}
+}
+
+// ── RenderPreview / CompareVersions / ListLocales tests (BIZ-03 Wave 2) ──────
+
+func TestRenderPreview_MissingVariables_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/preview", map[string]any{
+		"variables": map[string]string{},
+	}, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRenderPreview_Valid_Returns200(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/preview", map[string]any{
+		"variables": map[string]string{"first_name": "Ada"},
+	}, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestRenderPreview_UnknownVersion_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/nope/preview", map[string]any{}, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestCompareVersions_DifferentTemplates_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateA := createTestTemplate(t, r, "owner-1")
+	versionA := createTestVersion(t, r, templateA, "owner-1")
+	templateB := createTestTemplate(t, r, "owner-1")
+	versionB := createTestVersion(t, r, templateB, "owner-1")
+
+	rr := doReq(r, http.MethodGet,
+		"/v1/document-templates/"+templateA+"/compare?version_a="+versionA+"&version_b="+versionB, nil, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestCompareVersions_SameTemplate_ReportsContentChanged(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionA := createTestVersion(t, r, templateID, "owner-1")
+	versionB := createTestVersion(t, r, templateID, "owner-1")
+
+	rr := doReq(r, http.MethodGet,
+		"/v1/document-templates/"+templateID+"/compare?version_a="+versionA+"&version_b="+versionB, nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var result domain.CompareVersionsResult
+	if err := json.Unmarshal(rr.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if result.VersionA.VersionID != versionA || result.VersionB.VersionID != versionB {
+		t.Fatalf("expected version_a/version_b to match request, got %s/%s", result.VersionA.VersionID, result.VersionB.VersionID)
+	}
+}
+
+func TestCompareVersions_MissingParams_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/compare", nil, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", rr.Code)
+	}
+}
+
+func TestListLocales_ReturnsEachLocale(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	createTestVersion(t, r, templateID, "owner-1") // en-US, from the shared test helper
+
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/locales", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var locales []domain.LocaleSummary
+	if err := json.Unmarshal(rr.Body.Bytes(), &locales); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(locales) != 1 || locales[0].Locale != "en-US" {
+		t.Fatalf("expected one en-US locale, got %+v", locales)
+	}
+}
+
+func TestListLocales_UnknownTemplate_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/nope/locales", nil, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
 	}
 }
 

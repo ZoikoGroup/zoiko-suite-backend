@@ -214,3 +214,167 @@ func TestPgStore_ValidateTemplate_RejectsMalformedContent(t *testing.T) {
 		t.Fatalf("expected ErrTemplateContentInvalid, got %v", err)
 	}
 }
+
+// TestPgStore_RenderPreview_RefusesPartialRender proves RenderPreview
+// refuses to render a version whose required variables are not all
+// supplied, and renders correctly once they are.
+func TestPgStore_RenderPreview_RefusesPartialRender(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+	tmpl := newTestTemplate(t, s, ctx, "owner-1")
+	v, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmpl.TemplateID, Locale: "en-US", Content: "<p>Hello {{.first_name}}</p>",
+		VariableSchema: []string{"first_name"}, CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create version: %v", err)
+	}
+
+	if _, err := s.RenderPreview(ctx, domain.RenderPreviewParams{VersionID: v.VersionID, Variables: map[string]string{}}); err == nil {
+		t.Fatal("expected an error for missing required variables")
+	}
+
+	result, err := s.RenderPreview(ctx, domain.RenderPreviewParams{VersionID: v.VersionID, Variables: map[string]string{"first_name": "Ada"}})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if result.RenderedContent != "<p>Hello Ada</p>" {
+		t.Fatalf("expected rendered content with substituted variable, got %q", result.RenderedContent)
+	}
+}
+
+// TestPgStore_CompareVersions_RejectsDifferentTemplates is the
+// negative-controlled proof that comparing versions across two
+// different templates is refused rather than silently diffed.
+func TestPgStore_CompareVersions_RejectsDifferentTemplates(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+	tmplA := newTestTemplate(t, s, ctx, "owner-1")
+	vA, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmplA.TemplateID, Locale: "en-US", Content: "<p>a</p>", CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create version a: %v", err)
+	}
+	tmplB := newTestTemplate(t, s, ctx, "owner-1")
+	vB, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmplB.TemplateID, Locale: "en-US", Content: "<p>b</p>", CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create version b: %v", err)
+	}
+
+	if _, err := s.CompareVersions(ctx, vA.VersionID, vB.VersionID); err != domain.ErrTemplateVersionsBelongToDifferentTemplates {
+		t.Fatalf("expected ErrTemplateVersionsBelongToDifferentTemplates, got %v", err)
+	}
+}
+
+// TestPgStore_CompareVersions_ReportsVariableAndContentDiff proves the
+// real diff: content_changed reflects the content hash, and
+// added/removed reflect the actual variable schema delta.
+func TestPgStore_CompareVersions_ReportsVariableAndContentDiff(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+	tmpl := newTestTemplate(t, s, ctx, "owner-1")
+	v1, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmpl.TemplateID, Locale: "en-US", Content: "<p>v1 {{.a}}</p>",
+		VariableSchema: []string{"a"}, CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create v1: %v", err)
+	}
+	v2, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmpl.TemplateID, Locale: "en-US", Content: "<p>v2 {{.b}}</p>",
+		VariableSchema: []string{"b"}, CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create v2: %v", err)
+	}
+
+	result, err := s.CompareVersions(ctx, v1.VersionID, v2.VersionID)
+	if err != nil {
+		t.Fatalf("compare: %v", err)
+	}
+	if !result.ContentChanged {
+		t.Fatal("expected content_changed to be true")
+	}
+	if len(result.VariablesAdded) != 1 || result.VariablesAdded[0] != "b" {
+		t.Fatalf("expected variables_added = [b], got %v", result.VariablesAdded)
+	}
+	if len(result.VariablesRemoved) != 1 || result.VariablesRemoved[0] != "a" {
+		t.Fatalf("expected variables_removed = [a], got %v", result.VariablesRemoved)
+	}
+}
+
+// TestPgStore_ListLocales_ReportsLatestAndPublishedPerLocale proves
+// ListLocales correctly separates "latest version" from "currently
+// published version" for each locale — they can differ once a locale
+// has an unpublished draft on top of an older published version.
+func TestPgStore_ListLocales_ReportsLatestAndPublishedPerLocale(t *testing.T) {
+	pool := openTestPool(t)
+	s := store.New(pool)
+	ctx := tenantCtx("tenant-a")
+	tmpl := newTestTemplate(t, s, ctx, "owner-1")
+
+	published, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmpl.TemplateID, Locale: "en-US", Content: "<p>v1</p>", CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create v1: %v", err)
+	}
+	if _, err := s.ValidateTemplate(ctx, published.VersionID); err != nil {
+		t.Fatalf("validate v1: %v", err)
+	}
+	if _, err := s.ApproveTemplate(ctx, domain.ApproveVersionParams{VersionID: published.VersionID, ApprovedByPrincipalID: "approver-1"}); err != nil {
+		t.Fatalf("approve v1: %v", err)
+	}
+	if _, err := s.PublishTemplate(ctx, domain.PublishVersionParams{VersionID: published.VersionID, PublishedByPrincipalID: "approver-1"}); err != nil {
+		t.Fatalf("publish v1: %v", err)
+	}
+
+	draft, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmpl.TemplateID, Locale: "en-US", Content: "<p>v2 draft</p>", CreatedByPrincipalID: "owner-1",
+	})
+	if err != nil {
+		t.Fatalf("create v2 draft: %v", err)
+	}
+	if _, err := s.CreateVersion(ctx, domain.CreateVersionParams{
+		TemplateID: tmpl.TemplateID, Locale: "fr-FR", Content: "<p>bonjour</p>", CreatedByPrincipalID: "owner-1",
+	}); err != nil {
+		t.Fatalf("create fr-FR: %v", err)
+	}
+
+	locales, err := s.ListLocales(ctx, tmpl.TemplateID)
+	if err != nil {
+		t.Fatalf("list locales: %v", err)
+	}
+	if len(locales) != 2 {
+		t.Fatalf("expected 2 locales, got %d: %+v", len(locales), locales)
+	}
+	byLocale := map[string]domain.LocaleSummary{}
+	for _, ls := range locales {
+		byLocale[ls.Locale] = ls
+	}
+	en := byLocale["en-US"]
+	if en.LatestVersionID != draft.VersionID {
+		t.Fatalf("expected en-US latest to be the draft, got %s", en.LatestVersionID)
+	}
+	if en.PublishedVersionID == nil || *en.PublishedVersionID != published.VersionID {
+		t.Fatalf("expected en-US published to be the first version, got %v", en.PublishedVersionID)
+	}
+	fr := byLocale["fr-FR"]
+	if fr.PublishedVersionID != nil {
+		t.Fatalf("expected fr-FR to have no published version yet, got %v", *fr.PublishedVersionID)
+	}
+}
+
+func TestPgStore_ListLocales_UnknownTemplate_ReturnsNotFound(t *testing.T) {
+	s := store.New(openTestPool(t))
+	_, err := s.ListLocales(tenantCtx("tenant-a"), "00000000-0000-0000-0000-000000000000")
+	if err != domain.ErrTemplateNotFound {
+		t.Fatalf("expected ErrTemplateNotFound, got %v", err)
+	}
+}

@@ -4,6 +4,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -398,6 +399,157 @@ func (s *PgStore) RetireTemplate(ctx context.Context, p domain.RetireTemplatePar
 		return nil, err
 	}
 	return &out, nil
+}
+
+// RenderPreview renders a version's content against supplied variables
+// regardless of its status — BIZ-03's own RenderPreview query. Refuses a
+// partial render rather than producing one with a blank field, same
+// posture as internal/templates.Render.
+func (s *PgStore) RenderPreview(ctx context.Context, p domain.RenderPreviewParams) (*domain.RenderPreviewResult, error) {
+	v, err := s.GetTemplateVersion(ctx, p.VersionID)
+	if err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, key := range v.VariableSchema {
+		if p.Variables[key] == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
+	}
+
+	tmpl, err := htmltemplate.New("preview").Parse(v.Content)
+	if err != nil {
+		return nil, domain.ErrTemplateContentInvalid
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, p.Variables); err != nil {
+		return nil, fmt.Errorf("render preview: %w", err)
+	}
+	return &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: buf.String()}, nil
+}
+
+// CompareVersions diffs two versions of the same template — BIZ-03's
+// own CompareVersions query. Refuses to compare versions belonging to
+// different templates; that is not a meaningful diff.
+func (s *PgStore) CompareVersions(ctx context.Context, versionIDA, versionIDB string) (*domain.CompareVersionsResult, error) {
+	a, err := s.GetTemplateVersion(ctx, versionIDA)
+	if err != nil {
+		return nil, err
+	}
+	b, err := s.GetTemplateVersion(ctx, versionIDB)
+	if err != nil {
+		return nil, err
+	}
+	if a.TemplateID != b.TemplateID {
+		return nil, domain.ErrTemplateVersionsBelongToDifferentTemplates
+	}
+
+	aVars := make(map[string]bool, len(a.VariableSchema))
+	for _, v := range a.VariableSchema {
+		aVars[v] = true
+	}
+	bVars := make(map[string]bool, len(b.VariableSchema))
+	for _, v := range b.VariableSchema {
+		bVars[v] = true
+	}
+	var added, removed []string
+	for _, v := range b.VariableSchema {
+		if !aVars[v] {
+			added = append(added, v)
+		}
+	}
+	for _, v := range a.VariableSchema {
+		if !bVars[v] {
+			removed = append(removed, v)
+		}
+	}
+
+	return &domain.CompareVersionsResult{
+		VersionA: *a, VersionB: *b,
+		ContentChanged:   a.ContentHash != b.ContentHash,
+		VariablesAdded:   added,
+		VariablesRemoved: removed,
+	}, nil
+}
+
+// ListLocales returns every locale a template has versions in, along
+// with each locale's latest version and — if any — which version
+// currently governs it (PUBLISHED) — BIZ-03's own ListLocales query.
+func (s *PgStore) ListLocales(ctx context.Context, templateID string) ([]domain.LocaleSummary, error) {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+	if tenantID == "" {
+		return nil, domain.ErrIdentityMissing
+	}
+	var out []domain.LocaleSummary
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		if _, err := s.templateExists(ctx, tx, tenantID, templateID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT DISTINCT ON (locale) locale, version_id, version_number, status
+			FROM template_versions
+			WHERE template_id = $1 AND tenant_id = $2
+			ORDER BY locale, version_number DESC
+		`, templateID, tenantID)
+		if err != nil {
+			return fmt.Errorf("template store unavailable: %w", err)
+		}
+		for rows.Next() {
+			var ls domain.LocaleSummary
+			if err := rows.Scan(&ls.Locale, &ls.LatestVersionID, &ls.LatestVersionNumber, &ls.LatestStatus); err != nil {
+				rows.Close()
+				return fmt.Errorf("template store unavailable: %w", err)
+			}
+			out = append(out, ls)
+		}
+		rowsErr := rows.Err()
+		rows.Close()
+		if rowsErr != nil {
+			return fmt.Errorf("template store unavailable: %w", rowsErr)
+		}
+
+		// A second query per locale, only after the first result set is
+		// fully drained and closed — pgx refuses to interleave a new query
+		// with an open one on the same connection ("conn busy").
+		for i := range out {
+			var publishedID string
+			pubErr := tx.QueryRow(ctx, `
+				SELECT version_id FROM template_versions
+				WHERE template_id = $1 AND tenant_id = $2 AND locale = $3 AND status = 'PUBLISHED'
+			`, templateID, tenantID, out[i].Locale).Scan(&publishedID)
+			if pubErr == nil {
+				out[i].PublishedVersionID = &publishedID
+			} else if !errors.Is(pubErr, pgx.ErrNoRows) {
+				return fmt.Errorf("template store unavailable: %w", pubErr)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// templateExists is a lightweight existence check used by queries that
+// need to distinguish "template not found" from "template has no
+// versions yet" (an empty ListLocales result is valid; a missing
+// template is not).
+func (s *PgStore) templateExists(ctx context.Context, tx pgx.Tx, tenantID, templateID string) (bool, error) {
+	var exists bool
+	err := tx.QueryRow(ctx, `SELECT true FROM template_definitions WHERE template_id = $1 AND tenant_id = $2`,
+		templateID, tenantID).Scan(&exists)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, domain.ErrTemplateNotFound
+	}
+	if err != nil {
+		return false, fmt.Errorf("template store unavailable: %w", err)
+	}
+	return exists, nil
 }
 
 // validateTemplateContent proves the content is at least syntactically

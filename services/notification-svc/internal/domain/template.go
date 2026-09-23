@@ -1,6 +1,10 @@
 package domain
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // BIZ-03 Template — TemplateDefinition owns identity/purpose/owner;
 // TemplateVersion owns the actual governed content and its own
@@ -96,6 +100,44 @@ type RetireTemplateParams struct {
 	RetiredByPrincipalID string
 }
 
+// RenderPreviewParams is RenderPreview's input — renders a version's
+// content against supplied variables regardless of its status, so an
+// author or approver can see what a DRAFT/REVIEW version actually looks
+// like before it is ever published.
+type RenderPreviewParams struct {
+	VersionID string
+	Variables map[string]string
+}
+
+// RenderPreviewResult is RenderPreview's output.
+type RenderPreviewResult struct {
+	VersionID        string   `json:"version_id"`
+	RenderedContent  string   `json:"rendered_content"`
+	MissingVariables []string `json:"missing_variables,omitempty"`
+}
+
+// CompareVersionsResult is CompareVersions' output — both versions in
+// full, plus the two things that actually differ between them in a way
+// a reviewer cares about: whether the content itself changed, and which
+// variables were added or removed from the schema.
+type CompareVersionsResult struct {
+	VersionA         TemplateVersion `json:"version_a"`
+	VersionB         TemplateVersion `json:"version_b"`
+	ContentChanged   bool            `json:"content_changed"`
+	VariablesAdded   []string        `json:"variables_added,omitempty"`
+	VariablesRemoved []string        `json:"variables_removed,omitempty"`
+}
+
+// LocaleSummary is one entry in ListLocales' output — one locale's
+// latest version and, if any, which version currently governs it.
+type LocaleSummary struct {
+	Locale              string  `json:"locale"`
+	LatestVersionID     string  `json:"latest_version_id"`
+	LatestVersionNumber int     `json:"latest_version_number"`
+	LatestStatus        string  `json:"latest_status"`
+	PublishedVersionID  *string `json:"published_version_id,omitempty"`
+}
+
 var (
 	ErrTemplateNotFound            = errorString("template not found")
 	ErrTemplateVersionNotFound     = errorString("template version not found")
@@ -107,4 +149,20 @@ var (
 	ErrTemplateVersionSelfApproval = errorString("the principal who created a template version cannot also approve it")
 	ErrTemplateContentInvalid      = errorString("template content failed validation")
 	ErrTemplateLocaleRequired      = errorString("locale is required")
+	// ErrTemplateVersionsBelongToDifferentTemplates backs CompareVersions —
+	// comparing versions across two different templates is not a
+	// meaningful diff and is refused rather than silently allowed.
+	ErrTemplateVersionsBelongToDifferentTemplates = errorString("the two versions belong to different templates")
 )
+
+// ErrTemplateVariablesMissing backs RenderPreview — refusing a partial
+// render beats producing one with a blank field, same posture as
+// internal/templates.ErrMissingVariables.
+type ErrTemplateVariablesMissing struct {
+	VersionID string
+	Missing   []string
+}
+
+func (e ErrTemplateVariablesMissing) Error() string {
+	return fmt.Sprintf("version %s requires variables: %s", e.VersionID, strings.Join(e.Missing, ", "))
+}

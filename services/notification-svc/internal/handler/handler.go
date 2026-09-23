@@ -38,6 +38,9 @@ type Store interface {
 	PublishTemplate(ctx context.Context, p domain.PublishVersionParams) (*domain.TemplateVersion, error)
 	GetPublishedVersion(ctx context.Context, templateID, locale string) (*domain.TemplateVersion, error)
 	RetireTemplate(ctx context.Context, p domain.RetireTemplateParams) (*domain.TemplateDefinition, error)
+	RenderPreview(ctx context.Context, p domain.RenderPreviewParams) (*domain.RenderPreviewResult, error)
+	CompareVersions(ctx context.Context, versionIDA, versionIDB string) (*domain.CompareVersionsResult, error)
+	ListLocales(ctx context.Context, templateID string) ([]domain.LocaleSummary, error)
 }
 
 // RecipientResolver turns a principal into the contact endpoint a message is
@@ -176,9 +179,12 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{templateID}/versions", h.CreateVersion)
 		r.Get("/{templateID}/published", h.GetPublishedVersion)
 		r.Post("/{templateID}/retire", h.RetireTemplate)
+		r.Get("/{templateID}/locales", h.ListLocales)
+		r.Get("/{templateID}/compare", h.CompareVersions)
 		r.Post("/versions/{versionID}/validate", h.ValidateTemplate)
 		r.Post("/versions/{versionID}/approve", h.ApproveTemplate)
 		r.Post("/versions/{versionID}/publish", h.PublishTemplate)
+		r.Post("/versions/{versionID}/preview", h.RenderPreview)
 	})
 }
 
@@ -940,6 +946,111 @@ func (h *Handler) RetireTemplate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, retired)
 }
 
+type renderPreviewRequest struct {
+	Variables map[string]string `json:"variables,omitempty"`
+}
+
+// RenderPreview — BIZ-03's own RenderPreview query. Renders any
+// version's content, regardless of status, so a reviewer can see a
+// DRAFT/REVIEW version before it is ever published.
+func (h *Handler) RenderPreview(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req renderPreviewRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	result, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{VersionID: versionID, Variables: req.Variables})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// CompareVersions — BIZ-03's own CompareVersions query. Both version ids
+// are query parameters, not path segments — this reads two versions,
+// neither of which "owns" the comparison route.
+func (h *Handler) CompareVersions(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionA := r.URL.Query().Get("version_a")
+	versionB := r.URL.Query().Get("version_b")
+	if versionA == "" || versionB == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "version_a and version_b query parameters are required")
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	result, err := h.store.CompareVersions(r.Context(), versionA, versionB)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ListLocales — BIZ-03's own ListLocales query.
+func (h *Handler) ListLocales(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	locales, err := h.store.ListLocales(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if locales == nil {
+		locales = []domain.LocaleSummary{}
+	}
+	writeJSON(w, http.StatusOK, locales)
+}
+
 func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrTemplateNotFound):
@@ -962,7 +1073,14 @@ func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "invalid_content", err.Error())
 	case errors.Is(err, domain.ErrTemplateLocaleRequired):
 		writeError(w, http.StatusBadRequest, "missing_fields", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionsBelongToDifferentTemplates):
+		writeError(w, http.StatusBadRequest, "version_template_mismatch", err.Error())
 	default:
+		var missing domain.ErrTemplateVariablesMissing
+		if errors.As(err, &missing) {
+			writeError(w, http.StatusBadRequest, "missing_variables", missing.Error())
+			return
+		}
 		h.log.Error("template store error", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
 	}
