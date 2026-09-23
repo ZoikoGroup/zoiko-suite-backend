@@ -69,6 +69,20 @@ func (s *PgStore) outboxEnqueueTx(ctx context.Context, tx pgx.Tx, rec outbox.Rec
 	return nil
 }
 
+// nullIfEmpty maps "" to a SQL NULL.
+//
+// The four columns added in migration 000008 are evidence fields, and in
+// evidence "the caller presented nothing" and "the caller presented an empty
+// string" are different claims. Storing an empty string for both would erase
+// that distinction permanently, in the one record a governance decision is later
+// reconstructed from.
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
 // insertSessionContextTx is the shared INSERT used by both the plain and the
 // transactional entry points, so the column list cannot drift between them.
 func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionContext) error {
@@ -89,6 +103,9 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 		retentionClass = domain.RetentionClassSessionEvidence
 	}
 
+	// Empty string and "never presented" are different facts in evidence, and
+	// the columns are nullable so they can stay different. nullIfEmpty keeps
+	// that distinction at the one place the row is written.
 	_, err := tx.Exec(ctx, `
 		INSERT INTO session_contexts (
 			session_context_id, principal_id, tenant_id, legal_entity_id,
@@ -97,8 +114,10 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 			issued_at, expires_at, data_residency_policy_id,
 			source_service, schema_version,
 			ingress_source, environment, evidence_id, support_context_id,
-			retention_class, disposition_due_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+			retention_class, disposition_due_at,
+			source_channel, workload_id, causation_id, entitlement_context_ref,
+			ingress_binding_version)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
 		ON CONFLICT (session_context_id) DO NOTHING`,
 		sc.SessionContextID, sc.PrincipalID, sc.TenantID, legalEntityID,
 		sc.CorrelationID, string(sc.TrustPosture), sc.MFAVerified, sc.DeviceTrustScore,
@@ -107,6 +126,9 @@ func insertSessionContextTx(ctx context.Context, tx pgx.Tx, sc domain.SessionCon
 		sc.SourceService, sc.SchemaVersion,
 		ingress, string(environment), sc.EvidenceID, sc.SupportContextID,
 		retentionClass, sc.DispositionDueAt,
+		nullIfEmpty(sc.SourceChannel), nullIfEmpty(sc.WorkloadID),
+		nullIfEmpty(sc.CausationID), sc.EntitlementContextRef,
+		nullIfEmpty(sc.IngressBindingVersion),
 	)
 	if err != nil {
 		return fmt.Errorf("insert session_context: %w", err)
@@ -445,6 +467,64 @@ func (s *PgStore) FindUnreviewedExpiredSupportContexts(
 		return nil, fmt.Errorf("find unreviewed support contexts: %w", err)
 	}
 	return out, nil
+}
+
+// FindUnreviewedExpiredSupportContextsAllTenants is the same query with no
+// tenant, for the background reconciler.
+//
+// The tenant-scoped sibling above could only ever sweep the tenant that asked,
+// and nothing asked: SupportService.Reconcile was called by no goroutine in
+// cmd/server despite its own comment claiming otherwise. Even once wired, a
+// per-tenant sweep would have to be told which tenants exist — so a tenant
+// whose register nobody opened would have its expired elevations reviewed by
+// nobody, forever. That is the same shape as the read-triggered expiry defect
+// in delegated-authority-svc.
+//
+// Admitted by app.support_reconciler, a SELECT-only policy added in migration
+// 000008. Its own GUC, deliberately not app.outbox_relay: that one carries
+// UPDATE, and a reporting sweep must never be able to write. Sharing a GUC
+// name between two hatches silently grants each the union of both.
+func (s *PgStore) FindUnreviewedExpiredSupportContextsAllTenants(
+	ctx context.Context,
+	before time.Time,
+	limit int,
+) ([]domain.SupportContext, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback error discarded intentionally on commit path
+
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.support_reconciler', 'true', true)"); err != nil {
+		return nil, fmt.Errorf("set_config app.support_reconciler: %w", err)
+	}
+
+	rows, err := tx.Query(ctx, supportContextColumns+`
+		 WHERE reviewed_at IS NULL
+		   AND (expires_at <= $1 OR revoked_at IS NOT NULL)
+		 ORDER BY expires_at
+		 LIMIT $2`, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find unreviewed support contexts (all tenants): %w", err)
+	}
+	defer rows.Close()
+
+	var out []domain.SupportContext
+	for rows.Next() {
+		var sc domain.SupportContext
+		if err := scanSupportContext(rows, &sc); err != nil {
+			return nil, err
+		}
+		out = append(out, sc)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("find unreviewed support contexts (all tenants): %w", err)
+	}
+	rows.Close()
+	return out, tx.Commit(ctx)
 }
 
 // MarkSupportContextReviewed records the reconciliation.

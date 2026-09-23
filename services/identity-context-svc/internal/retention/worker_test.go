@@ -29,10 +29,11 @@ type fakeStore struct {
 	holds    map[string]bool // "tenant|principal" → held
 	holdErr  error
 
-	disposed   map[string][]string
-	purged     int
-	disposeErr error
-	tenantsErr error
+	disposed          map[string][]string
+	purged            int
+	idempotencyPurged int
+	disposeErr        error
+	tenantsErr        error
 }
 
 func newFakeStore() *fakeStore {
@@ -73,6 +74,13 @@ func (f *fakeStore) HasActiveLegalHold(_ context.Context, tenantID, principalID 
 func (f *fakeStore) PurgePublishedOutbox(_ context.Context, _ time.Time, _ int) (int, error) {
 	f.purged++
 	return 3, nil
+}
+
+// idempotencyPurged counts calls so a test can assert the sweep prunes the
+// replay table as well as the outbox.
+func (f *fakeStore) PurgeIdempotencyKeysBefore(_ context.Context, _ time.Time) (int64, error) {
+	f.idempotencyPurged++
+	return 2, nil
 }
 
 // capturingSink records the events the worker emits, so a test can assert on

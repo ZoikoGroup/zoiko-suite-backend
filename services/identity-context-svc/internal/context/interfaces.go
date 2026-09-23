@@ -127,3 +127,19 @@ type TokenVerifier interface {
 type EnvelopeSigner interface {
 	Sign(envelope *domain.IdentityContextEnvelope) (string, error)
 }
+
+// SupportContextVerifier answers whether a support grant named on a request is
+// one this caller may actually act under. Satisfied by *SupportService.
+//
+// Narrow on purpose: resolution needs a verdict, not the ability to mint,
+// revoke or reconcile grants. Handing the resolver the whole SupportService
+// would let a future change to the hot path create an elevation.
+type SupportContextVerifier interface {
+	// Verify returns the grant when it exists, is live, is unrevoked, belongs
+	// to supportPrincipalID within tenantID, and covers subjectPrincipalID.
+	//
+	// An empty subjectPrincipalID skips the coverage check — at resolution
+	// time the session being minted is the support operator's own, and which
+	// subject they may reach is decided per request, later.
+	Verify(ctx context.Context, supportContextID, tenantID, supportPrincipalID, subjectPrincipalID string) (*domain.SupportContext, error)
+}

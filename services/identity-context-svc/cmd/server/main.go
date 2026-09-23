@@ -34,6 +34,7 @@ import (
 	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/events"
 	"zoiko.io/identity-context-svc/internal/health"
+	"zoiko.io/identity-context-svc/internal/idempotency"
 	"zoiko.io/identity-context-svc/internal/outbox"
 	"zoiko.io/identity-context-svc/internal/retention"
 	"zoiko.io/identity-context-svc/internal/session"
@@ -372,7 +373,47 @@ func main() {
 	// handler so no request reaches business logic without a resolved tenant,
 	// actor, correlation and — on material writes — an idempotency key.
 	// Enforcement mode: ZS_ENVELOPE_ENFORCEMENT (default write-strict).
-	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
+	// §4's Engineering Interaction Wireframe classifies ResolveTenantContext as
+	// a QUERY. The envelope contract's default rule is "any non-GET/HEAD/OPTIONS
+	// is a material state change", which made this POST a material write and so
+	// demanded an Idempotency-Key — a replay key for an operation the spec says
+	// changes nothing the caller owns.
+	//
+	// Worse, it is circular in the same way /v1/authenticate is: resolve is the
+	// endpoint that MINTS the envelope every other service consumes, so
+	// requiring a complete envelope as INPUT can only ever be satisfied by a
+	// caller asserting the values this endpoint exists to establish.
+	//
+	// Declassifying it does NOT open it up. The handler still refuses a request
+	// with no bearer token (401 CONTEXT_UNRESOLVED), the tenant still comes from
+	// the verified token rather than any header, and a support context asserted
+	// on it is now verified. The envelope is still parsed, reported and
+	// propagated — it simply is not a precondition for obtaining one.
+	envelopePolicy := svcenvelope.ServicePolicy()
+	envelopePolicy.MaterialWrite = func(req *http.Request) bool {
+		if req.URL.Path == "/v1/context/resolve" {
+			return false
+		}
+		switch req.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			return false
+		default:
+			return true
+		}
+	}
+	r.Use(svcenvelope.Middleware(envelopePolicy, svcenvelope.DefaultReporter()))
+
+	// Replay protection, AFTER the envelope contract.
+	//
+	// Order is load-bearing. The envelope is what establishes the tenant an
+	// idempotency key is scoped to, and a request refused for an incomplete
+	// envelope must not first claim a key — otherwise a malformed retry
+	// storm would fill the table with claims for commands that never ran.
+	//
+	// §4 has always required Idempotency-Key on every COMMAND and the
+	// envelope has always enforced its presence. Nothing read it until now:
+	// replaying POST /v1/context/support minted a second break-glass grant.
+	r.Use(idempotency.Middleware(principalRepo, log))
 
 	// Structured request logging
 	r.Use(func(next http.Handler) http.Handler {
@@ -424,6 +465,35 @@ func main() {
 		log,
 	).WithMetrics(govMetrics)
 
+	// Resolution must be able to CHECK an asserted elevation, not merely record
+	// it. X-Support-Context-Id is client-supplied and is not sanitized at the
+	// edge, so without this the resolver stamped whatever the caller sent onto
+	// the session evidence. Wired here rather than passed to NewResolver
+	// because supportService depends on the publisher and SoD checker, which
+	// are built after the resolver.
+	resolver.WithSupportVerifier(supportService)
+
+	// ── Break-glass reconciliation (§1) ───────────────────────────────────
+	//
+	// SupportService.Reconcile has always documented a "reconciler goroutine in
+	// cmd/server". There was none. An elevation expired, nobody was told, and
+	// the SupportContextsUnreviewed gauge — which exists — was never set by
+	// anything, so no alert on it could fire.
+	//
+	// Cross-tenant by construction: a sweep has no tenant, and a per-tenant
+	// version would only cover tenants somebody thought to ask about.
+	reconcileCtx, stopReconciler := context.WithCancel(context.Background())
+	defer stopReconciler()
+	// SUPPORT_REVIEW_INTERVAL_MINUTES was already declared, already loaded, and
+	// read by nothing — the config knob for this control shipped before the
+	// control did. Zero still means "deliberately disabled", as its own comment
+	// says, and RunReconciler logs loudly when it is.
+	go supportService.RunReconciler(
+		reconcileCtx,
+		time.Duration(cfg.SupportReviewIntervalMinutes)*time.Minute,
+		500,
+	)
+
 	cacheService := identityctx.NewContextCacheService(
 		principalRepo,
 		sessionCache,
@@ -448,6 +518,10 @@ func main() {
 		Interval:        time.Duration(cfg.RetentionSweepIntervalMinutes) * time.Minute,
 		BatchSize:       500,
 		OutboxRetention: time.Duration(cfg.OutboxRetentionDays) * 24 * time.Hour,
+		// Seven days comfortably outlives any sane client retry budget while
+		// keeping the replay table bounded. Without a purge the table only
+		// grows, since every command ever issued leaves a row.
+		IdempotencyRetention: 7 * 24 * time.Hour,
 	}, log).WithMetrics(govMetrics)
 	retentionCtx, stopRetention := context.WithCancel(context.Background())
 	defer stopRetention()

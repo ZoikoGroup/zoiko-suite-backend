@@ -99,6 +99,18 @@ type Resolver struct {
 	// region. Also optional, for the same reason.
 	residency *ResidencyPolicy
 
+	// support verifies a client-asserted X-Support-Context-Id before the
+	// resolution is attributed to it.
+	//
+	// Unlike ingress and residency, a nil verifier does NOT mean "skip". Those
+	// two are nil when a deployment has no bindings table or no region to
+	// check against — there is genuinely nothing to verify. This one is nil
+	// when the support command family was never wired, and a caller asserting
+	// an elevation that this process cannot check is refused, not quietly
+	// admitted unelevated. Getting that backwards is how the original defect
+	// would reappear.
+	support SupportContextVerifier
+
 	// retention decides disposition_due_at for the session evidence row.
 	retention time.Duration
 
@@ -111,6 +123,16 @@ type Resolver struct {
 // WithMetrics attaches the GOV-01 instruments.
 func (r *Resolver) WithMetrics(m *telemetry.GovMetrics) *Resolver {
 	r.metrics = m
+	return r
+}
+
+// WithSupportVerifier wires support-context verification into resolution.
+//
+// Wired from cmd/server after SupportService is built, rather than taken by
+// NewResolver, because SupportService depends on the publisher and SoD checker
+// that are constructed later than the resolver.
+func (r *Resolver) WithSupportVerifier(v SupportContextVerifier) *Resolver {
+	r.support = v
 	return r
 }
 
@@ -254,8 +276,15 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 	// The check can only ever REFUSE. It never supplies a tenant, so a forged
 	// host header cannot select one; what it can do is catch a token being
 	// presented on a hostname bound to somebody else.
+	// ingressDecision carries the binding's source_version through to the
+	// evidence row — §4's "policy/version references". Declared outside the
+	// block so a deployment with no ingress checker simply records nothing
+	// rather than the resolution having to branch later.
+	var ingressDecision IngressDecision
 	if r.ingress != nil {
-		if err := r.ingress.Check(ctx, req.IngressSource, claims.TenantID); err != nil {
+		decision, err := r.ingress.Evaluate(ctx, req.IngressSource, claims.TenantID)
+		ingressDecision = decision
+		if err != nil {
 			r.wg.Add(1)
 			go func() {
 				defer r.wg.Done()
@@ -302,6 +331,16 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 
 	// ── Dimension 2: Tenant validation ──────────────────────────────────────
 	if err := r.validateTenant(ctx, principal.TenantID, req.CorrelationID); err != nil {
+		return nil, err
+	}
+
+	// ── Support elevation, if one is asserted ───────────────────────────────
+	//
+	// Placed here for two reasons. It is the first point at which the tenant
+	// and principal a grant must be checked against are both trusted; and a
+	// refused elevation should not first cost an entity-scope lookup, three
+	// upstream calls and a signature.
+	if err := r.verifySupportContext(ctx, principal, req); err != nil {
 		return nil, err
 	}
 
@@ -461,6 +500,13 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 			AdaptiveRiskScore: riskScore,
 			SessionContextID:  sessionContextID,
 		},
+		// Verified by verifySupportContext above — an unverified assertion
+		// never reaches here, because it returns before this point. Carrying
+		// it on the envelope is what lets a downstream service see that it is
+		// serving support traffic; recording it only in session_contexts left
+		// that fact inside this service's database.
+		SupportContextID: req.SupportContextID,
+
 		CorrelationID: req.CorrelationID,
 		SchemaVersion: "1.0",
 	}
@@ -503,6 +549,25 @@ func (r *Resolver) Resolve(ctx context.Context, req domain.ResolveRequest) (*Res
 		SupportContextID: req.SupportContextID,
 		RetentionClass:   domain.RetentionClassSessionEvidence,
 		DispositionDueAt: r.dispositionDue(now),
+
+		// §4 server-resolved context and required source inputs. These were
+		// parsed off the canonical envelope by the middleware and then
+		// discarded, so a decision could not afterwards be explained by the
+		// channel it arrived on or the workload that made it.
+		SourceChannel: req.SourceChannel,
+		WorkloadID:    req.WorkloadID,
+		CausationID:   req.CausationID,
+
+		// §4 evidence/lineage: "policy/version references". Which revision of
+		// the routing truth this decision was made against — the difference
+		// between a decision that can be replayed and one that can be
+		// reproduced.
+		IngressBindingVersion: ingressDecision.SourceVersion,
+
+		// EntitlementContextRef stays nil: §4 names it, and no service in the
+		// estate resolves one. Left explicitly unset rather than filled with a
+		// placeholder — see the field's own comment.
+		EntitlementContextRef: nil,
 	}
 
 	// ── Evidence, atomically ────────────────────────────────────────────────
@@ -661,6 +726,92 @@ func (r *Resolver) verifyToken(ctx context.Context, req domain.ResolveRequest) (
 	// equivalent — none of which exist here, so there is nothing to validate
 	// against and no way to test an implementation that claimed to.
 	return nil, ErrSAMLUnsupported
+}
+
+// verifySupportContext refuses a resolution whose asserted support grant is
+// not live, not this caller's, or not there at all.
+//
+// X-Support-Context-Id arrives from the client and, until this check existed,
+// the resolver stamped it onto the session evidence unread. An expired,
+// revoked, foreign-tenant or entirely fictional id became the grant the
+// session was recorded against — the same self-reported-actor defect that
+// requirePrincipal already refuses for X-Actor-Principal-ID one file away.
+// SupportService.Verify had been written and was called by nothing on the
+// request path, so the check existed and never ran.
+//
+// Refusal, not a silent downgrade. §4's negative-path column allows "deny
+// /block/quarantine OR preserve UNKNOWN state"; deny is the reading taken,
+// because a caller that names an elevation and receives an ordinary session
+// believes it is acting under a grant that no evidence records — which is the
+// condition NP3 exists to prevent rather than a safe fallback from it.
+//
+// subjectPrincipalID is empty here: the session being minted is the support
+// operator's own, and which subject they may reach is decided per request by
+// SupportContext.Covers, not at resolution time.
+func (r *Resolver) verifySupportContext(ctx context.Context, principal *domain.Principal, req domain.ResolveRequest) error {
+	if req.SupportContextID == nil {
+		return nil
+	}
+	scID := *req.SupportContextID
+
+	if r.support == nil {
+		r.denySupport(ctx, principal, req, "support_context_unverifiable", scID)
+		return domain.ErrSupportContextUnverifiable
+	}
+
+	// The tenant is the caller's own, verified in Dimension 1 from the token
+	// and revalidated in Dimension 2 — never the header. That matches how
+	// GetSupportContext and RevokeSupportContext scope their lookups, so a
+	// grant is reachable from exactly one tenant throughout the service.
+	if _, err := r.support.Verify(ctx, scID, principal.TenantID, principal.PrincipalID, ""); err != nil {
+		switch {
+		case errors.Is(err, domain.ErrSupportContextExpired):
+			r.denySupport(ctx, principal, req, "support_context_expired", scID)
+			return domain.ErrSupportContextExpired
+		case errors.Is(err, domain.ErrSupportContextNotFound):
+			// Absent, revoked, another principal's and another tenant's all
+			// arrive here as one error, by Verify's own non-enumeration
+			// design. The metric label keeps them together deliberately: a
+			// caller must not be able to tell which of the four it hit.
+			r.denySupport(ctx, principal, req, "support_context_not_found", scID)
+			return domain.ErrSupportContextNotFound
+		default:
+			// A store failure is not a refusal of the caller. Still fail
+			// closed, but say which kind of closed it is.
+			return fmt.Errorf("%w: support context lookup: %v", ErrUpstreamUnavailable, err)
+		}
+	}
+	return nil
+}
+
+// denySupport records a refused elevation: metric, resolution_failed event,
+// SIEM stream.
+//
+// §4's negative-path column requires a stable error code AND evidence, so a
+// rejected elevation has to leave a trail even though nothing was granted —
+// an attempt to use a revoked break-glass grant is exactly the event a
+// security team needs and is invisible if only the caller is told.
+//
+// Fire-and-forget on the resolver's WaitGroup, matching the residency and
+// ingress denial paths, so a slow SIEM cannot add latency to a refusal.
+func (r *Resolver) denySupport(ctx context.Context, principal *domain.Principal, req domain.ResolveRequest, reason, supportContextID string) {
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		ctx, cancel := detach(ctx)
+		defer cancel()
+		r.countFailure(reason)
+		if err := r.events.PublishResolutionFailed(ctx, principal.PrincipalID, req.CorrelationID, reason); err != nil {
+			r.log.Error("event publish failed",
+				zap.String("event_type", "identity.context.resolution_failed"),
+				zap.String("principal_id", principal.PrincipalID),
+				zap.Error(err))
+		}
+		r.siem.Stream(ctx, principal.TenantID, "identity.support_context_rejected",
+			siem.SeverityHigh,
+			fmt.Sprintf("Principal %s asserted support context %s: %s",
+				principal.PrincipalID, supportContextID, reason))
+	}()
 }
 
 func (r *Resolver) validateTenant(ctx context.Context, tenantID, correlationID string) error {

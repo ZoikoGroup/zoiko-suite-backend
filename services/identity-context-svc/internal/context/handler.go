@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
 
 	"zoiko.io/identity-context-svc/internal/domain"
+	svcenvelope "zoiko.io/identity-context-svc/internal/envelope"
 	"zoiko.io/identity-context-svc/internal/session"
 	"zoiko.io/identity-context-svc/internal/store"
 )
@@ -168,6 +170,29 @@ func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (stri
 	return principalID, true
 }
 
+// requireCorrelation returns the request's correlation id, or refuses.
+//
+// §4's Engineering Interaction Wireframe marks every GOV-01 QUERY "Read-only;
+// scoped; correlation required". Scoped was enforced by requireTenant and
+// requirePrincipal; correlation was not enforced by anything. The envelope
+// middleware parses and REPORTS it, but its default mode is write-strict,
+// which refuses material writes and admits reads — so a bare GET carrying no
+// correlation succeeded and produced a decision nothing could later be traced
+// to.
+//
+// 400 rather than 401: the caller is authenticated and scoped, the request is
+// simply not traceable, which is a malformed request rather than an
+// unauthenticated one.
+func (h *Handler) requireCorrelation(w http.ResponseWriter, r *http.Request) (string, bool) {
+	correlationID := strings.TrimSpace(r.Header.Get("X-Correlation-ID"))
+	if correlationID == "" {
+		writeCoded(w, http.StatusBadRequest, domain.ErrCodeContextUnresolved,
+			"X-Correlation-ID is required on GOV-01 queries — a governance read must be traceable to the story that caused it")
+		return "", false
+	}
+	return correlationID, true
+}
+
 // authorizeUnlessSelf permits an action on the caller's OWN principal or
 // session without an authorization round-trip, and requires a grant
 // otherwise.
@@ -228,6 +253,9 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/context/support", h.AttachSupportContext)
 		r.Get("/context/support/{supportContextID}", h.GetSupportContext)
 		r.Delete("/context/support/{supportContextID}", h.RevokeSupportContext)
+		// The review half of §1's "followed by reconciliation/review". The
+		// reconciler goroutine reports what is pending; this closes one.
+		r.Post("/context/support/{supportContextID}/review", h.ReviewSupportContext)
 
 		r.Get("/principals/{principalID}", h.GetPrincipal)
 		r.Get("/principals/{principalID}/roles", h.GetPrincipalRoles)
@@ -252,8 +280,23 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 	req.Environment = h.environment
 	// A support-scoped resolve carries its grant so every session issued under
 	// an elevation is attributable to it. Absent for ordinary traffic.
+	//
+	// This header is CLIENT-SUPPLIED and is not sanitized at the edge — the
+	// gateway's authResponseHeaders list does not include it and neither does
+	// the GTRM edge strip. Taking it here is therefore an assertion, not a
+	// fact; the resolver verifies it against the grant register before any
+	// session is attributed to it. See Resolver.verifySupportContext.
 	if scID := r.Header.Get("X-Support-Context-Id"); scID != "" {
 		req.SupportContextID = &scID
+	}
+
+	// Canonical envelope facts the middleware already parsed and validated.
+	// Read from the resolved envelope rather than re-read from headers, so
+	// there is exactly one place in the service that decides what these mean.
+	if env, ok := svcenvelope.FromContext(r.Context()); ok {
+		req.SourceChannel = string(env.SourceChannel)
+		req.WorkloadID = env.WorkloadID
+		req.CausationID = env.CausationID
 	}
 
 	result, err := h.resolver.Resolve(r.Context(), req)
@@ -274,6 +317,20 @@ func (h *Handler) ResolveContext(w http.ResponseWriter, r *http.Request) {
 			writeCoded(w, http.StatusBadRequest, domain.ErrCodeUnsupported, err.Error())
 		case errors.Is(err, ErrTrustPostureBlocked):
 			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeTrustPostureBlocked, err.Error())
+		// A refused support elevation. 401 rather than 403 for the same reason
+		// the ingress mismatch above is 401: the caller is not forbidden an
+		// action, the context it claimed to act in could not be established.
+		//
+		// These two codes were declared for exactly this and, until now, were
+		// reachable only from the support read/revoke routes.
+		case errors.Is(err, domain.ErrSupportContextExpired):
+			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeBreakGlassExpired, err.Error())
+		case errors.Is(err, domain.ErrSupportContextNotFound):
+			writeCoded(w, http.StatusUnauthorized, domain.ErrCodeBreakGlassRequired, err.Error())
+		// Not the caller's fault: support is unwired in this deployment, so
+		// the assertion could not be checked either way. 503, not 401.
+		case errors.Is(err, domain.ErrSupportContextUnverifiable):
+			writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable, err.Error())
 		case errors.Is(err, ErrTokenInvalid),
 			errors.Is(err, ErrPrincipalInactive),
 			errors.Is(err, ErrTenantInactive),
@@ -324,6 +381,12 @@ func (h *Handler) GetSession(w http.ResponseWriter, r *http.Request) {
 	}
 	callerPrincipalID, ok := h.requirePrincipal(w, r)
 	if !ok {
+		return
+	}
+	// §4: GOV-01 queries are "Read-only; scoped; correlation required".
+	// Scoped was enforced here; correlation was enforced by nothing, because
+	// the envelope's default write-strict mode admits reads.
+	if _, ok := h.requireCorrelation(w, r); !ok {
 		return
 	}
 	sessionContextID := chi.URLParam(r, "sessionContextID")
@@ -575,6 +638,7 @@ func writeCoded(w http.ResponseWriter, status int, code, msg string) {
 // Ensure the interfaces defined in interfaces.go are satisfied at compile time.
 // The concrete implementations live in their own packages.
 var _ PrincipalStore = (*store.PgStore)(nil)
+
 // DurableCache, not the legacy Redis-only Cache: cmd/server/main.go wires
 // session.NewDurableCache, and it is the one that carries the tenant scope and
 // EvictAllForPrincipal the interface now requires.

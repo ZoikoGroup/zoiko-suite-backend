@@ -83,6 +83,23 @@ func (f *fakeSupportStore) RevokeSupportContextWithEvent(_ context.Context, id, 
 	return true, nil
 }
 
+// FindUnreviewedExpiredSupportContextsAllTenants is the cross-tenant sibling
+// the background reconciler uses. Deliberately ignores tenant, which is the
+// whole point: a sweep that needed a tenant could only ever cover tenants
+// somebody thought to ask about.
+func (f *fakeSupportStore) FindUnreviewedExpiredSupportContextsAllTenants(_ context.Context, before time.Time, limit int) ([]domain.SupportContext, error) {
+	var out []domain.SupportContext
+	for _, sc := range f.contexts {
+		if sc.ReviewedAt != nil {
+			continue
+		}
+		if !sc.ExpiresAt.After(before) || sc.RevokedAt != nil {
+			out = append(out, *sc)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeSupportStore) FindUnreviewedExpiredSupportContexts(_ context.Context, tenantID string, before time.Time, limit int) ([]domain.SupportContext, error) {
 	var out []domain.SupportContext
 	for _, sc := range f.contexts {

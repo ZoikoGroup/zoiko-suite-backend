@@ -25,6 +25,11 @@ type SupportContextStore interface {
 	FindLiveSupportContext(ctx context.Context, supportPrincipalID, tenantID string, at time.Time) (*domain.SupportContext, error)
 	RevokeSupportContextWithEvent(ctx context.Context, supportContextID, tenantID, reason string, at time.Time, rec outbox.Record) (bool, error)
 	FindUnreviewedExpiredSupportContexts(ctx context.Context, tenantID string, before time.Time, limit int) ([]domain.SupportContext, error)
+
+	// FindUnreviewedExpiredSupportContextsAllTenants backs the background
+	// reconciler. A sweep has no tenant to be scoped to, and a per-tenant
+	// sweep would only ever cover tenants somebody thought to ask about.
+	FindUnreviewedExpiredSupportContextsAllTenants(ctx context.Context, before time.Time, limit int) ([]domain.SupportContext, error)
 	MarkSupportContextReviewed(ctx context.Context, supportContextID, tenantID, reviewer string, at time.Time) error
 }
 
@@ -124,6 +129,15 @@ const ActionAttachSupportContext = "IDENTITY_SUPPORT_CONTEXT_ATTACH"
 // support session as to start one means the person who notices a problem may
 // not be able to stop it.
 const ActionRevokeSupportContext = "IDENTITY_SUPPORT_CONTEXT_REVOKE"
+
+// ActionReviewSupportContext guards recording the post-hoc reconciliation.
+//
+// Its own action rather than reusing the revoke grant: reviewing an elapsed
+// elevation is an assurance duty, and the person who may end a live support
+// session is not necessarily the person who should sign off that it was
+// legitimate. §1 wants the review independent, and one shared permission makes
+// "independent" unexpressible.
+const ActionReviewSupportContext = "IDENTITY_SUPPORT_CONTEXT_REVIEW"
 
 // Attach grants a scoped, time-limited, independently-approved elevation.
 //
@@ -374,6 +388,75 @@ func (s *SupportService) Reconcile(ctx context.Context, tenantID string, limit i
 			zap.Time("expired_at", sc.ExpiresAt))
 	}
 	return pending, nil
+}
+
+// ReconcileAll is Reconcile across every tenant, for the background worker.
+//
+// Same reporting stance as Reconcile: it names what is awaiting review and
+// approves nothing. An automatic review is not a review.
+func (s *SupportService) ReconcileAll(ctx context.Context, limit int) ([]domain.SupportContext, error) {
+	pending, err := s.store.FindUnreviewedExpiredSupportContextsAllTenants(ctx, time.Now().UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	for _, sc := range pending {
+		s.log.Warn("SUPPORT CONTEXT AWAITING REVIEW",
+			zap.String("support_context_id", sc.SupportContextID),
+			zap.String("tenant_id", sc.TenantID),
+			zap.String("support_principal_id", sc.SupportPrincipalID),
+			zap.String("approver_principal_id", sc.ApproverPrincipalID),
+			zap.String("ticket_ref", sc.TicketRef),
+			zap.Time("expired_at", sc.ExpiresAt))
+	}
+	if s.metrics != nil {
+		// This gauge has existed since GOV-01 and has never been set by
+		// anything: the only writer would have been a reconciliation sweep,
+		// and no sweep ran. An alert on it could not have fired.
+		s.metrics.SupportContextsUnreviewed.Set(float64(len(pending)))
+	}
+	return pending, nil
+}
+
+// RunReconciler is the goroutine SupportService.Reconcile's comment has always
+// claimed existed. It did not, so §1's "followed by reconciliation/review" was
+// enforced by nothing: a grant expired, no one was told, and the control was
+// decorative — precisely the outcome §1 names as unacceptable.
+//
+// Reports on a fixed interval and on start, so a process that has just come up
+// after an outage does not wait a full interval before saying what is pending.
+// Returns when ctx is cancelled.
+// A non-positive interval disables the sweep, which is the meaning
+// SUPPORT_REVIEW_INTERVAL_MINUTES already documented. It is logged at WARN
+// rather than silently obeyed: "nobody is checking break-glass" is a decision
+// somebody should be able to find in the logs afterwards.
+func (s *SupportService) RunReconciler(ctx context.Context, interval time.Duration, limit int) {
+	if interval <= 0 {
+		s.log.Warn("break-glass reconciliation is DISABLED",
+			zap.String("reason", "SUPPORT_REVIEW_INTERVAL_MINUTES is zero"),
+			zap.String("consequence", "expired support contexts will not be reported for review"))
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	sweep := func() {
+		if _, err := s.ReconcileAll(ctx, limit); err != nil {
+			// Logged, not fatal. A reconciliation report that cannot run is an
+			// operational problem; failing the process would take the service
+			// down over a reporting query.
+			s.log.Error("support-context reconciliation sweep failed", zap.Error(err))
+		}
+	}
+
+	sweep()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
 }
 
 // MarkReviewed records that a human reconciled a grant.

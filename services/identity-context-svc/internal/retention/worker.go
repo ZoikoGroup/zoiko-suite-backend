@@ -40,6 +40,11 @@ type Store interface {
 	DisposeSessions(ctx context.Context, tenantID string, ids []string, at time.Time) (int, error)
 	HasActiveLegalHold(ctx context.Context, tenantID, principalID string) (bool, error)
 	PurgePublishedOutbox(ctx context.Context, before time.Time, limit int) (int, error)
+	// PurgeIdempotencyKeysBefore prunes recorded command responses. Added
+	// with the idempotency store: without it the table only ever grows,
+	// and a replay-protection table that is never pruned eventually costs
+	// more than the duplicates it prevents.
+	PurgeIdempotencyKeysBefore(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // Config tunes the sweep.
@@ -54,6 +59,11 @@ type Config struct {
 	// no evidential weight of their own — the event is on the topic and the
 	// fact it attests is in its own table — so this is short.
 	OutboxRetention time.Duration
+	// IdempotencyRetention is how long a command's recorded response is
+	// replayable. It bounds how late a retry may arrive and still be
+	// deduplicated, so it wants to comfortably exceed any client's retry
+	// budget without keeping responses indefinitely.
+	IdempotencyRetention time.Duration
 }
 
 func DefaultConfig() Config {
@@ -155,6 +165,18 @@ func (w *Worker) SweepOnce(ctx context.Context) error {
 			w.log.Error("outbox purge failed", zap.Error(err))
 		} else if purged > 0 {
 			w.log.Info("purged delivered outbox rows", zap.Int("rows", purged))
+		}
+	}
+
+	// Idempotency housekeeping. Same shape as the outbox purge: a true
+	// delete, not tenant-scoped, and a failure here must not fail the
+	// evidence sweep that is the worker's actual job.
+	if w.cfg.IdempotencyRetention > 0 {
+		purged, err := w.store.PurgeIdempotencyKeysBefore(ctx, now.Add(-w.cfg.IdempotencyRetention))
+		if err != nil {
+			w.log.Error("idempotency key purge failed", zap.Error(err))
+		} else if purged > 0 {
+			w.log.Info("purged expired idempotency keys", zap.Int64("rows", purged))
 		}
 	}
 

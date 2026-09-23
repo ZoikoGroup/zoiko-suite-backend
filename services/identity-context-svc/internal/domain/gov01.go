@@ -120,6 +120,74 @@ type TenantIngressBinding struct {
 	RefreshedAt       time.Time   `json:"refreshed_at"`
 }
 
+// CacheFreshness is §4's cache state model: "cache entries: Fresh / Stale /
+// Invalidated".
+//
+// All three states were reachable before this type existed and none was
+// nameable. A binding was fresh or stale depending on how RefreshedAt compared
+// to a TTL nobody had written down, and "invalidated" was expressed by
+// TouchIngressBindings setting refreshed_at to the epoch — a sentinel that
+// reads as "refreshed in 1970" to anyone who has not read that function.
+// Naming the states is most of the value: an operator reading a decision can
+// now be told which one applied.
+type CacheFreshness string
+
+const (
+	// CacheFresh — within TTL, usable for any read.
+	CacheFresh CacheFreshness = "FRESH"
+
+	// CacheStale — past TTL but not repudiated. §4 permits a stale entry to be
+	// read "only within bounded TTL for non-material reads", so this is a
+	// state a caller may still be served from, not a refusal.
+	CacheStale CacheFreshness = "STALE"
+
+	// CacheInvalidated — explicitly repudiated by RefreshTenantContextCache or
+	// InvalidateTenantContext. Distinct from merely stale: staleness is the
+	// passage of time, invalidation is somebody saying "this is wrong". A
+	// stale entry may be served under §4's bounded-TTL rule; an invalidated
+	// one may not, ever.
+	CacheInvalidated CacheFreshness = "INVALIDATED"
+)
+
+// invalidationEpochCutoff is the boundary below which RefreshedAt means
+// "deliberately invalidated" rather than "genuinely refreshed a long time ago".
+//
+// TouchIngressBindings writes the zero epoch to mark a binding invalid. Any
+// real refresh is far later than this, so the comparison is unambiguous
+// without a separate column — but it needs to be stated in one place rather
+// than rediscovered at each call site.
+var invalidationEpochCutoff = time.Unix(1, 0).UTC()
+
+// Freshness reports which of §4's three cache states this binding is in.
+//
+// A non-positive ttl means no staleness bound is configured, in which case a
+// non-invalidated entry is Fresh: inventing a default TTL here would silently
+// start refusing traffic on a control nobody switched on.
+func (b *TenantIngressBinding) Freshness(now time.Time, ttl time.Duration) CacheFreshness {
+	if b == nil {
+		return CacheInvalidated
+	}
+	// IsZero is checked FIRST and separately. A zero RefreshedAt means the
+	// field was never populated — an in-memory binding, or a caller that built
+	// one by hand — and "we do not know when this was refreshed" is not the
+	// same claim as "somebody invalidated this". Reading absence as
+	// invalidation would make every such binding unusable, which is how this
+	// method first shipped and what the ingress suite caught.
+	if b.RefreshedAt.IsZero() {
+		return CacheFresh
+	}
+	if b.RefreshedAt.UTC().Before(invalidationEpochCutoff) {
+		return CacheInvalidated
+	}
+	if ttl <= 0 {
+		return CacheFresh
+	}
+	if now.Sub(b.RefreshedAt) > ttl {
+		return CacheStale
+	}
+	return CacheFresh
+}
+
 // ErrIngressTenantMismatch is returned when the ingress a request arrived on
 // is bound to a different tenant than the one its token claims.
 //
@@ -236,6 +304,16 @@ var (
 	// ErrSupportContextExpired is distinct from not-found so an operator can
 	// tell an elapsed grant from one that never existed.
 	ErrSupportContextExpired = errors.New("support context expired")
+
+	// ErrSupportContextUnverifiable is returned when a request asserts a
+	// support grant and this process has no way to check it — the support
+	// command family is not wired in this deployment.
+	//
+	// Deliberately NOT folded into not-found. The grant may well exist; what
+	// is missing is our ability to say so, and answering "not found" to a
+	// question we never asked would be a lie in the evidence. It is also the
+	// reason this is a 503 rather than a 401: the caller did nothing wrong.
+	ErrSupportContextUnverifiable = errors.New("support context cannot be verified by this deployment")
 
 	// ErrSupportSelfApproval is returned when the grantee approved their own
 	// elevation. Checked in the handler as well as by a schema CHECK.

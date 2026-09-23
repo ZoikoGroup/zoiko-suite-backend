@@ -800,6 +800,28 @@ paths:
           required: true
           schema:
             type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          description: |
+            MANDATORY on GOV-01 queries. ZS-SVC-A-001 §4 marks every query
+            "Read-only; scoped; correlation required"; a governance read that
+            cannot be traced to the story that caused it is refused 400. The
+            envelope middleware parses this header but its default write-strict
+            mode admits reads, so the guard is in the handler.
+          schema:
+            type: string
+        - name: X-Correlation-ID
+          in: header
+          required: true
+          description: |
+            MANDATORY on GOV-01 queries. ZS-SVC-A-001 §4 marks every query
+            "Read-only; scoped; correlation required"; a governance read that
+            cannot be traced to the story that caused it is refused 400. The
+            envelope middleware parses this header but its default write-strict
+            mode admits reads, so the guard is in the handler.
+          schema:
+            type: string
       responses:
         "200":
           description: The recorded account of the resolution
@@ -1069,6 +1091,68 @@ paths:
           description: Revoked, or already revoked
         "404":
           description: Not found in this tenant
+
+  /v1/context/support/{supportContextId}/review:
+    post:
+      summary: Record the post-hoc review of an elapsed support context
+      operationId: reviewSupportContext
+      description: |
+        Closes the reconciliation half of the break-glass control. ZS-SVC-A-001
+        §1 requires emergency elevation to be "scoped, time-limited,
+        independently approved, fully evidenced and followed by
+        reconciliation/review" -- and the review half had no route, so
+        `reviewed_at` could never be set by anything. The background reconciler
+        reports what is pending; this is how a reviewer clears one.
+
+        Guarded by `IDENTITY_SUPPORT_CONTEXT_REVIEW`, its own action rather than
+        the revoke grant. Reviewing an elapsed elevation is an assurance duty,
+        and the person who may end a live support session is not necessarily the
+        person who should sign off that it was legitimate.
+
+        **Self-review is refused.** Neither the grantee nor the approver may
+        review the grant: both have an interest in it being found legitimate,
+        and §1's independence requirement is worth exactly what its enforcement
+        is worth.
+      parameters:
+        - name: supportContextId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Tenant-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Principal-Id
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: |
+            Mandatory on every material write per the canonical envelope
+            contract, and since migration 000008 actually honoured: a repeat
+            with the same key and body replays the first response and carries
+            `X-Idempotent-Replay: true`; the same key with a different body is
+            refused 409 `IDEMPOTENCY_MISMATCH`.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Review recorded
+        "403":
+          description: |
+            The caller is the grantee or the approver of this elevation
+            (`SOD_CONFLICT`), or holds no review grant.
+        "404":
+          description: Not found in this tenant
+        "409":
+          description: Idempotency key reused with a different request body
+        "501":
+          description: Support context is not configured in this deployment
 
   /health:
     get:

@@ -348,9 +348,18 @@ func (m *mockTokenVerifier) VerifyBearer(_ context.Context, _ string) (*domain.V
 }
 
 // mockEnvelopeSigner
-type mockEnvelopeSigner struct{ err error }
+type mockEnvelopeSigner struct {
+	err error
 
-func (m *mockEnvelopeSigner) Sign(_ *domain.IdentityContextEnvelope) (string, error) {
+	// captured is the last envelope handed to Sign. Recorded so a test can
+	// assert what downstream services will actually SEE, rather than only what
+	// this service wrote to its own tables — the distinction that let the
+	// support elevation be evidenced locally and invisible everywhere else.
+	captured *domain.IdentityContextEnvelope
+}
+
+func (m *mockEnvelopeSigner) Sign(e *domain.IdentityContextEnvelope) (string, error) {
+	m.captured = e
 	if m.err != nil {
 		return "", m.err
 	}

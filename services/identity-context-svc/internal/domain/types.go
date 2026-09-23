@@ -125,7 +125,46 @@ type SessionContext struct {
 	// SupportContextID is set only when the session was issued under a support
 	// elevation, making every action taken during support attributable to the
 	// grant that allowed it.
+	//
+	// Non-nil here now means VERIFIED: the resolver refuses a resolution whose
+	// asserted grant is absent, expired, revoked, another principal's or
+	// another tenant's. Before that check existed this field recorded whatever
+	// string the client put in a header.
 	SupportContextID *string `json:"support_context_id,omitempty"`
+
+	// ── Canonical envelope facts (§4 server-resolved context / source inputs) ─
+
+	// SourceChannel is the channel the request arrived on.
+	SourceChannel string `json:"source_channel,omitempty"`
+
+	// WorkloadID is the calling workload identity, where one was presented.
+	WorkloadID string `json:"workload_id,omitempty"`
+
+	// CausationID completes §4's "correlation/causation IDs". Correlation says
+	// these records belong to one story; causation says this one happened
+	// because of that one.
+	CausationID string `json:"causation_id,omitempty"`
+
+	// IngressBindingVersion is §4's "policy/version references" on the
+	// decision evidence.
+	//
+	// The residency policy id and schema version were already recorded, but
+	// neither says which revision of the ROUTING truth the resolution was
+	// decided against. This does, so a decision is reproducible and not merely
+	// replayable.
+	IngressBindingVersion string `json:"ingress_binding_version,omitempty"`
+
+	// EntitlementContextRef is §4's server-resolved "entitlement context
+	// reference".
+	//
+	// Always nil today, and deliberately so. §4 names a "commercial entitlement
+	// read model" as the dependency that resolves it, and no service in this
+	// estate exposes one — commercial-account-svc serves accounts, memberships
+	// and price catalogs, not entitlement resolution. The field exists so the
+	// evidence row has a home for the reference the moment an upstream does,
+	// and so that "we never resolved this" stays visibly distinct from "we
+	// resolved it to nothing".
+	EntitlementContextRef *string `json:"entitlement_context_ref,omitempty"`
 
 	// ── Retention (GOV-09) ───────────────────────────────────────────────────
 
@@ -190,6 +229,22 @@ type IdentityContextEnvelope struct {
 
 	// Dimension 6 — session trust posture
 	SessionTrustPosture SessionTrustClaims `json:"session_trust_posture"`
+
+	// SupportContextID is present only when this session was issued under a
+	// VERIFIED support elevation.
+	//
+	// Until this claim existed, a support-elevated session was recorded in
+	// session_contexts and then indistinguishable from an ordinary one to
+	// every service that consumed the envelope. §1 requires emergency
+	// elevation to be "scoped, time-limited, independently approved, fully
+	// evidenced" — a downstream service that cannot see the elevation can
+	// neither scope to it nor evidence it, so the guarantee stopped at this
+	// service's own database.
+	//
+	// omitempty is load-bearing. An ordinary session carries no such key at
+	// all, so a consumer's "is this support traffic?" is a presence check that
+	// cannot be satisfied by a zero value.
+	SupportContextID *string `json:"support_context_id,omitempty"`
 
 	// Propagation
 	CorrelationID string `json:"correlation_id"`
@@ -262,7 +317,33 @@ type ResolveRequest struct {
 	// SupportContextID is set by the handler when the caller is operating
 	// under a live support elevation, so every session issued during support
 	// is attributable to the grant that allowed it.
+	//
+	// It arrives on X-Support-Context-Id, which is CLIENT-SUPPLIED. The
+	// resolver verifies it against the grant register before the session is
+	// attributed to it — see Resolver.verifySupportContext. Being on this
+	// struct means "the caller asserted this", never "this is true".
 	SupportContextID *string `json:"-"`
+
+	// ── Canonical envelope facts, carried through to the decision evidence ───
+	//
+	// §4 lists source channel among the server-resolved context and workload
+	// identity among the required source inputs, and §4's evidence row wants
+	// "correlation/causation IDs". All three were parsed by the envelope
+	// middleware and then discarded. They are filled by the handler from the
+	// resolved envelope, never from the body — hence json:"-" like the rest.
+
+	// SourceChannel is the channel the request arrived on (api, web, mobile,
+	// batch, system).
+	SourceChannel string `json:"-"`
+
+	// WorkloadID is the calling workload identity where one was presented.
+	// Empty for ordinary user traffic.
+	WorkloadID string `json:"-"`
+
+	// CausationID names the event or command that caused this one. Distinct
+	// from CorrelationID: correlation groups a story, causation is the edge
+	// between two steps of it.
+	CausationID string `json:"-"`
 }
 
 type ResolveResponse struct {

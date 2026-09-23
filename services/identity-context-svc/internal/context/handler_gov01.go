@@ -55,6 +55,12 @@ func (h *Handler) ExplainContext(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// §4: GOV-01 queries are "Read-only; scoped; correlation required".
+	// Scoped was enforced here; correlation was enforced by nothing, because
+	// the envelope's default write-strict mode admits reads.
+	if _, ok := h.requireCorrelation(w, r); !ok {
+		return
+	}
 	sessionContextID := chi.URLParam(r, "sessionContextID")
 
 	sc, err := h.sessions.GetSessionContext(r.Context(), sessionContextID, tenantID)
@@ -334,6 +340,63 @@ func (h *Handler) RevokeSupportContext(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("support context revocation failed", zap.Error(err))
 		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
 			"could not revoke the support context")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ReviewSupportContext records that a human reconciled an elapsed elevation.
+//
+// §1 requires break-glass to be "followed by reconciliation/review". The
+// reconciler goroutine reports what is pending; this is how a reviewer closes
+// one. Without it MarkSupportContextReviewed was reachable from no route, so
+// reviewed_at could never be set by anything and the pending list could only
+// ever grow — a report nobody could act on through the API.
+//
+// Self-review is refused. The grantee and the approver both have an interest
+// in the elevation being found legitimate, and §1's independence requirement
+// is worth exactly as much as its enforcement.
+func (h *Handler) ReviewSupportContext(w http.ResponseWriter, r *http.Request) {
+	if h.support == nil {
+		writeCoded(w, http.StatusNotImplemented, domain.ErrCodeUpstreamUnavailable,
+			"support context is not configured in this deployment")
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	callerPrincipalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if !h.authorize(w, r, callerPrincipalID, tenantID, ActionReviewSupportContext) {
+		return
+	}
+
+	supportContextID := chi.URLParam(r, "supportContextID")
+
+	sc, err := h.support.store.FindSupportContext(r.Context(), supportContextID, tenantID)
+	if err != nil {
+		h.log.Error("support context lookup failed", zap.Error(err))
+		writeCoded(w, http.StatusServiceUnavailable, domain.ErrCodeUpstreamUnavailable,
+			"could not read the support context")
+		return
+	}
+	if sc == nil {
+		writeCoded(w, http.StatusNotFound, domain.ErrCodeBreakGlassRequired, "support context not found")
+		return
+	}
+	if sc.SupportPrincipalID == callerPrincipalID || sc.ApproverPrincipalID == callerPrincipalID {
+		writeCoded(w, http.StatusForbidden, domain.ErrCodeSoDConflict,
+			"a support context may not be reviewed by its grantee or its approver")
+		return
+	}
+
+	if err := h.support.MarkReviewed(r.Context(), supportContextID, tenantID, callerPrincipalID); err != nil {
+		h.log.Error("support context review failed", zap.Error(err))
+		writeCoded(w, http.StatusInternalServerError, domain.ErrCodeUpstreamUnavailable,
+			"could not record the review")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

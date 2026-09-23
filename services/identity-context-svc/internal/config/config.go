@@ -52,8 +52,8 @@ type Config struct {
 	Kafka KafkaConfig
 
 	// Upstream Tier 0 service base URLs (read-only calls only)
-	TenantRegistryURL     string
-	AccessControlURL      string
+	TenantRegistryURL string
+	AccessControlURL  string
 
 	// Authorization Service URL for admin mutation authorization checks.
 	// Must be set in production/staging; a placeholder is allowed only in local development.
@@ -303,12 +303,12 @@ func Load() (*Config, error) {
 			GroupID: env("KAFKA_GROUP_ID", "identity-context-svc"),
 			Topic:   env("KAFKA_EVENTS_TOPIC", "zoiko.identity.events"),
 		},
-		TenantRegistryURL:     env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
-		AccessControlURL:      env("ACCESS_CONTROL_URL", "http://access-control-svc"),
-		AuthzServiceURL:       env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
-		AuthzEnv:              env("AUTHZ_ENV", ""), // derived below; never defaulted here
-		OTELExporterEndpoint:  env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
-		SIEMServiceURL:        env("SIEM_SERVICE_URL", ""),
+		TenantRegistryURL:    env("TENANT_REGISTRY_URL", "http://tenant-registry-svc"),
+		AccessControlURL:     env("ACCESS_CONTROL_URL", "http://access-control-svc"),
+		AuthzServiceURL:      env("AUTHZ_SERVICE_URL", "http://authorization-svc"),
+		AuthzEnv:             env("AUTHZ_ENV", ""), // derived below; never defaulted here
+		OTELExporterEndpoint: env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
+		SIEMServiceURL:       env("SIEM_SERVICE_URL", ""),
 
 		Environment:              env("DEPLOY_ENVIRONMENT", "local"),
 		DeploymentRegion:         env("DEPLOYMENT_REGION", "local"),

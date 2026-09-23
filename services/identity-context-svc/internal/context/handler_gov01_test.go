@@ -134,6 +134,10 @@ func do(r chi.Router, method, path, tenantID, principalID string, body any) *htt
 	if principalID != "" {
 		req.Header.Set("X-Principal-Id", principalID)
 	}
+	// §4 makes correlation mandatory on GOV-01 queries, so a realistic caller
+	// always carries one. Tests that assert the REFUSAL when it is absent set
+	// their own request up rather than going through this helper.
+	req.Header.Set("X-Correlation-ID", "test-correlation")
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w

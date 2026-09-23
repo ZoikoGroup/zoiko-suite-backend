@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -105,6 +106,15 @@ type IngressChecker struct {
 	bindings IngressBindingReader
 	policy   IngressPolicy
 	log      *zap.Logger
+
+	// bindingTTL is how long a refreshed binding stays FRESH. Zero disables
+	// the staleness bound, which is the default: inventing a TTL would start
+	// classifying live bindings as stale on a control nobody switched on.
+	//
+	// Invalidation does NOT depend on this — an explicitly invalidated binding
+	// is unusable whatever the TTL, because staleness is the passage of time
+	// and invalidation is somebody saying the entry is wrong.
+	bindingTTL time.Duration
 }
 
 func NewIngressChecker(bindings IngressBindingReader, policy IngressPolicy, log *zap.Logger) *IngressChecker {
@@ -112,6 +122,12 @@ func NewIngressChecker(bindings IngressBindingReader, policy IngressPolicy, log 
 		policy = IngressPolicyObserve
 	}
 	return &IngressChecker{bindings: bindings, policy: policy, log: log}
+}
+
+// WithBindingTTL sets the FRESH/STALE boundary for §4's cache state model.
+func (c *IngressChecker) WithBindingTTL(ttl time.Duration) *IngressChecker {
+	c.bindingTTL = ttl
+	return c
 }
 
 // Check verifies that the ingress a request arrived on is consistent with the
@@ -132,14 +148,37 @@ func NewIngressChecker(bindings IngressBindingReader, policy IngressPolicy, log 
 // The one thing this never does is TAKE the tenant from the binding. That
 // would make a hostname sufficient to select a tenant, which is exactly the
 // "no trusted client context" refinement the spec opens with.
+// IngressDecision is what the ingress check concluded, beyond pass/fail.
+//
+// SourceVersion is the version of the tenant-registry fact the binding caches.
+// §4's evidence clause requires "policy/version references" on a decision, and
+// this is the one genuine version reference a resolution depends on: it says
+// WHICH revision of the routing truth was consulted. Without it a decision can
+// be replayed but not reproduced — you can see that the ingress matched, and
+// not what it matched against.
+type IngressDecision struct {
+	SourceVersion string
+	Freshness     domain.CacheFreshness
+}
+
+// Check reports only whether the ingress is acceptable.
+//
+// Retained so the many call sites that care solely about the refusal are not
+// forced to unpack a decision they ignore.
 func (c *IngressChecker) Check(ctx context.Context, ingress, claimedTenantID string) error {
+	_, err := c.Evaluate(ctx, ingress, claimedTenantID)
+	return err
+}
+
+// Evaluate is Check plus what the decision was made against.
+func (c *IngressChecker) Evaluate(ctx context.Context, ingress, claimedTenantID string) (IngressDecision, error) {
 	if ingress == "" || ingress == domain.IngressUnknown {
 		if c.policy == IngressPolicyStrict {
 			c.log.Warn("request presented no ingress identifier — refused under strict ingress policy",
 				zap.String("tenant_id", claimedTenantID))
-			return domain.ErrIngressTenantMismatch
+			return IngressDecision{}, domain.ErrIngressTenantMismatch
 		}
-		return nil
+		return IngressDecision{}, nil
 	}
 
 	binding, err := c.bindings.FindIngressBinding(ctx, ingress)
@@ -148,7 +187,7 @@ func (c *IngressChecker) Check(ctx context.Context, ingress, claimedTenantID str
 		// not run, and this one exists to stop cross-tenant resolution.
 		c.log.Error("ingress binding lookup failed — failing closed",
 			zap.String("ingress", ingress), zap.Error(err))
-		return ErrUpstreamUnavailable
+		return IngressDecision{}, ErrUpstreamUnavailable
 	}
 
 	if binding == nil {
@@ -156,11 +195,11 @@ func (c *IngressChecker) Check(ctx context.Context, ingress, claimedTenantID str
 			c.log.Warn("unknown ingress identifier — refused, no fallback tenant",
 				zap.String("ingress", ingress),
 				zap.String("claimed_tenant_id", claimedTenantID))
-			return domain.ErrIngressTenantMismatch
+			return IngressDecision{}, domain.ErrIngressTenantMismatch
 		}
 		c.log.Debug("ingress identifier not bound — permitted under observe policy",
 			zap.String("ingress", ingress))
-		return nil
+		return IngressDecision{}, nil
 	}
 
 	if binding.TenantID != claimedTenantID {
@@ -173,9 +212,42 @@ func (c *IngressChecker) Check(ctx context.Context, ingress, claimedTenantID str
 			zap.String("ingress", ingress),
 			zap.String("ingress_bound_tenant", binding.TenantID),
 			zap.String("token_claimed_tenant", claimedTenantID))
-		return domain.ErrIngressTenantMismatch
+		return IngressDecision{}, domain.ErrIngressTenantMismatch
 	}
-	return nil
+
+	// §4's cache state model, applied rather than merely named.
+	//
+	// InvalidateTenantContext marks a tenant's bindings invalid by writing the
+	// epoch to refreshed_at, and the store's own comment says "the resolver
+	// revalidates a stale binding against the registry on next use". It did
+	// not: nothing here ever read refreshed_at, so an INVALIDATED binding went
+	// on authorising exactly as before. That is negative path #4 — "cache
+	// invalidation removes stale privilege/context promptly" — passing on
+	// paper and failing in fact.
+	//
+	// An invalidated binding carries no authority, so it is treated as no
+	// binding at all: refused under strict, permitted under observe, and in
+	// neither case able to supply or confirm a tenant.
+	freshness := binding.Freshness(time.Now().UTC(), c.bindingTTL)
+	switch freshness {
+	case domain.CacheInvalidated:
+		c.log.Warn("ingress binding is INVALIDATED — not usable for this resolution",
+			zap.String("ingress", ingress),
+			zap.String("claimed_tenant_id", claimedTenantID))
+		if c.policy == IngressPolicyStrict {
+			return IngressDecision{}, domain.ErrIngressTenantMismatch
+		}
+		return IngressDecision{}, nil
+	case domain.CacheStale:
+		// Permitted: §4 allows a stale entry to be read within a bounded TTL
+		// for non-material reads, and resolution is a query. Logged so the
+		// bound can be tuned from evidence rather than guesswork.
+		c.log.Info("ingress binding is STALE but within policy",
+			zap.String("ingress", ingress),
+			zap.Time("refreshed_at", binding.RefreshedAt))
+	}
+
+	return IngressDecision{SourceVersion: binding.SourceVersion, Freshness: freshness}, nil
 }
 
 // ── Residency ────────────────────────────────────────────────────────────────
