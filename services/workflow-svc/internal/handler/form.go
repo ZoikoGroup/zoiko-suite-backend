@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -366,6 +367,231 @@ func (h *Handler) GetSubmission(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, submission)
 }
 
+type supersedeSubmissionRequest struct {
+	NewSubmissionID string `json:"new_submission_id"`
+}
+
+// SupersedeSubmission — BIZ-04's own SupersedeSubmission command. The
+// submissionID in the URL is the PREVIOUS (currently governing)
+// submission; the replacement is named in the body.
+func (h *Handler) SupersedeSubmission(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID, ok := h.requireCorrelationID(w, r)
+	if !ok {
+		return
+	}
+	var req supersedeSubmissionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	submissionID := chi.URLParam(r, "submission_id")
+	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit); err != nil {
+		h.writeFormAuthzErr(w, err)
+		return
+	}
+
+	superseded, err := h.store.SupersedeSubmission(r.Context(), domain.SupersedeSubmissionParams{
+		PreviousSubmissionID: submissionID, NewSubmissionID: req.NewSubmissionID, TenantID: tenantID,
+		ActorPrincipalID: actor, CorrelationID: correlationID,
+	})
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, superseded)
+}
+
+type routeToDomainRequest struct {
+	CommandReference string `json:"command_reference,omitempty"`
+	ResultReference  string `json:"result_reference,omitempty"`
+	Outcome          string `json:"outcome"`
+	FailureReason    string `json:"failure_reason,omitempty"`
+}
+
+// RouteToDomain — BIZ-04's own RouteToDomain command.
+func (h *Handler) RouteToDomain(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	correlationID, ok := h.requireCorrelationID(w, r)
+	if !ok {
+		return
+	}
+	var req routeToDomainRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json"})
+		return
+	}
+	if req.Outcome != "SUCCEEDED" && req.Outcome != "FAILED" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_outcome"})
+		return
+	}
+	submissionID := chi.URLParam(r, "submission_id")
+	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormSubmit); err != nil {
+		h.writeFormAuthzErr(w, err)
+		return
+	}
+
+	route, err := h.store.RouteToDomain(r.Context(), domain.RouteToDomainParams{
+		SubmissionID: submissionID, TenantID: tenantID, ActorPrincipalID: actor, CorrelationID: correlationID,
+		CommandReference: req.CommandReference, ResultReference: req.ResultReference, Outcome: req.Outcome, FailureReason: req.FailureReason,
+	})
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	if err := h.publisher.PublishFormEvent(r.Context(), "form.submission.routed", *existing, actor, correlationID); err != nil {
+		h.log.Error("failed to publish form.submission.routed event", zap.Error(err))
+	}
+	writeJSON(w, http.StatusCreated, route)
+}
+
+// GetSubmissionVersion — BIZ-04's own GetSubmissionVersion query.
+func (h *Handler) GetSubmissionVersion(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	submissionID := chi.URLParam(r, "submission_id")
+	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+		h.writeFormAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.GetSubmissionVersion(r.Context(), tenantID, submissionID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
+}
+
+// GetValidationResult — BIZ-04's own GetValidationResult query.
+func (h *Handler) GetValidationResult(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	submissionID := chi.URLParam(r, "submission_id")
+	existing, err := h.store.GetSubmission(r.Context(), tenantID, submissionID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	form, err := h.store.GetForm(r.Context(), tenantID, existing.FormID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+		h.writeFormAuthzErr(w, err)
+		return
+	}
+
+	result, err := h.store.GetValidationResult(r.Context(), tenantID, submissionID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ListPendingSubmissions — BIZ-04's own ListPendingSubmissions query,
+// scoped to one form so authorization stays meaningful.
+func (h *Handler) ListPendingSubmissions(w http.ResponseWriter, r *http.Request) {
+	actor, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+	formID := chi.URLParam(r, "form_id")
+	form, err := h.store.GetForm(r.Context(), tenantID, formID)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), actor, form.LegalEntityID, actionFormRead); err != nil {
+		h.writeFormAuthzErr(w, err)
+		return
+	}
+
+	limit, offset := 100, 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	pending, err := h.store.ListPendingSubmissions(r.Context(), tenantID, formID, limit, offset)
+	if err != nil {
+		h.writeFormErr(w, err)
+		return
+	}
+	if pending == nil {
+		pending = []*domain.FormSubmission{}
+	}
+	writeJSON(w, http.StatusOK, pending)
+}
+
 func (h *Handler) writeFormErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, domain.ErrFormNotFound):
@@ -394,6 +620,8 @@ func (h *Handler) writeFormErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "submission_already_superseded"})
 	case errors.Is(err, domain.ErrFormSubmissionsBelongToDifferentForms):
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "submissions_belong_to_different_forms"})
+	case errors.Is(err, domain.ErrFormSubmissionNotYetValidated):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_yet_validated"})
 	default:
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
 	}

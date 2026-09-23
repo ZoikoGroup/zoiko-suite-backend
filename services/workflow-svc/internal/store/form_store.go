@@ -384,3 +384,191 @@ func (s *PgStore) GetSubmission(ctx context.Context, tenantID, submissionID stri
 	}
 	return out, nil
 }
+
+// SupersedeSubmission confirms a corrected resubmission and, in the same
+// transaction, marks the submission it replaces as SUPERSEDED —
+// BIZ-04's own SupersedeSubmission command. Forward-links via
+// superseded_by_submission_id, never overwriting the previous row's own
+// facts — mirrors document-vault-svc's SupersedeClassification. The
+// replacement must itself be ACCEPTED: a still-pending or still-rejected
+// resubmission cannot yet stand in for the one it would replace.
+func (s *PgStore) SupersedeSubmission(ctx context.Context, p domain.SupersedeSubmissionParams) (*domain.FormSubmission, error) {
+	var out *domain.FormSubmission
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		previous, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1 FOR UPDATE`, p.PreviousSubmissionID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrFormSubmissionNotFound
+		}
+		if err != nil {
+			return err
+		}
+		// Checked in this order deliberately: a SUPERSEDED row already has
+		// superseded_by_submission_id set, so checking that first reports
+		// the precise reason (already superseded) instead of the more
+		// generic "not accepted or rejected" a status check alone would
+		// give it — same class of ordering bug found and fixed in
+		// document-vault-svc's SupersedeClassification earlier this build.
+		if previous.SupersededBySubmissionID != nil {
+			return domain.ErrFormSubmissionAlreadySuperseded
+		}
+		if previous.Status != domain.FormSubmissionAccepted && previous.Status != domain.FormSubmissionRejected {
+			return domain.ErrFormSubmissionNotAcceptedOrRejected
+		}
+
+		next, err := scanFormSubmission(tx.QueryRow(ctx, `SELECT `+formSubmissionColumns+` FROM form_submissions WHERE submission_id=$1`, p.NewSubmissionID))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.ErrFormSubmissionNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if next.FormID != previous.FormID {
+			return domain.ErrFormSubmissionsBelongToDifferentForms
+		}
+		if next.Status != domain.FormSubmissionAccepted {
+			return domain.ErrFormSubmissionNotAccepted
+		}
+
+		tag, err := tx.Exec(ctx, `
+			UPDATE form_submissions SET status='SUPERSEDED', superseded_by_submission_id=$2
+			WHERE submission_id=$1 AND superseded_by_submission_id IS NULL`,
+			p.PreviousSubmissionID, p.NewSubmissionID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrFormSubmissionAlreadySuperseded
+		}
+		out = next
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotAcceptedOrRejected) ||
+			errors.Is(err, domain.ErrFormSubmissionAlreadySuperseded) || errors.Is(err, domain.ErrFormSubmissionsBelongToDifferentForms) ||
+			errors.Is(err, domain.ErrFormSubmissionNotAccepted) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+const formSubmissionRouteColumns = `route_id, submission_id, tenant_id, target_domain, command_reference, result_reference,
+	outcome, failure_reason, routed_by_principal_id, routed_at`
+
+func scanFormSubmissionRoute(row pgx.Row) (*domain.FormSubmissionRoute, error) {
+	r := &domain.FormSubmissionRoute{}
+	err := row.Scan(&r.RouteID, &r.SubmissionID, &r.TenantID, &r.TargetDomain, &r.CommandReference, &r.ResultReference,
+		&r.Outcome, &r.FailureReason, &r.RoutedByPrincipalID, &r.RoutedAt)
+	return r, err
+}
+
+// RouteToDomain records one downstream routing attempt's evidence —
+// BIZ-04's own RouteToDomain command. Deliberately does NOT change
+// form_submissions.status: per the doc's own failure semantics, "target
+// domain rejection leaves submission accepted as evidence but not as
+// successful business action" — the submission stays ACCEPTED forever
+// once accepted, and this table is the append-only record of whether it
+// was ever successfully routed, and to what. Refuses to route anything
+// that is not itself ACCEPTED.
+func (s *PgStore) RouteToDomain(ctx context.Context, p domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error) {
+	var out *domain.FormSubmissionRoute
+	err := s.withRLS(ctx, p.TenantID, func(tx pgx.Tx) error {
+		// target_domain is not caller-supplied: it is the form's own
+		// fixed target_domain (set once at CreateForm), joined here rather
+		// than trusted from the request, so a route can never claim to
+		// have gone somewhere other than where its form was actually
+		// defined to go.
+		var status, targetDomain string
+		if err := tx.QueryRow(ctx, `
+			SELECT fs.status, fd.target_domain
+			FROM form_submissions fs JOIN form_definitions fd ON fd.form_id = fs.form_id
+			WHERE fs.submission_id=$1`, p.SubmissionID).Scan(&status, &targetDomain); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.ErrFormSubmissionNotFound
+			}
+			return err
+		}
+		if status != domain.FormSubmissionAccepted {
+			return domain.ErrFormSubmissionNotAccepted
+		}
+		var err error
+		out, err = scanFormSubmissionRoute(tx.QueryRow(ctx, `INSERT INTO form_submission_routes (
+				route_id, submission_id, tenant_id, target_domain, command_reference, result_reference,
+				outcome, failure_reason, routed_by_principal_id, correlation_id
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+formSubmissionRouteColumns,
+			uuid.NewString(), p.SubmissionID, p.TenantID, targetDomain, nullIfEmpty(p.CommandReference), nullIfEmpty(p.ResultReference),
+			p.Outcome, nullIfEmpty(p.FailureReason), p.ActorPrincipalID, nullIfEmpty(p.CorrelationID)))
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, domain.ErrFormSubmissionNotFound) || errors.Is(err, domain.ErrFormSubmissionNotAccepted) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}
+
+// GetSubmissionVersion — BIZ-04's own GetSubmissionVersion query. See
+// domain.FormSubmissionVersionInfo's own doc comment for why this is
+// narrower than GetSubmission.
+func (s *PgStore) GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error) {
+	var out domain.FormSubmissionVersionInfo
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT submission_id, form_id, form_version FROM form_submissions WHERE submission_id=$1`, submissionID).
+			Scan(&out.SubmissionID, &out.FormID, &out.FormVersion)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrFormSubmissionNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return &out, nil
+}
+
+// GetValidationResult — BIZ-04's own GetValidationResult query.
+func (s *PgStore) GetValidationResult(ctx context.Context, tenantID, submissionID string) (*domain.ValidationResult, error) {
+	sub, err := s.GetSubmission(ctx, tenantID, submissionID)
+	if err != nil {
+		return nil, err
+	}
+	if sub.ValidationResult == nil {
+		return nil, domain.ErrFormSubmissionNotYetValidated
+	}
+	return sub.ValidationResult, nil
+}
+
+// ListPendingSubmissions returns a form's submissions still awaiting a
+// validation outcome (SUBMITTED or VALIDATING) — BIZ-04's own
+// ListPendingSubmissions query, the governance backlog a
+// reviewer/validator works through. Scoped to one form (not the whole
+// tenant) so authorization stays meaningful: a caller is authorized per
+// legal entity, and a form is the unit that carries one.
+func (s *PgStore) ListPendingSubmissions(ctx context.Context, tenantID, formID string, limit, offset int) ([]*domain.FormSubmission, error) {
+	var out []*domain.FormSubmission
+	err := s.withRLS(ctx, tenantID, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+formSubmissionColumns+` FROM form_submissions
+			WHERE form_id=$1 AND status IN ('SUBMITTED', 'VALIDATING')
+			ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+			formID, limit, offset)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			sub, err := scanFormSubmission(rows)
+			if err != nil {
+				return err
+			}
+			out = append(out, sub)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", domain.ErrStoreUnavailable, err)
+	}
+	return out, nil
+}

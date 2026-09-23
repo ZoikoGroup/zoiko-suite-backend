@@ -88,6 +88,11 @@ type WorkflowStore interface {
 	SubmitForm(ctx context.Context, params domain.SubmitFormParams) (*domain.FormSubmission, error)
 	ValidateSubmission(ctx context.Context, params domain.ValidateSubmissionParams) (*domain.FormSubmission, error)
 	GetSubmission(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmission, error)
+	SupersedeSubmission(ctx context.Context, params domain.SupersedeSubmissionParams) (*domain.FormSubmission, error)
+	RouteToDomain(ctx context.Context, params domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error)
+	GetSubmissionVersion(ctx context.Context, tenantID, submissionID string) (*domain.FormSubmissionVersionInfo, error)
+	GetValidationResult(ctx context.Context, tenantID, submissionID string) (*domain.ValidationResult, error)
+	ListPendingSubmissions(ctx context.Context, tenantID, formID string, limit, offset int) ([]*domain.FormSubmission, error)
 }
 
 // EventPublisher is the narrow interface the handler depends on. actorID on
@@ -221,12 +226,17 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		r.Post("/{form_id}/publish", h.PublishForm)
 		r.Post("/{form_id}/retire", h.RetireForm)
 		r.Post("/{form_id}/drafts", h.SaveDraft)
+		r.Get("/{form_id}/pending-submissions", h.ListPendingSubmissions)
 	})
 	r.Route("/v1/form-submissions", func(r chi.Router) {
 		r.Get("/{submission_id}", h.GetSubmission)
 		r.Post("/{submission_id}/drafts", h.SaveDraft)
 		r.Post("/{submission_id}/submit", h.SubmitForm)
 		r.Post("/{submission_id}/validate", h.ValidateSubmission)
+		r.Get("/{submission_id}/version", h.GetSubmissionVersion)
+		r.Get("/{submission_id}/validation-result", h.GetValidationResult)
+		r.Post("/{submission_id}/supersede", h.SupersedeSubmission)
+		r.Post("/{submission_id}/route", h.RouteToDomain)
 	})
 }
 

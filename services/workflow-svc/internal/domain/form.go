@@ -125,6 +125,19 @@ type RouteToDomainParams struct {
 	FailureReason                                           string
 }
 
+// FormSubmissionVersionInfo is GetSubmissionVersion's own result — the
+// snapshot of which form version a submission was submitted against.
+// Deliberately narrow rather than the full FormSubmission: this query
+// answers "which form version", not "what did they submit" (that's
+// GetSubmission's job), and form_definitions content is immutable from
+// creation (Wave 1), so there is nothing more to version than the
+// single number already recorded on the submission.
+type FormSubmissionVersionInfo struct {
+	SubmissionID string `json:"submission_id"`
+	FormID       string `json:"form_id"`
+	FormVersion  int    `json:"form_version"`
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var (
@@ -141,4 +154,7 @@ var (
 	ErrFormSubmissionNotAcceptedOrRejected   = errorString("form submission is not in ACCEPTED or REJECTED status")
 	ErrFormSubmissionAlreadySuperseded       = errorString("form submission has already been superseded")
 	ErrFormSubmissionsBelongToDifferentForms = errorString("the two submissions belong to different forms")
+	// ErrFormSubmissionNotYetValidated backs GetValidationResult — there
+	// is no result to return before ValidateSubmission has run once.
+	ErrFormSubmissionNotYetValidated = errorString("form submission has not been validated yet")
 )

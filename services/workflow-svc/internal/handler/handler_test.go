@@ -133,6 +133,16 @@ type stubStore struct {
 	submitFormErr    error
 	validateSubErr   error
 	getSubmissionErr error
+
+	supersedeSubmissionErr  error
+	formRoute               *domain.FormSubmissionRoute
+	routeToDomainErr        error
+	submissionVersion       *domain.FormSubmissionVersionInfo
+	getSubmissionVersionErr error
+	validationResult        *domain.ValidationResult
+	getValidationResultErr  error
+	pendingSubmissions      []*domain.FormSubmission
+	listPendingErr          error
 }
 
 func (s *stubStore) CreateForm(_ context.Context, _ domain.CreateFormParams) (*domain.FormDefinition, bool, error) {
@@ -158,6 +168,21 @@ func (s *stubStore) ValidateSubmission(_ context.Context, _ domain.ValidateSubmi
 }
 func (s *stubStore) GetSubmission(_ context.Context, _, _ string) (*domain.FormSubmission, error) {
 	return s.submission, s.getSubmissionErr
+}
+func (s *stubStore) SupersedeSubmission(_ context.Context, _ domain.SupersedeSubmissionParams) (*domain.FormSubmission, error) {
+	return s.submission, s.supersedeSubmissionErr
+}
+func (s *stubStore) RouteToDomain(_ context.Context, _ domain.RouteToDomainParams) (*domain.FormSubmissionRoute, error) {
+	return s.formRoute, s.routeToDomainErr
+}
+func (s *stubStore) GetSubmissionVersion(_ context.Context, _, _ string) (*domain.FormSubmissionVersionInfo, error) {
+	return s.submissionVersion, s.getSubmissionVersionErr
+}
+func (s *stubStore) GetValidationResult(_ context.Context, _, _ string) (*domain.ValidationResult, error) {
+	return s.validationResult, s.getValidationResultErr
+}
+func (s *stubStore) ListPendingSubmissions(_ context.Context, _, _ string, _, _ int) ([]*domain.FormSubmission, error) {
+	return s.pendingSubmissions, s.listPendingErr
 }
 
 func (s *stubStore) CreateWorkflow(_ context.Context, _ domain.CreateWorkflowParams) (*domain.WorkflowInstance, []*domain.WorkflowStage, bool, error) {
