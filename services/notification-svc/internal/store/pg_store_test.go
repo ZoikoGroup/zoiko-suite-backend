@@ -6,9 +6,9 @@ import (
 	"errors"
 	"net/url"
 	"os"
-	"sort"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,7 +43,7 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
-	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS notifications CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS delivery_events, delivery_attempts, message_renders, message_intents, notifications CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.
 	//
@@ -81,6 +81,18 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 		if _, err := pool.Exec(ctx, string(sql)); err != nil {
 			t.Fatalf("failed to apply migration %s: %v", filepath.Base(path), err)
 		}
+	}
+
+	const appRole = "zoiko_app_test"
+	if _, err := pool.Exec(ctx, `DO $do$ BEGIN
+		IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '`+appRole+`') THEN
+			CREATE ROLE `+appRole+` NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+		END IF;
+	END $do$;
+	GRANT USAGE ON SCHEMA public TO `+appRole+`;
+	GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO `+appRole+`;
+	`); err != nil {
+		t.Fatalf("setup test role %s: %v", appRole, err)
 	}
 
 	return pool

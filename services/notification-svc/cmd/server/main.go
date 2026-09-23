@@ -27,6 +27,7 @@ import (
 	"zoiko.io/notification-svc/internal/handler"
 	"zoiko.io/notification-svc/internal/health"
 	"zoiko.io/notification-svc/internal/identity"
+	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/mtls"
 	"zoiko.io/notification-svc/internal/retry"
@@ -237,6 +238,16 @@ func main() {
 	}
 	retryPolicy = retryPolicy.Normalize()
 
+	// ── 4c. Phase 1 Delivery Ledger & Template Compiler ───────────────────────
+	compiler := ledger.NewCompiler()
+	for _, seed := range ledger.DefaultSeedDefinitions() {
+		if err := compiler.Register(seed); err != nil {
+			log.Fatal("failed to register seed template", zap.String("key", seed.TemplateKey), zap.Error(err))
+		}
+	}
+	killSwitch := ledger.NewKillSwitchManager(log)
+	orchestrator := ledger.NewOrchestrator(pgStore, compiler, killSwitch, deliverer, identityClient, log)
+
 	// ── 5. Router + handler ───────────────────────────────────────────────────
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -256,13 +267,15 @@ func main() {
 	r.Use(svcenvelope.Middleware(svcenvelope.ServicePolicy(), svcenvelope.DefaultReporter()))
 
 	h := handler.New(handler.Deps{
-		Store:       pgStore,
-		Publisher:   publisher,
-		AuthZ:       authzClient,
-		Deliverer:   deliverer,
-		Recipient:   identityClient,
-		RetryPolicy: retryPolicy,
-		Log:         log,
+		Store:        pgStore,
+		Publisher:    publisher,
+		AuthZ:        authzClient,
+		Deliverer:    deliverer,
+		Recipient:    identityClient,
+		RetryPolicy:  retryPolicy,
+		Orchestrator: orchestrator,
+		LedgerStore:  pgStore,
+		Log:          log,
 	})
 	handler.RegisterRoutes(r, h)
 
