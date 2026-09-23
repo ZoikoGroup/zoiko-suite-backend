@@ -37,6 +37,7 @@ import (
 	"zoiko.io/workflow-svc/internal/handler"
 	"zoiko.io/workflow-svc/internal/health"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
+	"zoiko.io/workflow-svc/internal/outbox"
 	"zoiko.io/workflow-svc/internal/store"
 	"zoiko.io/workflow-svc/internal/telemetry"
 )
@@ -140,6 +141,14 @@ func main() {
 	h := handler.New(pgStore, publisher, authzClient, documentVaultClient, log)
 	handler.RegisterRoutes(r, h)
 
+	// Outbox relay (ZS-STATE-001 Invariant I-13 / doc7 item 32):
+	// Asynchronously polls outbox_events and publishes to Kafka with FOR UPDATE SKIP LOCKED,
+	// guaranteeing multi-replica safety and durable at-least-once delivery.
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	defer relayCancel()
+	relay := outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, log)
+	go relay.Start(relayCtx)
+
 	healthH := health.New(pool, log)
 	r.Get("/healthz", healthH.Liveness)
 	r.Get("/readyz", metrics.WrapReadiness(healthH.Readiness))
@@ -171,6 +180,7 @@ func main() {
 		log.Info("shutdown signal received", zap.String("signal", sig.String()))
 	}
 
+	relayCancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {

@@ -15,8 +15,10 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/identity"
+	"zoiko.io/notification-svc/internal/ledger"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
 	"zoiko.io/notification-svc/internal/retry"
+	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/templates"
 )
 
@@ -116,12 +118,14 @@ type Deliverer interface {
 }
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	authz     AuthZClient
-	deliverer Deliverer
-	recipient RecipientResolver
-	log       *zap.Logger
+	store        Store
+	publisher    Publisher
+	authz        AuthZClient
+	deliverer    Deliverer
+	recipient    RecipientResolver
+	log          *zap.Logger
+	orchestrator *ledger.Orchestrator
+	ledgerStore  ledger.LedgerStore
 
 	// retryPolicy decides whether a first-attempt failure is scheduled for
 	// another try. The same policy the worker uses, so the schedule a send
@@ -137,24 +141,28 @@ type Handler struct {
 // position. Transposing two arguments there compiles and fails at runtime,
 // which is the same reason domain.ListFilter exists.
 type Deps struct {
-	Store       Store
-	Publisher   Publisher
-	AuthZ       AuthZClient
-	Deliverer   Deliverer
-	Recipient   RecipientResolver
-	RetryPolicy retry.Policy
-	Log         *zap.Logger
+	Store        Store
+	Publisher    Publisher
+	AuthZ        AuthZClient
+	Deliverer    Deliverer
+	Recipient    RecipientResolver
+	RetryPolicy  retry.Policy
+	Orchestrator *ledger.Orchestrator
+	LedgerStore  ledger.LedgerStore
+	Log          *zap.Logger
 }
 
 func New(d Deps) *Handler {
 	return &Handler{
-		store:       d.Store,
-		publisher:   d.Publisher,
-		authz:       d.AuthZ,
-		deliverer:   d.Deliverer,
-		recipient:   d.Recipient,
-		retryPolicy: d.RetryPolicy.Normalize(),
-		log:         d.Log,
+		store:        d.Store,
+		publisher:    d.Publisher,
+		authz:        d.AuthZ,
+		deliverer:    d.Deliverer,
+		recipient:    d.Recipient,
+		retryPolicy:  d.RetryPolicy.Normalize(),
+		orchestrator: d.Orchestrator,
+		ledgerStore:  d.LedgerStore,
+		log:          d.Log,
 	}
 }
 
@@ -168,6 +176,10 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		// "unread-count" is never captured as a notification id.
 		r.Get("/unread-count", h.UnreadCount)
 		r.Get("/templates", h.ListTemplates)
+
+		// Phase 1 Delivery Ledger & Event Ingestion routes
+		r.Post("/events/ingest", h.IngestEvent)
+		r.Get("/intents/{id}", h.GetIntent)
 
 		r.Get("/{id}", h.GetNotification)
 		r.Post("/{id}/read", h.MarkRead)
@@ -418,13 +430,39 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 
 	attemptedAt := time.Now().UTC()
 
+	// The OUTCOME of an attempt already made is recorded on a context that
+	// outlives the request, not on r.Context().
+	//
+	// WHY. Once the provider has been called, what happened is a fact about
+	// the outside world, and the caller hanging up does not un-send an email.
+	// r.Context() is cancelled when the response is written — and sooner if
+	// the client disconnects or the server's 15s WriteTimeout fires — so the
+	// two statements below could fail for no reason but the request ending,
+	// leaving the notification PENDING with nothing scheduled: in flight
+	// forever, which is the stranded state internal/retry's sweep exists to
+	// repair. Five rows on the dev stack were in exactly that state for six
+	// days.
+	//
+	// The sweep is the backstop; this is the fix. It matters most in the worst
+	// case — a message that WAS delivered and whose success was never written
+	// — because there the sweep would reasonably re-send it and the recipient
+	// would get the notice twice. Keeping the write alive is what makes that
+	// rare rather than routine.
+	//
+	// The tenant is carried over explicitly: the store reads it from the
+	// context, and a bare context.Background() would have no tenant installed
+	// and be refused by row-level security.
+	outcomeCtx, cancelOutcome := context.WithTimeout(
+		svcmiddleware.WithTenant(context.WithoutCancel(r.Context()), tenantID), 10*time.Second)
+	defer cancelOutcome()
+
 	// A failure worth re-attempting does not conclude the notification. It
 	// stays PENDING with a schedule on it, and internal/retry's worker picks
 	// it up — which is the whole difference between classifying a failure and
 	// doing something about it.
 	if !outcome.Delivered && outcome.Retryable {
 		if next, ok := h.retryPolicy.NextAttempt(attemptedAt, 1); ok {
-			if err := h.store.ScheduleRetry(r.Context(), notification.NotificationID,
+			if err := h.store.ScheduleRetry(outcomeCtx, notification.NotificationID,
 				tenantID, outcome.Reason, attemptedAt, next); err != nil {
 				h.log.Error("failed to schedule delivery retry", zap.Error(err))
 				writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -457,7 +495,7 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		newStatus = "FAILED"
 	}
 
-	if err := h.store.CompleteDelivery(r.Context(), notification.NotificationID,
+	if err := h.store.CompleteDelivery(outcomeCtx, notification.NotificationID,
 		newStatus, outcome.Reason, outcome.ProviderResponse, &attemptedAt); err != nil {
 		h.log.Error("failed to record delivery outcome", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
@@ -471,9 +509,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	notification.LastAttemptAt = &attemptedAt
 
 	if outcome.Delivered {
-		h.publisher.PublishSent(r.Context(), correlationID, *notification)
+		h.publisher.PublishSent(outcomeCtx, correlationID, *notification)
 	} else {
-		h.publisher.PublishFailed(r.Context(), correlationID, *notification, outcome.Reason)
+		h.publisher.PublishFailed(outcomeCtx, correlationID, *notification, outcome.Reason)
 	}
 
 	writeJSON(w, http.StatusCreated, notification)
@@ -1249,4 +1287,146 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// ── POST /v1/notifications/events/ingest ────────────────────────────────────
+
+// IngestEvent ingests a business domain event and coordinates the Phase 1 communications
+// pipeline: deduplication, recipient resolution, kill-switch check, template integrity,
+// deterministic render, ledger recording, and delivery dispatch.
+func (h *Handler) IngestEvent(w http.ResponseWriter, r *http.Request) {
+	if h.orchestrator == nil {
+		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "orchestrator not configured")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	_, ok = h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req ledger.EventIngestRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+
+	// Default correlation and causation from request envelope headers if omitted from body
+	if req.CorrelationID == "" {
+		req.CorrelationID = getCorrelationID(r)
+	}
+	if req.CausationID == nil {
+		if cid := r.Header.Get("X-Causation-Id"); cid != "" {
+			req.CausationID = &cid
+		}
+	}
+	if req.LegalEntityID == "" {
+		req.LegalEntityID = r.Header.Get("X-Legal-Entity-Id")
+	}
+
+	// Strictly validate mandatory request attributes
+	if req.EventID == "" || req.EventType == "" || req.RecipientPrincipalID == "" ||
+		req.TemplateKey == "" || req.LegalEntityID == "" || req.CorrelationID == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields",
+			"event_id, event_type, recipient_principal_id, template_key, legal_entity_id, correlation_id are required")
+		return
+	}
+
+	// Authorization check
+	if h.authz != nil {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	res, err := h.orchestrator.IngestEvent(r.Context(), req, principalID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ledger.ErrMissingTenantContext):
+			writeError(w, http.StatusUnauthorized, "tenant_missing", err.Error())
+		case errors.Is(err, ledger.ErrInvalidIngestRequest):
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		case errors.Is(err, ledger.ErrTemplateNotFound):
+			writeError(w, http.StatusBadRequest, "unknown_template", err.Error())
+		case errors.Is(err, ledger.ErrMissingVariables):
+			writeError(w, http.StatusBadRequest, "missing_template_variables", err.Error())
+		case errors.Is(err, ledger.ErrHashMismatch):
+			h.log.Error("template integrity verification failed", zap.String("template_key", req.TemplateKey), zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "template_integrity_failure", "template hash integrity check failed")
+		case errors.Is(err, ledger.ErrRecipientEmailUnresolved):
+			writeError(w, http.StatusUnprocessableEntity, "recipient_unresolved", err.Error())
+		default:
+			h.log.Error("event orchestration failed", zap.String("event_id", req.EventID), zap.Error(err))
+			writeError(w, http.StatusInternalServerError, "orchestration_failed", err.Error())
+		}
+		return
+	}
+
+	status := http.StatusCreated
+	if res.IsReplay {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, res)
+}
+
+// ── GET /v1/notifications/intents/{id} ──────────────────────────────────────
+
+type IntentDetailResponse struct {
+	*ledger.MessageIntent
+	Render *ledger.MessageRender `json:"render,omitempty"`
+}
+
+// GetIntent retrieves a message intent and associated render under strict tenant RLS.
+func (h *Handler) GetIntent(w http.ResponseWriter, r *http.Request) {
+	if h.ledgerStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "service_unavailable", "ledger store not configured")
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	id := chi.URLParam(r, "id")
+	if _, err := uuid.Parse(id); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_id", "id must be a valid UUID")
+		return
+	}
+
+	intent, err := h.ledgerStore.GetMessageIntent(r.Context(), tenantID, id)
+	if err != nil {
+		if errors.Is(err, store.ErrIntentNotFound) {
+			writeError(w, http.StatusNotFound, "intent_not_found", "message intent not found")
+			return
+		}
+		h.log.Error("failed to get message intent", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if h.authz != nil && intent.LegalEntityID != "" {
+		if err := h.authz.CheckAllowed(r.Context(), principalID, intent.LegalEntityID, actionView); err != nil {
+			h.writeAuthzErr(w, err)
+			return
+		}
+	}
+
+	render, rErr := h.ledgerStore.GetRenderByIntent(r.Context(), tenantID, id)
+	if rErr != nil && !errors.Is(rErr, store.ErrRenderNotFound) {
+		h.log.Warn("failed to fetch render for intent", zap.String("intent_id", id), zap.Error(rErr))
+	}
+
+	writeJSON(w, http.StatusOK, IntentDetailResponse{
+		MessageIntent: intent,
+		Render:        render,
+	})
 }

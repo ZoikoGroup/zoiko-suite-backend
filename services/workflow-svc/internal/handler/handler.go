@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"go.uber.org/zap"
@@ -12,6 +14,7 @@ import (
 	"zoiko.io/workflow-svc/internal/authz"
 	"zoiko.io/workflow-svc/internal/documentvault"
 	"zoiko.io/workflow-svc/internal/domain"
+	svcenvelope "zoiko.io/workflow-svc/internal/envelope"
 	"zoiko.io/workflow-svc/internal/evidence"
 	svcmiddleware "zoiko.io/workflow-svc/internal/middleware"
 )
@@ -25,6 +28,8 @@ type WorkflowStore interface {
 	SubmitAction(ctx context.Context, params domain.SubmitActionParams) (*domain.WorkflowInstance, *domain.WorkflowStage, bool, error)
 	EscalateWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
 	CancelWorkflow(ctx context.Context, workflowInstanceID, actorPrincipalID string) (*domain.WorkflowInstance, bool, error)
+	InvalidateWorkflow(ctx context.Context, params domain.InvalidateWorkflowParams) (*domain.WorkflowInstance, bool, error)
+	VerifyRelease(ctx context.Context, params domain.VerifyReleaseParams) (*domain.ReleaseVerificationResult, error)
 	CreateAuditEngagement(ctx context.Context, params domain.CreateAuditEngagementParams) (*domain.AuditEngagement, bool, error)
 	GetAuditEngagement(ctx context.Context, tenantID, engagementID string) (*domain.AuditEngagement, error)
 	SubmitAuditEngagementAcceptance(ctx context.Context, params domain.SubmitAuditEngagementAcceptanceParams) (*domain.AuditEngagement, bool, error)
@@ -108,6 +113,7 @@ type EventPublisher interface {
 	PublishApprovalRejected(ctx context.Context, w domain.WorkflowInstance, stage domain.WorkflowStage, actorID string) error
 	PublishWorkflowEscalated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishWorkflowCompleted(ctx context.Context, w domain.WorkflowInstance, actorID string) error
+	PublishWorkflowInvalidated(ctx context.Context, w domain.WorkflowInstance, actorID string) error
 	PublishAuditEngagementEvent(ctx context.Context, eventType string, engagement domain.AuditEngagement, actorID, correlationID string) error
 
 	// BIZ-04 Form — see internal/events/publisher.go's own doc comments.
@@ -161,6 +167,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 	r.Post("/v1/workflows/{workflow_instance_id}/actions", h.SubmitAction)
 	r.Post("/v1/workflows/{workflow_instance_id}/escalate", h.EscalateWorkflow)
 	r.Post("/v1/workflows/{workflow_instance_id}/cancel", h.CancelWorkflow)
+	r.Post("/v1/workflows/{workflow_instance_id}/invalidate", h.InvalidateWorkflow)
+	r.Post("/v1/workflows/{workflow_instance_id}/verify-release", h.VerifyRelease)
 	r.Route("/v1/audit/engagements", func(r chi.Router) {
 		r.Post("/", h.CreateAuditEngagement)
 		r.Get("/{engagement_id}", h.GetAuditEngagement)
@@ -308,10 +316,14 @@ func correlationIDMiddleware(next http.Handler) http.Handler {
 // ── POST /v1/workflows ───────────────────────────────────────────────────────
 
 type createWorkflowRequest struct {
-	TenantID      string                            `json:"tenant_id"`
-	LegalEntityID string                            `json:"legal_entity_id"`
-	WorkflowType  string                            `json:"workflow_type"`
-	Stages        []domain.CreateWorkflowStageInput `json:"stages"`
+	TenantID           string                            `json:"tenant_id"`
+	LegalEntityID      string                            `json:"legal_entity_id"`
+	WorkflowType       string                            `json:"workflow_type"`
+	SubjectType        *string                           `json:"subject_type,omitempty"`
+	SubjectID          *string                           `json:"subject_id,omitempty"`
+	SubjectVersion     *int                              `json:"subject_version,omitempty"`
+	SubjectFingerprint *string                           `json:"subject_fingerprint,omitempty"`
+	Stages             []domain.CreateWorkflowStageInput `json:"stages"`
 }
 
 func (req createWorkflowRequest) missingField() string {
@@ -381,11 +393,42 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Validate subject binding parameters per ZS-STATE-001 §6.1
+	if req.SubjectFingerprint != nil && strings.TrimSpace(*req.SubjectFingerprint) != "" {
+		trimmedFp := strings.TrimSpace(*req.SubjectFingerprint)
+		if !svcenvelope.IsValidFingerprint(trimmedFp) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error":   "invalid_subject_fingerprint",
+				"message": "subject_fingerprint must match sha256:<64 lowercase hex characters>",
+			})
+			return
+		}
+		req.SubjectFingerprint = &trimmedFp
+	}
+	if req.SubjectVersion != nil && *req.SubjectVersion < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_subject_version",
+			"message": "subject_version must be non-negative",
+		})
+		return
+	}
+	hasType := req.SubjectType != nil && strings.TrimSpace(*req.SubjectType) != ""
+	hasID := req.SubjectID != nil && strings.TrimSpace(*req.SubjectID) != ""
+	if hasType != hasID {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "missing_subject_field",
+			"message": "subject_type and subject_id must both be provided if either is present",
+		})
+		return
+	}
+
 	instance, stages, created, err := h.store.CreateWorkflow(r.Context(), domain.CreateWorkflowParams{
 		// initiated_by is always the verified caller, never the request
 		// body — see requirePrincipal's doc comment.
 		TenantID: req.TenantID, LegalEntityID: req.LegalEntityID, WorkflowType: req.WorkflowType,
-		InitiatedBy: principalID, CorrelationID: correlationID, Stages: req.Stages,
+		SubjectType: req.SubjectType, SubjectID: req.SubjectID, SubjectVersion: req.SubjectVersion,
+		SubjectFingerprint: req.SubjectFingerprint,
+		InitiatedBy:        principalID, CorrelationID: correlationID, Stages: req.Stages,
 	})
 	if err != nil {
 		if errors.Is(err, domain.ErrNoStages) {
@@ -404,9 +447,8 @@ func (h *Handler) CreateWorkflow(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated
-		if pubErr := h.publisher.PublishWorkflowStarted(r.Context(), *instance); pubErr != nil {
-			h.log.Error("CreateWorkflow: failed to publish workflow.started", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-		}
+		// Event publication is handled by the transactional outbox (outbox_events),
+		// written atomically in CreateWorkflow's DB transaction.
 		h.log.Info("workflow started",
 			zap.String("workflow_instance_id", instance.WorkflowInstanceID),
 			zap.String("workflow_type", instance.WorkflowType),
@@ -550,6 +592,27 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4)
+	targetState := "APPROVED"
+	if req.Action == "REJECT" {
+		targetState = "REJECTED"
+	}
+	if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", instanceForAuthzCheck.WorkflowStatus, targetState); edgeErr != nil {
+		var illegalErr *svcenvelope.IllegalEdgeError
+		if errors.As(edgeErr, &illegalErr) {
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"message":         illegalErr.Error(),
+				"from_state":      illegalErr.FromState,
+				"to_state":        illegalErr.ToState,
+				"reason_family":   string(illegalErr.ReasonFamily),
+				"reason_code":     string(illegalErr.ReasonCode),
+				"exception_class": string(illegalErr.ExceptionClass),
+			})
+			return
+		}
+	}
+
 	instance, stage, transitioned, err := h.store.SubmitAction(r.Context(), domain.SubmitActionParams{
 		WorkflowInstanceID: workflowInstanceID, ActorPrincipalID: principalID, Action: req.Action,
 		Rationale: req.Rationale, CausationID: req.CausationID,
@@ -561,7 +624,12 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, domain.ErrWrongApprover):
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "wrong_approver"})
 		case errors.Is(err, domain.ErrInvalidTransition):
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"reason_family":   string(svcenvelope.ReasonFamilyReject),
+				"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
+				"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
+			})
 		default:
 			h.log.Error("SubmitAction: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
@@ -570,20 +638,8 @@ func (h *Handler) SubmitAction(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if transitioned {
-		if req.Action == "APPROVE" {
-			if pubErr := h.publisher.PublishApprovalGranted(r.Context(), *instance, *stage, principalID); pubErr != nil {
-				h.log.Error("SubmitAction: failed to publish approval.granted", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-			}
-		} else {
-			if pubErr := h.publisher.PublishApprovalRejected(r.Context(), *instance, *stage, principalID); pubErr != nil {
-				h.log.Error("SubmitAction: failed to publish approval.rejected", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-			}
-		}
-		if instance.WorkflowStatus == "APPROVED" || instance.WorkflowStatus == "REJECTED" {
-			if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, principalID); pubErr != nil {
-				h.log.Error("SubmitAction: failed to publish workflow.completed", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-			}
-		}
+		// Event publication (approval.granted/rejected, workflow.completed) is handled
+		// by the transactional outbox (outbox_events), written atomically in SubmitAction's DB transaction.
 	}
 
 	h.log.Info("workflow action submitted",
@@ -619,9 +675,8 @@ func (h *Handler) EscalateWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if transitioned {
-		if pubErr := h.publisher.PublishWorkflowEscalated(r.Context(), *instance, principalID); pubErr != nil {
-			h.log.Error("EscalateWorkflow: failed to publish workflow.escalated", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-		}
+		// Event publication is handled by the transactional outbox (outbox_events),
+		// written atomically in EscalateWorkflow's DB transaction.
 	}
 	writeJSON(w, http.StatusOK, instance)
 }
@@ -649,11 +704,240 @@ func (h *Handler) CancelWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if transitioned {
-		if pubErr := h.publisher.PublishWorkflowCompleted(r.Context(), *instance, principalID); pubErr != nil {
-			h.log.Error("CancelWorkflow: failed to publish workflow.completed", zap.String("correlation_id", correlationID), zap.Error(pubErr))
-		}
+		// Event publication is handled by the transactional outbox (outbox_events),
+		// written atomically in CancelWorkflow's DB transaction.
 	}
 	writeJSON(w, http.StatusOK, instance)
+}
+
+// ── POST /v1/workflows/{id}/invalidate ───────────────────────────────────────
+
+type invalidateWorkflowRequest struct {
+	ReasonCode   string   `json:"reason_code"`
+	Narrative    *string  `json:"narrative,omitempty"`
+	EvidenceRefs []string `json:"evidence_refs,omitempty"`
+	CausationID  *string  `json:"causation_id,omitempty"`
+}
+
+// InvalidateWorkflow handles POST /v1/workflows/{workflow_instance_id}/invalidate per ZS-STATE-001 §6.1 / §7.
+//
+// Transitions a PENDING or APPROVED workflow to INVALIDATED when its bound business
+// object has materially changed or an authoritative policy invalidates it.
+//
+// Response: 200 invalidated (or idempotent no-op) / 400 invalid reason / 401 no verified principal or tenant / 404 not found / 409 illegal transition / 503 unavailable.
+func (h *Handler) InvalidateWorkflow(w http.ResponseWriter, r *http.Request) {
+	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantScope, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	var req invalidateWorkflowRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+
+	reasonCode := strings.TrimSpace(req.ReasonCode)
+	if reasonCode == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "reason_code"})
+		return
+	}
+
+	// Validate governed reason code per ZS-STATE-001 §16 and Appendix B
+	_, validatedCode, parseErr := svcenvelope.ParseReason(reasonCode)
+	if parseErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_reason_code",
+			"message": fmt.Sprintf("reason code %q is not registered in ZS-STATE-001 Appendix B: %v", reasonCode, parseErr),
+		})
+		return
+	}
+	canonicalReason := string(validatedCode)
+
+	// Build and validate canonical transition command (ZS-STATE-001 §4)
+	env := svcenvelope.Parse(r)
+	if env.TenantID == "" {
+		env.TenantID = tenantScope
+	}
+	if env.ActorSubjectID == "" {
+		env.ActorSubjectID = principalID
+	}
+	if env.CorrelationID == "" {
+		env.CorrelationID = correlationID
+	}
+	if env.IdempotencyKey == "" {
+		env.IdempotencyKey = r.Header.Get("Idempotency-Key")
+		if env.IdempotencyKey == "" {
+			env.IdempotencyKey = "inv-" + workflowInstanceID
+		}
+	}
+	if env.SourceChannel == "" {
+		env.SourceChannel = svcenvelope.ChannelWeb
+	}
+	if env.ExpectedVersion == "" {
+		env.ExpectedVersion = r.Header.Get("X-Expected-Version")
+		if env.ExpectedVersion == "" {
+			env.ExpectedVersion = "1"
+		}
+	}
+
+	payload := &svcenvelope.TransitionPayload{
+		ReasonCode:   canonicalReason,
+		EvidenceRefs: req.EvidenceRefs,
+	}
+	if req.Narrative != nil {
+		payload.Narrative = *req.Narrative
+	}
+	_, cmdErr := svcenvelope.NewTransitionCommand(
+		env,
+		"workflow_instance",
+		workflowInstanceID,
+		"invalidate",
+		payload,
+	)
+	if cmdErr != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_transition_command", "message": cmdErr.Error()})
+		return
+	}
+
+	// Verify transition edge exists in pinned state-machine definition (ZS-STATE-001 §4 step 4)
+	existing, findErr := h.store.FindWorkflowByID(r.Context(), workflowInstanceID)
+	if findErr == nil && existing != nil {
+		if edgeErr := svcenvelope.ValidateTransitionEdge("workflow_instance", existing.WorkflowStatus, "INVALIDATED"); edgeErr != nil {
+			var illegalErr *svcenvelope.IllegalEdgeError
+			if errors.As(edgeErr, &illegalErr) {
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error":           "invalid_transition",
+					"message":         illegalErr.Error(),
+					"from_state":      illegalErr.FromState,
+					"to_state":        illegalErr.ToState,
+					"reason_family":   string(illegalErr.ReasonFamily),
+					"reason_code":     string(illegalErr.ReasonCode),
+					"exception_class": string(illegalErr.ExceptionClass),
+				})
+				return
+			}
+		}
+	}
+
+	instance, transitioned, err := h.store.InvalidateWorkflow(r.Context(), domain.InvalidateWorkflowParams{
+		WorkflowInstanceID: workflowInstanceID,
+		TenantID:           tenantScope,
+		ActorPrincipalID:   principalID,
+		ReasonCode:         canonicalReason,
+		Narrative:          req.Narrative,
+		EvidenceRefs:       req.EvidenceRefs,
+		CorrelationID:      correlationID,
+		CausationID:        req.CausationID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, domain.ErrWorkflowNotFound):
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
+		case errors.Is(err, domain.ErrInvalidTransition):
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"error":           "invalid_transition",
+				"message":         "cannot invalidate a workflow in terminal rejected or cancelled state",
+				"reason_family":   string(svcenvelope.ReasonFamilyReject),
+				"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
+				"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
+			})
+		default:
+			h.log.Error("InvalidateWorkflow: store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})
+		}
+		return
+	}
+
+	if transitioned {
+		// Event publication is handled by the transactional outbox (outbox_events),
+		// written atomically in InvalidateWorkflow's DB transaction.
+		h.log.Info("workflow invalidated",
+			zap.String("workflow_instance_id", workflowInstanceID),
+			zap.String("reason_code", reasonCode),
+			zap.String("actor_id", principalID),
+			zap.String("correlation_id", correlationID),
+		)
+	}
+	writeJSON(w, http.StatusOK, instance)
+}
+
+// ── POST /v1/workflows/{id}/verify-release ───────────────────────────────────
+
+type verifyReleaseRequest struct {
+	ExpectedSubjectVersion    *int   `json:"expected_subject_version,omitempty"`
+	CurrentSubjectFingerprint string `json:"current_subject_fingerprint"`
+}
+
+// VerifyRelease handles POST /v1/workflows/{workflow_instance_id}/verify-release.
+//
+// Evaluates the Critical Release Rule per ZS-STATE-001 §6.1, Invariants I-06, I-07, T-02, T-04:
+// confirms that the workflow is APPROVED, bound to a subject, that versions match, and that the
+// current material fingerprint matches the approved fingerprint without stale divergence.
+//
+// Response:
+//   200 OK: {"can_release": true, "status": "VALID", ...}
+//   409 Conflict: {"can_release": false, "status": "INVALID", "reason": "...", ...}
+//   400 Bad Request: missing or invalid input
+//   404 Not Found: workflow does not exist
+//   503 Service Unavailable: store unavailable
+func (h *Handler) VerifyRelease(w http.ResponseWriter, r *http.Request) {
+	workflowInstanceID := chi.URLParam(r, "workflow_instance_id")
+	correlationID := r.Header.Get("X-Correlation-ID")
+
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	var req verifyReleaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_json", "message": err.Error()})
+		return
+	}
+
+	fp := strings.TrimSpace(req.CurrentSubjectFingerprint)
+	if fp == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_field", "field": "current_subject_fingerprint"})
+		return
+	}
+	if !svcenvelope.IsValidFingerprint(fp) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_subject_fingerprint",
+			"message": "current_subject_fingerprint must match sha256:<64 lowercase hex characters>",
+		})
+		return
+	}
+	if req.ExpectedSubjectVersion != nil && *req.ExpectedSubjectVersion < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error":   "invalid_subject_version",
+			"message": "expected_subject_version must be non-negative",
+		})
+		return
+	}
+
+	res, err := h.store.VerifyRelease(r.Context(), domain.VerifyReleaseParams{
+		WorkflowInstanceID:        workflowInstanceID,
+		TenantID:                  svcmiddleware.TenantFromContext(r.Context()),
+		ExpectedSubjectVersion:    req.ExpectedSubjectVersion,
+		CurrentSubjectFingerprint: fp,
+	})
+	if err != nil {
+		writeStoreErr(w, h.log, err, correlationID, "VerifyRelease")
+		return
+	}
+
+	if !res.CanRelease {
+		writeJSON(w, http.StatusConflict, res)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -663,7 +947,12 @@ func writeStoreErr(w http.ResponseWriter, log *zap.Logger, err error, correlatio
 	case errors.Is(err, domain.ErrWorkflowNotFound):
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "workflow_not_found"})
 	case errors.Is(err, domain.ErrInvalidTransition):
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "invalid_transition"})
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":           "invalid_transition",
+			"reason_family":   string(svcenvelope.ReasonFamilyReject),
+			"reason_code":     string(svcenvelope.ReasonRejectPolicyNotMet),
+			"exception_class": string(svcenvelope.ExceptionClassBusinessRule),
+		})
 	default:
 		log.Error(op+": store unavailable", zap.String("correlation_id", correlationID), zap.Error(err))
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "store_unavailable"})

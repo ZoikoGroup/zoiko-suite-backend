@@ -1038,13 +1038,86 @@ services:
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: authorization_svc
-      DB_USER: zoiko_app
-      DB_PASSWORD: zoiko_app_password
+      # app_authorization, not the shared zoiko_app. create-app-roles.sh has
+      # provisioned this role since 000007 gave permission_bundles and
+      # principal_role_assignments their policies, and until DB_USER named it
+      # the roles existed and bound nothing — "flipping DB_USER is the step
+      # that makes the policies bite", in that script's own words.
+      #
+      # zoiko_app is NOSUPERUSER NOBYPASSRLS too, so the policies did apply;
+      # what it is not is per-service, so a compromise of any one service
+      # reached every other service's database. This is the isolation half.
+      #
+      # Two reads still run under app.platform_scope by design (FindRoleByID,
+      # and FindGrantedActions / FindDelegatedActions when the caller supplies
+      # no tenant). An ordinary role does not close that hatch — it is an
+      # application-level escape, not a privilege one — and it must not, or
+      # /v1/authorize fails closed platform-wide. See
+      # 000007_add_rls_bundles_assignments.up.sql.
+      DB_USER: "${DB_USER_AUTHORIZATION:-app_authorization}"
+      DB_PASSWORD: "${DB_PASSWORD:-postgres}"
       DB_SSLMODE: disable
       KAFKA_BROKERS: "kafka:9094"
       KAFKA_GROUP_ID: "authorization-svc"
       KAFKA_EVENTS_TOPIC: "zoiko.authorization.events"
+      # CONSUMED, not produced: delegated-authority-svc is the authoritative
+      # owner of the delegated-authority concept (Doc 03 §9.3) and has been
+      # publishing authority.delegated / authority.revoked / authority.expired
+      # to nobody. This service projects them into its own
+      # delegated_authorities table so /v1/authorize's delegation layer
+      # resolves the grants that service actually made — see
+      # internal/events/consumer.go. Set to "" to disable.
+      KAFKA_DELEGATION_TOPIC: "zoiko.delegated-authority.events"
+      KAFKA_DELEGATION_GROUP_ID: "authorization-svc-delegation-projector"
+      # CONSUMED. The other three events Doc 03 §8.3 names — role.assigned,
+      # employment.changed, entity.scope.updated — which four passes of this
+      # service's notes recorded as having "no producer anywhere on the
+      # estate". They do. That conclusion came from grepping the SPEC's event
+      # names; the platform publishes the concepts under concrete ones:
+      #
+      #   zoiko.identity.events        principal.status.changed
+      #                                (identity-svc, line 485). PROJECTED into
+      #                                principal_status_projection and read as
+      #                                LAYER 0 of /v1/authorize — a principal
+      #                                identity has SUSPENDED or DISABLED is
+      #                                denied every action. Session eviction
+      #                                does not cover this: 111 services call
+      #                                the endpoint east-west on envelopes
+      #                                resolved before the suspension.
+      #   zoiko.access-control.events  role.created / role.updated /
+      #                                permission.bundle.updated (line 1914)
+      #   zoiko.entity.events          entity.status.changed /
+      #                                entity.hierarchy.changed /
+      #                                entity.jurisdiction.changed (line 613)
+      #
+      # The last two INVALIDATE this replica's cached grant reads rather than
+      # projecting anything. Those writes reach authorization-svc through ONE
+      # replica's admin API and are announced to all of them, so consuming the
+      # announcement is what stops AUTHZ_CACHE_TTL_SECONDS being the only bound
+      # on cross-replica staleness.
+      #
+      # employee.terminated is deliberately NOT consumed: its payload names an
+      # employee_id and nothing on this estate maps one to a principal, so the
+      # event says somebody left and this service cannot tell whose authority
+      # that is about. See internal/events/lifecycle_consumer.go.
+      #
+      # Set to "" to disable: layer 0 goes inert (no row means ACTIVE) and the
+      # cache TTL becomes the only staleness bound again.
+      KAFKA_LIFECYCLE_TOPICS: "zoiko.identity.events,zoiko.access-control.events,zoiko.entity.events"
+      KAFKA_LIFECYCLE_GROUP_ID: "authorization-svc-lifecycle"
       JURISDICTION_RULES_URL: "http://jurisdiction-svc:8082"
+      # The one platform-scope legal entity, matching the AUTHZ_PLATFORM_SCOPE_ID
+      # every CALLING service already carries. Without it this service refuses
+      # every platform-wide act — authoring a platform-wide SoD or ABAC rule —
+      # and answers 400 to any /v1/authorize naming legal_entity_id=PLATFORM.
+      # That fail-closed default was correct and also meant global SoD rules
+      # could not be authored on this stack at all.
+      AUTHZ_PLATFORM_SCOPE_ENTITY_ID: "00000000-0000-0000-0000-00000000f001"
+      # Seconds. Bounds how long an evaluation read may be served from memory
+      # on the /v1/authorize path, and therefore how long a grant revoked
+      # through ANOTHER replica can still authorize. 0 disables caching
+      # entirely. See internal/cache's package comment before raising it.
+      AUTHZ_CACHE_TTL_SECONDS: "5"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4318"
       # siem-integration-svc lives in docker-compose.phase6.yml — reachable
       # only when that file is up alongside this one. Streaming degrades to
@@ -1723,6 +1796,19 @@ services:
       NOTIFICATION_RETRY_MAX_DELAY: "${NOTIFICATION_RETRY_MAX_DELAY:-8m}"
       NOTIFICATION_RETRY_INTERVAL: "${NOTIFICATION_RETRY_INTERVAL:-10s}"
       NOTIFICATION_RETRY_BATCH_SIZE: "${NOTIFICATION_RETRY_BATCH_SIZE:-50}"
+      # How long a notification may sit in flight — PENDING with nothing
+      # scheduled — before the worker treats it as abandoned and puts it
+      # back on the schedule. Nothing else in the service ever moves such a
+      # row: the due poll requires a schedule to be set, so before this
+      # existed a send whose process died between accepting and concluding
+      # was never delivered, never failed and never retried. Five such rows
+      # were found on this stack on 2026-09-08, six days old.
+      #
+      # Must stay well above the longest possible attempt (SMTP timeout 10s,
+      # server WriteTimeout 15s) or the sweep could reschedule a send another
+      # replica is still working on and the recipient gets it twice. 0 is a
+      # true off switch, not "sweep everything now".
+      NOTIFICATION_STRANDED_AFTER: "${NOTIFICATION_STRANDED_AFTER:-15m}"
     depends_on:
       postgres:
         condition: service_healthy

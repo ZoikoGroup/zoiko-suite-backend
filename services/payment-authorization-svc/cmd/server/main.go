@@ -21,6 +21,7 @@ import (
 	"zoiko.io/payment-authorization-svc/internal/handler"
 	"zoiko.io/payment-authorization-svc/internal/health"
 	"zoiko.io/payment-authorization-svc/internal/middleware"
+	"zoiko.io/payment-authorization-svc/internal/outbox"
 	"zoiko.io/payment-authorization-svc/internal/payeeidentity"
 	"zoiko.io/payment-authorization-svc/internal/paymentproposal"
 	"zoiko.io/payment-authorization-svc/internal/policy"
@@ -69,6 +70,12 @@ func main() {
 	payeeClient := payeeidentity.NewHTTPClient(cfg.PayeeIdentityServiceURL, logger)
 	policyClient := policy.NewHTTPClient(cfg.PolicyServiceURL, logger)
 
+	relayCtx, relayCancel := context.WithCancel(context.Background())
+	if pool != nil {
+		relay := outbox.NewRelay(pool, publisher, 1500*time.Millisecond, 50, logger)
+		go relay.Start(relayCtx)
+	}
+
 	h := handler.New(pgStore, publisher, authzClient, proposalClient, supplierClient, payeeClient, policyClient, logger)
 
 	r := chi.NewRouter()
@@ -104,6 +111,8 @@ func main() {
 	<-stop
 
 	logger.Info("shutting down payment-authorization-svc gracefully...")
+	relayCancel()
+
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

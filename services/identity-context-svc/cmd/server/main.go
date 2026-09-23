@@ -140,7 +140,6 @@ func main() {
 	}
 	defer func() { _ = kafkaWriter.Close() }()
 
-
 	// ── Domain dependencies ───────────────────────────────────────────────
 	principalRepo := store.New(pool, log)
 	riskCache := session.NewRiskSignalCache(rdb)
@@ -216,6 +215,10 @@ func main() {
 	}
 
 	siemClient := siem.New(cfg.SIEMServiceURL, "identity-context-svc", log)
+
+	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
+	// so without this a SIGTERM would discard security events already accepted.
+	defer siemClient.Close()
 
 	// ── AuthZ client ───────────────────────────────────────────────────────
 	// Fail fast rather than starting and 503-ing every guarded route. An empty

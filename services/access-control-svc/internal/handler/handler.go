@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"zoiko.io/access-control-svc/internal/clients"
 	"zoiko.io/access-control-svc/internal/domain"
 	svcmiddleware "zoiko.io/access-control-svc/internal/middleware"
 )
@@ -38,10 +39,14 @@ type AuthZClient interface {
 
 // AuthzAdmin provisions the role/bundle definition into authorization-svc's
 // real admin API — the step that makes a definition actually enforced.
+// Every method takes a clients.Scope rather than a tail of bare strings. Two
+// of the three used to be called with empty principal and tenant, which
+// authorization-svc's admin routes reject outright — a struct turns that
+// omission into something the compiler catches.
 type AuthzAdmin interface {
-	CreateRole(ctx context.Context, roleID, tenantID, roleCode, roleName, roleScopeType, createdByPrincipalID, correlationID string) error
-	CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string, correlationID string) error
-	SetRoleActive(ctx context.Context, roleID string, active bool, correlationID string) error
+	CreateRole(ctx context.Context, roleID, roleCode, roleName, roleScopeType string, s clients.Scope) error
+	CreatePermissionBundle(ctx context.Context, roleID, bundleCode string, permittedActions []string, s clients.Scope) error
+	SetRoleActive(ctx context.Context, roleID string, active bool, s clients.Scope) error
 }
 
 const (
@@ -105,7 +110,13 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	}
 	roleID := uuid.NewString()
 
-	if err := h.authzAdmin.CreateRole(r.Context(), roleID, tenantID, req.RoleCode, req.RoleName, req.RoleScopeType, principalID, req.CorrelationID); err != nil {
+	authzScope := clients.Scope{
+		PrincipalID:   principalID,
+		TenantID:      tenantID,
+		LegalEntityID: req.LegalEntityID,
+		CorrelationID: req.CorrelationID,
+	}
+	if err := h.authzAdmin.CreateRole(r.Context(), roleID, req.RoleCode, req.RoleName, req.RoleScopeType, authzScope); err != nil {
 		h.log.Error("failed to provision role in authorization-svc", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 		return
@@ -201,7 +212,7 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_, ok = h.requireTenant(w, r)
+	updateTenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -245,7 +256,16 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Status != string(current.Status) {
 			active := req.Status == string(domain.RoleStatusActive)
-			if err := h.authzAdmin.SetRoleActive(r.Context(), roleDefinitionID, active, req.CorrelationID); err != nil {
+			// req.LegalEntityID, not the stored definition: RoleDefinition does
+			// not carry an entity, and this is the same value the CheckAllowed
+			// above authorized against — so the propagated call is scoped to
+			// exactly the entity the caller was permitted on.
+			if err := h.authzAdmin.SetRoleActive(r.Context(), roleDefinitionID, active, clients.Scope{
+				PrincipalID:   principalID,
+				TenantID:      updateTenantID,
+				LegalEntityID: req.LegalEntityID,
+				CorrelationID: req.CorrelationID,
+			}); err != nil {
 				h.log.Error("failed to propagate role status to authorization-svc",
 					zap.String("role_definition_id", roleDefinitionID),
 					zap.String("status", req.Status),
@@ -290,7 +310,7 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_, ok = h.requireTenant(w, r)
+	bundleTenantID, ok := h.requireTenant(w, r)
 	if !ok {
 		return
 	}
@@ -304,7 +324,12 @@ func (h *Handler) CreateBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authzAdmin.CreatePermissionBundle(r.Context(), roleDefinitionID, req.BundleCode, req.PermittedActions, req.CorrelationID); err != nil {
+	if err := h.authzAdmin.CreatePermissionBundle(r.Context(), roleDefinitionID, req.BundleCode, req.PermittedActions, clients.Scope{
+		PrincipalID:   principalID,
+		TenantID:      bundleTenantID,
+		LegalEntityID: req.LegalEntityID,
+		CorrelationID: req.CorrelationID,
+	}); err != nil {
 		h.log.Error("failed to provision permission bundle in authorization-svc", zap.Error(err))
 		writeError(w, http.StatusServiceUnavailable, "authz_admin_unavailable", err.Error())
 		return

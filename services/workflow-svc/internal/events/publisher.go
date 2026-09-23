@@ -56,14 +56,57 @@ func NewPublisher(log *zap.Logger, topic string, producer MessageWriter) *Publis
 }
 
 func (p *Publisher) PublishWorkflowStarted(ctx context.Context, w domain.WorkflowInstance) error {
-	return p.emit(ctx, "workflow.started", w.CorrelationID, w.TenantID, w.LegalEntityID, w.InitiatedBy, map[string]any{
+	payload := map[string]any{
 		"workflow_instance_id": w.WorkflowInstanceID,
 		"tenant_id":            w.TenantID,
 		"legal_entity_id":      w.LegalEntityID,
 		"workflow_type":        w.WorkflowType,
 		"initiated_by":         w.InitiatedBy,
 		"started_at":           w.StartedAt,
-	})
+	}
+	if w.SubjectType != nil {
+		payload["subject_type"] = *w.SubjectType
+	}
+	if w.SubjectID != nil {
+		payload["subject_id"] = *w.SubjectID
+	}
+	if w.SubjectVersion != nil {
+		payload["subject_version"] = *w.SubjectVersion
+	}
+	if w.SubjectFingerprint != nil {
+		payload["subject_fingerprint"] = *w.SubjectFingerprint
+	}
+	return p.emit(ctx, "workflow.started", w.CorrelationID, w.TenantID, w.LegalEntityID, w.InitiatedBy, payload)
+}
+
+// PublishWorkflowInvalidated emits workflow.approval.invalidated when an approval request
+// is invalidated due to a material subject change or policy invalidation per ZS-STATE-001 §6.1 / §7.
+func (p *Publisher) PublishWorkflowInvalidated(ctx context.Context, w domain.WorkflowInstance, actorID string) error {
+	payload := map[string]any{
+		"workflow_instance_id":     w.WorkflowInstanceID,
+		"workflow_status":          w.WorkflowStatus,
+		"invalidated_at":           w.InvalidatedAt,
+		"invalidation_reason_code": w.InvalidationReasonCode,
+	}
+	if w.SubjectType != nil {
+		payload["subject_type"] = *w.SubjectType
+	}
+	if w.SubjectID != nil {
+		payload["subject_id"] = *w.SubjectID
+	}
+	if w.SubjectVersion != nil {
+		payload["subject_version"] = *w.SubjectVersion
+	}
+	if w.SubjectFingerprint != nil {
+		payload["subject_fingerprint"] = *w.SubjectFingerprint
+	}
+	if w.InvalidationNarrative != nil {
+		payload["invalidation_narrative"] = *w.InvalidationNarrative
+	}
+	if len(w.InvalidationEvidenceRefs) > 0 {
+		payload["invalidation_evidence_refs"] = w.InvalidationEvidenceRefs
+	}
+	return p.emit(ctx, "workflow.approval.invalidated", w.CorrelationID, w.TenantID, w.LegalEntityID, actorID, payload)
 }
 
 // actorID is the already-verified req.ActorPrincipalID from the calling
@@ -216,6 +259,45 @@ func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID
 
 	p.log.Info("event published",
 		zap.String("event_id", eventID),
+		zap.String("event_type", eventType),
+		zap.String("topic", p.topic),
+		zap.String("correlation_id", correlationID),
+	)
+	return nil
+}
+
+// PublishOutbox publishes an event from the transactional outbox relay, preserving
+// the stable outboxEventID as the X-Event-ID Kafka header across all retries.
+func (p *Publisher) PublishOutbox(ctx context.Context, outboxEventID, eventType, correlationID, tenantID, legalEntityID, actorID string, payload []byte) error {
+	env := envelope{
+		EventType:     eventType,
+		EventVersion:  "1.0",
+		EmittedAt:     time.Now().UTC(),
+		SchemaVersion: "1.0",
+		SourceService: "workflow-svc",
+		CorrelationID: correlationID,
+		TenantID:      tenantID,
+		LegalEntityID: legalEntityID,
+		ActorID:       actorID,
+		Payload:       json.RawMessage(payload),
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("event %q: marshal envelope: %w", eventType, err)
+	}
+
+	msg := kafka.Message{
+		Value: data,
+		Headers: []kafka.Header{
+			{Key: "X-Event-ID", Value: []byte(outboxEventID)},
+		},
+	}
+	if err := p.producer.WriteMessages(ctx, msg); err != nil {
+		return fmt.Errorf("event %q: kafka write: %w", eventType, err)
+	}
+
+	p.log.Info("outbox event published",
+		zap.String("event_id", outboxEventID),
 		zap.String("event_type", eventType),
 		zap.String("topic", p.topic),
 		zap.String("correlation_id", correlationID),

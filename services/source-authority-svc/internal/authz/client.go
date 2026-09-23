@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 var ErrAuthzServiceUnavailable = errors.New("authorization-svc unavailable")
@@ -67,14 +69,18 @@ func NewClientWithHTTPClient(baseURL string, httpClient *http.Client) *Client {
 	}
 }
 
-func (c *Client) CheckAllowed(ctx context.Context, principalID, legalEntityID, actionType string) error {
-	key := principalID + "|" + legalEntityID + "|" + actionType
+func (c *Client) CheckAllowed(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
+	// tenantID is part of the key, not just the request: authorization-svc
+	// scopes every grant by tenant, so two tenants asking the same
+	// (principal, entity, action) are two different questions and must not
+	// share one cached answer.
+	key := tenantID + "|" + principalID + "|" + legalEntityID + "|" + actionType
 
 	if decision, hit := c.lookupCache(key); hit {
 		return decision
 	}
 
-	err := c.checkAllowedLive(ctx, principalID, legalEntityID, actionType)
+	err := c.checkAllowedLive(ctx, tenantID, principalID, legalEntityID, actionType)
 
 	// Cache the decision itself (GRANTED or DENIED), never an unavailable
 	// outcome — see the doc comment on decisionCacheTTL.
@@ -124,8 +130,18 @@ func (c *Client) storeCache(key string, decision error) {
 }
 
 // checkAllowedLive is the real, uncached call to authorization-svc.
-func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+//
+// authorization-svc enforces the canonical input contract on /v1/authorize and
+// rejects the request with envelope_incomplete before evaluating anything if
+// any of the six headers below is absent. This call previously sent only
+// Content-Type, so every check failed the contract and — via the non-200 branch
+// further down — surfaced to operators as "authorization service unavailable"
+// while authorization-svc was healthy and answering. tenant_id belongs in the
+// body as well as the header: the header carries the isolation boundary, the
+// body names the tenant the decision is evaluated against.
+func (c *Client) checkAllowedLive(ctx context.Context, tenantID, principalID, legalEntityID, actionType string) error {
 	reqBody, _ := json.Marshal(map[string]string{
+		"tenant_id":       tenantID,
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
 		"action_type":     actionType,
@@ -135,6 +151,17 @@ func (c *Client) checkAllowedLive(ctx context.Context, principalID, legalEntityI
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+	// Fresh per call: X-Request-Id identifies this hop for tracing, and
+	// Idempotency-Key is mandatory on the endpoint (INV-08). An evaluation is
+	// a read, so reusing one key across calls would be wrong — each check is
+	// its own logged access decision.
+	req.Header.Set("X-Request-Id", uuid.NewString())
+	req.Header.Set("Idempotency-Key", uuid.NewString())
+	// This is a service-to-service call, not a user channel.
+	req.Header.Set("X-Source-Channel", "system")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return ErrAuthzServiceUnavailable

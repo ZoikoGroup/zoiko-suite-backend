@@ -20,6 +20,11 @@ import (
 type Store interface {
 	FindDueRetries(ctx context.Context, now time.Time, limit int) ([]domain.DueRetry, error)
 	ClaimRetry(ctx context.Context, id, tenantID string) (bool, error)
+	// The stranded-delivery pair. A notification left in flight — PENDING
+	// with nothing scheduled — is invisible to FindDueRetries and nothing
+	// else in the service would ever touch it again.
+	FindStrandedDeliveries(ctx context.Context, staleBefore time.Time, limit int) ([]domain.DueRetry, error)
+	ReviveStranded(ctx context.Context, id, tenantID string, staleBefore, nextAttemptAt time.Time) (bool, error)
 	GetNotification(ctx context.Context, id string) (*domain.Notification, error)
 	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
@@ -62,13 +67,21 @@ type Worker struct {
 	policy    Policy
 	interval  time.Duration
 	batchSize int
-	log       *zap.Logger
+	// strandedAfter is how long a notification may sit in flight before the
+	// sweep reclaims it. Zero disables the sweep.
+	strandedAfter time.Duration
+	log           *zap.Logger
 }
 
 type Options struct {
 	Interval  time.Duration
 	BatchSize int
 	Policy    Policy
+
+	// StrandedAfter defaults to 15 minutes when unset. Set it explicitly to
+	// zero to disable the sweep — see Worker.SweepStranded for why the
+	// default is far larger than the longest possible attempt.
+	StrandedAfter time.Duration
 }
 
 func NewWorker(store Store, deliverer Deliverer, publisher Publisher, recipient RecipientResolver, settled Settled, opts Options, log *zap.Logger) *Worker {
@@ -78,16 +91,23 @@ func NewWorker(store Store, deliverer Deliverer, publisher Publisher, recipient 
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 50
 	}
+	// Negative is read as "off", never as "sweep everything" — a duration
+	// that went negative through arithmetic must not turn into a sweep that
+	// reclaims live in-flight notifications.
+	if opts.StrandedAfter < 0 {
+		opts.StrandedAfter = 0
+	}
 	return &Worker{
-		store:     store,
-		deliverer: deliverer,
-		publisher: publisher,
-		recipient: recipient,
-		settled:   settled,
-		policy:    opts.Policy.Normalize(),
-		interval:  opts.Interval,
-		batchSize: opts.BatchSize,
-		log:       log,
+		store:         store,
+		deliverer:     deliverer,
+		publisher:     publisher,
+		recipient:     recipient,
+		settled:       settled,
+		policy:        opts.Policy.Normalize(),
+		interval:      opts.Interval,
+		batchSize:     opts.BatchSize,
+		strandedAfter: opts.StrandedAfter,
+		log:           log,
 	}
 }
 
@@ -98,7 +118,8 @@ func (w *Worker) Start(ctx context.Context) {
 	w.log.Info("delivery retry worker started",
 		zap.Duration("interval", w.interval),
 		zap.Int("batch_size", w.batchSize),
-		zap.Int("max_attempts", w.policy.MaxAttempts))
+		zap.Int("max_attempts", w.policy.MaxAttempts),
+		zap.Duration("stranded_after", w.strandedAfter))
 	for {
 		select {
 		case <-ctx.Done():
@@ -114,6 +135,12 @@ func (w *Worker) Start(ctx context.Context) {
 // attempted. Exported so a test can drive the worker deterministically instead
 // of waiting on a ticker.
 func (w *Worker) RunOnce(ctx context.Context) int {
+	// The sweep runs FIRST, so anything it reclaims is picked up by the due
+	// pass in this same tick rather than waiting a further interval. It only
+	// sets a schedule; the delivery itself always goes through the ordinary
+	// path below, so there is one code path that actually sends.
+	w.SweepStranded(ctx)
+
 	due, err := w.store.FindDueRetries(ctx, time.Now().UTC(), w.batchSize)
 	if err != nil {
 		w.log.Error("retry worker: failed to poll for due deliveries", zap.Error(err))
@@ -126,7 +153,9 @@ func (w *Worker) RunOnce(ctx context.Context) int {
 		case <-ctx.Done():
 			// Shutting down. Unclaimed rows keep their schedule and the next
 			// process to start picks them up; a claimed one is PENDING with
-			// nothing scheduled, which the sweep below is for.
+			// nothing scheduled, which SweepStranded reclaims — a sweep this
+			// comment asserted before one existed, which is how five
+			// notifications sat undelivered for six days.
 			return attempted
 		default:
 		}
@@ -135,6 +164,108 @@ func (w *Worker) RunOnce(ctx context.Context) int {
 		}
 	}
 	return attempted
+}
+
+// SweepStranded puts abandoned in-flight notifications back on the retry
+// schedule, and returns how many it reclaimed.
+//
+// THE GAP THIS CLOSES. PENDING with next_attempt_at NULL means "in flight
+// right now". Nothing moves such a row on its own — FindDueRetries requires a
+// schedule to be set — so a notification whose attempt never reported an
+// outcome stays there permanently: never delivered, never failed, never
+// retried, and displayed as PENDING, which reads as progress rather than as a
+// notice that silently never went out. Measured on the dev database
+// 2026-09-08: five of them from 2026-09-02, delivery_attempts = 0.
+//
+// RunOnce's own shutdown comment claimed "the sweep below" handled exactly
+// this. It did not exist. That is the whole of the defect: the failure mode
+// was understood and written down, and the remedy was never built.
+//
+// It only ever SCHEDULES. The delivery goes through the ordinary due path, so
+// there is one place that sends and one place that decides what an outcome
+// means. Reclaimed rows keep their attempt count, so a notification that had
+// already burned attempts does not get a fresh budget by being stranded — the
+// policy's ceiling still applies and the sweep cannot become an unbounded
+// resend loop.
+//
+// The duplicate-send hazard, stated plainly: a stranded row may or may not
+// have reached the provider before its attempt died, and nothing on the row
+// can distinguish those. Rescheduling therefore risks a second copy of a
+// notice; not rescheduling guarantees some governed notices are never sent at
+// all. The second is the worse failure for this service, so the sweep
+// reschedules — and the staleness threshold, which must exceed the longest
+// possible attempt, is what keeps the risk to the genuine-crash case. Rows
+// that recorded SENT are never touched.
+//
+// A zero threshold disables the sweep entirely rather than sweeping
+// everything, because "reclaim every in-flight notification immediately" is
+// the one setting that would reliably cause the duplicates above.
+func (w *Worker) SweepStranded(ctx context.Context) int {
+	if w.strandedAfter <= 0 {
+		return 0
+	}
+
+	now := time.Now().UTC()
+	staleBefore := now.Add(-w.strandedAfter)
+
+	stranded, err := w.store.FindStrandedDeliveries(ctx, staleBefore, w.batchSize)
+	if err != nil {
+		w.log.Error("retry worker: failed to sweep for stranded deliveries", zap.Error(err))
+		return 0
+	}
+	if len(stranded) == 0 {
+		return 0
+	}
+
+	revived := 0
+	for _, d := range stranded {
+		select {
+		case <-ctx.Done():
+			return revived
+		default:
+		}
+
+		// The notification's own tenant installed on the context, exactly as
+		// attempt does and exactly as a request would. The store also takes
+		// the tenant explicitly, so this is belt and braces — but the poll
+		// above is the one cross-tenant read in the service, and every write
+		// that follows it running under the tenant's own policy is the
+		// property that makes that hatch safe to have.
+		tctx := svcmiddleware.WithTenant(ctx, d.TenantID)
+
+		// Due immediately: it has already waited longer than any backoff this
+		// policy would impose, and the point is to stop it waiting.
+		ok, err := w.store.ReviveStranded(tctx, d.NotificationID, d.TenantID, staleBefore, now)
+		if err != nil {
+			// Logged per row and the loop continues: one tenant's failure
+			// must not strand the rest of the batch, which is the same
+			// property that made this bug survive in the first place.
+			w.log.Error("retry worker: could not revive stranded delivery",
+				zap.String("notification_id", d.NotificationID), zap.Error(err))
+			continue
+		}
+		if !ok {
+			// Another replica got it, or it concluded between the find and
+			// the write. Not an error — the row itself is the claim.
+			continue
+		}
+		revived++
+
+		// WARN, not Info. Every row here is a notification the platform
+		// accepted and then lost track of, so each one is a delivery that
+		// would never have happened; that is worth an operator's attention
+		// even though the sweep repairs it.
+		w.log.Warn("retry worker: reclaimed a stranded delivery",
+			zap.String("notification_id", d.NotificationID),
+			zap.Duration("stranded_after", w.strandedAfter))
+	}
+
+	if revived > 0 {
+		w.log.Warn("retry worker: stranded deliveries reclaimed",
+			zap.Int("count", revived),
+			zap.Int("found", len(stranded)))
+	}
+	return revived
 }
 
 // attempt re-delivers one notification. Returns whether an attempt was made.

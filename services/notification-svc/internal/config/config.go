@@ -89,6 +89,24 @@ type RetryConfig struct {
 	// how many it takes per poll.
 	Interval  time.Duration
 	BatchSize int
+
+	// StrandedAfter is how long a notification may sit in flight — PENDING
+	// with nothing scheduled — before the worker treats it as abandoned and
+	// puts it back on the schedule.
+	//
+	// It must exceed the longest attempt this service can make, or the sweep
+	// could reschedule a send another replica is still working on and the
+	// recipient gets the notice twice. The SMTP provider's own timeout
+	// defaults to 10s and the HTTP server's WriteTimeout is 15s, so a real
+	// attempt cannot outlive roughly 30 seconds; 15 minutes is generous
+	// headroom that still recovers a stranded notice the same hour rather
+	// than never.
+	//
+	// Zero disables the sweep and is a true off switch, not a "sweep
+	// everything immediately" — which is the dangerous reading of 0 here, and
+	// the reason it is handled explicitly rather than falling through to a
+	// default.
+	StrandedAfter time.Duration
 }
 
 // EmailConfig describes the outbound mail provider.
@@ -182,6 +200,14 @@ func Load() (*Config, error) {
 			MaxDelay:    envDuration("NOTIFICATION_RETRY_MAX_DELAY", 8*time.Minute),
 			Interval:    envDuration("NOTIFICATION_RETRY_INTERVAL", 10*time.Second),
 			BatchSize:   envInt("NOTIFICATION_RETRY_BATCH_SIZE", 50),
+			// Deliberately NOT gated on Enabled. Retry being switched off
+			// means "do not re-attempt a failed delivery", and the handler
+			// concludes those as FAILED so none of them sits in flight. A
+			// stranded row is a different thing — an attempt that never got
+			// to report any outcome at all — and abandoning it because
+			// retries are off would leave the exact silent non-delivery this
+			// sweep exists to end.
+			StrandedAfter: envDuration("NOTIFICATION_STRANDED_AFTER", 15*time.Minute),
 		},
 
 		AuthzMTLSEnabled:         env("AUTHZ_MTLS_ENABLED", "false") == "true",

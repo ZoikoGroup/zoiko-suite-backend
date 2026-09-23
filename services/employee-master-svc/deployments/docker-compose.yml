@@ -1,0 +1,104 @@
+# docker-compose.yml — limited, self-contained local stack for employee-master-svc
+#
+# Runs:
+#   postgres   — PostgreSQL 16. DB: employee_master. Applies both migrations
+#                (000001 initial schema, 000002 HR profile fields) on first boot.
+#   authz      — tiny fake authorization-svc answering POST /v1/authorize with
+#                GRANTED (see fake-authz/). Required because every employee
+#                endpoint fails closed without it; this service has no
+#                permit-all fallback.
+#   svc        — employee-master-svc, resource-limited (mem_limit 256m,
+#                cpus 0.5). HTTP on :8108.
+#
+# The service is run without a real Kafka broker: it publishes employee events
+# to a kafka.Writer that connects lazily, so a missing broker is a logged,
+# non-blocking publish failure — the DB write and the API response complete.
+#
+# RLS note: employees uses ENABLE ROW LEVEL SECURITY with an app.tenant_id
+# policy. Connecting as the postgres superuser bypasses RLS (superusers ignore
+# it), which is fine for a local dev run.
+#
+# Usage:
+#   docker compose up -d --build     # build & start in background
+#   docker compose logs -f svc       # tail service logs
+#   docker compose down -v           # stop and remove volumes
+#
+# Health probe: http://localhost:8108/healthz   (liveness)
+# Readiness:    http://localhost:8108/readyz    (requires a live DB pool)
+
+name: employee-stack
+
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: emp-postgres
+    ports:
+      - "5435:5432"
+    environment:
+      POSTGRES_DB: employee_master
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./migrations/000001_initial_schema.up.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+      - ./migrations/000002_hr_profile_fields.up.sql:/docker-entrypoint-initdb.d/002_hr_profile_fields.sql:ro
+      - emp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d employee_master"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Fake authorization-svc (GRANTED) ──────────────────────────────────────────
+  authz:
+    build:
+      context: ./fake-authz
+      dockerfile: Dockerfile
+    container_name: emp-fake-authz
+    image: fake-authz:local
+    environment:
+      PORT: "8089"
+
+  # ── employee-master-svc (resource-limited) ────────────────────────────────────
+  svc:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: employee-master-svc
+    image: employee-master-svc:local
+    mem_limit: 256m
+    cpus: "0.5"
+    ports:
+      - "8108:8108"
+    environment:
+      ENV: local
+      PORT: "8108"
+      # Postgres — superuser for the single-service local run; RLS is
+      # bypassed because superusers ignore it, which is fine here.
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: employee_master
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSLMODE: disable
+      # Point every read/write authz decision at the local GRANTED shim.
+      AUTHZ_SERVICE_URL: "http://authz:8089"
+      # No real Kafka for the limited run; publishes are logged no-ops.
+      KAFKA_BROKERS: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      authz:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/healthcheck", "http://localhost:8108/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: on-failure
+
+volumes:
+  emp_pgdata:
