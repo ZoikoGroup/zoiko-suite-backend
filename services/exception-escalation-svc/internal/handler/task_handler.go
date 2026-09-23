@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -39,10 +40,18 @@ func RegisterTaskRoutes(r chi.Router, h *Handler, taskStore store.TaskStore) {
 	})
 	r.Route("/v1/tasks", func(r chi.Router) {
 		r.Post("/", th.CreateTask)
+		r.Get("/", th.ListQueue)
 		r.Get("/{task_id}", th.GetTask)
 		r.Post("/{task_id}/assign", th.AssignTask)
 		r.Post("/{task_id}/start", th.StartTask)
 		r.Get("/{task_id}/history", th.GetTaskHistory)
+		r.Post("/{task_id}/block", th.BlockTask)
+		r.Post("/{task_id}/escalate", th.EscalateTask)
+		r.Post("/{task_id}/complete", th.CompleteTask)
+		r.Post("/{task_id}/reopen", th.ReopenTask)
+		r.Post("/{task_id}/cancel", th.CancelTask)
+		r.Get("/{task_id}/sla-state", th.GetSLAState)
+		r.Get("/{task_id}/linked-object-status", th.GetLinkedObjectStatus)
 	})
 }
 
@@ -273,6 +282,285 @@ func (h *taskHandler) StartTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, t)
+}
+
+type blockTaskRequest struct {
+	Reason string `json:"reason"`
+}
+
+// BlockTask — BIZ-05's own Block command.
+func (h *taskHandler) BlockTask(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req blockTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "reason is required")
+		return
+	}
+	taskID := chi.URLParam(r, "task_id")
+	existing, err := h.store.GetTask(r.Context(), taskID)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTaskManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	t, err := h.store.BlockTask(r.Context(), domain.BlockTaskParams{
+		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, Reason: req.Reason,
+	})
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+type escalateTaskRequest struct {
+	EscalatedToRole string `json:"escalated_to_role"`
+	Reason          string `json:"reason"`
+}
+
+// EscalateTask — BIZ-05's own Escalate command.
+func (h *taskHandler) EscalateTask(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req escalateTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.EscalatedToRole == "" || req.Reason == "" {
+		writeError(w, http.StatusBadRequest, "escalated_to_role and reason are required")
+		return
+	}
+	taskID := chi.URLParam(r, "task_id")
+	existing, err := h.store.GetTask(r.Context(), taskID)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTaskManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	t, err := h.store.EscalateTask(r.Context(), domain.EscalateTaskParams{
+		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID,
+		EscalatedToRole: req.EscalatedToRole, Reason: req.Reason,
+	})
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "task.escalated", CaseID: taskID, TenantID: t.TenantID, LegalEntityID: t.LegalEntityID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: t,
+	}); err != nil {
+		h.logger.Warn("failed to publish task.escalated event", zap.Error(err))
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+type completeTaskRequest struct {
+	CompletionNotes string `json:"completion_notes,omitempty"`
+}
+
+// CompleteTask — BIZ-05's own Complete command. Fetched (read-only)
+// BEFORE authorization and BEFORE the mutation, same
+// fetch-then-authorize-then-mutate discipline as every handler in this
+// platform. Completion/closure authority is meant to be configurable
+// per the doc — actionTaskClose (the same action CloseCase uses) gates
+// this, distinct from actionTaskManage's lighter assign/start/block/
+// escalate authority.
+func (h *taskHandler) CompleteTask(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req completeTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	taskID := chi.URLParam(r, "task_id")
+	existing, err := h.store.GetTask(r.Context(), taskID)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTaskClose); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	t, err := h.store.CompleteTask(r.Context(), domain.CompleteTaskParams{
+		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, CompletionNotes: req.CompletionNotes,
+	})
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "task.completed", CaseID: taskID, TenantID: t.TenantID, LegalEntityID: t.LegalEntityID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: t,
+	}); err != nil {
+		h.logger.Warn("failed to publish task.completed event", zap.Error(err))
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+type reopenTaskRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// ReopenTask — BIZ-05's own Reopen command.
+func (h *taskHandler) ReopenTask(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req reopenTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	taskID := chi.URLParam(r, "task_id")
+	existing, err := h.store.GetTask(r.Context(), taskID)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTaskManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	t, err := h.store.ReopenTask(r.Context(), domain.ReopenTaskParams{
+		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, Reason: req.Reason,
+	})
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.publisher.Publish(r.Context(), events.PublishParams{
+		EventType: "task.reopened", CaseID: taskID, TenantID: t.TenantID, LegalEntityID: t.LegalEntityID,
+		ActorID: principalID, CorrelationID: r.Header.Get("X-Correlation-ID"), Payload: t,
+	}); err != nil {
+		h.logger.Warn("failed to publish task.reopened event", zap.Error(err))
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+type cancelTaskRequest struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// CancelTask — BIZ-05's own Cancel command.
+func (h *taskHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	var req cancelTaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	taskID := chi.URLParam(r, "task_id")
+	existing, err := h.store.GetTask(r.Context(), taskID)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTaskManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	t, err := h.store.CancelTask(r.Context(), domain.CancelTaskParams{
+		TaskID: taskID, TenantID: middleware.GetTenantID(r.Context()), ActorPrincipalID: principalID, Reason: req.Reason,
+	})
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
+}
+
+// ListQueue — BIZ-05's own ListQueue query.
+func (h *taskHandler) ListQueue(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	legalEntityID := r.URL.Query().Get("legal_entity_id")
+	if legalEntityID == "" {
+		writeError(w, http.StatusBadRequest, "legal_entity_id is required")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, legalEntityID, actionTaskManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	limit, offset := 100, 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	tasks, err := h.store.ListQueue(r.Context(), domain.ListQueueParams{
+		TenantID: middleware.GetTenantID(r.Context()), LegalEntityID: legalEntityID,
+		AssignedToUser: r.URL.Query().Get("assigned_to_user"), AssignedToRole: r.URL.Query().Get("assigned_to_role"),
+		Status: r.URL.Query().Get("status"),
+	}, limit, offset)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	if tasks == nil {
+		tasks = []domain.Task{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"tasks": tasks, "total": len(tasks)})
+}
+
+// GetSLAState — BIZ-05's own GetSLAState query.
+func (h *taskHandler) GetSLAState(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "task_id")
+	state, err := h.store.GetSLAState(r.Context(), middleware.GetTenantID(r.Context()), taskID)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, state)
+}
+
+// GetLinkedObjectStatus — BIZ-05's own GetLinkedObjectStatus query.
+func (h *taskHandler) GetLinkedObjectStatus(w http.ResponseWriter, r *http.Request) {
+	taskID := chi.URLParam(r, "task_id")
+	status, err := h.store.GetLinkedObjectStatus(r.Context(), middleware.GetTenantID(r.Context()), taskID)
+	if err != nil {
+		h.writeTaskErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
 }
 
 // GetTaskHistory — BIZ-05's own GetHistory query.

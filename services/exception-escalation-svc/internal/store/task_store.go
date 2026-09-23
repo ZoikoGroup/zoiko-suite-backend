@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -25,6 +26,15 @@ type TaskStore interface {
 	AssignTask(ctx context.Context, p domain.AssignTaskParams) (*domain.Task, error)
 	StartTask(ctx context.Context, p domain.StartTaskParams) (*domain.Task, error)
 	GetTaskHistory(ctx context.Context, tenantID, taskID string) ([]domain.TaskTransition, error)
+
+	BlockTask(ctx context.Context, p domain.BlockTaskParams) (*domain.Task, error)
+	EscalateTask(ctx context.Context, p domain.EscalateTaskParams) (*domain.Task, error)
+	CompleteTask(ctx context.Context, p domain.CompleteTaskParams) (*domain.Task, error)
+	ReopenTask(ctx context.Context, p domain.ReopenTaskParams) (*domain.Task, error)
+	CancelTask(ctx context.Context, p domain.CancelTaskParams) (*domain.Task, error)
+	ListQueue(ctx context.Context, p domain.ListQueueParams, limit, offset int) ([]domain.Task, error)
+	GetSLAState(ctx context.Context, tenantID, taskID string) (*domain.SLAState, error)
+	GetLinkedObjectStatus(ctx context.Context, tenantID, taskID string) (*domain.LinkedObjectStatus, error)
 }
 
 func (s *PgStore) taskSetRLS(ctx context.Context, tx pgx.Tx) error {
@@ -127,6 +137,43 @@ func (s *PgStore) CloseCase(ctx context.Context, p domain.CloseCaseParams) (*dom
 	if err != nil {
 		return nil, err
 	}
+
+	// Decision, not a silent guess: the doc's command list names no
+	// task-level "Close" command (only CloseCase) even though the
+	// lifecycle diagram shows Completed -> Closed as its own step. Rather
+	// than invent an unnamed command, CLOSED is reached for a task only
+	// as this cascade: closing a case administratively closes every
+	// COMPLETED task that belongs to it. A task with no case, or one
+	// still short of COMPLETED when its case closes, never reaches
+	// CLOSED — it stays at whatever state it was actually in, which is
+	// the honest record of what happened, not a fabricated completion.
+	rows, err := tx.Query(ctx, `SELECT task_id, status FROM tasks WHERE case_id=$1 AND tenant_id=$2 AND status='COMPLETED' FOR UPDATE`, p.CaseID, p.TenantID)
+	if err != nil {
+		return nil, err
+	}
+	var completedTaskIDs []string
+	for rows.Next() {
+		var taskID, status string
+		if err := rows.Scan(&taskID, &status); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		completedTaskIDs = append(completedTaskIDs, taskID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	for _, taskID := range completedTaskIDs {
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET status='CLOSED', closed_by=$3, closed_at=now(), updated_at=now() WHERE task_id=$1 AND tenant_id=$2`,
+			taskID, p.TenantID, p.ActorPrincipalID); err != nil {
+			return nil, err
+		}
+		if err := recordTaskTransition(ctx, tx, taskID, p.TenantID, string(domain.TaskStatusCompleted), string(domain.TaskStatusClosed), p.ActorPrincipalID, "case closed"); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -300,4 +347,284 @@ func (s *PgStore) GetTaskHistory(ctx context.Context, tenantID, taskID string) (
 		out = append(out, tr)
 	}
 	return out, rows.Err()
+}
+
+// BlockTask — BIZ-05's own Block command. Valid from IN_PROGRESS only.
+func (s *PgStore) BlockTask(ctx context.Context, p domain.BlockTaskParams) (*domain.Task, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.taskSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	current, err := scanTask(tx.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE task_id=$1 AND tenant_id=$2 FOR UPDATE`, p.TaskID, p.TenantID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if current.Status != domain.TaskStatusInProgress {
+		return nil, domain.ErrTaskInvalidState
+	}
+	t, err := scanTask(tx.QueryRow(ctx, `
+		UPDATE tasks SET status='BLOCKED', blocked_reason=$3, updated_at=now()
+		WHERE task_id=$1 AND tenant_id=$2 RETURNING `+taskColumns,
+		p.TaskID, p.TenantID, p.Reason))
+	if err != nil {
+		return nil, err
+	}
+	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusBlocked), p.ActorPrincipalID, p.Reason); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// EscalateTask — BIZ-05's own Escalate command. Valid from IN_PROGRESS
+// or BLOCKED.
+func (s *PgStore) EscalateTask(ctx context.Context, p domain.EscalateTaskParams) (*domain.Task, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.taskSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	current, err := scanTask(tx.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE task_id=$1 AND tenant_id=$2 FOR UPDATE`, p.TaskID, p.TenantID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if current.Status != domain.TaskStatusInProgress && current.Status != domain.TaskStatusBlocked {
+		return nil, domain.ErrTaskInvalidState
+	}
+	t, err := scanTask(tx.QueryRow(ctx, `
+		UPDATE tasks SET status='ESCALATED', escalated_to_role=$3, escalated_at=now(), updated_at=now()
+		WHERE task_id=$1 AND tenant_id=$2 RETURNING `+taskColumns,
+		p.TaskID, p.TenantID, p.EscalatedToRole))
+	if err != nil {
+		return nil, err
+	}
+	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusEscalated), p.ActorPrincipalID, p.Reason); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// CompleteTask — BIZ-05's own Complete command. Valid from IN_PROGRESS,
+// BLOCKED, or ESCALATED — the doc names no separate "Unblock"/"Resolve
+// escalation" command, so Complete is the one path back to a concluded
+// state from any active working state.
+func (s *PgStore) CompleteTask(ctx context.Context, p domain.CompleteTaskParams) (*domain.Task, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.taskSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	current, err := scanTask(tx.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE task_id=$1 AND tenant_id=$2 FOR UPDATE`, p.TaskID, p.TenantID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch current.Status {
+	case domain.TaskStatusInProgress, domain.TaskStatusBlocked, domain.TaskStatusEscalated:
+	default:
+		return nil, domain.ErrTaskInvalidState
+	}
+	t, err := scanTask(tx.QueryRow(ctx, `
+		UPDATE tasks SET status='COMPLETED', completion_notes=$3, completed_at=now(), updated_at=now()
+		WHERE task_id=$1 AND tenant_id=$2 RETURNING `+taskColumns,
+		p.TaskID, p.TenantID, p.CompletionNotes))
+	if err != nil {
+		return nil, err
+	}
+	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusCompleted), p.ActorPrincipalID, p.CompletionNotes); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// ReopenTask — BIZ-05's own Reopen command, a governed transition back
+// into IN_PROGRESS from COMPLETED or CLOSED. Increments reopened_count
+// so how many times a task was reopened is itself part of its record,
+// not just visible via GetHistory.
+func (s *PgStore) ReopenTask(ctx context.Context, p domain.ReopenTaskParams) (*domain.Task, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.taskSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	current, err := scanTask(tx.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE task_id=$1 AND tenant_id=$2 FOR UPDATE`, p.TaskID, p.TenantID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if current.Status != domain.TaskStatusCompleted && current.Status != domain.TaskStatusClosed {
+		return nil, domain.ErrTaskInvalidState
+	}
+	t, err := scanTask(tx.QueryRow(ctx, `
+		UPDATE tasks SET status='IN_PROGRESS', reopened_count=reopened_count+1, completed_at=NULL, closed_at=NULL, updated_at=now()
+		WHERE task_id=$1 AND tenant_id=$2 RETURNING `+taskColumns,
+		p.TaskID, p.TenantID))
+	if err != nil {
+		return nil, err
+	}
+	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusInProgress), p.ActorPrincipalID, p.Reason); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// CancelTask — BIZ-05's own Cancel command. Valid from any non-terminal
+// state.
+func (s *PgStore) CancelTask(ctx context.Context, p domain.CancelTaskParams) (*domain.Task, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.taskSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	current, err := scanTask(tx.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE task_id=$1 AND tenant_id=$2 FOR UPDATE`, p.TaskID, p.TenantID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.ErrTaskNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch current.Status {
+	case domain.TaskStatusCompleted, domain.TaskStatusClosed, domain.TaskStatusCancelled:
+		return nil, domain.ErrTaskInvalidState
+	}
+	t, err := scanTask(tx.QueryRow(ctx, `
+		UPDATE tasks SET status='CANCELLED', cancel_reason=$3, cancelled_at=now(), updated_at=now()
+		WHERE task_id=$1 AND tenant_id=$2 RETURNING `+taskColumns,
+		p.TaskID, p.TenantID, p.Reason))
+	if err != nil {
+		return nil, err
+	}
+	if err := recordTaskTransition(ctx, tx, p.TaskID, p.TenantID, string(current.Status), string(domain.TaskStatusCancelled), p.ActorPrincipalID, p.Reason); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+// ListQueue — BIZ-05's own ListQueue query, the "my work"/team backlog
+// view.
+func (s *PgStore) ListQueue(ctx context.Context, p domain.ListQueueParams, limit, offset int) ([]domain.Task, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := s.taskSetRLS(ctx, tx); err != nil {
+		return nil, err
+	}
+	query := `SELECT ` + taskColumns + ` FROM tasks WHERE tenant_id=$1`
+	args := []any{p.TenantID}
+	if p.LegalEntityID != "" {
+		args = append(args, p.LegalEntityID)
+		query += fmt.Sprintf(" AND legal_entity_id=$%d", len(args))
+	}
+	if p.AssignedToUser != "" {
+		args = append(args, p.AssignedToUser)
+		query += fmt.Sprintf(" AND assigned_to_user=$%d", len(args))
+	}
+	if p.AssignedToRole != "" {
+		args = append(args, p.AssignedToRole)
+		query += fmt.Sprintf(" AND assigned_to_role=$%d", len(args))
+	}
+	if p.Status != "" {
+		args = append(args, p.Status)
+		query += fmt.Sprintf(" AND status=$%d", len(args))
+	}
+	// task_id breaks ties: created_at alone is not a total order.
+	query += " ORDER BY created_at DESC, task_id DESC"
+	args = append(args, limit)
+	query += fmt.Sprintf(" LIMIT $%d", len(args))
+	args = append(args, offset)
+	query += fmt.Sprintf(" OFFSET $%d", len(args))
+
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+// GetSLAState — BIZ-05's own GetSLAState query. See
+// domain.SLAState's own doc comment on why this is computed live rather
+// than via a background clock service.
+func (s *PgStore) GetSLAState(ctx context.Context, tenantID, taskID string) (*domain.SLAState, error) {
+	t, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	state := &domain.SLAState{TaskID: t.TaskID, SLADeadline: t.SLADeadline}
+	if t.SLADeadline == nil {
+		return state, nil
+	}
+	now := time.Now().UTC()
+	if now.After(*t.SLADeadline) {
+		state.Overdue = true
+		return state, nil
+	}
+	remaining := int64(t.SLADeadline.Sub(now).Seconds())
+	state.TimeRemainingSeconds = &remaining
+	return state, nil
+}
+
+// GetLinkedObjectStatus — BIZ-05's own GetLinkedObjectStatus query. See
+// domain.LinkedObjectStatus's own doc comment on why this is a
+// passthrough rather than a live cross-service lookup.
+func (s *PgStore) GetLinkedObjectStatus(ctx context.Context, tenantID, taskID string) (*domain.LinkedObjectStatus, error) {
+	t, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return &domain.LinkedObjectStatus{
+		TaskID: t.TaskID, LinkedObjectType: t.LinkedObjectType, LinkedObjectID: t.LinkedObjectID,
+		Tracked: false,
+		Note:    "BIZ-05 does not own linked-object state; this is the reference recorded on the task, not a live status lookup.",
+	}, nil
 }
