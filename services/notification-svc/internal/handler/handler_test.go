@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	htmltemplate "html/template"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -27,10 +28,11 @@ type stubStore struct {
 	lastFilter domain.ListFilter
 	scheduled  []scheduledRetry
 
-	templates   map[string]*domain.TemplateDefinition
-	versions    map[string]*domain.TemplateVersion
-	templateSeq int
-	versionSeq  int
+	templates                map[string]*domain.TemplateDefinition
+	versions                 map[string]*domain.TemplateVersion
+	templateSeq              int
+	versionSeq               int
+	getPublishedVersionCalls int
 }
 
 func newStubStore() *stubStore {
@@ -251,6 +253,7 @@ func (s *stubStore) PublishTemplate(_ context.Context, p domain.PublishVersionPa
 }
 
 func (s *stubStore) GetPublishedVersion(_ context.Context, templateID, locale string) (*domain.TemplateVersion, error) {
+	s.getPublishedVersionCalls++
 	for _, v := range s.versions {
 		if v.TemplateID == templateID && v.Locale == locale && v.Status == domain.TemplateVersionPublished {
 			return v, nil
@@ -294,7 +297,15 @@ func (s *stubStore) RenderPreview(_ context.Context, p domain.RenderPreviewParam
 	if len(missing) > 0 {
 		return nil, domain.ErrTemplateVariablesMissing{VersionID: p.VersionID, Missing: missing}
 	}
-	return &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: v.Content}, nil
+	tmpl, err := htmltemplate.New("preview").Parse(v.Content)
+	if err != nil {
+		return nil, domain.ErrTemplateContentInvalid
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, p.Variables); err != nil {
+		return nil, err
+	}
+	return &domain.RenderPreviewResult{VersionID: p.VersionID, RenderedContent: buf.String()}, nil
 }
 
 func (s *stubStore) CompareVersions(_ context.Context, versionIDA, versionIDB string) (*domain.CompareVersionsResult, error) {

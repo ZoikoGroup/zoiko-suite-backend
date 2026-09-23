@@ -227,15 +227,25 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A template renders subject and body; supplying both forms would leave it
-	// ambiguous which one the recipient actually got.
-	if req.Template != "" && (req.Subject != "" || req.Body != "") {
+	// A template (static catalogue OR governed BIZ-03 template) renders
+	// the body; supplying free-text alongside one would leave it
+	// ambiguous which content the recipient actually got. TemplateID and
+	// the static Template catalogue are themselves mutually exclusive for
+	// the same reason.
+	usingStaticTemplate := req.Template != ""
+	usingGovernedTemplate := req.TemplateID != ""
+	if usingStaticTemplate && usingGovernedTemplate {
 		writeError(w, http.StatusBadRequest, "conflicting_content",
-			"supply either template (with variables) or subject and body, not both")
+			"supply either template or template_id, not both")
+		return
+	}
+	if (usingStaticTemplate || usingGovernedTemplate) && req.Body != "" {
+		writeError(w, http.StatusBadRequest, "conflicting_content",
+			"supply either a template (with variables) or subject and body, not both")
 		return
 	}
 
-	if req.Template != "" {
+	if usingStaticTemplate {
 		subject, body, err := templates.Render(req.Template, req.Variables)
 		switch e := err.(type) {
 		case nil:
@@ -254,6 +264,17 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "template_render_failed", e.Error())
 			return
 		}
+	}
+
+	// A governed BIZ-03 template renders only the BODY — templates carry
+	// no subject field (a document/form template has no notion of one),
+	// so Subject is still required from the caller in this path, checked
+	// below alongside every other required field. The actual fetch+render
+	// happens further down, AFTER authorization — see that block's own
+	// comment on why it cannot happen here.
+	if usingGovernedTemplate && req.Locale == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "locale is required when template_id is set")
+		return
 	}
 
 	if req.RecipientPrincipalID == "" || req.LegalEntityID == "" || req.Channel == "" ||
@@ -303,6 +324,38 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionSend); err != nil {
 		h.writeAuthzErr(w, err)
 		return
+	}
+
+	// The governed-template fetch happens here, not earlier: GetPublishedVersion
+	// and RenderPreview touch real tenant data (a template's content is itself
+	// something a legal entity may not want disclosed to a caller who is not
+	// authorized to send for it), so it must not run before the actionSend
+	// authorization check above. This is the same fetch-then-authorize-then-use
+	// discipline as every mutating handler in this platform, applied to a read
+	// that also needs gating.
+	if usingGovernedTemplate {
+		published, err := h.store.GetPublishedVersion(r.Context(), req.TemplateID, req.Locale)
+		if err != nil {
+			h.handleTemplateError(w, err)
+			return
+		}
+		// A template published for a different legal entity than the one this
+		// notification is being sent under is refused rather than used — using
+		// it anyway would let a caller borrow another entity's approved wording
+		// under this send's own legal_entity_id.
+		if published.LegalEntityID != req.LegalEntityID {
+			writeError(w, http.StatusBadRequest, "template_legal_entity_mismatch",
+				"the published template belongs to a different legal_entity_id than this notification is being sent under")
+			return
+		}
+		rendered, err := h.store.RenderPreview(r.Context(), domain.RenderPreviewParams{
+			VersionID: published.VersionID, Variables: req.Variables,
+		})
+		if err != nil {
+			h.handleTemplateError(w, err)
+			return
+		}
+		req.Body = rendered.RenderedContent
 	}
 
 	correlationID := getCorrelationID(r)
