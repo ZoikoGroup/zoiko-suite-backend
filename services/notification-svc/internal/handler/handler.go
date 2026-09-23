@@ -15,8 +15,8 @@ import (
 
 	"zoiko.io/notification-svc/internal/domain"
 	"zoiko.io/notification-svc/internal/identity"
-	"zoiko.io/notification-svc/internal/retry"
 	svcmiddleware "zoiko.io/notification-svc/internal/middleware"
+	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/templates"
 )
 
@@ -28,6 +28,16 @@ type Store interface {
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
 	MarkRead(ctx context.Context, id, recipientPrincipalID string, readAt time.Time) error
 	CountUnread(ctx context.Context, recipientPrincipalID string) (int, error)
+
+	CreateTemplate(ctx context.Context, p domain.CreateTemplateParams) (*domain.TemplateDefinition, error)
+	GetTemplate(ctx context.Context, templateID string) (*domain.TemplateDefinition, error)
+	CreateVersion(ctx context.Context, p domain.CreateVersionParams) (*domain.TemplateVersion, error)
+	GetTemplateVersion(ctx context.Context, versionID string) (*domain.TemplateVersion, error)
+	ValidateTemplate(ctx context.Context, versionID string) (*domain.TemplateVersion, error)
+	ApproveTemplate(ctx context.Context, p domain.ApproveVersionParams) (*domain.TemplateVersion, error)
+	PublishTemplate(ctx context.Context, p domain.PublishVersionParams) (*domain.TemplateVersion, error)
+	GetPublishedVersion(ctx context.Context, templateID, locale string) (*domain.TemplateVersion, error)
+	RetireTemplate(ctx context.Context, p domain.RetireTemplateParams) (*domain.TemplateDefinition, error)
 }
 
 // RecipientResolver turns a principal into the contact endpoint a message is
@@ -39,6 +49,11 @@ type RecipientResolver interface {
 type Publisher interface {
 	PublishSent(ctx context.Context, correlationID string, n domain.Notification)
 	PublishFailed(ctx context.Context, correlationID string, n domain.Notification, reason string)
+
+	PublishTemplateCreated(ctx context.Context, correlationID string, d domain.TemplateDefinition)
+	PublishTemplateVersionApproved(ctx context.Context, correlationID string, v domain.TemplateVersion)
+	PublishTemplatePublished(ctx context.Context, correlationID string, v domain.TemplateVersion)
+	PublishTemplateRetired(ctx context.Context, correlationID string, d domain.TemplateDefinition)
 }
 
 type AuthZClient interface {
@@ -48,10 +63,19 @@ type AuthZClient interface {
 const (
 	actionSend = "NOTIFICATION_SEND"
 	actionView = "NOTIFICATION_VIEW"
+
+	// actionTemplateManage gates authorship: CreateTemplate, CreateVersion,
+	// ValidateTemplate. actionTemplateApprove gates the separate
+	// governance actor's actions: ApproveTemplate, PublishTemplate,
+	// RetireTemplate — the doc names two roles ("content owner" and
+	// "policy/domain approver"), and every post-authorship lifecycle
+	// transition belongs to the second one.
+	actionTemplateManage  = "TEMPLATE_MANAGE"
+	actionTemplateApprove = "TEMPLATE_APPROVE"
 )
 
 var supportedChannels = map[string]bool{
-	"EMAIL":   true,
+	"EMAIL": true,
 	// SMS is deliberately absent. The service used to accept it, resolve a
 	// recipient for it, and then fail every one — the only channel that
 	// advertised a capability the platform does not have. A caller now gets
@@ -144,6 +168,17 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		r.Get("/{id}", h.GetNotification)
 		r.Post("/{id}/read", h.MarkRead)
+	})
+
+	r.Route("/v1/document-templates", func(r chi.Router) {
+		r.Post("/", h.CreateTemplate)
+		r.Get("/{templateID}", h.GetTemplate)
+		r.Post("/{templateID}/versions", h.CreateVersion)
+		r.Get("/{templateID}/published", h.GetPublishedVersion)
+		r.Post("/{templateID}/retire", h.RetireTemplate)
+		r.Post("/versions/{versionID}/validate", h.ValidateTemplate)
+		r.Post("/versions/{versionID}/approve", h.ApproveTemplate)
+		r.Post("/versions/{versionID}/publish", h.PublishTemplate)
 	})
 }
 
@@ -628,6 +663,309 @@ func (h *Handler) UnreadCount(w http.ResponseWriter, r *http.Request) {
 		// observe, which is in-app notices nobody has opened.
 		"channel": domain.ChannelInApp,
 	})
+}
+
+// ── BIZ-03 Template ──────────────────────────────────────────────────────────
+
+type createTemplateRequest struct {
+	LegalEntityID   string `json:"legal_entity_id"`
+	Name            string `json:"name"`
+	BusinessPurpose string `json:"business_purpose"`
+}
+
+// CreateTemplate creates a new template definition — BIZ-03's own
+// CreateTemplate command. The caller becomes the owner.
+func (h *Handler) CreateTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req createTemplateRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.LegalEntityID == "" || req.Name == "" || req.BusinessPurpose == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "legal_entity_id, name and business_purpose are required")
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, req.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	tmpl, err := h.store.CreateTemplate(r.Context(), domain.CreateTemplateParams{
+		LegalEntityID: req.LegalEntityID, Name: req.Name, BusinessPurpose: req.BusinessPurpose, OwnerPrincipalID: principalID,
+	})
+	if err != nil {
+		h.log.Error("failed to create template", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+	h.publisher.PublishTemplateCreated(r.Context(), getCorrelationID(r), *tmpl)
+	writeJSON(w, http.StatusCreated, tmpl)
+}
+
+// GetTemplate — BIZ-03's own GetTemplate query.
+func (h *Handler) GetTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, tmpl)
+}
+
+type createVersionRequest struct {
+	Locale                string   `json:"locale"`
+	Content               string   `json:"content"`
+	VariableSchema        []string `json:"variable_schema,omitempty"`
+	BrandingMetadata      string   `json:"branding_metadata,omitempty"`
+	AccessibilityMetadata string   `json:"accessibility_metadata,omitempty"`
+}
+
+// CreateVersion — BIZ-03's own CreateVersion command. Lands DRAFT;
+// requires ValidateTemplate then ApproveTemplate then PublishTemplate
+// before it governs anything a caller can render.
+func (h *Handler) CreateVersion(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	var req createVersionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Locale == "" || req.Content == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "locale and content are required")
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.CreateVersion(r.Context(), domain.CreateVersionParams{
+		TemplateID: templateID, Locale: req.Locale, Content: req.Content, VariableSchema: req.VariableSchema,
+		BrandingMetadata: req.BrandingMetadata, AccessibilityMetadata: req.AccessibilityMetadata,
+		CreatedByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, version)
+}
+
+// ValidateTemplate — BIZ-03's own ValidateTemplate command. Moves a
+// DRAFT version to REVIEW once its content parses and a variable schema
+// is present.
+func (h *Handler) ValidateTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.ValidateTemplate(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
+}
+
+// ApproveTemplate — BIZ-03's own ApproveTemplate command. Fetched
+// (read-only) BEFORE authorization and BEFORE the mutation, same
+// fetch-then-authorize-then-mutate discipline as every other handler in
+// this platform, so a denied caller can never cause the approval to
+// actually run before being refused.
+func (h *Handler) ApproveTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateApprove); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.ApproveTemplate(r.Context(), domain.ApproveVersionParams{
+		VersionID: versionID, ApprovedByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	h.publisher.PublishTemplateVersionApproved(r.Context(), getCorrelationID(r), *version)
+	writeJSON(w, http.StatusOK, version)
+}
+
+// PublishTemplate — BIZ-03's own PublishTemplate command.
+func (h *Handler) PublishTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	versionID := chi.URLParam(r, "versionID")
+	existing, err := h.store.GetTemplateVersion(r.Context(), versionID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, existing.LegalEntityID, actionTemplateApprove); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.PublishTemplate(r.Context(), domain.PublishVersionParams{
+		VersionID: versionID, PublishedByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	h.publisher.PublishTemplatePublished(r.Context(), getCorrelationID(r), *version)
+	writeJSON(w, http.StatusOK, version)
+}
+
+// GetPublishedVersion — BIZ-03's own GetPublishedVersion query.
+func (h *Handler) GetPublishedVersion(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	locale := r.URL.Query().Get("locale")
+	if locale == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", "locale query parameter is required")
+		return
+	}
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateManage); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	version, err := h.store.GetPublishedVersion(r.Context(), templateID, locale)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, version)
+}
+
+// RetireTemplate — BIZ-03's own RetireTemplate command.
+func (h *Handler) RetireTemplate(w http.ResponseWriter, r *http.Request) {
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+	templateID := chi.URLParam(r, "templateID")
+	tmpl, err := h.store.GetTemplate(r.Context(), templateID)
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	if err := h.authz.CheckAllowed(r.Context(), principalID, tmpl.LegalEntityID, actionTemplateApprove); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	retired, err := h.store.RetireTemplate(r.Context(), domain.RetireTemplateParams{
+		TemplateID: templateID, RetiredByPrincipalID: principalID,
+	})
+	if err != nil {
+		h.handleTemplateError(w, err)
+		return
+	}
+	h.publisher.PublishTemplateRetired(r.Context(), getCorrelationID(r), *retired)
+	writeJSON(w, http.StatusOK, retired)
+}
+
+func (h *Handler) handleTemplateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, domain.ErrTemplateNotFound):
+		writeError(w, http.StatusNotFound, "template_not_found", "")
+	case errors.Is(err, domain.ErrTemplateVersionNotFound):
+		writeError(w, http.StatusNotFound, "template_version_not_found", "")
+	case errors.Is(err, domain.ErrTemplateRetired):
+		writeError(w, http.StatusConflict, "template_retired", err.Error())
+	case errors.Is(err, domain.ErrTemplateAlreadyRetired):
+		writeError(w, http.StatusConflict, "already_retired", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionNotDraft):
+		writeError(w, http.StatusConflict, "not_draft", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionNotReview):
+		writeError(w, http.StatusConflict, "not_review", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionNotApproved):
+		writeError(w, http.StatusConflict, "not_approved", err.Error())
+	case errors.Is(err, domain.ErrTemplateVersionSelfApproval):
+		writeError(w, http.StatusForbidden, "self_approval_forbidden", err.Error())
+	case errors.Is(err, domain.ErrTemplateContentInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_content", err.Error())
+	case errors.Is(err, domain.ErrTemplateLocaleRequired):
+		writeError(w, http.StatusBadRequest, "missing_fields", err.Error())
+	default:
+		h.log.Error("template store error", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "")
+	}
 }
 
 func (h *Handler) requirePrincipal(w http.ResponseWriter, r *http.Request) (string, bool) {

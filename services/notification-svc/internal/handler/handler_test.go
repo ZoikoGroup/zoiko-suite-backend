@@ -1,9 +1,10 @@
-﻿package handler_test
+package handler_test
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -25,12 +26,19 @@ type stubStore struct {
 	byCorr     map[string]string // correlation_id -> notification_id
 	lastFilter domain.ListFilter
 	scheduled  []scheduledRetry
+
+	templates   map[string]*domain.TemplateDefinition
+	versions    map[string]*domain.TemplateVersion
+	templateSeq int
+	versionSeq  int
 }
 
 func newStubStore() *stubStore {
 	return &stubStore{
-		byID:   make(map[string]*domain.Notification),
-		byCorr: make(map[string]string),
+		byID:      make(map[string]*domain.Notification),
+		byCorr:    make(map[string]string),
+		templates: make(map[string]*domain.TemplateDefinition),
+		versions:  make(map[string]*domain.TemplateVersion),
 	}
 }
 
@@ -134,13 +142,165 @@ func (s *stubStore) CountUnread(_ context.Context, recipientPrincipalID string) 
 	return count, nil
 }
 
+// ── stub template store ──────────────────────────────────────────────────────
+
+func (s *stubStore) CreateTemplate(_ context.Context, p domain.CreateTemplateParams) (*domain.TemplateDefinition, error) {
+	s.templateSeq++
+	d := &domain.TemplateDefinition{
+		TemplateID: fmt.Sprintf("template-%d", s.templateSeq), TenantID: "tenant-abc",
+		LegalEntityID: p.LegalEntityID, Name: p.Name, BusinessPurpose: p.BusinessPurpose,
+		OwnerPrincipalID: p.OwnerPrincipalID, Status: "ACTIVE", CreatedAt: time.Now().UTC(),
+	}
+	s.templates[d.TemplateID] = d
+	return d, nil
+}
+
+func (s *stubStore) GetTemplate(_ context.Context, templateID string) (*domain.TemplateDefinition, error) {
+	d, ok := s.templates[templateID]
+	if !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	return d, nil
+}
+
+func (s *stubStore) CreateVersion(_ context.Context, p domain.CreateVersionParams) (*domain.TemplateVersion, error) {
+	tmpl, ok := s.templates[p.TemplateID]
+	if !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	if tmpl.Status == "RETIRED" {
+		return nil, domain.ErrTemplateRetired
+	}
+	if p.Locale == "" {
+		return nil, domain.ErrTemplateLocaleRequired
+	}
+	s.versionSeq++
+	v := &domain.TemplateVersion{
+		VersionID: fmt.Sprintf("version-%d", s.versionSeq), TemplateID: p.TemplateID,
+		TenantID: "tenant-abc", LegalEntityID: tmpl.LegalEntityID, VersionNumber: s.versionSeq, Locale: p.Locale,
+		Content: p.Content, VariableSchema: p.VariableSchema, Status: domain.TemplateVersionDraft,
+		CreatedByPrincipalID: p.CreatedByPrincipalID, CreatedAt: time.Now().UTC(),
+	}
+	s.versions[v.VersionID] = v
+	return v, nil
+}
+
+func (s *stubStore) GetTemplateVersion(_ context.Context, versionID string) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[versionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	return v, nil
+}
+
+func (s *stubStore) ValidateTemplate(_ context.Context, versionID string) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[versionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if v.Status != domain.TemplateVersionDraft {
+		return nil, domain.ErrTemplateVersionNotDraft
+	}
+	if v.Content == "" {
+		return nil, domain.ErrTemplateContentInvalid
+	}
+	now := time.Now().UTC()
+	v.Status = domain.TemplateVersionReview
+	v.ValidatedAt = &now
+	return v, nil
+}
+
+func (s *stubStore) ApproveTemplate(_ context.Context, p domain.ApproveVersionParams) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[p.VersionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if v.CreatedByPrincipalID == p.ApprovedByPrincipalID {
+		return nil, domain.ErrTemplateVersionSelfApproval
+	}
+	if v.Status != domain.TemplateVersionReview {
+		return nil, domain.ErrTemplateVersionNotReview
+	}
+	now := time.Now().UTC()
+	v.Status = domain.TemplateVersionApproved
+	v.ApprovedByPrincipalID = &p.ApprovedByPrincipalID
+	v.ApprovedAt = &now
+	return v, nil
+}
+
+func (s *stubStore) PublishTemplate(_ context.Context, p domain.PublishVersionParams) (*domain.TemplateVersion, error) {
+	v, ok := s.versions[p.VersionID]
+	if !ok {
+		return nil, domain.ErrTemplateVersionNotFound
+	}
+	if v.Status != domain.TemplateVersionApproved {
+		return nil, domain.ErrTemplateVersionNotApproved
+	}
+	now := time.Now().UTC()
+	v.Status = domain.TemplateVersionPublished
+	v.PublishedAt = &now
+	for _, other := range s.versions {
+		if other.VersionID != v.VersionID && other.TemplateID == v.TemplateID &&
+			other.Locale == v.Locale && other.Status == domain.TemplateVersionPublished {
+			other.Status = domain.TemplateVersionSuperseded
+			id := v.VersionID
+			other.SupersededByVersionID = &id
+		}
+	}
+	return v, nil
+}
+
+func (s *stubStore) GetPublishedVersion(_ context.Context, templateID, locale string) (*domain.TemplateVersion, error) {
+	for _, v := range s.versions {
+		if v.TemplateID == templateID && v.Locale == locale && v.Status == domain.TemplateVersionPublished {
+			return v, nil
+		}
+	}
+	return nil, domain.ErrTemplateVersionNotFound
+}
+
+func (s *stubStore) RetireTemplate(_ context.Context, p domain.RetireTemplateParams) (*domain.TemplateDefinition, error) {
+	d, ok := s.templates[p.TemplateID]
+	if !ok {
+		return nil, domain.ErrTemplateNotFound
+	}
+	if d.Status == "RETIRED" {
+		return nil, domain.ErrTemplateAlreadyRetired
+	}
+	now := time.Now().UTC()
+	d.Status = "RETIRED"
+	d.RetiredAt = &now
+	d.RetiredByPrincipalID = &p.RetiredByPrincipalID
+	for _, v := range s.versions {
+		if v.TemplateID == p.TemplateID && v.Status == domain.TemplateVersionPublished {
+			v.Status = domain.TemplateVersionRetired
+			v.RetiredAt = &now
+		}
+	}
+	return d, nil
+}
+
 type stubPublisher struct {
-	sent, failed int
+	sent, failed                                                          int
+	templateCreated, templateApproved, templatePublished, templateRetired int
 }
 
 func (p *stubPublisher) PublishSent(_ context.Context, _ string, _ domain.Notification) { p.sent++ }
 func (p *stubPublisher) PublishFailed(_ context.Context, _ string, _ domain.Notification, _ string) {
 	p.failed++
+}
+
+func (p *stubPublisher) PublishTemplateCreated(_ context.Context, _ string, _ domain.TemplateDefinition) {
+	p.templateCreated++
+}
+func (p *stubPublisher) PublishTemplateVersionApproved(_ context.Context, _ string, _ domain.TemplateVersion) {
+	p.templateApproved++
+}
+func (p *stubPublisher) PublishTemplatePublished(_ context.Context, _ string, _ domain.TemplateVersion) {
+	p.templatePublished++
+}
+func (p *stubPublisher) PublishTemplateRetired(_ context.Context, _ string, _ domain.TemplateDefinition) {
+	p.templateRetired++
 }
 
 type stubAuthZ struct {
@@ -593,6 +753,222 @@ func TestSendNotification_UnknownField_IsRejected(t *testing.T) {
 	}, "principal-1")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for an unknown field, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// ── BIZ-03 Template tests ────────────────────────────────────────────────────
+
+func createTestTemplate(t *testing.T, r chi.Router, owner string) string {
+	t.Helper()
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/", map[string]any{
+		"legal_entity_id":  "le-us",
+		"name":             "Password Reset",
+		"business_purpose": "Notify a user their password was reset",
+	}, owner)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create template: expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var tmpl domain.TemplateDefinition
+	if err := json.Unmarshal(rr.Body.Bytes(), &tmpl); err != nil {
+		t.Fatalf("decode template: %v", err)
+	}
+	return tmpl.TemplateID
+}
+
+func createTestVersion(t *testing.T, r chi.Router, templateID, author string) string {
+	t.Helper()
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/versions", map[string]any{
+		"locale":          "en-US",
+		"content":         "<p>Hello {{.first_name}}</p>",
+		"variable_schema": []string{"first_name"},
+	}, author)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("create version: expected 201 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var v domain.TemplateVersion
+	if err := json.Unmarshal(rr.Body.Bytes(), &v); err != nil {
+		t.Fatalf("decode version: %v", err)
+	}
+	return v.VersionID
+}
+
+func TestCreateTemplate_Valid_Returns201(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	createTestTemplate(t, r, "owner-1")
+	if pub.templateCreated != 1 {
+		t.Fatalf("expected 1 TemplateCreated event, got %d", pub.templateCreated)
+	}
+}
+
+func TestCreateTemplate_MissingFields_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/", map[string]any{
+		"legal_entity_id": "le-us",
+	}, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", rr.Code)
+	}
+}
+
+func TestCreateVersion_UnknownTemplate_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/nope/versions", map[string]any{
+		"locale": "en-US", "content": "hi",
+	}, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestCreateVersion_RetiredTemplate_Returns409(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/retire", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("retire: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/versions", map[string]any{
+		"locale": "en-US", "content": "hi",
+	}, "owner-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestValidateTemplate_EmptyContent_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	// The stub's CreateVersion requires non-empty content at the handler
+	// boundary, so exercise the store-level validation directly via a
+	// version whose content is blanked out after creation is not possible
+	// through the HTTP surface — this proves the boundary check instead.
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/versions", map[string]any{
+		"locale": "en-US", "content": "",
+	}, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestApproveTemplate_SelfApproval_Returns403(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/validate", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("validate: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/approve", nil, "owner-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestApproveTemplate_NotReview_Returns409(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	versionID := createTestVersion(t, r, templateID, "owner-1")
+	// Never validated — still DRAFT.
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/approve", nil, "approver-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestPublishTemplate_ThenSupersedesPriorPublished(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+
+	versionID1 := createTestVersion(t, r, templateID, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID1+"/validate", nil, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID1+"/approve", nil, "approver-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID1+"/publish", nil, "approver-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first publish: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	versionID2 := createTestVersion(t, r, templateID, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID2+"/validate", nil, "owner-1")
+	doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID2+"/approve", nil, "approver-1")
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/versions/"+versionID2+"/publish", nil, "approver-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("second publish: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	rr = doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/published?locale=en-US", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get published: expected 200 got %d: %s", rr.Code, rr.Body.String())
+	}
+	var current domain.TemplateVersion
+	if err := json.Unmarshal(rr.Body.Bytes(), &current); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if current.VersionID != versionID2 {
+		t.Fatalf("expected the second version to be the current published one, got %s", current.VersionID)
+	}
+	if pub.templatePublished != 2 {
+		t.Fatalf("expected 2 TemplatePublished events, got %d", pub.templatePublished)
+	}
+}
+
+func TestGetPublishedVersion_MissingLocale_Returns400(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/published", nil, "owner-1")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 got %d", rr.Code)
+	}
+}
+
+func TestGetPublishedVersion_NoneYet_Returns404(t *testing.T) {
+	r := newRouter(newStubStore(), &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodGet, "/v1/document-templates/"+templateID+"/published?locale=en-US", nil, "owner-1")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rr.Code)
+	}
+}
+
+func TestRetireTemplate_AlreadyRetired_Returns409(t *testing.T) {
+	pub := &stubPublisher{}
+	r := newRouter(newStubStore(), pub, &stubAuthZ{})
+	templateID := createTestTemplate(t, r, "owner-1")
+	rr := doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/retire", nil, "owner-1")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first retire: expected 200 got %d", rr.Code)
+	}
+	rr = doReq(r, http.MethodPost, "/v1/document-templates/"+templateID+"/retire", nil, "owner-1")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("expected 409 got %d", rr.Code)
+	}
+	if pub.templateRetired != 1 {
+		t.Fatalf("expected 1 TemplateRetired event, got %d", pub.templateRetired)
+	}
+}
+
+// Two routers share the same store: one with permissive authz sets up a
+// validated version, a second with denying authz attempts the approve —
+// proving the mutation is refused rather than the setup itself being
+// blocked by the same denial.
+func TestApproveTemplate_AuthzDenied_Returns403(t *testing.T) {
+	store := newStubStore()
+	setupRouter := newRouter(store, &stubPublisher{}, &stubAuthZ{})
+	templateID := createTestTemplate(t, setupRouter, "owner-1")
+	versionID := createTestVersion(t, setupRouter, templateID, "owner-1")
+	doReq(setupRouter, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/validate", nil, "owner-1")
+
+	denyingAuthz := &stubAuthZ{err: domain.ErrAuthorizationDenied}
+	denyRouter := newRouter(store, &stubPublisher{}, denyingAuthz)
+	rr := doReq(denyRouter, http.MethodPost, "/v1/document-templates/versions/"+versionID+"/approve", nil, "approver-1")
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d: %s", rr.Code, rr.Body.String())
+	}
+	if len(denyingAuthz.calls) != 1 || denyingAuthz.calls[0] != "TEMPLATE_APPROVE" {
+		t.Errorf("expected one TEMPLATE_APPROVE check, got %v", denyingAuthz.calls)
 	}
 }
 
