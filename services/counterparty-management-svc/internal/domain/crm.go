@@ -204,13 +204,73 @@ type UpdateStageParams struct {
 	Reason                                    string
 }
 
+// CloseOpportunityParams — Won is the caller's declared outcome: true
+// moves the final stage to CLOSED_WON, false to CLOSED_LOST. The doc's
+// own failure semantics apply here too: this never touches AR/GL —
+// opportunity value never feeds certified revenue automatically, and no
+// code in this wave calls any accounting service.
+type CloseOpportunityParams struct {
+	OpportunityID, TenantID, ActorPrincipalID, Reason string
+	Won                                               bool
+}
+
+// ActivateRelationshipParams / MarkDormantParams / CloseRelationshipParams
+// are gap-fills; see this file's own doc comment.
+type ActivateRelationshipParams struct {
+	RelationshipID, TenantID, ActorPrincipalID string
+}
+
+type MarkDormantParams struct {
+	RelationshipID, TenantID, ActorPrincipalID, Reason string
+}
+
+type CloseRelationshipParams struct {
+	RelationshipID, TenantID, ActorPrincipalID, ClosureReason string
+}
+
+// MergeCRMProfileParams — BIZ-06's own MergeCRMProfile command. Source
+// is the duplicate being retired; Target is the survivor, and Source is
+// forward-linked via MergedIntoRelationshipID exactly once — same
+// pattern as document-vault-svc's SupersedeClassification. Opportunities
+// are reparented onto Target directly (no append-only guard on that
+// table). Interactions/consent records/commercial-object-links are
+// append-only evidence and are never physically reparented — they stay
+// on Source, and every read of Target's children (GetTimeline,
+// GetLinkedFinancialObjects, GetConsentContext) walks the merge chain to
+// include them.
+type MergeCRMProfileParams struct {
+	SourceRelationshipID, TargetRelationshipID, TenantID, ActorPrincipalID string
+}
+
+// LinkCommercialObjectParams — BIZ-06's own LinkCommercialObject
+// command. LinkedObjectType/LinkedObjectID are opaque, cross-service —
+// no FK, same posture as document-vault-svc's document_links.
+type LinkCommercialObjectParams struct {
+	RelationshipID, TenantID, LinkedObjectType, LinkedObjectID, LinkedByPrincipalID string
+}
+
+// RecordConsentParams — a gap-fill; see this file's own doc comment.
+type RecordConsentParams struct {
+	RelationshipID, TenantID, ConsentType, Basis, RecordedByPrincipalID string
+	ConsentStatus                                                       ConsentStatus
+}
+
+// ListPipelineParams filters ListPipeline's read — the open-opportunity
+// pipeline view for one legal entity.
+type ListPipelineParams struct {
+	TenantID, LegalEntityID, Stage, OwnerPrincipalID string
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var (
-	ErrRelationshipNotFound     = errors.New("relationship not found")
-	ErrRelationshipInvalidState = errors.New("relationship is not in a state that permits this action")
-	ErrOpportunityNotFound      = errors.New("opportunity not found")
-	ErrOpportunityInvalidState  = errors.New("opportunity is not in a state that permits this action")
-	ErrPartyLinkNotCandidate    = errors.New("relationship has no candidate party link to confirm")
-	ErrInvalidStage             = errors.New("invalid opportunity stage")
+	ErrRelationshipNotFound      = errors.New("relationship not found")
+	ErrRelationshipInvalidState  = errors.New("relationship is not in a state that permits this action")
+	ErrOpportunityNotFound       = errors.New("opportunity not found")
+	ErrOpportunityInvalidState   = errors.New("opportunity is not in a state that permits this action")
+	ErrPartyLinkNotCandidate     = errors.New("relationship has no candidate party link to confirm")
+	ErrInvalidStage              = errors.New("invalid opportunity stage")
+	ErrRelationshipAlreadyMerged = errors.New("relationship has already been merged into another relationship")
+	ErrCannotMergeIntoSelf       = errors.New("a relationship cannot be merged into itself")
+	ErrInvalidConsentStatus      = errors.New("consent_status must be GRANTED or WITHDRAWN")
 )
