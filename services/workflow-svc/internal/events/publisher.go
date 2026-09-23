@@ -132,6 +132,42 @@ func (p *Publisher) PublishAuditEngagementEvent(ctx context.Context, eventType s
 	})
 }
 
+// PublishFormEvent backs BIZ-04's submission events — SubmissionReceived,
+// SubmissionValidated, SubmissionRejected, SubmissionRouted — same
+// generic-per-domain-emitter shape as PublishAuditEngagementEvent above.
+// FormPublished is a FormDefinition event, published separately via
+// PublishFormPublished below.
+func (p *Publisher) PublishFormEvent(ctx context.Context, eventType string, s domain.FormSubmission, actorID, correlationID string) error {
+	switch eventType {
+	case "form.submission.received", "form.submission.validated", "form.submission.rejected", "form.submission.routed":
+	default:
+		return fmt.Errorf("form: unsupported event type %q", eventType)
+	}
+	return p.emit(ctx, eventType, correlationID, s.TenantID, s.LegalEntityID, actorID, map[string]any{
+		"submission_id":      s.SubmissionID,
+		"form_id":            s.FormID,
+		"tenant_id":          s.TenantID,
+		"legal_entity_id":    s.LegalEntityID,
+		"form_version":       s.FormVersion,
+		"status":             s.Status,
+		"actor_principal_id": actorID,
+	})
+}
+
+// PublishFormPublished backs the one BIZ-04 event that has no
+// FormSubmission to source — FormPublished is a FormDefinition event.
+func (p *Publisher) PublishFormPublished(ctx context.Context, f domain.FormDefinition, actorID, correlationID string) error {
+	return p.emit(ctx, "form.published", correlationID, f.TenantID, f.LegalEntityID, actorID, map[string]any{
+		"form_id":            f.FormID,
+		"tenant_id":          f.TenantID,
+		"legal_entity_id":    f.LegalEntityID,
+		"name":               f.Name,
+		"target_domain":      f.TargetDomain,
+		"version":            f.Version,
+		"actor_principal_id": actorID,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {

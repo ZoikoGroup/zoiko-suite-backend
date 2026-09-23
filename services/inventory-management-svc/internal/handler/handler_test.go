@@ -46,6 +46,11 @@ type stubStore struct {
 	stockCounts         map[string]*domain.StockCount
 	stockCountLocations map[string][]string // count_id -> location_ids
 	countLines          map[string]*domain.StockCountLine
+
+	offerings        map[string]*domain.Offering
+	offeringVersions map[string]*domain.OfferingVersion
+	variants         map[string][]domain.CatalogVariant // version_id -> variants
+	mappings         map[string][]domain.CatalogMapping // version_id -> mappings
 }
 
 func newStubStore() *stubStore {
@@ -65,7 +70,178 @@ func newStubStore() *stubStore {
 		entriesByMovement:   make(map[string]string),
 		valuationRuns:       make(map[string]*domain.ValuationRun),
 		writeDowns:          make(map[string]*domain.WriteDown),
+		offerings:           make(map[string]*domain.Offering),
+		offeringVersions:    make(map[string]*domain.OfferingVersion),
+		variants:            make(map[string][]domain.CatalogVariant),
+		mappings:            make(map[string][]domain.CatalogMapping),
 	}
+}
+
+// ── BIZ-07 (Product & Service Catalog) ───────────────────────────────────────
+
+func (s *stubStore) CreateOffering(_ context.Context, o *domain.Offering, v *domain.OfferingVersion, variants []domain.CatalogVariantInput) error {
+	for _, existing := range s.offerings {
+		if existing.LegalEntityID == o.LegalEntityID && existing.SKUCode == o.SKUCode {
+			return domain.ErrDuplicateOfferingSKU
+		}
+	}
+	s.offerings[o.OfferingID] = o
+	s.offeringVersions[v.VersionID] = v
+	for _, vi := range variants {
+		s.variants[v.VersionID] = append(s.variants[v.VersionID], domain.CatalogVariant{VariantID: vi.VariantCode, VersionID: v.VersionID, VariantCode: vi.VariantCode, VariantName: vi.VariantName})
+	}
+	return nil
+}
+
+func (s *stubStore) GetOffering(_ context.Context, offeringID string) (*domain.Offering, error) {
+	o, ok := s.offerings[offeringID]
+	if !ok {
+		return nil, domain.ErrOfferingNotFound
+	}
+	return o, nil
+}
+
+func (s *stubStore) GetOfferingVersion(_ context.Context, versionID string) (*domain.OfferingVersion, error) {
+	v, ok := s.offeringVersions[versionID]
+	if !ok {
+		return nil, domain.ErrOfferingVersionNotFound
+	}
+	return v, nil
+}
+
+func (s *stubStore) GetCurrentOfferingVersion(_ context.Context, offeringID string) (*domain.OfferingVersion, error) {
+	var best *domain.OfferingVersion
+	priority := func(status string) int {
+		switch status {
+		case domain.CatalogVersionStatusActive:
+			return 0
+		case domain.CatalogVersionStatusApproved:
+			return 1
+		case domain.CatalogVersionStatusDraft:
+			return 2
+		default:
+			return 3
+		}
+	}
+	for _, v := range s.offeringVersions {
+		if v.OfferingID != offeringID {
+			continue
+		}
+		if best == nil || priority(v.Status) < priority(best.Status) || (priority(v.Status) == priority(best.Status) && v.VersionNumber > best.VersionNumber) {
+			best = v
+		}
+	}
+	if best == nil {
+		return nil, domain.ErrOfferingVersionNotFound
+	}
+	return best, nil
+}
+
+func (s *stubStore) CreateVersion(_ context.Context, v *domain.OfferingVersion, variants []domain.CatalogVariantInput) error {
+	if _, ok := s.offerings[v.OfferingID]; !ok {
+		return domain.ErrOfferingNotFound
+	}
+	maxVersion := 0
+	for _, existing := range s.offeringVersions {
+		if existing.OfferingID == v.OfferingID && existing.VersionNumber > maxVersion {
+			maxVersion = existing.VersionNumber
+		}
+	}
+	v.VersionNumber = maxVersion + 1
+	s.offeringVersions[v.VersionID] = v
+	for _, vi := range variants {
+		s.variants[v.VersionID] = append(s.variants[v.VersionID], domain.CatalogVariant{VariantID: vi.VariantCode, VersionID: v.VersionID, VariantCode: vi.VariantCode, VariantName: vi.VariantName})
+	}
+	return nil
+}
+
+func (s *stubStore) ApproveOfferingVersion(_ context.Context, versionID, principalID string, at time.Time) error {
+	v, ok := s.offeringVersions[versionID]
+	if !ok || v.Status != domain.CatalogVersionStatusDraft {
+		return domain.ErrInvalidCatalogVersionTransition
+	}
+	v.Status, v.ApprovedAt, v.ApprovedByPrincipalID = domain.CatalogVersionStatusApproved, &at, &principalID
+	return nil
+}
+
+func (s *stubStore) ActivateOfferingVersion(_ context.Context, offeringID, versionID, principalID string, at time.Time) (*string, error) {
+	v, ok := s.offeringVersions[versionID]
+	if !ok || v.Status != domain.CatalogVersionStatusApproved {
+		return nil, domain.ErrInvalidCatalogVersionTransition
+	}
+	v.Status, v.ActivatedAt, v.ActivatedByPrincipalID = domain.CatalogVersionStatusActive, &at, &principalID
+	var supersededID *string
+	for id, other := range s.offeringVersions {
+		if other.OfferingID == offeringID && id != versionID && other.Status == domain.CatalogVersionStatusActive {
+			other.Status, other.SupersededAt = domain.CatalogVersionStatusSuperseded, &at
+			supersededID = &id
+		}
+	}
+	return supersededID, nil
+}
+
+func (s *stubStore) SuspendOfferingVersion(_ context.Context, versionID, principalID, reason string, at time.Time) error {
+	v, ok := s.offeringVersions[versionID]
+	if !ok || v.Status != domain.CatalogVersionStatusActive {
+		return domain.ErrInvalidCatalogVersionTransition
+	}
+	v.Status, v.SuspendedAt, v.SuspendedByPrincipalID, v.SuspensionReason = domain.CatalogVersionStatusSuspended, &at, &principalID, &reason
+	return nil
+}
+
+func (s *stubStore) RetireOfferingVersion(_ context.Context, versionID, principalID, reason string, at time.Time) error {
+	v, ok := s.offeringVersions[versionID]
+	if !ok || (v.Status != domain.CatalogVersionStatusActive && v.Status != domain.CatalogVersionStatusSuspended) {
+		return domain.ErrInvalidCatalogVersionTransition
+	}
+	v.Status, v.RetiredAt, v.RetiredByPrincipalID, v.RetirementReason = domain.CatalogVersionStatusRetired, &at, &principalID, &reason
+	return nil
+}
+
+func (s *stubStore) GetVersionAsOf(_ context.Context, offeringID string, at time.Time) (*domain.OfferingVersion, error) {
+	for _, v := range s.offeringVersions {
+		if v.OfferingID != offeringID || v.ActivatedAt == nil || v.ActivatedAt.After(at) {
+			continue
+		}
+		if v.SupersededAt != nil && !v.SupersededAt.After(at) {
+			continue
+		}
+		if v.RetiredAt != nil && !v.RetiredAt.After(at) {
+			continue
+		}
+		return v, nil
+	}
+	return nil, domain.ErrCatalogVersionInvalid
+}
+
+func (s *stubStore) SearchCatalog(_ context.Context, legalEntityID, category string) ([]domain.Offering, error) {
+	var out []domain.Offering
+	for _, o := range s.offerings {
+		if o.LegalEntityID != legalEntityID {
+			continue
+		}
+		if category != "" && o.Category != category {
+			continue
+		}
+		out = append(out, *o)
+	}
+	return out, nil
+}
+
+func (s *stubStore) ListVariants(_ context.Context, versionID string) ([]domain.CatalogVariant, error) {
+	return s.variants[versionID], nil
+}
+
+func (s *stubStore) LinkMapping(_ context.Context, m *domain.CatalogMapping) error {
+	if _, ok := s.offeringVersions[m.VersionID]; !ok {
+		return domain.ErrOfferingVersionNotFound
+	}
+	s.mappings[m.VersionID] = append(s.mappings[m.VersionID], *m)
+	return nil
+}
+
+func (s *stubStore) GetMappings(_ context.Context, versionID string) ([]domain.CatalogMapping, error) {
+	return s.mappings[versionID], nil
 }
 
 // ── INV-04 (Inventory Valuation) ─────────────────────────────────────────────
@@ -1125,6 +1301,24 @@ func (p *stubPublisher) PublishStockCountVarianceDetected(_ context.Context, _, 
 	p.calls++
 }
 func (p *stubPublisher) PublishStockCountCertified(_ context.Context, _, _, _ string, _ domain.StockCount) {
+	p.calls++
+}
+
+// ── BIZ-07 (Product & Service Catalog) ───────────────────────────────────────
+
+func (p *stubPublisher) PublishOfferingCreated(_ context.Context, _, _ string, _ domain.Offering, _ domain.OfferingVersion) {
+	p.calls++
+}
+func (p *stubPublisher) PublishOfferingActivated(_ context.Context, _, _, _, _ string, _ domain.OfferingVersion) {
+	p.calls++
+}
+func (p *stubPublisher) PublishOfferingSuspended(_ context.Context, _, _, _, _ string, _ domain.OfferingVersion) {
+	p.calls++
+}
+func (p *stubPublisher) PublishOfferingRetired(_ context.Context, _, _, _, _ string, _ domain.OfferingVersion) {
+	p.calls++
+}
+func (p *stubPublisher) PublishOfferingVersionSuperseded(_ context.Context, _, _, _, _, _, _ string) {
 	p.calls++
 }
 

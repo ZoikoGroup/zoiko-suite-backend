@@ -6,9 +6,9 @@ import (
 	"errors"
 	"net/url"
 	"os"
-	"sort"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,6 +43,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	_, filename, _, _ := runtime.Caller(0)
 	base := filepath.Dir(filename)
 
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS template_versions CASCADE;`)
+	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS template_definitions CASCADE;`)
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS notifications CASCADE;`)
 
 	// Every migration, in order — discovered, not listed.

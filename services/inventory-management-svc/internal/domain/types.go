@@ -763,3 +763,167 @@ var (
 
 	ErrNoVarianceApprovedLines = errorString("no variance-approved lines were found to generate adjustments for")
 )
+
+// ── BIZ-07 Product & Service Catalog ────────────────────────────────────────
+//
+// From ZoikoSuite_Business_Operations_Content_Services_Detailed_Service_Specifications_v1_0.docx.
+// Bolted on as a sixth domain beside INV-01..INV-05 — inventory_items'
+// own CatalogItemID/LinkCommercialCatalogItemRequest (above) already
+// anticipates exactly this authority as an external reference it does
+// not own. See migration 000006's own doc comment for the full
+// state-model design decision and negative-path enforcement.
+//
+// Authoritative ownership (verbatim): "tenant/business offering
+// identity, descriptions, variants, units, eligibility/operational
+// attributes and version lifecycle." Explicitly NOT ZoikoSuite's own
+// SaaS price book — that is COM-01, owned by commercial-account-svc;
+// bolting this onto commercial-account-svc instead would have blurred
+// exactly the boundary the doc calls out by name.
+
+const (
+	CatalogVersionStatusDraft      = "DRAFT"
+	CatalogVersionStatusApproved   = "APPROVED"
+	CatalogVersionStatusActive     = "ACTIVE"
+	CatalogVersionStatusSuspended  = "SUSPENDED"
+	CatalogVersionStatusRetired    = "RETIRED"
+	CatalogVersionStatusSuperseded = "SUPERSEDED"
+)
+
+const (
+	CatalogMappingTax        = "TAX"
+	CatalogMappingAccounting = "ACCOUNTING"
+	CatalogMappingProduct    = "PRODUCT"
+)
+
+func ValidCatalogMappingType(t string) bool {
+	switch t {
+	case CatalogMappingTax, CatalogMappingAccounting, CatalogMappingProduct:
+		return true
+	}
+	return false
+}
+
+// Offering is BIZ-07's own stable identity — CreateOffering's own
+// authority. It carries no lifecycle status of its own; every named
+// state transition belongs to OfferingVersion instead (see migration
+// 000006's doc comment).
+type Offering struct {
+	OfferingID           string    `json:"offering_id"`
+	TenantID             string    `json:"tenant_id"`
+	LegalEntityID        string    `json:"legal_entity_id"`
+	SKUCode              string    `json:"sku_code"`
+	Category             string    `json:"category"`
+	OwnerPrincipalID     string    `json:"owner_principal_id"`
+	CreatedAt            time.Time `json:"created_at"`
+	CreatedByPrincipalID string    `json:"created_by_principal_id"`
+}
+
+// OfferingVersion is BIZ-07's own pinned content + lifecycle authority —
+// "descriptions, variants, units, eligibility/operational attributes and
+// version lifecycle." Description/Unit/AvailabilityRules are set once at
+// CreateVersion and never mutated (enforced by
+// reject_catalog_version_content_mutation) — this is the real mechanism
+// behind the doc's own invariant, "product/service offering versions
+// used by transactions SHALL be pinned; later catalog edits SHALL NOT
+// rewrite historical transaction meaning."
+type OfferingVersion struct {
+	VersionID              string     `json:"version_id"`
+	TenantID               string     `json:"tenant_id"`
+	OfferingID             string     `json:"offering_id"`
+	VersionNumber          int        `json:"version_number"`
+	Description            string     `json:"description"`
+	Unit                   string     `json:"unit"`
+	AvailabilityRules      string     `json:"availability_rules,omitempty"`
+	Status                 string     `json:"status"`
+	CreatedAt              time.Time  `json:"created_at"`
+	CreatedByPrincipalID   string     `json:"created_by_principal_id"`
+	ApprovedAt             *time.Time `json:"approved_at,omitempty"`
+	ApprovedByPrincipalID  *string    `json:"approved_by_principal_id,omitempty"`
+	ActivatedAt            *time.Time `json:"activated_at,omitempty"`
+	ActivatedByPrincipalID *string    `json:"activated_by_principal_id,omitempty"`
+	SuspendedAt            *time.Time `json:"suspended_at,omitempty"`
+	SuspendedByPrincipalID *string    `json:"suspended_by_principal_id,omitempty"`
+	SuspensionReason       *string    `json:"suspension_reason,omitempty"`
+	RetiredAt              *time.Time `json:"retired_at,omitempty"`
+	RetiredByPrincipalID   *string    `json:"retired_by_principal_id,omitempty"`
+	RetirementReason       *string    `json:"retirement_reason,omitempty"`
+	SupersededAt           *time.Time `json:"superseded_at,omitempty"`
+
+	Variants []CatalogVariant `json:"variants,omitempty"`
+}
+
+// CatalogVariant is the spec's own "variants" input — one row per
+// declared variant, part of its version's own pinned content.
+type CatalogVariant struct {
+	VariantID   string `json:"variant_id"`
+	VersionID   string `json:"version_id"`
+	VariantCode string `json:"variant_code"`
+	VariantName string `json:"variant_name"`
+}
+
+// CatalogMapping is LinkMapping's own authority — "linked tax/accounting/
+// product mappings," scoped to a version for the same pinning reason as
+// everything else here.
+type CatalogMapping struct {
+	MappingID           string    `json:"mapping_id"`
+	VersionID           string    `json:"version_id"`
+	MappingType         string    `json:"mapping_type"`
+	MappingRef          string    `json:"mapping_ref"`
+	LinkedAt            time.Time `json:"linked_at"`
+	LinkedByPrincipalID string    `json:"linked_by_principal_id"`
+}
+
+// ── Request types ────────────────────────────────────────────────────────
+
+type CatalogVariantInput struct {
+	VariantCode string `json:"variant_code"`
+	VariantName string `json:"variant_name"`
+}
+
+type CreateOfferingRequest struct {
+	LegalEntityID     string                `json:"legal_entity_id"`
+	SKUCode           string                `json:"sku_code"`
+	Category          string                `json:"category"`
+	OwnerPrincipalID  string                `json:"owner_principal_id"`
+	Description       string                `json:"description"`
+	Unit              string                `json:"unit"`
+	AvailabilityRules string                `json:"availability_rules,omitempty"`
+	Variants          []CatalogVariantInput `json:"variants,omitempty"`
+}
+
+type CreateVersionRequest struct {
+	Description       string                `json:"description"`
+	Unit              string                `json:"unit"`
+	AvailabilityRules string                `json:"availability_rules,omitempty"`
+	Variants          []CatalogVariantInput `json:"variants,omitempty"`
+}
+
+type SuspendOfferingVersionRequest struct {
+	Reason string `json:"reason"`
+}
+
+type RetireOfferingVersionRequest struct {
+	Reason string `json:"reason"`
+}
+
+type LinkMappingRequest struct {
+	MappingType string `json:"mapping_type"`
+	MappingRef  string `json:"mapping_ref"`
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────
+
+var (
+	ErrOfferingNotFound        = errorString("offering not found")
+	ErrOfferingVersionNotFound = errorString("offering version not found")
+	ErrDuplicateOfferingSKU    = errorString("an offering with this sku_code already exists for this legal entity")
+
+	ErrInvalidCatalogVersionTransition = errorString("offering version is not in a status that allows this action")
+
+	// ErrCatalogVersionInvalid is the spec's own named stable error,
+	// CATALOG_VERSION_INVALID: "Offering version missing, inactive or
+	// incompatible with requested use."
+	ErrCatalogVersionInvalid = errorString("offering version is missing, inactive or incompatible with requested use")
+
+	ErrInvalidMappingType = errorString("mapping_type must be one of TAX, ACCOUNTING, PRODUCT")
+)

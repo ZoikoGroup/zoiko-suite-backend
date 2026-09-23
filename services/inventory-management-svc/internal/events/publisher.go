@@ -240,6 +240,43 @@ func (p *Publisher) PublishStockCountVarianceDetected(ctx context.Context, corre
 	})
 }
 
+// BIZ-07's own named events: "OfferingCreated; OfferingActivated;
+// OfferingSuspended; OfferingRetired; OfferingVersionSuperseded."
+
+func (p *Publisher) PublishOfferingCreated(ctx context.Context, correlationID, actorID string, o domain.Offering, v domain.OfferingVersion) {
+	p.emit(ctx, "catalog.offering.created", correlationID, o.TenantID, o.LegalEntityID, actorID, o.OfferingID, map[string]any{
+		"offering_id": o.OfferingID, "sku_code": o.SKUCode, "version_id": v.VersionID,
+	})
+}
+
+func (p *Publisher) PublishOfferingActivated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion) {
+	p.emit(ctx, "catalog.offering.activated", correlationID, tenantID, legalEntityID, actorID, v.OfferingID, map[string]any{
+		"offering_id": v.OfferingID, "version_id": v.VersionID, "activated_at": v.ActivatedAt,
+	})
+}
+
+func (p *Publisher) PublishOfferingSuspended(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion) {
+	p.emit(ctx, "catalog.offering.suspended", correlationID, tenantID, legalEntityID, actorID, v.OfferingID, map[string]any{
+		"offering_id": v.OfferingID, "version_id": v.VersionID, "suspension_reason": v.SuspensionReason,
+	})
+}
+
+func (p *Publisher) PublishOfferingRetired(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, v domain.OfferingVersion) {
+	p.emit(ctx, "catalog.offering.retired", correlationID, tenantID, legalEntityID, actorID, v.OfferingID, map[string]any{
+		"offering_id": v.OfferingID, "version_id": v.VersionID, "retirement_reason": v.RetirementReason,
+	})
+}
+
+// PublishOfferingVersionSuperseded fires from ActivateOffering when a
+// newly-activated version displaces a previously-ACTIVE one — the real
+// mechanism behind "later catalog edits SHALL NOT rewrite historical
+// transaction meaning."
+func (p *Publisher) PublishOfferingVersionSuperseded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID, offeringID, versionID string) {
+	p.emit(ctx, "catalog.offering_version.superseded", correlationID, tenantID, legalEntityID, actorID, offeringID, map[string]any{
+		"offering_id": offeringID, "version_id": versionID,
+	})
+}
+
 func (p *Publisher) emit(ctx context.Context, eventType, correlationID, tenantID, legalEntityID, actorID, key string, payload map[string]any) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
