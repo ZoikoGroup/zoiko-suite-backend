@@ -38,6 +38,8 @@ func openTestPool(t *testing.T) *pgxpool.Pool {
 	base := filepath.Dir(filename)
 
 	_, _ = pool.Exec(ctx, `DROP TABLE IF EXISTS
+		inventory_catalog_mappings, inventory_catalog_variants,
+		inventory_catalog_offering_versions, inventory_catalog_offerings,
 		inventory_stock_count_lines, inventory_stock_count_locations, inventory_stock_counts,
 		inventory_write_downs, inventory_layer_consumptions, inventory_valuation_entries,
 		inventory_valuation_runs, inventory_cost_layers,
