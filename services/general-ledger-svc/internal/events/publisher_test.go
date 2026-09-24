@@ -140,3 +140,21 @@ func TestPublishJournalPosted_NilActorPointer_OmitsRatherThanPanics(t *testing.T
 	env := decodeOne(t, w)
 	assert.Empty(t, env.ActorID)
 }
+
+func TestPublishOutbox_KeyAndHeader(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisher(zap.NewNop(), "zoiko.general-ledger.events", w)
+
+	payload := []byte(`{"event_type":"journal.created"}`)
+	err := p.PublishOutbox(context.Background(), "evt-999", "j-123", payload)
+	require.NoError(t, err)
+
+	require.Len(t, w.msgs, 1)
+	msg := w.msgs[0]
+	assert.Equal(t, []byte("j-123"), msg.Key)
+	assert.Equal(t, payload, msg.Value)
+
+	require.Len(t, msg.Headers, 1)
+	assert.Equal(t, "X-Event-ID", msg.Headers[0].Key)
+	assert.Equal(t, []byte("evt-999"), msg.Headers[0].Value)
+}

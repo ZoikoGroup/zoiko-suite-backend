@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/riandyrn/otelchi"
@@ -132,11 +134,44 @@ func (a *httpAuthzClient) storeCache(key string, decision error) {
 // authorization-svc's /v1/authorize always responds 200, and signals the
 // actual decision via decision_outcome: "GRANTED" | "DENIED" — there is no
 // "allowed" boolean field in its response.
+//
+// ── THE ENVELOPE IS NOT OPTIONAL ON THIS CALL ───────────────────────────────
+//
+// This function used to send Content-Type and nothing else. authorization-svc
+// enforces the canonical input contract in middleware, ahead of the handler,
+// so every call was rejected with 401 `envelope_incomplete` before any
+// decision was evaluated. The non-200 then became ErrAuthzServiceUnavailable
+// below, and every route in this service answered 503 `authz_unavailable`.
+//
+// That failure was indistinguishable from authorization-svc being down. It was
+// not down — it was answering, correctly, that the request was malformed. The
+// symptom was a service that could not create, read or update a single role
+// definition while reporting a governance-plane outage.
+//
+// Nothing needed to be threaded through the AuthzClient interface to fix it:
+// the tenant is already in the request context (svcmiddleware.TenantContext
+// installs it, and requireTenant reads it the same way), and chi's RequestID
+// middleware supplies the correlation id that main's own middleware already
+// forwards on the inbound side.
+//
+// X-Purpose-Context is deliberately NOT sent. authorization-svc does not
+// require it on this route — verified against the running service — and this
+// call carries no personal, bank, tax or payroll content of its own. Sending
+// an invented purpose to satisfy a check that is not being made would put a
+// false provenance claim into the access decision log.
 func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, legalEntityID, actionType string) error {
+	tenantID := svcmiddleware.TenantFromContext(ctx)
+
 	reqBody, _ := json.Marshal(map[string]string{
 		"principal_id":    principalID,
 		"legal_entity_id": legalEntityID,
 		"action_type":     actionType,
+		// Also in the body because authorization-svc's resolveTenantScope
+		// accepts it there as a fallback. The header is what it prefers and
+		// what it verifies against; a body value that CONTRADICTS the header
+		// is refused outright, so sending the same value in both is safe and
+		// keeps the call working if the header is ever dropped upstream.
+		"tenant_id": tenantID,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/authorize", bytes.NewReader(reqBody))
@@ -144,6 +179,44 @@ func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, leg
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+
+	// The verified scope. An empty tenant here is not fatal to the call —
+	// authorization-svc warns and evaluates only globally-applicable SoD
+	// rules — but it IS a weaker check than intended, so it is logged rather
+	// than passed over in silence.
+	if tenantID == "" {
+		a.log.Warn("authorize: no tenant in context — authorization-svc will evaluate only global SoD rules",
+			zap.String("action_type", actionType))
+	}
+	req.Header.Set("X-Tenant-Id", tenantID)
+	req.Header.Set("X-Principal-Id", principalID)
+	req.Header.Set("X-Legal-Entity-Id", legalEntityID)
+
+	// Correlation joins this decision to the inbound request that caused it,
+	// which is what makes an access_decision_log row traceable back to an
+	// operator action. GetReqID returns "" outside a chi RequestID scope
+	// (notably in tests calling the client directly), so fall back rather
+	// than send an empty header the middleware will reject.
+	correlationID := middleware.GetReqID(ctx)
+	if correlationID == "" {
+		correlationID = uuid.NewString()
+	}
+	req.Header.Set("X-Correlation-ID", correlationID)
+
+	// Per-hop, distinct from the correlation id by design: one operator action
+	// can produce several authorize calls (a role write checks ROLE_MANAGE,
+	// a listing checks ROLE_VIEW) and each is its own request.
+	req.Header.Set("X-Request-Id", uuid.NewString())
+
+	// This is service-to-service, not a user channel. "system" is one of the
+	// values authorization-svc's contract admits.
+	req.Header.Set("X-Source-Channel", "system")
+
+	// Required as duplicate/replay protection (INV-08) because an authorize
+	// call is not read-only — it appends to access_decision_log. A fresh key
+	// per call is correct: two identical checks are two real decisions and
+	// both belong in the evidence record.
+	req.Header.Set("Idempotency-Key", uuid.NewString())
 
 	resp, err := a.client.Do(req)
 	if err != nil {
@@ -153,6 +226,16 @@ func (a *httpAuthzClient) checkAllowedLive(ctx context.Context, principalID, leg
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// Log the status and body. This is the branch that silently turned a
+		// contract violation into a reported outage for as long as the
+		// envelope was missing; without the body, the next such mismatch is
+		// just as invisible as this one was.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		a.log.Error("authorization-svc refused the authorize call",
+			zap.Int("status", resp.StatusCode),
+			zap.String("action_type", actionType),
+			zap.String("correlation_id", correlationID),
+			zap.ByteString("body", body))
 		return domain.ErrAuthzServiceUnavailable
 	}
 

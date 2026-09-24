@@ -153,7 +153,8 @@ for svc in "${targets[@]}"; do
 		continue
 	fi
 	mkdir -p "$dest"
-	cp "$SRC/envelope.go" "$SRC/policy.go" "$SRC/middleware.go" "$SRC/resolver.go" "$SRC/reporter.go" "$dest/"
+	cp "$SRC/envelope.go" "$SRC/policy.go" "$SRC/middleware.go" "$SRC/resolver.go" "$SRC/reporter.go" \
+		"$SRC/reason.go" "$SRC/fingerprint.go" "$SRC/transition.go" "$dest/"
 
 	legal_entity="NotRequired"
 	in_list "$svc" "$ENTITY_SCOPED" && legal_entity="RequiredOnWrite"

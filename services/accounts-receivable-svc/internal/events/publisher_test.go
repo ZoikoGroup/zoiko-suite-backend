@@ -20,9 +20,13 @@ import (
 
 type fakeWriter struct {
 	msgs []kafka.Message
+	err  error
 }
 
 func (f *fakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.msgs = append(f.msgs, msgs...)
 	return nil
 }
@@ -94,4 +98,31 @@ func TestPublishInvoiceIssued_RepeatEventsOnSameInvoice_GetDistinctEventIDs(t *t
 	first := decode(t, w.msgs[0])
 	second := decode(t, w.msgs[1])
 	assert.NotEqual(t, first.EventID, second.EventID)
+}
+
+func TestPublishOutbox_Success(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.accounts-receivable.events", w)
+
+	payload := []byte(`{"event_id":"evt-123","event_type":"invoice.issued"}`)
+	err := p.PublishOutbox(context.Background(), "123e4567-e89b-12d3-a456-426614174000", "inv-42", payload)
+	require.NoError(t, err)
+
+	require.Len(t, w.msgs, 1)
+	msg := w.msgs[0]
+	assert.Equal(t, "zoiko.accounts-receivable.events", msg.Topic)
+	assert.Equal(t, []byte("inv-42"), msg.Key)
+	assert.Equal(t, payload, msg.Value)
+	require.Len(t, msg.Headers, 1)
+	assert.Equal(t, "X-Event-ID", msg.Headers[0].Key)
+	assert.Equal(t, []byte("123e4567-e89b-12d3-a456-426614174000"), msg.Headers[0].Value)
+}
+
+func TestPublishOutbox_ErrorPropagated(t *testing.T) {
+	w := &fakeWriter{err: assert.AnError}
+	p := events.NewPublisherWithWriter(zap.NewNop(), "zoiko.accounts-receivable.events", w)
+
+	err := p.PublishOutbox(context.Background(), "123e4567-e89b-12d3-a456-426614174000", "inv-42", []byte(`{}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "kafka write")
 }

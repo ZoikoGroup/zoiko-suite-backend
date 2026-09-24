@@ -56,6 +56,18 @@ APP_DB_PASSWORD="${APP_DB_PASSWORD:-postgres}"
 # statement inside the tenant-scoped transaction it already had a helper for.
 # Nine of its queries went straight to the pool, so under an ordinary role its
 # entire compliance register would have read as empty.
+#
+# authorization-svc joined after 000007 gave permission_bundles and
+# principal_role_assignments the policies they had been missing — before that,
+# an ordinary role here would have bought nothing on the two tables that
+# actually hold who-can-do-what. Note the shape of its policies: two reads
+# (FindRoleByID, FindGrantedActions) deliberately run under
+# app.platform_scope, which every policy in that database honours, because
+# scoping FindGrantedActions by tenant would silently break /v1/authorize
+# platform-wide. An ordinary role does NOT close that hatch — it is an
+# application-level escape, not a privilege one — so flipping DB_USER here
+# tightens the other four tables and leaves those two reads exactly as they
+# were. That is the intended outcome, not an oversight.
 SERVICES="
 governance_decision_log:app_governance_decision_log
 policy:app_policy
@@ -78,6 +90,7 @@ jurisdiction_rules:app_jurisdiction_rules
 delegated_authority:app_delegated_authority
 document_vault:app_document_vault
 obligations:app_obligations
+authorization_svc:app_authorization
 "
 
 created=0

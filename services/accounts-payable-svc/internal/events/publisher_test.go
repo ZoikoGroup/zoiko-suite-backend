@@ -7,6 +7,8 @@ package events_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,9 +23,13 @@ import (
 
 type fakeWriter struct {
 	msgs []kafka.Message
+	err  error
 }
 
 func (f *fakeWriter) WriteMessages(_ context.Context, msgs ...kafka.Message) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.msgs = append(f.msgs, msgs...)
 	return nil
 }
@@ -125,4 +131,41 @@ func TestPublishPaymentRequested_NilActorPointer_OmitsRatherThanPanics(t *testin
 	})
 	env := decodeOne(t, w)
 	assert.Empty(t, env.ActorID)
+}
+
+func TestPublishOutbox_KeyAndHeader(t *testing.T) {
+	w := &fakeWriter{}
+	p := events.NewPublisher(zap.NewNop(), "zoiko.accounts-payable.events", w)
+
+	outboxEventID := "11111111-2222-3333-4444-555555555555"
+	aggregateID := "inv-999"
+	payload := []byte(`{"event_type":"vendor.invoice.received","payload":{"invoice_id":"inv-999"}}`)
+
+	err := p.PublishOutbox(context.Background(), outboxEventID, aggregateID, payload)
+	require.NoError(t, err)
+	require.Len(t, w.msgs, 1)
+
+	msg := w.msgs[0]
+	assert.Equal(t, "zoiko.accounts-payable.events", msg.Topic)
+	assert.Equal(t, []byte(aggregateID), msg.Key)
+	assert.Equal(t, payload, msg.Value)
+
+	foundHeader := false
+	for _, h := range msg.Headers {
+		if h.Key == "X-Event-ID" {
+			foundHeader = true
+			assert.Equal(t, []byte(outboxEventID), h.Value)
+		}
+	}
+	assert.True(t, foundHeader, "expected X-Event-ID header to be set")
+}
+
+func TestPublishOutbox_PropagatesError(t *testing.T) {
+	expectedErr := errors.New("kafka broken pipe")
+	w := &fakeWriter{err: expectedErr}
+	p := events.NewPublisher(zap.NewNop(), "zoiko.accounts-payable.events", w)
+
+	err := p.PublishOutbox(context.Background(), "id-1", "inv-1", []byte("{}"))
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, expectedErr) || strings.Contains(err.Error(), "kafka broken pipe"))
 }

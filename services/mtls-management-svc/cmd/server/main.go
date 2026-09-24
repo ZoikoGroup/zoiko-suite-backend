@@ -64,6 +64,10 @@ func main() {
 
 	s := store.NewMemoryStore()
 	siemClient := siem.New(os.Getenv("SIEM_SERVICE_URL"), "mtls-management-svc", logger)
+
+	// Drain accepted SIEM events on shutdown. Stream returns before delivery,
+	// so without this a SIGTERM would discard security events already accepted.
+	defer siemClient.Close()
 	// Fail fast rather than starting and 503-ing every guarded route.
 	// authz.NewClient("") builds requests against an empty base URL, so every
 	// CheckAllowed fails and the client — correctly — refuses. That posture is
