@@ -20,6 +20,7 @@ import (
 	"zoiko.io/notification-svc/internal/retry"
 	"zoiko.io/notification-svc/internal/store"
 	"zoiko.io/notification-svc/internal/templates"
+	"zoiko.io/notification-svc/internal/webhook"
 )
 
 type Store interface {
@@ -91,14 +92,15 @@ type Deliverer interface {
 }
 
 type Handler struct {
-	store        Store
-	publisher    Publisher
-	authz        AuthZClient
-	deliverer    Deliverer
-	recipient    RecipientResolver
-	log          *zap.Logger
-	orchestrator *ledger.Orchestrator
-	ledgerStore  ledger.LedgerStore
+	store          Store
+	publisher      Publisher
+	authz          AuthZClient
+	deliverer      Deliverer
+	recipient      RecipientResolver
+	log            *zap.Logger
+	orchestrator   *ledger.Orchestrator
+	ledgerStore    ledger.LedgerStore
+	webhookHandler *webhook.Handler
 
 	// retryPolicy decides whether a first-attempt failure is scheduled for
 	// another try. The same policy the worker uses, so the schedule a send
@@ -114,28 +116,30 @@ type Handler struct {
 // position. Transposing two arguments there compiles and fails at runtime,
 // which is the same reason domain.ListFilter exists.
 type Deps struct {
-	Store        Store
-	Publisher    Publisher
-	AuthZ        AuthZClient
-	Deliverer    Deliverer
-	Recipient    RecipientResolver
-	RetryPolicy  retry.Policy
-	Orchestrator *ledger.Orchestrator
-	LedgerStore  ledger.LedgerStore
-	Log          *zap.Logger
+	Store          Store
+	Publisher      Publisher
+	AuthZ          AuthZClient
+	Deliverer      Deliverer
+	Recipient      RecipientResolver
+	RetryPolicy    retry.Policy
+	Orchestrator   *ledger.Orchestrator
+	LedgerStore    ledger.LedgerStore
+	WebhookHandler *webhook.Handler
+	Log            *zap.Logger
 }
 
 func New(d Deps) *Handler {
 	return &Handler{
-		store:        d.Store,
-		publisher:    d.Publisher,
-		authz:        d.AuthZ,
-		deliverer:    d.Deliverer,
-		recipient:    d.Recipient,
-		retryPolicy:  d.RetryPolicy.Normalize(),
-		orchestrator: d.Orchestrator,
-		ledgerStore:  d.LedgerStore,
-		log:          d.Log,
+		store:          d.Store,
+		publisher:      d.Publisher,
+		authz:          d.AuthZ,
+		deliverer:      d.Deliverer,
+		recipient:      d.Recipient,
+		retryPolicy:    d.RetryPolicy.Normalize(),
+		orchestrator:   d.Orchestrator,
+		ledgerStore:    d.LedgerStore,
+		webhookHandler: d.WebhookHandler,
+		log:            d.Log,
 	}
 }
 
@@ -153,6 +157,11 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 		// Phase 1 Delivery Ledger & Event Ingestion routes
 		r.Post("/events/ingest", h.IngestEvent)
 		r.Get("/intents/{id}", h.GetIntent)
+
+		// Phase 2 Step 5 Webhook routes
+		if h.webhookHandler != nil {
+			r.Post("/webhooks/{provider}", h.webhookHandler.HandleWebhook)
+		}
 
 		r.Get("/{id}", h.GetNotification)
 		r.Post("/{id}/read", h.MarkRead)
