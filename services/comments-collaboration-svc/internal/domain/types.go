@@ -150,6 +150,50 @@ type EditCommentParams struct {
 	CommentID, TenantID, ActorPrincipalID, Body string
 }
 
+// DeleteCommentParams — BIZ-09's own DeleteComment command. Never a hard
+// delete: moves the comment to DELETED_REDACTED. The doc's own event
+// catalogue names no "CommentDeleted" event — only CommentAdded/Edited/
+// Moderated/MentionCreated/ThreadResolved — so this command deliberately
+// publishes nothing; that is the doc's own choice, not an oversight here.
+type DeleteCommentParams struct {
+	CommentID, TenantID, ActorPrincipalID, Reason string
+}
+
+// MentionParams — BIZ-09's own Mention command. VisibilityGranted is
+// decided by the caller (the handler, via its registered
+// ObjectVisibilityChecker) BEFORE this reaches the store — the store
+// only ever records the outcome, it never itself decides visibility.
+type MentionParams struct {
+	CommentID, TenantID, MentionedPrincipalID string
+	VisibilityGranted                         bool
+}
+
+type ReactParams struct {
+	CommentID, TenantID, PrincipalID, ReactionType string
+}
+
+// ModerateParams — BIZ-09's own Moderate command. Reason is mandatory —
+// the doc's own T46: "Comment moderation deletes evidence without reason
+// -> Fail; moderation history/reason required."
+type ModerateParams struct {
+	CommentID, TenantID, ModeratorPrincipalID, Action, Reason string
+}
+
+// ResolveThreadParams — BIZ-09's own ResolveThread command.
+type ResolveThreadParams struct {
+	ThreadID, TenantID, ActorPrincipalID, ResolutionNote string
+}
+
+// AttachReferenceParams — BIZ-09's own AttachReference command. Never
+// stores bytes — LinkedObjectID references a file already stored in
+// document-vault-svc (or any other object-owning service), same opaque
+// no-FK posture as everything else in this service.
+type AttachReferenceParams struct {
+	CommentID, TenantID              string
+	LinkedObjectType, LinkedObjectID string
+	AttachedByPrincipalID            string
+}
+
 // ── errors ───────────────────────────────────────────────────────────────────
 
 var (
@@ -157,6 +201,7 @@ var (
 	ErrCommentNotFound = errors.New("comment not found")
 
 	ErrCommentInvalidState = errors.New("comment is not in a state that permits this action")
+	ErrThreadInvalidState  = errors.New("thread is not in a state that permits this action")
 
 	ErrEmptyBody = errors.New("body is required")
 
@@ -164,4 +209,23 @@ var (
 	// belong to the same thread the new comment is being added to,
 	// otherwise a reply could silently cross discussions.
 	ErrParentCommentNotInThread = errors.New("parent_comment_id does not belong to this thread")
+
+	ErrReasonRequired = errors.New("reason is required")
+
+	// ErrNoVisibilityCheckRegistered is Mention's own fail-closed default
+	// — see internal/handler's own doc comment on ObjectVisibilityChecker
+	// for why an unregistered object type refuses rather than allows.
+	ErrNoVisibilityCheckRegistered = errors.New("no visibility check is registered for this object type — mention refused")
+
+	// ErrMentionNotVisible is the real enforcement of the doc's own T29:
+	// "Unauthorized user mentioned in restricted thread receives object
+	// title -> Block mention/notification leakage."
+	ErrMentionNotVisible = errors.New("mentioned principal does not have access to the linked object — mention refused")
+
+	// ErrRetentionHold is the doc's own DELETE-under-hold failure mode:
+	// "Deleted comment under legal hold disappears -> Block; retain
+	// restricted history."
+	ErrRetentionHold = errors.New("comment cannot be deleted while under an active legal hold or retention policy")
+
+	ErrRetentionServiceUnavailable = errors.New("retention-registry-svc unavailable")
 )

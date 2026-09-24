@@ -23,6 +23,7 @@ import (
 	"zoiko.io/comments-collaboration-svc/internal/health"
 	"zoiko.io/comments-collaboration-svc/internal/middleware"
 	"zoiko.io/comments-collaboration-svc/internal/mtls"
+	"zoiko.io/comments-collaboration-svc/internal/retention"
 	"zoiko.io/comments-collaboration-svc/internal/store"
 	"zoiko.io/comments-collaboration-svc/internal/telemetry"
 )
@@ -78,7 +79,14 @@ func main() {
 		authzClient = authz.NewClient(cfg.AuthzServiceURL)
 	}
 
-	h := handler.New(pgStore, publisher, authzClient, logger)
+	retentionClient := retention.NewHTTPClient(cfg.RetentionRegistryURL, logger)
+	h := handler.New(pgStore, publisher, authzClient, logger).WithRetentionClient(retentionClient)
+	// No ObjectVisibilityChecker is registered here yet — no other domain
+	// service exposes a CanView endpoint for comments-collaboration-svc to
+	// call. Until one is, every Mention refuses fail-closed (see
+	// handler.ObjectVisibilityChecker's own doc comment) rather than
+	// silently allowing. Register one per linked_object_type via
+	// h.WithVisibilityChecker(...) as domain services adopt it.
 
 	r := chi.NewRouter()
 	r.Use(chimiddleware.RequestID)

@@ -61,8 +61,8 @@ func NewKafkaPublisherWithWriter(writer MessageWriter, topic string, logger *zap
 }
 
 // BIZ-09's own named events: "CommentAdded; CommentEdited;
-// CommentModerated; MentionCreated; ThreadResolved." Wave 1 implements
-// the first two.
+// CommentModerated; MentionCreated; ThreadResolved." All five are
+// implemented as of Wave 2.
 
 func (p *KafkaPublisher) PublishCommentAdded(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, c domain.Comment, t domain.CommentThread) {
 	p.emit(ctx, "comment.added", correlationID, actorID, tenantID, legalEntityID, c.CommentID, map[string]any{
@@ -74,6 +74,24 @@ func (p *KafkaPublisher) PublishCommentAdded(ctx context.Context, correlationID,
 func (p *KafkaPublisher) PublishCommentEdited(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, c domain.Comment) {
 	p.emit(ctx, "comment.edited", correlationID, actorID, tenantID, legalEntityID, c.CommentID, map[string]any{
 		"comment_id": c.CommentID, "current_version_id": c.CurrentVersionID,
+	})
+}
+
+func (p *KafkaPublisher) PublishCommentModerated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, c domain.Comment) {
+	p.emit(ctx, "comment.moderated", correlationID, actorID, tenantID, legalEntityID, c.CommentID, map[string]any{
+		"comment_id": c.CommentID, "moderation_reason": c.ModerationReason,
+	})
+}
+
+func (p *KafkaPublisher) PublishMentionCreated(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, m domain.Mention) {
+	p.emit(ctx, "mention.created", correlationID, actorID, tenantID, legalEntityID, m.CommentID, map[string]any{
+		"mention_id": m.MentionID, "comment_id": m.CommentID, "mentioned_principal_id": m.MentionedPrincipalID,
+	})
+}
+
+func (p *KafkaPublisher) PublishThreadResolved(ctx context.Context, correlationID, actorID, tenantID, legalEntityID string, t domain.CommentThread) {
+	p.emit(ctx, "thread.resolved", correlationID, actorID, tenantID, legalEntityID, t.ThreadID, map[string]any{
+		"thread_id": t.ThreadID, "resolution_note": t.ResolutionNote,
 	})
 }
 

@@ -6,11 +6,12 @@ import (
 )
 
 type Config struct {
-	Port             string
-	DatabaseURL      string
-	KafkaBrokers     string
-	KafkaEventsTopic string
-	AuthzServiceURL  string
+	Port                 string
+	DatabaseURL          string
+	KafkaBrokers         string
+	KafkaEventsTopic     string
+	AuthzServiceURL      string
+	RetentionRegistryURL string
 
 	// AuthzMTLSEnabled/AuthzMTLSURL wire this service into the material-path
 	// mTLS pilot (see authorization-svc/internal/mtls's doc comment).
@@ -31,11 +32,12 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 	return &Config{
-		Port:             port,
-		DatabaseURL:      dbURL,
-		KafkaBrokers:     getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
-		KafkaEventsTopic: getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.comments-collaboration.events"),
-		AuthzServiceURL:  getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		Port:                 port,
+		DatabaseURL:          dbURL,
+		KafkaBrokers:         getEnvOrDefault("KAFKA_BROKERS", "kafka:9092"),
+		KafkaEventsTopic:     getEnvOrDefault("KAFKA_EVENTS_TOPIC", "zoiko.comments-collaboration.events"),
+		AuthzServiceURL:      getEnvOrDefault("AUTHZ_SERVICE_URL", "http://authorization-svc:8089"),
+		RetentionRegistryURL: getEnvOrDefault("RETENTION_REGISTRY_URL", "http://retention-registry-svc:8148"),
 
 		AuthzMTLSEnabled:         getEnvOrDefault("AUTHZ_MTLS_ENABLED", "false") == "true",
 		AuthzMTLSURL:             getEnvOrDefault("AUTHZ_MTLS_URL", "https://authorization-svc:8449"),

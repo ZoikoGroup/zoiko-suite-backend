@@ -262,3 +262,200 @@ func TestPgStore_GetThread_UnknownThread_ReturnsNotFound(t *testing.T) {
 	_, err := s.GetThread(ctx(), "thread-does-not-exist")
 	require.ErrorIs(t, err, domain.ErrThreadNotFound)
 }
+
+func TestPgStore_DeleteComment_ThenRejectsDoubleDelete(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-9",
+		Body: "spam", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+
+	deleted, err := s.DeleteComment(ctx(), domain.DeleteCommentParams{CommentID: comment.CommentID, TenantID: "default", ActorPrincipalID: "moderator-1", Reason: "spam"})
+	require.NoError(t, err)
+	require.Equal(t, domain.CommentStatusDeletedRedacted, deleted.Status)
+	require.Equal(t, "spam", deleted.DeletionReason)
+
+	_, err = s.DeleteComment(ctx(), domain.DeleteCommentParams{CommentID: comment.CommentID, TenantID: "default", ActorPrincipalID: "moderator-1", Reason: "again"})
+	require.ErrorIs(t, err, domain.ErrCommentInvalidState)
+}
+
+func TestPgStore_Mention_ThenGetMentions(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-10",
+		Body: "hello", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+
+	m, err := s.Mention(ctx(), domain.MentionParams{CommentID: comment.CommentID, TenantID: "default", MentionedPrincipalID: "sarah", VisibilityGranted: true})
+	require.NoError(t, err)
+	require.True(t, m.VisibilityGranted)
+
+	mentions, err := s.GetMentions(ctx(), "default", comment.CommentID)
+	require.NoError(t, err)
+	require.Len(t, mentions, 1)
+	require.Equal(t, "sarah", mentions[0].MentionedPrincipalID)
+}
+
+// TestPgStore_Mentions_AreAppendOnly is the negative control on migration
+// 000001's trigger for the mentions table.
+func TestPgStore_Mentions_AreAppendOnly(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-11",
+		Body: "hello", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+	m, err := s.Mention(ctx(), domain.MentionParams{CommentID: comment.CommentID, TenantID: "default", MentionedPrincipalID: "sarah", VisibilityGranted: true})
+	require.NoError(t, err)
+
+	conn, err := pool.Acquire(context.Background())
+	require.NoError(t, err)
+	defer conn.Release()
+	_, err = conn.Exec(context.Background(), `SELECT set_config('app.tenant_id', 'default', false)`)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(context.Background(), `UPDATE mentions SET visibility_granted=false WHERE mention_id=$1`, m.MentionID)
+	require.Error(t, err, "expected the append-only trigger to reject a direct mutation")
+}
+
+func TestPgStore_React_TogglesOnAndOff(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-12",
+		Body: "hello", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+
+	added, err := s.React(ctx(), domain.ReactParams{CommentID: comment.CommentID, TenantID: "default", PrincipalID: "reviewer-2", ReactionType: "THUMBS_UP"})
+	require.NoError(t, err)
+	require.True(t, added)
+
+	removed, err := s.React(ctx(), domain.ReactParams{CommentID: comment.CommentID, TenantID: "default", PrincipalID: "reviewer-2", ReactionType: "THUMBS_UP"})
+	require.NoError(t, err)
+	require.False(t, removed)
+}
+
+func TestPgStore_Moderate_RequiresReasonAndRecordsTrail(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-13",
+		Body: "inappropriate", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+
+	_, err = s.Moderate(ctx(), domain.ModerateParams{CommentID: comment.CommentID, TenantID: "default", ModeratorPrincipalID: "moderator-1", Action: "REDACT", Reason: ""})
+	require.ErrorIs(t, err, domain.ErrReasonRequired)
+
+	moderated, err := s.Moderate(ctx(), domain.ModerateParams{CommentID: comment.CommentID, TenantID: "default", ModeratorPrincipalID: "moderator-1", Action: "REDACT", Reason: "policy violation"})
+	require.NoError(t, err)
+	require.Equal(t, domain.CommentStatusModerated, moderated.Status)
+
+	trail, err := s.GetModerationTrail(ctx(), "default", comment.CommentID)
+	require.NoError(t, err)
+	require.Len(t, trail, 1)
+	require.Equal(t, "policy violation", trail[0].Reason)
+}
+
+// TestPgStore_ModerationTrail_AreAppendOnly is the negative control
+// proving moderation evidence cannot be silently rewritten (doc's own
+// T46).
+func TestPgStore_ModerationTrail_AreAppendOnly(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-14",
+		Body: "inappropriate", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+	_, err = s.Moderate(ctx(), domain.ModerateParams{CommentID: comment.CommentID, TenantID: "default", ModeratorPrincipalID: "moderator-1", Action: "REDACT", Reason: "policy violation"})
+	require.NoError(t, err)
+
+	trail, err := s.GetModerationTrail(ctx(), "default", comment.CommentID)
+	require.NoError(t, err)
+	require.Len(t, trail, 1)
+
+	conn, err := pool.Acquire(context.Background())
+	require.NoError(t, err)
+	defer conn.Release()
+	_, err = conn.Exec(context.Background(), `SELECT set_config('app.tenant_id', 'default', false)`)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(context.Background(), `UPDATE moderation_trail SET reason='tampered' WHERE moderation_id=$1`, trail[0].ModerationID)
+	require.Error(t, err, "expected the append-only trigger to reject a direct mutation")
+}
+
+func TestPgStore_ResolveThread_ThenRejectsDoubleResolve(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	_, thread, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-15",
+		Body: "hello", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+
+	resolved, err := s.ResolveThread(ctx(), domain.ResolveThreadParams{ThreadID: thread.ThreadID, TenantID: "default", ActorPrincipalID: "reviewer-1", ResolutionNote: "answered"})
+	require.NoError(t, err)
+	require.Equal(t, domain.ThreadStatusResolved, resolved.Status)
+
+	_, err = s.ResolveThread(ctx(), domain.ResolveThreadParams{ThreadID: thread.ThreadID, TenantID: "default", ActorPrincipalID: "reviewer-1", ResolutionNote: "again"})
+	require.ErrorIs(t, err, domain.ErrThreadInvalidState)
+}
+
+func TestPgStore_AttachReference_ThenRejectsOnDeletedComment(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-16",
+		Body: "see attached quote", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+
+	attachment, err := s.AttachReference(ctx(), domain.AttachReferenceParams{CommentID: comment.CommentID, TenantID: "default", LinkedObjectID: "quote-1", AttachedByPrincipalID: "reviewer-1"})
+	require.NoError(t, err)
+	require.Equal(t, "DOCUMENT", attachment.LinkedObjectType)
+
+	_, err = s.DeleteComment(ctx(), domain.DeleteCommentParams{CommentID: comment.CommentID, TenantID: "default", ActorPrincipalID: "moderator-1", Reason: "spam"})
+	require.NoError(t, err)
+
+	_, err = s.AttachReference(ctx(), domain.AttachReferenceParams{CommentID: comment.CommentID, TenantID: "default", LinkedObjectID: "quote-2", AttachedByPrincipalID: "reviewer-1"})
+	require.ErrorIs(t, err, domain.ErrCommentInvalidState)
+}
+
+// TestPgStore_CommentAttachments_AreAppendOnly is the negative control
+// on migration 000001's trigger for comment_attachments.
+func TestPgStore_CommentAttachments_AreAppendOnly(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	comment, _, err := s.AddComment(ctx(), domain.AddCommentParams{
+		TenantID: "default", LegalEntityID: "le-1", LinkedObjectType: "DOCUMENT", LinkedObjectID: "doc-17",
+		Body: "see attached quote", CreatedByPrincipalID: "reviewer-1",
+	})
+	require.NoError(t, err)
+	attachment, err := s.AttachReference(ctx(), domain.AttachReferenceParams{CommentID: comment.CommentID, TenantID: "default", LinkedObjectID: "quote-1", AttachedByPrincipalID: "reviewer-1"})
+	require.NoError(t, err)
+
+	conn, err := pool.Acquire(context.Background())
+	require.NoError(t, err)
+	defer conn.Release()
+	_, err = conn.Exec(context.Background(), `SELECT set_config('app.tenant_id', 'default', false)`)
+	require.NoError(t, err)
+
+	_, err = conn.Exec(context.Background(), `DELETE FROM comment_attachments WHERE attachment_id=$1`, attachment.AttachmentID)
+	require.Error(t, err, "expected the append-only trigger to reject a direct delete")
+}
