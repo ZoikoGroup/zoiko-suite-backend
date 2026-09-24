@@ -118,11 +118,32 @@ const (
 	ActionFlagGlobalWrite   = "FEATURE_FLAG_GLOBAL_WRITE"
 )
 
-// Event types, for the pre-created outbox series.
+// Event types, for the pre-created outbox series. All ten must stay in step
+// with internal/events/publisher.go and asyncapi.yaml — the outbox CHECK in
+// migration 000008 admits exactly these strings, so a drift here fails the
+// next write, loudly, at the database.
 const (
 	EventConfigUpdated = "config.updated"
 	EventFlagUpdated   = "feature_flag.updated"
+
+	EventSnapshotPublished   = "config.snapshot.published"
+	EventVersionPublished    = "config.version.published"
+	EventOverrideActivated   = "config.override.activated"
+	EventReleaseActivated    = "flag.release.activated"
+	EventKillSwitchActivated = "flag.kill_switch.activated"
+	EventChangeVerified      = "config.change.verified"
+	EventDriftDetected       = "config.drift.detected"
+	EventEmergencyExpired    = "config.emergency.expired"
 )
+
+// allEventTypes is the single list both the pre-created series loop and the
+// telemetry tests read, so a new event cannot be added in one place only.
+var allEventTypes = []string{
+	EventConfigUpdated, EventFlagUpdated,
+	EventSnapshotPublished, EventVersionPublished, EventOverrideActivated,
+	EventReleaseActivated, EventKillSwitchActivated, EventChangeVerified,
+	EventDriftDetected, EventEmergencyExpired,
+}
 
 // NewDomain registers this service decision counters and pre-creates every
 // label combination at zero.
@@ -215,7 +236,7 @@ func NewDomainWith(reg prometheus.Registerer, serviceName string) *Domain {
 			d.GlobalScopeWrites.WithLabelValues(res, o)
 		}
 	}
-	for _, t := range []string{EventConfigUpdated, EventFlagUpdated} {
+	for _, t := range allEventTypes {
 		d.OutboxPublished.WithLabelValues(t)
 	}
 

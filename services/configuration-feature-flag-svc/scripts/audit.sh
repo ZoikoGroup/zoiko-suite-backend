@@ -175,8 +175,14 @@ echo
 echo "-- 6. Event contract matches asyncapi.yaml -------------------------"
 ASPEC=$(Q asyncapi-events asyncapi.yaml)
 PUB=$(cat internal/events/publisher.go)
-MIG=$(cat deployments/migrations/000003_outbox.up.sql)
-for e in config.updated feature_flag.updated; do
+# The outbox CHECK constraint was introduced on event_outbox in 000003 and
+# widened to all ten event types in 000008, so the constraint that must admit
+# an event lives in whichever file carries the current CHECK — read them all.
+MIG=$(cat deployments/migrations/000003_outbox.up.sql deployments/migrations/000008_release_plans.up.sql)
+for e in config.updated feature_flag.updated config.snapshot.published \
+         config.version.published config.override.activated flag.release.activated \
+         flag.kill_switch.activated config.change.verified config.drift.detected \
+         config.emergency.expired; do
   hasf "asyncapi documents $e" "$ASPEC" "$e"
   hasf "publisher builds $e" "$PUB" "$e"
   # The outbox CHECK constraint is the only list a deployment can actually

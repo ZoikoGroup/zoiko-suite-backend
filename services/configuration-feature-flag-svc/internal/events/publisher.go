@@ -46,6 +46,20 @@ const (
 	TypeConfigUpdated = "config.updated"
 	// TypeFeatureFlagUpdated is the same rule for POST /v1/flags.
 	TypeFeatureFlagUpdated = "feature_flag.updated"
+
+	// The eight ZS-SVC-AA-001 events. Each is enqueued by the store, inside
+	// the transaction that produced the fact it announces, and admitted by the
+	// widened event_outbox CHECK in migration 000008 — see that migration's
+	// comment for the "keep in step with internal/events and asyncapi.yaml"
+	// rule.
+	TypeSnapshotPublished   = "config.snapshot.published"
+	TypeVersionPublished    = "config.version.published"
+	TypeOverrideActivated   = "config.override.activated"
+	TypeReleaseActivated    = "flag.release.activated"
+	TypeKillSwitchActivated = "flag.kill_switch.activated"
+	TypeChangeVerified      = "config.change.verified"
+	TypeDriftDetected       = "config.drift.detected"
+	TypeEmergencyExpired    = "config.emergency.expired"
 )
 
 // envelope is this platform event contract (Doc 03 §19): every published event
@@ -152,6 +166,153 @@ func FeatureFlagUpdated(flag domain.FeatureFlag, correlationID string) (Outbound
 		"rollout_percentage":      flag.RolloutPercentage,
 		"effective_from":          flag.EffectiveFrom,
 		"created_by_principal_id": flag.CreatedByPrincipalID,
+	})
+}
+
+// ── ZS-SVC-AA-001 event builders ─────────────────────────────────────────────
+//
+// The same discipline as ConfigUpdated/FeatureFlagUpdated applies to all eight:
+// built inside the store's transaction, enqueued to event_outbox atomically
+// with the fact they announce, never published from the handler. A consumer
+// that misses one is acting on a superseded snapshot/version/plan/switch —
+// the exact staleness the AA-001 surface exists to make visible.
+
+// SnapshotPublished builds config.snapshot.published for a mint: a new
+// environment imprints was published and every consumer may now pin to it
+// (INV-12). Partition key is the snapshot id, so all events about one imprint
+// arrive in order.
+func SnapshotPublished(snap domain.MintedSnapshot, actor, correlationID string) (Outbound, error) {
+	return Build(TypeSnapshotPublished, correlationID, "", actor, snap.SnapshotID, map[string]any{
+		"snapshot_id":             snap.SnapshotID,
+		"environment":             snap.Environment,
+		"epoch":                   snap.Epoch,
+		"digest":                  snap.Digest,
+		"issued_at":               snap.IssuedAt,
+		"freshness_deadline":      snap.FreshnessDeadline,
+		"created_by_principal_id": actor,
+	})
+}
+
+// VersionPublished builds config.version.published for a definition publish:
+// a new immutable ConfigDefinitionVersion is what every resolver reads from
+// now on (INV-04). Partition key is the version id.
+func VersionPublished(v domain.ConfigDefinitionVersion, key, actor, correlationID string) (Outbound, error) {
+	return Build(TypeVersionPublished, correlationID, "", actor, v.VersionID, map[string]any{
+		"version_id":                v.VersionID,
+		"definition_id":             v.DefinitionID,
+		"key":                       key,
+		"version":                   v.Version,
+		"digest":                    v.Digest,
+		"lifecycle":                 v.Lifecycle,
+		"published_at":              v.PublishedAt,
+		"published_by_principal_id": actor,
+	})
+}
+
+// OverrideActivated builds config.override.activated for a value set at one of
+// the five INV-07 precedence layers. Partition key is the config key, keeping
+// every override to one key ordered.
+func OverrideActivated(p domain.ActivateOverrideParams, effectiveFrom time.Time) (Outbound, error) {
+	scopeID := ""
+	if p.ScopeID != nil {
+		scopeID = *p.ScopeID
+	}
+	return Build(TypeOverrideActivated, p.CorrelationID, scopeID, p.ActorPrincipalID, p.Key, map[string]any{
+		"key":                p.Key,
+		"layer":              p.Layer,
+		"environment":        p.Environment,
+		"scope_id":           p.ScopeID,
+		"value":              p.Value,
+		"effective_from":     effectiveFrom,
+		"actor_principal_id": p.ActorPrincipalID,
+	})
+}
+
+// ReleaseActivated builds flag.release.activated for a published release plan
+// version. Partition key is the plan id; the immutable targeting rules stay in
+// the payload so a consumer can fingerprint the exact ruleset from the event
+// alone (targeting_hash, TC-05).
+func ReleaseActivated(p domain.ReleasePlan, correlationID string) (Outbound, error) {
+	return Build(TypeReleaseActivated, correlationID, deref(p.TenantID), p.PublishedByPrincipalID, p.ReleasePlanID, map[string]any{
+		"release_plan_id":           p.ReleasePlanID,
+		"flag_key":                  p.FlagKey,
+		"environment":               p.Environment,
+		"tenant_id":                 p.TenantID,
+		"version":                   p.Version,
+		"strategy":                  p.Strategy,
+		"salt":                      p.Salt,
+		"bucket_count":              p.BucketCount,
+		"targeting_hash":            p.TargetingHash,
+		"targeting_rules":           p.TargetingRules,
+		"published_at":              p.PublishedAt,
+		"published_by_principal_id": p.PublishedByPrincipalID,
+	})
+}
+
+// KillSwitchActivated builds flag.kill_switch.activated for a switch entering
+// force — the single highest-blast-radius flag event this service emits, so it
+// carries the reason and incident alongside the switch itself. Partition key
+// is the switch id.
+func KillSwitchActivated(k domain.KillSwitch, correlationID string) (Outbound, error) {
+	return Build(TypeKillSwitchActivated, correlationID, deref(k.TenantID), k.CreatedByPrincipalID, k.KillSwitchID, map[string]any{
+		"kill_switch_id":          k.KillSwitchID,
+		"flag_key":                k.FlagKey,
+		"environment":             k.Environment,
+		"tenant_id":               k.TenantID,
+		"safe_behavior":           k.SafeBehavior,
+		"reason":                  k.Reason,
+		"incident_id":             k.IncidentID,
+		"expires_at":              k.ExpiresAt,
+		"created_by_principal_id": k.CreatedByPrincipalID,
+	})
+}
+
+// ChangeVerified builds config.change.verified once a change set reaches
+// VERIFIED, the terminal success of the Table 7 lifecycle. Partition key is
+// the change id, keeping every event about one change ordered.
+func ChangeVerified(c domain.ConfigChange, actor, correlationID string) (Outbound, error) {
+	return Build(TypeChangeVerified, correlationID, deref(c.TenantID), actor, c.ChangeID, map[string]any{
+		"change_id":                c.ChangeID,
+		"change_class":             c.ChangeClass,
+		"environment":              c.Environment,
+		"tenant_id":                c.TenantID,
+		"status":                   c.Status,
+		"verified_at":              c.VerifiedAt,
+		"verified_by_principal_id": actor,
+	})
+}
+
+// DriftDetected builds config.drift.detected for a recorded desired/observed
+// disagreement (TC-08). Partition key is the drift id.
+func DriftDetected(d domain.DriftEvent, correlationID string) (Outbound, error) {
+	return Build(TypeDriftDetected, correlationID, deref(d.TenantID), "system:reconciliation", d.DriftID, map[string]any{
+		"drift_id":             d.DriftID,
+		"runtime_id":           d.RuntimeID,
+		"environment":          d.Environment,
+		"tenant_id":            d.TenantID,
+		"drift_class":          d.DriftClass,
+		"severity":             d.Severity,
+		"desired_snapshot_id":  d.DesiredSnapshotID,
+		"desired_digest":       d.DesiredDigest,
+		"observed_snapshot_id": d.ObservedSnapshotID,
+		"observed_digest":      d.ObservedDigest,
+		"detected_at":          d.DetectedAt,
+	})
+}
+
+// EmergencyExpired builds config.emergency.expired when the sweep flips a
+// break-glass change to EXPIRED and reverts it. Partition key is the emergency
+// change id.
+func EmergencyExpired(e domain.EmergencyChange, correlationID string) (Outbound, error) {
+	return Build(TypeEmergencyExpired, correlationID, deref(e.TenantID), "system:ops_sweep", e.EmergencyChangeID, map[string]any{
+		"emergency_change_id": e.EmergencyChangeID,
+		"key":                 e.Key,
+		"environment":         e.Environment,
+		"tenant_id":           e.TenantID,
+		"status":              e.Status,
+		"reverted_to_prior":   e.RevertedToPrior,
+		"expires_at":          e.ExpiresAt,
+		"actor_principal_id":  e.ActorPrincipalID,
 	})
 }
 
