@@ -169,3 +169,31 @@ type PolicyDecision struct {
 	RuleName        string `json:"rule_name"`
 	Reason          string `json:"reason,omitempty"`
 }
+
+// ActionTokenStatus defines the lifecycle status of single-use action tokens per ZS-COMMS-EMAIL-001 §6.
+type ActionTokenStatus string
+
+const (
+	ActionTokenStatusActive   ActionTokenStatus = "ACTIVE"
+	ActionTokenStatusConsumed ActionTokenStatus = "CONSUMED"
+	ActionTokenStatusExpired  ActionTokenStatus = "EXPIRED"
+	ActionTokenStatusRevoked  ActionTokenStatus = "REVOKED"
+)
+
+// ActionToken models a link-scanner safe, signed, single-use action token in action_tokens.
+type ActionToken struct {
+	TokenID              string            `json:"token_id"`
+	TokenHash            string            `json:"token_hash"`
+	MessageIntentID      string            `json:"message_intent_id"`
+	TenantID             string            `json:"tenant_id"`
+	RecipientPrincipalID string            `json:"recipient_principal_id"`
+	Purpose              string            `json:"purpose"`
+	TargetActionURL      string            `json:"target_action_url"`
+	TargetMethod         string            `json:"target_method"`
+	Payload              json.RawMessage   `json:"payload,omitempty"`
+	Status               ActionTokenStatus `json:"status"`
+	ExpiresAt            time.Time         `json:"expires_at"`
+	ConsumedAt           *time.Time        `json:"consumed_at,omitempty"`
+	ConsumedByIP         *string           `json:"consumed_by_ip,omitempty"`
+	CreatedAt            time.Time         `json:"created_at"`
+}
