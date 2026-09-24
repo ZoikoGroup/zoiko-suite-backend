@@ -29,6 +29,8 @@ type Notification struct {
 	RecipientAddressSource string `json:"recipient_address_source,omitempty"`
 
 	Channel string `json:"channel"` // EMAIL, SMS, IN_APP, WEBHOOK
+	From    string `json:"from,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 	Subject string `json:"subject"`
 	Body    string `json:"body"`
 	Status  string `json:"status"` // PENDING, SENT, FAILED
@@ -175,6 +177,10 @@ type DeliveryOutcome struct {
 	// SMTP 4xx). Nothing re-attempts on it yet; recording it is what makes a
 	// retry worker possible without re-litigating every historical failure.
 	Retryable bool
+
+	// ProviderName records the name of the provider that actually handled or refused
+	// the attempt (e.g. "smtp-primary", "smtp-secondary", "ses").
+	ProviderName string
 }
 
 // AddressSource values for Notification.RecipientAddressSource.

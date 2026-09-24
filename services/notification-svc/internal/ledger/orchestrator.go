@@ -44,12 +44,18 @@ type RecipientResolver interface {
 	ResolveEmail(ctx context.Context, tenantID, callerPrincipalID, recipientPrincipalID string) (string, error)
 }
 
+// PolicyResolver evaluates communications policy and suppression rules before rendering.
+type PolicyResolver interface {
+	Evaluate(ctx context.Context, intent *MessageIntent, stream SenderStream) (PolicyDecision, error)
+}
+
 // Orchestrator coordinates event ingestion, deduplication, template integrity,
 // kill-switch enforcement, delivery dispatch, and audit ledger recording.
 type Orchestrator struct {
 	store      LedgerStore
 	compiler   *Compiler
 	killSwitch *KillSwitchManager
+	policy     PolicyResolver
 	deliverer  Deliverer
 	recipient  RecipientResolver
 	log        *zap.Logger
@@ -75,6 +81,12 @@ func NewOrchestrator(
 		recipient:  recipient,
 		log:        log,
 	}
+}
+
+// WithPolicyResolver attaches a policy precedence and suppression resolver.
+func (o *Orchestrator) WithPolicyResolver(pr PolicyResolver) *Orchestrator {
+	o.policy = pr
+	return o
 }
 
 // OrchestrationResult represents the outcome of an event ingestion and dispatch.
@@ -242,6 +254,37 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		}, nil
 	}
 
+	// 7.5. Policy & Suppression Precedence Evaluation (ZS-COMMS-EMAIL-001 §4, §5)
+	if o.policy != nil {
+		decision, pErr := o.policy.Evaluate(ctx, intent, tmplDef.SenderStream)
+		if pErr != nil {
+			failMsg := fmt.Sprintf("policy evaluation error: %v", pErr)
+			if upErr := o.store.UpdateIntentStatus(ctx, tenantID, intent.MessageIntentID, IntentStatusFailed, &failMsg); upErr != nil {
+				o.log.Error("failed to update intent status to FAILED", zap.String("intent_id", intent.MessageIntentID), zap.Error(upErr))
+			}
+			return nil, fmt.Errorf("policy evaluation: %w", pErr)
+		}
+		if !decision.Allowed {
+			o.log.Info("communications orchestrator: event suppressed by policy",
+				zap.String("tenant_id", tenantID),
+				zap.String("intent_id", intent.MessageIntentID),
+				zap.String("rule", decision.RuleName),
+				zap.String("reason", decision.Reason),
+			)
+			suppressReason := fmt.Sprintf("policy_suppressed: %s", decision.Reason)
+			if upErr := o.store.UpdateIntentStatus(ctx, tenantID, intent.MessageIntentID, IntentStatusKilled, &suppressReason); upErr != nil {
+				o.log.Error("failed to update suppressed intent to KILLED", zap.String("intent_id", intent.MessageIntentID), zap.Error(upErr))
+			}
+			return &OrchestrationResult{
+				MessageIntentID:  intent.MessageIntentID,
+				Status:           IntentStatusKilled,
+				IsReplay:         false,
+				DeduplicationKey: dedupKey,
+				FailureReason:    &suppressReason,
+			}, nil
+		}
+	}
+
 	// 8. Template compilation and rendering with SHA-256 verification
 	renderRes, err := o.compiler.Render(req.TemplateKey, req.Variables)
 	if err != nil {
@@ -279,9 +322,13 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 	}
 
 	// 10. Dispatch delivery using existing Deliverer abstraction
-	fromAddress := "notifications@notify.zoikosuite.com"
-	if tmplDef.SenderStream == StreamCritical {
-		fromAddress = "security@security.zoikosuite.com"
+	senderIdentity := ResolveSenderIdentity(tmplDef.SenderStream, req.TemplateKey)
+
+	headers := make(map[string]string)
+	if tmplDef.SenderStream == StreamMarketing {
+		// RFC 8058 One-Click List-Unsubscribe
+		headers["List-Unsubscribe"] = fmt.Sprintf("<https://notify.zoiko.com/v1/notifications/unsubscribe?tenant_id=%s>, <mailto:unsubscribe@news.zoikosuite.com?subject=unsubscribe>", tenantID)
+		headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
 	}
 
 	notificationForDeliverer := domain.Notification{
@@ -291,6 +338,8 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		RecipientPrincipalID: req.RecipientPrincipalID,
 		RecipientAddress:     recipientEmail,
 		Channel:              "EMAIL",
+		From:                 senderIdentity.Formatted(),
+		Headers:              headers,
 		Subject:              renderRes.Subject,
 		Body:                 renderRes.BodyHTML,
 		Status:               "PENDING",
@@ -317,15 +366,20 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		providerMessageID = &resp
 	}
 
+	providerName := outcome.ProviderName
+	if providerName == "" {
+		providerName = "DEFAULT"
+	}
+
 	attempt := &DeliveryAttempt{
 		ProviderAttemptID: attemptID,
 		MessageIntentID:   intent.MessageIntentID,
 		RenderID:          renderID,
 		TenantID:          tenantID,
 		SenderStream:      tmplDef.SenderStream,
-		FromAddress:       fromAddress,
+		FromAddress:       senderIdentity.Email,
 		ToAddress:         recipientEmail,
-		ProviderName:      "DEFAULT",
+		ProviderName:      providerName,
 		ProviderMessageID: providerMessageID,
 		Status:            attemptStatus,
 		FailureReason:     attemptFailureReason,
