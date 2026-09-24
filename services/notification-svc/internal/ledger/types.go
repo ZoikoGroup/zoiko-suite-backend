@@ -5,6 +5,8 @@ package ledger
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -27,7 +29,60 @@ const (
 	StreamTransactional SenderStream = "TRANSACTIONAL" // notifications@notify.zoikosuite.com / billing@
 	StreamOperational   SenderStream = "OPERATIONAL"   // updates@updates.zoikosuite.com
 	StreamMarketing     SenderStream = "MARKETING"     // hello@news.zoikosuite.com
+	StreamSupport       SenderStream = "SUPPORT"       // support@support.zoikosuite.com
 )
+
+// StreamSenderIdentity defines the display name, email, and formatted From header for a stream.
+type StreamSenderIdentity struct {
+	DisplayName string `json:"display_name"`
+	Email       string `json:"email"`
+}
+
+// Formatted returns the RFC 5322 From address (e.g. "ZoikoSuite Security <security@security.zoikosuite.com>").
+func (s StreamSenderIdentity) Formatted() string {
+	return fmt.Sprintf("%s <%s>", s.DisplayName, s.Email)
+}
+
+// ResolveSenderIdentity returns the canonical sender identity according to ZS-COMMS-EMAIL-001 §7.
+func ResolveSenderIdentity(stream SenderStream, templateKey string) StreamSenderIdentity {
+	switch stream {
+	case StreamCritical:
+		return StreamSenderIdentity{
+			DisplayName: "ZoikoSuite Security",
+			Email:       "security@security.zoikosuite.com",
+		}
+	case StreamOperational:
+		return StreamSenderIdentity{
+			DisplayName: "ZoikoSuite Updates",
+			Email:       "updates@updates.zoikosuite.com",
+		}
+	case StreamMarketing:
+		return StreamSenderIdentity{
+			DisplayName: "ZoikoSuite",
+			Email:       "hello@news.zoikosuite.com",
+		}
+	case StreamSupport:
+		return StreamSenderIdentity{
+			DisplayName: "ZoikoSuite Support",
+			Email:       "support@support.zoikosuite.com",
+		}
+	case StreamTransactional:
+		fallthrough
+	default:
+		// Specialized billing stream per ZS-COMMS-EMAIL-001 §7
+		if strings.HasPrefix(templateKey, "ZS-BE-") || strings.HasPrefix(templateKey, "ZS-AF-") {
+			return StreamSenderIdentity{
+				DisplayName: "ZoikoSuite Billing",
+				Email:       "billing@billing.zoikosuite.com",
+			}
+		}
+		return StreamSenderIdentity{
+			DisplayName: "ZoikoSuite",
+			Email:       "notifications@notify.zoikosuite.com",
+		}
+	}
+}
+
 
 // IntentStatus defines the lifecycle status of a governed message intent.
 type IntentStatus string

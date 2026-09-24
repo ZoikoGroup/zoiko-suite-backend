@@ -175,7 +175,14 @@ func (p *SMTPProvider) Send(ctx context.Context, msg Message) (string, error) {
 		return "", fmt.Errorf("recipient address %q is not valid: %w", msg.To, err)
 	}
 
-	messageID := fmt.Sprintf("<%s@%s>", uuid.NewString(), p.messageIDDomain())
+	mailFrom := p.from.Address
+	if strings.TrimSpace(msg.From) != "" {
+		if parsed, err := mail.ParseAddress(msg.From); err == nil {
+			mailFrom = parsed.Address
+		}
+	}
+
+	messageID := fmt.Sprintf("<%s@%s>", uuid.NewString(), p.messageIDDomain(mailFrom))
 	raw, err := p.buildMessage(msg, *to, messageID)
 	if err != nil {
 		return "", err
@@ -203,8 +210,8 @@ func (p *SMTPProvider) Send(ctx context.Context, msg Message) (string, error) {
 		return "", err
 	}
 
-	if err := client.Mail(p.from.Address); err != nil {
-		return "", classifySMTPError(fmt.Errorf("MAIL FROM %s: %w", p.from.Address, err))
+	if err := client.Mail(mailFrom); err != nil {
+		return "", classifySMTPError(fmt.Errorf("MAIL FROM %s: %w", mailFrom, err))
 	}
 	if err := client.Rcpt(to.Address); err != nil {
 		return "", classifySMTPError(fmt.Errorf("RCPT TO: %w", err))
@@ -303,9 +310,13 @@ func (p *SMTPProvider) addr() string { return net.JoinHostPort(p.host, fmt.Sprin
 // messageIDDomain takes the domain of the From address, so the Message-ID is
 // rooted in a domain this platform actually sends as. Falling back to the SMTP
 // host would generate ids under the relay's domain, which is not ours.
-func (p *SMTPProvider) messageIDDomain() string {
-	if at := strings.LastIndex(p.from.Address, "@"); at >= 0 && at+1 < len(p.from.Address) {
-		return p.from.Address[at+1:]
+func (p *SMTPProvider) messageIDDomain(fromAddr ...string) string {
+	target := p.from.Address
+	if len(fromAddr) > 0 && strings.TrimSpace(fromAddr[0]) != "" {
+		target = fromAddr[0]
+	}
+	if at := strings.LastIndex(target, "@"); at >= 0 && at+1 < len(target) {
+		return target[at+1:]
 	}
 	return p.host
 }
@@ -370,7 +381,12 @@ func (p *SMTPProvider) buildMessage(msg Message, to mail.Address, messageID stri
 	// stripped first.
 	subject := mime.QEncoding.Encode("utf-8", sanitizeHeaderValue(msg.Subject))
 
-	fmt.Fprintf(&b, "From: %s\r\n", p.from.String())
+	fromHeader := p.from.String()
+	if strings.TrimSpace(msg.From) != "" {
+		fromHeader = sanitizeHeaderValue(msg.From)
+	}
+
+	fmt.Fprintf(&b, "From: %s\r\n", fromHeader)
 	fmt.Fprintf(&b, "To: %s\r\n", to.String())
 	fmt.Fprintf(&b, "Subject: %s\r\n", subject)
 	fmt.Fprintf(&b, "Date: %s\r\n", time.Now().UTC().Format(time.RFC1123Z))
@@ -379,6 +395,9 @@ func (p *SMTPProvider) buildMessage(msg Message, to mail.Address, messageID stri
 		// The same correlation id the notification row carries, so a mail in
 		// the relay's logs can be tied to the send that produced it.
 		fmt.Fprintf(&b, "X-Zoiko-Correlation-Id: %s\r\n", sanitizeHeaderValue(msg.CorrelationID))
+	}
+	for k, v := range msg.Headers {
+		fmt.Fprintf(&b, "%s: %s\r\n", sanitizeHeaderValue(k), sanitizeHeaderValue(v))
 	}
 	// Transactional mail. Without this, a bulk-mail auto-responder can reply
 	// to a password reset and loop.

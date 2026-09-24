@@ -322,9 +322,13 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 	}
 
 	// 10. Dispatch delivery using existing Deliverer abstraction
-	fromAddress := "notifications@notify.zoikosuite.com"
-	if tmplDef.SenderStream == StreamCritical {
-		fromAddress = "security@security.zoikosuite.com"
+	senderIdentity := ResolveSenderIdentity(tmplDef.SenderStream, req.TemplateKey)
+
+	headers := make(map[string]string)
+	if tmplDef.SenderStream == StreamMarketing {
+		// RFC 8058 One-Click List-Unsubscribe
+		headers["List-Unsubscribe"] = fmt.Sprintf("<https://notify.zoiko.com/v1/notifications/unsubscribe?tenant_id=%s>, <mailto:unsubscribe@news.zoikosuite.com?subject=unsubscribe>", tenantID)
+		headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
 	}
 
 	notificationForDeliverer := domain.Notification{
@@ -334,6 +338,8 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		RecipientPrincipalID: req.RecipientPrincipalID,
 		RecipientAddress:     recipientEmail,
 		Channel:              "EMAIL",
+		From:                 senderIdentity.Formatted(),
+		Headers:              headers,
 		Subject:              renderRes.Subject,
 		Body:                 renderRes.BodyHTML,
 		Status:               "PENDING",
@@ -360,15 +366,20 @@ func (o *Orchestrator) IngestEvent(ctx context.Context, req EventIngestRequest, 
 		providerMessageID = &resp
 	}
 
+	providerName := outcome.ProviderName
+	if providerName == "" {
+		providerName = "DEFAULT"
+	}
+
 	attempt := &DeliveryAttempt{
 		ProviderAttemptID: attemptID,
 		MessageIntentID:   intent.MessageIntentID,
 		RenderID:          renderID,
 		TenantID:          tenantID,
 		SenderStream:      tmplDef.SenderStream,
-		FromAddress:       fromAddress,
+		FromAddress:       senderIdentity.Email,
 		ToAddress:         recipientEmail,
-		ProviderName:      "DEFAULT",
+		ProviderName:      providerName,
 		ProviderMessageID: providerMessageID,
 		Status:            attemptStatus,
 		FailureReason:     attemptFailureReason,
