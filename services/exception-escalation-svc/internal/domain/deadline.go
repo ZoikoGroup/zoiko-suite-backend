@@ -63,10 +63,25 @@ type Deadline struct {
 	SupersededAt           *time.Time `json:"superseded_at,omitempty"`
 	SupersededByDeadlineID string     `json:"superseded_by_deadline_id,omitempty"`
 
+	// DueSoonNotifiedAt/OverdueNotifiedAt back DeadlineDueSoon/
+	// DeadlineOverdue — see migration 000005's own doc comment on why
+	// these are set by the first read to observe the crossing, not by a
+	// background clock service this codebase doesn't have.
+	DueSoonNotifiedAt *time.Time `json:"due_soon_notified_at,omitempty"`
+	OverdueNotifiedAt *time.Time `json:"overdue_notified_at,omitempty"`
+
 	CreatedBy string    `json:"created_by"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+// DeadlineDueSoonWindow is the "due soon" horizon ListUpcoming uses to
+// decide whether a SCHEDULED deadline counts as upcoming. The doc names
+// no specific value — this is a real, documented decision (same class as
+// BIZ-06's opportunity-stage enum or BIZ-07's netting-policy field),
+// not a silently invented default: 72 hours, pending a real
+// product-configurable threshold if one is ever added.
+const DeadlineDueSoonWindow = 72 * time.Hour
 
 // DeadlineEscalation is the append-only escalation evidence trail —
 // Wave 2's own Escalate command writes these. Same split as
@@ -137,6 +152,57 @@ type AssignOwnerParams struct {
 
 type CompleteDeadlineParams struct {
 	DeadlineID, TenantID, ActorPrincipalID string
+}
+
+// RecalculateParams — BIZ-08's own Recalculate command. Only ever valid
+// on a deadline BIZ-08 owns outright (SourceType empty) — see
+// ErrCannotRecalculateMirroredDeadline's own doc comment. Resets
+// DueSoonNotifiedAt/OverdueNotifiedAt to nil: a materially different due
+// date means the notification state is stale and must be re-observed.
+type RecalculateParams struct {
+	DeadlineID, TenantID, ActorPrincipalID string
+	DueAt                                  time.Time
+	CalcRule, CalcInputs                   string
+}
+
+type WaiveParams struct {
+	DeadlineID, TenantID, ActorPrincipalID, Reason string
+}
+
+type CancelDeadlineParams struct {
+	DeadlineID, TenantID, ActorPrincipalID, Reason string
+}
+
+// EscalateParams — BIZ-08's own Escalate command. Deliberately does NOT
+// change Deadline.Status: the doc's own lifecycle line lists no
+// "Escalated" state (unlike BIZ-05's Task, which does), so escalation is
+// pure evidence — a DeadlineEscalation row — layered on top of whatever
+// status the deadline is actually in.
+type EscalateParams struct {
+	DeadlineID, TenantID, ActorPrincipalID, EscalatedToRole, Reason string
+}
+
+// ListUpcomingParams filters ListUpcoming's read.
+type ListUpcomingParams struct {
+	TenantID, LegalEntityID, OwnerPrincipalID string
+}
+
+// ListOverdueParams filters ListOverdue's read.
+type ListOverdueParams struct {
+	TenantID, LegalEntityID, OwnerPrincipalID string
+}
+
+// ExplainCalculationResult is ExplainCalculation's own result — the
+// rule/inputs recorded at creation/recalculation time for an owned
+// deadline, or an honest statement that a mirrored deadline was never
+// calculated locally at all.
+type ExplainCalculationResult struct {
+	DeadlineID string    `json:"deadline_id"`
+	DueAt      time.Time `json:"due_at"`
+	Mirrored   bool      `json:"mirrored"`
+	CalcRule   string    `json:"calc_rule,omitempty"`
+	CalcInputs string    `json:"calc_inputs,omitempty"`
+	Note       string    `json:"note"`
 }
 
 // ── errors ───────────────────────────────────────────────────────────────────

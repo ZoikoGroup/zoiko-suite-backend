@@ -213,3 +213,202 @@ func TestPgStore_DeadlineEscalations_AreAppendOnly(t *testing.T) {
 	_, err = conn.Exec(ctx(), `UPDATE deadline_escalations SET escalated_to_role = 'CFO' WHERE escalation_id = 'esc-1'`)
 	require.Error(t, err, "expected the append-only trigger to reject a direct mutation")
 }
+
+func TestPgStore_Recalculate_MovesDueAtAndResetsNotifications(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	due := time.Now().UTC().Add(1 * time.Hour) // within the due-soon window
+	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Close monthly books",
+		DueAt: due, CalcRule: "original rule", CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+
+	// Observe it via ListUpcoming so due_soon_notified_at gets set.
+	_, justNotified, err := s.ListUpcoming(ctx(), domain.ListUpcomingParams{TenantID: "default", LegalEntityID: "le-1"})
+	require.NoError(t, err)
+	require.Contains(t, justNotified, d.DeadlineID)
+
+	newDue := due.Add(200 * time.Hour) // outside the due-soon window
+	recalced, err := s.Recalculate(ctx(), domain.RecalculateParams{
+		DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "creator-1",
+		DueAt: newDue, CalcRule: "revised rule",
+	})
+	require.NoError(t, err)
+	require.WithinDuration(t, newDue, recalced.DueAt, time.Second)
+	require.Equal(t, "revised rule", recalced.CalcRule)
+	require.Nil(t, recalced.DueSoonNotifiedAt, "notification state must reset after recalculation")
+}
+
+// TestPgStore_Recalculate_RefusedOnMirroredDeadline is the negative
+// control for the doc's own prohibited anti-pattern: "Recalculating
+// legal/tax deadlines in BIZ-08 instead of consuming authoritative
+// source."
+func TestPgStore_Recalculate_RefusedOnMirroredDeadline(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	d, _, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "GST return due",
+		DueAt:      time.Now().UTC().Add(48 * time.Hour),
+		SourceType: "TAX", SourceRef: "gst-filing-recalc", SourceVersion: "v1", CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+
+	_, err = s.Recalculate(ctx(), domain.RecalculateParams{
+		DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "creator-1",
+		DueAt: time.Now().UTC().Add(96 * time.Hour),
+	})
+	require.ErrorIs(t, err, domain.ErrCannotRecalculateMirroredDeadline)
+}
+
+func TestPgStore_Waive_ThenRejectsSecondWaive(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Optional internal review",
+		DueAt: time.Now().UTC().Add(24 * time.Hour), CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+
+	waived, err := s.Waive(ctx(), domain.WaiveParams{DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "owner-1", Reason: "no longer applicable"})
+	require.NoError(t, err)
+	require.Equal(t, domain.DeadlineStatusWaived, waived.Status)
+	require.Equal(t, "no longer applicable", waived.WaiverReason)
+
+	_, err = s.Waive(ctx(), domain.WaiveParams{DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "owner-1", Reason: "again"})
+	require.ErrorIs(t, err, domain.ErrDeadlineInvalidState)
+}
+
+func TestPgStore_CancelDeadline_ThenRejectsCancelOfTerminalDeadline(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Draft process improvement",
+		DueAt: time.Now().UTC().Add(24 * time.Hour), CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+
+	cancelled, err := s.CancelDeadline(ctx(), domain.CancelDeadlineParams{DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "owner-1", Reason: "duplicate"})
+	require.NoError(t, err)
+	require.Equal(t, domain.DeadlineStatusCancelled, cancelled.Status)
+
+	_, err = s.CancelDeadline(ctx(), domain.CancelDeadlineParams{DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "owner-1", Reason: "again"})
+	require.ErrorIs(t, err, domain.ErrDeadlineInvalidState)
+}
+
+func TestPgStore_Escalate_RecordsEvidenceWithoutChangingStatus(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Vendor SLA review",
+		DueAt: time.Now().UTC().Add(1 * time.Hour), CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+
+	esc, err := s.Escalate(ctx(), domain.EscalateParams{
+		DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "owner-1", EscalatedToRole: "FINANCE_LEAD", Reason: "at risk of breach",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "FINANCE_LEAD", esc.EscalatedToRole)
+
+	// The doc's own lifecycle line lists no "Escalated" status — the
+	// deadline itself must remain SCHEDULED.
+	got, err := s.GetDeadline(ctx(), d.DeadlineID)
+	require.NoError(t, err)
+	require.Equal(t, domain.DeadlineStatusScheduled, got.Status)
+}
+
+func TestPgStore_Escalate_RefusedOnTerminalDeadline(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Vendor SLA review",
+		DueAt: time.Now().UTC().Add(1 * time.Hour), CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+	_, err = s.CompleteDeadline(ctx(), domain.CompleteDeadlineParams{DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "owner-1"})
+	require.NoError(t, err)
+
+	_, err = s.Escalate(ctx(), domain.EscalateParams{
+		DeadlineID: d.DeadlineID, TenantID: "default", ActorPrincipalID: "owner-1", EscalatedToRole: "FINANCE_LEAD", Reason: "too late",
+	})
+	require.ErrorIs(t, err, domain.ErrDeadlineInvalidState)
+}
+
+// TestPgStore_ListUpcoming_NotifiesOnceThenNotAgain proves the
+// first-observation mechanism: the same still-upcoming deadline is only
+// ever reported in justNotifiedIDs on the call that first observes it.
+func TestPgStore_ListUpcoming_NotifiesOnceThenNotAgain(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Close monthly books",
+		DueAt: time.Now().UTC().Add(2 * time.Hour), CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+
+	list1, justNotified1, err := s.ListUpcoming(ctx(), domain.ListUpcomingParams{TenantID: "default", LegalEntityID: "le-1"})
+	require.NoError(t, err)
+	require.Len(t, list1, 1)
+	require.Contains(t, justNotified1, d.DeadlineID)
+
+	list2, justNotified2, err := s.ListUpcoming(ctx(), domain.ListUpcomingParams{TenantID: "default", LegalEntityID: "le-1"})
+	require.NoError(t, err)
+	require.Len(t, list2, 1, "the deadline must still be reported as upcoming")
+	require.NotContains(t, justNotified2, d.DeadlineID, "must not be re-notified on a second observation")
+}
+
+// TestPgStore_ListOverdue_NotifiesOnceThenNotAgain is ListUpcoming's own
+// negative-controlled sibling for overdue_notified_at.
+func TestPgStore_ListOverdue_NotifiesOnceThenNotAgain(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	d, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Expired filing checklist",
+		DueAt: time.Now().UTC().Add(-1 * time.Hour), CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+
+	list1, justNotified1, err := s.ListOverdue(ctx(), domain.ListOverdueParams{TenantID: "default", LegalEntityID: "le-1"})
+	require.NoError(t, err)
+	require.Len(t, list1, 1)
+	require.Contains(t, justNotified1, d.DeadlineID)
+
+	list2, justNotified2, err := s.ListOverdue(ctx(), domain.ListOverdueParams{TenantID: "default", LegalEntityID: "le-1"})
+	require.NoError(t, err)
+	require.Len(t, list2, 1)
+	require.NotContains(t, justNotified2, d.DeadlineID)
+}
+
+func TestPgStore_ExplainCalculation_OwnVsMirrored(t *testing.T) {
+	pool := requireTestDB(t)
+	s := store.NewPgStore(pool)
+
+	own, err := s.CreateDeadline(ctx(), domain.CreateDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "Close monthly books",
+		DueAt: time.Now().UTC().Add(24 * time.Hour), CalcRule: "5 business days after period end", CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+	ownExplain, err := s.ExplainCalculation(ctx(), "default", own.DeadlineID)
+	require.NoError(t, err)
+	require.False(t, ownExplain.Mirrored)
+	require.Equal(t, "5 business days after period end", ownExplain.CalcRule)
+
+	mirrored, _, err := s.MirrorAuthoritativeDeadline(ctx(), domain.MirrorAuthoritativeDeadlineParams{
+		TenantID: "default", LegalEntityID: "le-1", Title: "GST return due",
+		DueAt: time.Now().UTC().Add(48 * time.Hour), SourceType: "TAX", SourceRef: "gst-explain-1", SourceVersion: "v1", CreatedByPrincipalID: "creator-1",
+	})
+	require.NoError(t, err)
+	mirroredExplain, err := s.ExplainCalculation(ctx(), "default", mirrored.DeadlineID)
+	require.NoError(t, err)
+	require.True(t, mirroredExplain.Mirrored)
+	require.Empty(t, mirroredExplain.CalcRule, "a mirrored deadline was never calculated locally")
+}
