@@ -217,11 +217,21 @@ func (p *SMTPProvider) Send(ctx context.Context, msg Message) (string, error) {
 	if _, err := w.Write(raw); err != nil {
 		return "", Retryable(fmt.Errorf("writing message body: %w", err))
 	}
-	// Close is where the server's accept-or-reject verdict arrives. An error
-	// here means the message was NOT accepted, which is why it is checked
-	// rather than deferred.
+	// Close is where the server's accept-or-reject verdict arrives — the
+	// client has just sent the terminating "." and is waiting on the
+	// server's 250-or-rejection reply. A protocol-level reply (a real SMTP
+	// response code) is unambiguous either way, classified exactly like
+	// every other step below. But a bare network fault RIGHT HERE — the
+	// connection dropping before any reply arrives — is not: the "." may
+	// have reached the server and been accepted a moment before the
+	// connection died, or may never have arrived at all. Treating that as
+	// "not accepted" (the old assumption this comment used to make) risks
+	// a duplicate send on retry if the message did go out; treating it as
+	// "accepted" risks silently losing a notice if it did not. Neither
+	// guess is safe, so this one specific fault is classified Unknown
+	// instead — see domain.DeliveryOutcome.Unknown's own doc comment.
 	if err := w.Close(); err != nil {
-		return "", classifySMTPError(fmt.Errorf("completing DATA: %w", err))
+		return "", classifyDataVerdictError(fmt.Errorf("completing DATA: %w", err))
 	}
 
 	return fmt.Sprintf("smtp %s accepted; message-id=%s", p.addr(), messageID), nil
@@ -429,6 +439,31 @@ func classifySMTPError(err error) error {
 	// being wrong differs: a retried permanent failure wastes an attempt, an
 	// un-retried transient one silently loses a notice.
 	return Retryable(err)
+}
+
+// classifyDataVerdictError classifies an error at the one call site where
+// the server's accept-or-reject verdict for THIS message is what a
+// network fault would obscure — see that call site's own doc comment. A
+// real protocol-level reply is unambiguous, classified exactly like
+// classifySMTPError; a bare network fault right here is classified
+// Unknown instead of Retryable, since the message may already have been
+// accepted.
+func classifyDataVerdictError(err error) error {
+	var proto *textproto.Error
+	if errors.As(err, &proto) {
+		if proto.Code >= 400 && proto.Code < 500 {
+			return Retryable(err)
+		}
+		return err // 5xx: the server has refused this message for good.
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return Unknown(err)
+	}
+	// An unrecognised failure at the verdict boundary gets the same
+	// benefit of the doubt as a network fault: it is not proof of either
+	// acceptance or rejection.
+	return Unknown(err)
 }
 
 // isLoopbackHost reports whether a host refers to this machine.

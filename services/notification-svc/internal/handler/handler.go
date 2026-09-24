@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -26,6 +28,10 @@ type Store interface {
 	ListNotifications(ctx context.Context, f domain.ListFilter) ([]domain.Notification, error)
 	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
+	// MarkOutcomeUnknown/ResolveDeliveryOutcome back BIZ-10's own
+	// PENDING_UNKNOWN handling — see their own doc comments in pg_store.go.
+	MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time) error
+	ResolveDeliveryOutcome(ctx context.Context, p domain.ResolveDeliveryOutcomeParams, resolvedAt time.Time) error
 	MarkRead(ctx context.Context, id, recipientPrincipalID string, readAt time.Time) error
 	CountUnread(ctx context.Context, recipientPrincipalID string) (int, error)
 
@@ -52,6 +58,10 @@ type RecipientResolver interface {
 type Publisher interface {
 	PublishSent(ctx context.Context, correlationID string, n domain.Notification)
 	PublishFailed(ctx context.Context, correlationID string, n domain.Notification, reason string)
+	// PublishOutcomeUnknown backs BIZ-10's own NotificationOutcomeUnknown
+	// event — fired when a delivery attempt's outcome is genuinely
+	// ambiguous. See domain.DeliveryOutcome.Unknown's own doc comment.
+	PublishOutcomeUnknown(ctx context.Context, correlationID string, n domain.Notification, reason string)
 
 	PublishTemplateCreated(ctx context.Context, correlationID string, d domain.TemplateDefinition)
 	PublishTemplateVersionApproved(ctx context.Context, correlationID string, v domain.TemplateVersion)
@@ -75,6 +85,12 @@ const (
 	// transition belongs to the second one.
 	actionTemplateManage  = "TEMPLATE_MANAGE"
 	actionTemplateApprove = "TEMPLATE_APPROVE"
+
+	// actionResolveOutcome gates ResolveDeliveryOutcome — deliberately
+	// distinct from actionSend. Resolving an ambiguous attempt is a
+	// reconciliation/operator action against a record that already
+	// exists, not an act of originating a new notification.
+	actionResolveOutcome = "NOTIFICATION_RESOLVE_OUTCOME"
 )
 
 var supportedChannels = map[string]bool{
@@ -171,6 +187,8 @@ func RegisterRoutes(r chi.Router, h *Handler) {
 
 		r.Get("/{id}", h.GetNotification)
 		r.Post("/{id}/read", h.MarkRead)
+		r.Get("/{id}/delivery-status", h.GetDeliveryStatus)
+		r.Post("/{id}/resolve-delivery-outcome", h.ResolveDeliveryOutcome)
 	})
 
 	r.Route("/v1/document-templates", func(r chi.Router) {
@@ -333,6 +351,11 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	// authorization check above. This is the same fetch-then-authorize-then-use
 	// discipline as every mutating handler in this platform, applied to a read
 	// that also needs gating.
+	// templateVersionID/renderedHash carry BIZ-10's own evidence/lineage
+	// requirement ("template/version, rendered hash") onto the notification
+	// row — empty for free-text/static-catalogue sends, which cite no
+	// governed version.
+	var templateVersionID, renderedHash string
 	if usingGovernedTemplate {
 		published, err := h.store.GetPublishedVersion(r.Context(), req.TemplateID, req.Locale)
 		if err != nil {
@@ -356,6 +379,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Body = rendered.RenderedContent
+		templateVersionID = published.VersionID
+		sum := sha256.Sum256([]byte(rendered.RenderedContent))
+		renderedHash = hex.EncodeToString(sum[:])
 	}
 
 	correlationID := getCorrelationID(r)
@@ -389,6 +415,9 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 		CorrelationID:          req.CorrelationID,
 		CreatedByPrincipalID:   principalID,
 		CreatedAt:              now,
+		TemplateID:             req.TemplateID,
+		TemplateVersionID:      templateVersionID,
+		RenderedContentHash:    renderedHash,
 	}
 
 	created, err := h.store.CreateNotification(r.Context(), notification)
@@ -417,6 +446,33 @@ func (h *Handler) SendNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	attemptedAt := time.Now().UTC()
+
+	// An ambiguous outcome is neither a success nor a settled failure — see
+	// domain.DeliveryOutcome.Unknown's own doc comment. It is checked
+	// before Retryable so an outcome that is genuinely unknown can never
+	// also be silently retried (which risks a duplicate if the message did
+	// go out).
+	if outcome.Unknown {
+		if err := h.store.MarkOutcomeUnknown(r.Context(), notification.NotificationID, tenantID, outcome.Reason, attemptedAt); err != nil {
+			h.log.Error("failed to record ambiguous delivery outcome", zap.Error(err))
+			writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+			return
+		}
+		notification.Status = domain.StatusPendingUnknown
+		notification.FailureReason = outcome.Reason
+		notification.DeliveryAttempts = 1
+		notification.LastAttemptAt = &attemptedAt
+		notification.SentAt = &attemptedAt
+		notification.UnknownAt = &attemptedAt
+
+		h.log.Warn("delivery outcome ambiguous on first attempt",
+			zap.String("notification_id", notification.NotificationID),
+			zap.String("reason", outcome.Reason))
+
+		h.publisher.PublishOutcomeUnknown(r.Context(), correlationID, *notification, outcome.Reason)
+		writeJSON(w, http.StatusCreated, notification)
+		return
+	}
 
 	// A failure worth re-attempting does not conclude the notification. It
 	// stays PENDING with a schedule on it, and internal/retry's worker picks
@@ -687,6 +743,156 @@ func (h *Handler) MarkRead(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
 		return
 	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
+// deliveryStatusResponse is GetDeliveryStatus's own response shape — the
+// doc's own query, a narrower view than the full notification record.
+// ErrorCode surfaces the doc's own named stable error,
+// DELIVERY_OUTCOME_UNKNOWN, describing the notification's own state — a
+// 200 response, not a request failure.
+type deliveryStatusResponse struct {
+	NotificationID string     `json:"notification_id"`
+	Status         string     `json:"status"`
+	ErrorCode      string     `json:"error_code,omitempty"`
+	FailureReason  string     `json:"failure_reason,omitempty"`
+	SentAt         *time.Time `json:"sent_at,omitempty"`
+	ResolvedAt     *time.Time `json:"resolved_at,omitempty"`
+}
+
+// GetDeliveryStatus — BIZ-10's own GetDeliveryStatus query.
+// GET /v1/notifications/{id}/delivery-status
+func (h *Handler) GetDeliveryStatus(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireTenant(w, r); !ok {
+		return
+	}
+
+	notification, err := h.store.GetNotification(r.Context(), id)
+	if errors.Is(err, domain.ErrNotificationNotFound) {
+		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch notification", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionView); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	resp := deliveryStatusResponse{
+		NotificationID: notification.NotificationID, Status: notification.Status,
+		FailureReason: notification.FailureReason, SentAt: notification.SentAt, ResolvedAt: notification.ResolvedAt,
+	}
+	if notification.Status == domain.StatusPendingUnknown {
+		resp.ErrorCode = "DELIVERY_OUTCOME_UNKNOWN"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+type resolveDeliveryOutcomeRequest struct {
+	ResolvedStatus    string `json:"resolved_status"`
+	ResolutionNote    string `json:"resolution_note"`
+	ProviderResponse  string `json:"provider_response,omitempty"`
+}
+
+// ResolveDeliveryOutcome — BIZ-10's own ResolveDeliveryOutcome command.
+// POST /v1/notifications/{id}/resolve-delivery-outcome
+//
+// Gated on actionResolveOutcome, not actionSend — see that constant's own
+// doc comment. Fetched first so a wrong-status target gets its own
+// distinguishable error rather than the store's generic "no row
+// changed" — same discipline as MarkRead above.
+func (h *Handler) ResolveDeliveryOutcome(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+
+	var req resolveDeliveryOutcomeRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.ResolvedStatus != domain.StatusSent && req.ResolvedStatus != domain.StatusFailed {
+		writeError(w, http.StatusBadRequest, "invalid_resolved_status", domain.ErrInvalidResolvedStatus.Error())
+		return
+	}
+	if req.ResolutionNote == "" {
+		writeError(w, http.StatusBadRequest, "missing_fields", domain.ErrResolutionNoteRequired.Error())
+		return
+	}
+
+	principalID, ok := h.requirePrincipal(w, r)
+	if !ok {
+		return
+	}
+	tenantID, ok := h.requireTenant(w, r)
+	if !ok {
+		return
+	}
+
+	notification, err := h.store.GetNotification(r.Context(), id)
+	if errors.Is(err, domain.ErrNotificationNotFound) {
+		writeError(w, http.StatusNotFound, "notification_not_found", "")
+		return
+	}
+	if err != nil {
+		h.log.Error("failed to fetch notification", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	if err := h.authz.CheckAllowed(r.Context(), principalID, notification.LegalEntityID, actionResolveOutcome); err != nil {
+		h.writeAuthzErr(w, err)
+		return
+	}
+
+	if notification.Status != domain.StatusPendingUnknown {
+		writeError(w, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
+		return
+	}
+
+	resolvedAt := time.Now().UTC()
+	err = h.store.ResolveDeliveryOutcome(r.Context(), domain.ResolveDeliveryOutcomeParams{
+		NotificationID: id, TenantID: tenantID, ActorPrincipalID: principalID,
+		ResolvedStatus: req.ResolvedStatus, ResolutionNote: req.ResolutionNote, ProviderResponse: req.ProviderResponse,
+	}, resolvedAt)
+	if err != nil {
+		if errors.Is(err, domain.ErrNotificationNotFound) {
+			// A race: the row moved (or vanished under a replay) between
+			// the fetch above and this call. 409 rather than 404 — the
+			// notification exists, it just stopped being PENDING_UNKNOWN.
+			writeError(w, http.StatusConflict, "not_pending_unknown", domain.ErrNotPendingUnknown.Error())
+			return
+		}
+		h.log.Error("failed to resolve delivery outcome", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	updated, err := h.store.GetNotification(r.Context(), id)
+	if err != nil {
+		h.log.Error("failed to re-read notification after resolving outcome", zap.Error(err))
+		writeError(w, http.StatusServiceUnavailable, "store_unavailable", err.Error())
+		return
+	}
+
+	// The event that would have fired at the original attempt, now fired
+	// at resolution time — the doc names no separate "resolved" event,
+	// only "resolve the original attempt".
+	correlationID := getCorrelationID(r)
+	if req.ResolvedStatus == domain.StatusSent {
+		h.publisher.PublishSent(r.Context(), correlationID, *updated)
+	} else {
+		h.publisher.PublishFailed(r.Context(), correlationID, *updated, req.ResolutionNote)
+	}
+
 	writeJSON(w, http.StatusOK, updated)
 }
 

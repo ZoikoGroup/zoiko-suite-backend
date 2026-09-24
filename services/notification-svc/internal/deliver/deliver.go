@@ -83,6 +83,27 @@ func isRetryable(err error) bool {
 	return errors.As(err, &r)
 }
 
+// UnknownError marks a provider failure whose outcome is genuinely
+// ambiguous — not "try again" and not "this failed", because the message
+// may already have reached the provider. A provider wraps a failure in
+// this only at the one moment retrying or failing it outright would both
+// risk being wrong: see smtp.go's own use at the DATA-close step, the
+// exact point a provider's accept-or-reject verdict arrives.
+type UnknownError struct{ Err error }
+
+func (e UnknownError) Error() string { return e.Err.Error() }
+func (e UnknownError) Unwrap() error { return e.Err }
+
+// Unknown wraps err as an ambiguous outcome.
+func Unknown(err error) error { return UnknownError{Err: err} }
+
+// isUnknown reports whether a provider error asked to be treated as
+// ambiguous.
+func isUnknown(err error) bool {
+	var u UnknownError
+	return errors.As(err, &u)
+}
+
 // Router dispatches a notification to the transport for its channel. It
 // implements handler.Deliverer.
 type Router struct {
@@ -178,11 +199,13 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 		CorrelationID: n.CorrelationID,
 	})
 	if err != nil {
-		retry := isRetryable(err)
+		unknown := isUnknown(err)
+		retry := !unknown && isRetryable(err)
 		r.log.Warn("email delivery failed",
 			zap.String("notification_id", n.NotificationID),
 			zap.String("provider", r.email.Name()),
 			zap.Bool("retryable", retry),
+			zap.Bool("unknown", unknown),
 			// The address is not logged. It is PII, it is already on the
 			// notification row under RLS, and a log line is the one place it
 			// would sit outside the tenant boundary.
@@ -190,6 +213,7 @@ func (r *Router) deliverEmail(ctx context.Context, n domain.Notification) domain
 		return domain.DeliveryOutcome{
 			Reason:    fmt.Sprintf("%s: %s", r.email.Name(), err.Error()),
 			Retryable: retry,
+			Unknown:   unknown,
 		}
 	}
 

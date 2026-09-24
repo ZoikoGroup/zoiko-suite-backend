@@ -24,6 +24,9 @@ type Store interface {
 	CompleteDelivery(ctx context.Context, id, newStatus, failureReason, providerResponse string, sentAt *time.Time) error
 	ScheduleRetry(ctx context.Context, id, tenantID, failureReason string, attemptedAt, nextAttemptAt time.Time) error
 	SetRecipientAddress(ctx context.Context, id, tenantID, address, source string) error
+	// MarkOutcomeUnknown backs an ambiguous re-attempt — see conclude's own
+	// doc comment.
+	MarkOutcomeUnknown(ctx context.Context, id, tenantID, reason string, attemptedAt time.Time) error
 }
 
 type Deliverer interface {
@@ -33,6 +36,7 @@ type Deliverer interface {
 type Publisher interface {
 	PublishSent(ctx context.Context, correlationID string, n domain.Notification)
 	PublishFailed(ctx context.Context, correlationID string, n domain.Notification, reason string)
+	PublishOutcomeUnknown(ctx context.Context, correlationID string, n domain.Notification, reason string)
 }
 
 // RecipientResolver re-resolves an address the first attempt could not get.
@@ -258,6 +262,26 @@ func (w *Worker) conclude(ctx context.Context, n *domain.Notification, outcome d
 	// incremented yet — ScheduleRetry and CompleteDelivery both do that — so
 	// the value the policy needs is the stored count plus this one.
 	attemptsMade := n.DeliveryAttempts + 1
+
+	// An ambiguous outcome on a retried attempt gets the same treatment as
+	// one on the first attempt (handler.SendNotification): it is checked
+	// before Retryable so it is never silently retried, which would risk
+	// a duplicate if the message did go out. See
+	// domain.DeliveryOutcome.Unknown's own doc comment.
+	if outcome.Unknown {
+		if err := w.store.MarkOutcomeUnknown(ctx, n.NotificationID, n.TenantID, outcome.Reason, now); err != nil {
+			w.log.Error("retry worker: could not record ambiguous delivery outcome",
+				zap.String("notification_id", n.NotificationID), zap.Error(err))
+			return
+		}
+		n.Status, n.SentAt, n.UnknownAt, n.FailureReason = "PENDING_UNKNOWN", &now, &now, outcome.Reason
+		w.log.Warn("retry worker: delivery outcome ambiguous on re-attempt",
+			zap.String("notification_id", n.NotificationID),
+			zap.Int("attempt", attemptsMade),
+			zap.String("reason", outcome.Reason))
+		w.publisher.PublishOutcomeUnknown(ctx, n.CorrelationID, *n, outcome.Reason)
+		return
+	}
 
 	if outcome.Retryable {
 		if next, ok := w.policy.NextAttempt(now, attemptsMade); ok {
